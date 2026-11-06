@@ -296,13 +296,18 @@ impl Footprints {
             over -= usize::from(gone);
             !gone
         });
-        let mut recent: Vec<Option<u64>> = Vec::new();
+        let mut recent = [None; SCOPES];
+        let mut recent_len = 0usize;
         for r in self.runs.iter().rev() {
-            if !recent.contains(&r.scope) {
-                recent.push(r.scope);
+            if !recent[..recent_len].contains(&r.scope) {
+                if recent_len == SCOPES {
+                    break;
+                }
+                recent[recent_len] = r.scope;
+                recent_len += 1;
             }
         }
-        recent.truncate(SCOPES);
+        let recent = &recent[..recent_len];
         self.runs.retain(|r| recent.contains(&r.scope));
     }
 

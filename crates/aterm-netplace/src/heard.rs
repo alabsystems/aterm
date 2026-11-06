@@ -20,8 +20,17 @@
 //! noted for fleet answers (with the interface that held it) or captured from the authenticated
 //! socket for Commons contacts, so the place counts it for the network it came over and not for
 //! the one this Mac moved to.
+//!
+//! THE HOME-DAY LEDGER, `<state>/netplace/home-days` ([`HomeDays`],
+//! `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.2 M2, §11 B6): for each network, the days on
+//! which members were heard on it and which ones ([`note_days`]), and the days the one-time seed
+//! credited it with ([`seed_days`]), from which the vault's automatic admission counts the
+//! distinct days a network has been home on this Mac (`aterm_secrets::home_lan::HOME_DAYS`). It
+//! sits apart from [`FILE`], so a build that predates it, which drops a line it cannot read when
+//! it rewrites [`FILE`] and reads such a file as torn, neither loses it nor stops admitting. Its
+//! writes hold [`DAYS_LOCK`] as those of [`FILE`] hold [`LOCK`]; readers take no lock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -29,8 +38,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::place::{
-    Answer, Book, BookMember, Evidence, InternetNote, InternetSource, Lane, NetworkId, Round,
-    member_key,
+    Answer, Book, BookMember, Evidence, InternetNote, InternetSource, Known, Lane, NetworkId,
+    Round, member_key,
 };
 
 /// The evidence file's name.
@@ -60,10 +69,6 @@ const MAX_BYTES: usize = 256 * 1024;
 /// How often one process notes the same member on the same lane, or the same internet verdict,
 /// within one stay; the first after a move is noted at once.
 pub const COALESCE_MS: u64 = 60_000;
-
-fn opt<T: ToString>(value: Option<T>) -> String {
-    value.map_or_else(|| "-".to_owned(), |v| v.to_string())
-}
 
 fn answer_line(answer: &Answer) -> String {
     use std::fmt::Write as _;
@@ -318,10 +323,15 @@ pub fn compact(mut evidence: Evidence) -> Evidence {
     evidence
         .answers
         .sort_by_key(|note| std::cmp::Reverse(note.at_ms));
-    let mut seen = std::collections::HashSet::new();
-    evidence
-        .answers
-        .retain(|answer| seen.insert((answer.lane, answer.member.clone())));
+    let mut seen_fixed = std::collections::HashSet::with_capacity(evidence.answers.len());
+    let mut seen_other = std::collections::HashSet::new();
+    evidence.answers.retain(|answer| {
+        if let Ok(fixed) = <[u8; 16]>::try_from(answer.member.as_bytes()) {
+            seen_fixed.insert((answer.lane, fixed))
+        } else {
+            seen_other.insert((answer.lane, answer.member.clone()))
+        }
+    });
     evidence
         .rounds
         .sort_by_key(|note| std::cmp::Reverse(note.at_ms));
@@ -419,7 +429,7 @@ pub fn note_observations(dir: &Path, mut answers: Vec<Answer>) {
 #[must_use]
 pub fn read_counted(dir: &Path) -> (Evidence, usize) {
     let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(dir) else {
-        return refused_read(dir);
+        return (Evidence::default(), refused(dir, FILE));
     };
     read_counted_in(dir, &judged)
 }
@@ -434,21 +444,20 @@ pub(crate) fn read_counted_in(
             Err(_) => (Evidence::default(), 1),
         },
         Err(aterm_uds::private_file::PrivateFileError::Missing) => (Evidence::default(), 0),
-        Err(_) => refused_read(dir),
+        Err(_) => (Evidence::default(), refused(dir, FILE)),
     }
 }
 
-fn refused_read(dir: &Path) -> (Evidence, usize) {
+/// How many lines a refused read of `name` in `dir` passed over: one where the file is there,
+/// or `dir` is a symbolic link, and cannot be read (not private); none where it is missing.
+fn refused(dir: &Path, name: &str) -> usize {
     let dir_is_symlink =
         std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
     let file_present = !matches!(
-        std::fs::symlink_metadata(dir.join(FILE)),
+        std::fs::symlink_metadata(dir.join(name)),
         Err(e) if e.kind() == io::ErrorKind::NotFound
     );
-    (
-        Evidence::default(),
-        usize::from(dir_is_symlink || file_present),
-    )
+    usize::from(dir_is_symlink || file_present)
 }
 
 /// Adds `notes` to the evidence in `dir` under [`LOCK`] ([the lock rule](self)), bounded by
@@ -457,7 +466,11 @@ fn refused_read(dir: &Path) -> (Evidence, usize) {
 /// # Errors
 /// The directory could not be made private, the lock was held past [`LOCK_WAIT`], or the file
 /// could not be written.
-pub fn add(dir: &Path, notes: Evidence) -> io::Result<()> {
+pub fn add(dir: &Path, mut notes: Evidence) -> io::Result<()> {
+    add_inner(dir, &mut notes)
+}
+
+fn add_inner(dir: &Path, notes: &mut Evidence) -> io::Result<()> {
     aterm_uds::private_file::ensure_private_dir(dir)?;
     let _lock = aterm_uds::private_file::PrivateLock::take(
         dir,
@@ -466,27 +479,41 @@ pub fn add(dir: &Path, notes: Evidence) -> io::Result<()> {
         "the network place's evidence is being written by another process",
     )?;
     let mut evidence = read(dir);
-    evidence.answers.extend(notes.answers);
-    evidence.rounds.extend(notes.rounds);
-    evidence.internet.extend(notes.internet);
-    aterm_uds::private_file::write_private(dir, FILE, format(&compact(evidence)).as_bytes())
+    evidence.answers.append(&mut notes.answers);
+    evidence.rounds.append(&mut notes.rounds);
+    evidence.internet.append(&mut notes.internet);
+    let compacted = compact(evidence);
+    let formatted = format(&compacted);
+    if let Err(e) = aterm_uds::private_file::write_private(dir, FILE, formatted.as_bytes()) {
+        *notes = compacted;
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The fleet book snapshot's text.
 #[must_use]
 pub fn format_book(book: &Book) -> String {
-    book.members
-        .iter()
-        .map(|member| {
-            format!(
-                "m {} {} {} {}\n",
-                member.member,
-                opt(member.addr),
-                opt(member.answered_ms),
-                member.network.as_ref().map_or("-", NetworkId::as_str)
-            )
-        })
-        .collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(book.members.len().saturating_mul(48));
+    for member in &book.members {
+        let _ = write!(out, "m {} ", member.member);
+        match member.addr {
+            Some(addr) => {
+                let _ = write!(out, "{addr} ");
+            }
+            None => out.push_str("- "),
+        }
+        match member.answered_ms {
+            Some(ms) => {
+                let _ = write!(out, "{ms} ");
+            }
+            None => out.push_str("- "),
+        }
+        out.push_str(member.network.as_ref().map_or("-", NetworkId::as_str));
+        out.push('\n');
+    }
+    out
 }
 
 /// The fleet book snapshot a [`format_book`] text holds; lines this build cannot read are
@@ -627,7 +654,7 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
         }
     }
     drop(guard);
-    if let Err(e) = add(dir, notes.clone()) {
+    if let Err(e) = add_inner(dir, &mut notes) {
         aterm_log::debug!("network place: a note waits for the next ({e})");
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         let held = guard
@@ -795,6 +822,414 @@ pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &st
         vec![noted_key.to_owned()],
         at_ms,
     );
+}
+
+/// The home-day ledger's file name ([the module](self)).
+pub const DAYS_FILE: &str = "home-days";
+
+/// The lock every write of [`DAYS_FILE`] holds, for one bounded read-modify-rename.
+pub const DAYS_LOCK: &str = "home-days.lock";
+
+/// The ledger's day: a UTC day of this Mac's clock, the unix ms an answer came at divided by it.
+pub const DAY_MS: u64 = 24 * 60 * 60_000;
+
+/// The most networks the ledger keeps of each kind ([`compact_days`]): credited networks (the
+/// seed credits at most as many as the place remembers as the ALab LAN), and apart from them the
+/// networks still earning their days, the most recently heard first, so the network a note books
+/// today always keeps its place and a lab that moves earns its new home's days.
+pub const DAYS_NETWORKS: usize = crate::place::REMEMBERED_MAX;
+
+/// The most days the ledger keeps for one network: the newest (the day a note is booking, so its
+/// members gather), then the days most members were heard on, then the newest, so a stretch of
+/// days with one member heard never pushes out a home's days.
+pub const DAYS_KEPT: usize = 32;
+
+/// The most members the ledger keeps for one day of one network, past what any rule counts.
+pub const DAY_MEMBERS: usize = 8;
+
+/// What the home-day ledger holds ([the module](self)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeDays {
+    /// When the one-time seed ran on this Mac (unix ms); `None` before it has ([`seed_days`]).
+    pub seeded_ms: Option<u64>,
+    /// Each network's entry, by its id.
+    pub networks: Vec<NetworkDays>,
+}
+
+/// One network's entry in the home-day ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkDays {
+    /// The network (strong id).
+    pub network: NetworkId,
+    /// The home days the one-time seed credited it with ([`seed_days`]).
+    pub credited: u32,
+    /// The days members were heard on it, oldest first.
+    pub days: Vec<HeardDay>,
+}
+
+/// One day on one network in the home-day ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeardDay {
+    /// The day ([`DAY_MS`] since the epoch).
+    pub day: u64,
+    /// The distinct members heard on the network that day ([`member_key`]), sorted, at most
+    /// [`DAY_MEMBERS`].
+    pub members: Vec<String>,
+}
+
+impl HomeDays {
+    /// `network`'s entry; `None` where the ledger holds none.
+    #[must_use]
+    pub fn of(&self, network: &NetworkId) -> Option<&NetworkDays> {
+        self.networks.iter().find(|entry| entry.network == *network)
+    }
+}
+
+impl NetworkDays {
+    /// The days on which at least `members` distinct members were heard on this network.
+    pub fn heard_by(&self, members: usize) -> impl Iterator<Item = u64> + '_ {
+        self.days
+            .iter()
+            .filter(move |day| day.members.len() >= members)
+            .map(|day| day.day)
+    }
+}
+
+/// What [`seed_days`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seeding {
+    /// This call seeded the ledger: it credited these networks.
+    Now(Vec<NetworkId>),
+    /// The ledger was seeded before, at this time (unix ms): this call credited nothing.
+    Before(u64),
+}
+
+/// A strong network id word of the ledger; `None` for anything else.
+fn strong_word(word: &str) -> Option<NetworkId> {
+    NetworkId::parse(word).filter(NetworkId::is_strong)
+}
+
+/// Adds the entry `line` holds to `days`; `false` where this build cannot read it.
+fn parse_days_line(line: &str, days: &mut HomeDays) -> bool {
+    let words: Vec<&str> = line.split(' ').collect();
+    match words.as_slice() {
+        ["s", at] if days.seeded_ms.is_none() => at.parse().is_ok_and(|at| {
+            days.seeded_ms = Some(at);
+            true
+        }),
+        ["c", network, credited] => {
+            let (Some(network), Ok(credited)) = (strong_word(network), credited.parse::<u32>())
+            else {
+                return false;
+            };
+            days.networks.push(NetworkDays {
+                network,
+                credited,
+                days: Vec::new(),
+            });
+            true
+        }
+        ["d", network, day, members] => {
+            let (Some(network), Ok(day)) = (strong_word(network), day.parse()) else {
+                return false;
+            };
+            let members: Vec<String> = members.split(',').map(str::to_owned).collect();
+            if members.len() > DAY_MEMBERS || !members.iter().all(|member| is_lower_hex16(member)) {
+                return false;
+            }
+            days.networks.push(NetworkDays {
+                network,
+                credited: 0,
+                days: vec![HeardDay { day, members }],
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The home-day ledger a [`DAYS_FILE`] text holds, with how many of its lines it passed over:
+/// each line that is not empty and this build cannot read (malformed, torn, unterminated by
+/// `'\n'`, a second seed line, or of a kind this build does not write).
+#[must_use]
+pub fn parse_days(text: &str) -> (HomeDays, usize) {
+    let mut days = HomeDays::default();
+    let mut passed = 0;
+    for chunk in text.split_inclusive('\n') {
+        let read = chunk
+            .strip_suffix('\n')
+            .filter(|line| !line.ends_with('\r'))
+            .is_some_and(|line| line.is_empty() || parse_days_line(line, &mut days));
+        if !read && !chunk.is_empty() {
+            passed += 1;
+        }
+    }
+    (compact_days(days), passed)
+}
+
+/// `days` as one entry per network, each day once with its members sorted, within
+/// [`DAYS_NETWORKS`], [`DAYS_KEPT`] and [`DAY_MEMBERS`]: of the networks the seed credited, those
+/// with the most credit and days, then the most recently heard; apart from them, of the networks
+/// still earning their days, the most recently heard, then those with the most days.
+#[must_use]
+pub fn compact_days(days: HomeDays) -> HomeDays {
+    use std::cmp::Reverse;
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut merged: BTreeMap<NetworkId, (u32, BTreeMap<u64, BTreeSet<String>>)> = BTreeMap::new();
+    for entry in days.networks {
+        let slot = merged.entry(entry.network).or_default();
+        slot.0 = slot.0.max(entry.credited);
+        for day in entry.days {
+            slot.1.entry(day.day).or_default().extend(day.members);
+        }
+    }
+    let networks: Vec<NetworkDays> = merged
+        .into_iter()
+        .map(|(network, (credited, heard))| {
+            let mut days: Vec<HeardDay> = heard
+                .into_iter()
+                .map(|(day, members)| HeardDay {
+                    day,
+                    members: members.into_iter().take(DAY_MEMBERS).collect(),
+                })
+                .collect();
+            if days.len() > DAYS_KEPT {
+                let newest = days.last().map(|day| day.day);
+                days.sort_by_key(|day| {
+                    (
+                        Reverse(Some(day.day) == newest),
+                        Reverse(day.members.len()),
+                        Reverse(day.day),
+                    )
+                });
+                days.truncate(DAYS_KEPT);
+                days.sort_by_key(|day| day.day);
+            }
+            NetworkDays {
+                network,
+                credited,
+                days,
+            }
+        })
+        .collect();
+    let (mut credited, mut earning): (Vec<NetworkDays>, Vec<NetworkDays>) =
+        networks.into_iter().partition(|entry| entry.credited > 0);
+    let heard = |entry: &NetworkDays| {
+        u64::from(entry.credited)
+            .saturating_add(u64::try_from(entry.days.len()).unwrap_or(u64::MAX))
+    };
+    if credited.len() > DAYS_NETWORKS {
+        credited.sort_by_key(|entry| {
+            (
+                Reverse(heard(entry)),
+                Reverse(entry.days.last().map(|day| day.day)),
+            )
+        });
+        credited.truncate(DAYS_NETWORKS);
+    }
+    if earning.len() > DAYS_NETWORKS {
+        earning.sort_by_key(|entry| {
+            (
+                Reverse(entry.days.last().map(|day| day.day)),
+                Reverse(heard(entry)),
+            )
+        });
+        earning.truncate(DAYS_NETWORKS);
+    }
+    let mut networks = credited;
+    networks.append(&mut earning);
+    networks.sort_by(|a, b| a.network.cmp(&b.network));
+    HomeDays {
+        seeded_ms: days.seeded_ms,
+        networks,
+    }
+}
+
+/// The [`DAYS_FILE`] text of `days`: the seed's line, then each network's credit and days.
+#[must_use]
+pub fn format_days(days: &HomeDays) -> String {
+    let mut text = String::new();
+    if let Some(at) = days.seeded_ms {
+        text.push_str(&format!("s {at}\n"));
+    }
+    for entry in &days.networks {
+        let network = entry.network.as_str();
+        if entry.credited > 0 {
+            text.push_str(&format!("c {network} {}\n", entry.credited));
+        }
+        for day in entry.days.iter().filter(|day| !day.members.is_empty()) {
+            text.push_str(&format!(
+                "d {network} {} {}\n",
+                day.day,
+                day.members.join(",")
+            ));
+        }
+    }
+    text
+}
+
+/// The home-day ledger in `dir`, with how many of its lines this build passed over
+/// ([`parse_days`]): `(empty, 0)` where there is none, `(empty, 1)` where it is there and cannot
+/// be read (not private, not UTF-8), so a caller that must not take damage for silence can tell.
+#[must_use]
+pub fn read_days(dir: &Path) -> (HomeDays, usize) {
+    let read = aterm_uds::private_file::JudgedDir::judge(dir)
+        .and_then(|judged| judged.read(DAYS_FILE, MAX_BYTES));
+    match read {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_or_else(|_| (HomeDays::default(), 1), |text| parse_days(&text)),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => (HomeDays::default(), 0),
+        Err(_) => (HomeDays::default(), refused(dir, DAYS_FILE)),
+    }
+}
+
+/// Changes the home-day ledger in `dir` under [`DAYS_LOCK`]: `change` is handed it as read, and
+/// how many lines were passed over, and says whether to write it back (whole, by rename, bounded
+/// by [`compact_days`]); `true` where it was written.
+fn change_days(
+    dir: &Path,
+    change: impl FnOnce(&mut HomeDays, usize) -> io::Result<bool>,
+) -> io::Result<bool> {
+    aterm_uds::private_file::ensure_private_dir(dir)?;
+    let _lock = aterm_uds::private_file::PrivateLock::take(
+        dir,
+        DAYS_LOCK,
+        LOCK_WAIT,
+        "the home-day ledger is being written by another process",
+    )?;
+    let (mut days, passed) = read_days(dir);
+    if !change(&mut days, passed)? {
+        return Ok(false);
+    }
+    aterm_uds::private_file::write_private(
+        dir,
+        DAYS_FILE,
+        format_days(&compact_days(days)).as_bytes(),
+    )?;
+    Ok(true)
+}
+
+/// One member heard on one network on one day: what [`note_days`] books.
+type Booking = (NetworkId, u64, String);
+
+/// The bookings this process wrote, per directory: [`note_days`] writes each once.
+static BOOKED: Mutex<Option<HashSet<(PathBuf, Booking)>>> = Mutex::new(None);
+
+/// BOOKS THE DAYS `answers` WERE HEARD ON into the home-day ledger in `dir` (the place's directory,
+/// [`crate::record::dir`]): each logged fleet answer booked on a strong network
+/// ([`Answer::network`], [`Answer::logged`]) adds its member to the day it came on
+/// ([`DAY_MS`]), on that network. Any other answer books nothing. Call it only for node-proven
+/// answers, beside noting them ([`note_answers`]). A booking this process wrote already is not
+/// written again; one a held lock kept back is written by the next note of it. A note that
+/// writes a ledger it read in part counts the seed as run where it read no mark of it
+/// ([`seed_days`]).
+pub fn note_days(dir: &Path, answers: &[Answer]) {
+    let mut wanted: Vec<Booking> = answers
+        .iter()
+        .filter(|answer| answer.lane == Lane::Fleet && answer.logged)
+        .filter_map(|answer| {
+            Some((
+                answer.network.clone().filter(NetworkId::is_strong)?,
+                answer.at_ms / DAY_MS,
+                answer.member.clone(),
+            ))
+        })
+        .collect();
+    {
+        let guard = BOOKED.lock().unwrap_or_else(PoisonError::into_inner);
+        wanted.retain(|booking| {
+            guard
+                .as_ref()
+                .is_none_or(|booked| !booked.contains(&(dir.to_path_buf(), booking.clone())))
+        });
+    }
+    wanted.sort();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return;
+    }
+    let at_ms = answers.iter().map(|answer| answer.at_ms).max().unwrap_or(0);
+    let written = change_days(dir, |days, passed| {
+        // A ledger read in part may have lost its seed's mark: the seed counts as run, so a
+        // damaged ledger never lets it credit a network that did not earn its days.
+        if passed > 0 && days.seeded_ms.is_none() {
+            days.seeded_ms = Some(at_ms);
+        }
+        for (network, day, member) in &wanted {
+            days.networks.push(NetworkDays {
+                network: network.clone(),
+                credited: 0,
+                days: vec![HeardDay {
+                    day: *day,
+                    members: vec![member.clone()],
+                }],
+            });
+        }
+        Ok(true)
+    });
+    match written {
+        Ok(_) => {
+            let mut guard = BOOKED.lock().unwrap_or_else(PoisonError::into_inner);
+            let booked = guard.get_or_insert_with(HashSet::new);
+            let newest = wanted.iter().map(|(_, day, _)| *day).max().unwrap_or(0);
+            // Only today's and yesterday's bookings can come again; older ones are let go.
+            booked.retain(|(_, (_, day, _))| day.saturating_add(1) >= newest);
+            booked.extend(
+                wanted
+                    .into_iter()
+                    .map(|booking| (dir.to_path_buf(), booking)),
+            );
+        }
+        Err(e) => aterm_log::debug!("network place: a home-day booking waits for the next ({e})"),
+    }
+}
+
+/// THE ONE-TIME SEED of the home-day ledger in `dir` (`docs/DESIGN-alab-one-mesh-2026-11-05.md`
+/// §4.2 M2, §11 B6): the first call credits each network in `remembered` (the place's networks
+/// remembered as the ALab LAN, [`crate::place::Record::remembered`]) with `credit` home days
+/// and marks the ledger seeded at `at_ms`; every later call credits nothing, whatever it is
+/// handed ([`Seeding::Before`]). So a network this Mac already called home stays home across the
+/// first start of a build that counts home days, and one first remembered after that earns its
+/// days.
+///
+/// # Errors
+/// The directory could not be made private, the lock was held past [`LOCK_WAIT`], the ledger
+/// could not be written, or it holds a line this build cannot read, so it cannot tell whether the
+/// seed ran ([`io::ErrorKind::InvalidData`]): it seeds nothing, and the note that next writes the
+/// ledger whole counts the seed as run where no mark of it was read ([`note_days`]), so damage
+/// never credits a network that did not earn its days.
+pub fn seed_days(dir: &Path, remembered: &[Known], credit: u32, at_ms: u64) -> io::Result<Seeding> {
+    let mut seeding = None;
+    change_days(dir, |days, passed| {
+        if passed > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the home-day ledger holds a line this build cannot read, so it cannot tell \
+                 whether the seed ran",
+            ));
+        }
+        if let Some(seeded_ms) = days.seeded_ms {
+            seeding = Some(Seeding::Before(seeded_ms));
+            return Ok(false);
+        }
+        let mut credited: Vec<NetworkId> = remembered
+            .iter()
+            .map(|known| known.network.clone())
+            .filter(NetworkId::is_strong)
+            .collect();
+        credited.sort();
+        credited.dedup();
+        days.networks
+            .extend(credited.iter().map(|network| NetworkDays {
+                network: network.clone(),
+                credited: credit,
+                days: Vec::new(),
+            }));
+        days.seeded_ms = Some(at_ms);
+        seeding = Some(Seeding::Now(credited));
+        Ok(true)
+    })?;
+    seeding.ok_or_else(|| io::Error::other("the home-day seed decided nothing"))
 }
 
 #[cfg(test)]
@@ -1271,5 +1706,299 @@ mod tests {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert_eq!(read_counted(&dir), (Evidence::default(), 1));
         }
+    }
+
+    /// A strong network id of the home-day tests, `n` its last hex digit.
+    fn net(n: u8) -> NetworkId {
+        NetworkId::parse(&format!("n00112233445566{n:02x}")).expect("a strong id")
+    }
+
+    /// `member`'s answer on network `on` (strong, or `None`) at `at_ms`, logged or not.
+    fn heard_on(member: &str, on: Option<NetworkId>, at_ms: u64, logged: bool) -> Answer {
+        Answer {
+            network: on,
+            logged,
+            ..answer(member, at_ms)
+        }
+    }
+
+    const DAY0: u64 = 20_400 * DAY_MS;
+
+    /// The ledger books one day per member per network per UTC day: only a logged fleet answer
+    /// booked on a strong network books one (an unlogged one, a Commons contact, one booked on no
+    /// network or a weak one books none), two answers of a member on one day book that day once,
+    /// and the next day is another day. What it wrote reads back whole.
+    /// NEGATIVE CONTROL: dropping `answer.logged` from `note_days`' filter books the unlogged
+    /// answer's member, and "an unlogged answer books nothing" fails.
+    #[test]
+    fn only_logged_fleet_answers_on_a_strong_network_book_their_day() {
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = crate::record::dir(root.path());
+        let home = net(1);
+        note_days(
+            &dir,
+            &[
+                heard_on("m1", Some(home.clone()), DAY0 + 1_000, true),
+                heard_on("m1", Some(home.clone()), DAY0 + 60_000, true),
+                heard_on("m2", Some(home.clone()), DAY0 + 2_000, true),
+            ],
+        );
+        note_days(
+            &dir,
+            &[
+                heard_on("m3", Some(home.clone()), DAY0 + 3_000, false),
+                Answer {
+                    lane: Lane::Commons,
+                    ..heard_on("m4", Some(home.clone()), DAY0 + 4_000, true)
+                },
+                heard_on("m5", None, DAY0 + 5_000, true),
+                heard_on(
+                    "m6",
+                    NetworkId::parse("w00112233445566ff"),
+                    DAY0 + 6_000,
+                    true,
+                ),
+            ],
+        );
+        let (days, passed) = read_days(&dir);
+        assert_eq!(passed, 0);
+        let entry = days.of(&home).expect("the home network's entry");
+        assert_eq!(entry.days.len(), 1, "one day: {entry:?}");
+        let mut members = vec![member_key(Lane::Fleet, "m1"), member_key(Lane::Fleet, "m2")];
+        members.sort();
+        assert_eq!(
+            entry.days[0].members, members,
+            "an unlogged answer books nothing, nor a Commons contact"
+        );
+        assert_eq!(days.networks.len(), 1, "no weak or missing network books");
+
+        note_days(
+            &dir,
+            &[heard_on("m1", Some(home.clone()), DAY0 + DAY_MS, true)],
+        );
+        let (days, _) = read_days(&dir);
+        let entry = days.of(&home).expect("the home network's entry");
+        assert_eq!(
+            entry.days.iter().map(|day| day.day).collect::<Vec<_>>(),
+            [DAY0 / DAY_MS, DAY0 / DAY_MS + 1]
+        );
+        assert_eq!(entry.heard_by(2).collect::<Vec<_>>(), [DAY0 / DAY_MS]);
+        assert_eq!(entry.heard_by(1).count(), 2);
+        assert_eq!(
+            parse_days(&format_days(&days)),
+            (days, 0),
+            "reads back whole"
+        );
+    }
+
+    /// THE SEED IS ONCE: the first seed credits each strong network remembered as the ALab LAN
+    /// (a weak one never is) and marks the ledger seeded; a second, handed a network remembered
+    /// since, credits nothing and leaves the first credit as it was. Days booked before the seed
+    /// stay beside its credit.
+    /// NEGATIVE CONTROL: dropping `seed_days`' `seeded_ms` check credits the network remembered
+    /// since on the second start, and "a second start credits nothing" fails.
+    #[test]
+    fn the_seed_credits_each_remembered_network_once() {
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = crate::record::dir(root.path());
+        let known = |network: NetworkId| Known {
+            network,
+            learned_ms: DAY0 - 90 * DAY_MS,
+            confirmed_ms: DAY0 - DAY_MS,
+        };
+        note_days(&dir, &[heard_on("m1", Some(net(1)), DAY0 - DAY_MS, true)]);
+        let first = seed_days(
+            &dir,
+            &[
+                known(net(1)),
+                known(NetworkId::parse("w00112233445566ff").expect("a weak id")),
+            ],
+            7,
+            DAY0,
+        )
+        .expect("the first seed");
+        assert_eq!(first, Seeding::Now(vec![net(1)]));
+        let (days, _) = read_days(&dir);
+        assert_eq!(days.seeded_ms, Some(DAY0));
+        let home = days.of(&net(1)).expect("the remembered network");
+        assert_eq!((home.credited, home.days.len()), (7, 1));
+
+        let second = seed_days(&dir, &[known(net(1)), known(net(2))], 7, DAY0 + DAY_MS)
+            .expect("the second seed");
+        assert_eq!(
+            second,
+            Seeding::Before(DAY0),
+            "a second start credits nothing"
+        );
+        let (after, _) = read_days(&dir);
+        assert_eq!(after, days);
+        assert!(after.of(&net(2)).is_none());
+    }
+
+    /// A ledger with a line this build cannot read is read as passed over, and the seed, which
+    /// cannot tell from it whether it ran, credits nothing; the note that next writes the ledger
+    /// whole, reading no mark of the seed, counts it as run, so the damage credits no network.
+    ///
+    /// NEGATIVE CONTROL: `seed_days` ignoring `passed` seeds the torn ledger, and "a torn ledger
+    /// seeds nothing" fails; `note_days` leaving `seeded_ms` unset lets the next seed credit
+    /// `net(1)`, and "the damage reopens no seed" fails.
+    #[test]
+    fn a_torn_ledger_never_reopens_the_seed() {
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = crate::record::dir(root.path());
+        aterm_uds::private_file::ensure_private_dir(&dir).expect("private dir");
+        let line = format!(
+            "d {} 3 {}\n",
+            net(1).as_str(),
+            member_key(Lane::Fleet, "m1")
+        );
+        aterm_uds::private_file::write_private(
+            &dir,
+            DAYS_FILE,
+            format!("{line}{}", &line[..line.len() / 2]).as_bytes(),
+        )
+        .expect("a torn ledger");
+        assert_eq!(read_days(&dir).1, 1);
+        let known = Known {
+            network: net(1),
+            learned_ms: 0,
+            confirmed_ms: 0,
+        };
+        let refused = seed_days(&dir, std::slice::from_ref(&known), 7, DAY0)
+            .expect_err("a torn ledger seeds nothing");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_days(&dir).0.seeded_ms, None);
+        note_days(&dir, &[heard_on("m2", Some(net(1)), DAY0 + 5, true)]);
+        let (whole, passed) = read_days(&dir);
+        assert_eq!(passed, 0, "a note writes it whole");
+        assert_eq!(whole.seeded_ms, Some(DAY0 + 5));
+        assert_eq!(
+            whole.of(&net(1)).map(|entry| entry.days.len()),
+            Some(2),
+            "the day it read is kept"
+        );
+        assert_eq!(
+            seed_days(&dir, &[known], 7, DAY0 + 6).expect("the seed"),
+            Seeding::Before(DAY0 + 5),
+            "the damage reopens no seed"
+        );
+        assert_eq!(
+            read_days(&dir).0.of(&net(1)).map(|entry| entry.credited),
+            Some(0)
+        );
+    }
+
+    /// Every bound holds as the ledger is written, and none starves what the condition counts: a
+    /// day keeps at most [`DAY_MEMBERS`] members; a network keeps its newest day (the one a note
+    /// is booking), then the days most members were heard on; the ledger keeps its credited
+    /// networks (most credit and days first) and apart from them the networks still earning
+    /// their days, most recently heard first, so a new home earns its days among old networks.
+    ///
+    /// NEGATIVE CONTROL: `compact_days` with the newest-day key dropped loses day 35, and "the
+    /// newest day is kept" fails; ranking the earning networks by days first drops `net(50)`, and
+    /// "a new network keeps its place" fails; one ranking for both kinds (credited first) drops
+    /// `net(50)` too; the credited ranking by id alone drops `net(116)`, and "the most credited"
+    /// fails.
+    #[test]
+    fn every_bound_holds_and_none_starves_a_new_home() {
+        let days_up_to = |last: u64| -> Vec<HeardDay> {
+            (0..=last)
+                .map(|day| HeardDay {
+                    day,
+                    members: (0..if day >= 32 { 1 } else { DAY_MEMBERS + 2 })
+                        .map(|m| member_key(Lane::Fleet, &format!("m{m}")))
+                        .collect(),
+                })
+                .collect()
+        };
+        let bound = u8::try_from(DAYS_NETWORKS).expect("a small bound");
+        let mut networks: Vec<NetworkDays> = (0..bound)
+            .map(|n| NetworkDays {
+                network: net(n),
+                credited: 0,
+                days: days_up_to(35),
+            })
+            .collect();
+        // A network first heard after all of them, on one day.
+        networks.push(NetworkDays {
+            network: net(50),
+            credited: 0,
+            days: vec![HeardDay {
+                day: 40,
+                members: vec![member_key(Lane::Fleet, "m0")],
+            }],
+        });
+        // One more credited network than the bound, each with as many days as its place.
+        networks.extend((0..=bound).map(|n| {
+            NetworkDays {
+                network: net(100 + n),
+                credited: 7,
+                days: (0..u64::from(n))
+                    .map(|day| HeardDay {
+                        day,
+                        members: vec![member_key(Lane::Fleet, "m0")],
+                    })
+                    .collect(),
+            }
+        }));
+        let bounded = compact_days(HomeDays {
+            seeded_ms: Some(DAY0),
+            networks,
+        });
+        let (credited, earning): (Vec<&NetworkDays>, Vec<&NetworkDays>) = bounded
+            .networks
+            .iter()
+            .partition(|entry| entry.credited > 0);
+        assert_eq!(
+            (credited.len(), earning.len()),
+            (DAYS_NETWORKS, DAYS_NETWORKS)
+        );
+        assert!(
+            bounded.of(&net(50)).is_some(),
+            "a new network keeps its place"
+        );
+        assert!(bounded.of(&net(100 + bound)).is_some(), "the most credited");
+        assert!(bounded.of(&net(100)).is_none(), "the least credited goes");
+        for entry in earning.iter().filter(|entry| entry.network != net(50)) {
+            let kept: Vec<u64> = entry.days.iter().map(|day| day.day).collect();
+            assert_eq!(kept.len(), DAYS_KEPT);
+            assert_eq!(kept.last(), Some(&35), "the newest day is kept");
+            assert_eq!(kept[0], 1, "then the days most members were heard on");
+            assert!(
+                !kept.contains(&32) && !kept.contains(&34),
+                "the days one member was heard on go first"
+            );
+            assert!(
+                entry.days[..DAYS_KEPT - 1]
+                    .iter()
+                    .all(|day| day.members.len() == DAY_MEMBERS)
+            );
+        }
+        assert_eq!(parse_days(&format_days(&bounded)), (bounded, 0));
+
+        // Through the ledger: a network with 32 days of two members gathers a new day's three,
+        // one note at a time.
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = crate::record::dir(root.path());
+        for day in 0..32u64 {
+            for member in ["m1", "m2"] {
+                note_days(
+                    &dir,
+                    &[heard_on(member, Some(net(7)), DAY0 + day * DAY_MS, true)],
+                );
+            }
+        }
+        for member in ["m1", "m2", "m3"] {
+            note_days(
+                &dir,
+                &[heard_on(member, Some(net(7)), DAY0 + 40 * DAY_MS, true)],
+            );
+        }
+        let (days, _) = read_days(&dir);
+        assert!(
+            days.of(&net(7))
+                .is_some_and(|entry| entry.heard_by(3).any(|day| day == DAY0 / DAY_MS + 40)),
+            "the newest day gathers its members"
+        );
     }
 }

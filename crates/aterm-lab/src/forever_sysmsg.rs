@@ -876,15 +876,27 @@ pub fn land_on_by(seen: &Seen, resumed: i64, by: i64, t0: i64) -> Result<String,
     ))
 }
 
+/// The point record (`point@v1`) the act at `met` was typed on, the last at or before it that
+/// names a streak: its time and the short turns in a row it names ([`point_streak`]).
+#[must_use]
+pub fn typed_on(seen: &Seen, met: i64) -> Option<(i64, u32)> {
+    seen.ledger
+        .iter()
+        .filter(|r| r.rule == RULE_POINT && r.ts <= met)
+        .filter_map(|r| Some((r.ts, point_streak(r)?)))
+        .next_back()
+}
+
 /// THE STREAK STANDS AT THE AGENT'S OWN SHORT ANSWERS past a wall (v6 §14.17.5.7). The act that
 /// met the wall at `met` was answered by the wall, not the agent (the wall's one pass, as the
 /// first cut since the agent's last answer is); the wall's tries, its resume and a person's own
 /// turn are no short answers of the agent's to aterm: none adds to the short streak, and none
-/// resets it. So every point record (`point@v1`) past `from` (the resume, or the person's prompt)
-/// and before `before` (aterm's next act), and every back-off journaled there, names the short
-/// turns in a row the point record that typed that act named, the last at or before `met`: no
-/// more, and, as the sysmsg stub answers every act short with no tool, so that no turn there is
-/// real work, no fewer. What it read, in the verdict's words.
+/// resets it. So every point record (`point@v1`) past `from` (the resume, the person's prompt, or
+/// what went on past W8's usage wall) and before `before` (aterm's next act), and every back-off
+/// journaled there, names the short turns in a row the point record that typed that act named
+/// ([`typed_on`]): no more, and, as the stub answers every act of these chains short with no tool
+/// (the system messages' under Cruise and under Land, and W8's usage wall's: [`Chain::rules`]), so
+/// that no turn there is real work, no fewer. What it read, in the verdict's words.
 ///
 /// # Errors
 /// [`LandOn::Fault`] where one names more (a build that counts the act the wall cut or the
@@ -899,13 +911,7 @@ pub fn streak_kept(
     (from, past, before): (i64, &str, i64),
     t0: i64,
 ) -> Result<String, LandOn> {
-    let Some((then, was)) = seen
-        .ledger
-        .iter()
-        .filter(|r| r.rule == RULE_POINT && r.ts <= met)
-        .filter_map(|r| Some((r.ts, point_streak(r)?)))
-        .next_back()
-    else {
+    let Some((then, was)) = typed_on(seen, met) else {
         return Err(LandOn::Unwatched(format!(
             "no point record at or before the act that met the wall (+{}), so the streak it was \
              typed on is unread",

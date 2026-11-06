@@ -62,6 +62,8 @@ pub enum PromptKind {
     AutoModeSetup,
     /// `Claude in Chrome` first-use intro, whose footer's Enter is its one input.
     ChromeIntro,
+    /// Cold-cache quota warning before resuming an existing conversation.
+    ConversationResume,
     /// Unrecognized dialog box header.
     Other,
 }
@@ -97,6 +99,7 @@ impl PromptKind {
             PromptKind::McpServer => "mcp-server",
             PromptKind::AutoModeSetup => "auto-mode-setup",
             PromptKind::ChromeIntro => "chrome-intro",
+            PromptKind::ConversationResume => "conversation-resume",
             PromptKind::Other => "other",
         }
     }
@@ -2366,6 +2369,8 @@ fn header_kind(row: &str) -> Option<PromptKind> {
         PromptKind::ComputerUse
     } else if b == crate::anchor!("read_outside.title") {
         PromptKind::ReadOutsideSetting
+    } else if b == crate::anchor!("conversation_resume.title") {
+        PromptKind::ConversationResume
     } else if b == crate::anchor!("model_switch.title")
         || b == crate::anchor!("effort_switch.title")
     {
@@ -10869,4 +10874,20 @@ mod tests {
             assert_eq!(parse_prompt_v2(&said), None, "words under it");
         }
     }
+}
+
+#[test]
+fn conversation_resume_is_read_from_the_measured_claude_dialog() {
+    let text = include_str!("fixtures/claude-2.1.318-conversation-resume.txt");
+    let rows = fixtures::screen(text);
+    let prompt = parse_prompt_v2(&rows).expect("resume warning");
+    assert_eq!(prompt.kind, PromptKind::ConversationResume);
+    assert_eq!(prompt.options[0].n, Some(1));
+    assert_eq!(prompt.options[0].label, "Resume");
+    let other =
+        fixtures::screen(&text.replace("Resume this conversation?", "Delete this conversation?"));
+    assert_ne!(
+        parse_prompt_v2(&other).map(|p| p.kind),
+        Some(PromptKind::ConversationResume)
+    );
 }

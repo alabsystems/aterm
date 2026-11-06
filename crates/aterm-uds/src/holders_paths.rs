@@ -1628,7 +1628,7 @@ mod writes_tests {
                 started.elapsed() < std::time::Duration::from_secs(60),
                 "top never ran as its owner"
             );
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         let scan = super::scan_path_users_of(&[pid], std::slice::from_ref(&dir), &[]);
         drop(top);

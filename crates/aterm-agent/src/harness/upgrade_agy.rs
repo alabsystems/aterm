@@ -513,12 +513,27 @@ pub(super) fn bound_worker_flags(
     Ok(result)
 }
 
+/// AGY'S PERMISSION FLOOR (its worker row's, `worker::WorkerCli::unnamed_posture`): `--mode auto`,
+/// which agy's `--help` (1.5.1) offers beside `accept-edits` and `plan` and its own words
+/// describe as "auto-approve edits and safe commands, prompt on irreversible actions", a separate
+/// agent first reviewing each command that would leave its terminal sandbox: agy's counterpart of
+/// Claude Code's auto mode. Where agy says "Auto mode isn't available right now", it keeps its
+/// default mode, which asks on each edit too: a worker of an `accept-edits` starter then asks
+/// more than its starter did. Nothing aterm reads before the launch says whether an account has
+/// auto mode, and one `--mode` is all a line can name, so the floor is typed alike; aterm's engine
+/// supervises agy, and under `[harness] approve = "all"` answers each box either mode raises.
+pub const WORKER_FLOOR: [&str; 2] = ["--mode", "auto"];
+
 /// The flags of `argv` a worker of this agy starts with: what moves its config
-/// ([`config_flags`]) and what it may do unasked, its parent's permissions (owner ruling
-/// 2026-11-02).
+/// ([`config_flags`]) and what it may do unasked, its parent's (owner ruling 2026-11-02) held to
+/// [`WORKER_FLOOR`] (owner, 2026-11-04: workers are fully automated by default). A starter that
+/// skips permissions (`--dangerously-skip-permissions`, unless Go reads its value as false) or
+/// runs in auto mode lends its posture as it is; any other mode, or none, lends the floor in
+/// place of its `--mode` (Go reads the last of several), and its `--sandbox` stays.
 #[must_use]
 pub fn worker_flags(argv: &[String]) -> Vec<String> {
     let mut out = config_flags(argv);
+    let mut posture: Vec<(&str, Vec<String>)> = Vec::new();
     let mut i = 1;
     while i < argv.len() {
         let tok = argv[i].as_str();
@@ -534,11 +549,41 @@ pub fn worker_flags(argv: &[String]) -> Vec<String> {
         if carries {
             i += 1;
         }
-        if matches!(name, "dangerously-skip-permissions" | "sandbox" | "mode") {
-            out.push(tok.to_string());
-            out.extend(value);
+        if let Some(name) = ["dangerously-skip-permissions", "sandbox", "mode"]
+            .into_iter()
+            .find(|own| *own == name)
+        {
+            posture.push((
+                name,
+                std::iter::once(tok.to_string()).chain(value).collect(),
+            ));
         }
     }
+    let skips = posture
+        .iter()
+        .rfind(|(name, _)| *name == "dangerously-skip-permissions")
+        .is_some_and(|(_, words)| {
+            go_bool(flag_token(&words[0]).and_then(|(_, v)| v)) == Some(true)
+        });
+    let mode = posture
+        .iter()
+        .rfind(|(name, _)| *name == "mode")
+        .and_then(|(_, words)| match words.as_slice() {
+            [_, value] => Some(value.as_str()),
+            [attached] => flag_token(attached).and_then(|(_, value)| value),
+            _ => None,
+        });
+    if skips || mode == Some(WORKER_FLOOR[1]) {
+        out.extend(posture.into_iter().flat_map(|(_, words)| words));
+        return out;
+    }
+    out.extend(
+        posture
+            .into_iter()
+            .filter(|(name, _)| *name == "sandbox")
+            .flat_map(|(_, words)| words),
+    );
+    out.extend(WORKER_FLOOR.map(str::to_string));
     out
 }
 

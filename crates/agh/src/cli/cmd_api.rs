@@ -37,7 +37,11 @@ fn method(inv: &Invocation) -> Result<Method> {
 
 // Treat `+` as space before percent-decoding.
 fn query_text(text: &str) -> String {
-    aterm_codec::pct::decode(&text.replace('+', " "))
+    if text.contains('+') {
+        aterm_codec::pct::decode(&text.replace('+', " "))
+    } else {
+        aterm_codec::pct::decode(text)
+    }
 }
 
 fn path_and_query(
@@ -45,9 +49,14 @@ fn path_and_query(
     typed: &str,
     api: &Origin,
 ) -> Result<(String, Vec<(String, String)>)> {
-    let lower = typed.to_ascii_lowercase();
     let absolute;
-    let typed = if lower.starts_with("http://") || lower.starts_with("https://") {
+    let typed = if typed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || typed
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
         match Origin::parse(typed) {
             Some((origin, path_and_query)) if origin == *api => {
                 absolute = path_and_query;

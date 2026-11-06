@@ -936,7 +936,7 @@ mod tests {
                 Instant::now() < deadline,
                 "timed out waiting for {at_least} park(s)"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 

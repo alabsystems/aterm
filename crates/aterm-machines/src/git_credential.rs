@@ -984,7 +984,7 @@ fn scrub(bytes: &mut [u8]) {
 /// and the vault's converge pass: each scripts a [`crate::port::Fake`] answer for one of them.
 #[cfg(test)]
 pub(crate) mod script {
-    use super::{ANY_HELPER, GIST_HELPER, Git, HELPER, Helper, USE_PATH, USERNAME};
+    use super::{GIST_HELPER, Git, HELPER, Helper, USE_PATH, USERNAME};
     use crate::model::User;
     use crate::port::{Fake, Ran, System as _};
     use std::path::{Path, PathBuf};
@@ -1119,19 +1119,6 @@ pub(crate) mod script {
                 "osxkeychain",
             )])),
         );
-    }
-
-    /// `line`, a git run's arguments joined from its first global option on, past aterm's route
-    /// ([`super::pinned`]), for a test whose model keys a run by what it does.
-    pub(crate) fn without_route(line: &str) -> &str {
-        let resets = format!("-c {ANY_HELPER}= -c {USERNAME}= ");
-        let line = line.strip_prefix(&resets).unwrap_or(line);
-        match line.strip_prefix(&format!("-c {HELPER}=")) {
-            Some(rest) => rest
-                .split_once("git-credential ")
-                .map_or(line, |(_, rest)| rest),
-            None => line,
-        }
     }
 
     /// A read-back through aterm's route with `helper` that hands back `token`.

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::graph::{attribute, fn_name, fn_name_at};
-use super::rules::{CENSUS_CRATE, PRODUCT, TestCode, test_path, use_leaves};
+use super::rules::{CENSUS_CRATE, PRODUCT, use_leaves};
 use super::{Bound, Finding, Line, Rule, SourceFile, Tree, calls, has, hits, is_word};
 
 /// Product source this crate does not own: the census spells every name its
@@ -213,7 +213,7 @@ const UNSAFE_READS: &[(&str, Bound)] = &[
 /// ([`outside_findings`]), and what the permission gate trusts (the window's own admission and
 /// a person's press, which alone open a page of a grant only a person can give) to their fenced
 /// callers ([`FENCES`], [`caller_findings`], [`gate_macro_findings`]). A
-/// file is test code only while no shipped line loads it ([`TestCode`]).
+/// file is test code only while no shipped line loads it ([`TestCode`](super::rules::TestCode)).
 ///
 /// It is lexical, and does not see an unsafe read under another name (a generic helper, a
 /// renamed import) or with an inferred token type, or a token an `extern` fn returns; what a
@@ -273,7 +273,7 @@ fn devtools_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     needles.extend(AUTHZ_LITERALS);
     let definition = format!("fn {DEVTOOLS_RUNNER}");
     for file in product(tree) {
-        if test_path(&file.rel) || !file.mentions(&needles) {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         let home = file.rel == DEVTOOLS_HOME;
@@ -540,7 +540,8 @@ const FENCES: &[Fence] = &[
 ];
 
 /// The gate's inputs, fenced ([`Fence`]). Findings: in aterm-gui's shipped code (test code is a
-/// `#[cfg(test)]` item, or a file its parent declares test-only that no shipped line loads), a
+/// `#[cfg(test)]` item, or a file its parent declares test-only or its path names for tests that
+/// no shipped line loads: [`TestCode`](super::rules::TestCode)), a
 /// fenced function named outside its callers' bodies; a caller defined twice or outside
 /// `impl App` ([`caller_findings`]); in the gate's parent, a module beside the gate's leaf or an
 /// `include!`; in any product macro's body, a gate transition ([`gate_macro_findings`]); and a
@@ -604,7 +605,7 @@ fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         flags.push(parent, out);
     }
     gate_macro_findings(tree, out);
-    let test_code = TestCode::read(tree.corpus, &[GUI_SRC]);
+    let test_code = tree.corpus.test_code();
     let needles: Vec<&str> = FENCES.iter().map(|f| f.name).collect();
     for file in tree.corpus.under(&[GUI_SRC]) {
         if test_code.holds(&file.rel) || !file.mentions(&needles) {
@@ -1275,7 +1276,14 @@ fn folded(s: &str) -> String {
 
 /// `s` with every run of whitespace made one space.
 fn one_spaced(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    for (i, w) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
 }
 
 /// `s` split at `sep` outside any bracket.
@@ -1922,7 +1930,7 @@ pub(super) const FFI_DOOR: Rule = Rule {
 fn ffi_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let needles: Vec<&str> = FFI_DOORS.iter().map(|(name, ..)| *name).collect();
     for file in product(tree) {
-        if test_path(&file.rel) || !file.mentions(&needles) {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -2024,7 +2032,10 @@ pub(super) const HANDOFF_NAME: Rule = Rule {
 fn handoff_name(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let needles: Vec<&str> = HANDOFF_PREFIXES.iter().map(|p| &p[1..]).collect();
     for file in tree.corpus.under(HANDOFF_SCOPE) {
-        if file.rel == HANDOFF_HOME || test_path(&file.rel) || !file.mentions(&needles) {
+        if file.rel == HANDOFF_HOME
+            || tree.corpus.test_code().holds(&file.rel)
+            || !file.mentions(&needles)
+        {
             continue;
         }
         for line in file.shipped_lines() {

@@ -110,7 +110,7 @@ pub(crate) fn restate(
     reseal: (&dyn Sealer, &dyn Sealer),
 ) -> Result<Vec<Vec<Change>>> {
     let mut rows = Vec::new();
-    for ((collection, key), cell) in source {
+    for (coord @ (collection, key), cell) in source {
         if NOT_RESTATED.contains(&collection.as_str())
             || cell.stopped
             || table
@@ -129,7 +129,7 @@ pub(crate) fn restate(
             .then_some(parsed)
         });
         let now: BTreeMap<Digest, Value> = target
-            .get(&(collection.clone(), key.clone()))
+            .get(coord)
             .map(cell::origins)
             .unwrap_or_default()
             .into_iter()
@@ -225,8 +225,11 @@ pub(crate) struct Held {
 
 /// The `Held` of each operation this Mac retains of a table.
 pub(crate) fn held_of(log: &Log) -> Vec<Held> {
-    log.snapshot()
-        .operations
+    held_of_ops(&log.snapshot().operations)
+}
+
+fn held_of_ops(operations: &[crate::documents::log::Operation]) -> Vec<Held> {
+    operations
         .iter()
         .map(|op| Held {
             actor: op.header.actor,
@@ -288,6 +291,9 @@ pub(crate) fn covers(
         .iter()
         .filter(|op| !op.revert && !view.quota.over.contains(&op.id))
     {
+        if !op.changes.iter().any(|c| c.collection == ROLL.name) {
+            continue;
+        }
         let Some(machine) = resolve(&op.roster, &op.actor) else {
             continue;
         };
@@ -360,12 +366,13 @@ fn cover_row(
         .iter()
         .map(|(actor, sequence)| json!({"a": actor, "s": sequence}))
         .collect();
-    let said = target
+    if target
         .rows
         .get(&pk)
         .and_then(|row| row.get("covered"))
-        .cloned();
-    if said == Some(Value::Array(covered.clone())) {
+        .and_then(Value::as_array)
+        == Some(&covered)
+    {
         return Ok(Vec::new());
     }
     let cell = |col: &str, x: Value| {
@@ -715,9 +722,9 @@ impl Registry {
             ));
         }
         let old_view = View::read(from.table, &session, &old_log);
-        let held_ops = held_of(&old_log);
-        let held: BTreeSet<Digest> = old_log
-            .snapshot()
+        let old_snapshot = old_log.snapshot();
+        let held_ops = held_of_ops(&old_snapshot.operations);
+        let held: BTreeSet<Digest> = old_snapshot
             .operations
             .iter()
             .map(|op| op.header.id)
@@ -753,7 +760,8 @@ impl Registry {
                             .into_iter()
                             .map(|op| op.id)
                             .collect();
-                    (view.cells.clone(), carried, archived, view.project(&ROLL))
+                    let rolls = view.project(&ROLL);
+                    (view.cells, carried, archived, rolls)
                 }
                 None => Default::default(),
             };

@@ -214,9 +214,7 @@ fn validate(key: &str, value: &Value) -> Result<()> {
     if value["schema"].as_u64() != Some(1) || field(value, "source_sha256")? != key {
         return Err(Error::new("invalid import source identity"));
     }
-    if hex::encode_lower(&decode_hex::<32>(key)?) != key {
-        return Err(Error::new("import source digest is not canonical"));
-    }
+    decode_hex::<32>(key).map_err(|_| Error::new("import source digest is not canonical"))?;
     let records = value["records"]
         .as_u64()
         .filter(|n| *n <= super::MAX_ROWS as u64)

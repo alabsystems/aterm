@@ -5,7 +5,7 @@
 //! pure string predicates for principals, topics, kinds, verdicts, and `via=`
 //! chains, shared by `aterm-link`, `aterm-gui`, and `aterm-gui-fabric`.
 
-use astream_wire::WakeClass;
+use astream_wire::{ReceiptVerdict, WakeClass};
 
 /// Principal class prefixes for `<src>` segments (§3.2): session, node, human, agent.
 pub const PRINCIPAL_CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
@@ -76,14 +76,19 @@ pub const ANSWER_KINDS: [&str; 3] = [
     WakeClass::Ack.as_str(),
 ];
 
-/// Receipt verdicts accepted by `inbox seen <id> <verdict>` and `deliver` (`verdict=`).
-pub const VERDICTS: [&str; 3] = ["handled", "refused", "deferred"];
+/// Receipt verdicts accepted by `inbox seen <id> <verdict>` and `deliver` (`verdict=`):
+/// astream's [`ReceiptVerdict::ALL`] spelled, in its wire order (`handled`, `refused`,
+/// `deferred`).
+pub const VERDICTS: [&str; ReceiptVerdict::ALL.len()] = {
+    let [a, b, c] = ReceiptVerdict::ALL;
+    [a.as_str(), b.as_str(), c.as_str()]
+};
 
-/// Whether `v` is one of [`VERDICTS`].
+/// Whether `v` is one of [`VERDICTS`]: a word astream's [`ReceiptVerdict::parse`] reads.
 #[inline]
 #[must_use]
-pub fn is_verdict(v: &str) -> bool {
-    VERDICTS.contains(&v)
+pub const fn is_verdict(v: &str) -> bool {
+    ReceiptVerdict::parse(v).is_ok()
 }
 
 /// Maximum relay hops in a `via=` chain (§6.7).

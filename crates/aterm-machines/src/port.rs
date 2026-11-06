@@ -22,6 +22,7 @@ mod low_data;
 mod processes;
 mod read_owned_file;
 mod relay;
+mod remove_empty_dir;
 mod rename_noreplace;
 mod scratch;
 mod screen_lock;
@@ -31,6 +32,7 @@ mod secret;
 pub(crate) mod spawns;
 mod staged_child;
 mod stops;
+mod tty_wait;
 
 pub use github_rest::RestMethod;
 pub use scratch::Scratch;
@@ -775,6 +777,12 @@ pub trait System: Sync {
 
     /// Remove a file or empty directory at `path` (succeeding if already absent).
     fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// Remove only an empty directory, or succeed if absent. An appearing file or
+    /// symbolic link is never unlinked to make room for a publication.
+    fn remove_empty_dir(&self, _path: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     /// Create `path` and any missing parent directories with `mode`.
     fn create_dir_all(&self, path: &Path, mode: u32) -> io::Result<()>;
@@ -1605,8 +1613,7 @@ impl System for Live {
                 .stderr(aterm_uds::spawnfd::Stdio::inherit())
                 .spawn()
                 .map_err(|error| RunFailed::Spawn(error.to_string()))?;
-            started
-                .wait()
+            tty_wait::wait(&mut started, || self.stopped())
                 .map_err(|error| RunFailed::AfterStart(format!("wait failed: {error}")))
         })?;
         Ok(status.code())
@@ -1791,6 +1798,10 @@ impl System for Live {
             Ok(m) if m.is_dir() => std::fs::remove_dir(path),
             Ok(_) => std::fs::remove_file(path),
         }
+    }
+
+    fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
+        remove_empty_dir::remove(path)
     }
 
     fn create_dir_all(&self, path: &Path, mode: u32) -> io::Result<()> {
@@ -3636,6 +3647,34 @@ mod fake {
             self.files.lock().unwrap().remove(path);
             self.links.lock().unwrap().remove(path);
             self.stats.lock().unwrap().remove(path);
+            Ok(())
+        }
+
+        fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("rmdir {}", path.display()));
+            let files = self.files.lock().unwrap();
+            let links = self.links.lock().unwrap();
+            let mut stats = self.stats.lock().unwrap();
+            if files.contains_key(path)
+                || links.contains_key(path)
+                || stats
+                    .get(path)
+                    .is_some_and(|stat| !stat.dir || stat.symlink)
+            {
+                return Err(io::ErrorKind::NotADirectory.into());
+            }
+            if files
+                .keys()
+                .chain(links.keys())
+                .chain(stats.keys())
+                .any(|child| child != path && child.starts_with(path))
+            {
+                return Err(io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            stats.remove(path);
             Ok(())
         }
 

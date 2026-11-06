@@ -1184,6 +1184,10 @@ fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
     );
 }
 
+/// W8 on Muse Code as main's turn-end policy journals it (v6 §14.17.5.7): the done claim's
+/// point, one short turn; Cruise's done check met by the usage wall, which answered it (the
+/// wall's pass: still one); the loop's resume past the reset, and its answer's point, still one;
+/// and Cruise's done check at that point's one short turn's back-off.
 fn muse_cruise_walled() -> Seen {
     Seen {
         journal: vec![
@@ -1211,25 +1215,25 @@ fn muse_cruise_walled() -> Seen {
             j(365_000, &format!("EVENT idle seq=3 {DONE_CLAIM}")),
             j(
                 365_100,
-                "WAITING seq=3 until=x 2 short turn(s) in a row: 4 min back-off",
+                "WAITING seq=3 until=x 1 short turn(s) in a row: 2 min back-off",
             ),
             j(
-                605_000,
+                485_000,
                 "CONTINUED seq=3 rule=continue-done-check@v1 [aterm harness] done is never the end",
             ),
         ],
         ledger: vec![
             point(5_000, 1),
             typed(125_000, "continue-done-check@v1", DONE_CHECK),
-            point(140_000, 2),
+            point(140_000, 1),
             typed(361_000, "usage-resume@v1", LAND_NUDGE),
-            point(365_000, 2),
-            typed(605_000, "continue-done-check@v1", DONE_CHECK),
+            point(365_000, 1),
+            typed(485_000, "continue-done-check@v1", DONE_CHECK),
         ],
         status: vec![status(1_000, "open", "cruise")],
         meta: vec![no_meta(1_000)],
         task: vec![j(1_000, "OK task -")],
-        end_ms: T0 + 615_000,
+        end_ms: T0 + 495_000,
         cover: Cover {
             wall: wall_at(300_000),
             lifted_ms: Some(T0 + 297_000),
@@ -1248,12 +1252,16 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
     assert!(
         why.contains("Cruise's continue-done-check@v1 typed at +125.0 s met it")
             && why.contains("gone on: usage-resume@v1 at +361.0 s (61.0 s past the reset)")
-            && why.contains("Cruise went on: continue-done-check@v1 at +605.0 s"),
+            && why.contains(
+                "the streak kept: 1 short turn(s) in a row past the going on, of the 1 before the \
+                 act the wall cut"
+            )
+            && why.contains("Cruise went on: continue-done-check@v1 at +485.0 s"),
         "{why}"
     );
     assert_eq!(
         crate::forever::walls::cruise_went_on(&muse_cruise_walled()),
-        Some(T0 + 605_000)
+        Some(T0 + 485_000)
     );
     assert_eq!(
         crate::forever::walls::cruise_met(&muse_cruise_walled()),
@@ -1308,7 +1316,7 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
     assert_eq!(w, "PASS", "{why}");
     assert!(
         why.contains("gone on: the program's own continuation at +340.0 s")
-            && why.contains("Cruise went on: continue-done-check@v1 at +605.0 s"),
+            && why.contains("Cruise went on: continue-done-check@v1 at +485.0 s"),
         "{why}"
     );
     let mut s = muse_cruise_walled();
@@ -1323,9 +1331,10 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
     let (w, why) = w8(&s, "muse");
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("never drawn as a limit point"), "{why}");
-    // CRUISE'S ACT IS DUE WHERE THE LOOP SAID, at the chain's two short
-    // turns' back-off: the act past that due and its grace FAILs; with no
-    // back-off named, the act past the fixed window FAILs
+    // CRUISE'S ACT IS DUE WHERE THE LOOP SAID, at the back-off of the
+    // streak past the wall: the act past that due and its grace FAILs; with
+    // no back-off named, the act past the ladder's step for the streak the
+    // act the wall cut was typed on, the grace and a minute FAILs
     let late = |act_at: i64| {
         let mut s = muse_cruise_walled();
         s.journal[8].0 = T0 + act_at;
@@ -1333,37 +1342,131 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
         s.end_ms = T0 + act_at + 10_000;
         s
     };
-    let (w, why) = w8(&late(605_000), "muse");
+    let (w, why) = w8(&late(485_000), "muse");
     assert_eq!(w, "PASS", "{why}");
     assert!(
         why.contains(
-            "the back-off it named due +605.0 s (2 short turn(s) in a row: 4 min back-off)"
+            "the back-off it named due +485.0 s (1 short turn(s) in a row: 2 min back-off)"
         ),
         "{why}"
     );
     fail(
-        &late(605_000 + 61_000),
+        &late(485_000 + 61_000),
         "muse",
-        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +666.0 s",
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +546.0 s",
     );
-    let mut s = late(845_000);
-    s.journal.remove(7);
+    let unnamed = |act_at: i64| {
+        let mut s = late(act_at);
+        s.journal.remove(7);
+        s
+    };
+    // one short turn's step past the resume at +361 s, the grace and a minute: +601 s
+    let (w, why) = w8(&unnamed(600_000), "muse");
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("no back-off named"), "{why}");
     fail(
-        &s,
+        &unnamed(661_000),
         "muse",
-        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +845.0 s",
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +661.0 s, 300.0 s after it (no back-off named)",
     );
-    // NEGATIVE CONTROL: the going on past the wall counted as one more short
-    // turn, three short turns, 8 min, though Cruise's act came at that due
-    let mut s = late(845_000);
+}
+
+/// [`muse_cruise_walled`] with the point past the going on naming `past`
+/// short turns, its back-off the ladder's step for them, and Cruise's act at
+/// that back-off's due; with `before` past one, a point of the agent's own
+/// `before` short turns just before Cruise's act that met the wall.
+fn cruise_walled_streak(before: u32, past: u32) -> Seen {
+    let step = next_step_ms(past, false);
+    let mut s = muse_cruise_walled();
     s.journal[7] = j(
         365_100,
-        "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
+        &format!(
+            "WAITING seq=3 until=x {past} short turn(s) in a row: {} min back-off",
+            step / 60_000
+        ),
+    );
+    s.journal[8].0 = T0 + 365_000 + step;
+    s.ledger[4] = point(365_000, past);
+    s.ledger[5].ts = T0 + 365_000 + step;
+    if before > 1 {
+        s.ledger.push(point(124_000, before));
+        s.ledger.sort_by_key(|r| r.ts);
+    }
+    s.end_ms = T0 + 365_000 + step + 10_000;
+    s
+}
+
+/// THE STREAK AFTER W8'S WALL STANDS AT THE ONE THE CUT ACT WAS TYPED ON
+/// (v6 §14.17.5.7): Cruise's done check the wall cut, the loop's resume or
+/// the vendor's own continuation that delivers it add nothing, so past what
+/// went on no point and no back-off names more short turns, or fewer, than
+/// the point Cruise's act that met the wall was typed on. NEGATIVE CONTROLS:
+/// the cut act counted once (two short turns, 4 min, the branch decision main
+/// replaced, which this judge wanted before), or the going on counted as well
+/// (three, 8 min, walls-3's record), each at its own back-off's due, FAIL;
+/// the streak reset past the wall (none, Cruise's act at once) FAILs; the
+/// agent's own two short turns before the wall standing past it PASS, so the
+/// want follows the records, not a count; with no point before the act that
+/// met the wall the streak is unread.
+#[test]
+fn past_w8s_wall_the_streak_stands_at_the_one_the_cut_act_was_typed_on() {
+    let w8 = |s: &Seen| one(Chain::CruiseWall, s, "muse", Scenario::W8);
+    let fail = |s: &Seen, needle: &str| {
+        let (w, why) = w8(s);
+        assert_eq!(w, "FAIL", "{needle}: {why}");
+        assert!(why.contains(needle), "{needle}: {why}");
+    };
+    let (w, why) = w8(&cruise_walled_streak(1, 1));
+    assert_eq!(w, "PASS", "{why}");
+    fail(
+        &cruise_walled_streak(1, 2),
+        "THE STREAK AFTER THE WALL: COUNTED A TURN THAT WAS NOT THE AGENT'S ANSWER: at +365.0 s a \
+         point names 2 short turns in a row past the going on (+361.0 s), of the 1 the point at \
+         +5.0 s named before the act the wall cut (+125.0 s)",
     );
     fail(
+        &cruise_walled_streak(1, 3),
+        "COUNTED A TURN THAT WAS NOT THE AGENT'S ANSWER: at +365.0 s a point names 3 short turns",
+    );
+    // the back-off's line alone names it, the point record unread
+    let mut s = cruise_walled_streak(1, 2);
+    s.ledger.remove(4);
+    fail(&s, "at +365.1 s a back-off names 2 short turns in a row");
+    // the streak reset past the wall: no back-off, Cruise's act at once
+    let mut s = muse_cruise_walled();
+    s.journal.remove(7);
+    s.journal[7].0 = T0 + 366_000;
+    s.ledger[4] = point(365_000, 0);
+    s.ledger[5].ts = T0 + 366_000;
+    s.end_ms = T0 + 376_000;
+    fail(
         &s,
-        "muse",
-        "THE STREAK AFTER THE WALL is not the chain's two short turns (the done claim, the done check the wall cut): WAITING seq=3 until=",
+        "THE STREAK AFTER THE WALL: DROPPED THE AGENT'S OWN SHORT ANSWERS: at +365.0 s a point \
+         names 0 short turns in a row past the going on (+361.0 s), of the 1",
+    );
+    // the control: the agent's own two by the act that met the wall stand
+    // past it, at two short turns' back-off
+    let (w, why) = w8(&cruise_walled_streak(2, 2));
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains(
+            "the streak kept: 2 short turn(s) in a row past the going on, of the 2 before the act \
+             the wall cut"
+        ) && why.contains("(2 short turn(s) in a row: 4 min back-off)"),
+        "{why}"
+    );
+    // no point at or before the act that met the wall: unread, decided last
+    let mut s = muse_cruise_walled();
+    s.ledger.remove(0);
+    let (w, why) = w8(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(
+        why.contains("Cruise went on: continue-done-check@v1 at +485.0 s")
+            && why.contains(
+                "no point record at or before the act that met the wall (+125.0 s), so the streak \
+                 it was typed on is unread"
+            ),
+        "{why}"
     );
 }
 

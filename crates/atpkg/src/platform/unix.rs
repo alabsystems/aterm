@@ -631,21 +631,10 @@ pub fn open_for_sync(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Push one open file's contents out of the page cache.
+/// Push one open file's contents out of the page cache: a plain `fsync(2)`, retried on
+/// `EINTR`, through aterm-durable (`primitive::fsync`), so astream-sys counts it `plain`.
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd as _;
-    loop {
-        // SAFETY: `f` is a live, open `File` borrowed for the whole call, so its raw fd is
-        // valid; `fsync` takes that fd BY VALUE and dereferences no pointer.
-        let rc = unsafe { libc::fsync(f.as_raw_fd()) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
+    aterm_durable::primitive::fsync(f)
 }
 
 /// A file's permission bits (`st_mode`), as read by the tree-root hash and doctor.

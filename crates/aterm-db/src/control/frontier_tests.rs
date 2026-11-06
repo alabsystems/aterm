@@ -145,11 +145,11 @@ fn frontier_metadata_is_fixed_exact_and_independently_pinned() {
     for length in 0..wire.len() {
         assert!(Metadata::decode(lab.trust, &wire[..length]).is_err());
     }
-    let mut extended = wire.clone();
+    let mut extended = wire.to_vec();
     extended.push(0);
     assert!(Metadata::decode(lab.trust, &extended).is_err());
     for at in [0, 4, 20, 52, HELLO_FIXED + 4, HELLO_FIXED + 5] {
-        let mut damaged = wire.clone();
+        let mut damaged = wire;
         damaged[at] ^= 128;
         assert!(Metadata::decode(lab.trust, &damaged).is_err(), "byte {at}");
     }
@@ -2177,4 +2177,586 @@ fn a_remove_not_yet_acknowledged_refuses_its_mac_at_the_handshake() {
         "CONTROL: the acknowledged records alone passed the removed Mac: {result:?}"
     );
     assert_eq!(repair.authenticated_actor(), Some(actor), "CONTROL");
+}
+
+/// One session from `initiator` to `responder` under `wire` over loopback, with the responder's
+/// checks and grants taped ([`crate::control::peer_check::tape`]): what it returned, its repair,
+/// and its tape.
+fn taped(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    wire: Wire,
+) -> (
+    Result<Report>,
+    Repair,
+    Vec<crate::control::peer_check::tape::Step>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let run = |endpoint: &Endpoint, peer: &Endpoint, mut stream: TcpStream, side: Side| {
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let mut repair = Repair::default();
+        let result = endpoint.connected_until(
+            &mut stream,
+            Some(&proof_of(peer)),
+            side,
+            &mut repair,
+            Instant::now() + EXCHANGE,
+            Protocol::Frontier(wire),
+        );
+        (result, repair)
+    };
+    thread::scope(|scope| {
+        let answered = scope.spawn(|| {
+            let stream = listener.accept().unwrap().0;
+            crate::control::peer_check::tape::recorded(|| {
+                run(responder, initiator, stream, Side::Responder)
+            })
+        });
+        let _ = run(
+            initiator,
+            responder,
+            TcpStream::connect(address).unwrap(),
+            Side::Initiator,
+        );
+        let ((result, repair), tape) = answered.join().unwrap();
+        (result, repair, tape)
+    })
+}
+
+/// Replay `tape` through the handshake kernel, as the island's session model steps
+/// (`crates/aterm-db-core/src/peer_check_island.rs`): each read is of the stage the kernel named,
+/// a check passes or refuses where the kernel says, at a log endpoint a passing check read every
+/// record held and found them clear, and each grant spends the one pass the check before it
+/// minted. The grants the tape holds.
+fn replay(tape: &[crate::control::peer_check::tape::Step]) -> usize {
+    use crate::control::peer_check::tape::Step;
+    use aterm_db_core::peer_check::{Custody, Read, Stage};
+    use aterm_db_core::{peer_check_next as next, peer_check_start as start};
+    let (mut check, mut unspent, mut grants, mut refused) = (None, 0, 0, false);
+    for step in tape {
+        match *step {
+            Step::Begin(custody, witness) => {
+                assert!(check.is_none(), "a check began inside another: {tape:?}");
+                check = Some((custody, witness, start(custody), false));
+            }
+            Step::Read(stage, outcome) => {
+                let (custody, witness, at, held) = check.expect("a read outside a check");
+                assert_eq!(stage, at, "the driver read a stage the kernel did not name");
+                let held = held || (stage == Stage::Held as u8 && outcome == Read::Clear as u8);
+                check = Some((
+                    custody,
+                    witness,
+                    next(custody, stage, outcome, witness),
+                    held,
+                ));
+            }
+            Step::Pass => {
+                let (custody, _, at, held) = check.take().expect("a pass outside a check");
+                assert_eq!(at, Stage::Pass as u8, "a pass the kernel did not reach");
+                assert!(
+                    custody != Custody::Log as u8 || held,
+                    "a log endpoint passed without its held records"
+                );
+                unspent += 1;
+                assert_eq!(unspent, 1, "two passes in hand: {tape:?}");
+            }
+            Step::Refuse => {
+                let (_, _, at, _) = check.take().expect("a refusal outside a check");
+                assert_eq!(
+                    at,
+                    Stage::Refuse as u8,
+                    "a refusal the kernel did not reach"
+                );
+                refused = true;
+            }
+            Step::Grant => {
+                assert!(!refused, "a grant after a refusal: {tape:?}");
+                assert_eq!(unspent, 1, "a grant with no fresh pass: {tape:?}");
+                unspent -= 1;
+                grants += 1;
+            }
+        }
+    }
+    assert!(check.is_none(), "a check left unfinished: {tape:?}");
+    grants
+}
+
+/// PF4: real sessions follow the island's event order. A responder's every check walks the
+/// stages the kernel names, a log endpoint passes a peer only on its held records read clear, and
+/// every grant (the lease, its own evidence, control, membership records, the application) spends
+/// the one pass a fresh check minted, under either wire; a Mac its records remove is refused at
+/// its first check, with no grant at all.
+#[test]
+fn every_grant_of_a_real_session_spends_one_fresh_pass() {
+    let lab = Lab::new();
+    drop(lab.journal(1));
+    let (founded, removed) = founded_then_removed(&lab);
+    let mac2 = witnessed(&lab, 1, founded.clone());
+    let kept = custodied(&lab, 0, "kept", founded.clone(), &founded);
+    let responder = custodied(&lab, 0, "responder", founded, &removed);
+    for wire in [Wire::Delta, Wire::Whole] {
+        let (result, _, tape) = taped(&mac2, &kept, wire);
+        assert!(result.is_ok(), "{wire:?}: {result:?}");
+        let grants = replay(&tape);
+        assert!(
+            grants >= 3,
+            "{wire:?}: the lease, the evidence and control: {tape:?}"
+        );
+
+        let (result, repair, tape) = taped(&mac2, &responder, wire);
+        assert!(result.is_err(), "{wire:?}: the records it reads refuse it");
+        assert_eq!(repair.authenticated_actor(), None, "{wire:?}");
+        assert_eq!(
+            replay(&tape),
+            0,
+            "{wire:?}: a refused Mac is granted nothing"
+        );
+    }
+}
+
+/// What a test names `protocol` by: its ALPN, or none.
+const fn alpn(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Legacy => "no ALPN",
+        Protocol::Repair => "atdb/2",
+        Protocol::Credentials => "atdb/3",
+        Protocol::Frontier(Wire::Whole) => "atdb/4",
+        Protocol::Frontier(Wire::Delta) => "atdb/5",
+    }
+}
+
+/// One session from `initiator` to `responder` over loopback under `protocol`, with `mutant` on
+/// and `hook` observing the peer cache in the responder's thread: what each side returned and its
+/// repair, the responder's first.
+fn session(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    protocol: Protocol,
+    mutant: Option<mutants::Mutant>,
+    hook: impl FnMut(PeerCacheStage) + Send + 'static,
+) -> [(Result<Report>, Repair); 2] {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let run = |endpoint: &Endpoint, peer: &Endpoint, mut stream: TcpStream, side: Side| {
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let mut repair = Repair::default();
+        let result = endpoint.connected_until(
+            &mut stream,
+            Some(&proof_of(peer)),
+            side,
+            &mut repair,
+            Instant::now() + EXCHANGE,
+            protocol,
+        );
+        (result, repair)
+    };
+    thread::scope(|scope| {
+        let answered = scope.spawn(|| {
+            let stream = listener.accept().unwrap().0;
+            let answer = || run(responder, initiator, stream, Side::Responder);
+            observe_peer_cache(hook, || match mutant {
+                Some(mutant) => mutants::with(mutant, answer),
+                None => answer(),
+            })
+        });
+        let dialed = run(
+            initiator,
+            responder,
+            TcpStream::connect(address).unwrap(),
+            Side::Initiator,
+        );
+        [answered.join().unwrap(), dialed]
+    })
+}
+
+/// PF4: a member serves a pending device's enrollment only while every membership record it
+/// holds lets that device in. Mac 2 enrolls, pending, from Mac 1, whose membership genesis founded
+/// its log; Mac 1 then makes a `Remove` of Mac 2 durable without acknowledging it (as a writer cut
+/// short between writing the records file and acknowledging it leaves the file, the records
+/// written here as X1's test writes them), and the same pending device dials it again under
+/// `atdb/5`, `atdb/4` and the legacy `ACE1` exchange (the one an `atdb/2` or `atdb/3` channel and
+/// a channel with no ALPN carry for a pending device). Under each, Mac 1 refuses it: its session
+/// fails, it never authenticates Mac 2, and it authors no record.
+///
+/// The defect it pins: a pending device skips the peer check. `frontier::connected` routes a
+/// `PENDING` flag to `enroll` before any `verify_evidence`, and `connected_until` an `ACE1` hello
+/// to `enrollment::serve`; the serving side checks only `check_log_commons_enrollment`, which
+/// judges the acknowledged log ([`client::trusted_commons_log`]), so a `Remove` ahead of its
+/// acknowledgement, which X1 made stand at the handshake
+/// (`a_remove_not_yet_acknowledged_refuses_its_mac_at_the_handshake`), takes no one out there.
+///
+/// CONTROLS (in the test): the same pending device enrolls from Mac 1 under each protocol while its
+/// records hold no `Remove` of it (the first enrollment authoring its seat), and once the `Remove`
+/// is acknowledged it is refused under each: the guard the acknowledged log already holds, so the
+/// refusal this test asks for differs only in reading every record held.
+#[test]
+fn a_pending_enrollment_is_judged_on_every_record_held() {
+    use crate::control::enrollment::tests::Lab as Vault;
+    const ENROLLING: [Protocol; 3] = [
+        Protocol::Frontier(Wire::Delta),
+        Protocol::Frontier(Wire::Whole),
+        Protocol::Legacy,
+    ];
+    let vault = Vault::new(true);
+    vault.found_log();
+    let pending = vault.pending();
+    let owner = Endpoint::from_bootstrap(&vault.bootstrap(0))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(owner.custody(), Custody::Log(_)));
+    let paths = vault.paths[0].clone();
+    let actor = pending.actor;
+    let founded = client::load_records(&paths).unwrap().inventory();
+    for protocol in ENROLLING {
+        let [(served, repair), (enrolled, _)] = session(&pending, &owner, protocol, None, |_| {});
+        assert!(
+            served.is_ok() && enrolled.is_ok(),
+            "CONTROL {}: a Mac no record removes enrolls: {served:?} {enrolled:?}",
+            alpn(protocol)
+        );
+        assert_eq!(
+            repair.authenticated_actor(),
+            Some(actor),
+            "CONTROL {}",
+            alpn(protocol)
+        );
+    }
+    let seated = client::load_records(&paths).unwrap();
+    assert_ne!(
+        seated.inventory(),
+        founded,
+        "CONTROL: the first enrollment authored Mac 2's seat"
+    );
+    let seated = seated.log().unwrap().clone();
+    let entry = seated.membership().members()[&actor].entry;
+    let own = |record: &&Record| {
+        *record.actor() == actor && !matches!(record.body(), Body::Genesis { .. })
+    };
+    let cutoff = seated
+        .records()
+        .filter(own)
+        .max_by_key(|record| record.sequence())
+        .map_or(entry, |record| *record.id());
+    let mut removed = seated.clone();
+    let bootstrap = vault.bootstrap(0);
+    let request = bootstrap.request().unwrap();
+    let authored_ms = seated.records().map(Record::authored_ms).max().unwrap() + 1;
+    let remove = bootstrap
+        .device()
+        .with_seed(|seed| {
+            seated
+                .draft(
+                    &request.binding().actor(),
+                    authored_ms,
+                    Body::Remove {
+                        member: actor,
+                        cutoff,
+                    },
+                )
+                .sign(seed, *request.binding().incarnation())
+        })
+        .unwrap();
+    removed.insert(remove).unwrap();
+    assert!(removed.membership().removal(&actor).is_some());
+    aterm_secrets::fsx::write_atomic(
+        &paths.records_file(),
+        &encode_records(removed.records()),
+        0o600,
+    )
+    .unwrap();
+    let read = client::load_acknowledged_and_ahead(&paths).unwrap();
+    let heads = |store: &aterm_secrets::membership_log::Store| store.log().map(Log::heads);
+    assert_eq!(
+        heads(&read.acknowledged),
+        Some(seated.heads()),
+        "the acknowledged history holds no Remove"
+    );
+    assert_eq!(
+        read.ahead.as_ref().and_then(heads),
+        Some(removed.heads()),
+        "the Remove is durable, ahead of it"
+    );
+    let held = client::load_records(&paths).unwrap().inventory();
+    let served: Vec<_> = ENROLLING
+        .into_iter()
+        .filter_map(|protocol| {
+            let [(served, repair), (enrolled, _)] =
+                session(&pending, &owner, protocol, None, |_| {});
+            let authored = client::load_records(&paths).unwrap().inventory() != held;
+            (served.is_ok() || repair.authenticated_actor().is_some() || authored).then(|| {
+                format!(
+                    "{}: served {:?}, authenticated {}, authored {authored}, device {:?}",
+                    alpn(protocol),
+                    served.map(|report| report.sent),
+                    repair.authenticated_actor().is_some(),
+                    enrolled.map(|report| report.received),
+                )
+            })
+        })
+        .collect();
+    assert!(
+        served.is_empty(),
+        "a Remove ahead of its acknowledgement left Mac 2 an enrollment: {served:?}"
+    );
+    // NEGATIVE CONTROL: judged by the acknowledged log alone, as before PF4, the same pending
+    // device enrolls under each protocol.
+    for protocol in ENROLLING {
+        let [(served, repair), _] = session(
+            &pending,
+            &owner,
+            protocol,
+            Some(mutants::Mutant::AcknowledgedOnly),
+            |_| {},
+        );
+        assert!(
+            served.is_ok() && repair.authenticated_actor() == Some(actor),
+            "NEGATIVE CONTROL {}: the acknowledged log alone enrolls Mac 2: {served:?}",
+            alpn(protocol)
+        );
+    }
+
+    // CONTROL: the same records acknowledged, as a writer that finishes leaves them.
+    aterm_secrets::fsx::write_atomic(
+        &paths.records_file(),
+        &encode_records(seated.records()),
+        0o600,
+    )
+    .unwrap();
+    assert_eq!(
+        client::save_records(&paths, &encode_records(removed.records())).unwrap(),
+        1
+    );
+    assert_eq!(
+        heads(
+            &client::load_acknowledged_and_ahead(&paths)
+                .unwrap()
+                .acknowledged
+        ),
+        Some(removed.heads()),
+        "CONTROL: the Remove is acknowledged"
+    );
+    for protocol in ENROLLING {
+        let [(served, repair), _] = session(&pending, &owner, protocol, None, |_| {});
+        assert!(
+            served.is_err(),
+            "CONTROL {}: an acknowledged Remove refuses Mac 2: {served:?}",
+            alpn(protocol)
+        );
+        assert_eq!(
+            repair.authenticated_actor(),
+            None,
+            "CONTROL {}",
+            alpn(protocol)
+        );
+    }
+}
+
+/// How a test makes a `Remove` durable in a Mac's records: as a writer cut short leaves the
+/// records file, ahead of its acknowledgement, or as one that finishes leaves it.
+#[derive(Clone, Copy, Debug)]
+enum Durable {
+    Ahead,
+    Acknowledged,
+}
+
+/// What a responder granted Mac 2 in one session after its `Remove` of Mac 2 became durable.
+#[derive(Debug)]
+struct Later {
+    /// The control nodes the responder's session reported sending, had it completed.
+    answered: Option<usize>,
+    /// The membership records it reported sending, had it traded any.
+    membership: Option<usize>,
+    /// The control nodes Mac 2's journal took.
+    control: usize,
+    /// Whether Mac 2's records took any.
+    records: bool,
+}
+
+impl Later {
+    /// Whether any grant ran.
+    const fn any(&self) -> bool {
+        self.answered.is_some() || self.membership.is_some() || self.control != 0 || self.records
+    }
+}
+
+/// PF4: once a peer passes its check, every later grant of a session stands only while this Mac's
+/// records still let it in. A responder speaking the legacy protocol (no ALPN, `atdb/2` or
+/// `atdb/3`) checks Mac 2 once and passes it; then, at its first grant (the lease, where
+/// [`PeerCacheStage::Acquired`] fires in its thread), its own `Remove` of Mac 2 becomes durable,
+/// ahead of its acknowledgement or acknowledged. Its session must fail with no grant after: it
+/// trades Mac 2 no membership records and sends it none of its control history (one node its
+/// journal holds that Mac 2's lacks). `atdb/5` and `atdb/4`, which re-check before each grant,
+/// stop at the same moment.
+///
+/// The defect it pins: `connected_until`'s legacy branch calls `verify_peer_against_local_log`
+/// once, before the lease, and then syncs `ACX2` membership, repairs control, trades recovery and
+/// membership records, repairs the application and hands off credentials, none re-checked: a Mac
+/// removed while a legacy session runs is granted the rest of that session.
+///
+/// Each session asserts its hook fired, so one refused before its lease (the `Remove` not yet
+/// written) cannot pass the test.
+///
+/// NEGATIVE CONTROLS (in the test): under `atdb/4`, with the check judging the acknowledged
+/// records alone ([`mutants::Mutant::AcknowledgedOnly`]), the `Remove` written ahead of its
+/// acknowledgement stops nothing, and the facts this test reads see Mac 2 granted its records and
+/// the responder's control history; and under each legacy protocol, with one check passing every
+/// later one ([`mutants::Mutant::CheckedOnce`], the session before PF4), so does the `Remove`
+/// written either way.
+#[test]
+fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let lab = Lab::new();
+    let (founded, removed) = founded_then_removed(&lab);
+    let wire = encode_records(removed.records());
+    let mut n = 0;
+    // What the responder granted Mac 2 after its `Remove` became durable, `durable`, at its lease
+    // under `protocol` with `mutant` on.
+    let mut granted = |protocol: Protocol, durable: Durable, mutant: Option<mutants::Mutant>| {
+        n += 1;
+        let responder = custodied(
+            &lab,
+            0,
+            &format!("responder-{n}"),
+            founded.clone(),
+            &founded,
+        );
+        let mac2 = custodied(&lab, 1, &format!("mac2-{n}"), founded.clone(), &founded);
+        Journal::open(&responder.dir, lab.trust)
+            .unwrap()
+            .ingest(lab.genesis.bytes())
+            .unwrap();
+        let paths = responder.paths.clone().unwrap();
+        let written = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let (paths, wire, written) = (paths.clone(), wire.clone(), written.clone());
+            move |stage: PeerCacheStage| {
+                if matches!(stage, PeerCacheStage::Acquired(Side::Responder))
+                    && !written.swap(true, Ordering::SeqCst)
+                {
+                    match durable {
+                        Durable::Ahead => {
+                            aterm_secrets::fsx::write_atomic(&paths.records_file(), &wire, 0o600)
+                                .unwrap();
+                        }
+                        Durable::Acknowledged => {
+                            assert_eq!(client::save_records(&paths, &wire).unwrap(), 1);
+                        }
+                    }
+                }
+            }
+        };
+        let [(answered, repair), (dialed, _)] = session(&mac2, &responder, protocol, mutant, hook);
+        assert!(
+            written.load(Ordering::SeqCst),
+            "{} {durable:?}: the responder passed Mac 2's check and took its lease: \
+             {answered:?} {dialed:?}",
+            alpn(protocol)
+        );
+        assert_eq!(
+            client::load_records(&paths).unwrap().log().map(Log::heads),
+            Some(removed.heads()),
+            "{} {durable:?}: the Remove is durable",
+            alpn(protocol)
+        );
+        Later {
+            answered: answered.ok().map(|report| report.sent),
+            membership: repair.membership().map(|report| report.sent),
+            control: Journal::open(&mac2.dir, lab.trust)
+                .unwrap()
+                .inventory()
+                .count(),
+            records: client::load_records(mac2.paths.as_ref().unwrap())
+                .unwrap()
+                .log()
+                .is_some_and(|log| log.heads() != founded.heads()),
+        }
+    };
+    let mut later = Vec::new();
+    for protocol in [
+        Protocol::Legacy,
+        Protocol::Repair,
+        Protocol::Credentials,
+        Protocol::Frontier(Wire::Delta),
+        Protocol::Frontier(Wire::Whole),
+    ] {
+        for durable in [Durable::Ahead, Durable::Acknowledged] {
+            let seen = granted(protocol, durable, None);
+            if seen.any() {
+                later.push((alpn(protocol), durable, seen));
+            }
+        }
+    }
+    let control = granted(
+        Protocol::Frontier(Wire::Whole),
+        Durable::Ahead,
+        Some(mutants::Mutant::AcknowledgedOnly),
+    );
+    assert!(
+        control.answered.is_some() && control.control != 0 && control.records,
+        "CONTROL: judged by the acknowledged records alone, the Remove ahead stops nothing: \
+         {control:?}"
+    );
+    for protocol in [Protocol::Legacy, Protocol::Repair, Protocol::Credentials] {
+        for durable in [Durable::Ahead, Durable::Acknowledged] {
+            let control = granted(protocol, durable, Some(mutants::Mutant::CheckedOnce));
+            assert!(
+                control.answered.is_some() && control.control != 0 && control.records,
+                "NEGATIVE CONTROL {} {durable:?}: one check for every grant grants the removed Mac \
+                 the rest of the session: {control:?}",
+                alpn(protocol)
+            );
+        }
+    }
+    assert!(
+        later.is_empty(),
+        "a Remove made durable after the check left Mac 2 later grants: {later:?}"
+    );
+}
+
+/// PF4: the acknowledged log a Mac's records custody holds is classified for judging a Commons
+/// peer ([`client::CommonsLog`]): trusted where it is of `trust`'s root and carries Commons epochs,
+/// another root's under another `Trust`, nothing to judge by with no Commons epoch or no records.
+/// A records file of another vault lineage is not read into the store at all
+/// (`Store::under`), so another lineage is classified only for a store a caller hands in
+/// (`aterm-secrets`' `a_log_of_another_lineage_is_told_from_one_with_nothing_to_judge`).
+#[test]
+fn the_acknowledged_log_is_classified_for_judging_a_peer() {
+    use client::CommonsLog;
+    let lab = Lab::new();
+    let (founded, _) = founded_then_removed(&lab);
+    let kind = |log: CommonsLog| match log {
+        CommonsLog::Trusted(..) => "trusted",
+        CommonsLog::NoLog => "no log",
+        CommonsLog::NoCommonsEpochs => "no commons epochs",
+        CommonsLog::OtherRoot => "other root",
+        CommonsLog::OtherLineage => "other lineage",
+    };
+    let held = |name: &str, log: &Log| {
+        let home = lab.root.path().join(name);
+        aterm_secrets::fsx::ensure_private_dir(&home).unwrap();
+        custody(&home, 0, log)
+    };
+    let paths = held("ours", &founded);
+    let judged = client::acknowledged_commons_log(&paths, lab.trust).unwrap();
+    assert_eq!(kind(judged), "trusted");
+    let mut other = lab.trust;
+    other.network[0] ^= 1;
+    let judged = client::acknowledged_commons_log(&paths, other).unwrap();
+    assert_eq!(kind(judged), "other root");
+
+    let genesis = Record::found(&ROOT, vec![entrant(&lab, 0), entrant(&lab, 1)], 1).unwrap();
+    let paths = held("bare", &log_of(std::slice::from_ref(&genesis)));
+    let judged = client::acknowledged_commons_log(&paths, lab.trust).unwrap();
+    assert_eq!(kind(judged), "no commons epochs");
+
+    let home = lab.root.path().join("empty");
+    aterm_secrets::fsx::ensure_private_dir(&home).unwrap();
+    let judged =
+        client::acknowledged_commons_log(&client::Paths::for_home(&home), lab.trust).unwrap();
+    assert_eq!(kind(judged), "no log");
 }

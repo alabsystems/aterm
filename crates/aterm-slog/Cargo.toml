@@ -23,8 +23,14 @@ workspace = true
 aterm-codec = { workspace = true }
 # The engine's one table of hidden characters
 # (`aterm_messages::text::is_hidden_char`), which free text passes before it
-# is stored (the metadata sanitizer the design names).
+# is stored (the metadata sanitizer the design names), and the `story` words
+# (`StoryVerb::TOLD_WORDS`) the `word=` vocabulary spells.
 aterm-messages = { workspace = true }
+# The fabric's nine `in` kinds (`WakeClass::ALL`) and three receipt verdicts
+# (`ReceiptVerdict::ALL`), which `vocab::MAIL_KIND_WORDS` and `WORD_WORDS`
+# spell: one list each, astream's. astream-wire has no dependencies and no
+# platform code, and it is in this graph already through aterm-codec.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 
 [dev-dependencies]
 # Tier-0/Tier-1: the derived `SessionLogRing`, `SessionLogCursor` and `TurnTracker` models, and the
@@ -35,9 +41,6 @@ aterm-models-session = { workspace = true }
 # The vocabularies the box and wall words mirror (`PromptKind::name`,
 # `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
 aterm-phase = { workspace = true }
-# The fabric's closed kinds and inbox verdicts (`fabric_grammar::KINDS`,
-# `VERDICTS`), which the mail and verdict words must hold (`vocab_mirror.rs`).
-aterm-types = { workspace = true }
 
 [[test]]
 name = "slog_suite"

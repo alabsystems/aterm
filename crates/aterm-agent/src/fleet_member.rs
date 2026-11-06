@@ -612,14 +612,24 @@ struct Opts {
     code_file: Option<PathBuf>,
     /// `join --at <host[:port]>`: a member to dial first, since the code names none.
     at: Option<(String, u16)>,
-    /// `fleet sync`'s join, made only while this Mac holds the fleet sync read here, which a
-    /// leave's [`member::OFF_FILE`] stops too.
-    synced: Option<Held>,
+    /// `fleet sync`'s join ([`Synced`]).
+    synced: Option<Synced>,
     /// Set when `join`'s issuer dial failed at connection or per-address capacity.
     saw_capacity: std::sync::atomic::AtomicBool,
     /// The `_alab._tcp` browse a join reads members' places from once none it knows answered
     /// ([`advertised_places`]); `None`: one of its own, started then.
     adverts: Option<std::sync::Arc<aterm_secrets::discover::Watch>>,
+}
+
+/// A `fleet sync`'s join ([`converge_under`]).
+#[derive(Debug)]
+struct Synced {
+    /// The fleet this Mac held when the sync read the vault's code: the join is made only while
+    /// it holds it still, which a leave's [`member::OFF_FILE`] stops too.
+    from: Held,
+    /// The vault the sync read the vault's default fleet code under, which the join takes the
+    /// fleet under (`crate::fleet_vault::take`), whichever is configured by the time it writes.
+    under: Option<crate::fleet_vault::Vault>,
 }
 
 impl Opts {
@@ -1407,6 +1417,14 @@ fn init_first(
             }
         ))
     })?;
+    // The fleet state is taken under the vault configured now, in the take of its key: the grants
+    // of the fleet held before are out of aterm.toml already (`ungranted`), or there were none.
+    crate::fleet_vault::take(book, vault_now(places).as_ref()).map_err(|e| {
+        failed(format!(
+            "{}: {e}",
+            places.state.join(member::VAULT_FILE).display()
+        ))
+    })?;
     Ok(Begun::Minted(Box::new(Minted {
         code,
         place: (host, port),
@@ -1817,6 +1835,13 @@ fn join_with_denial_deadline(
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
     let finish = Finish::of(opts);
+    // The vault this join takes the fleet under: a sync's, the one it read the vault's code
+    // under; a person's, the one configured as the join begins. A move while it dials leaves the
+    // fleet the vault left's, beside which no grant admits (`crate::fleet_vault::take`).
+    let under = opts
+        .synced
+        .as_ref()
+        .map_or_else(|| vault_now(places), |synced| synced.under.clone());
     // A join dials, and takes the book of, only members the deny list does not name: with none
     // read, none can be told apart, so the join waits for one.
     let (denied, log) = denied_and_log_by(places, Some(deadline));
@@ -1905,10 +1930,11 @@ fn join_with_denial_deadline(
     let bound = not_an_issuer(places, &code, &secret)
         .and_then(|()| bound_issuer(places, &secret).map_err(failed))
         .inspect_err(|_| say(&out))?;
-    // A join of another fleet, of one a join left unfinished, or held to no issuer keeps no
-    // drive grants.
+    // A join of another fleet, of one a join left unfinished, held to no issuer, or taken under
+    // another vault than the one this join takes it under keeps no drive grants.
     let regrant = aterm_net::fleet::read_key_file(&places.state).ok().as_ref() != Some(&secret)
-        || !names_issuer(places);
+        || !names_issuer(places)
+        || tenure_under(places, under.as_ref()).void().is_some();
     if let Err(why) = with_fleet(
         text_of(&config)?,
         &listen_on(&first.0, port),
@@ -1986,7 +2012,10 @@ fn join_with_denial_deadline(
     at_step("lock");
     let not_keyed = "the fleet's key was not written, and the book is as it was";
     // A sync's join is made only while this machine holds the fleet the sync found it in.
-    let began = opts.synced.as_ref().map_or(Began::Here, Began::Under);
+    let began = opts
+        .synced
+        .as_ref()
+        .map_or(Began::Here, |synced| Began::Under(&synced.from));
     // The join's first write, from what it reads again under the book's lock (a leave, an init
     // or a join may have come while it dialled). The marking, the key's write and the drop are
     // its one take, so no other edit comes between them (an older aterm's write drops every
@@ -2200,9 +2229,15 @@ fn join_with_denial_deadline(
             // The book's entry of the issuer, read again: one gone since backs no grant, and
             // aterm.toml as it is now gives the level.
             let named = named && names_issuer(places);
-            let ungrant = match &replaced {
-                Some(Replaced::Renewed) => Some(Ungrant::NewSecret),
+            // The fleet held taken again under another vault than the one it was taken under, or
+            // beside a record of that vault this Mac cannot read: the grants made beside the
+            // record go, as a join of another fleet takes its grants out (`crate::fleet_vault`).
+            let standing = tenure_under(places, under.as_ref());
+            let ungrant = match (&replaced, &standing) {
+                (Some(Replaced::Renewed), _) => Some(Ungrant::NewSecret),
                 _ if !same_fleet => Some(Ungrant::OtherFleet),
+                (_, crate::fleet_vault::Tenure::Elsewhere { .. }) => Some(Ungrant::OtherVault),
+                (_, crate::fleet_vault::Tenure::Unread(_)) => Some(Ungrant::VaultUnread),
                 _ if !named => Some(Ungrant::Unbacked),
                 _ => None,
             };
@@ -2227,6 +2262,16 @@ fn join_with_denial_deadline(
                 (&listen_on(&first.0, port), allow),
                 ungrant,
             )?;
+            // The vault this join takes the fleet under is the one its state is of, once the
+            // grants of any other are out of aterm.toml, and before a grant made under it: a
+            // listener that reads between the writes finds no grant that admits. It is written
+            // here, not in the key's take, so no record of it stands beside those grants.
+            crate::fleet_vault::take(book, under.as_ref()).map_err(|e| {
+                failed(format!(
+                    "{}: {e}",
+                    places.state.join(member::VAULT_FILE).display()
+                ))
+            })?;
             at_step("grant");
             let granted = if owes {
                 grant_default(places, book)?
@@ -2380,6 +2425,9 @@ fn join_with_denial_deadline(
         out.push('\n');
         out.push_str(&granted);
     }
+    // The vault configured moved on while the join dialled: the fleet is the vault left's, and
+    // `aterm fleet peers` would say the same.
+    out.push_str(&void_grants(places).unwrap_or_default());
     Ok(out)
 }
 
@@ -3388,8 +3436,19 @@ fn driving(places: &Places) -> Option<Vec<String>> {
     )
 }
 
-/// The drive grants aterm.toml names, none below drive.
+/// The drive grants aterm.toml names that admit now ([`configured_grants`] where this Mac's fleet
+/// state is of the vault configured now, none where it is of another:
+/// [`crate::fleet_vault::grants_in_effect`], as every listener reads them).
 fn granted_here(places: &Places) -> Vec<DriveGrant> {
+    crate::fleet_vault::grants_in_effect(
+        &places.state,
+        vault_paths_for(places).as_ref(),
+        configured_grants(places),
+    )
+}
+
+/// The drive grants aterm.toml names, none below drive, whichever vault they were made under.
+fn configured_grants(places: &Places) -> Vec<DriveGrant> {
     ConfigFile::open(&places.config)
         .ok()
         .and_then(|config| fleet_table(text_of(&config).ok()?).ok())
@@ -4579,19 +4638,34 @@ pub fn fleet_node() -> Option<String> {
     own_node(&Places::here().ok()?)
 }
 
-/// Vault paths associated with `places`: a scratch test root holding `.secrets/` or its vault
-/// config directory, or the live home when `places.state` is the live account's state directory.
+/// Vault paths associated with `places` ([`crate::fleet_vault::vault_paths_for`] of its state
+/// directory): a scratch test root holding `.secrets/` or its vault config directory, or the live
+/// home when `places.state` is the live account's state directory.
 fn vault_paths_for(places: &Places) -> Option<aterm_secrets::client::Paths> {
-    if let Some(root) = places.state.parent() {
-        let candidate = aterm_secrets::client::Paths::for_home(root);
-        if root.join(".secrets").is_dir() || candidate.dir.is_dir() {
-            return Some(candidate);
-        }
-    }
-    if aterm_types::dirs::state_dir().as_deref() == Some(places.state.as_path()) {
-        return aterm_secrets::client::Paths::live().ok();
-    }
-    None
+    crate::fleet_vault::vault_paths_for(&places.state)
+}
+
+/// Where this Mac's fleet state stands against the vault configured now
+/// ([`crate::fleet_vault::tenure`]): whether its drive grants admit.
+fn tenure(places: &Places) -> crate::fleet_vault::Tenure {
+    crate::fleet_vault::tenure(&places.state, vault_paths_for(places).as_ref())
+}
+
+/// Where this Mac's fleet state stands against `under`, the vault a take of the fleet is decided
+/// under ([`crate::fleet_vault::tenure_under`]): what that take finds of the grants beside it.
+fn tenure_under(
+    places: &Places,
+    under: Option<&crate::fleet_vault::Vault>,
+) -> crate::fleet_vault::Tenure {
+    crate::fleet_vault::tenure_under(&places.state, vault_paths_for(places).as_ref(), under)
+}
+
+/// The vault `places` configures now ([`crate::fleet_vault::Vault::configured`]): none with none,
+/// one this process does not read, or one that pins no signer.
+fn vault_now(places: &Places) -> Option<crate::fleet_vault::Vault> {
+    vault_paths_for(places)
+        .as_ref()
+        .and_then(crate::fleet_vault::Vault::configured)
 }
 
 /// Why a fleet verb that admits, joins or drives refuses while this Mac cannot read its deny
@@ -5042,6 +5116,9 @@ fn keep_book(
             // A record of when each member last answered: one this machine cannot write costs
             // `peers` its "since" line, never the read.
             let _ = book.note_answered(&answers);
+            // A record of the vault the fleet state is of, adopted where an older build left
+            // none (`crate::fleet_vault::keep`).
+            crate::fleet_vault::keep_in(book, &places.state, vault_now(places));
             book.keep_issuer_book(
                 copy.as_ref()?
                     .as_ref()
@@ -5434,7 +5511,24 @@ fn format_peer_listing(
              the peers named here.\n",
         );
     }
+    out.push_str(&void_grants(places).unwrap_or_default());
     Ok(out)
+}
+
+/// The line `aterm fleet peers` says while aterm.toml keeps drive grants and none admits, as the
+/// fleet state was taken under another vault than the one configured now
+/// ([`crate::fleet_vault::Tenure::void`]): they stay as they are, and how a fleet is taken under
+/// the vault this Mac is in.
+fn void_grants(places: &Places) -> Option<String> {
+    let kept = configured_grants(places).len();
+    let why = (kept > 0).then(|| tenure(places).void()).flatten()?;
+    Some(format!(
+        "Drive: {why}; [fleet] drive_from keeps {kept} grant{} as {} {}: {}.\n",
+        if kept == 1 { "" } else { "s" },
+        if kept == 1 { "it" } else { "they" },
+        if kept == 1 { "is" } else { "are" },
+        take_again(places)
+    ))
 }
 
 /// The note `fleet peers` gives for a read's no-route dials: with this Mac's place read, the
@@ -6002,6 +6096,11 @@ pub enum FleetSync {
     /// The vault rotated the secret of the fleet this Mac is in, and this Mac took it in place:
     /// the report.
     Rekeyed(String),
+    /// This Mac issues the vault's default fleet, which it took under another vault than the one
+    /// configured (or beside a record of that vault it cannot read), and took it again in place
+    /// under this one (`crate::fleet_vault`): the report, the default grant's where one was
+    /// written again.
+    Retaken(String),
     /// The fleet this Mac holds was left as it is: why, and what a person does about it.
     Blocked(String),
 }
@@ -6023,9 +6122,10 @@ impl FleetSync {
                                   fleet code; fleet membership is unchanged"
                 .into(),
             FleetSync::Current => "default ALab fleet membership is current".into(),
-            FleetSync::Granted(report) | FleetSync::Joined(report) | FleetSync::Rekeyed(report) => {
-                report.clone()
-            }
+            FleetSync::Granted(report)
+            | FleetSync::Joined(report)
+            | FleetSync::Rekeyed(report)
+            | FleetSync::Retaken(report) => report.clone(),
             FleetSync::Blocked(why) => format!("fleet membership is unchanged: {why}"),
         }
     }
@@ -6224,7 +6324,7 @@ fn check_on(places: &Places, code: &str) -> Result<FleetCheck, Failure> {
     let current = FleetSecret::new(&parsed.secret).map_err(failed)?;
     let due = |why: &str| Ok(FleetCheck::Due(why.to_owned()));
     match sync_plan(places, &parsed, &current)? {
-        SyncPlan::Join(_, why) => due(why),
+        SyncPlan::Join(_, why) | SyncPlan::Retake(why) => due(why),
         SyncPlan::Rekey { .. } => due(
             "the vault's default fleet code holds a new secret for the fleet a sync put this Mac \
              in",
@@ -6252,6 +6352,11 @@ enum SyncPlan {
     Rekey { from: FleetSecret, minted: bool },
     /// This Mac is in the code's fleet, its join made: record it, and write a grant it owes.
     In,
+    /// This Mac issues the code's fleet and took it under another vault than the one configured,
+    /// or beside a record of the vault it took it under that does not read (why, in one line):
+    /// take it again in place under the vault whose default fleet it is, as a member's sync takes
+    /// it by a join ([`retake`]), then as [`SyncPlan::In`].
+    Retake(&'static str),
     /// Left as it is: why, and what a person does about it.
     Blocked(String),
 }
@@ -6259,7 +6364,38 @@ enum SyncPlan {
 /// [`SyncPlan`] for the vault's default fleet code `code`, whose secret is `current`.
 fn sync_plan(places: &Places, code: &JoinCode, current: &FleetSecret) -> Result<SyncPlan, Failure> {
     let issues = in_state(places, CODE_FILE)?;
+    // A fleet state taken under another vault than the one whose code this is, or beside a record
+    // of that vault this Mac cannot read: the vault's default fleet is taken under it, as a join
+    // takes it, the grants made beside the record out (`crate::fleet_vault`).
+    let elsewhere = match tenure(places) {
+        crate::fleet_vault::Tenure::Here => None,
+        crate::fleet_vault::Tenure::Elsewhere { .. } => Some(
+            "this Mac's fleet was taken under another vault than the one whose default fleet this \
+             is",
+        ),
+        crate::fleet_vault::Tenure::Unread(_) => Some(
+            "this Mac cannot read which vault its fleet was taken under (its record of that \
+             vault, or the vault's configuration, does not read)",
+        ),
+    };
     Ok(match aterm_net::fleet::read_key_file(&places.state) {
+        Ok(held)
+            if !issues && (held == *current || synced(places) == Some(held.mark()))
+                && let Some(why) = elsewhere =>
+        {
+            SyncPlan::Join(Held::Key(held), why)
+        }
+        // The fleet this Mac issues is the vault's default fleet: it takes it again in place.
+        Ok(held) if issues && held == *current && let Some(why) = elsewhere => {
+            SyncPlan::Retake(why)
+        }
+        Ok(_) if issues && elsewhere.is_some() => SyncPlan::Blocked(format!(
+            "this Mac issues a fleet it took under another vault than the one configured now (or \
+             cannot read which), and the vault's default fleet is another, so no drive grant of \
+             the fleet it issues admits: `aterm fleet init --rotate` issues it anew under this \
+             vault (every member joins again), or {LEAVE_THEN_ON} joins this vault's default \
+             fleet"
+        )),
         // A join is made once the book holds an entry of the fleet: any member's is a place to
         // dial, and heartbeats refill the book from it (docs/DESIGN-fluid-swarm-2026-10-28.md
         // F17), so a `peers rm` of the issuer leaves it made.
@@ -6407,6 +6543,10 @@ fn sync_with(
     if in_state(places, member::OFF_FILE)? {
         return Ok(FleetSync::Off);
     }
+    // The vault configured as the sync reads the code: what the sync writes is that vault's,
+    // whichever is configured by the time it writes, so a move while it dials leaves the fleet the
+    // vault left's (`crate::fleet_vault::take`).
+    let under = vault_now(places);
     let code = match vault()? {
         VaultCode::NoVault => return Ok(FleetSync::NoVault),
         VaultCode::NotAlab => return Ok(FleetSync::NotAlab),
@@ -6416,7 +6556,7 @@ fn sync_with(
     let code = code
         .as_str()
         .ok_or_else(|| failed("the signed fleet code is not UTF-8"))?;
-    converge_on(places, code, at)
+    converge_under(places, code, under.as_ref(), at)
 }
 
 /// What a sync names as the way out of a fleet it leaves as it is: a leave, whose fleet-off
@@ -6433,15 +6573,22 @@ const LEAVE_THEN_ON: &str = "`aterm fleet leave`, then `aterm fleet sync --on`";
 /// every member, a vault admin included (docs/DESIGN-fluid-swarm-2026-10-28.md F2), and only
 /// where no narrower level stands ([`default_grant_stands`]), so a level a person set after a
 /// sync's join stays; one that join owed and did not write ([`GRANT_OWED_FILE`]) is written by a
-/// later pass.
-fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Failure> {
+/// later pass. What it writes is the fleet state of `under`, the vault the code was read under
+/// (`crate::fleet_vault`).
+fn converge_under(
+    places: &Places,
+    code: &str,
+    under: Option<&crate::fleet_vault::Vault>,
+    at: &Opts,
+) -> Result<FleetSync, Failure> {
     let parsed = JoinCode::parse(code).map_err(failed)?;
     let current = FleetSecret::new(&parsed.secret).map_err(failed)?;
     let from = match sync_plan(places, &parsed, &current)? {
         SyncPlan::Blocked(why) => return Ok(FleetSync::Blocked(why)),
-        SyncPlan::In => return in_fleet(places, (&parsed, &current)),
+        SyncPlan::In => return in_fleet(places, (&parsed, &current), under),
+        SyncPlan::Retake(_) => return retake(places, (&parsed, &current), under),
         SyncPlan::Rekey { from, minted } => {
-            return rekey(places, (&from, minted), (&parsed, &current));
+            return rekey(places, (&from, minted), (&parsed, &current), under);
         }
         // The fleet a join moves this Mac from: its join is made only while this Mac holds it
         // still.
@@ -6452,7 +6599,10 @@ fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Fail
     let opts = Opts {
         port: at.port,
         host: at.host.clone(),
-        synced: Some(from),
+        synced: Some(Synced {
+            from,
+            under: under.cloned(),
+        }),
         adverts: at.adverts.clone(),
         ..Opts::default()
     };
@@ -6467,11 +6617,18 @@ fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Fail
             // in the code's fleet while this one dialled, which this one's join then reads as a
             // move away from the fleet it began under: the Mac is where the sync brings it.
             match sync_plan(places, &parsed, &current) {
-                Ok(SyncPlan::In) => in_fleet(places, (&parsed, &current)),
+                Ok(SyncPlan::In) => in_fleet(places, (&parsed, &current), under),
                 _ => Err(failure),
             }
         }
     }
+}
+
+/// [`converge_under`] the vault configured now: a test's sync of a code it holds, which it reads
+/// under that vault.
+#[cfg(test)]
+fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Failure> {
+    converge_under(places, code, vault_now(places).as_ref(), at)
 }
 
 /// A sync that found this Mac in the vault's fleet `current`, its join made: the record that it is
@@ -6479,9 +6636,100 @@ fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Fail
 fn in_fleet(
     places: &Places,
     (code, current): (&JoinCode, &FleetSecret),
+    under: Option<&crate::fleet_vault::Vault>,
 ) -> Result<FleetSync, Failure> {
     record_synced(places, (code, current))?;
+    // The vault whose default fleet this is, which the sync read the code under: a record an
+    // older build left none of adopts it, whichever vault is configured by now.
+    crate::fleet_vault::keep_as(&places.state, under.cloned());
     Ok(grant_owed(places, current)?.map_or(FleetSync::Current, FleetSync::Granted))
+}
+
+/// Take the fleet this Mac issues, the vault's default fleet `current`, again in place under
+/// `under`, the vault the sync read its code under, as a member's sync takes it by a join: in one
+/// take while this Mac holds it, the grants made beside the record of the vault it was taken under
+/// (another, or one that does not read) out of aterm.toml and the level lowered from drive as a
+/// join's are, then `under` recorded; where the default grant stood (`"*"`, the vault's
+/// `--all` policy), it is owed again, and [`in_fleet`] writes it as a sync's join owes it.
+/// Nothing is written where a leave came since, or the record is of `under` by then.
+fn retake(
+    places: &Places,
+    (code, current): (&JoinCode, &FleetSecret),
+    under: Option<&crate::fleet_vault::Vault>,
+) -> Result<FleetSync, Failure> {
+    let mut out = String::new();
+    private_state(places, &mut out)?;
+    let took = member::write_held(
+        &places.state,
+        Began::Under(&Held::Key(current.clone())),
+        |book| {
+            if in_state(places, member::OFF_FILE)? || !in_state(places, CODE_FILE)? {
+                return Ok(None);
+            }
+            let ungrant = match tenure_under(places, under) {
+                crate::fleet_vault::Tenure::Here => return Ok(None),
+                crate::fleet_vault::Tenure::Elsewhere { .. } => Ungrant::OtherVault,
+                crate::fleet_vault::Tenure::Unread(_) => Ungrant::VaultUnread,
+            };
+            let config = ConfigFile::open(&places.config).map_err(failed)?;
+            let now = fleet_table(text_of(&config)?).map_err(failed)?;
+            let (line, gone) = match now.listen.as_deref() {
+                _ if now.drive_from.is_empty() => (String::new(), None),
+                Some(listen) => {
+                    if default_grant_stands(&now) {
+                        owe_grant(places)?;
+                    }
+                    write_fleet(
+                        book,
+                        &config,
+                        &places.config,
+                        (listen, now.written_level(None, true)),
+                        Some(ungrant),
+                    )?
+                }
+                None => {
+                    return Err(failed(format!(
+                        "aterm.toml names no [fleet] listen beside the fleet this Mac issues, so \
+                         its grants were left as they are: `aterm fleet init` again writes it \
+                         ({})",
+                        places.config.display()
+                    )));
+                }
+            };
+            crate::fleet_vault::take(book, under).map_err(|e| {
+                failed(format!(
+                    "{}: {e}",
+                    places.state.join(member::VAULT_FILE).display()
+                ))
+            })?;
+            Ok(Some(line + &gone.unwrap_or_default()))
+        },
+    );
+    let taken = match took {
+        Ok(taken) => taken.inspect_err(|_| say(&out))?,
+        // A leave, a join or an init came since: the next pass reads what it left.
+        Err(Unwritten::Moved) => None,
+        Err(Unwritten::Lock(why)) => {
+            say(&out);
+            return Err(failed(format!(
+                "{why}, so the fleet this Mac issues was not taken under the vault configured: \
+                 the next `aterm fleet sync` takes it"
+            )));
+        }
+    };
+    let synced = in_fleet(places, (code, current), under)?;
+    Ok(match taken {
+        None => synced,
+        Some(said) => FleetSync::Retaken(format!(
+            "aterm fleet sync: this Mac issues the vault's default fleet, which it took under \
+             another vault than the one it is in now, or cannot read which: taken again under \
+             this one, its grants made beside the old record out\n{out}{said}{}",
+            match synced {
+                FleetSync::Granted(granted) => granted,
+                _ => String::new(),
+            }
+        )),
+    })
 }
 
 /// Take the vault's rotated secret of the fleet `from` this Mac holds, in place, while it holds it
@@ -6502,6 +6750,7 @@ fn rekey(
     places: &Places,
     (from, minted): (&FleetSecret, bool),
     (code, current): (&JoinCode, &FleetSecret),
+    under: Option<&crate::fleet_vault::Vault>,
 ) -> Result<FleetSync, Failure> {
     let mut out = String::new();
     private_state(places, &mut out)?;
@@ -6567,6 +6816,10 @@ fn rekey(
             })
             .map_err(failed)?;
             write_synced(places, (code, current)).map_err(failed)?;
+            // The vault whose code rotated the secret, which the sync read it under, is the one
+            // the fleet state is of (a sync rekeys only that: [`sync_plan`]): a record an older
+            // build left none of adopts it, whichever vault is configured by now.
+            crate::fleet_vault::keep_in(book, &places.state, under.cloned());
             Ok(Some(kept))
         },
     );
@@ -6922,6 +7175,14 @@ fn set_level(
             if ReadUnder::now(places, book.held().clone(), true) != began {
                 return Ok(None);
             }
+            // A grant is the vault's it is made under: beside a fleet taken under another, it
+            // would be that one's, and no grant of it admits (`crate::fleet_vault`).
+            if let Some(why) = tenure(places).void() {
+                return Err(failed(format!(
+                    "{why}; nothing was granted: {}",
+                    take_again(places)
+                )));
+            }
             let (grants, unconfirmed) = drive_grants(places, from, missed)?;
             // A list below drive grants nothing, so a grant starts it afresh.
             let mut nodes = if table.level() == Some(aterm_net::fleet::DRIVE_LEVEL) {
@@ -6961,6 +7222,25 @@ fn set_level(
 /// How many times a grant reads its issuer's book before it refuses as moved: one more than the
 /// writes of a first `join` (its key, aterm.toml, its book's issuer), each of which moves it.
 const GRANT_READS: usize = 4;
+
+/// How a person takes a fleet under the vault this Mac is in now, once the one it holds was taken
+/// under another ([`crate::fleet_vault::Tenure::void`]): an issuer's sync takes it again where it
+/// is that vault's default fleet, else it issues its fleet anew; a member joins the vault's
+/// default fleet, or leaves for one of this vault's.
+fn take_again(places: &Places) -> String {
+    if in_state(places, CODE_FILE).unwrap_or(false) {
+        "`aterm fleet sync` takes this fleet again under the vault this Mac is in where it is that \
+         vault's default fleet; otherwise `aterm fleet init --rotate` issues it anew under that \
+         vault (every member joins again); a grant made then is that vault's"
+            .to_owned()
+    } else {
+        format!(
+            "`aterm fleet sync` joins the default fleet of the vault this Mac is in, which takes \
+             its grants afresh; where that vault publishes none, or this fleet was joined by hand, \
+             {LEAVE_THEN_ON}, or a join of one of its fleets; a grant made then is that vault's"
+        )
+    }
+}
 
 /// What a grant's or a `peers rm`'s read of its issuer's book is made under: the fleet's key,
 /// whether `[fleet]` listens (a grant reads only where it does, `peers rm` either way), and the
@@ -7563,12 +7843,15 @@ fn leave_within_node(
             }
         }
         // What a sync or an older build's steward recorded goes with the fleet, unreported: a
-        // later join by hand is the person's, and owes no default grant. So does the record of
-        // when each member last answered, which alone holds no fleet, and of a fleet seed
-        // refused against the one it held.
+        // later join by hand is the person's, and owes no default grant. So do the record of
+        // when each member last answered, which alone holds no fleet, of a fleet seed refused
+        // against the one it held, of when a root found it held none, and of the vault the
+        // fleet was taken under.
         for name in [
             member::ANSWERED_FILE,
             member::fleet_seed::CONFLICT_FILE,
+            member::fleet_seed::UNHELD_FILE,
+            member::VAULT_FILE,
             SYNCED_FILE,
             GRANT_OWED_FILE,
             STEWARDED_FILE,
@@ -9014,6 +9297,13 @@ enum Ungrant {
     /// The fleet's secret is new (the issuer's `init --rotate`, or its `leave` and `init`
     /// again), which removes every grant.
     NewSecret,
+    /// The fleet held is taken again under another vault than the one its state was taken
+    /// under (`crate::fleet_vault`): its grants were made under that vault.
+    OtherVault,
+    /// The fleet held is taken again beside a record of the vault its state was taken under that
+    /// does not read (`crate::fleet_vault::Tenure::Unread`): no vault can be told to be the one
+    /// its grants were made under.
+    VaultUnread,
 }
 
 impl Ungrant {
@@ -9045,6 +9335,16 @@ impl Ungrant {
             Self::NewSecret => {
                 "the fleet's secret is new, and a new secret removes every grant".to_owned()
             }
+            Self::OtherVault => format!(
+                "{they} {} made under another vault than the one this Mac is in now, and a \
+                 fleet taken under this one keeps no grant made under another",
+                if had.len() == 1 { "was" } else { "were" }
+            ),
+            Self::VaultUnread => format!(
+                "the record of the vault {they} {} made under does not read, and a fleet taken \
+                 under the vault this Mac is in keeps no grant it cannot tell was made under it",
+                if had.len() == 1 { "was" } else { "were" }
+            ),
         }
     }
 }

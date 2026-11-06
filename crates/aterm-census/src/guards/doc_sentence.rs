@@ -26,6 +26,8 @@
 //! (``SAFETY: `-setContentMinSize:`.``) is cut too: it names what it is about and states
 //! nothing of it.
 
+use std::borrow::Cow;
+
 use super::rules::PRODUCT;
 use super::{Finding, Rule, Tree};
 
@@ -70,7 +72,7 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let mut paragraph = String::new();
         for line in file.lines() {
             let code_free = line.text.trim().is_empty();
-            let Some(own) = marker(line.no).filter(|_| code_free) else {
+            let Some(own) = code_free.then(|| marker(line.no)).flatten() else {
                 (fenced, safety, just_opened) = (false, false, false);
                 first_in_fence.clear();
                 paragraph.clear();
@@ -230,7 +232,10 @@ fn names_only_code(text: &str) -> bool {
 
 /// `text` without its code spans, or `None` when one never closes: a run of backticks opens
 /// a span that only a run of the same length closes, and a backslash makes one literal.
-fn outside_code(text: &str) -> Option<String> {
+fn outside_code(text: &str) -> Option<Cow<'_, str>> {
+    if !text.contains('`') {
+        return Some(Cow::Borrowed(text));
+    }
     let mut prose = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('`') {
@@ -253,24 +258,28 @@ fn outside_code(text: &str) -> Option<String> {
         rest = body;
     }
     prose.push_str(rest);
-    Some(prose)
+    Some(Cow::Owned(prose))
 }
 
 /// `prose` without the characters it names in single quotes (`'"'`, `'('`): a quoted
 /// character is shown, not opened.
-fn unquoted(prose: &str) -> String {
-    let chars: Vec<char> = prose.chars().collect();
+fn unquoted(prose: &str) -> Cow<'_, str> {
+    if !prose.contains('\'') {
+        return Cow::Borrowed(prose);
+    }
     let mut out = String::with_capacity(prose.len());
-    let mut at = 0;
-    while let Some(&c) = chars.get(at) {
-        if c == '\'' && chars.get(at + 2) == Some(&'\'') {
-            at += 3;
-            continue;
+    let mut chars = prose.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            let mut look = chars.clone();
+            if look.next().is_some() && look.next() == Some('\'') {
+                chars = look;
+                continue;
+            }
         }
         out.push(c);
-        at += 1;
     }
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]

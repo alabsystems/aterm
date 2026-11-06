@@ -403,6 +403,10 @@ fn worker() -> Res {
         }
         step = std::hint::black_box(step.wrapping_add(1));
         std::hint::black_box(&memory);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the CPU-burning fixture's give-way between passes: it waits for nobody, and its stop is a flag it reads each pass"
+        )]
         std::thread::yield_now();
     }
     Ok(0)

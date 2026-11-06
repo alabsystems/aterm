@@ -30,7 +30,8 @@
 //! last press opened nothing.
 //! Keys typed while it spawns stay where they were ([`crate::tab_spawn::SpawnAsk::unasked`]).
 //! The same checks run before landing: a busy or typed-into destination defers the request
-//! without opening an empty tab or consuming its attempt. Stop withdraws a request not yet opened.
+//! without opening an empty tab or consuming its attempt. Stop withdraws an unopened request
+//! and interrupts only the exact receipt-bound installer child already running.
 //! The tab's program waits for the window's go line, typed once it landed, before it does
 //! anything. Its exact child lifetime holds off other setup prompts; the finished terminal keeps
 //! the result visible, and a program that ended without saying how gets the window's end line.
@@ -42,6 +43,8 @@ use aterm_types::macos_setup::Observation;
 
 mod probe;
 mod receipt;
+mod stop;
+pub(crate) use stop::Reach as StopReach;
 
 /// The "revision" of the want a launch that found the tools missing makes itself: newer than any
 /// pass, so only a person's Stop or the tools' arrival ([`App::developer_tools_watch`]) withdraws
@@ -420,6 +423,8 @@ pub(crate) struct Terminal {
     /// one that failed, one Low Data Mode held back, or one whose program never ran. A tab whose
     /// line is none of these takes back nothing.
     spent_mark: bool,
+    /// This exact child has already received setup's cancellation signal.
+    stop_sent: bool,
 }
 
 impl Terminal {
@@ -435,6 +440,7 @@ impl Terminal {
             ended: false,
             told: false,
             spent_mark: false,
+            stop_sent: false,
         }
     }
 }
@@ -598,7 +604,8 @@ pub(crate) fn watch_for_tools() {
 
 /// Whether setup's one early elevation owes this Mac a root step beside the tools, from what
 /// this account reads with no prompt (`aterm_machines::root_steps::owed` reads the same for
-/// `aterm init`): developer mode `off` (`DevToolsSecurity -status`), or `rule`, the stat of the
+/// `aterm init`): developer mode `off` (`DevToolsSecurity -status`), or an enabled mode this
+/// console account is not authorized to use (`member`), or `rule`, the stat of the
 /// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
 /// reading no root-owned 0440 file while no refused rule stands
 /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`). A step that cannot be
@@ -606,6 +613,7 @@ pub(crate) fn watch_for_tools() {
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
     off: Option<bool>,
+    member: aterm_containment::consent::DebuggerMember,
     rule: std::io::Result<(u32, u32, bool)>,
     refused: bool,
 ) -> bool {
@@ -613,7 +621,9 @@ pub(crate) fn root_steps_owed_by(
         Ok((uid, mode, file)) => !(file && uid == 0 && mode == 0o440),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound && !refused,
     };
-    off == Some(true) || rule_owed
+    off == Some(true)
+        || (off == Some(false) && member == aterm_containment::consent::DebuggerMember::NotMember)
+        || rule_owed
 }
 
 /// Read, on a thread of its own, whether setup's one early elevation owes this Mac anything
@@ -625,19 +635,31 @@ pub(crate) fn read_root_steps() {
         .spawn(|| {
             #[cfg(target_os = "macos")]
             {
-                use aterm_containment::consent::{DebuggerMode, ProbeGate, probe_debugger};
+                use aterm_containment::consent::{
+                    DebuggerMember, DebuggerMode, ProbeGate, probe_debugger,
+                };
                 use std::os::unix::fs::MetadataExt as _;
-                let off = match probe_debugger(ProbeGate::on()).mode {
+                let debugger = probe_debugger(ProbeGate::on());
+                let off = match debugger.mode {
                     DebuggerMode::Disabled | DebuggerMode::Unrecognized => Some(true),
                     DebuggerMode::Enabled => Some(false),
                     DebuggerMode::Unknown => None,
+                };
+                // SAFETY: `geteuid` reads this process's effective uid and cannot fail.
+                let uid = unsafe { libc::geteuid() };
+                let member = if uid != 0
+                    && std::fs::metadata("/dev/console").is_ok_and(|meta| meta.uid() == uid)
+                {
+                    debugger.member
+                } else {
+                    DebuggerMember::Unknown
                 };
                 let rule = std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE)
                     .map(|meta| (meta.uid(), meta.mode() & 0o7777, meta.file_type().is_file()));
                 let refused =
                     std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
                         .is_ok();
-                let owed = root_steps_owed_by(off, rule, refused);
+                let owed = root_steps_owed_by(off, member, rule, refused);
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed}");
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
@@ -2578,23 +2600,53 @@ mod tests {
 
         let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(root_steps_owed_by(Some(true), Ok((0, 0o440, true)), false));
-        assert!(root_steps_owed_by(Some(false), gone(), false));
+        use aterm_containment::consent::DebuggerMember::Admin;
+        assert!(root_steps_owed_by(
+            Some(true),
+            Admin,
+            Ok((0, 0o440, true)),
+            false
+        ));
+        assert!(root_steps_owed_by(Some(false), Admin, gone(), false));
         assert!(root_steps_owed_by(
             Some(false),
+            Admin,
             Ok((501, 0o440, true)),
             false
         ));
         assert!(!root_steps_owed_by(
             Some(false),
+            Admin,
             Ok((0, 0o440, true)),
             false
         ));
-        assert!(!root_steps_owed_by(None, denied(), false));
+        assert!(!root_steps_owed_by(None, Admin, denied(), false));
         assert!(
-            !root_steps_owed_by(Some(false), gone(), true),
+            !root_steps_owed_by(Some(false), Admin, gone(), true),
             "refused stands"
         );
+    }
+
+    /// An enabled developer mode still needs the root step when this account is in neither
+    /// permitted group. Admins and developers already have authorization, and missing readings
+    /// never cause a password request of their own.
+    #[cfg(unix)]
+    #[test]
+    fn enabled_mode_owes_only_a_definitely_unauthorized_console_account() {
+        use aterm_containment::consent::DebuggerMember::{Admin, Developer, NotMember, Unknown};
+        for (off, member, owed) in [
+            (Some(false), NotMember, true),
+            (Some(false), Admin, false),
+            (Some(false), Developer, false),
+            (Some(false), Unknown, false),
+            (None, NotMember, false),
+        ] {
+            assert_eq!(
+                root_steps_owed_by(off, member, Ok((0, 0o440, true)), false),
+                owed,
+                "{off:?} {member:?}"
+            );
+        }
     }
 
     /// The per-build mark is written durably, the file and then its directory entry, so a

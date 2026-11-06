@@ -5694,6 +5694,23 @@ fn a_claude_sign_in_on_a_bot_check_ends_naming_it_and_one_that_clears_goes_on() 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_claude_bot_check_or_block_page_can_finish_through_the_central_challenge() {
+    for state in ["bot_check", "block_page"] {
+        let _central = super::super::challenge_relay::set_central_result_for_tests(Ok(
+            BOT_CALLBACK.to_owned(),
+        ));
+        let page =
+            move |_: usize| aterm_json::json!({"state":state,"url":"https://claude.ai/login"});
+        let (result, delivered, _, met) =
+            drive_bot_check(page, Duration::from_millis(500), Duration::from_millis(20));
+        assert_eq!(result, Ok(()), "{state}");
+        assert_eq!(delivered, [BOT_CALLBACK.to_owned()], "{state}");
+        assert_eq!(met, None, "{state}");
+    }
+}
+
 /// The opener's outcome file holds one closed word and a host it keeps, and nothing else is
 /// read back from it: never a URL, a path, another word or a second line. Its words name
 /// Cloudflare where the page was Cloudflare's.
@@ -5743,7 +5760,7 @@ fn the_outcome_file_holds_one_closed_word_and_a_host() {
     assert_eq!(read_outcome(&file), Some(met.clone()));
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
-        "bot-check claude.ai\n"
+        "opener-outcome=1\nphase=failed\nmet=bot-check claude.ai\n"
     );
     write_outcome(Path::new("outcome"), &met);
     assert!(
@@ -5813,5 +5830,60 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
         let path = tmp.path().join("outcome");
         write_outcome(&path, &expected);
         assert_eq!(read_outcome(&path), Some(expected));
+    }
+}
+#[cfg(unix)]
+#[test]
+fn opener_outcome_phases_preserve_diagnostics_but_only_failed_is_terminal() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    for word in [
+        MetWord::BrowserStart,
+        MetWord::BrowserControl,
+        MetWord::BotCheck,
+        MetWord::BlockPage,
+        MetWord::Stall,
+    ] {
+        let met = Met::new(word, Some("claude.ai"));
+        write_outcome_phase(&path, &met, OutcomePhase::Continuing);
+        assert_eq!(read_outcome(&path), Some(met.clone()));
+        assert_eq!(read_failed_outcome(&path), None);
+        write_outcome(&path, &met);
+        assert_eq!(read_failed_outcome(&path), Some(met));
+    }
+    for bad in [
+        "bot-check claude.ai\n".to_owned(),
+        "opener-outcome=2\nphase=failed\nmet=browser-start\n".to_owned(),
+        "opener-outcome=1\nphase=unknown\nmet=browser-start\n".to_owned(),
+        "opener-outcome=1\nphase=failed\nmet=browser-start".to_owned(),
+        "opener-outcome=1\nphase=failed\nphase=failed\nmet=browser-start\n".to_owned(),
+        "opener-outcome=1\nphase=failed\nmet=browser-start\nmet=browser-start\n".to_owned(),
+        "opener-outcome=1\nphase=failed\nmet=browser-start\nunknown=true\n".to_owned(),
+        format!(
+            "opener-outcome=1\nphase=failed\nmet=browser-start\n{}",
+            " ".repeat(256)
+        ),
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        assert_eq!(read_outcome(&path), None);
+        assert_eq!(read_failed_outcome(&path), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    let met = Met::new(MetWord::BotCheck, Some("claude.ai"));
+    for code in [0, 1] {
+        let result = profile_fallback_outcome(Some(&path), Some(&met), || {
+            assert_eq!(read_outcome(&path), Some(met.clone()));
+            assert_eq!(read_failed_outcome(&path), None);
+            (code, Some("profile opener diagnostic".to_owned()))
+        });
+        assert_eq!(result, (code, Some("profile opener diagnostic".to_owned())));
+        assert_eq!(read_outcome(&path), Some(met.clone()));
+        assert_eq!(read_failed_outcome(&path), (code != 0).then(|| met.clone()));
     }
 }

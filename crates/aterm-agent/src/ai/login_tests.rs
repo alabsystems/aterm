@@ -693,7 +693,7 @@ fn a_file_roster_cannot_redirect_or_hold_a_hidden_backend_sign_in() {
                 refused: refused.then(|| "a broken inactive file roster".into()),
                 state: Some("expired"),
                 next: Some("inactive-file-row".into()),
-                off: Some("an inactive pool switch"),
+                off: Some("an inactive pool switch".into()),
                 bot_check_at: Some(1_800_000_000),
                 sign_in_refused: Some("an inactive file-account refusal".into()),
                 ..CliAccounts::default()
@@ -1873,7 +1873,7 @@ fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
         ),
         (
             "sign-ins off",
-            &|v| v.off = Some("`[harness] logins = \"off\"`"),
+            &|v| v.off = Some("`[harness] logins = \"off\"`".into()),
             "aterm ai login claude",
         ),
         (

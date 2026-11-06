@@ -362,7 +362,7 @@ mod tests {
                     started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
                     "retain neither waited nor answered"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             };
             assert!(
                 early.is_none(),

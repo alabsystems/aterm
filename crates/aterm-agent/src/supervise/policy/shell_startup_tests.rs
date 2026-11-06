@@ -397,9 +397,10 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
 /// A glob may meet a name's leading dot wherever the startup may turn `GLOB_DOTS` or `dotglob` on
 /// unseen: a line at either snapshot's top level this check does not read, a `.zshenv` not proven
 /// to set no option, a shell the Bash tool may run with no snapshot of its own read, and bash
-/// with `GLOBIGNORE` in its environment. A snapshot whose every top-level line is read leaves it
-/// off, as does a bash worker's read with no `GLOBIGNORE` (bash reads no `.zshenv`, which keeps a
-/// host's `/etc/zshenv` out of it).
+/// with `GLOBIGNORE` in its environment; and a `GLOBIGNORE` Claude Code's settings give the Bash
+/// tool, which the worker's environment does not show, fails the read. A snapshot whose every
+/// top-level line is read leaves it off, as does a bash worker's read with no `GLOBIGNORE` (bash
+/// reads no `.zshenv`, which keeps a host's `/etc/zshenv` out of it).
 #[test]
 fn a_glob_may_meet_a_leading_dot_wherever_the_startup_may_set_it_unseen() {
     let parsed = |kind: Kind, snapshot: &str| {
@@ -422,6 +423,16 @@ fn a_glob_may_meet_a_leading_dot_wherever_the_startup_may_set_it_unseen() {
         .read(&s.worker("/bin/bash", &["GLOBIGNORE=zz"]))
         .expect("read");
     assert!(state.may_dot_glob(), "GLOBIGNORE: {state:?}");
+    std::fs::create_dir_all(s.project().join(".claude")).expect(".claude");
+    std::fs::write(
+        s.project().join(".claude/settings.json"),
+        "{\"env\": {\"GLOBIGNORE\": \"zz\"}}",
+    )
+    .expect("settings");
+    let why = s
+        .read(&s.worker("/bin/bash", &[]))
+        .expect_err("GLOBIGNORE in the settings' env");
+    assert!(why.contains("`GLOBIGNORE`"), "{why}");
     for (snapshot, worker) in [
         ("bash", ["/bin/zsh", "CLAUDE_CODE_SHELL=/bin/bash"]),
         ("zsh", ["/bin/bash", "CLAUDE_CODE_SHELL=/bin/zsh"]),

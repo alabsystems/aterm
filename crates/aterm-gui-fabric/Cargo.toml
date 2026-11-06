@@ -49,6 +49,9 @@ astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-feat
 aterm-spec = { workspace = true }
 # The carry's TOML round trips.
 aterm-tempfile = { workspace = true }
+# A test's poll pauses with `aterm_uds::deadline::poll_yield` on every target, the
+# library's own use being Unix's (clippy.toml: a wait that wakes).
+aterm-uds = { workspace = true }
 
 [lints]
 workspace = true

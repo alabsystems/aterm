@@ -145,8 +145,8 @@ impl fmt::Display for PaneTraceFault {
             PaneTraceFault::Seal { sealed, found } => write!(
                 f,
                 "the trace closes with the digest {}, but its bytes digest to {}: it was cut or altered",
-                sealed.short(),
-                found.short()
+                sealed.short_display(),
+                found.short_display()
             ),
             PaneTraceFault::Wire(w) => write!(f, "the trace does not decode: {w}"),
             PaneTraceFault::Identity(m) => write!(
@@ -161,14 +161,14 @@ impl fmt::Display for PaneTraceFault {
             PaneTraceFault::State { recorded, replayed } => write!(
                 f,
                 "the replay reached the state {}, not the exporter's {}",
-                replayed.short(),
-                recorded.short()
+                replayed.short_display(),
+                recorded.short_display()
             ),
             PaneTraceFault::Chain { recorded, replayed } => write!(
                 f,
                 "the replay observed the chain {}, not the exporter's {}",
-                replayed.short(),
-                recorded.short()
+                replayed.short_display(),
+                recorded.short_display()
             ),
         }
     }
@@ -478,10 +478,11 @@ impl PaneTrace {
     /// [`PaneTraceFault::Identity`], [`PaneTraceFault::Checkpoint`], [`PaneTraceFault::Restore`], [`PaneTraceFault::Log`], [`PaneTraceFault::Tail`], [`PaneTraceFault::State`] or [`PaneTraceFault::Chain`], in that order.
     pub fn check(&self, origin: ClockReading, build: &str) -> Result<PaneCheck, PaneTraceFault> {
         let ours = |c: PaneCode| pane_identity(&PrebuiltPane::new(c, build));
-        let code = PaneCode::ALL
+        let prebuilt = PaneCode::ALL
             .iter()
             .copied()
-            .find(|&c| ours(c) == self.identity)
+            .map(|c| PrebuiltPane::new(c, build))
+            .find(|p| pane_identity(p) == self.identity)
             .ok_or_else(|| {
                 PaneTraceFault::Identity(
                     IdentityMismatch::first(&self.identity, &ours(PaneCode::ThisBuild))
@@ -540,13 +541,7 @@ impl PaneTrace {
         if tail != Tail::Clean {
             return Err(PaneTraceFault::Tail(tail));
         }
-        let (_, check) = run(
-            &schema,
-            &PrebuiltPane::new(code, build),
-            start,
-            log.inputs(),
-            &self.effects,
-        );
+        let (_, check) = run(&schema, &prebuilt, start, log.inputs(), &self.effects);
         if check.state_digest != self.head_state {
             return Err(PaneTraceFault::State {
                 recorded: self.head_state,

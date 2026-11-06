@@ -8028,7 +8028,7 @@ mod tests {
             "negative control: without Drop closing the slot, both owner and parked thread hold the queue"
         );
         unclosed.queue.ready.notify_all();
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
         assert_eq!(
             weak_unclosed.strong_count(),
             2,

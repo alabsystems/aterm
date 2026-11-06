@@ -49,7 +49,8 @@ const DRIVERS: &str = "target";
 
 impl FakeRepo {
     fn new() -> Self {
-        let base = mktemp_dir("atv-repo").expect("mktemp");
+        // Physical, as verify spells its root and target (`/tmp` is a link on macOS).
+        let base = fs::canonicalize(mktemp_dir("atv-repo").expect("mktemp")).expect("real");
         let root = base.join("repo");
         let stage2 = base.join("stage2");
         let scratch = base.join("scratch");

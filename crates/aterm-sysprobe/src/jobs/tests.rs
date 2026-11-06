@@ -1933,7 +1933,7 @@ fn a_ptys_word_is_read_through_its_device_node() {
     assert_eq!(n, 3, "write: {}", std::io::Error::last_os_error());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while term_word(me, dev).is_some_and(|w| w.queued < 3) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert_eq!(
         term_word(me, dev).map(|w| w.queued),

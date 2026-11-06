@@ -553,7 +553,7 @@ impl WalkFence {
             write_marker(root, previous).is_ok()
         } else {
             aterm_dirfd::unlinkat(root, MARKER, aterm_dirfd::AtFlags::empty()).is_ok()
-                && aterm_dirfd::fsync(root).is_ok()
+                && aterm_durable::primitive::fsync(root).is_ok()
         }
     }
 }
@@ -607,7 +607,8 @@ pub(super) fn write_marker(root: &aterm_dirfd::OwnedFd, receipt: &Receipt) -> Re
     aterm_durable::ordered(&file).map_err(|_| "cache retention marker was not durable")?;
     aterm_dirfd::renameat(root, name.as_str(), root, MARKER)
         .map_err(|_| "cache retention marker cannot be published")?;
-    aterm_dirfd::fsync(root).map_err(|_| "cache retention directory was not durable")?;
+    aterm_durable::primitive::fsync(root)
+        .map_err(|_| "cache retention directory was not durable")?;
     Ok(())
 }
 

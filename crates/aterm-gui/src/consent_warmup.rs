@@ -988,7 +988,7 @@ mod tests {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.is_live() && Instant::now() < deadline {
             state.drain();
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!state.is_live(), "the pass ended");
         assert!(state.last_pass_ms().is_some());
@@ -1058,7 +1058,7 @@ mod tests {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN + Duration::from_secs(5);
         while state.is_live() && Instant::now() < deadline {
             state.drain();
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!state.is_live(), "the pass ended");
         assert_eq!(
@@ -1106,7 +1106,7 @@ mod tests {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.is_live() && Instant::now() < deadline {
             state.drain();
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!state.is_live(), "the retired pass ended");
         assert_eq!(LOOKED.load(Ordering::Acquire), 0, "no look asked");
@@ -1144,7 +1144,7 @@ mod tests {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.is_live() && Instant::now() < deadline {
             state.drain();
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!state.is_live(), "the pass ended once the gate opened");
         assert!(state.last_pass_ms().is_some());

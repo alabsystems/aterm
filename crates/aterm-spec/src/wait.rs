@@ -35,11 +35,19 @@ pub fn within<T>(
                 return None;
             }
             if gap.is_zero() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a zero-gap poll a test asked for: its budget is the hang detector, and no deadline waits on it"
+                )]
                 std::thread::yield_now();
             } else {
                 std::thread::sleep(gap.min(deadline.saturating_duration_since(now)));
             }
         } else if gap.is_zero() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a zero-gap poll a test asked for: its budget is the hang detector, and no deadline waits on it"
+            )]
             std::thread::yield_now();
         } else {
             std::thread::sleep(gap);

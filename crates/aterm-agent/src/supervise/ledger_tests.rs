@@ -1444,3 +1444,118 @@ fn a_carried_turn_the_log_holds_is_placed_by_it() {
         "{detail}"
     );
 }
+
+/// A TURN WRAPPED BESIDE THE SIDE PANEL IS FOUND IN THE ARCHIVE BY ITS TEXT: `reply_sizes` finds
+/// each turn's `❯` row by the first `MARKER_CHARS` (60) characters of its text (whitespace
+/// aside), read across the rows the text wraps onto, in its `offscreen` tail joined as the
+/// report joins it (`report::join`: the archived rows as the archive stored them). Beside Claude
+/// Code's side panel a turn wraps at the panel's rule and each of its rows ends in the padding,
+/// the rule and the panel's text, so a turn of two lines read as stored is none of the block's
+/// and its reply's size was "not found"; read cut at each `│` its first row draws
+/// (`report::begins_with`) it is the turn's words, whatever the screen draws now (cut at the
+/// screen's rule alone, as this branch first read it, it was not found once the panel closed or
+/// its rule moved, as a ledger read after the fact may well see). CONSTRUCTED: the measured 2.1.316
+/// panel capture's composer and the rows under it, under a transcript padded to the capture's rule
+/// (the turn's first row beside the panel's measured heading), its turn and first reply rows
+/// archived, in a read that counts no break and in one that counts one, under the rest of the
+/// transcript still beside the panel, drawn after it closed and drawn after its rule moved 8 cells
+/// right. CONTROL: the same rows with no panel.
+#[test]
+fn a_turn_wrapped_beside_the_side_panel_is_found_in_the_archive() {
+    use aterm_phase::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen};
+    let capture = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+    let top = capture
+        .iter()
+        .position(|r| r.starts_with('─'))
+        .expect("the composer's top rule");
+    let rule = capture[0]
+        .split_once('│')
+        .expect("the panel's rule")
+        .0
+        .chars()
+        .count();
+    let text = "1. Fix the parser\n2. Then rerun the tests";
+    let gone = [
+        "⏺ Older words.",
+        "",
+        "❯ 1. Fix the parser",
+        "  2. Then rerun the tests",
+        "",
+        "⏺ Working on it.",
+    ];
+    let on_screen = ["  Ran 2 shell commands", "", "⏺ Done.", ""];
+    let hist = [HistTurn {
+        id: 1,
+        submitted: true,
+        status: "settled".to_string(),
+        by: "ctl".to_string(),
+        started_ms: 10_000,
+        dur_ms: 1_800,
+        arch: Some(Mark {
+            origin: Some(7730),
+            index: 102,
+        }),
+        carried: false,
+        text: text.to_string(),
+    }];
+    let beside = |words: &[&str], rule: usize| -> Vec<String> {
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let side = if i == 2 { "1 file changed" } else { "" };
+                format!("{w:<rule$}│{side}")
+            })
+            .collect()
+    };
+    let mut misread = Vec::new();
+    for (pane, archived, mut screen) in [
+        (
+            "beside the panel",
+            beside(&gone, rule),
+            beside(&on_screen, rule),
+        ),
+        (
+            "beside the panel, closed since",
+            beside(&gone, rule),
+            rows(&on_screen),
+        ),
+        (
+            "beside the panel, its rule moved since",
+            beside(&gone, rule),
+            beside(&on_screen, rule + 8),
+        ),
+        ("CONTROL with no panel", rows(&gone), rows(&on_screen)),
+    ] {
+        if pane.starts_with("beside") {
+            screen.extend(capture[top..].iter().cloned());
+        } else {
+            screen.extend(composer("  ? for shortcuts"));
+        }
+        for breaks in [0, 1] {
+            let n = archived.len() + screen.len();
+            let stdout: String = archived
+                .iter()
+                .chain(&screen)
+                .map(|r| format!("{r}\n"))
+                .collect();
+            let off = CtlReply {
+                code: 0,
+                stdout,
+                stderr: format!(
+                    "aterm-ctl: OK {n} first=101 last={} lost=0 breaks={breaks} back=0 epoch=1 \
+                     origin=7730 alt=1 seq=900 screen_rows={}\n",
+                    100 + archived.len(),
+                    screen.len()
+                ),
+            };
+            let mut host = Host::default().on("offscreen", off);
+            let mut sources = Vec::new();
+            let sizes = reply_sizes(&mut host, "@s-work", &hist, &mut sources);
+            if !sizes.first().is_some_and(|(size, _)| size.is_ok()) {
+                misread.push(format!("{pane}, breaks={breaks}: {sizes:?}"));
+            }
+        }
+    }
+    assert!(misread.is_empty(), "{}", misread.join("\n"));
+}

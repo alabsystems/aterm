@@ -528,6 +528,74 @@ pub fn own_newest(
 ) -> Option<(NameRecord, [u8; 8])> {
     let key = me.key();
     let mut newest: Option<(NameRecord, [u8; 8])> = None;
+    for (node, entry_key, carried) in carried_in_books(dir) {
+        if node != me.node() || entry_key != key {
+            continue;
+        }
+        // Under the digest it was signed under, exactly: `accept` falls back to the zero
+        // digest, which names no fleet the record was signed in. At this clock nothing is
+        // ahead.
+        let found = digests.iter().find_map(|digest| {
+            match accept(
+                &carried,
+                (me.node(), &key),
+                *digest,
+                Source::Entry,
+                None,
+                u64::MAX,
+            ) {
+                Ok(Accepted::Record {
+                    record,
+                    digest: under,
+                }) if under == *digest => Some((record, under)),
+                Ok(_) | Err(_) => None,
+            }
+        });
+        if let Some((record, digest)) = found
+            && newest
+                .as_ref()
+                .is_none_or(|(held, _)| (record.eseq, record.rev) > (held.eseq, held.rev))
+        {
+            newest = Some((record, digest));
+        }
+    }
+    newest
+}
+
+/// The nicknames other nodes' records in this node's books carry (§2.4's "in view", without the
+/// `computers` table until stage 5): each record that verifies under its entry's key and the
+/// seed digest held here (`digest`), else the zero digest, of every entry whose node is not
+/// `me`. A book that cannot be read names none. It steers a first draw away from these words, so
+/// a record that verifies under a key no member binds costs one more draw, never a NAME.
+#[must_use]
+pub fn nicknames_in_books(
+    dir: &std::path::Path,
+    me: Option<&str>,
+    digest: [u8; 8],
+) -> Vec<Nickname> {
+    carried_in_books(dir)
+        .into_iter()
+        .filter(|(node, _, _)| Some(node.as_str()) != me)
+        .filter_map(|(node, key, carried)| {
+            match accept(
+                &carried,
+                (&node, &key),
+                digest,
+                Source::Entry,
+                None,
+                u64::MAX,
+            ) {
+                Ok(Accepted::Record { record, .. }) => record.nick,
+                Ok(_) | Err(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// Each entry in `fleet-peers` and `fleet-issuer-book`, in that order, that names its node and
+/// key and carries a record, not yet verified. A book that cannot be read holds none.
+fn carried_in_books(dir: &std::path::Path) -> Vec<(String, NodeKey, Carried)> {
+    let mut carried = Vec::new();
     for file in [super::PEERS_FILE, super::ISSUER_BOOK_FILE] {
         let Ok(bytes) = super::read_private(dir, file, super::PEERS_FILE_MAX) else {
             continue;
@@ -536,41 +604,16 @@ pub fn own_newest(
             .lines()
             .filter_map(super::Peer::parse)
         {
-            if peer.node.as_deref() != Some(me.node()) || peer.key != Some(key) {
-                continue;
-            }
-            let Some(carried) = peer.signed.as_ref().and_then(|signed| signed.record()) else {
-                continue;
-            };
-            // Under the digest it was signed under, exactly: `accept` falls back to the zero
-            // digest, which names no fleet the record was signed in. At this clock nothing is
-            // ahead.
-            let found = digests.iter().find_map(|digest| {
-                match accept(
-                    carried,
-                    (me.node(), &key),
-                    *digest,
-                    Source::Entry,
-                    None,
-                    u64::MAX,
-                ) {
-                    Ok(Accepted::Record {
-                        record,
-                        digest: under,
-                    }) if under == *digest => Some((record, under)),
-                    Ok(_) | Err(_) => None,
-                }
-            });
-            if let Some((record, digest)) = found
-                && newest
-                    .as_ref()
-                    .is_none_or(|(held, _)| (record.eseq, record.rev) > (held.eseq, held.rev))
-            {
-                newest = Some((record, digest));
+            if let (Some(node), Some(key), Some(record)) = (
+                peer.node,
+                peer.key,
+                peer.signed.as_ref().and_then(|signed| signed.record()),
+            ) {
+                carried.push((node, key, *record));
             }
         }
     }
-    newest
+    carried
 }
 
 /// What a name record's signature covers: `node ‖ key ‖ seed digest ‖ the canonical bytes`

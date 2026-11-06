@@ -378,7 +378,7 @@ mod tests {
             x
         });
         while !registered.load(Ordering::SeqCst) {
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let before = cpu_time().expect("thread_info on the registered thread");
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;

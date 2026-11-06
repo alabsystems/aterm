@@ -44,7 +44,7 @@ fn poll_until(host: &mut Host, ready: impl Fn(&Host) -> bool) {
     while !ready(host) {
         assert!(Instant::now() < until, "host hang detector");
         host.poll().unwrap();
-        thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
 }
 
@@ -147,7 +147,7 @@ fn transition_with(
                         .unwrap();
                 })
                 .unwrap();
-                thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             peak = 1;
             seen.recv_timeout(Duration::from_secs(60)).unwrap();
@@ -204,7 +204,7 @@ fn transition_with(
                     break;
                 }
                 assert!(Instant::now() < until, "token child hang detector");
-                thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert!(host.revoke(token.bytes()).unwrap());
             assert!(!host.revoke(token.bytes()).unwrap());

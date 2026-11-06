@@ -54,36 +54,41 @@ pub(super) fn trusted_seeded_store(
     envelope_signer: &[u8; 32],
     handoff: &[([u8; 32], [u8; 64])],
 ) -> crate::Result<Option<(Store, [u8; 32])>> {
-    seeded_store(paths, config, envelope_signer, handoff, false)
+    Ok(
+        seeded_under(&Reads::new(paths), config, envelope_signer, handoff)?
+            .map(|seeded| (seeded.store().clone(), seeded.digest())),
+    )
 }
 
-fn seeded_store(
-    paths: &Paths,
+/// Whether `log` is one `config`'s vault holds: seeded with epochs, its genesis of this key line
+/// or durably bound to it.
+fn seeds_vault(
+    reads: &Reads<'_>,
+    config: &Config,
+    log: &Log,
+    envelope_signer: &[u8; 32],
+    handoff: &[([u8; 32], [u8; 64])],
+) -> crate::Result<bool> {
+    Ok(log.has_epochs()
+        && (genesis_matches_lineage(log, config, envelope_signer, handoff)
+            || super::retained_history::durably_bound(reads, config, log.network())?))
+}
+
+/// The acknowledged store under `config`, where an envelope of `envelope_signer` and `handoff`
+/// may read it.
+pub(super) fn seeded_under(
+    reads: &Reads<'_>,
     config: &Config,
     envelope_signer: &[u8; 32],
     handoff: &[([u8; 32], [u8; 64])],
-    replacement: bool,
-) -> crate::Result<Option<(Store, [u8; 32])>> {
+) -> crate::Result<Option<HeldLog>> {
     if !super::pin_admitted(config, None) {
         return Ok(None);
     }
-    let store = super::load_records_for(paths, config)?;
-    let store = if replacement {
-        super::retained_history::replacement_candidate(paths, config, store)?
-    } else {
-        super::retained_history::project_store(paths, config, store)?
-    };
-    let Some(log) = store.log() else {
+    let Some(held) = reads.acknowledged(config)? else {
         return Ok(None);
     };
-    if !log.has_epochs()
-        || (!genesis_matches_lineage(log, config, envelope_signer, handoff)
-            && !super::retained_history::durably_bound(paths, config, log.network())?)
-    {
-        return Ok(None);
-    }
-    let digest = records_heads_digest(log);
-    Ok(Some((store, digest)))
+    Ok(seeds_vault(reads, config, held.log(), envelope_signer, handoff)?.then_some(held))
 }
 
 pub(super) fn trusted_seeded_log(
@@ -91,12 +96,13 @@ pub(super) fn trusted_seeded_log(
     config: &Config,
     envelope: &Envelope,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
-    let Some((store, digest)) =
-        trusted_seeded_store(paths, config, &envelope.signer, &envelope.handoff)?
-    else {
-        return Ok(None);
-    };
-    Ok(store.log().cloned().map(|log| (log, digest)))
+    Ok(seeded_under(
+        &Reads::new(paths),
+        config,
+        &envelope.signer,
+        &envelope.handoff,
+    )?
+    .map(HeldLog::into_owned))
 }
 
 /// Causal inspection after `verify_for_reader` returned `Pin::Replaced`. The caller must
@@ -106,10 +112,26 @@ pub(super) fn replacement_seeded_log(
     config: &Config,
     envelope: &Envelope,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
-    Ok(
-        seeded_store(paths, config, &envelope.signer, &envelope.handoff, true)?
-            .and_then(|(store, digest)| store.log().cloned().map(|log| (log, digest))),
-    )
+    if !super::pin_admitted(config, None) {
+        return Ok(None);
+    }
+    let reads = Reads::new(paths);
+    let store = super::retained_history::replacement_candidate(
+        &reads,
+        config,
+        super::load_records_for(&reads, config)?,
+    )?;
+    let Some(held) = HeldLog::of(store) else {
+        return Ok(None);
+    };
+    Ok(seeds_vault(
+        &reads,
+        config,
+        held.log(),
+        &envelope.signer,
+        &envelope.handoff,
+    )?
+    .then(|| held.into_owned()))
 }
 
 pub(super) struct ConfiguredLog {
@@ -136,30 +158,33 @@ pub(super) fn trusted_configured_log(
     paths: &Paths,
     config: &Config,
 ) -> crate::Result<Option<ConfiguredLog>> {
+    Ok(
+        configured_under(&Reads::new(paths), config)?.map(|held| ConfiguredLog {
+            log: held.log().clone(),
+        }),
+    )
+}
+
+/// The acknowledged store under `config`, where the signer `config` pins may read it alone.
+pub(super) fn configured_under(
+    reads: &Reads<'_>,
+    config: &Config,
+) -> crate::Result<Option<HeldLog>> {
     if !super::pin_admitted(config, None) {
         return Ok(None);
     }
     let Some(pin) = config.signer else {
         return Ok(None);
     };
-    let store = super::retained_history::project_store(
-        paths,
-        config,
-        super::load_records_for(paths, config)?,
-    )?;
-    let Some(log) = store.log() else {
+    let Some(held) = reads.acknowledged(config)? else {
         return Ok(None);
     };
-    if !log.has_epochs()
-        || (!genesis_matches_lineage(log, config, &pin, &[])
-            && !super::retained_history::durably_bound(paths, config, log.network())?)
+    if !seeds_vault(reads, config, held.log(), &pin, &[])?
+        || !matches!(held.log().genesis().body(), Body::Genesis { .. })
     {
         return Ok(None);
     }
-    if !matches!(log.genesis().body(), Body::Genesis { .. }) {
-        return Ok(None);
-    }
-    Ok(Some(ConfiguredLog { log: log.clone() }))
+    Ok(Some(held))
 }
 
 /// Authenticated records remain evidence while a reader is revoked or partly applied.
@@ -169,15 +194,9 @@ pub(super) fn authenticated_custody(
     config: &Config,
     state: &State,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
-    if let Some(bytes) = super::read_verified_cached_envelope(paths, config, state)?
-        && let Some(seeded) = trusted_seeded_log(paths, config, &envelope::parse(&bytes)?)?
-    {
-        return Ok(Some(seeded));
-    }
-    Ok(trusted_configured_log(paths, config)?.map(|c| {
-        let digest = records_heads_digest(&c.log);
-        (c.log, digest)
-    }))
+    Ok(Reads::under(paths, config, state)
+        .custody()?
+        .map(HeldLog::into_owned))
 }
 
 #[cfg_attr(
@@ -460,19 +479,19 @@ pub fn applied_version_names_log(paths: &Paths) -> crate::Result<bool> {
 
 /// First enrollment must match an applied digest and cover a verified envelope's causal witness.
 pub(super) fn check_legacy_frontier(
-    paths: &Paths,
+    reads: &Reads<'_>,
     config: &Config,
     log: &Log,
 ) -> crate::Result<bool> {
-    let state = super::load_state(paths)?;
-    if !super::retained_history::durably_bound(paths, config, log.network())?
-        && !legacy_applied_log_available(&state, log)
+    let state = reads.state()?;
+    if !super::retained_history::durably_bound(reads, config, log.network())?
+        && !legacy_applied_log_available(state, log)
     {
         return Ok(false);
     }
-    if let Some(bytes) = super::read_verified_cached_envelope(paths, config, &state)?
-        && let Some(identity) = super::read_identity(paths)?
-        && let Stamp::Heads(heads) = envelope_stamp(&envelope::parse(&bytes)?, &identity)?
+    if let Some(envelope) = reads.verified_under(config, state)?
+        && let Some(identity) = reads.identity()?
+        && let Stamp::Heads(heads) = envelope_stamp(envelope, identity)?
         && !super::retained_frontier::covers(log, log.network(), &heads)
     {
         return Ok(false);
@@ -619,8 +638,8 @@ pub(super) type OpenedWithDigest = (Option<Vec<Entry>>, Option<[u8; 32]>);
         project = "aterm_secrets::client::cold_read_tests::cold_read_transition"
     )
 )]
-pub(super) fn applied_log_available(state: &State, seeded: Option<&(Log, [u8; 32])>) -> bool {
-    !super::peer_selection::awaiting_applied_log(state, seeded.map(|(_, digest)| *digest))
+pub(super) fn applied_log_available(state: &State, seeded_digest: Option<[u8; 32]>) -> bool {
+    !super::peer_selection::awaiting_applied_log(state, seeded_digest)
 }
 
 pub(super) fn open_entries_preferring_log(
@@ -1701,7 +1720,7 @@ fn local_roster_read(
     }
     // A caller's uncommitted draft may extend custody, but cannot omit its heads.
     if let Some(expected) = super::config(paths)? {
-        super::retained_history::require_covers(paths, &expected, log)?;
+        super::retained_history::require_covers(&Reads::new(paths), &expected, log)?;
         let state = super::load_state(paths)?;
         let custody = authenticated_custody(paths, &expected, &state)?;
         if super::peer_selection::awaiting_applied_log(
@@ -1946,9 +1965,10 @@ impl Drafted {
     }
 }
 
-/// [`draft_document_diff_until`], with the drafted records added to `paths.records_file()`, and the
-/// `[everyone]` writes that wait for the new key ([`Waiting`]) beside them. Where any wait, it
-/// keeps nothing: the caller drafts the whole text again once the key is here.
+/// [`draft_document_diff_until`] of an edit made from no admin view, with the drafted records
+/// added to `paths.records_file()`, and the `[everyone]` writes that wait for the new key
+/// ([`Waiting`]) beside them. Where any wait, it keeps nothing: the caller drafts the whole text
+/// again once the key is here.
 pub(super) fn append_document_diff_to_log(
     paths: &Paths,
     config: &Config,
@@ -1957,7 +1977,7 @@ pub(super) fn append_document_diff_to_log(
     identity: &Identity,
     doc: &Document,
     base: Base<'_>,
-) -> crate::Result<Option<(Drafted, Waiting)>> {
+) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
     let drafted = draft_document_diff_until(
         paths,
         config,
@@ -1967,9 +1987,10 @@ pub(super) fn append_document_diff_to_log(
         doc,
         base,
         None,
+        None,
     )?;
-    if let Some((drafted, waiting)) = &drafted
-        && waiting.is_empty()
+    if let Some((drafted, everyone)) = &drafted
+        && !everyone.waits
         && !drafted.records.is_empty()
     {
         super::save_records(paths, &encode_records(&drafted.records))?;
@@ -2455,719 +2476,46 @@ fn rotation_due(
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     audience: &EpochAudience,
 ) -> bool {
-    let removed = log.removed_recipients();
-    opened.maximal_epochs.get(audience).is_some_and(|newest| {
-        newest.iter().any(|epoch| {
-            opened
-                .wrapped_recipients
-                .get(epoch)
-                .is_some_and(|wrapped| !wrapped.is_disjoint(&removed))
-        })
+    opened
+        .maximal_epochs
+        .get(audience)
+        .is_some_and(|newest| wraps_removed(opened, newest, &log.removed_recipients()))
+}
+
+/// Whether one of the epochs `newest` (an audience's causally newest, as `opened` reads them)
+/// still wraps a recipient in `removed`: the one reading of "a held `Remove` made a re-key due"
+/// that a writer's wait ([`rotation_due`]), a host list's rotation ([`rotates_host_list`]), a
+/// removal's reserve ([`super::remove::RemovalFill`]) and a heal's ([`owed_rekeys`]) share, as
+/// [`Log::rekey_dues`]' `rotation` reads it over the same epochs cache.
+pub(super) fn wraps_removed(
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    newest: &[RecordId],
+    removed: &BTreeSet<Recipient>,
+) -> bool {
+    newest.iter().any(|epoch| {
+        opened
+            .wrapped_recipients
+            .get(epoch)
+            .is_some_and(|wrapped| !wrapped.is_disjoint(removed))
     })
 }
 
-/// One `[everyone]` write a writer keeps unsigned while it waits for the new key ([`Waiting`]).
-#[derive(Clone)]
-struct WaitingWrite {
-    /// What the name becomes. A writer never keeps a `Delete` waiting: an edit that takes a name
-    /// out of `[everyone]` mints its fresh epoch at once (`leaves_everyone` in
-    /// [`draft_document_diff_with`]).
-    to: Entry,
-    /// The [`entry_digest`] of what the writer read there when the edit was made; `None` where it
-    /// read nothing.
-    from: Option<[u8; 32]>,
-    /// A person's save of a name the log holds concurrent values for: a `Delete` goes first, so the
-    /// `Put` replaces every sibling ([`Base::resolve`]).
-    resolve: bool,
-}
-
-impl WaitingWrite {
-    fn same(&self, other: &Self) -> bool {
-        self.from == other.from && self.resolve == other.resolve && same_entry(&self.to, &other.to)
-    }
-}
-
-/// The `[everyone]` writes a writer that holds a `Remove` keeps unsigned until the new key arrives
-/// (one-mesh M4: "writers wait for the new key"), by name. While a newest `[everyone]` epoch still
-/// wraps a removed Mac ([`rotation_due`]), a writer signs no `[everyone]` `Put`: sealed under that
-/// epoch the value would reach the removed Mac, and a fresh epoch of its own would cost the log
-/// an epoch and a `Wrap` a seat beside the rotation already due. An edit that takes a name out of
-/// `[everyone]` mints that fresh epoch anyway (it reseals what stays, so the old value's epoch is
-/// neither newest nor winning), and so writes at once. The
-/// remover's own batch, or the ranked tender's rotation or coalesce, brings the new epoch, which
-/// the 8,500 stop never holds; a later vault pass then signs each write under it
-/// ([`sign_waiting_writes`]).
-///
-/// A publish keeps them pending, bound to the digest of the envelope that carries them, from
-/// before that envelope goes out ([`wait_for_key`]), and they wait in this Mac's
-/// `everyone.waiting` only once a server took that version ([`land_waiting`]): the publish's own
-/// answer, or a sync, a mirror or a later publish that reads that version, or one naming it as a
-/// parent, from a server later (a reply lost after the store). A version no
-/// server took never lands them, so a publish the person saw fail never lands its edit
-/// afterwards; one every server refused drops them at once ([`forget_waiting`]). Both files are
-/// sealed to this Mac's own age recipient, as its lockers are.
-/// The envelope still carries the edit to the Macs that read its lockers; it is stamped with the
-/// log's heads, which hold none of the waiting writes, so a Mac that reads the log reads them
-/// once they are signed, and no import of that version's older text ever reaches the log.
-#[derive(Clone, Default)]
-pub(super) struct Waiting(BTreeMap<String, WaitingWrite>);
-
-impl Waiting {
-    /// Whether nothing waits.
-    pub(super) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// The `[everyone]` writes an edit makes from what the writer reads there (`view`) to `doc`,
-    /// the edit's entries there: each name whose entry `doc` changes (or whose conflict a
-    /// person's save settles, `resolving`) is put. The caller keeps an edit that drops a name
-    /// from waiting.
-    fn of_edit(
-        view: Option<&BTreeMap<String, Entry>>,
-        doc: Option<&BTreeMap<String, Entry>>,
-        resolving: impl Fn(&String) -> bool,
-    ) -> Self {
-        let mut writes = BTreeMap::new();
-        for (name, entry) in doc.into_iter().flatten() {
-            let resolve = resolving(name);
-            let read = view.and_then(|view| view.get(name));
-            if resolve || read.is_none_or(|read| !same_entry(read, entry)) {
-                writes.insert(
-                    name.clone(),
-                    WaitingWrite {
-                        to: entry.clone(),
-                        from: read.map(entry_digest),
-                        resolve,
-                    },
-                );
-            }
-        }
-        Self(writes)
-    }
-
-    /// The plain text of these writes, one line each: `put <name> <resolve> <from> <if-absent>
-    /// <anchor> v<value>`, `-` for a missing `from` or anchor, the value in unpadded base64.
-    /// Names and anchors hold no whitespace.
-    fn encode(&self) -> zeroize::Zeroizing<Vec<u8>> {
-        let mut text = zeroize::Zeroizing::new(String::new());
-        for (name, write) in &self.0 {
-            let from = write
-                .from
-                .map_or_else(|| "-".to_owned(), |d| aterm_codec::hex::encode_lower(&d));
-            let resolve = u8::from(write.resolve);
-            let entry = &write.to;
-            text.push_str(&format!(
-                "put {name} {resolve} {from} {} {} v",
-                u8::from(entry.if_absent),
-                entry.anchor.as_deref().unwrap_or("-"),
-            ));
-            text.push_str(&crate::b64::encode_nopad(entry.value.as_slice()));
-            text.push('\n');
-        }
-        zeroize::Zeroizing::new(text.as_bytes().to_vec())
-    }
-
-    /// [`Waiting::encode`]'s text read back; a line of another shape is an error.
-    fn decode(plain: &[u8]) -> crate::Result<Self> {
-        let bad = || Error::new("everyone.waiting holds a line of no known shape");
-        let text = std::str::from_utf8(plain).map_err(|_| bad())?;
-        let flag = |word: &str| match word {
-            "0" => Ok(false),
-            "1" => Ok(true),
-            _ => Err(bad()),
-        };
-        let from = |word: &str| -> crate::Result<Option<[u8; 32]>> {
-            if word == "-" {
-                return Ok(None);
-            }
-            let mut digest = [0u8; 32];
-            (word.len() == 64 && aterm_codec::hex::decode_into(word.as_bytes(), &mut digest))
-                .then_some(Some(digest))
-                .ok_or_else(bad)
-        };
-        let mut writes = BTreeMap::new();
-        for line in text.lines() {
-            let words: Vec<&str> = line.split_ascii_whitespace().collect();
-            let (name, write) = match words.as_slice() {
-                ["put", name, resolve, base, if_absent, anchor, value] => {
-                    let value = value
-                        .strip_prefix('v')
-                        .and_then(crate::b64::decode_nopad)
-                        .ok_or_else(bad)?;
-                    let entry = Entry {
-                        name: (*name).to_owned(),
-                        value: SecretBytes::from(value),
-                        audience: Audience::Everyone,
-                        if_absent: flag(if_absent)?,
-                        anchor: (*anchor != "-").then(|| (*anchor).to_owned()),
-                    };
-                    (
-                        *name,
-                        WaitingWrite {
-                            to: entry,
-                            from: from(base)?,
-                            resolve: flag(resolve)?,
-                        },
-                    )
-                }
-                _ => return Err(bad()),
-            };
-            writes.insert(name.to_owned(), write);
-        }
-        Ok(Self(writes))
-    }
-}
-
-/// A digest of `entry` as [`same_entry`] compares two of one name: its flags, anchor and value.
-fn entry_digest(entry: &Entry) -> [u8; 32] {
-    let mut buf = zeroize::Zeroizing::new(b"aterm/everyone-waiting/from/1\0".to_vec());
-    buf.push(u8::from(entry.if_absent));
-    let anchor = entry.anchor.as_deref().unwrap_or_default();
-    buf.extend_from_slice(
-        &u64::try_from(anchor.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(anchor.as_bytes());
-    buf.extend_from_slice(entry.value.as_slice());
-    Sha256::digest(&buf)
-}
-
-/// Where [`Waiting`] keeps its writes, sealed to this Mac's own age recipient.
-pub(super) fn waiting_file(paths: &Paths) -> PathBuf {
-    paths.dir.join("everyone.waiting")
-}
-
-/// The writes waiting in [`waiting_file`], opened with `identity`; none where there is no file.
-///
-/// # Errors
-/// The file cannot be read, does not open with `identity`, or holds a line of no known shape.
-fn read_waiting(paths: &Paths, identity: &Identity) -> crate::Result<Waiting> {
-    let Some(sealed) = fsx::read_private(
-        &waiting_file(paths),
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )?
-    else {
-        return Ok(Waiting::default());
-    };
-    let plain = age::decrypt(std::slice::from_ref(identity), sealed.as_slice())
-        .map_err(|error| Error::new(format!("everyone.waiting: {error}")))?;
-    Waiting::decode(plain.as_slice())
-}
-
-/// Write `waiting` to [`waiting_file`], sealed to `identity`'s recipient; remove the file where
-/// nothing waits.
-///
-/// # Errors
-/// The writes cannot be sealed, or the file cannot be written or removed.
-fn write_waiting(paths: &Paths, identity: &Identity, waiting: &Waiting) -> crate::Result<()> {
-    let path = waiting_file(paths);
-    if waiting.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                Err(Error::new(format!("{}: {error}", path.display())))
-            }
-            _ => Ok(()),
-        };
-    }
-    let sealed = age::encrypt(&[identity.recipient()], waiting.encode().as_slice())?;
-    fsx::write_atomic(&path, &sealed, 0o600)
-}
-
-/// Change the writes waiting in [`waiting_file`] under this Mac's state lock: `change` gets what
-/// waits now and leaves what is to wait.
-fn change_waiting(
-    paths: &Paths,
-    identity: &Identity,
-    change: impl FnOnce(&mut Waiting),
-) -> crate::Result<()> {
-    let _lock = StateLock::take(paths)?;
-    let mut waiting = read_waiting(paths, identity)?;
-    change(&mut waiting);
-    write_waiting(paths, identity, &waiting)
-}
-
-/// Where publishes keep their waiting writes until a server takes the version that carries them
-/// ([`wait_for_key`], [`land_waiting`]), sealed to this Mac's own age recipient: one set per
-/// version, oldest first, each a `version <digest>` line and its writes' lines.
-fn pending_waiting_file(paths: &Paths) -> PathBuf {
-    paths.dir.join("everyone.waiting.pending")
-}
-
-/// Whether a publish left writes pending ([`wait_for_key`]) that no server's version has landed.
-pub(super) fn waiting_pending(paths: &Paths) -> bool {
-    pending_waiting_file(paths).exists()
-}
-
-/// The pending sets ([`pending_waiting_file`]), each the digest of the envelope that carries it
-/// and its writes, oldest first, opened with `identity`; none where there is no file.
-///
-/// # Errors
-/// The file cannot be read, does not open with `identity`, or is of no known shape.
-fn read_pending_waiting(
-    paths: &Paths,
-    identity: &Identity,
-) -> crate::Result<Vec<([u8; 32], Waiting)>> {
-    let Some(sealed) = fsx::read_private(
-        &pending_waiting_file(paths),
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )?
-    else {
-        return Ok(Vec::new());
-    };
-    let plain = age::decrypt(std::slice::from_ref(identity), sealed.as_slice())
-        .map_err(|error| Error::new(format!("everyone.waiting.pending: {error}")))?;
-    let bad = || Error::new("everyone.waiting.pending is of no known shape");
-    let mut sets: Vec<([u8; 32], zeroize::Zeroizing<Vec<u8>>)> = Vec::new();
-    for line in plain.as_slice().split_inclusive(|&b| b == b'\n') {
-        if let Some(hex) = line.strip_prefix(b"version ") {
-            let hex = hex.strip_suffix(b"\n").unwrap_or(hex);
-            let mut version = [0u8; 32];
-            if hex.len() != 64 || !aterm_codec::hex::decode_into(hex, &mut version) {
-                return Err(bad());
-            }
-            sets.push((version, zeroize::Zeroizing::new(Vec::new())));
-        } else {
-            let (_, writes) = sets.last_mut().ok_or_else(bad)?;
-            writes.extend_from_slice(line);
-        }
-    }
-    if sets.is_empty() {
-        return Err(bad());
-    }
-    sets.into_iter()
-        .map(|(version, writes)| Ok((version, Waiting::decode(writes.as_slice())?)))
-        .collect()
-}
-
-/// Write `sets` ([`read_pending_waiting`]) as the pending file, removing it where none is left.
-/// The caller holds the state lock.
-///
-/// # Errors
-/// The sets cannot be sealed, or the file cannot be written or removed.
-fn write_pending_waiting(
-    paths: &Paths,
-    identity: &Identity,
-    sets: &[([u8; 32], Waiting)],
-) -> crate::Result<()> {
-    if sets.is_empty() {
-        let path = pending_waiting_file(paths);
-        return match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                Err(Error::new(format!("{}: {error}", path.display())))
-            }
-            _ => Ok(()),
-        };
-    }
-    let mut plain = zeroize::Zeroizing::new(Vec::new());
-    for (version, writes) in sets {
-        plain.extend_from_slice(
-            format!("version {}\n", aterm_codec::hex::encode_lower(version)).as_bytes(),
-        );
-        plain.extend_from_slice(writes.encode().as_slice());
-    }
-    let sealed = age::encrypt(&[identity.recipient()], plain.as_slice())?;
-    fsx::write_atomic(&pending_waiting_file(paths), &sealed, 0o600)
-}
-
-/// The most pending sets ([`wait_for_key`]) this Mac keeps. Each one is a publish whose version
-/// no answer, sync or mirror has yet shown stored or refused (its reply was lost, its server
-/// unreachable). The oldest past this many is dropped, so a run of failed publishes cannot grow
-/// the file past what [`read_pending_waiting`] reads.
-pub(super) const MAX_PENDING_SETS: usize = 8;
-
-/// Keep a publish's `[everyone]` writes pending for the version whose envelope digest is
-/// `version`, before that envelope goes out: a version a server stores with them is never left
-/// without them, whatever becomes of the reply ([`land_waiting_held`]).
-///
-/// First, each pending set of a version among `stored` lands: the version this publish builds
-/// on and its parents, which a server holds. That covers an earlier publish whose answer said
-/// it was stored but whose landing missed the lock, and an earlier one a later version, read
-/// in its place, builds on.
-///
-/// Every other earlier set stays beside this one. This edit starts from a text that holds none
-/// of their writes, and one of them may be on a server after all, its reply lost. That server
-/// then refuses this version as not newer, and a later sync lands that set.
-///
-/// A pending file that cannot be read holds nothing this Mac can land, so it is started again
-/// rather than refusing every publish.
-///
-/// # Errors
-/// The state lock is not taken by `deadline`, the waiting writes cannot be read or written, or
-/// the pending writes cannot be sealed or written.
-pub(super) fn wait_for_key(
-    paths: &Paths,
-    identity: &Identity,
-    waiting: &Waiting,
-    version: &[u8; 32],
-    stored: &[[u8; 32]],
-    deadline: Option<std::time::Instant>,
-) -> crate::Result<()> {
-    if waiting.is_empty() && !waiting_pending(paths) {
-        return Ok(());
-    }
-    let _lock = match deadline {
-        Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline)?,
-        None => StateLock::take(paths)?,
-    };
-    let mut sets = read_pending_waiting(paths, identity).unwrap_or_default();
-    land_sets(paths, identity, &mut sets, stored)?;
-    if !waiting.is_empty() {
-        sets.retain(|(pending, _)| pending != version);
-        sets.push((*version, waiting.clone()));
-        let over = sets.len().saturating_sub(MAX_PENDING_SETS);
-        sets.drain(..over);
-    }
-    write_pending_waiting(paths, identity, &sets)
-}
-
-/// [`land_waiting_held`], taking this Mac's state lock by `deadline` where one is given: the
-/// publish whose version a server took.
-///
-/// # Errors
-/// As [`land_waiting_held`], or the state lock is not taken by `deadline`.
-pub(super) fn land_waiting(
-    paths: &Paths,
-    identity: &Identity,
-    versions: &[[u8; 32]],
-    deadline: Option<std::time::Instant>,
-) -> crate::Result<()> {
-    let _lock = match deadline {
-        Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline)?,
-        None => StateLock::take(paths)?,
-    };
-    land_waiting_held(paths, identity, versions)
-}
-
-/// A server holds each version whose envelope digest is in `versions`: a version it took or
-/// served, and the parents that version names. The writes pending for each ([`wait_for_key`])
-/// now wait in [`waiting_file`] for the new key ([`land_sets`]). Sets of other versions stay
-/// pending. The caller holds the state lock.
-///
-/// # Errors
-/// The pending or waiting writes cannot be read or written.
-pub(super) fn land_waiting_held(
-    paths: &Paths,
-    identity: &Identity,
-    versions: &[[u8; 32]],
-) -> crate::Result<()> {
-    let mut sets = read_pending_waiting(paths, identity)?;
-    let before = sets.len();
-    land_sets(paths, identity, &mut sets, versions)?;
-    if sets.len() == before {
-        return Ok(());
-    }
-    write_pending_waiting(paths, identity, &sets)
-}
-
-/// Land each of `sets` (oldest first) whose version is in `stored`, in order: its writes wait in
-/// [`waiting_file`] over what waits already. Each name it writes also leaves every earlier
-/// pending set. A person's later write of a name replaces an earlier one's whichever version is
-/// read first, and two servers that took different versions of one sequence still land the
-/// later edit. A set left with no write is dropped. The caller holds the state lock and writes
-/// `sets` back.
-///
-/// # Errors
-/// The waiting writes cannot be read or written.
-fn land_sets(
-    paths: &Paths,
-    identity: &Identity,
-    sets: &mut Vec<([u8; 32], Waiting)>,
-    stored: &[[u8; 32]],
-) -> crate::Result<()> {
-    let mut waiting: Option<Waiting> = None;
-    let mut at = 0;
-    while at < sets.len() {
-        if !stored.contains(&sets[at].0) {
-            at += 1;
-            continue;
-        }
-        let (_, landing) = sets.remove(at);
-        for (_, earlier) in &mut sets[..at] {
-            earlier.0.retain(|name, _| !landing.0.contains_key(name));
-        }
-        let held = match &mut waiting {
-            Some(held) => held,
-            None => waiting.insert(read_waiting(paths, identity)?),
-        };
-        for (name, write) in landing.0 {
-            held.0.insert(name, write);
-        }
-    }
-    sets.retain(|(_, writes)| !writes.is_empty());
-    match &waiting {
-        Some(held) => write_waiting(paths, identity, held),
-        None => Ok(()),
-    }
-}
-
-/// Drop the writes pending for `version` ([`wait_for_key`]): every server refused that version,
-/// so, as its records, they never enter the log. Other versions' sets stay pending. Best effort,
-/// as [`forget_held_draft`].
-pub(super) fn forget_waiting(paths: &Paths, identity: &Identity, version: &[u8; 32]) {
-    let Ok(_lock) = StateLock::take(paths) else {
-        return;
-    };
-    let Ok(mut sets) = read_pending_waiting(paths, identity) else {
-        return;
-    };
-    let before = sets.len();
-    sets.retain(|(pending, _)| pending != version);
-    if sets.len() != before {
-        let _ = write_pending_waiting(paths, identity, &sets);
-    }
-}
-
-/// The digests of `envelope` and of the parents it names: versions a server holds once it took
-/// or served `envelope` ([`land_waiting_held`]).
-pub(super) fn stored_versions(envelope: &crate::envelope::Envelope) -> Vec<[u8; 32]> {
-    std::iter::once(envelope.digest())
-        .chain(envelope.parents.iter().copied())
-        .collect()
-}
-
+#[path = "log_entries/waiting.rs"]
+mod waiting;
 #[cfg(test)]
-impl Waiting {
-    /// `[everyone]` `Put`s of `writes` (name, value), each over a name the writer read empty.
-    pub(super) fn of_puts(writes: &[(&str, &[u8])]) -> Self {
-        Self(
-            writes
-                .iter()
-                .map(|&(name, value)| {
-                    let to = Entry {
-                        name: name.to_owned(),
-                        value: SecretBytes::from(value.to_vec()),
-                        audience: Audience::Everyone,
-                        if_absent: false,
-                        anchor: None,
-                    };
-                    let write = WaitingWrite {
-                        to,
-                        from: None,
-                        resolve: false,
-                    };
-                    (name.to_owned(), write)
-                })
-                .collect(),
-        )
-    }
-
-    /// Each name and the value it becomes.
-    pub(super) fn values(&self) -> Values {
-        self.0
-            .iter()
-            .map(|(name, write)| (name.clone(), write.to.value.as_slice().to_vec()))
-            .collect()
-    }
-}
-
-/// Waiting writes as each name and the value it becomes ([`Waiting::values`]).
-#[cfg(test)]
-pub(super) type Values = BTreeMap<String, Vec<u8>>;
-
-/// What waits ([`waiting_file`]) and what is pending ([`pending_waiting_file`]), by version, as
-/// [`Waiting::values`].
-#[cfg(test)]
-pub(super) fn waiting_and_pending(
-    paths: &Paths,
-    identity: &Identity,
-) -> (Values, Vec<([u8; 32], Values)>) {
-    let waiting = read_waiting(paths, identity).expect("waiting").values();
-    let pending = read_pending_waiting(paths, identity)
-        .expect("pending")
-        .into_iter()
-        .map(|(version, writes)| (version, writes.values()))
-        .collect();
-    (waiting, pending)
-}
-
-/// Remove from `held` each write of `done` that still waits there as `done` names it.
-fn settle(held: &mut Waiting, done: &Waiting) {
-    for (name, write) in &done.0 {
-        if held.0.get(name).is_some_and(|kept| kept.same(write)) {
-            held.0.remove(name);
-        }
-    }
-}
-
-/// One vault pass's waiting writes ([`Waiting`]): once no newest `[everyone]` epoch wraps a Mac
-/// the log removed, sign each `[everyone]` write waiting here, as the edit would have signed it,
-/// under the epoch a writer seals under ([`sealing_epoch`]), and forget it. A write whose name
-/// the log holds just as it would leave it is done already (a pass cut short after its commit
-/// signs nothing twice). A write whose name another write changed since the edit read it (the
-/// rotation's own cascade among them, a removed Mac's deny rows or a new fleet code) is dropped,
-/// so a value the edit never saw stands: signed now, after it, it would revert it. Nothing is
-/// signed where this Mac does not open the newest epoch. Where a newest epoch was minted by, or
-/// wraps, a Mac the log or roster denies, the writes go under a fresh epoch, as a writer's
-/// departure does: minted after every head, it is wrapped to the Macs the newest epochs wrap and
-/// to the current seats (each seat a batch still arriving may wrap among them), less each one the
-/// log removed or the log or roster denies, so neither concurrent heads nor a batch still
-/// arriving hold it. Otherwise the writes reuse the epoch a writer seals under
-/// ([`sealing_epoch`]): the one newest epoch, or the lowest of secure twins. Nothing is signed
-/// where there is none: newest epochs concurrent with distinct recipient sets (the tender
-/// coalesces them), or a batch still arriving that may wrap a Mac outside the current seats and
-/// outside those only that batch can decide (a Mac with no seat it may still wrap). Returns what
-/// it signed, already in this Mac's records, nothing posted.
-///
-/// # Errors
-/// The waiting writes or local state cannot be read or written, or a record fails to sign.
-pub(super) fn sign_waiting_writes(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
-    let Some(identity) = super::read_identity(paths)? else {
-        return Ok(Vec::new());
-    };
-    if read_waiting(paths, &identity)?.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (minted, _, settled) = author_and_commit_records(paths, |store| {
-        let none = || Ok((Vec::new(), Waiting::default()));
-        let Some(mut log) = store.log().cloned() else {
-            return none();
-        };
-        let Some((actor, device, incarnation)) = open_local_member_signer(paths, &log)? else {
-            return none();
-        };
-        let Some(opened) = log.open_audience_entries(&identity)? else {
-            return none();
-        };
-        if rotation_due(&log, &opened, &EpochAudience::Everyone) {
-            return none();
-        }
-        let waiting = read_waiting(paths, &identity)?;
-        let newest = opened
-            .maximal_epochs
-            .get(&EpochAudience::Everyone)
-            .cloned()
-            .unwrap_or_default();
-        if newest.is_empty() || !opens_newest(&opened, &EpochAudience::Everyone) {
-            return none();
-        }
-        let roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
-        let denied = |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), &log, r);
-        let membership = log.membership();
-        let departed = newest.iter().any(|epoch| {
-            log.get(epoch).is_some_and(|record| {
-                membership.removal(record.actor()).is_some()
-                    || membership
-                        .get(record.actor())
-                        .is_some_and(|minter| denied(&minter.binding.recipient()))
-            }) || opened
-                .wrapped_recipients
-                .get(epoch)
-                .is_some_and(|wrapped| wrapped.iter().any(&denied))
-        });
-        let current = log.current_recipients_where(&EpochAudience::Everyone, |seat| {
-            roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, seat))
-        });
-        let flight = Flight::of_reader(&log, &identity.recipient());
-        // A departure that is no removal: a fresh epoch for the rest, as a writer's.
-        let fresh_to: BTreeSet<Recipient> = if departed {
-            newest
-                .iter()
-                .filter_map(|epoch| opened.wrapped_recipients.get(epoch))
-                .flatten()
-                .chain(&current)
-                .filter(|r| !log.recipient_is_removed(r) && !denied(r))
-                .copied()
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
-        let reuse = if departed {
-            None
-        } else {
-            let Some(epoch) = sealing_epoch(
-                &log,
-                &opened,
-                &newest,
-                &identity,
-                &current,
-                flight.undecided(&EpochAudience::Everyone),
-            ) else {
-                return none();
-            };
-            let Some(key) = opened.unwrapped_keys.get(&epoch) else {
-                return none();
-            };
-            Some((epoch, zeroize::Zeroizing::new(**key)))
-        };
-        let view = opened.by_audience.get(&Audience::Everyone);
-        let mut settled = Waiting::default();
-        let mut puts: Vec<&Entry> = Vec::new();
-        let mut deletes: Vec<&String> = Vec::new();
-        for (name, write) in &waiting.0 {
-            let read = view.and_then(|view| view.get(name));
-            let done = read.is_some_and(|read| same_entry(read, &write.to))
-                && !(write.resolve
-                    && opened
-                        .conflicts
-                        .contains(&(Audience::Everyone, name.clone())));
-            settled.0.insert(name.clone(), write.clone());
-            if done || read.map(entry_digest) != write.from {
-                continue;
-            }
-            if write.resolve {
-                deletes.push(name);
-            }
-            puts.push(&write.to);
-        }
-        let authored_ms = now_ms;
-        let mut minted = Vec::new();
-        device.with_seed(|writer_seed| -> crate::Result<()> {
-            if puts.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-            let (epoch, key) = match reuse {
-                Some(reused) => reused,
-                None => {
-                    let generation = opened
-                        .max_generation
-                        .get(&EpochAudience::Everyone)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                        .max(1);
-                    let (draft, key) =
-                        log.draft_epoch(&actor, authored_ms, EpochAudience::Everyone, generation)?;
-                    let record = draft.sign(writer_seed, incarnation)?;
-                    let epoch = *record.id();
-                    let _ = log.insert(record.clone())?;
-                    minted.push(record);
-                    for &recipient in &fresh_to {
-                        let record = log
-                            .draft_wrap(&actor, authored_ms, epoch, &key, recipient)?
-                            .sign(writer_seed, incarnation)?;
-                        let _ = log.insert(record.clone())?;
-                        minted.push(record);
-                    }
-                    (epoch, key)
-                }
-            };
-            // A `Delete` before its `Put`: a person's save replaces every sibling.
-            for name in &deletes {
-                let record = log
-                    .draft_delete(&actor, authored_ms, epoch, &key, name)?
-                    .sign(writer_seed, incarnation)?;
-                let _ = log.insert(record.clone())?;
-                minted.push(record);
-            }
-            for entry in &puts {
-                let record = log
-                    .draft_put(&actor, authored_ms, epoch, &key, entry)?
-                    .sign(writer_seed, incarnation)?;
-                let _ = log.insert(record.clone())?;
-                minted.push(record);
-            }
-            Ok(())
-        })?;
-        Ok((minted, settled))
-    })?;
-    if !settled.is_empty() {
-        change_waiting(paths, &identity, |held| settle(held, &settled))?;
-    }
-    Ok(minted)
-}
+pub(super) use waiting::{
+    BASES_LOG_ONLY, DRAFT_UNCLAIMED, MOVES_WAIT, OVERTAKEN_UNRECORDED, PENDING_BY_COUNT,
+    RACE_UNDEFERRED, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING, Values, pending_reach,
+    waiting_and_pending, waiting_file, waiting_values,
+};
+pub use waiting::{Overtaken, Overtaker};
+pub(super) use waiting::{
+    Waiting, claim_draft, forget_unsent, forget_waiting, land_published, land_waiting,
+    land_waiting_held, overlay_waiting_onto_document, overtaken_seen, read_overtaken,
+    sign_waiting_writes, sign_waiting_writes_by, stored_versions, unread_waiting, view_waiting,
+    wait_for_key, waiting_pending,
+};
+use waiting::{everyone_edit, moves_wait, read_waiting, standing, unread_as_none};
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
 /// `[everyone]` (unless `readmit` lets it back in, or its `Wrap` may still arrive: `flight`).
@@ -3472,6 +2820,7 @@ pub(super) fn draft_document_diff(
         doc,
         base,
         None,
+        None,
     )?
     .map(|(drafted, _)| drafted))
 }
@@ -3497,9 +2846,14 @@ pub(super) fn draft_document_diff(
 /// ([`Waiting`], one-mesh M4), returned beside the records, which hold none of them, for a
 /// publish to keep until a vault pass signs them. Nor does it mint a Commons epoch for that
 /// departure alone, where Commons' newest epoch wraps the removed Mac too.
+///
+/// `view` is what the admin view the edit was made from showed of this Mac's waiting writes
+/// ([`view_waiting`]; `None` for an edit made from no such view): the edit is drafted against it
+/// ([`everyone_edit`]), and the log and the writes that wait now are read under one observation of
+/// this Mac's state, so a vault pass signs none of them between the two reads (one-mesh W3).
 #[expect(
     clippy::too_many_arguments,
-    reason = "the existing document-diff inputs plus a caller-owned deadline"
+    reason = "the existing document-diff inputs plus the view and a caller-owned deadline"
 )]
 pub(super) fn draft_document_diff_until(
     paths: &Paths,
@@ -3509,13 +2863,101 @@ pub(super) fn draft_document_diff_until(
     identity: &Identity,
     doc: &Document,
     base: Base<'_>,
+    view: Option<&Waiting>,
     deadline: Option<std::time::Instant>,
-) -> crate::Result<Option<(Drafted, Waiting)>> {
+) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
     super::publication_current(deadline)?;
+    let observation = match view {
+        Some(_) if !unobserved_draft() => draft_observation(paths, deadline)?,
+        _ => None,
+    };
     let Some((store, _)) = trusted_seeded_store(paths, config, envelope_signer, handoff)? else {
         return Ok(None);
     };
-    draft_document_diff_with(paths, &store, identity, doc, base, deadline, true)
+    #[cfg(test)]
+    if let Some(hook) = DRAFT_READS.with(|hook| hook.borrow_mut().take()) {
+        hook(paths);
+    }
+    // What waits that this Mac cannot read is never read as none (one-mesh W3): a draft that
+    // writes `[everyone]` refuses over it.
+    let held = match view {
+        Some(_) => match read_waiting(paths, identity) {
+            Err(_) if unread_as_none() => Ok(Waiting::default()),
+            read => read,
+        },
+        None => Ok(Waiting::default()),
+    };
+    let drafted = draft_document_diff_with(
+        paths,
+        &store,
+        identity,
+        doc,
+        base,
+        (view, held.as_ref()),
+        deadline,
+        true,
+    );
+    drop(observation);
+    drafted
+}
+
+/// A test's hook into a draft ([`DRAFT_READS`]).
+#[cfg(test)]
+pub(super) type DraftReadsHook = Box<dyn FnOnce(&Paths)>;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hook, run once by the next draft on this thread made from an admin view, between
+    /// its read of the log and its read of the waiting writes ([`draft_document_diff_until`]).
+    pub(super) static DRAFT_READS: std::cell::RefCell<Option<DraftReadsHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// One-mesh W3's negative control, on for one test thread, or named for a whole lab process
+    /// in `ATERM_TEST_NEGATIVE_CONTROL` (`unobserved-draft`): a publish's draft reads the log and
+    /// this Mac's waiting writes with no observation of the state between them, so a vault pass
+    /// may sign a waiting write between the two reads, as before W3.
+    pub(crate) static UNOBSERVED_DRAFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`UNOBSERVED_DRAFT`] is on; never in a release build, which has no switch.
+fn unobserved_draft() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        UNOBSERVED_DRAFT.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("unobserved-draft")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// What a draft leaves for this Mac's `[everyone]` writes (one-mesh M4, W3).
+pub(super) struct EveryoneWrites {
+    /// What the publish keeps pending on its version ([`wait_for_key`]): where `waits`, the
+    /// edit's writes there, which its records hold none of; otherwise the writes that settle the
+    /// waiting ones the edit replaces or takes back ([`waiting::EveryoneEdit::settles`]), whose values the
+    /// records sign themselves.
+    pub(super) pending: Waiting,
+    /// Whether the edit's `[everyone]` writes wait for the new key.
+    pub(super) waits: bool,
+    /// Where `waits`, the names a view shows waiting ([`waiting::EveryoneEdit::shows`]): each the
+    /// edit changes, never a take-back.
+    pub(super) shows: Vec<String>,
+}
+
+impl EveryoneWrites {
+    /// Nothing pending, nothing waiting.
+    pub(super) fn none() -> Self {
+        Self {
+            pending: Waiting::default(),
+            waits: false,
+            shows: Vec::new(),
+        }
+    }
 }
 
 /// The document planner over an already authenticated, state-held snapshot.
@@ -3531,23 +2973,38 @@ pub(super) fn draft_document_diff_in_store(
     base: Base<'_>,
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<Option<Drafted>> {
-    Ok(
-        draft_document_diff_with(paths, store, identity, doc, base, deadline, false)?
-            .map(|(drafted, _)| drafted),
-    )
+    Ok(draft_document_diff_with(
+        paths,
+        store,
+        identity,
+        doc,
+        base,
+        (None, Ok(&Waiting::default())),
+        deadline,
+        false,
+    )?
+    .map(|(drafted, _)| drafted))
 }
 
 /// [`draft_document_diff_until`] over `store`: its `[everyone]` writes wait for the new key where
-/// `waits_for_key` and a `Remove` here waits for its rotation.
+/// `waits_for_key` and a `Remove` here waits for its rotation. `(view, held)` is the view the
+/// edit was made from and this Mac's waiting writes as read with `store`, or why they did not
+/// read: an edit that writes `[everyone]` refuses then, since any write it makes may be over one
+/// of them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the document-diff inputs, the view and what waits, a deadline and the wait switch"
+)]
 fn draft_document_diff_with(
     paths: &Paths,
     store: &Store,
     identity: &Identity,
     doc: &Document,
     base: Base<'_>,
+    (view, held): (Option<&Waiting>, Result<&Waiting, &Error>),
     deadline: Option<std::time::Instant>,
     waits_for_key: bool,
-) -> crate::Result<Option<(Drafted, Waiting)>> {
+) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
     super::publication_current(deadline)?;
     let Some(mut log) = store.log().cloned() else {
         return Ok(None);
@@ -3620,7 +3077,6 @@ fn draft_document_diff_with(
     };
     let rotation_waits = waits_in(&EpochAudience::Everyone);
     let commons_waits = waits_in(&EpochAudience::Commons);
-    let mut waiting = Waiting::default();
 
     let has_commons_aud = log.has_commons_epochs();
     let doc_commons_entry = doc
@@ -3635,7 +3091,7 @@ fn draft_document_diff_with(
             .find(|e| e.name == crate::commons::ENTRY)
             .map(|e| e.value)
     });
-    let entries_by_aud = entries_by_audience(doc, has_commons_aud);
+    let mut entries_by_aud = entries_by_audience(doc, has_commons_aud);
 
     let plans = doc.lockers();
     let active_plan_audiences: BTreeSet<Audience> =
@@ -3706,29 +3162,107 @@ fn draft_document_diff_with(
         .doc
         .map(|base_doc| entries_by_audience(base_doc, has_commons_aud))
         .unwrap_or_default();
-    // An edit that takes a name out of `[everyone]` (a `Delete`, a narrowing to a host list, the
-    // section dropped whole) writes it now, never waits: as any such edit, it mints a fresh epoch
-    // and reseals what stays, so the old value's epoch is neither newest nor winning, and that
-    // epoch carries the plan's machines, never a removed Mac. Signed later under the rotation's
-    // epoch, a waiting `Delete` would leave the value readable by every Mac admitted after (F15).
-    let leaves_everyone = {
-        let view = if sealed_away(&Audience::Everyone) {
-            base_entries.get(&Audience::Everyone)
-        } else {
-            opened.by_audience.get(&Audience::Everyone)
-        };
-        let kept = entries_by_aud.get(&Audience::Everyone);
-        view.is_some_and(|view| {
-            view.keys()
-                .any(|name| kept.is_none_or(|kept| !kept.contains_key(name)))
-        })
-    };
-    let waits = rotation_waits && !leaves_everyone;
     // A conflicted name a person saved: a `Delete` before its `Put` replaces every sibling, as a
     // `Put` of the value already winning would not (it carries that value, and leaves the others).
     let resolving = |aud: &Audience, name: &String| {
         let key = (aud.clone(), name.clone());
         opened.conflicts.contains(&key) && base.resolve.is_some_and(|names| names.contains(&key))
+    };
+    // What the edit reads of an audience: the log, or where this Mac opens none of its newest
+    // epochs, the text the edit started from.
+    let read_of = |aud: &Audience| {
+        if sealed_away(aud) {
+            base_entries.get(aud)
+        } else {
+            opened.by_audience.get(aud)
+        }
+    };
+    // One-mesh W3: the edit is drafted against the view it was made from, the log overlaid with
+    // this Mac's waiting writes, so a name it left as the view showed it keeps what stands there
+    // now, and a waiting write it changed or took back is replaced ([`everyone_edit`]).
+    let everyone_read = read_of(&Audience::Everyone);
+    let unread_held = Waiting::default();
+    let (held, unread) = match held {
+        Ok(held) => (held, None),
+        Err(error) => (&unread_held, Some(error)),
+    };
+    let edit = everyone_edit(
+        everyone_read,
+        view,
+        &standing(
+            held,
+            opened.by_audience.get(&Audience::Everyone),
+            &opened.conflicts,
+        ),
+        entries_by_aud.get(&Audience::Everyone),
+        |name| resolving(&Audience::Everyone, name),
+    );
+    if let Some(error) = unread
+        && !edit.writes.is_empty()
+    {
+        return Err(Error::new(format!(
+            "{error}; no [everyone] edit is drafted over this Mac's waiting writes until they read"
+        )));
+    }
+    if view.is_some_and(|view| !view.is_empty()) {
+        if edit.entries.is_empty() {
+            entries_by_aud.remove(&Audience::Everyone);
+        } else {
+            entries_by_aud.insert(Audience::Everyone, edit.entries.clone());
+        }
+    }
+    // An edit that takes a name out of `[everyone]` (a `Delete`, a narrowing to a host list, the
+    // section dropped whole) writes it now, never waits: as any such edit, it mints a fresh epoch
+    // and reseals what stays, so the old value's epoch is neither newest nor winning, and that
+    // epoch carries the plan's machines, never a removed Mac. Signed later under the rotation's
+    // epoch, a waiting `Delete` would leave the value readable by every Mac admitted after (F15).
+    let kept = entries_by_aud.get(&Audience::Everyone);
+    let leaves_everyone = everyone_read.is_some_and(|read| {
+        read.keys()
+            .any(|name| kept.is_none_or(|kept| !kept.contains_key(name)))
+    });
+    // A name the edit moves into `[everyone]` from a host list writes now too (one-mesh W3): the
+    // host list's `Delete` and the `[everyone]` `Put` go in one batch, under a fresh `[everyone]`
+    // epoch the removed Mac is not wrapped to, so the name is in one set at every point of the
+    // log. Kept waiting, its `Put` would leave the name in neither set until the new key came, and
+    // its `Delete` held back with it would need a signing path across audiences that the host
+    // lists' own end (B13) retires.
+    let moves_in = !moves_wait()
+        && kept.is_some_and(|kept| {
+            kept.keys().any(|name| {
+                everyone_read.is_none_or(|read| !read.contains_key(name))
+                    && opened
+                        .by_audience
+                        .keys()
+                        .chain(base_entries.keys())
+                        .filter(|aud| matches!(aud, Audience::Hosts(_)))
+                        .any(|aud| {
+                            read_of(aud).is_some_and(|read| read.contains_key(name))
+                                && entries_by_aud
+                                    .get(aud)
+                                    .is_none_or(|now| !now.contains_key(name))
+                        })
+            })
+        });
+    let waits = rotation_waits && !leaves_everyone && !moves_in;
+    // A name the edit left as the view showed it keeps its waiting write's settle of a conflict
+    // ([`everyone_edit`]): where the draft's records sign the name, they settle it too.
+    let carried = edit.writes.clone();
+    let resolving = |aud: &Audience, name: &String| {
+        resolving(aud, name) || (*aud == Audience::Everyone && carried.resolves(name))
+    };
+    let everyone = if waits {
+        EveryoneWrites {
+            waits: !edit.writes.is_empty(),
+            pending: edit.writes,
+            shows: edit.shows,
+        }
+    } else {
+        EveryoneWrites {
+            pending: edit.settles,
+            waits: false,
+            shows: Vec::new(),
+        }
     };
     let next_generation = |aud: &Audience| {
         opened
@@ -3744,16 +3278,7 @@ fn draft_document_diff_with(
     device.with_seed(|writer_seed| -> crate::Result<()> {
         for plan in &plans {
             if waits && plan.audience == Audience::Everyone {
-                // What the edit reads there: the log, or where this Mac opens none of its
-                // newest epochs, the text the edit started from.
-                let view = if sealed_away(&plan.audience) {
-                    base_entries.get(&plan.audience)
-                } else {
-                    opened.by_audience.get(&plan.audience)
-                };
-                waiting = Waiting::of_edit(view, entries_by_aud.get(&plan.audience), |name| {
-                    resolving(&plan.audience, name)
-                });
+                // Its writes wait for the new key ([`EveryoneWrites`]).
                 continue;
             }
             let mut plan_recipients = BTreeSet::new();
@@ -4267,18 +3792,63 @@ fn draft_document_diff_with(
             records: minted,
             heads: log.heads(),
         },
-        waiting,
+        everyone,
     )))
+}
+
+/// What a store's membership log is for judging a Commons peer ([`acknowledged_commons_log`]).
+/// Only [`CommonsLog::Trusted`] judges one; the others say why it does not, so a reader that
+/// must refuse a log of another root or lineage can tell it from one with nothing to judge by.
+pub enum CommonsLog {
+    /// A log of `trust`'s root and the configured vault lineage that carries
+    /// [`EpochAudience::Commons`] epochs (`F18`), with its heads digest. Boxed: a log is large
+    /// beside the empty answers.
+    Trusted(Box<Log>, [u8; 32]),
+    /// The store holds no membership log.
+    NoLog,
+    /// The log is of this root and lineage and carries no Commons epoch: it judges no Commons
+    /// peer.
+    NoCommonsEpochs,
+    /// The log is another root's: its genesis names another `(network, authority)`.
+    OtherRoot,
+    /// The log is of this root and not of the configured vault lineage.
+    OtherLineage,
+}
+
+impl CommonsLog {
+    /// The trusted log and its heads digest, if this is one.
+    #[must_use]
+    pub fn trusted(self) -> Option<(Log, [u8; 32])> {
+        match self {
+            Self::Trusted(log, digest) => Some((*log, digest)),
+            Self::NoLog | Self::NoCommonsEpochs | Self::OtherRoot | Self::OtherLineage => None,
+        }
+    }
+}
+
+/// The locally acknowledged [`Log`], classified for judging a Commons peer ([`CommonsLog`]).
+///
+/// # Errors
+/// The acknowledged records, the vault configuration or the retained history did not read, or
+/// the retained history does not cover a trusted log.
+pub fn acknowledged_commons_log(
+    paths: &Paths,
+    trust: crate::commons::journal::Trust,
+) -> crate::Result<CommonsLog> {
+    commons_log_from_store(paths, &super::load_acknowledged_records(paths)?, trust)
 }
 
 /// Load the locally held [`Log`] and its heads digest when it carries [`EpochAudience::Commons`]
 /// epochs (`F18`), matches `trust`'s `(network, authority)`, and aligns with the configured vault
-/// lineage.
+/// lineage ([`acknowledged_commons_log`]'s [`CommonsLog::Trusted`]).
+///
+/// # Errors
+/// As [`acknowledged_commons_log`].
 pub fn trusted_commons_log(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
-    trusted_commons_log_from_store(paths, &super::load_acknowledged_records(paths)?, trust)
+    acknowledged_commons_log(paths, trust).map(CommonsLog::trusted)
 }
 
 pub(super) fn trusted_commons_log_from_store(
@@ -4286,31 +3856,37 @@ pub(super) fn trusted_commons_log_from_store(
     store: &Store,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<Option<(Log, [u8; 32])>> {
+    commons_log_from_store(paths, store, trust).map(CommonsLog::trusted)
+}
+
+/// `store`'s log classified for judging a Commons peer: its root and lineage first, so a log of
+/// another root or lineage is never read as one with nothing to judge by.
+fn commons_log_from_store(
+    paths: &Paths,
+    store: &Store,
+    trust: crate::commons::journal::Trust,
+) -> crate::Result<CommonsLog> {
     let Some(log) = store.log() else {
-        return Ok(None);
+        return Ok(CommonsLog::NoLog);
     };
-    if !log.has_commons_epochs() {
-        return Ok(None);
-    }
-    let Body::Genesis { root, .. } = log.genesis().body() else {
-        return Ok(None);
+    let ours = Root {
+        network: trust.network,
+        authority: trust.authority,
     };
-    if *root
-        != (Root {
-            network: trust.network,
-            authority: trust.authority,
-        })
-    {
-        return Ok(None);
+    if !matches!(log.genesis().body(), Body::Genesis { root, .. } if *root == ours) {
+        return Ok(CommonsLog::OtherRoot);
     }
     if !commons_log_matches_local_lineage(paths, log)? {
-        return Ok(None);
+        return Ok(CommonsLog::OtherLineage);
+    }
+    if !log.has_commons_epochs() {
+        return Ok(CommonsLog::NoCommonsEpochs);
     }
     if let Some(config) = super::config(paths)? {
-        super::retained_history::require_covers(paths, &config, log)?;
+        super::retained_history::require_covers(&Reads::new(paths), &config, log)?;
     }
     let digest = records_heads_digest(log);
-    Ok(Some((log.clone(), digest)))
+    Ok(CommonsLog::Trusted(Box::new(log.clone()), digest))
 }
 
 pub(super) struct RecordsAuthorLock(std::fs::File);
@@ -4396,7 +3972,7 @@ pub(super) fn author_and_commit_records<T>(
 ) -> crate::Result<(Vec<Record>, Store, T)> {
     let _author = RecordsAuthorLock::take(paths)?;
     for attempt in 0..4 {
-        let observation = draft_observation(paths)?;
+        let observation = draft_observation(paths, None)?;
         let raw = super::load_records(paths)?;
         let before = raw.inventory();
         let snapshot = author_snapshot(paths, raw)?;
@@ -4419,16 +3995,24 @@ pub(super) fn author_and_commit_records<T>(
     unreachable!("bounded loop returns on attempt == 3")
 }
 
-/// The observation [`author_and_commit_records`] drafts under: `None` where this Mac has no state
-/// lock yet, so there is no pass to wait for, and the draft refuses whatever it needs from the
-/// state.
-fn draft_observation(paths: &Paths) -> crate::Result<Option<super::Drafting>> {
+/// The observation [`author_and_commit_records`] drafts under, and a publish's draft reads the log
+/// and this Mac's waiting writes under ([`draft_document_diff_until`]), taken by `deadline`, or
+/// within [`AUTHOR_OBSERVE`] without one: `None` where this Mac has no state lock yet, so there is
+/// no pass to wait for, and the draft refuses whatever it needs from the state.
+fn draft_observation(
+    paths: &Paths,
+    deadline: Option<Instant>,
+) -> crate::Result<Option<super::Drafting>> {
     // A lock an older build left wide is narrowed first, as the draft's own signer read narrows
     // it: the observation refuses a wide lock.
     StateLock::narrow_owned(paths)?;
-    match StateLock::observe_until(paths, Instant::now() + AUTHOR_OBSERVE)? {
+    let until = deadline.unwrap_or_else(|| Instant::now() + AUTHOR_OBSERVE);
+    match StateLock::observe_until(paths, until)? {
         Some(lock) => Ok(Some(super::Drafting::new(lock, paths))),
         None if !paths.lock_file().exists() => Ok(None),
+        None if deadline.is_some() => Err(Error::new(
+            "a vault pass still held this Mac's state at the deadline: run it again",
+        )),
         None => Err(Error::new(
             "a vault pass still held this Mac's state after a minute: run it again",
         )),
@@ -4475,7 +4059,8 @@ pub(super) fn checked_author_projection_for(
     config: &Config,
     store: &Store,
 ) -> crate::Result<Store> {
-    let projected = super::retained_history::project_store(paths, config, store.clone())?;
+    let projected =
+        super::retained_history::project_store(&Reads::new(paths), config, store.clone())?;
     let state = super::load_state(paths)?;
     if store.log().is_none()
         && (state.records_digest.is_some()
@@ -4493,7 +4078,7 @@ pub(super) fn checked_author_projection_for(
         ));
     }
     if let Some(log) = store.log()
-        && !check_legacy_frontier(paths, config, log)?
+        && !check_legacy_frontier(&Reads::new(paths), config, log)?
     {
         return Err(Error::of_kind(
             crate::ErrorKind::MembershipHistoryUnavailable,
@@ -4566,7 +4151,7 @@ pub(super) fn genesis_record_matches_local_lineage(
     let Some(config) = super::config(paths)? else {
         return Ok(false);
     };
-    super::retained_history::durably_bound(paths, &config, record.id())
+    super::retained_history::durably_bound(&Reads::new(paths), &config, record.id())
 }
 
 pub(super) fn genesis_signer_matches_local_lineage(
@@ -4682,6 +4267,80 @@ mod lineage_tests {
                 )
                 .unwrap(),
                 "accepted {why}"
+            );
+        }
+    }
+
+    /// A store holding only a genesis `seed` signed for `root`, which takes a genesis of `seed`'s
+    /// key alone: what a caller hands [`commons_log_from_store`] when the store it classifies
+    /// was not read under this Mac's lineage (a removal plan's or a retirement's candidate).
+    fn founded_by(seed: &[u8; 32], root: Root) -> Store {
+        let request = crate::commons::binding::Request::create(
+            root.network,
+            root.authority,
+            [0x21; 16],
+            [1; 16],
+            &Identity::from_secret_bytes([0x41; 32]),
+            &[1; 32],
+        )
+        .unwrap();
+        let entrant = Entrant {
+            request,
+            node_key: [0xAA; 32],
+            name: "m1".into(),
+            label: "m1".into(),
+        };
+        let genesis = Record::found(seed, vec![entrant], 1).unwrap();
+        let mut store = Store::dormant(&[envelope::signer_public(seed).unwrap()]);
+        assert!(store.insert(genesis).unwrap());
+        store
+    }
+
+    /// PF4: a store's log is classified for judging a Commons peer, and a log of another vault
+    /// lineage or another root is told apart from one with nothing to judge by
+    /// ([`CommonsLog`]), whether or not it carries Commons epochs: root and lineage are judged
+    /// first.
+    ///
+    /// NEGATIVE CONTROL (in the test): the `Option` reading
+    /// ([`trusted_commons_log_from_store`], all there was before PF4) answers `None` for the
+    /// foreign log and for this vault's log with no Commons epoch alike, so nothing reading it
+    /// could refuse the first without refusing the second.
+    #[test]
+    fn a_log_of_another_lineage_is_told_from_one_with_nothing_to_judge() {
+        let (_home, paths) = configured();
+        let root = Root {
+            network: [3; 16],
+            authority: [4; 32],
+        };
+        let trust = crate::commons::journal::Trust {
+            network: root.network,
+            authority: root.authority,
+            genesis: [0; 32],
+        };
+        let kind =
+            |store: &Store, trust| match commons_log_from_store(&paths, store, trust).unwrap() {
+                CommonsLog::Trusted(..) => "trusted",
+                CommonsLog::NoLog => "no log",
+                CommonsLog::NoCommonsEpochs => "no commons epochs",
+                CommonsLog::OtherRoot => "other root",
+                CommonsLog::OtherLineage => "other lineage",
+            };
+        let ours = founded_by(&PIN, root);
+        let foreign = founded_by(&UNRELATED, root);
+        assert_eq!(kind(&Store::dormant(&[]), trust), "no log");
+        assert_eq!(kind(&ours, trust), "no commons epochs");
+        assert_eq!(kind(&foreign, trust), "other lineage");
+        let mut elsewhere = trust;
+        elsewhere.network[0] ^= 1;
+        assert_eq!(kind(&ours, elsewhere), "other root");
+        assert_eq!(kind(&foreign, elsewhere), "other root");
+
+        for (why, store) in [("ours", &ours), ("foreign", &foreign)] {
+            assert!(
+                trusted_commons_log_from_store(&paths, store, trust)
+                    .unwrap()
+                    .is_none(),
+                "NEGATIVE CONTROL {why}: the Option reading names neither"
             );
         }
     }
@@ -5824,15 +5483,10 @@ pub(super) fn rotates_host_list(
     let opens_all = max_ids
         .iter()
         .all(|id| opened.unwrapped_keys.contains_key(id));
-    let wraps_removed = max_ids.iter().any(|id| {
-        opened
-            .wrapped_recipients
-            .get(id)
-            .is_some_and(|set| !set.is_disjoint(removed))
-    });
     let concurrent =
         max_ids.len() > 1 && !secure_twins(max_ids, &opened.wrapped_recipients, removed);
-    opens_all && (wraps_removed || concurrent || reseal_ready(opened, audience))
+    opens_all
+        && (wraps_removed(opened, max_ids, removed) || concurrent || reseal_ready(opened, audience))
 }
 
 /// [`post_records_best_effort`] on a thread of its own, for a caller inside a bounded exchange:
@@ -6021,10 +5675,55 @@ pub(super) fn reseal_audience(
     Ok(())
 }
 
-/// An upper bound on the keyed records one re-key of `audience` signs, read over the log, the
-/// `opened` view and `flight` (what was in flight before the batch's first mint,
-/// [`Flight::of_batch`]) before the batch mints: a [`reseal_audience`] (the tender's coverage,
-/// rotation and reseal, or another holder's later one), or a removal's own rotation
+/// What one re-key of an audience signs at most ([`rekey_bound`]): its keyed records and their
+/// wire bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RekeyCost {
+    /// Its keyed records ([`crate::membership_log::RecordBudgets::keyed`]).
+    pub(super) keyed: usize,
+    /// Their wire bytes ([`crate::membership_log::budgets::held_bytes_bound`]).
+    pub(super) bytes: usize,
+}
+
+impl RekeyCost {
+    /// This cost and `more`'s.
+    #[must_use]
+    pub(super) const fn plus(self, more: Self) -> Self {
+        Self {
+            keyed: self.keyed.saturating_add(more.keyed),
+            bytes: self.bytes.saturating_add(more.bytes),
+        }
+    }
+
+    /// This cost `times` over.
+    #[must_use]
+    pub(super) const fn times(self, times: usize) -> Self {
+        Self {
+            keyed: self.keyed.saturating_mul(times),
+            bytes: self.bytes.saturating_mul(times),
+        }
+    }
+
+    /// `records` records of `bytes` wire bytes each.
+    const fn of(records: usize, bytes: usize) -> Self {
+        Self {
+            keyed: records,
+            bytes: records.saturating_mul(bytes),
+        }
+    }
+}
+
+/// The most wire bytes a record the log holds takes when another `Put` or `Delete` re-seals
+/// what it sealed: its own bytes, with the most parents in place of its own.
+fn resealed_bytes(record: &Record) -> usize {
+    let parents = crate::membership_log::MAX_PARENTS.saturating_sub(record.parents().len());
+    record.bytes().len().saturating_add(32 * parents)
+}
+
+/// An upper bound on the keyed records one re-key of `audience` signs, and on their wire bytes,
+/// read over the log, the `opened` view and `flight` (what was in flight before the batch's first
+/// mint, [`Flight::of_batch`]) before the batch mints: a [`reseal_audience`] (the tender's
+/// coverage, rotation and reseal, or another holder's later one), or a removal's own rotation
 /// ([`rotate_after_removal`]) that puts `next` (its cascade) there. It counts, never fewer than
 /// such a re-key signs:
 /// - an attesting `Wrap` per uncovered keyed epoch of the audience, which a re-key that attests
@@ -6041,11 +5740,20 @@ pub(super) fn reseal_audience(
 ///   and deletes the dropped ones; for one it does not open whole, where a holder reads winners
 ///   this Mac cannot, those names and tombstones and each `Put` and `Delete` record the log holds
 ///   there under an epoch whose key this Mac lacks: a holder's winner this Mac cannot read is one
-///   of those records, and one it can read is a winner here too.
+///   of those records, and one it can read is this Mac's winner or, for a name whose concurrent
+///   writes differ here (`conflicts`), another of its siblings.
+///
+/// Its bytes are each record's most ([`crate::membership_log::Kind::most_bytes`] for a `Wrap`,
+/// [`crate::membership_log::entries::most_bytes`] for the rest): a name's `Put` of the value
+/// `next` or the view holds, or its `Delete`, whichever is longer, and for a conflicted name of an
+/// audience this Mac does not open whole the longest `Put` the log holds there, re-sealed
+/// ([`resealed_bytes`]); Commons' descriptor as this Mac reads it where it opens Commons whole,
+/// or else the longest of it and the descriptor `Put`s the log holds; and a record this Mac
+/// cannot read, re-sealed.
 ///
 /// The bound is of the log this Mac holds: records that reach it later (another Mac's admission
 /// or write) are counted when they arrive.
-pub(super) fn rekey_keyed_bound(
+pub(super) fn rekey_bound(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     flight: &Flight,
@@ -6053,7 +5761,9 @@ pub(super) fn rekey_keyed_bound(
     seats: &BTreeSet<Recipient>,
     removed: &BTreeSet<Recipient>,
     next: Option<&BTreeMap<String, Entry>>,
-) -> usize {
+) -> RekeyCost {
+    use crate::membership_log::entries::most_bytes;
+    let wrap = crate::membership_log::Kind::Wrap.most_bytes();
     let attest = opened.uncovered_keyed.get(audience).map_or(0, Vec::len);
     let mut carried = seats.clone();
     carried.extend(flight.of(audience).iter().filter(|r| !removed.contains(r)));
@@ -6068,30 +5778,86 @@ pub(super) fn rekey_keyed_bound(
         );
     }
     let values = match text_audience(audience) {
-        None => 1,
-        Some(text) if opened.fully_unwrapped_audiences.contains(audience) => {
-            let mut names: BTreeSet<&String> = opened
-                .by_audience
-                .get(&text)
-                .into_iter()
-                .flat_map(BTreeMap::keys)
-                .collect();
-            names.extend(next.into_iter().flat_map(BTreeMap::keys));
-            names.len() + opened.keyed_deletes.get(&text).map_or(0, BTreeSet::len)
+        None => {
+            // Where this Mac opens Commons whole a holder re-puts the descriptor it reads; else a
+            // holder may re-put one sealed under an epoch this Mac lacks, which is one of the
+            // log's descriptor `Put`s.
+            let control = opened.commons_control.as_ref().map(|control| {
+                most_bytes::put(audience, crate::commons::ENTRY.len(), None, control.len())
+            });
+            let descriptor = match control {
+                Some(control) if opened.fully_unwrapped_audiences.contains(audience) => control,
+                control => log
+                    .records()
+                    .filter(|record| {
+                        matches!(record.body(), Body::Put { audience: there, .. }
+                            if *there == EpochAudience::Commons)
+                    })
+                    .map(resealed_bytes)
+                    .chain(control)
+                    .max()
+                    .unwrap_or_else(|| {
+                        most_bytes::put(
+                            audience,
+                            crate::commons::ENTRY.len(),
+                            None,
+                            crate::text::MAX_VALUE,
+                        )
+                    }),
+            };
+            RekeyCost {
+                keyed: 1,
+                bytes: descriptor,
+            }
         }
         Some(text) => {
-            // A holder reads every name this Mac reads and, beyond them, only winners sealed
-            // under an epoch whose key this Mac lacks: each is one record there.
-            let mut names: BTreeSet<&String> = opened
-                .by_audience
-                .get(&text)
-                .into_iter()
-                .flat_map(BTreeMap::keys)
-                .collect();
+            let whole = opened.fully_unwrapped_audiences.contains(audience);
+            let held = opened.by_audience.get(&text);
+            let mut names: BTreeSet<&String> = held.into_iter().flat_map(BTreeMap::keys).collect();
             names.extend(next.into_iter().flat_map(BTreeMap::keys));
-            let unread = log
-                .records()
-                .filter(|record| match record.body() {
+            let put = |entry: Option<&Entry>| {
+                entry.map_or(0, |entry| {
+                    most_bytes::put(
+                        audience,
+                        entry.name.len(),
+                        entry.anchor.as_deref().map(str::len),
+                        entry.value.as_slice().len(),
+                    )
+                })
+            };
+            // A name whose concurrent writes differ, in an audience this Mac does not open
+            // whole: a holder that reads a write this Mac cannot may pick another sibling, which
+            // is one of the log's `Put`s there.
+            let mut longest: Option<usize> = None;
+            let mut longest_put = || {
+                *longest.get_or_insert_with(|| {
+                    log.records()
+                        .filter(|record| {
+                            matches!(record.body(), Body::Put { audience: there, .. }
+                                if there == audience)
+                        })
+                        .map(resealed_bytes)
+                        .max()
+                        .unwrap_or(0)
+                })
+            };
+            let mut values = RekeyCost::default();
+            for name in names {
+                let mut most = put(held.and_then(|held| held.get(name)))
+                    .max(put(next.and_then(|next| next.get(name))))
+                    .max(most_bytes::delete(audience, name.len()));
+                if !whole && opened.conflicts.contains(&(text.clone(), name.clone())) {
+                    most = most.max(longest_put());
+                }
+                values = values.plus(RekeyCost::of(1, most));
+            }
+            for name in opened.keyed_deletes.get(&text).into_iter().flatten() {
+                values = values.plus(RekeyCost::of(1, most_bytes::delete(audience, name.len())));
+            }
+            if !whole {
+                // A holder reads every name this Mac reads and, beyond them, only winners sealed
+                // under an epoch whose key this Mac lacks: each is one record there.
+                for record in log.records().filter(|record| match record.body() {
                     Body::Put {
                         audience: there,
                         epoch,
@@ -6107,15 +5873,78 @@ pub(super) fn rekey_keyed_bound(
                             && !opened.keyed_keys.contains_key(epoch)
                     }
                     _ => false,
-                })
-                .count();
-            names.len() + opened.keyed_deletes.get(&text).map_or(0, BTreeSet::len) + unread
+                }) {
+                    values = values.plus(RekeyCost::of(1, resealed_bytes(record)));
+                }
+            }
+            values
         }
     };
-    attest
-        .saturating_add(1)
-        .saturating_add(carried.len())
-        .saturating_add(values)
+    RekeyCost::of(attest, wrap)
+        .plus(RekeyCost::of(1, most_bytes::epoch(audience)))
+        .plus(RekeyCost::of(carried.len(), wrap))
+        .plus(values)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`owed_audiences`], on for one test thread: a due no Mac carries owes room too,
+    /// as the first P6 F1/F4 fix had it, so a host list every holder of which was removed keeps
+    /// its re-keys' room reserved for good, and the heal that would give concurrent heads a
+    /// carrier waits on a re-key that needs it.
+    pub(super) static OWED_UNCARRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn owed_uncarried() -> bool {
+    OWED_UNCARRIED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn owed_uncarried() -> bool {
+    false
+}
+
+/// The audiences a held `Remove` owes a re-key that some Mac can sign: [`Log::rekey_dues`]'
+/// `rotation` (a newest epoch still wraps a recipient the log removed) with a carrier, a current
+/// seat that holds every newest epoch (the removers are carriers too, and a due with none ranks
+/// nobody, [`crate::membership_log::RekeyDue::turn`]). A due no seat carries owes no room: nobody
+/// signs it (a host list every holder of which the log removed), or only a heal gives it a
+/// carrier (concurrent heads no seat holds both of), and that heal must not wait on it.
+pub(super) fn owed_audiences(log: &Log) -> BTreeSet<EpochAudience> {
+    log.rekey_dues()
+        .into_iter()
+        .filter(|due| due.rotation && (owed_uncarried() || !due.carriers.is_empty()))
+        .map(|due| due.audience)
+        .collect()
+}
+
+/// What the re-keys a held `Remove` made due still owe at worst, over the log as this Mac holds
+/// it (one-mesh proofs P6's `need`): for each of [`owed_audiences`], a ranked holder's rotation
+/// and one coalesce of the heads a concurrent removal leaves, each of [`rekey_bound`] over the
+/// log's current seats (none for a host list). A removal reserves it
+/// ([`super::remove::RemovalFill`]), and a heal ([`close_wrap_gaps`]) and the tender's re-keys no
+/// removal made due (`super::remove`'s `within_automatic_stop`) keep it free; a proof admission
+/// and a person's other writes weigh only the log's hard bound (P6's Calm premises F3 and F4).
+pub(super) fn owed_rekeys(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    flight: &Flight,
+) -> RekeyCost {
+    let removed = log.removed_recipients();
+    let seats = log.current_recipients(&EpochAudience::Everyone);
+    let no_seats = BTreeSet::new();
+    let mut owed = RekeyCost::default();
+    for audience in owed_audiences(log) {
+        let seats = if matches!(audience, EpochAudience::Hosts(_)) {
+            &no_seats
+        } else {
+            &seats
+        };
+        owed =
+            owed.plus(rekey_bound(log, opened, flight, &audience, seats, &removed, None).times(2));
+    }
+    owed
 }
 
 /// The coverage rule of §3.3.7 for `[everyone]` and Commons, for each of them `only` names (the
@@ -6962,7 +6791,7 @@ fn mirror_heads(
         // M4): the mirror waits with it, and drafts the heads again once the new key is here. A
         // version stamped now would name a log without those writes, and one sent unstamped would
         // be imported over the rotation's own writes.
-        Some((_, waiting)) if !waiting.is_empty() => return Ok(None),
+        Some((_, everyone)) if everyone.waits => return Ok(None),
         drafted => drafted.map(|(drafted, _)| drafted),
     };
     let my_recipient = identity.recipient().to_bech32();
@@ -7088,22 +6917,22 @@ fn mirror_heads(
 /// One step of the wrap-gap spread: the member ranked `k` among an epoch's holders closes a gap
 /// that is still open `k` steps after this Mac first saw it
 /// ([`crate::membership_log::Log::gap_rank`]).
-pub(super) const GAP_STEP_MS: u64 = 60_000;
+pub const GAP_STEP_MS: u64 = 60_000;
 
 /// How long every member but a remover waits on a re-key a removal made due, from when it first
 /// saw that removal (or the audience due, if later), before its own rank counts
 /// ([`super::remove::tend_epochs_at`]): the remover's rotation is in its own batch, so it arrives
 /// with the `Remove` or soon after.
-pub(super) const REMOVER_GRACE_MS: u64 = 10 * GAP_STEP_MS;
+pub const REMOVER_GRACE_MS: u64 = 10 * GAP_STEP_MS;
 
 /// How long an epoch another Mac minted holds the re-keys and gap closes over it while this Mac
-/// may hold only a prefix of its minter's batch ([`unsettled_of_others`]), from first sight. Not
+/// may hold only a prefix of its minter's batch (`unsettled_of_others`), from first sight. Not
 /// every batch ends in a record that settles it (a rotation of an audience its minter does not
 /// open whole ends in `Wrap`s), and no record kind could end one without writing a value, a
 /// name or a node key, so a minter that falls silent after its last `Wrap` holds the audience
 /// only this long, a Mac with no seat its batch may still wrap ([`Log::undecided`]) included:
 /// a whole batch that left such a Mac out reads the same until its minter signs again.
-pub(super) const SETTLE_GRACE_MS: u64 = REMOVER_GRACE_MS;
+pub const SETTLE_GRACE_MS: u64 = REMOVER_GRACE_MS;
 
 /// The epochs of `epochs` a Mac other than `me` minted whose batch `log` may hold only a prefix
 /// of ([`Log::unsettled`]): while they may be, the tender mints from none of them and the gap
@@ -7220,6 +7049,14 @@ fn write_gap_mark(
     fsx::write_atomic(&gap_mark_file(paths), text.as_bytes(), 0o600)
 }
 
+/// The gap closer's mark at `paths` as a record landing leaves it: its heads digest no longer the
+/// log's, so the next pass looks again, and every gap's clock kept.
+#[cfg(test)]
+pub(super) fn gap_mark_after_a_record(paths: &Paths) {
+    let mark = read_gap_mark(paths).expect("the gap closer's mark");
+    write_gap_mark(paths, &[0xA5; 32], mark.due, &mark.seen).expect("the mark");
+}
+
 /// Close the wrap gaps this member can close now (§3.3.6, F15, one-mesh M5): for `[everyone]` and
 /// the Commons audience, each epoch it holds that a current seat no roster denies lacks
 /// ([`Log::wrap_gaps`]: a newest epoch whatever its minter knew, since only a `Remove` revokes,
@@ -7234,7 +7071,9 @@ fn write_gap_mark(
 /// [`SETTLE_GRACE_MS`] after first sight if it has not, so a late settle or the grace puts no two
 /// ranks due at once. The spread counts from first sight, not from when the gap opened: after a
 /// split longer than a few steps every holder would otherwise be past due at its first look, and
-/// all sign.
+/// all sign. It signs only the `Wrap`s that leave free the room the re-keys a held `Remove` made
+/// due still owe (one-mesh proofs P6, F4), and a gap the room cannot hold ranks again from the
+/// first look that finds room, for the same reason.
 /// The records' heads digest gates the work: with no new record and nothing due, it reads
 /// nothing more. It looks without the state lock first, which the desk, the subscriber and the
 /// Commons runtime wait on, and takes it only to sign, looking again under it. Returns the
@@ -7273,6 +7112,52 @@ pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<R
     let _author = RecordsAuthorLock::take(paths)?;
     let lock = StateLock::take(paths)?;
     Ok(wrap_gaps_pass(paths, now_ms, Some(&lock))?.1)
+}
+
+/// A shared observation of this Mac's state a pass's look holds until it is done reading, so each
+/// of its reads sees the state rather than finding it busy, waiting out a writer until `deadline`.
+/// The outer `None`: a writer still held the state then. The inner: this Mac has no lock file yet,
+/// so no writer. The look drops it before any exclusive take of the lock.
+///
+/// # Errors
+/// The lock file cannot be read or narrowed.
+pub(super) fn look_until(
+    paths: &Paths,
+    deadline: Instant,
+) -> crate::Result<Option<Option<super::Drafting>>> {
+    StateLock::narrow_owned(paths)?;
+    match StateLock::observe_until(paths, deadline)? {
+        Some(lock) => Ok(Some(Some(super::Drafting::new(lock, paths)))),
+        None if paths.lock_file().exists() => Ok(None),
+        None => Ok(Some(None)),
+    }
+}
+
+/// [`close_wrap_gaps`], its waits for the vault's locks ending at `deadline`: `None` where a
+/// writer still held one then, which says nothing of what gaps there are.
+///
+/// # Errors
+/// As [`close_wrap_gaps`].
+pub(super) fn close_wrap_gaps_until(
+    paths: &Paths,
+    now_ms: u64,
+    deadline: Instant,
+) -> crate::Result<Option<Vec<Record>>> {
+    let Some(look) = look_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    let due = wrap_gaps_pass(paths, now_ms, None)?.0;
+    drop(look);
+    if !due {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(_author) = RecordsAuthorLock::try_take_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    let Some(lock) = StateLock::try_take_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    Ok(Some(wrap_gaps_pass(paths, now_ms, Some(&lock))?.1))
 }
 
 /// Host for `KeyedEpochs`' environment markers (F21), so `spec_xref_closure` accounts for every
@@ -7375,7 +7260,7 @@ fn wrap_gaps_pass(
     let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
     let membership = log.membership();
     let audiences = crate::membership_log::admission_audiences(&opened);
-    let mut due_now = Vec::new();
+    let mut ranked = Vec::new();
     let mut next_due: Option<u64> = None;
     let mut seen = BTreeMap::new();
     let gaps = log.wrap_gaps(&opened, &audiences);
@@ -7425,11 +7310,35 @@ fn wrap_gaps_pass(
         }
         let due = start
             .saturating_add(GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)));
-        if now_ms < due {
-            next_due = Some(next_due.map_or(due, |at| at.min(due)));
-            continue;
+        ranked.push((due, gap));
+    }
+    // A heal is never held by the 8,500 stop, and never takes the room a re-key a held `Remove`
+    // made due needs, in records or in bytes (one-mesh proofs P6: a removal reserves it, and a
+    // heal and the tender's other re-keys keep it free), since writers wait on that re-key. The gaps past the room, soonest due first, stay open until a record lands: a gap
+    // of the due audience closes with its rotation, one of another audience heals once the room
+    // comes back. A held gap ranks again from its first look with room, as a gap whose batch has
+    // not settled waits, whether or not its rank had come: every holder looks again on the same
+    // record, and ranks counted from before the hold would all have passed, a holder's that was
+    // not due when it last looked too.
+    ranked.sort_by_key(|(due, _)| *due);
+    let mut due_now = Vec::new();
+    if !ranked.is_empty() {
+        let keeps_ranks = heal_hold_keeps_ranks();
+        let weighed = if keeps_ranks {
+            ranked.iter().filter(|(due, _)| *due <= now_ms).count()
+        } else {
+            ranked.len()
+        };
+        let room = heal_room(&log, &opened, &actor, weighed);
+        for (place, (due, gap)) in ranked.into_iter().enumerate() {
+            if place >= room && !keeps_ranks {
+                seen.insert((gap.epoch, gap.recipient.to_bech32()), (now_ms, 0));
+            } else if now_ms < due {
+                next_due = Some(next_due.map_or(due, |at| at.min(due)));
+            } else if place < room {
+                due_now.push(gap);
+            }
         }
-        due_now.push(gap);
     }
     if due_now.is_empty() {
         write_gap_mark(paths, &digest, next_due.unwrap_or(0), &seen)?;
@@ -7461,6 +7370,75 @@ fn wrap_gaps_pass(
     // kept for the gaps still open.
     write_gap_mark(paths, &digest, next_due.unwrap_or(0), &seen)?;
     Ok((true, signed))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`heal_room`], on for one test thread: a heal weighs only the log's hard bound,
+    /// as before one-mesh proofs P6 F4, so its `Wrap`s take the room a due re-key needs.
+    pub(super) static HEAL_IGNORES_NEED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of the gap closer's room hold, on for one test thread: the room is weighed over the
+    /// gaps due now alone, and a gap held for it keeps the ranks it had, as the first P6 F4 fix
+    /// did, so once the room comes back every holder whose rank passed during the hold signs the
+    /// same `Wrap`.
+    pub(super) static HEAL_HOLD_KEEPS_RANKS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn heal_ignores_need() -> bool {
+    HEAL_IGNORES_NEED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn heal_ignores_need() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn heal_hold_keeps_ranks() -> bool {
+    HEAL_HOLD_KEEPS_RANKS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn heal_hold_keeps_ranks() -> bool {
+    false
+}
+
+/// How many of `gaps` heal `Wrap`s, signed by `actor`, the log takes while it keeps free, in
+/// records and in bytes, what the re-keys a held `Remove` made due owe ([`owed_rekeys`]; one-mesh
+/// proofs P6, F4).
+fn heal_room(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    actor: &MemberId,
+    gaps: usize,
+) -> usize {
+    use super::remove::{keeps_room, wide};
+    let owed = if heal_ignores_need() {
+        RekeyCost::default()
+    } else {
+        owed_rekeys(log, opened, &Flight::of_batch(log, opened, actor))
+    };
+    let wrap = crate::membership_log::Kind::Wrap.most_bytes();
+    let (keyed, limit) = (log.counts().keyed, log.budgets().keyed);
+    let (bytes, bound) = (
+        log.held_bytes(),
+        crate::membership_log::budgets::held_bytes_bound(),
+    );
+    (0..=gaps)
+        .rev()
+        .find(|&heals| {
+            keeps_room(wide(keyed), wide(heals), wide(owed.keyed), wide(limit))
+                && keeps_room(
+                    wide(bytes),
+                    wide(heals.saturating_mul(wrap)),
+                    wide(owed.bytes),
+                    wide(bound),
+                )
+        })
+        .unwrap_or(0)
 }
 
 /// Whether a roster denies `gap`'s seat or recipient (one-mesh M1: until wave D turns each

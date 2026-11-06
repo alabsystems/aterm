@@ -640,11 +640,14 @@ pub fn reset_clause(text: &str, shift: i64, year: i64) -> Option<String> {
         }
         None => (None, first),
     };
-    let lower = time.to_ascii_lowercase();
-    let (clock, half) = lower
-        .strip_suffix("am")
-        .map(|c| (c, "am"))
-        .or_else(|| lower.strip_suffix("pm").map(|c| (c, "pm")))?;
+    if time.len() < 3 {
+        return None;
+    }
+    let (clock, half) = match &time.as_bytes()[time.len() - 2..] {
+        s if s.eq_ignore_ascii_case(b"am") => (&time[..time.len() - 2], "am"),
+        s if s.eq_ignore_ascii_case(b"pm") => (&time[..time.len() - 2], "pm"),
+        _ => return None,
+    };
     let (h, m) = match clock.split_once(':') {
         Some((h, m)) => (h, Some(m)),
         None => (clock, None),
@@ -654,7 +657,6 @@ pub fn reset_clause(text: &str, shift: i64, year: i64) -> Option<String> {
     if !ok(h, 2) || m.is_some_and(|m| !(m.len() == 2 && ok(m, 2))) {
         return None;
     }
-    let clock = m.map_or_else(|| h.to_string(), |m| format!("{h}:{m}"));
     Some(format!(
         " · resets {}{clock}{half}",
         date.unwrap_or_default()
@@ -678,14 +680,18 @@ impl Reading {
     /// The reading of `text`.
     #[must_use]
     pub fn of(text: &str) -> Reading {
-        let lower = text.to_lowercase();
         Reading {
             wall: aterm_phase::classify_wall(text),
             not_a_wall: aterm_phase::wall::not_a_wall(text),
             by_status: aterm_phase::wall::named_by_status_alone(text),
             compact: ["wall.compact_images", "wall.compact_attachments"]
                 .iter()
-                .any(|id| lower.contains(&aterm_phase::anchor(id).to_lowercase())),
+                .any(|id| {
+                    let needle = aterm_phase::anchor(id).as_bytes();
+                    text.as_bytes()
+                        .windows(needle.len())
+                        .any(|w| w.eq_ignore_ascii_case(needle))
+                }),
         }
     }
 }
@@ -1063,8 +1069,9 @@ fn build_named(line: &str, program: Program) -> Option<String> {
 fn moved_before(line: &str, program: Program) -> Option<i64> {
     let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
     let (_, tail) = rest.split_once(" · lab reduce (")?;
-    let n = tail.split("times moved ").nth(1)?.split(' ').next()?;
-    let days = tail.split("times moved ").nth(1)?.split(' ').nth(1)?;
+    let mut moved = tail.split_once("times moved ")?.1.split(' ');
+    let n = moved.next()?;
+    let days = moved.next()?;
     (days.starts_with("day")).then(|| n.parse::<i64>().ok())?
 }
 
@@ -1077,7 +1084,7 @@ fn opens_free(
     id_key: bool,
 ) -> bool {
     id_key
-        || key.to_ascii_lowercase().ends_with("schema")
+        || (key.len() >= 6 && key.as_bytes()[key.len() - 6..].eq_ignore_ascii_case(b"schema"))
         || match program {
             Program::Claude => {
                 matches!(key, "toolUseResult" | "mcpMeta" | "trackedFileBackups")

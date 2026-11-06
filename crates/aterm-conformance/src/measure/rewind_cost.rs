@@ -546,9 +546,10 @@ fn writer_finished(status: &str) -> Result<bool, CouldNotRun> {
 /// The throughput row's disposition from the adjacent takes' ratios' [`MedianInterval`]: a
 /// recording that dropped input fails, whatever its speed; an interval at or above `min_milli`
 /// passes, and one wholly below it fails (recording cost more than the bound, under whatever load
-/// the takes ran in: ATERM-KI-1102-7's cost is real). An interval that holds `min_milli`, or none
-/// (too few pairs), is unproved: the takes varied more than the bound the row judges, so they
-/// are no evidence either way.
+/// the takes ran in: the replay mint's cost was real,
+/// `docs/measured/temporal-reader-rekey-2026-11-05.md`). An interval that holds `min_milli`, or
+/// none (too few pairs), is unproved: the takes varied more than the bound the row judges, so
+/// they are no evidence either way.
 #[must_use]
 pub const fn throughput_disposition(
     interval: Option<MedianInterval>,
@@ -697,7 +698,8 @@ mod tests {
     }
 
     /// A take drains for 0.2 to 3 s in a fresh instance (these runs' takes), so a load that
-    /// comes and goes slows whole takes (ATERM-KI-1102-7) and the arms' pooled medians follow
+    /// comes and goes slows whole takes (`docs/measured/temporal-reader-rekey-2026-11-05.md`)
+    /// and the arms' pooled medians follow
     /// the Mac: retained loaded runs pooled 955, a fail, and 1025, a pass that had one block run
     /// 2.5 times slow in both arms. Judged on the adjacent takes' ratios, each reads unproved:
     /// their intervals, 931..1049 and 892..1047, hold the bound. A quiet run's, 979..1005, clears

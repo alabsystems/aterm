@@ -390,8 +390,33 @@ fn repos_say_what_they_wait_on() {
     );
     let cloned = setup_with(vec![stage("GitHub repositories", "applied", "")], true);
     assert_eq!(
-        repos_area(&cloned, true, true, &none_owed()).level,
+        repos_area(
+            &cloned,
+            true,
+            true,
+            &Ok(OwedClone::Verified {
+                present: 3,
+                total: 3
+            })
+        )
+        .level,
         Level::Ok
+    );
+    assert_eq!(
+        repos_area(&cloned, true, true, &none_owed()).level,
+        Level::Due,
+        "a historical applied stage does not verify current repository contents"
+    );
+    assert_eq!(
+        repos_area(
+            &cloned,
+            true,
+            true,
+            &Ok(OwedClone::Due("0/53 present".into()))
+        )
+        .level,
+        Level::Working,
+        "a historical applied stage cannot hide missing repositories"
     );
     assert_eq!(
         repos_area(&setup_with(Vec::new(), true), true, true, &none_owed()).level,
@@ -412,15 +437,15 @@ fn repos_say_what_they_wait_on() {
 }
 
 /// Where no setup clones them (off macOS), the repositories read the clone `aterm init` owes: one
-/// already run owes none and reads ok with the token here, forever after; one owed is the vault
-/// sync's own; only with neither a clone owed nor a token is `aterm init` an agent's step.
+/// already run owes none, as does one never run. A token cannot distinguish them, so neither
+/// is reported as verified. An owed clone remains the vault sync's own step.
 #[test]
 fn repos_off_macos_read_the_owed_clone() {
     let here = Setup::NotHere;
     assert_eq!(
         repos_area(&here, true, true, &none_owed()).level,
-        Level::Ok,
-        "a clone aterm init ran owes nothing"
+        Level::Due,
+        "absence of clone debt does not prove the inventory is present"
     );
     let first = repos_area(&here, true, false, &none_owed());
     assert_eq!((first.level, who(&first)), (Level::Due, Some(Who::Agent)));
@@ -601,18 +626,18 @@ fn words_parse() {
 }
 
 /// Name: one name in the roster, the fleet and the Mac's own names is ok; a fleet name aterm
-/// still follows is aterm's; the Mac's own names that differ are a person's password; a taken
-/// fleet name is an agent's pick; no label yet is aterm's at admission. NEGATIVE CONTROL: a
-/// person's own fleet name is no step.
+/// still follows and a repair through its naming rule are aterm's; a missing rule needs setup's
+/// elevation, while an unreadable rule justifies no password request. A taken fleet name is an
+/// agent's pick; no label yet is aterm's at admission. A personal fleet name is no step.
 #[test]
 fn name_reads_one_name_across_vault_fleet_and_the_mac() {
-    use crate::converge::MacName;
+    use crate::converge::{MacName, MacNamePending};
     use aterm_agent::FleetName;
-    let named = |fleet: FleetName, pending: Option<&str>| {
+    let named = |fleet: FleetName, pending: Option<MacNamePending>| {
         name_area(&Ok(MacName::Named {
             target: "m42".to_owned(),
             fleet,
-            pending: pending.map(str::to_owned),
+            pending,
         }))
     };
     let ok = named(FleetName::Current, None);
@@ -627,10 +652,28 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
     assert_eq!(who(&following), Some(Who::Aterm));
     let host = named(
         FleetName::Current,
-        Some("this Mac's own name is Mac, not m42"),
+        Some(MacNamePending::Elevation(
+            "this Mac's own name is Mac, not m42".to_owned(),
+        )),
     );
     assert_eq!((host.level, who(&host)), (Level::Due, Some(Who::Person)));
-    assert!(host.next.unwrap().act.contains("--name m42"));
+    assert!(host.next.unwrap().act.contains("aterm init"));
+    let automatic = named(
+        FleetName::Current,
+        Some(MacNamePending::ThroughRule("own name differs".to_owned())),
+    );
+    assert_eq!(
+        (automatic.level, who(&automatic)),
+        (Level::Working, Some(Who::Aterm))
+    );
+    let unread = named(
+        FleetName::Current,
+        Some(MacNamePending::Unread("own name differs".to_owned())),
+    );
+    assert_eq!(
+        (unread.level, who(&unread)),
+        (Level::Unknown, Some(Who::Agent))
+    );
     let taken = named(FleetName::Taken("node-77".to_owned()), None);
     assert_eq!(who(&taken), Some(Who::Agent));
     let yours = named(FleetName::Kept("studio".to_owned()), None);
@@ -640,7 +683,7 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
         name_area(&Ok(MacName::Off("swarm off".to_owned()))).level,
         Level::Off
     );
-    for area in [ok, following, taken, yours] {
+    for area in [ok, following, taken, yours, automatic, unread] {
         assert!(consistent(&area), "{area:?}");
     }
 }

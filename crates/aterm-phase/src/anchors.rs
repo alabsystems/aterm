@@ -388,6 +388,17 @@ pub const ANCHORS: &[Anchor] = &[
     ),
     lit("automode.not_now", "Not now", "2.1.310"),
     lit("automode.never", "Don't show again", "2.1.310"),
+    lit(
+        "conversation_resume.title",
+        "Resume this conversation?",
+        "2.1.318",
+    ),
+    lit("conversation_resume.resume", "Resume", "2.1.318"),
+    lit(
+        "conversation_resume.new",
+        "Start a new conversation",
+        "2.1.318",
+    ),
     // The `Claude in Chrome` intro ([`crate::chrome_intro`]), as 2.1.317 drew it on 2026-11-02
     // and as its bundle's `ClaudeInChromeOnboarding` composes it: the title; the first paragraph;
     // while the bundle's extension check has not found the extension, the `Requires…` words and

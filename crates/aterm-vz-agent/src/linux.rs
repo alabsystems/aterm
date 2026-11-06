@@ -265,7 +265,7 @@ impl System for Guest {
 /// The registration was refused.
 pub fn register_rosetta() -> io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    if Path::new(boot::ROSETTA_ENTRY).exists() {
+    if std::fs::symlink_metadata(boot::ROSETTA_ENTRY).is_ok() {
         return Ok(false);
     }
     let line = boot::rosetta_registration(&format!("{}/rosetta", boot::ROSETTA_SHARE));

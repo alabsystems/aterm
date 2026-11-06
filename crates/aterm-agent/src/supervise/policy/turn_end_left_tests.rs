@@ -349,6 +349,32 @@ fn the_left_suffix_never_pushes_the_repository_ask_out() {
     );
 }
 
+/// THE LEFT SUFFIX RIDES EITHER LEAD OF LAND'S CONTRADICTION: led by git's finding, or by the
+/// agent's list standing over a clean repository, the contradiction carries the rows the agent
+/// left, whole where they fit, and with none left it names none. Asserted on the suffix's own
+/// function, not on its prose. Run against a contradiction whose either lead drops the left
+/// suffix from its parts, this test fails.
+#[test]
+fn the_left_suffix_rides_either_lead_of_lands_contradiction() {
+    let found = RepoRead::Found(crate::harness::repo_work::RepoWork {
+        repo: "/Users//a/Developer/parser".to_string(),
+        unlanded: 1,
+        ..Default::default()
+    });
+    let listed = "The parser's branch is not merged yet.";
+    for (repo, list) in [(&found, None), (&RepoRead::Clean, Some(listed))] {
+        for left in [0, 2] {
+            let text = land_contradicted_left(repo, list, left, &[], None).expect("a lead");
+            assert!(text.starts_with(LAND_CONTRADICTED_HEAD), "{text}");
+            assert_eq!(
+                text.contains(&left_suffix(2)),
+                left == 2,
+                "{list:?}, {left} left: {text}"
+            );
+        }
+    }
+}
+
 /// KEEP LINES ARE LEFT OUT OF THE BODY LAND READS: a keep line under the defense, bulleted or
 /// bare, its token in backticks or not, keeps its token; a word that is no token keeps nothing,
 /// and a keep line above the defense keeps nothing either. The body Land reads for open work

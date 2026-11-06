@@ -494,15 +494,19 @@ fn never_narrowed(dir: &Path, home: &Path, held: Held<'_>) -> bool {
     let Some(dir_id) = id(dir) else {
         return false;
     };
-    let mut kept = Vec::new();
+    let matches = |path: &Path| id(path) == Some(dir_id);
     if !home.as_os_str().is_empty() {
         let config = home.join(".config");
-        kept.extend([home.to_path_buf(), config.join("aterm"), config]);
+        if matches(home) || matches(&config.join("aterm")) || matches(&config) {
+            return true;
+        }
     }
-    if let Held::Config(Some(agh_dir)) = held {
-        kept.extend(agh_dir.ancestors().skip(1).take(2).map(Path::to_path_buf));
+    if let Held::Config(Some(agh_dir)) = held
+        && agh_dir.ancestors().skip(1).take(2).any(matches)
+    {
+        return true;
     }
-    kept.iter().any(|path| id(path) == Some(dir_id))
+    false
 }
 
 /// Formats the `Symlink` remedy for `name` inside `dir`.

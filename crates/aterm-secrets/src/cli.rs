@@ -1266,9 +1266,12 @@ mod unix {
             };
             install_subscriber(&paths, Some(program))
         };
+        let node_state = || service::node_state(&paths.home);
         let subscriber = Subscriber {
             state: &state,
             install: &install,
+            node: aterm_types::mesh_switch::MESH
+                .then_some(&node_state as &dyn Fn() -> crate::Result<service::State>),
         };
         match command {
             Command::Status => status(&paths, &subscriber),
@@ -1322,6 +1325,7 @@ mod unix {
             } => set(&paths, &name, &hosts, file, &fill),
             Command::Unset { name, hosts } => {
                 let admin = client::admin_open(&paths)?;
+                view_notes(&paths, &admin);
                 let mut doc = admin.doc.clone();
                 let hosts = machines_named_in_vault(&paths, &admin, &hosts)?;
                 if !doc
@@ -1590,6 +1594,27 @@ mod unix {
             ""
         };
         println!("{what}; published seq {}{rotated}", done.seq);
+        if !done.waiting.is_empty() {
+            println!(
+                "{} {} for a removal's new key: this Mac's vault pass signs {} once it arrives (aterm secrets edit shows {} until then)",
+                done.waiting.join(", "),
+                if done.waiting.len() == 1 {
+                    "waits"
+                } else {
+                    "wait"
+                },
+                if done.waiting.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+                if done.waiting.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            );
+        }
         if let Some(release) = &done.alab_release {
             print!("{}", release_note(release));
         }
@@ -1794,6 +1819,38 @@ mod unix {
         Ok(trimmed)
     }
 
+    /// What a view a person edits from shows of this Mac's `[everyone]` writes waiting for a
+    /// removal's new key (one-mesh W3), and of the ones a later change overtook, each record once:
+    /// a record, never an alert.
+    fn view_notes(paths: &Paths, admin: &client::Admin) {
+        let waiting = admin.waiting();
+        if !waiting.is_empty() {
+            eprintln!(
+                "waiting for a removal's new key: {} (this Mac's writes, shown as they will be; a vault pass signs them once the key arrives, and an edit that changes one or sets it back takes it back)",
+                waiting.join(", ")
+            );
+        }
+        for unread in client::waiting_unread(paths) {
+            match unread {
+                client::UnreadWaiting::Waiting(file) => eprintln!(
+                    "not read: {file} does not open with this Mac's key; nothing waiting is signed over it, and a save that writes [everyone] is refused until it is moved aside (which drops the writes it holds)"
+                ),
+                client::UnreadWaiting::Pending(file) => eprintln!(
+                    "not read: {file} does not open with this Mac's key; nothing waiting is signed or landed over it, and a save whose [everyone] writes would wait for the new key, or that replaces a waiting one, is refused until it is moved aside (which drops the writes it holds)"
+                ),
+            }
+        }
+        let overtaken = admin.overtaken();
+        for record in overtaken {
+            eprintln!("overtaken: {}", record.line(|ms| ago(ms / 1000)));
+        }
+        if !overtaken.is_empty()
+            && let Err(error) = client::overtaken_shown(paths, admin)
+        {
+            eprintln!("overtaken: not marked shown ({error})");
+        }
+    }
+
     fn ago(then: u64) -> String {
         let now = aterm_time::unix_secs().unwrap_or(then);
         let secs = now.saturating_sub(then);
@@ -1906,6 +1963,34 @@ mod unix {
         pub(super) state: &'a dyn Fn() -> crate::Result<service::State>,
         /// Install and start it ([`install_subscriber`]).
         pub(super) install: &'a dyn Fn() -> crate::Result<String>,
+        /// The node service's state, with the mesh on ([`service::node_state`]): its vault pass
+        /// is this Mac's, and `status` reads it.
+        pub(super) node: Option<&'a dyn Fn() -> crate::Result<service::State>>,
+    }
+
+    /// What the node service's vault pass did last, in `aterm secrets status`'s words.
+    pub(super) fn node_pass_words(
+        state: &crate::Result<service::State>,
+        receipt: Option<&client::NodePassReceipt>,
+        turned_off: bool,
+    ) -> String {
+        let job = service_words(state);
+        if turned_off {
+            return format!("{job}, keeps no vault work (aterm secrets agent off)");
+        }
+        let Some(receipt) = receipt else {
+            return format!("{job}, has not looked at the vault yet");
+        };
+        let when = ago(receipt.ran_ms / 1000);
+        match receipt.said {
+            client::NodePassSaid::Done => format!("{job}, looked at the vault {when}"),
+            client::NodePassSaid::Busy => {
+                format!("{job}, waited for another vault write {when} and looks again")
+            }
+            client::NodePassSaid::Failed => {
+                format!("{job}, could not finish its look at the vault {when} and looks again")
+            }
+        }
     }
 
     /// What became of this Mac's approver where a command needs one to keep what it promises.
@@ -2275,6 +2360,16 @@ mod unix {
                 }
             }
             Err(error) => println!("needs: unreadable ({error})"),
+        }
+        if let (Some(_), Some(node)) = (&status.config, subscriber.node) {
+            println!(
+                "node service: {}",
+                node_pass_words(
+                    &node(),
+                    client::node_pass_receipt(paths).as_ref(),
+                    service::subscriber_turned_off(&paths.home),
+                )
+            );
         }
         if status.config.is_some() {
             let state = (subscriber.state)();
@@ -3329,6 +3424,7 @@ mod unix {
         ask: &dyn Fn(&str) -> Option<String>,
     ) -> crate::Result<ExitCode> {
         let mut admin = client::admin_open(paths)?;
+        view_notes(paths, &admin);
         let base = admin.doc.clone();
         let scratch = client::Scratch::new(paths)?;
         let file = scratch
@@ -3529,6 +3625,7 @@ mod unix {
             )));
         }
         let mut admin = client::admin_open(paths)?;
+        view_notes(paths, &admin);
         let hosts = &machines_named_in_vault(paths, &admin, hosts)?;
         let (doc, anchor) = set_in(&admin.doc, &audience(hosts), name, value.as_slice(), fill)?;
         // A person's save settles a conflict the log holds for this entry.
@@ -6789,6 +6886,49 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn status_says_what_the_node_service_last_did_with_the_vault() {
+        let running = || {
+            Ok(crate::service::State::Installed {
+                pid: Some(7),
+                unit: std::path::PathBuf::from("unit"),
+            })
+        };
+        let now_ms = aterm_time::unix_secs().unwrap() * 1000;
+        let receipt = |said| crate::client::NodePassReceipt {
+            ran_ms: now_ms,
+            said,
+            signed: 0,
+            applied: None,
+        };
+        let words = |said, off| unix::node_pass_words(&running(), Some(&receipt(said)), off);
+        assert!(
+            words(crate::client::NodePassSaid::Done, false)
+                .starts_with("running (pid 7), looked at the vault ")
+        );
+        assert!(
+            words(crate::client::NodePassSaid::Busy, false)
+                .starts_with("running (pid 7), waited for another vault write ")
+        );
+        assert!(
+            words(crate::client::NodePassSaid::Failed, false)
+                .starts_with("running (pid 7), could not finish its look at the vault ")
+        );
+        assert_eq!(
+            words(crate::client::NodePassSaid::Done, true),
+            "running (pid 7), keeps no vault work (aterm secrets agent off)"
+        );
+        assert_eq!(
+            unix::node_pass_words(&running(), None, false),
+            "running (pid 7), has not looked at the vault yet"
+        );
+        assert_eq!(
+            unix::node_pass_words(&Ok(crate::service::State::Absent), None, false),
+            "not installed, has not looked at the vault yet"
+        );
+    }
+
     /// `status` of a machine of a signed vault names it by its code: the name it asked for
     /// may be another machine's in the vault.
     #[cfg(unix)]
@@ -6824,7 +6964,11 @@ mod tests {
         state: &'a dyn Fn() -> crate::Result<crate::service::State>,
         install: &'a dyn Fn() -> crate::Result<String>,
     ) -> unix::Subscriber<'a> {
-        unix::Subscriber { state, install }
+        unix::Subscriber {
+            state,
+            install,
+            node: None,
+        }
     }
 
     #[cfg(unix)]

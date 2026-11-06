@@ -33,6 +33,10 @@ use closed_restart::ClosedRestart;
 mod account_continuation;
 use account_continuation::AccountContinuation;
 
+#[path = "native_account_retention.rs"]
+mod account_retention;
+use account_retention::{AccountLineages, AccountSlot};
+
 #[path = "native_preparation.rs"]
 mod preparation;
 use preparation::{Preparation, Preparing, finish_preparation, retry_preparation};
@@ -192,6 +196,7 @@ pub(crate) struct Operations {
     reservations: std::collections::BTreeSet<String>,
     cancelled: BTreeMap<String, CancelledPrepare>,
     receipt_flights: BTreeMap<String, usize>,
+    account_lineages: AccountLineages,
 }
 
 /// A data-only seal for a preparation that had not published an operation. The original
@@ -214,6 +219,7 @@ impl Operations {
                     .filter(|id| !self.reservations.contains(*id))
                     .count(),
             )
+            .saturating_add(self.account_lineages.spares())
     }
 
     #[cfg_attr(
@@ -233,6 +239,7 @@ impl Operations {
         )
     )]
     fn reclaim(&mut self, now_us: u64) -> Vec<Arc<Mutex<Operation>>> {
+        let mut retired = self.compact_account_lineages();
         let expired_seals = self
             .cancelled
             .iter()
@@ -248,7 +255,7 @@ impl Operations {
             .completed
             .iter()
             .filter_map(|id| {
-                if self.receipt_flights.contains_key(id) {
+                if self.receipt_flights.contains_key(id) || self.account_lineages.pins(id) {
                     return None;
                 }
                 let operation = self.by_id.get(id)?;
@@ -263,7 +270,6 @@ impl Operations {
                 .then(|| id.clone())
             })
             .collect::<Vec<_>>();
-        let mut retired = Vec::new();
         for id in expired {
             self.completed.retain(|old| old != &id);
             if let Some(operation) = self.by_id.remove(&id) {
@@ -280,6 +286,7 @@ struct PrepareSlot<'a> {
     ctx: &'a crate::SessionCtx,
     id: String,
     published: bool,
+    account: AccountSlot,
 }
 
 /// Transient data-only pin, installed under the same table lock as reclamation
@@ -381,6 +388,7 @@ impl<'a> PrepareSlot<'a> {
         id: &str,
         now_us: u64,
         crash: bool,
+        account: AccountSlot,
     ) -> Result<Self, String> {
         let (retired, result) = {
             let mut table = ctx
@@ -407,11 +415,14 @@ impl<'a> PrepareSlot<'a> {
                 || table.cancelled.contains_key(id)
             {
                 Err("ERR busy native operation prepare\n".into())
-            } else if table.slots() >= MAX_COMPLETED {
-                Err("ERR busy native operation history\n".into())
             } else {
-                table.reservations.insert(id.to_string());
-                Ok(())
+                let occupied = table.slots();
+                table
+                    .account_lineages
+                    .reserve(&account, id, occupied)
+                    .map(|()| {
+                        table.reservations.insert(id.to_string());
+                    })
             };
             (retired, result)
         };
@@ -422,6 +433,7 @@ impl<'a> PrepareSlot<'a> {
             ctx,
             id: id.to_string(),
             published: false,
+            account,
         })
     }
 
@@ -435,13 +447,14 @@ impl<'a> PrepareSlot<'a> {
 impl Drop for PrepareSlot<'_> {
     fn drop(&mut self) {
         if !self.published {
-            self.ctx
+            let mut table = self
+                .ctx
                 .fenced_writes
                 .native
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .reservations
-                .remove(&self.id);
+                .unwrap_or_else(|p| p.into_inner());
+            table.reservations.remove(&self.id);
+            table.account_lineages.cancel(&self.account, &self.id);
         }
     }
 }
@@ -1851,7 +1864,9 @@ fn prepare_inner(
             ..
         }
     );
-    let mut slot = match PrepareSlot::reserve(ctx, &request.id, now, crash) {
+    let account_slot =
+        AccountSlot::for_request(&request, &caller, renewal.is_some(), account.as_ref());
+    let mut slot = match PrepareSlot::reserve(ctx, &request.id, now, crash, account_slot) {
         Ok(slot) => slot,
         Err(refusal) => return refusal,
     };

@@ -57,9 +57,15 @@ pub mod fleet_log;
 /// fleet.
 #[cfg(unix)]
 mod fleet_member;
+/// The vault this Mac's fleet state was taken under, which alone lets its drive grants admit
+/// (F17, ATERM-KI-1105-10).
+#[cfg(unix)]
+pub mod fleet_vault;
 /// This machine's name: `machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3).
 #[cfg(unix)]
 pub mod machine_name;
+/// The `aterm name` CLI, callable in-process.
+pub mod name_cli;
 /// The production signed-image service backend and immutable native proof.
 #[cfg(unix)]
 pub mod service_activation;

@@ -863,9 +863,15 @@ impl Directory {
         let mut seen: BTreeSet<_> = records.iter().map(|r| r.header().id).collect();
         let (retained, _) = self.retained()?;
         for evidence in catalog.metadata_evidence(session)? {
+            if evidence.catalog_eligible || retained.is_empty() {
+                continue;
+            }
             let Some(record) = evidence.record else {
                 continue;
             };
+            if seen.contains(&record.header().id) {
+                continue;
+            }
             let Ok(descriptor) = Descriptor::decode(self.trust, record.payload()) else {
                 continue;
             };
@@ -905,16 +911,16 @@ impl Directory {
             if nominated.len() < PER_CREATOR {
                 nominated.insert(id);
             }
-            if !snapshot.entries.contains_key(&id) {
-                order.push(id);
-            }
             snapshot
                 .entries
                 .entry(id)
-                .or_insert_with(|| Entry {
-                    scope: descriptor.scope,
-                    declarations: Vec::new(),
-                    state: State::Subscribed,
+                .or_insert_with(|| {
+                    order.push(id);
+                    Entry {
+                        scope: descriptor.scope,
+                        declarations: Vec::new(),
+                        state: State::Subscribed,
+                    }
                 })
                 .declarations
                 .push(Declaration {

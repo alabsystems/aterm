@@ -401,7 +401,7 @@ pub fn join_vault(old: &str, new: &str) -> Result<String> {
         !routes(table)
             && (read_names(table).is_empty()
                 || owner_name(table).is_some_and(|name| {
-                    routed.contains(&name.to_ascii_lowercase())
+                    routed.iter().any(|r| r.eq_ignore_ascii_case(name))
                         || name.eq_ignore_ascii_case(aterm_types::channel::PUBLIC_OWNER)
                 }))
     };

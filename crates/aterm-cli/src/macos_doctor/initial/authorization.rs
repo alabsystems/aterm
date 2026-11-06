@@ -1587,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_expansion_widens_finished_and_saved_partial_plans() {
+    fn fleet_expansion_widens_finished_automatic_plans_and_preserves_personal_plans() {
         let root = aterm_tempfile::tempdir().unwrap();
         let narrow = selected(&[Setting::Permissions]);
         let first = admit(root.path(), &narrow, Admission::Automatic).unwrap();
@@ -1608,12 +1608,14 @@ mod tests {
         assert_eq!(saved_plan(root.path()).unwrap(), Some(full.clone()));
         assert!(saved_plan_provisional(root.path()).unwrap());
 
-        // Fleet admission also expands a saved partial plan.
+        // Fleet admission preserves a partial plan the person chose.
         let other = aterm_tempfile::tempdir().unwrap();
         admit(other.path(), &narrow, Admission::Person).unwrap();
         assert!(!saved_plan_provisional(other.path()).unwrap());
-        assert!(admit(other.path(), &full, Admission::Upgrade).is_some());
-        assert_eq!(saved_plan(other.path()).unwrap(), Some(full));
+        let before = observation_at(other.path()).unwrap();
+        assert_eq!(admit(other.path(), &full, Admission::Upgrade), None);
+        assert_eq!(saved_plan(other.path()).unwrap(), Some(narrow));
+        assert_eq!(observation_at(other.path()).unwrap(), before);
     }
 
     #[test]

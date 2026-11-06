@@ -509,7 +509,9 @@ impl Planner<'_> {
         }
         if let Some((value, at)) =
             self.agreed(ADDRESS.name, &pk, "protected", read.get("protected"))
-            && matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+            && (value.eq_ignore_ascii_case("true")
+                || value == "1"
+                || value.eq_ignore_ascii_case("yes"))
         {
             self.protect(&pk, &at);
         }
@@ -536,22 +538,33 @@ impl Planner<'_> {
         let protected = self.protected.contains(&pk);
         if let Some((value, at)) = self.agreed(ADDRESS.name, &pk, "provider", read.get("provider"))
         {
-            let word = match value.to_ascii_lowercase().as_str() {
-                "proton" | "protonmail" => "proton",
-                "gmail" => "gmail",
-                "google" => "google",
-                "outlook" | "hotmail" => "outlook",
-                "privateemail" => "privateemail",
-                _ => "other",
+            let word = if value.eq_ignore_ascii_case("proton")
+                || value.eq_ignore_ascii_case("protonmail")
+            {
+                "proton"
+            } else if value.eq_ignore_ascii_case("gmail") {
+                "gmail"
+            } else if value.eq_ignore_ascii_case("google") {
+                "google"
+            } else if value.eq_ignore_ascii_case("outlook") || value.eq_ignore_ascii_case("hotmail")
+            {
+                "outlook"
+            } else if value.eq_ignore_ascii_case("privateemail") {
+                "privateemail"
+            } else {
+                "other"
             };
             self.want(&ADDRESS, &pk, "provider", json!(word), &at);
         }
         if let Some((value, at)) = self.agreed(ADDRESS.name, &pk, "status", read.get("status")) {
-            let word = match value.to_ascii_lowercase().as_str() {
-                "active" => "active",
-                "suspended" => "suspended",
-                "disabled" => "disabled",
-                _ => "unknown",
+            let word = if value.eq_ignore_ascii_case("active") {
+                "active"
+            } else if value.eq_ignore_ascii_case("suspended") {
+                "suspended"
+            } else if value.eq_ignore_ascii_case("disabled") {
+                "disabled"
+            } else {
+                "unknown"
             };
             self.want(&ADDRESS, &pk, "status", json!(word), &at);
         }
@@ -626,8 +639,9 @@ impl Planner<'_> {
         if let Some((url, at)) =
             self.agreed(ADDRESS.name, &pk, "webmail_url", read.get("webmail_url"))
         {
-            let provider = read.get("provider").map(|(p, _, _)| p.to_ascii_lowercase());
-            let default = provider.as_deref().map_or("", default_webmail);
+            let default = read
+                .get("provider")
+                .map_or("", |(p, _, _)| default_webmail(&p));
             if url != default {
                 match &mailbox {
                     Some(mb)
@@ -789,7 +803,7 @@ impl Planner<'_> {
         // fleet_db's `service` names the product where it is one of the provider's; otherwise
         // the provider's default, and the word a finding.
         let service = match read.get("service") {
-            Some((word, at, _)) => match super::service_word(&word.to_ascii_lowercase()) {
+            Some((word, at, _)) => match super::service_word(&word) {
                 Some((of, service)) if of == provider => Some((service, at)),
                 _ => {
                     self.uncarried(ACCOUNT.name, &pk, "service", at);
@@ -956,7 +970,10 @@ impl Planner<'_> {
         // fleet_db wrote `<label>.local` for every row: a host name is carried only where the
         // owner gave another.
         if let Some((host, at)) = self.agreed(MACHINE.name, &pk, "hostname", read.get("hostname"))
-            && host != format!("{}.local", raw.trim().to_ascii_lowercase())
+            && host.strip_suffix(".local").is_none_or(|stem| {
+                stem.bytes().any(|b| b.is_ascii_uppercase())
+                    || !stem.eq_ignore_ascii_case(raw.trim())
+            })
         {
             if guard::text(&host, 64).is_ok() && !host.contains('@') {
                 self.want(&MACHINE, &pk, "hosts", json!([host]), &at);
@@ -1035,11 +1052,15 @@ impl Planner<'_> {
 
 /// The webmail fleet_db wrote by default for a provider word: carried only where it differs.
 fn default_webmail(provider: &str) -> &'static str {
-    match provider {
-        "proton" | "protonmail" => "https://mail.proton.me/u/0/inbox",
-        "gmail" | "google" => "https://mail.google.com/",
-        "outlook" | "hotmail" => "https://outlook.live.com/mail/",
-        "privateemail" => "https://privateemail.com/",
-        _ => "",
+    if provider.eq_ignore_ascii_case("proton") || provider.eq_ignore_ascii_case("protonmail") {
+        "https://mail.proton.me/u/0/inbox"
+    } else if provider.eq_ignore_ascii_case("gmail") || provider.eq_ignore_ascii_case("google") {
+        "https://mail.google.com/"
+    } else if provider.eq_ignore_ascii_case("outlook") || provider.eq_ignore_ascii_case("hotmail") {
+        "https://outlook.live.com/mail/"
+    } else if provider.eq_ignore_ascii_case("privateemail") {
+        "https://privateemail.com/"
+    } else {
+        ""
     }
 }

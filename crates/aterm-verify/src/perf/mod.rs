@@ -569,6 +569,12 @@ const BENCH_BOX_LANES: &[Lane] = &[Lane::Cat, Lane::Scroll, Lane::Vte];
 
 const OPTIONS: &[OptSpec] = &[
     OptSpec {
+        flag: "--size-only",
+        value: None,
+        lanes: &[Lane::Wasm],
+        help: "judge optimized wasm module byte ceilings without running a browser or timing work",
+    },
+    OptSpec {
         flag: "--binary",
         value: Some("PATH"),
         lanes: &[Lane::Start, Lane::CliStart],
@@ -735,8 +741,15 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--attach-backlog",
         value: Some("N"),
         lanes: &[Lane::Fabric],
-        help: "records filled behind every attach session's refill watermark, after each one's \
-               note is seen, with a paced publisher timing the writer's stall (default 0: none)",
+        help: "the attach world's backlog (default 0: none). In the bench's process (inproc): \
+               records filled behind every attach session's refill watermark, after each one's \
+               note is seen, with a paced publisher timing the writer's stall. With an outside \
+               --broker-process: N records for each population seeded into the log before \
+               `aterm link broker` opens it, enough in all for the cold reads (the lane refuses \
+               fewer and names the least), no session's mail seen; two more opens beside it (an \
+               empty log, the seed plaintext), the broker's own process read through each open, \
+               the world and a wait for a retention tick, then timed cold-read passes over the \
+               sealed and plaintext logs in the bench's process",
     },
     OptSpec {
         flag: "--durability",
@@ -775,8 +788,8 @@ const OPTIONS: &[OptSpec] = &[
                bench's process (default inproc), or as `aterm link broker` started with its \
                launchd job's argv as a Background job's task type (background, the band that \
                ships) or an Interactive one's (interactive), measuring the messaging, ping-pong \
-               and attach worlds' outside stamps: `background,interactive --passes 2` is an A B \
-               B A set",
+               and attach worlds' outside stamps, and with --attach-backlog the broker's own \
+               process over a seeded log: `background,interactive --passes 2` is an A B B A set",
     },
     OptSpec {
         flag: "--log",
@@ -926,8 +939,20 @@ pub(crate) struct Cli {
     pub record: Vec<Lane>,
     pub list: bool,
     pub help: bool,
+    /// Compare floor lanes without reading or appending the same-box trend.
+    pub no_trend: bool,
     /// Every option given, by flag (switches hold an empty value).
     pub options: BTreeMap<&'static str, String>,
+}
+
+impl Cli {
+    fn runs_trend(&self, has_samples: bool) -> bool {
+        has_samples && !self.no_trend
+    }
+    fn takes_quiet_claim(&self, lane: Lane) -> bool {
+        lane.takes_quiet_claim()
+            && !(lane == Lane::Wasm && self.options.contains_key("--size-only"))
+    }
 }
 
 /// Parse `perf`'s arguments. Pure (unit-tested).
@@ -940,6 +965,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
             "--list" => cli.list = true,
             "-h" | "--help" => cli.help = true,
             "--record" => recording = true,
+            "--no-trend" => cli.no_trend = true,
             flag if flag.starts_with('-') => {
                 let spec = OPTIONS
                     .iter()
@@ -968,6 +994,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
                 cli.lanes.push(lane);
             }
         }
+    }
+    if cli.record.contains(&Lane::Wasm) && cli.options.contains_key("--size-only") {
+        return Err("--size-only cannot re-record wasm runtime floors".into());
     }
     if recording && cli.record.is_empty() {
         return Err(
@@ -1031,6 +1060,7 @@ fn usage() -> String {
          medians to crates/aterm-verify/perf/golden/perf-trend.tsv (commit it: that is the\n\
          history the trend reads). `--record` rewrites, from this run, the baseline of every floor lane\n\
          named after it; an arena or measured lane named there just runs.\n\
+         --no-trend compares the requested lanes without reading or appending trend history.\n\
          Exit: 0 nothing failed (a SKIP names its fix) · 1 a lane failed · 2 usage · 3 a lane\n\
          could not run (a COULD NOT RUN names its fix).\n\
          \n\
@@ -1207,7 +1237,7 @@ fn main(args: &[String]) -> ExitCode {
         let record = cli.record.contains(lane);
         eprintln!("--- {} ---", lane.name());
         let skip = no_windows && lane.opens_windows();
-        let quiet = match (!skip && lane.takes_quiet_claim())
+        let quiet = match (!skip && cli.takes_quiet_claim(*lane))
             .then(|| quiet(*lane, admit))
             .transpose()
         {
@@ -1236,6 +1266,7 @@ fn main(args: &[String]) -> ExitCode {
             Lane::TrailDarkComposer => floors::gate_effects(&floors::TRAIL_DARK_COMPOSER, record),
             Lane::TrailLightComposer => floors::gate_effects(&floors::TRAIL_LIGHT_COMPOSER, record),
             Lane::Deck => deck::gate_deck(record),
+            Lane::Wasm if cli.options.contains_key("--size-only") => wasm::gate_wasm_size(),
             Lane::Wasm => wasm::gate_wasm(record),
             #[cfg(unix)]
             Lane::VteEngine => vte_engine::run(record),
@@ -1330,7 +1361,7 @@ fn main(args: &[String]) -> ExitCode {
 
     let samples: Vec<TrendSample> = ran.iter().flat_map(|(_, r, _)| r.samples.clone()).collect();
     let mut trend_run = None;
-    if !samples.is_empty() {
+    if cli.runs_trend(!samples.is_empty()) {
         let started = Instant::now();
         eprintln!("--- trend ---");
         let floors: Vec<&LaneRun> = ran
@@ -1504,6 +1535,26 @@ pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_pilot_can_measure_without_appending_trends() {
+        let ordinary = parse(&args("vte-engine")).unwrap();
+        let pilot = parse(&args("vte-engine --no-trend")).unwrap();
+        assert_eq!(pilot.lanes, ordinary.lanes);
+        assert!(ordinary.runs_trend(true));
+        assert!(!pilot.runs_trend(true));
+        assert!(!ordinary.runs_trend(false));
+    }
+
+    #[test]
+    fn profile_pilot_size_ceilings_have_no_timing_admission() {
+        let ordinary = parse(&args("wasm")).unwrap();
+        let sizes = parse(&args("wasm --size-only --no-trend")).unwrap();
+        assert!(ordinary.takes_quiet_claim(Lane::Wasm));
+        assert!(!sizes.takes_quiet_claim(Lane::Wasm));
+        assert!(parse(&args("vte-engine --size-only")).is_err());
+        assert!(parse(&args("--record wasm --size-only")).is_err());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()

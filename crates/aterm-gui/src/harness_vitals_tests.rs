@@ -229,7 +229,7 @@ fn resource_shares_require_a_measured_numerator_and_positive_capacity() {
     };
     let text = format_local_snapshot_vitals(&snapshot);
     assert!(
-        text.contains("Disk 384 GiB/512 GiB (75% \u{b7} 64.0 GiB free)"),
-        "reserved blocks are free but unavailable to writes: {text}"
+        text.contains("Disk 448 GiB/512 GiB (87% \u{b7} 64.0 GiB free)"),
+        "used is the total less what this user can write, reserved blocks included: {text}"
     );
 }

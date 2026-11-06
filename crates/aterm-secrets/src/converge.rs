@@ -37,6 +37,11 @@ pub const SETUP: &str = "setup";
 /// pass's own recheck (`aterm_machines::sync::RECHECK`).
 pub const RECHECK_MS: u64 = 30 * 60 * 1000;
 
+/// Retry a failed runner on unchanged inputs after five seconds, backing off to five minutes.
+pub const FIRST_RETRY_MS: u64 = 5 * 1000;
+/// The maximum failed-runner retry delay on unchanged inputs.
+pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
+
 /// The runner for `trigger` (`subscriber`, `window` or `setup`): `exe init --converge --trigger
 /// <trigger>`, reading and writing nothing of its starter's (stdio null), in a session of its
 /// own (`setsid`), so a launchd job's restart, which ends its process group, or a terminal's
@@ -81,24 +86,63 @@ pub enum Last {
     None,
     /// It still runs.
     Running,
-    /// It ended, having run a pass or failed.
+    /// It ended successfully.
     Ended,
+    /// It exited unsuccessfully, or ended by a signal.
+    Failed,
     /// It ended without running, another pass holding the lock ([`HELD`]).
     Held,
 }
 
 impl Last {
-    /// How `child`, the last runner started, stands now, reaping it once it ended and never
-    /// waiting for it.
-    pub fn of(child: Option<&mut Child>) -> Self {
-        let Some(child) = child else {
+    /// How `runner` stands now, reaping and taking it once it ended without waiting. A terminal
+    /// outcome is delivered once; a failed wait retains custody until a later read can decide.
+    pub fn of(runner: &mut Option<Child>) -> Self {
+        let Some(child) = runner.as_mut() else {
             return Self::None;
         };
-        match child.try_wait() {
-            Ok(None) => Self::Running,
+        let last = match child.try_wait() {
+            Ok(None) | Err(_) => Self::Running,
             Ok(Some(status)) if status.code() == Some(HELD) => Self::Held,
-            Ok(Some(_)) | Err(_) => Self::Ended,
+            Ok(Some(status)) if status.success() => Self::Ended,
+            Ok(Some(_)) => Self::Failed,
+        };
+        if last != Self::Running {
+            runner.take();
         }
+        last
+    }
+}
+
+/// Failed runner pacing shared by the subscriber and the mesh node's vault pass.
+#[derive(Debug, Default)]
+pub(crate) struct RunnerRetry {
+    at: Option<u64>,
+    delay: u64,
+}
+
+impl RunnerRetry {
+    pub(crate) fn reaped(&mut self, last: Last, now_ms: u64) {
+        match last {
+            Last::Failed => {
+                let pause = self.delay.clamp(FIRST_RETRY_MS, LONGEST_RETRY_MS);
+                self.at = Some(now_ms.saturating_add(pause));
+                self.delay = pause.saturating_mul(2).min(LONGEST_RETRY_MS);
+            }
+            Last::Ended => {
+                self.at = None;
+                self.delay = 0;
+            }
+            Last::None | Last::Running | Last::Held => {}
+        }
+    }
+
+    pub(crate) fn due(&self, now_ms: u64) -> bool {
+        self.at.is_some_and(|at| now_ms >= at)
+    }
+
+    pub(crate) fn started(&mut self) {
+        self.at = None;
     }
 }
 
@@ -108,15 +152,17 @@ impl Last {
 /// healthy pass once this Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back)
 /// since the last start. One runner at a time: a start that comes due while the last one runs,
 /// or after one that found the lock held, is owed to the next round, so a version applied during
-/// a pass is never left to the next recheck.
+/// a pass is never left to the next recheck. A failed runner retries unchanged inputs on a
+/// bounded backoff; every time here is elapsed milliseconds on the subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
-    /// When the last runner started, in ms since the epoch, and the routes then.
+    /// When the last runner started on the subscriber's monotonic clock, and the routes then.
     started: Option<(u64, Routes)>,
     /// A start came due while the last runner ran, or the last one found the lock held.
     owed: bool,
     /// A pass failed since the last healthy one ([`Due::failed`]).
     failing: bool,
+    retry: RunnerRetry,
 }
 
 impl Due {
@@ -163,12 +209,18 @@ impl Due {
         self.failing = true;
     }
 
+    /// Keep one reaped runner's outcome even while the vault source is unavailable. Successful
+    /// completion ends the failure streak; a held lock stays owed without consuming backoff.
+    pub fn reaped(&mut self, last: Last, now_ms: u64) {
+        self.retry.reaped(last, now_ms);
+        self.owed |= last == Last::Held;
+    }
+
     fn start(&mut self, called: bool, now_ms: u64, routes: Routes, last: Last) -> bool {
-        if last == Last::Held {
-            self.owed = true;
-        }
+        self.reaped(last, now_ms);
         let due = called
             || self.owed
+            || self.retry.due(now_ms)
             || self
                 .started
                 .is_none_or(|(at, was)| was != routes || now_ms < at || now_ms - at >= RECHECK_MS);
@@ -180,6 +232,7 @@ impl Due {
             return false;
         }
         self.owed = false;
+        self.retry.started();
         self.started = Some((now_ms, routes));
         true
     }
@@ -288,6 +341,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failed_runner_retries_unchanged_inputs_and_success_ends_the_retry() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        // The subscriber reaps before its source round, even if that round is unhealthy.
+        due.reaped(Last::Failed, 1_000);
+        for at in [1_000, 1_001, 5_999] {
+            assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
+        }
+        assert!(
+            due.after_pass(&unchanged(), 6_000, HOME, Last::None),
+            "a failed clone gets another pass without a new route, token or inventory"
+        );
+        assert!(
+            !due.after_pass(&unchanged(), 6_001, HOME, Last::Running),
+            "the retry remains the only runner"
+        );
+        due.reaped(Last::Ended, 6_002);
+        for at in [6_003, 11_000, RECHECK_MS] {
+            assert!(
+                !due.after_pass(&unchanged(), at, HOME, Last::None),
+                "success leaves only the ordinary recheck due"
+            );
+        }
+        assert!(due.after_pass(&unchanged(), 6_000 + RECHECK_MS, HOME, Last::None));
+        // Success reset the failure streak: another failure begins at five seconds again.
+        let failed_at = 6_001 + RECHECK_MS;
+        due.reaped(Last::Failed, failed_at);
+        assert!(!due.after_pass(&unchanged(), failed_at + 4_999, HOME, Last::None));
+        assert!(due.after_pass(&unchanged(), failed_at + 5_000, HOME, Last::None));
+    }
+
+    #[test]
+    fn consecutive_runner_failures_back_off_without_a_hot_loop_and_stay_bounded() {
+        let mut due = Due::default();
+        let mut at = 0;
+        assert!(due.at_start(at, HOME, Last::None));
+        for seconds in [5, 10, 20, 40, 80, 160, 300, 300] {
+            at += 1;
+            due.reaped(Last::Failed, at);
+            let ready = at + seconds * 1000;
+            assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
+            assert!(!due.after_pass(&unchanged(), ready - 1, HOME, Last::None));
+            assert!(due.after_pass(&unchanged(), ready, HOME, Last::None));
+            at = ready;
+        }
+    }
+
+    #[test]
+    fn held_and_running_runners_preserve_failed_retry_and_coalesced_work() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        due.reaped(Last::Failed, 1);
+        assert!(due.after_pass(&unchanged(), 5_001, HOME, Last::None));
+        due.reaped(Last::Held, 5_002);
+        assert!(
+            due.after_pass(&unchanged(), 5_002, HOME, Last::None),
+            "a held lock still owes a pass at the next round"
+        );
+        due.reaped(Last::Failed, 5_003);
+        assert!(!due.after_pass(&unchanged(), 15_002, HOME, Last::None));
+        assert!(
+            due.after_pass(&unchanged(), 15_003, HOME, Last::None),
+            "a lock hold did not erase the failure streak"
+        );
+        assert!(!due.after_pass(&applied(), 15_004, HOME, Last::Running));
+        assert!(!due.after_pass(&unchanged(), 15_005, HOME, Last::Running));
+        assert!(due.after_pass(&unchanged(), 15_006, HOME, Last::Ended));
+        assert!(!due.after_pass(&unchanged(), 15_007, HOME, Last::Ended));
+    }
+
     /// The runner is `aterm init --converge --trigger <who>` of the program given, never
     /// disclaims responsibility (macOS then keeps the runner's Local Network use the starting
     /// app's), and the subscriber's leaves its starter's background band, so the fleet book's
@@ -337,8 +461,9 @@ mod tests {
             path
         };
         let endless = script("endless", format!("exec {} 600", sleep.display()));
-        let mut child = start(&endless, "subscriber").expect("start a runner");
-        assert_eq!(Last::of(Some(&mut child)), Last::Running);
+        let mut runner = Some(start(&endless, "subscriber").expect("start a runner"));
+        assert_eq!(Last::of(&mut runner), Last::Running);
+        let child = runner.as_mut().unwrap();
         let pid = i32::try_from(child.id()).expect("a pid");
         let lineage = aterm_uds::process::read_lineage(pid).expect("its lineage");
         assert_eq!(
@@ -348,11 +473,23 @@ mod tests {
         );
         child.kill().expect("kill the stand-in");
         child.wait().expect("reap it");
-        assert_eq!(Last::of(Some(&mut child)), Last::Ended);
-        let held = script("held", format!("exit {HELD}"));
-        let mut child = start(&held, "subscriber").expect("start a runner");
-        child.wait().expect("reap it");
-        assert_eq!(Last::of(Some(&mut child)), Last::Held);
-        assert_eq!(Last::of(None), Last::None);
+        assert_eq!(Last::of(&mut runner), Last::Failed);
+        assert!(runner.is_none());
+        assert_eq!(
+            Last::of(&mut runner),
+            Last::None,
+            "a signal is consumed once"
+        );
+        for (code, expected) in [(0, Last::Ended), (1, Last::Failed), (HELD, Last::Held)] {
+            let exe = script(&format!("exit-{code}"), format!("exit {code}"));
+            let mut runner = Some(start(&exe, "subscriber").expect("start a runner"));
+            runner.as_mut().unwrap().wait().expect("reap it");
+            assert_eq!(Last::of(&mut runner), expected);
+            assert_eq!(
+                Last::of(&mut runner),
+                Last::None,
+                "exit {code} is consumed once"
+            );
+        }
     }
 }

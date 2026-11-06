@@ -37,11 +37,11 @@
 //! through neither: a read that fails then answers as one with no verdict to keep, and one that
 //! finds no log where the version applied names none (no vault; a join that waits to be let in,
 //! whose version applied holds no locker for this Mac yet; or a version whose locker carries no
-//! heads) falls back to the book, which admits each Mac it binds and grants, a member of the
-//! vault left included. Once the new vault's log reads, a key it does not
-//! bind is judged as with no log (F17), so the book admits such a Mac still that holds the
-//! fleet secret this Mac holds, one the vault left held out included, until a sync of the new
-//! vault's default fleet code moves this Mac to that fleet (`docs/KNOWN_ISSUES.md`). A reader
+//! heads) falls back to the book. Once the new vault's log reads, a key it does not bind is
+//! judged as with no log (F17). Neither fallback lets a Mac of the vault left drive this one by a
+//! grant made there: the grants of a fleet taken under another vault than the one configured
+//! admit no Mac (`crate::fleet_vault`), until this Mac takes a fleet under the vault configured
+//! (a join, or a sync of that vault's default fleet code). A reader
 //! with no verdict to keep through a read that fails answers [`MemberKeys::unreadable`], under
 //! which every key stands out, so no node the book alone would admit gets in until the log reads
 //! again. What this Mac may still do under it: its listener keeps running and refuses every
@@ -51,6 +51,7 @@
 //! authors no `Node` record for itself ([`ensure_local_node_key_in_log`]); and its census does not
 //! count this Mac itself out.
 
+use crate::fleet_vault::Vault;
 use aterm_net::fleet::NodeKey;
 use aterm_net::fleet_member::{MemberKeys, Standing};
 use aterm_secrets::membership_log::{Log, Membership, NodeStanding};
@@ -379,38 +380,6 @@ struct Held {
     /// configuration moved during the read, so which one the verdict is of is unknown.
     vault: Option<Vault>,
     keys: Option<Arc<MemberKeys>>,
-}
-
-/// A vault as admission tells one from another: its name and the key line its configuration
-/// pins (its signer and the keys that signer was reached from). It is the same vault while the
-/// name stays and the line keeps a key of the one before ([`Vault::is`]), as the history this Mac
-/// acknowledged ties a vault's membership to its name and keys: a mirror added or a host renamed
-/// changes neither, and a signer rotation pins a new signer reached from the old one, keeping the
-/// old among the keys it followed. A join elsewhere names another vault or pins another line, and
-/// a replacement (the pin giving way to the key this build names for a retired one) pins a line
-/// that keeps no key of the one before unless its handoff chain reached from one.
-#[derive(PartialEq, Eq)]
-struct Vault {
-    name: String,
-    keys: std::collections::BTreeSet<[u8; 32]>,
-}
-
-impl Vault {
-    /// The vault `paths` configures now: `None` with none, one whose configuration does not
-    /// read, or one that pins no signer.
-    fn configured(paths: &aterm_secrets::client::Paths) -> Option<Self> {
-        let config = aterm_secrets::client::config(paths).ok().flatten()?;
-        let signer = config.signer?;
-        Some(Self {
-            name: config.name,
-            keys: std::iter::once(signer).chain(config.followed).collect(),
-        })
-    }
-
-    /// Whether `now` is this vault still: the same name, and a key of this line on its line.
-    fn is(&self, now: &Self) -> bool {
-        self.name == now.name && !self.keys.is_disjoint(&now.keys)
-    }
 }
 
 impl LocalLog {

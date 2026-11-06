@@ -179,7 +179,9 @@ fn authenticate(
     }
     let peer = peer.ok_or_else(|| Error::new("database requires a node-bound TLS proof"))?;
     if peer.key.bytes().as_slice() != &capability.actor[..32]
-        || peer.node != aterm_codec::hex::encode_lower(&capability.actor[32..])
+        || crate::database::decode_hex::<16>(&peer.node)
+            .ok()
+            .is_none_or(|incarnation| incarnation != capability.actor[32..])
         || capability.actor == credentials.capability.actor
     {
         return Err(Error::new(
@@ -212,10 +214,12 @@ fn read_u32(stream: &mut impl Read) -> Result<u32> {
     Ok(u32::from_le_bytes(n))
 }
 fn send_inventory(stream: &mut impl Write, ids: &BTreeSet<Digest>) -> Result<()> {
-    stream.write_all(&(ids.len() as u32).to_le_bytes())?;
+    let mut frame = Vec::with_capacity(4 + ids.len() * 32);
+    frame.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for id in ids {
-        stream.write_all(id)?;
+        frame.extend_from_slice(id);
     }
+    stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
@@ -224,11 +228,11 @@ fn receive_inventory(stream: &mut impl Read) -> Result<BTreeSet<Digest>> {
     if n > MAX_RECORDS {
         return Err(Error::new("peer inventory exceeds database capacity"));
     }
+    let mut wire = vec![0; n * 32];
+    stream.read_exact(&mut wire)?;
     let mut ids = BTreeSet::new();
     let mut previous = None;
-    for _ in 0..n {
-        let mut id = [0; 32];
-        stream.read_exact(&mut id)?;
+    for &id in wire.as_chunks::<32>().0 {
         if previous.is_some_and(|p| p >= id) {
             return Err(Error::new("peer inventory is not sorted and unique"));
         }
@@ -252,12 +256,12 @@ fn send_operations(
         db.history
             .index
             .inventory()
-            .filter(|id| cursor.is_none_or(|cursor| **id > cursor))
+            .skip_while(|id| cursor.is_some_and(|cursor| **id <= cursor))
             .chain(
                 db.history
                     .index
                     .inventory()
-                    .filter(|id| cursor.is_some_and(|cursor| **id <= cursor)),
+                    .take_while(|id| cursor.is_some_and(|cursor| **id <= cursor)),
             )
             .filter(|id| !remote.contains(*id) && !repair.deferred.contains(*id))
             .take(RECORDS_PER_ROUND)
@@ -273,16 +277,14 @@ fn send_operations(
     let mut sent = 0;
     for (id, wire) in &records {
         send_frame(stream, wire)?;
-        let mut ack = [0; 32];
+        let mut ack = [0u8; 33];
         stream.read_exact(&mut ack)?;
-        if ack != *id {
+        if ack[..32] != *id {
             return Err(Error::new(
                 "peer did not acknowledge the exact durable operation",
             ));
         }
-        let mut verdict = [0];
-        stream.read_exact(&mut verdict)?;
-        match verdict[0] {
+        match ack[32] {
             0 | 1 => {
                 sent += 1;
             }
@@ -328,8 +330,10 @@ fn receive_operations(stream: &mut (impl Read + Write), dir: &Path) -> Result<(u
                 2
             }
         };
-        stream.write_all(&id)?;
-        stream.write_all(&[verdict])?;
+        let mut receipt = [0u8; 33];
+        receipt[..32].copy_from_slice(&id);
+        receipt[32] = verdict;
+        stream.write_all(&receipt)?;
         stream.flush()?;
     }
     Ok((received, deferred))
@@ -402,8 +406,10 @@ fn server_exchange(
     let (received, incoming_deferred) = receive_operations(stream, dir)?;
     let (sent, outgoing_deferred) = send_operations(stream, dir, &remote, &mut repair)?;
     let mut repairs = repairs.lock().unwrap_or_else(|p| p.into_inner());
-    if repairs.len() < 64 || repairs.contains_key(&actor) {
+    if repairs.len() < 64 {
         repairs.insert(actor, repair);
+    } else if let std::collections::btree_map::Entry::Occupied(mut entry) = repairs.entry(actor) {
+        entry.insert(repair);
     }
     Ok(Report {
         sent,

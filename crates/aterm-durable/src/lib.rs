@@ -7,8 +7,10 @@
 //! one, by the call it is: [`primitive::full`] and [`primitive::full_data`] are `full_sync` and
 //! `full_sync_data` (a `full` each), [`primitive::barrier`] is `barrier_sync` on Apple targets
 //! (a `barrier`, and a `full` more when the volume refuses it) and `full_sync` elsewhere, and
-//! `primitive::fsync` (Unix) is `plain_fsync` (a `plain`). The `seam` records what each write
-//! asked for ([`Flush`]); the tally counts the calls that answered it.
+//! `primitive::fsync` (Unix) is `plain_fsync` (a `plain`), on a file or a bare descriptor: aterm's
+//! one plain flush, since `clippy.toml` refuses `libc::fsync` and `libc::fdatasync`. The `seam`
+//! records what each write asked for ([`Flush`]) and counts the plain flushes beside it; the
+//! tally counts the calls that answered them.
 
 use std::fs::File;
 use std::io;
@@ -306,7 +308,8 @@ fn same_device(_a: &Path, _b: &Path) -> bool {
     false
 }
 
-/// The flushes themselves, unrecorded.
+/// The flushes themselves, unrecorded as a [`Flush`] (the seam counts only [`primitive::fsync`]'s,
+/// apart from them).
 pub mod primitive {
     use std::fs::File;
     use std::io;
@@ -370,21 +373,20 @@ pub mod primitive {
         }
     }
 
-    #[cfg(all(test, unix))]
-    thread_local! {
-        /// The plain `fsync(2)`s [`fsync`] issued on this test thread.
-        pub(crate) static FSYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-
-    /// A plain `fsync(2)`: `astream_sys::plain_fsync`, retried on `EINTR` there, counted
-    /// `plain`.
+    /// A plain `fsync(2)` of an open file or directory, a `&File` or a bare descriptor (an
+    /// `OwnedFd`, a `BorrowedFd`: the handle-relative trees' folders): `astream_sys::plain_fsync`,
+    /// retried on `EINTR` there, counted `plain` by `astream_sys::flush_tally` and timed by
+    /// `flush_times`. aterm's one plain flush: `clippy.toml` refuses `libc::fsync` and
+    /// `libc::fdatasync`, whose flushes no tally counts. The seam counts each call on its
+    /// thread ([`super::seam::Recording::take_plain`]), the one flush of this module it sees,
+    /// since a caller takes it from here by name.
     /// # Errors
     /// The flush's own error.
     #[cfg(unix)]
-    pub fn fsync(file: &File) -> io::Result<()> {
-        #[cfg(test)]
-        FSYNCS.with(|fsyncs| fsyncs.set(fsyncs.get() + 1));
-        astream_sys::plain_fsync(file)
+    pub fn fsync(fd: impl std::os::fd::AsFd) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        super::seam::note_plain();
+        astream_sys::plain_fsync(fd)
     }
 }
 
@@ -394,33 +396,55 @@ pub mod seam {
     use super::Flush;
     use std::cell::RefCell;
 
+    /// What one recording has seen so far on its thread.
+    #[derive(Default)]
+    struct Log {
+        /// Each [`Flush`] asked for, oldest first.
+        flushes: Vec<Flush>,
+        /// The plain `fsync(2)`s ([`crate::primitive::fsync`]), which no [`Flush`] names.
+        plain: u32,
+    }
+
     thread_local! {
-        static LOG: RefCell<Option<Vec<Flush>>> = const { RefCell::new(None) };
+        static LOG: RefCell<Option<Log>> = const { RefCell::new(None) };
     }
 
     /// A recording of every flush this thread asks for through this crate.
     #[must_use = "the recording stops when it drops"]
     pub struct Recording {
-        outer: Option<Vec<Flush>>,
+        outer: Option<Log>,
         _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
 
     impl Recording {
         /// Start recording this thread's flushes.
         pub fn start() -> Self {
-            let outer = LOG.with(|log| log.replace(Some(Vec::new())));
+            let outer = LOG.with(|log| log.replace(Some(Log::default())));
             Self {
                 outer,
                 _thread: std::marker::PhantomData,
             }
         }
 
-        /// The flushes recorded since the start or the last take, oldest first.
+        /// The flushes recorded since the start or the last take, oldest first. A plain
+        /// `fsync(2)` is none of them: [`Recording::take_plain`] counts those.
         #[must_use]
         pub fn take(&self) -> Vec<Flush> {
             LOG.with(|log| match log.borrow_mut().as_mut() {
-                Some(v) => std::mem::take(v),
+                Some(log) => std::mem::take(&mut log.flushes),
                 None => Vec::new(),
+            })
+        }
+
+        /// How many plain `fsync(2)`s ([`crate::primitive::fsync`]) this thread issued since
+        /// the start or the last call. Each is one `plain` in `astream_sys::flush_tally`,
+        /// which counts the whole process's: this is the count a test reads its own sites'
+        /// by.
+        #[must_use]
+        pub fn take_plain(&self) -> u32 {
+            LOG.with(|log| match log.borrow_mut().as_mut() {
+                Some(log) => std::mem::take(&mut log.plain),
+                None => 0,
             })
         }
     }
@@ -434,8 +458,18 @@ pub mod seam {
 
     pub(crate) fn note(flush: Flush) {
         LOG.with(|log| {
-            if let Some(flushes) = log.borrow_mut().as_mut() {
-                flushes.push(flush);
+            if let Some(log) = log.borrow_mut().as_mut() {
+                log.flushes.push(flush);
+            }
+        });
+    }
+
+    /// One plain `fsync(2)` ([`crate::primitive::fsync`], Unix: elsewhere none is made).
+    #[cfg(unix)]
+    pub(crate) fn note_plain() {
+        LOG.with(|log| {
+            if let Some(log) = log.borrow_mut().as_mut() {
+                log.plain += 1;
             }
         });
     }
@@ -998,14 +1032,14 @@ mod tests {
     }
 
     /// The shipped [`super::ordered_or_fsync`] on a descriptor that refuses both of [`ordered`]'s
-    /// flushes issues one plain `fsync(2)` ([`primitive::fsync`], the one flush `FSYNCS`
-    /// counts) and one ordered flush to the seam, and one that takes the barrier issues no
-    /// `fsync(2)`. This binary takes the shipped flushes ([`shipped_durable_flushes_in_tests!`]),
-    /// so the refused full flush is the real `F_FULLFSYNC`'s.
+    /// flushes issues one plain `fsync(2)` ([`primitive::fsync`], which the seam counts by
+    /// [`seam::Recording::take_plain`]) and one ordered flush to the seam, and one that takes
+    /// the barrier issues no `fsync(2)`. This binary takes the shipped flushes
+    /// ([`shipped_durable_flushes_in_tests!`]), so the refused full flush is the real
+    /// `F_FULLFSYNC`'s.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_shipped_fallback_takes_fsync_where_both_flushes_are_refused() {
-        let fsyncs = || primitive::FSYNCS.with(std::cell::Cell::get);
         let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
         let refused = ordered(&null);
         assert!(
@@ -1013,21 +1047,63 @@ mod tests {
             "devfs no longer refuses both flushes on /dev/null ({refused:?}): this test needs \
              another descriptor that does"
         );
-        let before = fsyncs();
         let recording = seam::Recording::start();
         super::ordered_or_fsync(&null).expect("the refused flushes answered by fsync");
-        assert_eq!(fsyncs(), before + 1, "one fsync(2) answered the refusals");
+        assert_eq!(
+            recording.take_plain(),
+            1,
+            "one fsync(2) answered the refusals"
+        );
         assert_eq!(
             recording.take(),
             [Flush::Ordered],
             "the fallback is a plain fsync(2)"
         );
-        drop(recording);
         let dir = scratch();
         let file = std::fs::File::create(dir.path().join("f")).unwrap();
-        let before = fsyncs();
         super::ordered_or_fsync(&file).expect("this volume takes an ordered flush");
-        assert_eq!(fsyncs(), before, "a flush that succeeded owes no fsync(2)");
+        assert_eq!(
+            recording.take_plain(),
+            0,
+            "a flush that succeeded owes no fsync(2)"
+        );
+        assert_eq!(recording.take(), [Flush::Ordered]);
+    }
+
+    /// A plain `fsync(2)` is counted on its own thread, apart from the [`Flush`]es: a file's
+    /// and a directory's bare descriptor each move [`seam::Recording::take_plain`] by one and
+    /// record no [`Flush`], a nested recording sees only its own and hands the outer one
+    /// back whole, and no recording counts nothing. NEGATIVE CONTROL: a durable flush moves
+    /// the plain count by none.
+    #[cfg(unix)]
+    #[test]
+    fn the_seam_counts_each_plain_fsync_on_its_thread() {
+        let dir = scratch();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        let folder = std::os::fd::OwnedFd::from(std::fs::File::open(dir.path()).unwrap());
+        primitive::fsync(&file).expect("no recording yet");
+        let outer = seam::Recording::start();
+        assert_eq!(
+            outer.take_plain(),
+            0,
+            "a flush before the recording is none of its"
+        );
+        primitive::fsync(&file).expect("a file's plain flush");
+        {
+            let inner = seam::Recording::start();
+            primitive::fsync(&folder).expect("a directory's bare descriptor");
+            primitive::fsync(std::os::fd::AsFd::as_fd(&folder)).expect("and borrowed");
+            assert_eq!(inner.take_plain(), 2);
+            assert_eq!(inner.take_plain(), 0, "a take empties the count");
+            assert_eq!(inner.take(), [], "a plain flush is no Flush");
+        }
+        durable(&file).expect("the control: a full flush");
+        assert_eq!(outer.take(), [Flush::Durable]);
+        assert_eq!(
+            outer.take_plain(),
+            1,
+            "the outer recording's own plain flush"
+        );
     }
 
     #[test]

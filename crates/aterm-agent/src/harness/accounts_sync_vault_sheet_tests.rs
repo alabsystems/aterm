@@ -336,7 +336,7 @@ fn the_copy_aterm_wrote_is_never_reported_as_the_vaults() {
     );
 }
 
-/// A window's sync that fails (the sheet gives this machine no row) is logged once and not run
+/// A window's sync that fails (this machine's assignment conflicts) is logged once and not run
 /// again while what it reads is unchanged, by the window or the setup pass; after 15 minutes it
 /// runs once more, quietly; an edited sheet is read at once, its new failure logged, and the
 /// sheet that gives this machine a row writes the roster. CONTROL: the first upkeep runs and
@@ -345,7 +345,11 @@ fn the_copy_aterm_wrote_is_never_reported_as_the_vaults() {
 fn a_failing_sync_waits_for_its_inputs_to_change() {
     let desk = Desk::new("m27");
     let sheet = secrets_dir(&desk).join(ACCOUNTS_CSV_FILE);
-    fs::write(&sheet, "email,computer,claude\nb1@example.test,m28,1\n").unwrap();
+    fs::write(
+        &sheet,
+        "email,computer,claude\nb1@example.test,m27,1\nb1@example.test,m28,1\n",
+    )
+    .unwrap();
     let fetch = |_: &Env, source: &str| -> Result<String, String> {
         Err(format!("no fetch in a test: {source}"))
     };
@@ -403,7 +407,7 @@ fn a_failing_sync_waits_for_its_inputs_to_change() {
 
     fs::write(
         &sheet,
-        "email,computer,claude\nb1@example.test,m28,1\nb2@example.test,m29,1\n",
+        "email,computer,claude\nb2@example.test,m27,1\nb2@example.test,m29,1\n",
     )
     .unwrap();
     upkeep(NOW + 905);

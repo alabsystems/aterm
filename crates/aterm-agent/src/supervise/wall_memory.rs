@@ -64,10 +64,17 @@ enum Witness {
     Words(&'static str),
 }
 
-fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String {
+/// The agent's words a stuck-busy episode holds still: `what` it names, the letters of the last
+/// rows above the composer's caret, each as the screen's transcript reads it
+/// ([`ScreenReader::transcript`]: beside Claude Code's side panel, its words up to the panel's
+/// rule, so the panel's text moves none), and the draft.
+pub(super) fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String {
     let mut words = format!("{what}\n");
     if let Some((caret, draft)) = reader.composer(rows) {
-        push_words_above(&mut words, &rows[..caret.min(rows.len())]);
+        push_words_above(
+            &mut words,
+            &reader.transcript(rows).rows()[..caret.min(rows.len())],
+        );
         words.push_str(&draft.join("\n"));
     }
     words

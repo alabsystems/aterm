@@ -3740,27 +3740,7 @@ fn owner_topic_and_settings_reach_a_nested_child() {
 /// A socket bound at `path` and closed without ever listening.
 #[cfg(unix)]
 fn never_listening_socket(path: &std::path::Path) {
-    let _ = std::fs::remove_file(path);
-    // SAFETY: three straight-line libc calls; the path is checked to fit
-    // sun_path, and every return is checked.
-    unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-        assert!(fd >= 0, "socket(AF_UNIX)");
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = path.as_os_str().as_encoded_bytes();
-        assert!(bytes.len() < addr.sun_path.len(), "sun_path fits");
-        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
-            *slot = *byte as libc::c_char;
-        }
-        let bound = libc::bind(
-            fd,
-            std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        );
-        assert_eq!(bound, 0, "bind never-listening dead socket");
-        assert_eq!(libc::close(fd), 0, "close bound socket");
-    }
+    drop(crate::test_socket::never_listening_socket(path));
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "PRECONDITION: the dead socket answers ECONNREFUSED (transient connect errors \
@@ -8388,7 +8368,7 @@ fn subscription_probe_keeps_quiet_peer_and_rejects_write_half_close() {
         .expect("client closes its send half");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !subscription_peer_gone(&server) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(
         subscription_peer_gone(&server),
@@ -12533,6 +12513,44 @@ fn a_starved_programs_late_echoes_are_given_back_to_the_turns_deadline() {
     assert_eq!((t.keys.concat().as_str(), t.enters), ("version ", 0));
 }
 
+/// A fenced typed turn keeps room for a wait like one it has already needed: keys take 100 ms
+/// each in a 12 s turn whose submit takes 5.5 s of it, and the program draws the key before each
+/// digit 6.7 s late. The first digit's wait fits, with almost 5 s to spare for a loaded machine,
+/// and is given back; after it the pace counts a 6.7 s wait into the next key's room, which no
+/// longer fits, so the rest goes as one paste and the whole text is submitted.
+/// NEGATIVE CONTROL: without the hold's wait in the pace, typing goes on to the second digit,
+/// whose 6.7 s wait meets the deadline part-way: `reason=deadline typed=55`, those 55 graphemes
+/// left in the composer.
+#[test]
+fn a_fenced_typed_turn_keeps_room_for_a_wait_it_has_needed() {
+    use std::time::Duration;
+    let text = "step 1 of the follow-ups: read the notes, settle each, 2 more";
+    let digit_next: Vec<bool> = text.chars().skip(1).map(|ch| ch.is_ascii_digit()).collect();
+    let digits: Vec<usize> = (0..digit_next.len())
+        .filter(|&k| digit_next[k])
+        .map(|k| k + 2)
+        .collect();
+    assert_eq!(digits, [6, 56], "the keys that are digits");
+    let slow = |k: usize, c: &Composer, _: &SessionHandle| {
+        if digit_next.get(k).copied().unwrap_or(false) {
+            c.lag.set(Some(Duration::from_millis(6_700)));
+        }
+        // A key the program takes 100 ms to read.
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // The submit's share: 150 ms of settle and a 5.35 s window.
+    let opts = "timeout=12000 submit_window=5350";
+    let t = composer_turn_with(&composer_rule(), 76, opts, text, &slow);
+    let n = text.chars().count();
+    assert!(
+        t.verdict.contains(" submitted=1 ")
+            && t.verdict.ends_with(&format!(" typed=6 pasted={}", n - 6)),
+        "{}",
+        t.verdict
+    );
+    assert_eq!((t.keys.concat().as_str(), t.enters), ("step 1", 1));
+}
+
 /// A guarded submit judges the tail the program drew: the turn waits, as a digit does, for the
 /// program to read and draw its last key before the echo settles, so an agent that draws it
 /// later than any settle gets its Enter, never `reason=guard` with the text left typed. The
@@ -12746,30 +12764,208 @@ fn a_typed_turn_fenced_on_no_input_frame_types_every_key() {
     assert_eq!((t.keys.concat().as_str(), t.enters), (text, 1));
 }
 
+/// A TYPED TURN SLOWER THAN ITS DEADLINE LANDS WHOLE OR WRITES NOTHING (m14 driving m108,
+/// 2026-11-04): a drive's turn (`timeout=20000`) to a loaded Claude Code worker, its keys going
+/// at about 5 a second, answered `skipped reason=deadline typed=106 submitted=0` and left the 106
+/// in the composer, and each retry stacked another. Here every key takes 60 ms and the text needs
+/// over 5 s of them in a 3 s turn: the turn types while the next key and one paste of the rest still
+/// fit, pastes the rest, and submits the whole text. One whose first key does not fit writes
+/// nothing, and one with the time types every key. A key that alone runs past the deadline
+/// still ends in the paste, never a cut, and a program that never stops drawing (a working
+/// agent's spinner) does not keep the submit from its window. The program's composer is the
+/// model: what the keys and the pastes put there, which the Enter takes whole.
+/// NEGATIVE CONTROLS: with the per-key `now >= deadline` cut in place of the pace, or beside it,
+/// the slow arm or the long key's answers `reason=deadline typed=<k>` and leaves those `k`
+/// graphemes in the composer, no Enter; with the echo's settle waited to the deadline, the
+/// spinner's Enter goes with no window left.
 #[test]
-fn a_typed_turn_the_deadline_overtakes_is_never_submitted() {
-    let (verdict, keys, enters) = typed_turn_with("cadence=100 timeout=500", false, &|_, _| {});
+fn a_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use aterm_grapheme::GraphemeClusters;
+
+    use crate::input::InputEvent;
+
+    struct Landed {
+        verdict: String,
+        keys: usize,
+        pastes: usize,
+        composer: String,
+        sent: Vec<String>,
+        /// When the turn began, and when its Enter went.
+        began: Instant,
+        pressed: Option<Instant>,
+    }
+    let run_with = |opts: &str, per_key: &dyn Fn(usize) -> Duration, text: &str, spins: bool| {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let graphemes: Vec<&str> = text.graphemes().collect();
+        let (keys, pastes) = (Cell::new(0usize), Cell::new(0usize));
+        let composer = RefCell::new(String::new());
+        let sent = RefCell::new(Vec::new());
+        let pressed = Cell::new(None);
+        // A key the program takes `per_key` to read: a loaded worker behind a drive.
+        let key = |_: InputEvent| {
+            std::thread::sleep(per_key(keys.get()));
+            composer.borrow_mut().push_str(graphemes[keys.get()]);
+            keys.set(keys.get() + 1);
+            true
+        };
+        let paste = |rest: &str| {
+            pastes.set(pastes.get() + 1);
+            composer.borrow_mut().push_str(rest);
+            true
+        };
+        let press = |_: &str| {
+            pressed.set(Some(Instant::now()));
+            sent.borrow_mut().push(composer.take());
+            h.term.lock().unwrap().process(b"\r\nresponse-line\r\n");
+            true
+        };
+        let momentum = || Ok((0.0, Instant::now()));
+        let began = Instant::now();
+        let stop = AtomicBool::new(false);
+        let out = std::thread::scope(|scope| {
+            // A working agent's spinner: it draws every 40 ms, so the echo never settles.
+            if spins {
+                let (term, stop) = (&h.term, &stop);
+                scope.spawn(move || {
+                    let mut frame = 0u8;
+                    while !stop.load(Ordering::Relaxed) {
+                        frame = frame.wrapping_add(1);
+                        let glyph = b"|/-\\"[usize::from(frame % 4)];
+                        let mut draw = b"\x1b7\x1b[1;1H".to_vec();
+                        draw.extend([glyph, 0x1b, b'8']);
+                        term.lock().unwrap().process(&draw);
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                });
+            }
+            let out = cmd_turn(
+                &h.term,
+                &store,
+                0,
+                &format!("typed=1 cadence=1 idle=20 {opts} {text}"),
+                &h.ctx,
+                &TurnIo {
+                    paste: &paste,
+                    press: &press,
+                    key: &key,
+                    momentum: &momentum,
+                    driver: None,
+                    by: crate::turn_ledger::TurnBy::Ctl,
+                    actor: aterm_slog::Actor::Ctl,
+                    cause: None,
+                    mark: None,
+                    witness: None,
+                    refused: &|| None,
+                },
+            );
+            stop.store(true, Ordering::Relaxed);
+            out
+        });
+        Landed {
+            verdict: out.lines().next().unwrap_or("").to_string(),
+            keys: keys.get(),
+            pastes: pastes.get(),
+            composer: composer.take(),
+            sent: sent.take(),
+            began,
+            pressed: pressed.get(),
+        }
+    };
+    let run = |opts: &str, per_key: Duration, text: &str| run_with(opts, &|_| per_key, text, false);
+    let text =
+        "follow-up for the worker: rebase onto origin/main, rerun the accept test, and report it";
+    let n = text.graphemes().count();
+    let slow = Duration::from_millis(60);
     assert!(
-        verdict.starts_with("OK 0 turn skipped reason=deadline typed=0 pasted=0 submitted=0"),
-        "{verdict}"
+        slow * u32::try_from(n).expect("short") > Duration::from_secs(5),
+        "the keys alone outrun the turn"
     );
-    assert_eq!((keys, enters), (0, 0), "not begun");
-    let slow =
-        |_: usize, _: &SessionHandle| std::thread::sleep(std::time::Duration::from_millis(60));
-    let (verdict, keys, enters) = typed_turn_with("cadence=1 timeout=300", false, &slow);
+
+    let t = run("timeout=3000", slow, text);
+    assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
+    assert_eq!(
+        t.sent,
+        [text],
+        "the Enter took the whole text: {}",
+        t.verdict
+    );
+    assert_eq!(t.composer, "", "nothing left in the composer");
+    let typed = t.keys;
     assert!(
-        verdict.starts_with("OK 0 turn skipped reason=deadline typed="),
-        "{verdict}"
+        t.verdict
+            .ends_with(&format!(" typed={typed} pasted={}", n - typed)),
+        "{}",
+        t.verdict
     );
-    assert!(keys < 11, "cut short of the text: {keys}");
+    assert!(typed < n, "the deadline left no room to press every key");
+    assert_eq!(t.pastes, 1, "the rest went as one paste");
+
+    for opts in ["timeout=0", "cadence=2000 timeout=1000"] {
+        let t = run(opts, slow, text);
+        assert!(
+            t.verdict
+                .starts_with("OK 0 turn skipped reason=deadline typed=0 pasted=0 submitted=0"),
+            "{opts}: {}",
+            t.verdict
+        );
+        assert_eq!(
+            (t.keys, t.pastes, t.composer.as_str(), t.sent.len()),
+            (0, 0, "", 0),
+            "{opts}: nothing written, the composer as the turn found it"
+        );
+    }
+
+    let t = run("timeout=60000", Duration::from_millis(1), text);
     assert!(
-        verdict.contains(&format!(" typed={keys} pasted=0 ")),
-        "{verdict}"
+        t.verdict.contains(" submitted=1 ") && t.verdict.ends_with(&format!(" typed={n} pasted=0")),
+        "{}",
+        t.verdict
     );
-    assert_eq!(enters, 0, "the part typed is not submitted");
-    let (verdict, keys, enters) = typed_turn_with("cadence=1 timeout=60000", false, &slow);
-    assert!(verdict.contains(" submitted=1 "), "{verdict}");
-    assert_eq!((keys, enters), (11, 1));
+    assert_eq!(t.sent, [text]);
+    assert_eq!(t.pastes, 0, "nothing pasted");
+
+    // The fifth key alone outlasts the 3 s turn: the rest still goes as the paste.
+    let long = |k: usize| {
+        if k == 4 {
+            Duration::from_millis(3_500)
+        } else {
+            slow
+        }
+    };
+    let t = run_with("timeout=3000", &long, text, false);
+    assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
+    assert_eq!(t.sent, [text], "{}", t.verdict);
+    assert_eq!(t.composer, "", "nothing left in the composer");
+    assert!(
+        t.verdict.ends_with(&format!(" typed=5 pasted={}", n - 5)) && t.pastes == 1,
+        "{}",
+        t.verdict
+    );
+
+    // A program that never stops drawing: the Enter goes with the submit's 2 s window still
+    // to run before the deadline, not at it.
+    let timeout = Duration::from_millis(8_000);
+    let t = run_with(
+        &format!("timeout={}", timeout.as_millis()),
+        &|_| Duration::from_millis(100),
+        text,
+        true,
+    );
+    assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
+    assert_eq!(t.sent, [text], "{}", t.verdict);
+    let pressed = t.pressed.expect("pressed");
+    assert!(
+        pressed + Duration::from_millis(1_000) <= t.began + timeout,
+        "the Enter went {:?} into an {timeout:?} turn, its window spent: {}",
+        pressed - t.began,
+        t.verdict
+    );
 }
 
 #[test]
@@ -13626,7 +13822,13 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
         true,
         "settle=submitted presses=2 submit_window=200 timeout=60000 carry on",
     );
-    assert!(verdict.contains("submitted=0 status=timeout"), "{verdict}");
+    // The Enters went and none was seen taken: they are named, so a caller that retries does
+    // not type the text again over one the program may yet take. NEGATIVE CONTROL: naming them
+    // only where the screen judges leaves `pressed=` off this composer's verdict.
+    assert!(
+        verdict.contains("submitted=0 status=timeout") && verdict.contains(" pressed=2"),
+        "{verdict}"
+    );
     assert_eq!(presses, 2, "the text still in the composer: pressed again");
     let (verdict, presses) = run(
         App::Box,
@@ -18181,171 +18383,6 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
     );
 }
 
-/// `result`, `task` and `await task` ANSWER FOR A WORKER THE REAPER CLOSED, BY ITS SID OR THE
-/// LOCAL ID IT HAD, to its owner and to an edge its session granted a read: what it left outlives
-/// its tab while its retired row stands, a Dismiss included, read as a live worker's is, and a wait
-/// on it answers at once with its end, beside a live target's row in the list's order. CONTROL: an
-/// edge granted nothing; a worker a person closed, which keeps no row; a sid no session had.
-#[test]
-fn a_worker_the_reaper_closed_answers_its_managers_reads_from_its_retired_row() {
-    use super::{ActiveHandle, Scope, Selector, closed_session_reply, dispatch_await_task};
-    use crate::task_record::{TaskMark, TaskState};
-    use crate::worker_reaper::tests::{live, worker_tab};
-    let mut app = crate::App::headless_for_test();
-    let reaped = worker_tab(&mut app);
-    let closed = worker_tab(&mut app);
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-retired-result-")
-        .tempdir()
-        .expect("scratch");
-    let mut since = std::time::Instant::now();
-    let mut sids = Vec::new();
-    for (session, stem) in [(reaped, "s-reaped-1"), (closed, "s-closed-1")] {
-        let snap = aterm_agent::harness::result::snapshot_screen(
-            &dir.path().join("tasks"),
-            stem,
-            "claude",
-            "Fixed the parser.",
-            aterm_agent::harness::result::DoneBy::Turn,
-        )
-        .expect("written");
-        let handle = live(&app, session);
-        let done = TaskMark {
-            why: Some(crate::task_record::WHY_LANDED),
-            result_bytes: snap.bytes,
-            result_path: Some(snap.path.clone()),
-            ..TaskMark::new(TaskState::Done)
-        };
-        let (record, _) =
-            crate::task_record::mark_session_task(&handle.ctx, session, &done).expect("unfenced");
-        since = since.max(record.since);
-        sids.push((handle.sid.clone(), snap.path));
-    }
-    // A manager in another session holds a read of the worker, as a live one's edge does.
-    let granted = {
-        let handle = live(&app, reaped);
-        let token = handle.ctx.edges.lock().unwrap().grant(
-            SessionId::new("s-test-manager"),
-            handle.sid.clone(),
-            Op::ReadScreen,
-            handle.ctx.nonce,
-        );
-        Scope::Edge(token)
-    };
-    let answer = aterm_agent::harness::result::answer(&sids[0].1, false);
-    assert!(answer.starts_with("OK "), "{answer}");
-    assert!(app.close_session_tab_for_test(closed));
-    let steps = app.reap_workers(since + crate::worker_reaper::LINGER);
-    assert_eq!(steps, [(reaped, crate::worker_reaper::Ending::ClosePane)]);
-
-    let sid = sids[0].0.as_str();
-    let by_sid = Selector::parse(sid);
-    for scope in [Scope::Owner, granted] {
-        for selector in [by_sid, Selector::Local(reaped)] {
-            assert_eq!(
-                closed_session_reply(Some(&selector), "result", "", &app.store, scope),
-                answer
-            );
-        }
-    }
-    assert_eq!(
-        closed_session_reply(Some(&by_sid), "result", "bogus", &app.store, Scope::Owner),
-        crate::task_record::RESULT_USAGE
-    );
-    let task = closed_session_reply(Some(&by_sid), "task", "", &app.store, Scope::Owner);
-    assert!(
-        task.starts_with("OK task rev=")
-            && task.contains(" state=done ")
-            && task.contains(" conclusion=finished")
-            && task.ends_with(" agent=- program_state=- attention=-\n"),
-        "{task}"
-    );
-    assert_eq!(
-        closed_session_reply(Some(&by_sid), "task", "mark done", &app.store, Scope::Owner),
-        "ERR no such session\n",
-        "a mark has no session to land in"
-    );
-
-    // A live worker with no news yet, a wait's other target.
-    let waiting = worker_tab(&mut app);
-    let waiting = live(&app, waiting).sid;
-    let active: ActiveHandle = Arc::default();
-    let wait = |list: String, scope: Scope| {
-        let words: Vec<&str> = list.split_whitespace().collect();
-        dispatch_await_task(&words, &active, &app.store, scope)
-    };
-    let reply = wait(format!("@{sid}:1 timeout=60000"), Scope::Owner);
-    let rows: Vec<&str> = reply.lines().collect();
-    assert_eq!(rows.first(), Some(&"OK 1"), "{reply}");
-    let ended = rows[1].to_string();
-    assert!(
-        ended.starts_with(&format!("@{sid} rev="))
-            && ended.contains(" state=closed ")
-            && ended.contains(" conclusion=finished")
-            && ended.ends_with(" task_news=1"),
-        "{reply}"
-    );
-    assert_eq!(
-        wait(format!("@{sid}"), granted),
-        reply,
-        "the edge's wait too"
-    );
-    let reply = wait(
-        format!("@{},@{sid} any timeout=60000", waiting.as_str()),
-        Scope::Owner,
-    );
-    let rows: Vec<&str> = reply.lines().collect();
-    assert_eq!(rows.len(), 3, "{reply}");
-    assert_eq!(rows[0], "OK 2", "{reply}");
-    assert!(
-        rows[1].starts_with(&format!("@{} ", waiting.as_str()))
-            && rows[1].ends_with(" task_news=0"),
-        "{reply}"
-    );
-    assert_eq!(rows[2], ended, "{reply}");
-
-    let ungranted = Scope::Edge(aterm_session::EdgeToken::generate());
-    assert_eq!(
-        closed_session_reply(Some(&by_sid), "result", "", &app.store, ungranted),
-        "ERR no such session\n",
-        "CONTROL: an edge granted nothing"
-    );
-    assert_eq!(
-        wait(format!("@{sid}"), ungranted),
-        format!("ERR no such session @{sid}\n"),
-        "CONTROL: an edge granted nothing waits on nothing"
-    );
-    let by_hand = sids[1].0.as_str();
-    assert_eq!(
-        closed_session_reply(
-            Some(&Selector::parse(by_hand)),
-            "result",
-            "",
-            &app.store,
-            Scope::Owner
-        ),
-        "ERR no such session\n",
-        "CONTROL: a person's close keeps nothing"
-    );
-    assert_eq!(
-        wait(format!("@{sid},@{by_hand}"), Scope::Owner),
-        format!("ERR no such session @{by_hand}\n"),
-        "CONTROL: a person's close keeps nothing to wait on"
-    );
-    let never = aterm_session::SessionId::generate();
-    assert_eq!(
-        wait(format!("@{}", never.as_str()), Scope::Owner),
-        format!("ERR no such session @{}\n", never.as_str()),
-        "CONTROL: a sid no session had"
-    );
-    app.dismiss_finished(reaped);
-    assert_eq!(
-        closed_session_reply(Some(&by_sid), "result", "", &app.store, Scope::Owner),
-        answer,
-        "a Dismiss takes the row off the page, not what it left"
-    );
-}
-
 #[test]
 fn a_close_wakes_its_watchers_only_once_its_log_is_kept() {
     use std::sync::atomic::Ordering;
@@ -21328,6 +21365,26 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "accounts-renew run=0123456789abcdef0123456789abcdef",
         "accounts-renew start=0123456789abcdef0123456789abcdef command=sh",
         "@s-00000000000000aa accounts-renew start=0123456789abcdef0123456789abcdef",
+    ] {
+        assert!(gate(refused).is_err(), "{refused}");
+    }
+    let challenge = format!(
+        "claude-challenge start=0123456789abcdef0123456789abcdef url={}",
+        aterm_agent::harness::open_url::percent_encode(
+            "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state"
+        )
+    );
+    assert_eq!(wrote(&challenge), Some("claude-challenge"));
+    assert_eq!(
+        wrote("claude-challenge poll=0123456789abcdef0123456789abcdef"),
+        None
+    );
+    for refused in [
+        "claude-challenge",
+        "claude-challenge start=x",
+        "claude-challenge start=0123456789abcdef0123456789abcdef url=not-a-flow",
+        "claude-challenge run=0123456789abcdef0123456789abcdef",
+        "@s-00000000000000aa claude-challenge poll=0123456789abcdef0123456789abcdef",
     ] {
         assert!(gate(refused).is_err(), "{refused}");
     }

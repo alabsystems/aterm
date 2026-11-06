@@ -118,6 +118,7 @@ pub fn secret_digest(
     let projection = cell::project(collection, cells);
     part(&(projection.rows.len() as u64).to_le_bytes());
     let mut with_secret = 0;
+    let mut epoch_keys: BTreeMap<Digest, Zeroizing<[u8; 32]>> = BTreeMap::new();
     for (pk, row) in &projection.rows {
         part(pk.as_bytes());
         part(&(row.fields.len() as u64).to_le_bytes());
@@ -136,7 +137,7 @@ pub fn secret_digest(
                     }
                     cell::Field::Set(_) => return Err(Error::new("a secret is not a set")),
                 };
-                let mut values: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+                let mut values: Vec<Zeroizing<Vec<u8>>> = Vec::with_capacity(candidates.len());
                 for value in candidates {
                     if value.is_null() {
                         values.push(Zeroizing::new(vec![0]));
@@ -145,10 +146,16 @@ pub fn secret_digest(
                     let token = value
                         .as_str()
                         .ok_or_else(|| Error::new("invalid secret cell"))?;
-                    let old_key = resolve(&secret::epoch(token)?)?;
+                    let token_epoch = secret::epoch(token)?;
+                    let old_key = match epoch_keys.entry(token_epoch) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(resolve(&token_epoch)?)
+                        }
+                    };
                     let plain = secret::open(
                         token,
-                        &old_key,
+                        old_key,
                         secret::Cell {
                             table,
                             collection: collection.name,
@@ -171,20 +178,24 @@ pub fn secret_digest(
                 }
             } else {
                 part(b"value");
-                let values: Vec<Value> = match field {
-                    cell::Field::Value(c) => vec![c.value.x.clone()],
-                    cell::Field::Conflict { candidates, .. } => {
-                        candidates.iter().map(|c| c.value.x.clone()).collect()
+                let mut encoded: Vec<Vec<u8>> = match field {
+                    cell::Field::Value(c) => vec![
+                        aterm_json::to_vec(&c.value.x)
+                            .map_err(|_| Error::new("cannot encode digest field"))?,
+                    ],
+                    cell::Field::Conflict { candidates, .. } => candidates
+                        .iter()
+                        .map(|c| aterm_json::to_vec(&c.value.x))
+                        .collect::<std::result::Result<_, _>>()
+                        .map_err(|_| Error::new("cannot encode digest field"))?,
+                    cell::Field::Set(_) => {
+                        let members: Vec<_> = field.members().into_iter().collect();
+                        vec![
+                            aterm_json::to_vec(&members)
+                                .map_err(|_| Error::new("cannot encode digest field"))?,
+                        ]
                     }
-                    cell::Field::Set(_) => vec![aterm_json::json!(
-                        field.members().into_iter().collect::<Vec<_>>()
-                    )],
                 };
-                let mut encoded: Vec<Vec<u8>> = values
-                    .iter()
-                    .map(aterm_json::to_vec)
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(|_| Error::new("cannot encode digest field"))?;
                 encoded.sort();
                 encoded.dedup();
                 part(&(encoded.len() as u64).to_le_bytes());
@@ -520,9 +531,11 @@ impl View {
             .snapshot()
             .operations
             .iter()
-            .filter(|op| !op.available || !op.catalog_eligible || op.refusal.is_some())
+            .filter(|op| {
+                (!op.available || !op.catalog_eligible || op.refusal.is_some())
+                    && !awaited.contains(&op.header.id)
+            })
             .map(|op| op.header.id)
-            .filter(|id| !awaited.contains(id))
             .collect();
         // A later generation is whole only once a roll's cover row is here: before that its
         // history is still arriving from the Macs that restated it.
@@ -590,7 +603,11 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
             let slot = rows.entry(key.pk).or_default();
             match (key.col, key.elem) {
                 ("generation", None) => slot.0 = value.x.as_u64(),
-                ("wire", None) => slot.1 = value.x.as_str().map(str::to_owned),
+                ("wire", None) => {
+                    if let Value::String(wire) = value.x {
+                        slot.1 = Some(wire);
+                    }
+                }
                 _ => {}
             }
         }
@@ -611,7 +628,7 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
                 continue;
             };
             let header = record.header();
-            if typed::keys::archived_pk(&header.id) != pk || out.contains_key(&header.id) {
+            if out.contains_key(&header.id) || typed::keys::archived_pk(&header.id) != pk {
                 continue;
             }
             let Some(changes) = decode(record.payload())
@@ -650,18 +667,29 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
 /// # Errors
 /// One row alone passes a record's limits.
 pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
-    let fits = |changes: &[Change]| {
-        changes.len() <= MAX_WRITES
-            && Command::Write {
-                request: [0; 16],
-                changes: changes.to_vec(),
-            }
+    let fits = |changes: &mut Vec<Change>| {
+        if changes.len() > MAX_WRITES {
+            return false;
+        }
+        let command = Command::Write {
+            request: [0; 16],
+            changes: std::mem::take(changes),
+        };
+        let ok = command
             .encode()
-            .is_ok_and(|payload| payload.len() <= crate::crypto::MAX_BODY)
+            .is_ok_and(|payload| payload.len() <= crate::crypto::MAX_BODY);
+        let Command::Write {
+            changes: restored, ..
+        } = command
+        else {
+            unreachable!()
+        };
+        *changes = restored;
+        ok
     };
     let mut records: Vec<Vec<Change>> = Vec::new();
-    for row in rows {
-        if !fits(&row) {
+    for mut row in rows {
+        if !fits(&mut row) {
             return Err(Error::new("one typed row passes a record's limits"));
         }
         match records.last_mut() {
@@ -796,6 +824,29 @@ pub(crate) fn sealer<'s>(
     })
 }
 
+/// Observe the table again while an observation answers busy, until `deadline`: a writer that
+/// advanced the table mid-read (a repair round landing, another Mac's edit arriving) makes the
+/// observer refuse its result and ask for a fresh observation ([`Error::snapshot_changed`]), so a
+/// read racing a sync takes the newer table instead of failing. Any other answer, and a busy one
+/// once `deadline` passed, is returned as it is. Only pure reads come here: each attempt is a
+/// whole new observation, and none writes.
+///
+/// # Errors
+/// What the last attempt answered.
+pub(crate) fn reopened<T>(
+    deadline: std::time::Instant,
+    mut observe: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    loop {
+        match observe() {
+            Err(error) if error.is_busy() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            answered => return answered,
+        }
+    }
+}
+
 /// A typed table on this Mac's Commons.
 pub struct Handle {
     paths: Paths,
@@ -827,20 +878,22 @@ impl Handle {
         everyone_key: &[u8; 32],
     ) -> Result<SecretDigest> {
         let collection = self.compiled.collection(collection)?;
-        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-            let view = View::read(
-                self.compiled.table,
-                session,
-                &Log::read_with(session, store, scope, decode)?,
-            );
-            secret_digest(
-                &self.compiled.name(),
-                collection,
-                &view.cells,
-                epoch,
-                everyone_key,
-                |basis| session.secret_key(scope, basis),
-            )
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                let view = View::read(
+                    self.compiled.table,
+                    session,
+                    &Log::read_with(session, store, scope, decode)?,
+                );
+                secret_digest(
+                    &self.compiled.name(),
+                    collection,
+                    &view.cells,
+                    epoch,
+                    everyone_key,
+                    |basis| session.secret_key(scope, basis),
+                )
+            })
         })
     }
 
@@ -919,12 +972,14 @@ impl Handle {
     /// No Commons, the table is not declared or not subscribed here, or its storage is damaged.
     pub fn view(&self) -> Result<View> {
         let table = self.compiled.table;
-        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-            Ok(View::read(
-                table,
-                session,
-                &Log::read_with(session, store, scope, decode)?,
-            ))
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                Ok(View::read(
+                    table,
+                    session,
+                    &Log::read_with(session, store, scope, decode)?,
+                ))
+            })
         })
     }
 
@@ -934,22 +989,24 @@ impl Handle {
     /// As [`Self::view`].
     pub fn usage(&self) -> Result<(View, Usage)> {
         let table = self.compiled.table;
-        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-            let used = store.retained_use(session, session.actor())?;
-            Ok((
-                View::read(
-                    table,
-                    session,
-                    &Log::read_with(session, store, scope, decode)?,
-                ),
-                Usage {
-                    actor: session.actor(),
-                    records: used.records,
-                    bytes: used.bytes,
-                    mine_records: used.writer_records,
-                    mine_bytes: used.writer_bytes,
-                },
-            ))
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                let used = store.retained_use(session, session.actor())?;
+                Ok((
+                    View::read(
+                        table,
+                        session,
+                        &Log::read_with(session, store, scope, decode)?,
+                    ),
+                    Usage {
+                        actor: session.actor(),
+                        records: used.records,
+                        bytes: used.bytes,
+                        mine_records: used.writer_records,
+                        mine_bytes: used.writer_bytes,
+                    },
+                ))
+            })
         })
     }
 
@@ -959,26 +1016,28 @@ impl Handle {
     /// # Errors
     /// As [`Self::view`].
     pub fn history(&self) -> Result<Vec<Entry>> {
-        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-            let log = Log::read_with(session, store, scope, decode)?;
-            let resolve = owned::commons::historical(session);
-            let mut entries: Vec<Entry> = log
-                .eligible()
-                .into_iter()
-                .filter_map(|(operation, command)| {
-                    Some(Entry {
-                        operation: operation.header.id,
-                        actor: operation.header.actor,
-                        machine: resolve(&operation.roster, &operation.header.actor),
-                        authored_ms: operation.authored_ms,
-                        request: operation.request,
-                        reverts: operation.reverts,
-                        changes: command.changes()?.to_vec(),
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let resolve = owned::commons::historical(session);
+                let mut entries: Vec<Entry> = log
+                    .eligible()
+                    .into_iter()
+                    .filter_map(|(operation, command)| {
+                        Some(Entry {
+                            operation: operation.header.id,
+                            actor: operation.header.actor,
+                            machine: resolve(&operation.roster, &operation.header.actor),
+                            authored_ms: operation.authored_ms,
+                            request: operation.request,
+                            reverts: operation.reverts,
+                            changes: command.changes()?.to_vec(),
+                        })
                     })
-                })
-                .collect();
-            entries.sort_by_key(|e| (e.authored_ms, e.operation));
-            Ok(entries)
+                    .collect();
+                entries.sort_by_key(|e| (e.authored_ms, e.operation));
+                Ok(entries)
+            })
         })
     }
 
@@ -1172,13 +1231,11 @@ impl Handle {
                     else {
                         return Ok(None);
                     };
-                    if typed::secret::open(token, &key, cell).is_err() {
+                    let Ok(plain) = typed::secret::open(token, &key, cell) else {
                         return Ok(None);
-                    }
-                    crate::alab::secret::reveal(journal, token, &key, cell, surface, when_ms, |s| {
-                        typed::secret::Secret::new(s.to_owned())
-                    })
-                    .map(Some)
+                    };
+                    crate::alab::secret::record_reveal(journal, cell, surface, when_ms)?;
+                    Ok(Some(plain))
                 })
                 .collect()
         })

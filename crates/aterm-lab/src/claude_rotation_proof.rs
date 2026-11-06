@@ -2898,7 +2898,7 @@ fn r6(d: &Drive<'_>, m: &mut Marks) -> Result<(), Fail> {
             m.job.gone = now_ms();
             break;
         }
-        if m.job.held == 0 && looks % 5 == 0 {
+        if m.job.held == 0 && looks.is_multiple_of(5) {
             let listing = d.listing();
             if held_by_jobs(&listing, &d.sid) {
                 m.job.held = now_ms();

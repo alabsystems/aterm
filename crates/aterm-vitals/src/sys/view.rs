@@ -2556,7 +2556,7 @@ fn global_json(s: &Snapshot) -> Jv {
     for (name, value) in [
         (
             "disk_used_bytes",
-            s.volume.as_ref().map(crate::model::VolumeSample::occupied),
+            s.volume.as_ref().map(crate::model::VolumeSample::used),
         ),
         (
             "disk_available_bytes",

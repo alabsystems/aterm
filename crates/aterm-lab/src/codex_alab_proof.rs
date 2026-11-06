@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane; `--terminals-only` runs only the background terminals leg (survey `bg=` from codex-alab's own record, `codex_alab_terminals_proof.rs`); `--facts-only` runs only the facts leg (aterm's no-progress fact riding codex-alab's continuation once per stall, `codex_alab_facts_proof.rs`, gap 23), which the default run does not include yet; `--capacity-only` runs only the capacity lane (the package's `codex exec` recovering from a capacity answer in a jail of its own, no aterm, `codex_alab_capacity_proof.rs`), which the full proof runs last, once its instance is gone. One run takes at most one `--*-only` lane ([`Lane`]).
+//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane; `--terminals-only` runs only the background terminals leg (survey `bg=` from codex-alab's own record, `codex_alab_terminals_proof.rs`); `--facts-only` runs only the facts leg (aterm's no-progress fact riding codex-alab's continuation once per stall, `codex_alab_facts_proof.rs`, gap 23), which the default run does not include yet; `--capacity-only` runs only the capacity lane (the package's `codex exec` recovering from a capacity or account-quota answer, and failing at a terminal one, in a jail of its own, no aterm, `codex_alab_capacity_proof.rs`), which the full proof runs last, once its instance is gone. One run takes at most one `--*-only` lane ([`Lane`]).
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -1322,7 +1322,7 @@ impl Proof {
     /// Whether the package under proof holds codex-alab's one cleared line. A package that cannot
     /// be read is held to the line, so a broken rig fails rather than skips.
     fn package_holds_cleared_line(&self) -> bool {
-        std::fs::read(self.s.join("pkg-a").join("bin").join("codex"))
+        crate::util::read_program(&self.s.join("pkg-a").join("bin").join("codex"))
             .map_or(true, |program| holds_cleared_line(&program))
     }
 
@@ -2026,10 +2026,10 @@ impl Proof {
     fn reads_land_question_text(&self) -> bool {
         let root = self.s.join("pkg-a");
         let key = b"land_question_text";
-        std::fs::read_to_string(root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON))
+        crate::util::read_regular_text(&root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON))
             .ok()
             .and_then(|t| aterm_agent::harness::codex_alab::package_entrypoint(&t))
-            .and_then(|e| std::fs::read(root.join(e)).ok())
+            .and_then(|e| crate::util::read_program(&root.join(e)).ok())
             .is_some_and(|bin| bin.windows(key.len()).any(|w| w == key))
     }
 
@@ -4002,7 +4002,7 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
 
 /// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--window-only|--capacity-only]`
 /// (`--terminals-only`: the background terminals leg alone, about 1 min; `--facts-only`: the facts
-/// leg alone, about 7 min; `--capacity-only`: the capacity lane alone, with no aterm, about 10 s).
+/// leg alone, about 7 min; `--capacity-only`: the capacity lane alone, with no aterm, about 1 min).
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {

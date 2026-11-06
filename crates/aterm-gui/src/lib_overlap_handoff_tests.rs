@@ -2358,7 +2358,7 @@ fn a_reload_reconciles_the_observer() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while ended.consent_observer.is_live() && std::time::Instant::now() < deadline {
         ended.poll_consent_observer(std::time::Instant::now());
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(
         !ended.consent_observer.is_live(),

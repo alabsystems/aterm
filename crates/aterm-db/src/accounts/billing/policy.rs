@@ -157,15 +157,26 @@ impl Policy {
 
     /// Canonical editable proposal text. This signs nothing and loads no key.
     pub fn text(&self) -> String {
-        let mut text = "version = 1\n".to_owned();
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(16 + self.resources.len() * 512);
+        text.push_str("version = 1\n");
         for resource in self.resources.values() {
-            text.push_str(&format!(
-                "\n[[resource]]\nprincipal = {:?}\nallocation = {:?}\npin = {:?}\nprovider = {:?}\nadapter = {:?}\n",
-                aterm_codec::hex::encode_lower(&resource.allocation.terms().resource),
-                aterm_codec::hex::encode_lower(resource.allocation.bytes()),
-                aterm_codec::hex::encode_lower(&resource.allocation.fingerprint()),
+            text.push_str("\n[[resource]]\n");
+            for (name, bytes) in [
+                ("principal", resource.allocation.terms().resource.as_slice()),
+                ("allocation", resource.allocation.bytes()),
+                ("pin", &resource.allocation.fingerprint()),
+            ] {
+                text.push_str(name);
+                text.push_str(" = \"");
+                aterm_codec::hex::push_lower(&mut text, bytes);
+                text.push_str("\"\n");
+            }
+            let _ = write!(
+                text,
+                "provider = {:?}\nadapter = {:?}\n",
                 resource.provider, resource.adapter
-            ));
+            );
         }
         text
     }

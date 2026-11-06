@@ -253,8 +253,12 @@ impl Resources {
             descriptor(bootstrap, &self.allocation)
         };
         let apply = |session: &Session<'_>, store: &mut Store, scope: Scope| {
-            if self.check_existing_pin()?.is_some() {
-                self.pin(session, store, false)?;
+            if let Some(pinned) = self.check_existing_pin()?
+                && pinned != store.primary_custody_id(session)?
+            {
+                return Err(Error::new(
+                    "resource table custody differs from its retained activation pin",
+                ));
             }
             let directory = crate::catalog::Directory::new(session.paths(), scope.trust());
             if let Some(recovery) = directory
@@ -297,23 +301,27 @@ impl Resources {
         )
     }
 
-    fn pin_path(&self) -> std::path::PathBuf {
-        self.pin_path_at(&self.paths)
+    fn pin_name(&self) -> String {
+        hex::encode_lower(&window_id(&self.allocation))
     }
-    fn pin_path_at(&self, paths: &Paths) -> std::path::PathBuf {
-        paths
-            .dir
-            .join("commons/resource-pins")
-            .join(hex::encode_lower(&window_id(&self.allocation)))
+    fn pin_path_named(&self, paths: &Paths, name: &str) -> std::path::PathBuf {
+        paths.dir.join("commons/resource-pins").join(name)
+    }
+    #[cfg(test)]
+    fn pin_path(&self) -> std::path::PathBuf {
+        self.pin_path_named(&self.paths, &self.pin_name())
     }
     fn check_existing_pin(&self) -> Result<Option<Digest>> {
+        self.check_existing_pin_named(&self.pin_name())
+    }
+    fn check_existing_pin_named(&self, name: &str) -> Result<Option<Digest>> {
         // Succession changes writer custody, not the allocation for an already
         // pinned resource window. Ancestor pins only constrain identity; they
         // never supply the successor's local custody or an inherited share.
         for predecessor in crate::generation::predecessors(&self.paths)? {
-            self.check_pin_at(&self.pin_path_at(&predecessor))?;
+            self.check_pin_at(&self.pin_path_named(&predecessor, name))?;
         }
-        self.check_pin_at(&self.pin_path())
+        self.check_pin_at(&self.pin_path_named(&self.paths, name))
     }
     fn check_pin_at(&self, path: &std::path::Path) -> Result<Option<Digest>> {
         let Some(bytes) = fsx::read_private(path, 69).map_err(crate::table::failure)? else {
@@ -333,31 +341,35 @@ impl Resources {
         }
         Ok(Some(bytes[37..].try_into().unwrap()))
     }
-    fn pin_bytes(&self, custody: Digest) -> Vec<u8> {
-        let mut bytes = b"ARAP2".to_vec();
-        bytes.extend_from_slice(&self.allocation.id());
-        bytes.extend_from_slice(&custody);
+    fn pin_bytes(&self, custody: Digest) -> [u8; 69] {
+        let mut bytes = [0u8; 69];
+        bytes[..5].copy_from_slice(b"ARAP2");
+        bytes[5..37].copy_from_slice(&self.allocation.id());
+        bytes[37..69].copy_from_slice(&custody);
         bytes
     }
     fn pin(&self, session: &Session<'_>, store: &Store, create: bool) -> Result<()> {
-        let path = self.pin_path();
+        let name = self.pin_name();
+        let path = self.pin_path_named(&self.paths, &name);
         let custody = store.primary_custody_id(session)?;
-        if self.check_existing_pin()?.is_none() {
-            if !create {
-                return Err(Error::new(
-                    "resource activation pin is not retained locally",
-                ));
+        let pinned = match self.check_existing_pin_named(&name)? {
+            Some(pinned) => pinned,
+            None => {
+                if !create {
+                    return Err(Error::new(
+                        "resource activation pin is not retained locally",
+                    ));
+                }
+                let dir = path
+                    .parent()
+                    .ok_or_else(|| Error::new("invalid resource pin directory"))?;
+                aterm_journal::create_private_dir_durable(dir)?;
+                fsx::write_new(&path, &self.pin_bytes(custody), 0o600)
+                    .map_err(crate::table::failure)?;
+                self.check_existing_pin_named(&name)?
+                    .ok_or_else(|| Error::new("resource activation pin was not retained"))?
             }
-            let dir = path
-                .parent()
-                .ok_or_else(|| Error::new("invalid resource pin directory"))?;
-            aterm_journal::create_private_dir_durable(dir)?;
-            fsx::write_new(&path, &self.pin_bytes(custody), 0o600)
-                .map_err(crate::table::failure)?;
-        }
-        let pinned = self
-            .check_existing_pin()?
-            .ok_or_else(|| Error::new("resource activation pin was not retained"))?;
+        };
         if pinned != custody {
             return Err(Error::new(
                 "resource table custody differs from its retained activation pin",
@@ -373,13 +385,14 @@ impl Resources {
 
 fn window_id(allocation: &Allocation) -> Digest {
     let trust = allocation.trust();
-    let mut bytes = b"aterm/commons/resource-window/1\0".to_vec();
-    bytes.extend_from_slice(&trust.network);
-    bytes.extend_from_slice(&trust.authority);
-    bytes.extend_from_slice(&trust.genesis);
-    bytes.extend_from_slice(&allocation.terms().resource);
-    bytes.extend_from_slice(&allocation.terms().window);
-    Sha256::digest(&bytes)
+    let mut hash = Sha256::new();
+    hash.update(b"aterm/commons/resource-window/1\0");
+    hash.update(trust.network);
+    hash.update(trust.authority);
+    hash.update(trust.genesis);
+    hash.update(allocation.terms().resource);
+    hash.update(allocation.terms().window);
+    hash.finalize()
 }
 fn descriptor(bootstrap: &Bootstrap, allocation: &Allocation) -> Result<Descriptor> {
     Descriptor::application(

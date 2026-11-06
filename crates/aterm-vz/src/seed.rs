@@ -182,15 +182,20 @@ impl Seed {
 
 /// `text` indented by `pad` spaces on every line, for a YAML block scalar.
 fn indented(text: &str, pad: usize) -> String {
-    let pad = " ".repeat(pad);
-    text.lines().fold(String::new(), |mut out, line| {
+    let lines = text.lines().count();
+    let mut out = String::with_capacity(text.len() + lines.saturating_mul(pad + 1));
+    for line in text.lines() {
         if line.is_empty() {
             out.push('\n');
         } else {
-            let _ = writeln!(out, "{pad}{line}");
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push_str(line);
+            out.push('\n');
         }
-        out
-    })
+    }
+    out
 }
 
 /// The `#cloud-config` for `user` (its name already checked by [`Seed::new`]).
@@ -287,7 +292,7 @@ pub fn make_iso(files: &Path, iso: &Path) -> Result<(), String> {
     cmd.args(makehybrid_args(files, iso));
     let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
         .map_err(|e| format!("{hdiutil} makehybrid {e}"))?;
-    if out.status.success() && iso.is_file() {
+    if out.status.success() && crate::is_regular_file(iso) {
         Ok(())
     } else {
         Err(format!(

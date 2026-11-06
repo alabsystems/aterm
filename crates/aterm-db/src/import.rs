@@ -113,7 +113,9 @@ fn load(path: &Path) -> Result<Csv> {
         return Err(Error::new("CSV has no header"));
     }
     let mut headers = records.remove(0);
-    if let Some(first) = headers.first_mut() {
+    if let Some(first) = headers.first_mut()
+        && first.starts_with('\u{feff}')
+    {
         *first = first.trim_start_matches('\u{feff}').to_owned();
     }
     Ok(Csv {
@@ -196,10 +198,10 @@ fn finish_cell(row: &mut Vec<String>, cell: &mut Vec<u8>) -> Result<()> {
 }
 /// The provider word a sheet header names (`claude`, `Open AI`, `google`, `meta`, `kimi`, `x`).
 pub(crate) fn provider(header: &str) -> Option<&'static str> {
-    let header = header.trim().to_ascii_lowercase();
+    let header = header.trim();
     PROVIDERS
         .iter()
-        .find_map(|(h, p)| (*h == header).then_some(*p))
+        .find_map(|(h, p)| h.eq_ignore_ascii_case(header).then_some(*p))
 }
 fn nonempty(cell: &str) -> bool {
     !cell.trim().is_empty()
@@ -308,8 +310,10 @@ pub fn inspect(path: &Path) -> Result<Value> {
             if possible_phone(cell) {
                 phone_cells += 1;
             }
-            let lower = cell.to_ascii_lowercase();
-            if lower.contains("alias") || lower.contains("forward") {
+            let bytes = cell.as_bytes();
+            if bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+                || bytes.windows(7).any(|w| w.eq_ignore_ascii_case(b"forward"))
+            {
                 alias_markers += 1;
             }
         }

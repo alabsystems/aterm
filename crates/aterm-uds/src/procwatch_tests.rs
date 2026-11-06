@@ -115,7 +115,7 @@ fn open_writer(fifo: &std::path::Path) -> std::os::fd::OwnedFd {
             "hang: nothing ever read {}",
             fifo.display()
         );
-        std::thread::yield_now();
+        crate::deadline::poll_yield();
     }
 }
 
@@ -200,7 +200,7 @@ fn a_child_that_never_execs_is_no_exec() {
             start.elapsed() < MUST_HAPPEN,
             "hang: the subshell never ran"
         );
-        std::thread::yield_now();
+        crate::deadline::poll_yield();
     }
     watch.drain(&mut seen);
     assert_eq!(
@@ -278,7 +278,7 @@ fn a_followed_holder_reports_its_exec_until_unfollowed() {
     let start = std::time::Instant::now();
     while child_pids(holder.pid()).unwrap_or_default().is_empty() {
         assert!(start.elapsed() < MUST_HAPPEN, "hang: the holder never ran");
-        std::thread::yield_now();
+        crate::deadline::poll_yield();
     }
     let before = execs_of(&seen, holder.pid());
     watch.drain(&mut seen);
@@ -340,7 +340,7 @@ fn a_child_past_the_cap_is_counted_and_heard_only_once_followed() {
             start.elapsed() < MUST_HAPPEN,
             "hang: the shell never held {MAX_CHILDREN} jobs: {now:?}"
         );
-        std::thread::yield_now();
+        crate::deadline::poll_yield();
     };
     let mut watch = ProcWatch::new(shell.pid()).expect("watch the shell");
     assert_eq!(watch.overflow(), 0, "the cap's worth adopted");

@@ -73,7 +73,21 @@ pub fn identity() -> Result<aterm_net::fleet::NodeIdentity> {
     aterm_net::fleet_member::read_node_identity(&state_dir()?)?
         .ok_or_else(|| fail("service repair requires existing fleet identity"))
 }
-fn grants() -> Result<Vec<aterm_net::fleet::DriveGrant>> {
+/// The drive grants aterm.toml names that admit now: none while this Mac's fleet state was taken
+/// under another vault than the one `paths` configures ([`crate::fleet_vault::grants_in_effect`]).
+/// # Errors
+/// As [`configured_grants`].
+fn grants(paths: &Paths) -> Result<Vec<aterm_net::fleet::DriveGrant>> {
+    Ok(crate::fleet_vault::grants_in_effect(
+        &state_dir()?,
+        Some(paths),
+        configured_grants()?,
+    ))
+}
+/// The drive grants aterm.toml names, whichever vault they were made under.
+/// # Errors
+/// No aterm.toml, sharing Off, no `[fleet]`, a level below drive, or a grant that does not parse.
+fn configured_grants() -> Result<Vec<aterm_net::fleet::DriveGrant>> {
     let path =
         aterm_types::dirs::aterm_config_path().ok_or_else(|| fail("no aterm configuration"))?;
     let bytes = aterm_secrets::fsx::read_aterm_config(&path, 1024 * 1024)?
@@ -307,7 +321,7 @@ impl Backend for NativeBackend {
             &body,
             &signature(signed)?,
             &state_dir()?,
-            &grants()?,
+            &grants(&self.paths)?,
             Some(&membership),
         )
         .map_err(fail)?;
@@ -647,7 +661,7 @@ pub fn authorize_rpc(paths: &Paths, requester: &str, key: &str) -> Result<()> {
             key,
         },
         &state_dir()?,
-        &grants()?,
+        &grants(paths)?,
         Some(&membership),
     )
     .map_err(fail)?;

@@ -12,9 +12,9 @@ use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, check_owned_plain_dir_existing,
-    check_upgrade_tree, connect, cwd_of, exe_of, first_word, ids, ledger, load, now_s, open_files,
-    pause, process_in_tab, read_upgrade_dir, registry_graph, registry_life, roster, said, save,
-    squash, table, type_relaunch_line_with, upgrade, wait_until,
+    check_upgrade_tree, connect, cwd_of, exe_of, first_word, ids, ledger, load_record, now_s,
+    open_files, pause, process_in_tab, read_upgrade_dir, registry_graph, registry_life, roster,
+    said, save, squash, table, type_relaunch_line_with, upgrade, wait_until,
 };
 #[cfg(all(test, unix))]
 use super::{registry_vouches_for_state, state_dir};
@@ -311,7 +311,11 @@ pub(super) fn self_claimed_after_exit(
         return said(r, "wait:not-exited");
     }
     let witnesses = super::super::self_claimed::Witnesses::under(&opts.state);
-    if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
+    let prior = match load_record(opts, &session) {
+        Ok(prior) => prior,
+        Err(_) => return said(r, format!("wait:{}", super::UNREAD_SAVED_RECORD)),
+    };
+    if let Some(mut st) = prior.filter(St::in_flight) {
         let want_cwd = resume.cwd.as_deref().unwrap_or(snap.cwd.as_str());
         if st.pid == snap.pid
             && st.resume_argv == resume.argv
@@ -805,7 +809,8 @@ pub(super) fn prune_retired(opts: &Opts, now: u64) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let is_file = entry.file_type().is_ok_and(|t| t.is_file());
-            if is_file && name.to_str().is_some_and(stale) && super::sat_a_week(&entry, now) {
+            if is_file && name.to_str().is_some_and(stale) && super::sat_a_week(&entry.path(), now)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -844,7 +849,9 @@ pub(super) fn in_flight_records(
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        let Some(st) = load(opts, &session)
+        let Some(st) = load_record(opts, &session)
+            .ok()
+            .flatten()
             .filter(|st| st.agent == Agent::Codex)
             .filter(St::in_flight)
         else {
@@ -1044,15 +1051,15 @@ pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
         else {
             continue;
         };
-        if !super::sat_a_week(&entry, now) {
+        if !super::sat_a_week(&path, now) {
             continue;
         }
-        let Some(st) = load(opts, &key(tab)) else {
+        let Ok(Some(st)) = load_record(opts, &key(tab)) else {
             continue;
         };
         let ours = st.agent == Agent::Codex && (st.tab.is_empty() || st.tab == tab);
         if ours && !st.in_flight() && super::settled(&st) && life(tab) == TabLife::Gone {
-            let _ = std::fs::remove_file(&path);
+            super::prune_if_unchanged(opts, &key(tab), &st, now);
         }
     }
 }

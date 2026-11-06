@@ -36,6 +36,65 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
 const SESSION: &str = "446a0b3c-1979-414f-ae20-e06e26a2ef44";
 const T0: u64 = 1_790_531_000;
 
+#[test]
+fn an_in_memory_candidate_is_held_before_retirement_flag_normalization() {
+    let prior = St {
+        native_account_candidate: Some(crate::harness::native_account_handoff::Pending::read(
+            &aterm_json::Value::Null,
+        )),
+        from: "1.0.0".into(),
+        to: "1.0.1".into(),
+        ..St::default()
+    };
+    let target = Candidate {
+        exe: PathBuf::from("/nonexistent/claude"),
+        version: Version::parse("1.0.2").unwrap(),
+        source: Source::Managed,
+    };
+    let (retargeted, how) = St::retarget(
+        Some(prior.clone()),
+        &Version::parse("1.0.0").unwrap(),
+        &target,
+        None,
+        Proc::default(),
+        T0,
+    );
+    assert_eq!(how, Retarget::Kept);
+    assert_eq!(retargeted.to, prior.to);
+    assert_eq!(
+        retargeted.native_account_candidate,
+        prior.native_account_candidate
+    );
+    let mut replacement = St::default();
+    assert!(prior.preserve_unresolved_native(&mut replacement));
+    assert_eq!(
+        replacement.native_account_candidate,
+        prior.native_account_candidate
+    );
+    assert_eq!(replacement.to, prior.to);
+    assert!(replacement.native_coordination);
+}
+
+#[test]
+fn reaching_a_pending_native_target_closes_it_once_without_erasing_coordination() {
+    let (_dir, opts) = scratch("native-reached");
+    let st = St {
+        native_coordination: true,
+        from: "1.0.0".into(),
+        to: "1.0.1".into(),
+        source: "native".into(),
+        ..St::default()
+    };
+    save_checked(&opts, SESSION, &st).unwrap();
+    let running = Version::parse("1.0.1").unwrap();
+    let read = load(&opts, SESSION).unwrap();
+    assert!(forget_settled_pending(&opts, SESSION, Some(&read), &running).is_some());
+    let closed = load(&opts, SESSION).unwrap();
+    assert_eq!(closed.phase, Phase::Done);
+    assert!(closed.native_coordination);
+    assert!(forget_settled_pending(&opts, SESSION, Some(&closed), &running).is_none());
+}
+
 struct Writer {
     save: fn(&Opts, &str, &St, u64),
     restore: fn(&Opts, &str, Option<&St>, u64),

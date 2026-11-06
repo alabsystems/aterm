@@ -292,7 +292,7 @@ impl Fixture {
                         &records.roster,
                         &records.logins,
                         &records.state,
-                        &enrolled,
+                        &crate::harness::accounts::OtherMacs::NONE,
                         NOW,
                     )
                     .contains(&self.label)

@@ -143,7 +143,7 @@ fn the_switch_mode_runs_its_six_cruise_chains_and_the_off_control() {
             "{c:?}"
         );
     }
-    assert!(SwitchOverHeld.same_reply() && !SwitchAgent.same_reply());
+    assert!(!SwitchOverHeld.same_reply() && !SwitchAgent.same_reply());
     assert_eq!(
         Chain::SWITCH[..6]
             .iter()
@@ -944,6 +944,79 @@ fn a_held_tab_switched_to_land_asks_once_and_is_held_again_at_the_same_answer() 
     ));
 }
 
+/// `switch-over-held` as main records it since the continuous-forward design of 2026-11-01:
+/// Cruise holds nothing at the repeated reply but waits the ladder's step for two short turns
+/// (4 min) before its request ([`recovery_wait`]); `meta set`'s Land, no person's, holds there
+/// (limit 1), and the person's press, inside Cruise's wait, asks once. Every other record as
+/// [`over_held`]'s.
+fn over_repeated() -> Seen {
+    let until = |t: i64| crate::util::utc_iso((T0 + t).div_euclid(1000)).replace(".000Z", "Z");
+    let wait = |t: i64| {
+        j(
+            t,
+            &format!(
+                "WAITING seq=2681 until={} {}",
+                until(HELD_AT + 240_000),
+                turn_end::REPEAT_RECOVERY_WAIT
+            ),
+        )
+    };
+    let mut s = over_held();
+    let k = s.journal.iter().position(|(_, l)| l == STALL).unwrap();
+    s.journal[k] = wait(HELD_AT);
+    let ctl = HELD_AT + HELD_SWITCH_MS;
+    s.journal.insert(k + 1, j(ctl + 1_100, STALL));
+    s.journal.insert(
+        k + 2,
+        j(
+            ctl + CTL_WATCH_MS + 1_100,
+            "CLEARED seq=2681 exception=stalled someone's turn",
+        ),
+    );
+    s.journal.insert(k + 3, wait(ctl + CTL_WATCH_MS + 1_200));
+    s.status[0].1 = "task=- autopilot=cruise held=- land_asked=-".into();
+    s
+}
+
+/// SWO on main's records passes: the repeat is Cruise's wait, not a hold. NEGATIVE CONTROLS:
+/// Cruise's request typed before the person's press fails, named; records with neither a wait
+/// nor a hold are unobserved.
+#[test]
+fn a_repeated_cruise_tab_switched_to_land_asks_once_and_land_holds() {
+    let seen = over_repeated();
+    let v = judge_over_held(&seen, T0);
+    let Verdict::Pass(said) = &v else {
+        panic!("{v:?}");
+    };
+    assert!(said.starts_with("repeated at +372.0 s (WAITING"), "{said}");
+    assert!(said.contains("opened by the why"), "{said}");
+    assert_eq!(repeat_of(&seen, T0).map(|(t, _)| *t), Some(T0 + HELD_AT));
+    let mut requested = over_repeated();
+    let at = HELD_AT + HELD_SWITCH_MS - 5_000;
+    let k = requested
+        .journal
+        .iter()
+        .position(|(t, _)| *t > T0 + at)
+        .unwrap();
+    let text: String = turn_end::FORWARD_RECOVERY.chars().take(120).collect();
+    requested.journal.insert(
+        k,
+        j(at, &format!("CONTINUED seq=2681 rule=continue@v1 {text}")),
+    );
+    let Verdict::Fail(why) = judge_over_held(&requested, T0) else {
+        panic!("a request before the press passed");
+    };
+    assert!(why.contains("typed after the repeat"), "{why}");
+    let mut unrepeated = over_repeated();
+    unrepeated
+        .journal
+        .retain(|(_, l)| !recovery_wait(l) && !is_stall(l));
+    assert!(matches!(
+        judge_over_held(&unrepeated, T0),
+        Verdict::Unobserved(_)
+    ));
+}
+
 /// The hold is read at a new point (the agent's same answer), so the switch's one ask after it is
 /// no act typed twice for one point. NEGATIVE CONTROL: the same two acts with no point read
 /// between are.
@@ -1278,4 +1351,35 @@ fn a_persons_command_is_held_never_sent_and_the_loop_goes_on_once_it_clears() {
         panic!("a hold journalled twice passed");
     };
     assert!(why.contains("journaled 2 times"), "{why}");
+}
+
+/// The captures' switch-asked scene reads the repeat off the session's journal file: Cruise's
+/// recovery wait, or an older build's hold; a plain back-off, or no journal, is none (THE NEGATIVE
+/// CONTROL: the ladder's own step is no repeat).
+#[test]
+fn the_repeat_is_read_off_the_journal_file() {
+    let line = |t: i64, l: &str| format!("{{\"t\":{t},\"line\":{l:?}}}");
+    let backoff = line(
+        T0,
+        "WAITING seq=2 until=2026-10-25T10:07:44Z 2 short turn(s) in a row: 4 min back-off",
+    );
+    assert!(!repeat_journaled(&backoff));
+    assert!(!repeat_journaled(""));
+    let recovery = format!(
+        "{backoff}\n{}",
+        line(
+            T0 + 1,
+            &format!(
+                "WAITING seq=3 until=2026-10-25T10:15:44Z {}",
+                turn_end::REPEAT_RECOVERY_WAIT
+            )
+        )
+    );
+    assert!(repeat_journaled(&recovery));
+    let held = line(
+        T0,
+        "EXCEPTION seq=3 kind=stalled when=later held=same-reply Its program answers aterm's acts \
+         with the same reply and no work, so aterm types nothing more.",
+    );
+    assert!(repeat_journaled(&held));
 }

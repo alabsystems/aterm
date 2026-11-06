@@ -12,6 +12,7 @@ use super::*;
 use crate::harness::relaunch::ended_by_restart;
 use crate::harness::upgrade::Request;
 use crate::harness::upgrade_drive::build_start::{NamedProbe, PROBE, Probe};
+use crate::harness::upgrade_drive::load;
 use crate::harness::upgrade_drive::{Ask, ask_for};
 use crate::harness::upgrade_drive::{Due, Job, Kernel, LiveTab};
 use crate::harness::upgrade_muse_live::{self as pure, Look, Open};
@@ -804,7 +805,7 @@ fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
         b"keep the existing destination"
     );
     assert!(
-        refused.step == "wait:claim-unwritten"
+        refused.step == "wait:record-unreadable"
             && blocked.asked("signal").is_empty()
             && blocked.asked("turn").is_empty(),
         "MUSE_CLAIM_MUST_BE_WRITTEN_BEFORE_SIGNAL: {refused:?}"

@@ -161,6 +161,10 @@ pub(super) fn write_captured_landing<T>(
     let captured = capture(&file)?;
     drop(file);
     check()?;
+    #[cfg(any(test, debug_assertions))]
+    if let Some(error) = publication_seam::failure() {
+        return Err(error);
+    }
     std::fs::rename(&temporary.path, path)?;
     // The old temporary name is free after the rename; do not remove a later user's file.
     temporary.armed = false;
@@ -176,6 +180,45 @@ pub(super) fn write_captured_landing<T>(
         captured,
         aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()),
     ))
+}
+
+/// Deterministic publication failures for tests using the real atomic writer.
+#[cfg(any(test, debug_assertions))]
+pub mod publication_seam {
+    use std::cell::Cell;
+    use std::io;
+
+    thread_local! {
+        static FAILURE: Cell<Option<io::ErrorKind>> = const { Cell::new(None) };
+    }
+
+    /// Refuse this thread's renames after writing and flushing the temporary.
+    /// Nested guards restore the preceding failure when dropped.
+    #[must_use = "the failure stops when the guard drops"]
+    pub struct FailBeforeRename {
+        outer: Option<io::ErrorKind>,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl FailBeforeRename {
+        /// Install a failure without changing any destination file.
+        pub fn with_kind(kind: io::ErrorKind) -> Self {
+            Self {
+                outer: FAILURE.with(|failure| failure.replace(Some(kind))),
+                _thread: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for FailBeforeRename {
+        fn drop(&mut self) {
+            FAILURE.with(|failure| failure.set(self.outer.take()));
+        }
+    }
+
+    pub(super) fn failure() -> Option<io::Error> {
+        FAILURE.with(|failure| failure.get().map(io::Error::from))
+    }
 }
 
 /// The bytes of a temporary name's salt ([`create_temp_beside`]), written as twice as many hex

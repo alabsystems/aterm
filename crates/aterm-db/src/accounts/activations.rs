@@ -389,7 +389,8 @@ impl Activations {
                 Some(intent) => session.issue_account_with_intent(admin, wanted, intent)?,
                 None => session.issue_account(admin, wanted)?,
             };
-            let mut payload = b"AAOP1".to_vec();
+            let mut payload = Vec::with_capacity(21 + decision.bytes().len());
+            payload.extend_from_slice(b"AAOP1");
             payload.extend_from_slice(&request);
             payload.extend_from_slice(decision.bytes());
             let receipt = crate::documents::application::append(session, store, &payload)?;
@@ -583,7 +584,7 @@ fn prepared_members(
                     continue;
                 };
                 let child = &history.records[head];
-                if matches!(&child.request().action,Action::Prepare(terms) if **terms==intent.for_device(reference,member.clone()))
+                if matches!(&child.request().action, Action::Prepare(terms) if terms.intent == Some(reference) && terms.device == member && intent.matches(terms))
                 {
                     result.insert(member, *head);
                 }

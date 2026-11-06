@@ -553,7 +553,7 @@ pub(crate) fn extract_executable_faulted_symbols(
         return hits;
     };
 
-    let mut sect_syms: Vec<(u8, u64, String)> = Vec::new();
+    let mut sect_syms: Vec<(u8, u64, &str)> = Vec::new();
     for entry in sym_table.as_chunks::<16>().0 {
         let n_type = entry[4];
         if (n_type & N_STAB) != 0 || (n_type & N_TYPE) != N_SECT {
@@ -579,13 +579,13 @@ pub(crate) fn extract_executable_faulted_symbols(
         if name == "__mh_execute_header" || name.is_empty() {
             continue;
         }
-        sect_syms.push((n_sect, addr, name.to_string()));
+        sect_syms.push((n_sect, addr, name));
     }
 
     sect_syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     for i in 0..sect_syms.len() {
-        let (sect, start, ref name) = sect_syms[i];
+        let (sect, start, name) = sect_syms[i];
         if !should_order_symbol_name(name) {
             continue;
         }
@@ -608,7 +608,7 @@ pub(crate) fn extract_executable_faulted_symbols(
         let mut p = first_page;
         while p <= last_page {
             if faulted_pages.contains(&p) {
-                hits.insert(name.clone());
+                hits.insert(name.to_string());
                 break;
             }
             let Some(next_p) = p.checked_add(ARM64_PAGE_BYTES) else {
@@ -1025,7 +1025,7 @@ fn is_stdlib_crate(crate_name: &str) -> bool {
 fn extract_v0_locality(sym: &str) -> Option<(String, String, bool)> {
     let v0_body = sym.strip_prefix("__R").or_else(|| sym.strip_prefix("_R"))?;
     let bytes = v0_body.as_bytes();
-    let mut fallback_std: Option<(String, String)> = None;
+    let mut fallback_std: Option<(&str, &str)> = None;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -1036,23 +1036,23 @@ fn extract_v0_locality(sym: &str) -> Option<(String, String, bool)> {
             let module_name = if preceded_by_nt {
                 parse_v0_ident(after_crate)
                     .filter(|(ident, _)| is_module_like_ident(ident))
-                    .map(|(ident, _)| ident.to_string())
-                    .unwrap_or_default()
+                    .map(|(ident, _)| ident)
+                    .unwrap_or("")
             } else {
-                String::new()
+                ""
             };
 
             if !is_stdlib_crate(crate_name) {
-                return Some((crate_name.to_string(), module_name, true));
+                return Some((crate_name.to_string(), module_name.to_string(), true));
             }
             if fallback_std.is_none() {
-                fallback_std = Some((crate_name.to_string(), module_name));
+                fallback_std = Some((crate_name, module_name));
             }
         }
         i += 1;
     }
 
-    fallback_std.map(|(c, m)| (c, m, false))
+    fallback_std.map(|(c, m)| (c.to_string(), m.to_string(), false))
 }
 
 fn parse_v0_crate_at(s: &str, c_pos: usize) -> Option<(&str, &str)> {

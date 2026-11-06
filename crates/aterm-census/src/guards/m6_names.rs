@@ -96,7 +96,10 @@ const M6_NAMERS: &[&str] = &[
 /// `src`'s refusals under the workspace scan of m6's path, for the file at `path`.
 fn scan_workspace_file(path: &str, src: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let squeezed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    let m6 = concat!("m", "6");
+    if !src.contains(m6) && !src.contains("aos_momentum") {
+        return out;
+    }
     // Paths with the whitespace around `::` removed, each matched as whole words.
     let paths = tight(src);
     let word = |c: char| c.is_alphanumeric() || c == '_';
@@ -107,9 +110,14 @@ fn scan_workspace_file(path: &str, src: &str) -> Vec<String> {
             }
         }
     }
-    let m6 = concat!("m", "6");
     let in_crate = path.starts_with("crates/aterm-effects/src/");
-    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut flat = String::with_capacity(src.len());
+    for (i, w) in src.split_whitespace().enumerate() {
+        if i > 0 {
+            flat.push(' ');
+        }
+        flat.push_str(w);
+    }
     let mut rest = flat.as_str();
     while let Some(at) = rest.find("use ") {
         let item = &rest[at..];
@@ -144,10 +152,12 @@ fn scan_workspace_file(path: &str, src: &str) -> Vec<String> {
         out.push(format!("the path {bare}"));
     }
     // The parent declares m6 and names it nowhere else, so it re-exports none of it.
-    if path == MOMENTUM_RS
-        && words(src).filter(|w| *w == m6).count() > squeezed.matches(concat!("mod", "m6;")).count()
-    {
-        out.push("aos_momentum.rs names m6 past its declaration".to_owned());
+    if path == MOMENTUM_RS {
+        let squeezed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        if words(src).filter(|w| *w == m6).count() > squeezed.matches(concat!("mod", "m6;")).count()
+        {
+            out.push("aos_momentum.rs names m6 past its declaration".to_owned());
+        }
     }
     out
 }
@@ -334,6 +344,14 @@ fn has_flag(text: &str, flag: &str) -> bool {
 /// they are named or gated.
 fn scan_confinement(path: &str, text: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let flag = concat!("--", "pair");
+    if !text.contains(concat!("Real", "Sets"))
+        && !text.contains(concat!("mint_", "real"))
+        && !text.contains(concat!("mint_", "practice"))
+        && !text.contains(flag)
+    {
+        return out;
+    }
     let tests = test_parts(path, text);
     let in_tests = |word: &str| tests.iter().any(|t| has_word(t, word));
     let rules: [(&str, &[&str], &[&str]); 3] = [
@@ -360,7 +378,6 @@ fn scan_confinement(path: &str, text: &str) -> Vec<String> {
             out.push(format!("names {word}"));
         }
     }
-    let flag = concat!("--", "pair");
     let entry = [LEARN_RS, LEARN_BENCH_RS].contains(&path);
     if tests.iter().any(|t| has_flag(t, flag)) || (!entry && has_flag(text, flag)) {
         out.push(format!("{flag} outside the lab's learner and runner"));

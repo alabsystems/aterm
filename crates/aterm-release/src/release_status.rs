@@ -189,6 +189,11 @@ fn read_events(mut reader: impl Read) -> std::io::Result<Events> {
                                         | "test-case-failed"
                                         | "release-stage"
                                         | "build-child-finished"
+                                        | "step-child-finished"
+                                        | "compile-finished"
+                                        | "inputs"
+                                        | "disk"
+                                        | "publish-line"
                                 )
                             ) =>
                     {
@@ -354,6 +359,16 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         }
         _ => Events::default(),
     };
+    let timeline = match logs
+        .as_deref()
+        .map(crate::release_timeline::Timeline::of_logs)
+    {
+        Some(Ok(timeline)) => timeline.value(),
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Error::new(error.to_string()));
+        }
+        _ => aterm_json::Value::Null,
+    };
     let state = if holder.is_some() {
         "running"
     } else if journal.is_some() || logs.is_some() {
@@ -404,6 +419,7 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         "first_reported_failure": events.first_failure.or(release_events.first_failure),
         "latest_verification_event": events.latest,
         "rejected_log_lines": events.rejected_lines.saturating_add(release_events.rejected_lines),
+        "timeline": timeline,
     });
     if json {
         println!("{value}");
@@ -462,10 +478,35 @@ fn text_status(value: &aterm_json::Value) -> String {
             lines.push(scrub_controls(&format!("{label}: {}", value[field])));
         }
     }
+    if let Some(line) = timeline_line(&value["timeline"]) {
+        lines.push(line);
+    }
     if value["observations_complete"].as_bool() == Some(false) {
         lines.push("observations: incomplete; a log record is partial or unreadable".into());
     }
     lines.join("\n")
+}
+
+/// One line of where the run's time went, from the timeline's totals; `None` before any step ended.
+fn timeline_line(timeline: &aterm_json::Value) -> Option<String> {
+    let path = timeline["critical_path_s"].as_f64()?;
+    let mut words = vec![format!("timeline: {path:.0} s on the critical path")];
+    if let Some(red) = timeline["time_to_first_red_s"].as_f64() {
+        words.push(format!("first red after {red:.0} s"));
+    }
+    if let Some(hashes) = timeline["full_hashes"].as_u64() {
+        words.push(format!("{hashes} full input hash(es)"));
+    }
+    if let Some(walks) = timeline["disk_walks"].as_u64() {
+        words.push(format!("{walks} disk walk(s)"));
+    }
+    if let (Some(fresh), Some(compiled)) = (
+        timeline["units"]["fresh"].as_u64(),
+        timeline["units"]["compiled"].as_u64(),
+    ) {
+        words.push(format!("{fresh} units fresh / {compiled} compiled"));
+    }
+    Some(words.join(", "))
 }
 
 fn operational_status(logs: Option<&Path>) -> aterm_json::Value {

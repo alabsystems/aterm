@@ -213,6 +213,9 @@ pub struct Opening<'p> {
     pub beside: Option<&'p str>,
     /// Opened to be read only (`--show-passwords`, `--show-numbers`).
     pub read_only: bool,
+    /// The headers of the grid's `Secret` columns, whose cells no reader of the window but the
+    /// person's eyes gets (`edit … secret=`, `att::Opener`).
+    pub secret: &'p [String],
 }
 
 /// What a view reads and opens beyond the registry: whether and where the session may reveal,
@@ -273,12 +276,12 @@ pub fn run(paths: &Paths, noun: Noun, words: &[String], io: &mut ViewIo<'_>) -> 
     let view = match handle.view() {
         Ok(view) => view,
         Err(error) => {
-            return Ok(json!({
-                "registry": "not imported",
-                "why": error.to_string(),
-                "next": "aterm db alab import --fleet-db --authoritative --apply on the Mac whose \
-                         replica the owner edits",
-            }));
+            return super::unread(
+                paths,
+                error,
+                "aterm db alab import --fleet-db --authoritative --apply on the Mac whose replica \
+                 the owner edits",
+            );
         }
     };
     let collection = noun.collection();
@@ -319,7 +322,10 @@ fn shown_row(
         .iter()
         .filter(|c| c.live_at(collection.version))
     {
-        let shown = match revealed.get(&(pk.to_owned(), column.name.to_owned())) {
+        let opened = (!revealed.is_empty() && matches!(column.ty, crate::typed::Ty::Secret))
+            .then(|| revealed.get(&(pk.to_owned(), column.name.to_owned())))
+            .flatten();
+        let shown = match opened {
             Some(values) => grid::show_opened(values),
             None => grid::show_field(column, row.fields.get(column.name), show_addresses),
         };
@@ -361,29 +367,28 @@ fn reveal_all(
 /// `computers`: each machine row with the Commons seats bound to it, then each live seat no
 /// machine row binds.
 fn seats(paths: &Paths, view: &att::View, rows: &mut [Value]) -> Result<Vec<Value>> {
-    let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
+    let empty = crate::typed::owned::OwnedRead::default();
+    let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
     let lab = LabView::read(
         &view.cells,
-        &owned(registry::MACHINE_FACTS.name),
-        &owned(registry::MAILBOX_OBS.name),
+        owned(registry::MACHINE_FACTS.name),
+        owned(registry::MAILBOX_OBS.name),
         None,
     );
     for row in rows.iter_mut() {
-        let Some(pk) = row
-            .get(MACHINE.prefix)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
+        let Some(seats) = row.get(MACHINE.prefix).and_then(Value::as_str).map(|pk| {
+            let bound: Vec<&String> = lab
+                .bound
+                .iter()
+                .filter(|(_, machine)| *machine == pk)
+                .map(|(uuid, _)| uuid)
+                .collect();
+            json!(bound)
+        }) else {
             continue;
         };
-        let bound: Vec<&String> = lab
-            .bound
-            .iter()
-            .filter(|(_, machine)| **machine == pk)
-            .map(|(uuid, _)| uuid)
-            .collect();
         if let Value::Object(fields) = row {
-            fields.insert("seats".to_owned(), json!(bound));
+            fields.insert("seats".to_owned(), seats);
         }
     }
     let live = crate::alab::Registry::at(paths.clone()).live_uuids()?;
@@ -426,12 +431,13 @@ fn show_in_tab(handle: &Handle, noun: Noun, sid: &str, io: &mut ViewIo<'_>) -> R
         when_ms: io.now_ms,
     };
     let open = &mut *io.open;
-    let mut opener = |file: &Path, line: usize| {
+    let mut opener = |file: &Path, line: usize, secret: &[String]| {
         open(&Opening {
             file,
             line,
             beside: Some(sid),
             read_only: true,
+            secret,
         })
     };
     att::show_grid(handle, noun.collection(), &secrets, &mut opener)?;
@@ -453,12 +459,13 @@ fn edit(handle: &Handle, noun: Noun, place: &Place, io: &mut ViewIo<'_>) -> Resu
         Place::Outside => None,
     };
     let open = &mut *io.open;
-    let mut opener = |file: &Path, line: usize| {
+    let mut opener = |file: &Path, line: usize, secret: &[String]| {
         open(&Opening {
             file,
             line,
             beside,
             read_only: false,
+            secret,
         })
     };
     let edited = att::edit_grid(
@@ -535,11 +542,12 @@ fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
                 .ok_or_else(|| Error::new("no email row holds that address"))
         }
         Noun::Computers => {
-            let owned = |n: &str| view.owned.get(n).cloned().unwrap_or_default();
+            let empty = crate::typed::owned::OwnedRead::default();
+            let owned = |n: &str| view.owned.get(n).unwrap_or(&empty);
             let lab = LabView::read(
                 &view.cells,
-                &owned(registry::MACHINE_FACTS.name),
-                &owned(registry::MAILBOX_OBS.name),
+                owned(registry::MACHINE_FACTS.name),
+                owned(registry::MAILBOX_OBS.name),
                 None,
             );
             verbs::machine_named(&lab, name)
@@ -729,10 +737,11 @@ fn open_for_person(noun: Noun, opening: &Opening<'_>) -> Result<()> {
                 opening.file,
                 opening.line,
                 opening.read_only,
+                opening.secret,
                 &mut said,
             )
         }
-        None => att::amacs(opening.file, opening.line),
+        None => att::amacs(opening.file, opening.line, Some(opening.secret)),
     }
 }
 

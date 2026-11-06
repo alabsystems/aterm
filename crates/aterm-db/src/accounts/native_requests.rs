@@ -128,10 +128,7 @@ impl Requests {
                     if Instant::now() >= self.deadline {
                         return Err(Error::new("native request observation expired"));
                     }
-                    let Ok(requester) = session.peer_writer(operation.header.actor) else {
-                        continue;
-                    };
-                    let (_, target, policy) = body(&decoded)?;
+                    let (target, policy) = body(&decoded)?;
                     if filter
                         .is_some_and(|(expected, digest)| *expected != target || digest != policy)
                     {
@@ -140,6 +137,9 @@ impl Requests {
                     if command(operation.header.actor, &target, policy) != decoded {
                         continue;
                     }
+                    let Ok(requester) = session.peer_writer(operation.header.actor) else {
+                        continue;
+                    };
                     requests.push(Request {
                         operation: operation.header.id,
                         target,
@@ -176,7 +176,7 @@ fn command(actor: Actor, target: &Target, policy: Digest) -> Command {
     }
 }
 
-fn body(command: &Command) -> Result<(&str, Target, Digest)> {
+fn body(command: &Command) -> Result<(Target, Digest)> {
     let Command::Write { changes, .. } = command else {
         return Err(Error::new("native allocation request is not a write"));
     };
@@ -196,7 +196,7 @@ fn body(command: &Command) -> Result<(&str, Target, Digest)> {
             .as_str()
             .ok_or_else(|| Error::new("invalid native request identifier"))?;
         let digest = crate::database::decode_hex::<32>(text)?;
-        if digest == [0; 32] || aterm_codec::hex::encode_lower(&digest) != text {
+        if digest == [0; 32] {
             return Err(Error::new("invalid native request identifier"));
         }
         Ok(digest)
@@ -222,7 +222,7 @@ fn body(command: &Command) -> Result<(&str, Target, Digest)> {
     if command.request() != key[..16] {
         return Err(Error::new("native request retry identifier differs"));
     }
-    Ok((&change.key, target, policy))
+    Ok((target, policy))
 }
 
 fn decode(bytes: &[u8]) -> Result<Command> {

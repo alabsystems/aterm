@@ -5246,7 +5246,7 @@ fn reads_reach(n: usize) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while READ_ON.lock().map_or(0, |reads| reads.len()) < n {
         assert!(Instant::now() < deadline, "the status reader never read");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
 }
 

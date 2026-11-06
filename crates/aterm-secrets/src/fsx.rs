@@ -966,7 +966,7 @@ static READS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, us
 
 /// Count one read of `path` ([`reads_of`]).
 #[cfg(test)]
-fn count_read(path: &Path) {
+pub(crate) fn count_read(path: &Path) {
     *READS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1013,6 +1013,18 @@ pub(crate) fn reads_of(path: &Path) -> usize {
         .get(path)
         .copied()
         .unwrap_or(0)
+}
+
+/// Every path under `dir` this test process opened to read, with how many times ([`reads_of`]).
+#[cfg(test)]
+pub(crate) fn reads_under(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(path, _)| path.starts_with(dir))
+        .map(|(path, reads)| (path.clone(), *reads))
+        .collect()
 }
 
 #[cfg(test)]

@@ -432,11 +432,41 @@ fn serving_now(running: Option<&Wanted>, now: Option<&str>) -> Serving {
 }
 
 /// What this Mac's listener serves now ([`serving_now`] of the running table and aterm.toml as it
-/// is on disk).
+/// is on disk), its grants those that admit now ([`window_grants`]).
 #[cfg(unix)]
 fn served_now() -> Serving {
     let running = FLEET_DESK.lock_or_recover().wanted.clone();
-    serving_now(running.as_ref(), config_now().as_deref())
+    let serving = serving_now(running.as_ref(), config_now().as_deref());
+    Serving {
+        grants: window_grants(serving.grants),
+        ..serving
+    }
+}
+
+/// The grants among `grants` that admit now in this window's fleet state: none while it was taken
+/// under another vault than the one this window reads ([`window_vault`],
+/// [`in_effect`]). Every reader of the window's grants reads them so: each connection's serving
+/// and each lift of a hold.
+#[cfg(unix)]
+fn window_grants(grants: Vec<aterm_net::fleet::DriveGrant>) -> Vec<aterm_net::fleet::DriveGrant> {
+    match aterm_types::dirs::state_dir() {
+        Some(state) => in_effect(grants, &state, window_vault().as_ref()),
+        None => grants,
+    }
+}
+
+/// The grants among `grants` that admit now in the fleet state at `state`, under the vault
+/// `vault` (none: this process reads no vault): all of them where that fleet state was taken under
+/// the vault configured, none where under another or none
+/// ([`aterm_agent::fleet_vault::grants_in_effect`]), as the window's listener and the node job's
+/// read them alike.
+#[cfg(unix)]
+pub(crate) fn in_effect(
+    grants: Vec<aterm_net::fleet::DriveGrant>,
+    state: &std::path::Path,
+    vault: Option<&aterm_secrets::client::Paths>,
+) -> Vec<aterm_net::fleet::DriveGrant> {
+    aterm_agent::fleet_vault::grants_in_effect(state, vault, grants)
 }
 
 /// aterm.toml's text as it is on disk now, a missing one's empty: `None` when it cannot be read.
@@ -569,16 +599,25 @@ pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
     static LOG: std::sync::OnceLock<Option<aterm_agent::fleet_log::LocalLog>> =
         std::sync::OnceLock::new();
     LOG.get_or_init(|| {
-        let isolated = cfg!(test)
-            || std::env::var_os("ATERM_STATE_HOME").is_some()
-            || std::env::var_os("CI").is_some();
-        (!isolated)
-            .then(|| aterm_secrets::client::Paths::live().ok())
-            .flatten()
-            .map(|paths| aterm_agent::fleet_log::LocalLog::of(&paths))
+        window_vault()
+            .as_ref()
+            .map(aterm_agent::fleet_log::LocalLog::of)
     })
     .as_ref()?
     .keys()
+}
+
+/// The vault this window's process reads its membership log, and the vault its fleet's grants
+/// are of, from: the live secrets directory, none in a test or an isolated run (`ATERM_STATE_HOME`,
+/// `CI`, as the node job).
+#[cfg(unix)]
+pub(crate) fn window_vault() -> Option<aterm_secrets::client::Paths> {
+    let isolated = cfg!(test)
+        || std::env::var_os("ATERM_STATE_HOME").is_some()
+        || std::env::var_os("CI").is_some();
+    (!isolated)
+        .then(|| aterm_secrets::client::Paths::live().ok())
+        .flatten()
 }
 
 /// The key `keys` binds `node` to, unless the membership log `log` holds that key out of the
@@ -1182,7 +1221,7 @@ fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
     // next sweep after a read lifts by the list too.
     #[cfg(unix)]
     lift_undriving_holds(
-        &grants_of(wanted.as_ref()),
+        &window_grants(grants_of(wanted.as_ref())),
         &keyring_now(),
         denied_nodes_now().as_deref().unwrap_or_default(),
     );
@@ -2540,6 +2579,8 @@ fn spawn_member_heartbeat(
     let Some(state) = aterm_types::dirs::state_dir() else {
         return;
     };
+    // A record of the vault the fleet state is of, adopted where an older build left none.
+    aterm_agent::fleet_vault::keep(&state, window_vault().as_ref());
     let mut log = window_log();
     if log.as_deref().is_some_and(|keys| {
         aterm_net::fleet_member::read_node_identity(&state)

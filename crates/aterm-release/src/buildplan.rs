@@ -78,12 +78,30 @@ pub struct SliceBuild {
     /// CPU nanoseconds charged to the reaped build child and descendants it waited
     /// for. This is not wall time and excludes descendants abandoned without a wait.
     pub cpu_ns: Option<u64>,
+    /// The units Cargo reported and what the build wrote ([`Units`]); `None` when its messages
+    /// could not be read.
+    pub units: Option<Units>,
+}
+
+/// What one compile call's Cargo messages said (`--message-format=json-render-diagnostics`,
+/// `docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Units {
+    /// `compiler-artifact` messages Cargo found `fresh`.
+    pub fresh: u64,
+    /// `compiler-artifact` messages it built.
+    pub compiled: u64,
+    /// The bytes of the files the built (not fresh) units reported, each file once, by
+    /// `fs::metadata`: what this call wrote, short of the compiler's intermediates. A reported
+    /// file that is gone counts nothing.
+    pub output_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BuildUsage {
     peak_bytes: Option<u64>,
     cpu_ns: Option<u64>,
+    units: Option<Units>,
 }
 
 /// The file name of a universal cut's x86_64 execution record.
@@ -663,6 +681,7 @@ fn build_slices(
                     secs,
                     peak_bytes: usage.peak_bytes,
                     cpu_ns: usage.cpu_ns,
+                    units: usage.units,
                 })
             }
             Err(error) => Err(format!("[{triple}] {error}\n{}", log_tail(&log, 40))),
@@ -925,6 +944,9 @@ fn cargo_build_args(
         "--offline".into(),
         "-p".into(),
         pkg.into(),
+        // Cargo's messages on stdout, for the units the call built and found fresh
+        // ([`Units`]); the compiler's diagnostics still read as text in the log.
+        "--message-format=json-render-diagnostics".into(),
     ]);
     if let Some(triple) = target {
         args.extend(["--target".into(), triple.into()]);
@@ -996,6 +1018,163 @@ const fn release_profile_debug() -> (&'static str, &'static str) {
     } else {
         ("1", "false")
     }
+}
+
+/// Build one pilot arm with the same sealed source and environment as a cut.
+/// Each target is new: a pilot never inherits Cargo intermediates from a cut.
+pub(crate) fn pilot_build(
+    take: &Take,
+    arm: crate::profile_pilot::Arm,
+    root: &Path,
+    target: Option<&str>,
+    build_number: u64,
+    index_hint: Option<&str>,
+) -> Result<aterm_json::Value, String> {
+    snapshot::private_dir(root, "profile pilot take")?;
+    let target_dir = root.join("build.noindex");
+    std::fs::create_dir(&target_dir)
+        .map_err(|e| format!("fresh pilot target {}: {e}", target_dir.display()))?;
+    let log = root.join("build.log");
+    let waiting = Instant::now();
+    let claim = aterm_capacity::admit(
+        aterm_capacity::Need::new(format!("profile-pilot {}", arm.name()))
+            .mem_gib(37)
+            .cores(aterm_capacity::cores())
+            .disk(30 * (1 << 30), root),
+        aterm_capacity::Admit::Wait,
+    )
+    .map_err(|e| e.to_string())?;
+    let waiting_s = waiting.elapsed().as_secs_f64();
+    let load_before = aterm_sysprobe::load_average();
+    let started = Instant::now();
+    let (usage, max_load1) = crate::profile_pilot::with_load(|| {
+        run_slice_profile(
+            take,
+            &SliceRun {
+                verb: "build",
+                pkg: "aterm",
+                target,
+                target_dir: target_dir.clone(),
+                build_number,
+                index_hint,
+                static_crt: false,
+            },
+            Some(&log),
+            Some((arm, claim.cores())),
+        )
+    });
+    let usage = usage?;
+    let wall = started.elapsed().as_secs_f64();
+    take.verify()?;
+    let binary = match target {
+        Some(triple) => target_bin(&target_dir, triple, "aterm"),
+        None => target_dir.join("release/aterm"),
+    };
+    let gui_rlib_to_binary_s = crate::profile_pilot::gui_link_interval(&log, &binary)?;
+    let inspection = crate::profile_pilot::inspect(&binary, root)
+        .unwrap_or_else(|error| aterm_json::json!({"error": error}));
+    let (sha256, bytes) = crate::dmg::sha256_and_size(&binary)?;
+    let retained = root.join("aterm");
+    std::fs::rename(&binary, &retained).map_err(|e| format!("retain pilot artifact: {e}"))?;
+    // Preserve evidence, not eight cold intermediate graphs. Nothing in this
+    // experiment executes the image whose intermediate directory is removed.
+    std::fs::remove_dir_all(&target_dir).map_err(|e| format!("clear pilot intermediates: {e}"))?;
+    Ok(aterm_json::json!({
+        "arm": arm.name(), "slice": target.unwrap_or(NATIVE_SLICE),
+        "wall_s": wall, "cpu_s": usage.cpu_ns.map(|ns| ns as f64 / 1e9),
+        "peak_bytes": usage.peak_bytes,
+        "accounting": "wait4: reaped child and waited descendants",
+        "binary": retained, "binary_bytes": bytes, "sha256": sha256,
+        "granted_cores": claim.cores(), "waiting_s": waiting_s,
+        "gui_rlib_to_binary_s": gui_rlib_to_binary_s,
+        "units": usage.units.map(|u| aterm_json::json!({"fresh": u.fresh, "compiled": u.compiled, "output_bytes": u.output_bytes})),
+        "starved_s": null,
+        "inspection": inspection, "log": log,
+        "load_before": load_before, "load_after": aterm_sysprobe::load_average(),
+        "max_load1": max_load1,
+    }))
+}
+
+/// Run the existing host-only library/wasm instruments against the sealed source,
+/// with the pilot's release overrides reaching the examples they compile.
+pub(crate) fn pilot_host_checks(
+    take: &Take,
+    arm: crate::profile_pilot::Arm,
+    root: &Path,
+    build_number: u64,
+    index_hint: Option<&str>,
+) -> Result<(), String> {
+    let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME").ok_or("profile-pilot requires HOME")?;
+    let claim = aterm_capacity::admit(
+        aterm_capacity::Need::new("profile-pilot host instruments")
+            .mem_gib(26)
+            .cores(aterm_capacity::cores()),
+        aterm_capacity::Admit::Wait,
+    )
+    .map_err(|e| e.to_string())?;
+    for lane in ["vte-engine", "vte-marks", "wasm"] {
+        let args = vec![
+            "--unverified".into(),
+            "--config".into(),
+            take.workspace_config.as_os_str().to_owned(),
+            "--config".into(),
+            take.snapshot.sealed_config.as_os_str().to_owned(),
+            "run".into(),
+            "--manifest-path".into(),
+            take.snapshot.src.join("Cargo.toml").into_os_string(),
+            "--profile".into(),
+            "test".into(),
+            "--locked".into(),
+            "--offline".into(),
+            "-p".into(),
+            "aterm-verify".into(),
+            "--bin".into(),
+            "aterm-verify".into(),
+            "--".into(),
+            "perf".into(),
+            lane.into(),
+            "--no-trend".into(),
+        ];
+        let mut cmd = release_build_command(
+            &stage2.join("targo"),
+            args,
+            &ReleaseEnv {
+                path: release_tool_path(&stage2)?,
+                home: &home,
+                tmp: &take.temporary_dir,
+                cargo_home: take.slice_cargo_home(None),
+                build_number,
+                short_commit: &take.short_commit,
+                commit: &take.snapshot.commit,
+                target_dir: root
+                    .parent()
+                    .ok_or("pilot checks have no parent")?
+                    .join("instruments.noindex"),
+                rustup_home: None,
+                index_hint,
+            },
+        );
+        cmd.current_dir(&take.snapshot.src)
+            .envs(arm.environment())
+            .env("CARGO_BUILD_JOBS", claim.cores().to_string());
+        if lane == "wasm" {
+            cmd.arg("--size-only");
+        }
+        let file = crate::durable::create_fresh(&root.join(format!("{lane}.log")))
+            .map_err(|e| e.to_string())?;
+        cmd.stderr(file.try_clone().map_err(|e| e.to_string())?)
+            .stdout(file);
+        let status = cmd.status().map_err(|e| format!("pilot {lane}: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "pilot {lane} failed ({status}); see {}",
+                root.display()
+            ));
+        }
+        take.verify()?;
+    }
+    Ok(())
 }
 
 /// The shipped channel's published index run now, as a store that has verified nothing finds it ([`atpkg::net::published_index_run`]), for a release build to compile in.
@@ -1112,6 +1291,15 @@ struct SliceRun<'a> {
 }
 
 fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<BuildUsage, String> {
+    run_slice_profile(take, run, log, None)
+}
+
+fn run_slice_profile(
+    take: &Take,
+    run: &SliceRun<'_>,
+    log: Option<&Path>,
+    arm: Option<(crate::profile_pilot::Arm, u32)>,
+) -> Result<BuildUsage, String> {
     let &SliceRun {
         verb, pkg, target, ..
     } = run;
@@ -1168,6 +1356,10 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Buil
             index_hint: run.index_hint,
         },
     );
+    if let Some((arm, cores)) = arm {
+        cmd.envs(arm.environment())
+            .env("CARGO_BUILD_JOBS", cores.to_string());
+    }
     let lane = if run.static_crt {
         "upstream stable (+r) static"
     } else if target.is_some() {
@@ -1185,26 +1377,47 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Buil
             .map_err(|e| format!("create {}: {e}", log.display()))?;
         std::io::Write::write_all(&mut file, format!("{banner}\n").as_bytes())
             .map_err(|e| format!("write {}: {e}", log.display()))?;
-        let err = file
-            .try_clone()
-            .map_err(|e| format!("open {}: {e}", log.display()))?;
-        cmd.stdout(file).stderr(err);
+        cmd.stderr(file);
     } else {
         println!("{banner}");
     }
+    // Cargo's messages go to a file, not a pipe: a daemon the build leaves behind holding
+    // its stdout cannot keep the count from ending.
+    let messages = take.temporary_dir.join(format!(
+        "{verb}-{pkg}-{}-{}.messages.jsonl",
+        target.unwrap_or("native"),
+        std::process::id()
+    ));
+    let sink = crate::durable::create_fresh(&messages)
+        .map_err(|e| format!("create {}: {e}", messages.display()))?;
+    cmd.stdout(sink);
     let started = Instant::now();
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {driver_name} for {pkg}: {e}"))?;
-    let (status, usage) =
+    let spawned = cmd.spawn();
+    cmd.stdout(aterm_uds::spawnfd::Stdio::null());
+    let child = spawned.map_err(|e| format!("spawn {driver_name} for {pkg}: {e}"))?;
+    let (status, mut usage) =
         wait_with_peak(child).map_err(|e| format!("wait for {driver_name} for {pkg}: {e}"))?;
-    let event = build_cpu_event(pkg, target, verb, status, usage, started.elapsed(), log);
-    println!("{event}");
+    let wall = started.elapsed();
+    usage.units = crate::durable::open_regular_file(&messages)
+        .and_then(units_of)
+        .inspect_err(|e| println!("==> {pkg}: cannot read Cargo's messages: {e}"))
+        .ok();
+    if let Some(log) = log.filter(|_| arm.is_some()) {
+        let retained = log.with_extension("messages.jsonl");
+        std::fs::rename(&messages, &retained)
+            .map_err(|e| format!("retain pilot Cargo messages {}: {e}", retained.display()))?;
+    } else {
+        let _ = std::fs::remove_file(&messages);
+    }
+    let call = format!("{verb} {pkg} {}", target.unwrap_or("native"));
+    let line = compile_line(&call, usage, wall);
+    let event = build_cpu_event(&call, pkg, target, verb, status, usage, wall, log);
+    println!("{line}\n{event}");
     if let Some(log) = log {
         use std::io::Write as _;
         let mut file = crate::durable::open_append(log, false)
             .map_err(|e| format!("append {}: {e}", log.display()))?;
-        writeln!(file, "{event}").map_err(|e| format!("append {}: {e}", log.display()))?;
+        writeln!(file, "{line}\n{event}").map_err(|e| format!("append {}: {e}", log.display()))?;
     }
     if !status.success() {
         return Err(format!("{driver_name} {verb} -p {pkg} failed ({status})"));
@@ -1212,7 +1425,97 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Buil
     Ok(usage)
 }
 
+/// The longest Cargo message line [`units_of`] reads; a longer one is skipped.
+const MESSAGE_LINE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Count the units Cargo's `messages` report ([`Units`]), each line read once and bounded.
+/// # Errors
+/// The read's.
+fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
+    let mut units = Units::default();
+    let mut built = std::collections::BTreeSet::new();
+    let mut line = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0; 64 * 1024];
+    let mut book = |line: &[u8], units: &mut Units| {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return;
+        };
+        for artifact in aterm_verify::shape::artifacts(text) {
+            if artifact.fresh {
+                units.fresh += 1;
+            } else {
+                units.compiled += 1;
+                built.extend(artifact.filenames);
+            }
+        }
+    };
+    loop {
+        let n = messages.read(&mut chunk)?;
+        if n == 0 {
+            if !overflow {
+                book(&line, &mut units);
+            }
+            break;
+        }
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                if !overflow {
+                    book(&line, &mut units);
+                }
+                line.clear();
+                overflow = false;
+            } else if line.len() < MESSAGE_LINE_LIMIT && !overflow {
+                line.push(byte);
+            } else {
+                overflow = true;
+            }
+        }
+    }
+    // A file reported twice, or under two names (an uplifted hard link), is written once.
+    let mut seen = std::collections::BTreeSet::new();
+    for file in built {
+        if let Ok(meta) = std::fs::metadata(&file) {
+            use std::os::unix::fs::MetadataExt as _;
+            if seen.insert((meta.dev(), meta.ino())) {
+                units.output_bytes = units.output_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(units)
+}
+
+/// One compile call's line (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1): `-` where
+/// nothing measured it. A slice shares its build child's process group with the other slice, so
+/// no group read can split its starvation out.
+fn compile_line(call: &str, usage: BuildUsage, wall: std::time::Duration) -> String {
+    let units = usage.units.map_or_else(
+        || "- fresh / - compiled".to_owned(),
+        |u| format!("{} fresh / {} compiled", u.fresh, u.compiled),
+    );
+    let cpu = usage.cpu_ns.map_or_else(
+        || "-".to_owned(),
+        |ns| format!("{:.1}", std::time::Duration::from_nanos(ns).as_secs_f64()),
+    );
+    let peak = usage
+        .peak_bytes
+        .map_or_else(|| "-".to_owned(), |b| format!("{} MiB", b / (1024 * 1024)));
+    let bytes = usage.units.map_or_else(
+        || "-".to_owned(),
+        |u| format!("{} MiB", u.output_bytes / (1024 * 1024)),
+    );
+    format!(
+        "compile {call}: {units}, {cpu} CPU-s, - starved-s, {:.1} s wall, peak {peak}, {bytes} written",
+        wall.as_secs_f64()
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one record of one call: each argument is a field it carries"
+)]
 fn build_cpu_event(
+    call: &str,
     package: &str,
     target: Option<&str>,
     verb: &str,
@@ -1224,9 +1527,13 @@ fn build_cpu_event(
     format!(
         "release-event: {}",
         aterm_json::json!({
-            "schema": 1, "event": "build-child-finished",
+            "schema": 1, "event": "build-child-finished", "call": call,
             "package": package, "target": target, "verb": verb,
             "log": log.map(|path| path.to_string_lossy().into_owned()),
+            "units": usage.units.map(|u| aterm_json::json!({
+                "fresh": u.fresh, "compiled": u.compiled,
+            })),
+            "output_bytes": usage.units.map(|u| u.output_bytes),
             "outcome": if status.success() { "ok" } else { "FAIL" },
             "exit_code": status.code(), "execution_s": wall.as_secs_f64(),
             "child_cpu": usage.cpu_ns.map(|ns| aterm_json::json!({
@@ -1251,6 +1558,7 @@ fn wait_with_peak(
         BuildUsage {
             peak_bytes: Some(usage.maxrss).filter(|b| *b > 0),
             cpu_ns: u64::try_from(usage.cpu.as_nanos()).ok(),
+            units: None,
         },
     ))
 }
@@ -2291,6 +2599,7 @@ mod tests {
         assert!(usage.peak_bytes.is_some_and(|bytes| bytes > 0), "{usage:?}");
         assert!(usage.cpu_ns.is_some(), "{usage:?}");
         let event = super::build_cpu_event(
+            "build aterm native",
             "aterm",
             None,
             "build",
@@ -2298,12 +2607,21 @@ mod tests {
             super::BuildUsage {
                 peak_bytes: usage.peak_bytes,
                 cpu_ns: Some(8_000_000_000),
+                units: Some(super::Units {
+                    fresh: 3,
+                    compiled: 2,
+                    output_bytes: 4096,
+                }),
             },
             std::time::Duration::from_secs(3),
             None,
         );
         let value: aterm_json::Value =
             aterm_json::from_str(event.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(value["call"].as_str(), Some("build aterm native"));
+        assert_eq!(value["units"]["fresh"].as_u64(), Some(3));
+        assert_eq!(value["units"]["compiled"].as_u64(), Some(2));
+        assert_eq!(value["output_bytes"].as_u64(), Some(4096));
         assert_eq!(value["outcome"].as_str(), Some("FAIL"));
         assert_eq!(value["execution_s"].as_f64(), Some(3.0));
         assert_eq!(value["child_cpu"]["observed_s"].as_f64(), Some(8.0));
@@ -2312,6 +2630,7 @@ mod tests {
             Some("reaped-child-and-waited-descendants")
         );
         let unknown = super::build_cpu_event(
+            "build aterm native",
             "aterm",
             None,
             "build",
@@ -2323,6 +2642,61 @@ mod tests {
         let value: aterm_json::Value =
             aterm_json::from_str(unknown.strip_prefix("release-event: ").unwrap()).unwrap();
         assert!(value["child_cpu"].is_null());
+        assert!(value["units"].is_null() && value["output_bytes"].is_null());
+        assert_eq!(
+            super::compile_line(
+                "build aterm native",
+                super::BuildUsage::default(),
+                std::time::Duration::from_secs(3)
+            ),
+            "compile build aterm native: - fresh / - compiled, - CPU-s, - starved-s, 3.0 s wall, peak -, - written"
+        );
+    }
+
+    /// Cargo's messages count each unit once by `fresh`, and the bytes are the built units'
+    /// files, each file once however many names it has; a fresh unit's files, a file that is
+    /// gone and a line that is not a `compiler-artifact` count nothing.
+    #[test]
+    fn the_units_count_fresh_and_built_and_size_only_what_was_built() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libbuilt.rlib");
+        std::fs::write(&lib, vec![0_u8; 1000]).unwrap();
+        let meta = dir.path().join("libbuilt.rmeta");
+        std::fs::write(&meta, vec![0_u8; 200]).unwrap();
+        let uplifted = dir.path().join("aterm");
+        std::fs::write(&uplifted, vec![0_u8; 30]).unwrap();
+        let alias = dir.path().join("aterm-0123");
+        std::fs::hard_link(&uplifted, &alias).unwrap();
+        let fresh = dir.path().join("libfresh.rlib");
+        std::fs::write(&fresh, vec![0_u8; 5000]).unwrap();
+        let artifact = |files: &[&std::path::Path], fresh: bool| {
+            aterm_json::json!({
+                "reason": "compiler-artifact",
+                "filenames": files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                "fresh": fresh,
+            })
+            .to_string()
+        };
+        let gone = dir.path().join("gone.rlib");
+        let messages = [
+            artifact(&[&lib, &meta], false),
+            artifact(&[&uplifted], false),
+            artifact(&[&alias, &gone], false),
+            artifact(&[&fresh], true),
+            artifact(&[&lib], false),
+            r#"{"reason":"build-script-executed","filenames":["x"]}"#.to_owned(),
+            "   Compiling aterm v0.1.0".to_owned(),
+        ]
+        .join("\n");
+        let units = super::units_of(Cursor::new(messages.as_bytes())).unwrap();
+        assert_eq!(
+            units,
+            super::Units {
+                fresh: 1,
+                compiled: 4,
+                output_bytes: 1230,
+            }
+        );
     }
 
     /// A stage whose shipped binary was started and never showed it ran is refused, not
@@ -2753,6 +3127,10 @@ mod tests {
                 args.windows(2)
                     .any(|pair| pair == ["--manifest-path", manifest.to_str().unwrap()])
             );
+            assert!(
+                args.iter()
+                    .any(|arg| arg == "--message-format=json-render-diagnostics")
+            );
             assert!(args.contains(&"--locked".to_owned()));
             assert!(args.contains(&"--offline".to_owned()));
         }
@@ -3061,6 +3439,7 @@ mod tests {
                     secs: 1,
                     peak_bytes: None,
                     cpu_ns: None,
+                    units: None,
                 }],
                 archs: "x86_64 arm64".into(),
                 compiler_line: "trust".into(),

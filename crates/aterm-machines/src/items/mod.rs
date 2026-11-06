@@ -94,6 +94,21 @@ pub trait Item: Send + Sync {
     /// One line saying what did not work.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String>;
 
+    /// Apply while a caller's current authorization still holds. Items that perform a batch
+    /// of effects check again at each boundary rather than carrying one admission through it.
+    ///
+    /// # Errors
+    /// The caller withdraws authorization, or the item's apply cannot finish.
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        current()?;
+        self.apply(sys, ctx)
+    }
+
     /// Typed before-images of preference keys this item currently plans to change.
     ///
     /// # Errors

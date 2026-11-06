@@ -8,19 +8,22 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
+use aterm_agent::harness::leftover::{LeftRead, LeftWord, token_of};
 use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::land_check::listed_suffix;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, GaveUp, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
-    Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE, Reach,
-    TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, clean_defense,
-    decide_turn_end, land_contradicted, open_work_strict, repo_work_suffix, says_done,
+    LEFT_HOLDS, Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK,
+    RULE_LAND_NUDGE, Reach, TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD,
+    VERBATIM_UNITS, WaitKind, clean_defense, decide_turn_end, land_contradicted, left_suffix,
+    left_suffix_short, open_work_strict, repo_work_suffix, says_done,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_land_model;
 use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
+use aterm_uds::process::Identity;
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -82,11 +85,20 @@ struct Seen {
     busy: bool,
     dirty: bool,
     keyed: bool,
+    /// The turn ran a tool, however short it was (an `aterm ctl end`).
+    tooled: bool,
     earlier: usize,
 }
 
-/// `reach`: what the host measured of the API's reach, as the loop reads it there.
-fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEndReading {
+/// `reach`: what the host measured of the API's reach, as the loop reads it there; `left`: the
+/// agent's left rows the host read there, each re-proved.
+fn point(
+    said: &str,
+    at: Seen,
+    worked: Option<Duration>,
+    reach: Reach,
+    left: &[Identity],
+) -> TurnEndReading {
     TurnEndReading {
         phase: if at.busy { Phase::Busy } else { Phase::Idle },
         authoritative: true,
@@ -156,12 +168,12 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
-        ran_tools: worked.is_some_and(|w| w >= LONG),
+        ran_tools: at.tooled || worked.is_some_and(|w| w >= LONG),
         tools_unread: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
-        leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
+        leftover: LeftRead::Rows(left.to_vec()),
         fact: None,
         wake: None,
     }
@@ -255,22 +267,37 @@ fn expected(m: &Model, st: &State) -> Verdict {
     }
 }
 
-/// Land's nudge as the model's point says it: the agent's own list quoted where it answered the
-/// check with one (never the word reader's open words), then the repository's facts; where the
-/// reply standing is a `Nothing left:` defense over the repository's work, its contradiction
-/// (slice 4c), git's finding leading.
+/// Land's nudge as the model's point says it: the agent's own list quoted while its answer to the
+/// check stands (never the word reader's open words), then the repository's facts, then the
+/// left suffix where the left leg held the yield (`lheld`); where the reply standing is a
+/// `Nothing left:` defense over the repository's work, its contradiction, git's finding leading
+/// (the contradiction with no row named), and the left suffix riding it as it rides the nudge.
 fn nudge(st: &State) -> String {
-    if matches!(st["said"], 2 | 3) && st["dirty"] == 1 {
-        return land_contradicted(&RepoRead::Found(finding()), None, &[], None).expect("git's leg");
-    }
-    let mut text = LAND_NUDGE.to_string();
-    if st["said"] == 5 {
+    let left = u16::from(st["lheld"] == 1);
+    let mut text = if matches!(st["said"], 2 | 3) && st["dirty"] == 1 {
+        land_contradicted(&RepoRead::Found(finding()), None, &[], None).expect("git's leg")
+    } else {
+        let mut text = LAND_NUDGE.to_string();
+        if st["listed"] == 1 {
+            text.push(' ');
+            text.push_str(&listed_suffix(LIST).expect("the list quoted"));
+        }
+        if st["dirty"] == 1 {
+            text.push(' ');
+            text.push_str(&repo_work_suffix(&finding()));
+        }
+        text
+    };
+    // The left suffix takes the room the rest left: whole, else short, else none.
+    let room = VERBATIM_UNITS.saturating_sub(text.encode_utf16().count());
+    if let Some(said) = (left > 0)
+        .then(|| [left_suffix(left), left_suffix_short(left)])
+        .into_iter()
+        .flatten()
+        .find(|said| said.encode_utf16().count() < room)
+    {
         text.push(' ');
-        text.push_str(&listed_suffix(LIST).expect("the list quoted"));
-    }
-    if st["dirty"] == 1 {
-        text.push(' ');
-        text.push_str(&repo_work_suffix(&finding()));
+        text.push_str(&said);
     }
     text
 }
@@ -306,7 +333,7 @@ enum HoldTeller {
 struct Real {
     st: TurnEndState,
     now: Instant,
-    said: &'static str,
+    said: String,
     at: Seen,
     told: Option<TaskFace>,
     teller: Teller,
@@ -322,6 +349,15 @@ struct Real {
     /// A decider that ignores the measured outage (the negative control): its readings never
     /// carry the Down.
     blind: bool,
+    /// The processes the agent left that `keep <token>` lines kept, still running.
+    kept: Vec<Identity>,
+    /// The process the agent left running that nothing kept (the model's `left`).
+    unkept: Option<Identity>,
+    /// The pid the next process the agent leaves gets.
+    next_pid: u32,
+    /// A host that reads none of the agent's left rows (the negative control): its readings
+    /// carry an empty view.
+    left_unread: bool,
 }
 
 impl Real {
@@ -333,18 +369,37 @@ impl Real {
         }
     }
 
+    /// The agent's left rows a point's reading carries: the kept ones and the unkept one.
+    fn rows(&self) -> Vec<Identity> {
+        if self.left_unread {
+            return Vec::new();
+        }
+        self.kept.iter().copied().chain(self.unkept).collect()
+    }
+
+    /// The reading of a point that ended on `said`, as the host reads it now.
+    fn reading(&self, said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
+        point(said, at, worked, self.reach(), &self.rows())
+    }
+
+    /// The agent's turn leaves a process running, unkept (`LeaveProcess`).
+    fn leaves(&mut self) {
+        let token = format!("{}@1792098840004410:3", self.next_pid);
+        self.next_pid += 1;
+        self.unkept = Some(token_of(&token).expect("a token"));
+    }
+
     /// The decision at the point now, the wall's own wait run through (its ladder's clock,
     /// which the model does not count), never the measured outage's hold, which its `NetUp` or
     /// `OutageCapDue` ends.
     fn decide(&mut self) -> TurnEndAction {
-        let r = point(
-            self.said,
+        let r = self.reading(
+            &self.said,
             Seen {
                 keyed: false,
                 ..self.at
             },
             None,
-            self.reach(),
         );
         self.st.observe(&r, self.now);
         let cfg = SupervisorConfig::default();
@@ -359,6 +414,15 @@ impl Real {
             }
         }
         panic!("the decider waits for ever at {:?}", self.said)
+    }
+
+    /// The act the decider typed at the point now, booked as the loop books it.
+    fn acts(&mut self, a: &TurnEndAction) {
+        let r = self.reading(&self.said, self.at, None);
+        self.st.acted(a, &r, self.now);
+        if let TurnEndAction::Type { rule_id, .. } = a {
+            self.ledgered(rule_id);
+        }
     }
 
     fn tell(&mut self, busy: bool) {
@@ -424,29 +488,29 @@ impl Real {
         }
     }
 
-    fn yields(&mut self, said: &'static str, at: Seen, worked: Duration) {
+    fn yields(&mut self, said: &str, at: Seen, worked: Duration) {
         self.st.took();
         self.ends(said, at, worked);
     }
 
     /// A turn that ended as [`Self::ends`]'s, its earlier words the last's.
-    fn yields_again(&mut self, said: &'static str, worked: Duration) {
+    fn yields_again(&mut self, said: &str, worked: Duration) {
         self.st.took();
         self.ended(said, self.at, worked);
     }
 
     /// A turn that ended on `said`, its earlier words its own.
-    fn ends(&mut self, said: &'static str, at: Seen, worked: Duration) {
+    fn ends(&mut self, said: &str, at: Seen, worked: Duration) {
         let earlier = self.at.earlier + 1;
         self.ended(said, Seen { earlier, ..at }, worked);
     }
 
-    fn ended(&mut self, said: &'static str, at: Seen, worked: Duration) {
+    fn ended(&mut self, said: &str, at: Seen, worked: Duration) {
         self.now += worked;
-        self.said = said;
+        self.said = said.to_string();
         self.at = Seen { busy: false, ..at };
-        self.st
-            .observe(&point(said, at, Some(worked), self.reach()), self.now);
+        let r = self.reading(said, at, Some(worked));
+        self.st.observe(&r, self.now);
         self.tell(false);
     }
 }
@@ -468,6 +532,11 @@ fn hold_of(held: Option<LandHeld>) -> (i64, i64) {
         None => (0, 0),
         Some(h) => {
             assert!(!h.holds(HoldLeg::Cut), "a reply read whole cut: {h:?}");
+            assert_eq!(
+                h.left > 0,
+                h.holds(HoldLeg::Left),
+                "the left rows told beside the left leg: {h:?}"
+            );
             (if h.read { 2 } else { 1 }, i64::from(h.legs))
         }
     }
@@ -588,11 +657,19 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
                 ),
                 "{action} at {before:?}: {a:?}"
             );
-            let r = point(real.said, real.at, None, real.reach());
-            real.st.acted(&a, &r, real.now);
-            if let TurnEndAction::Type { rule_id, .. } = &a {
-                real.ledgered(rule_id);
+            real.acts(&a);
+        }
+        "LeaveProcess" => real.leaves(),
+        "EndProcess" => real.unkept = None,
+        // The keep line names the row's token as `sys left` prints it, under the defense; it keeps
+        // the row where Land judges the defense, a land act's yield.
+        "YieldDefenseKeeps" => {
+            let row = real.unkept.expect("a row to keep");
+            if before["pending"] == 1 || (before["pending"] == 3 && before["cut"] == 1) {
+                real.unkept = None;
+                real.kept.push(row);
             }
+            real.yields(&format!("{DEFENSE}\nkeep {}", row.token()), plain, LONG);
         }
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
         "YieldWork" => real.yields(PROGRESS, plain, LONG),
@@ -667,39 +744,12 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
     }
 }
 
-fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
-    let mut real = Real {
-        st: TurnEndState::default(),
-        now: base,
-        said: PROGRESS,
-        at: Seen::default(),
-        told: None,
-        teller,
-        noted: false,
-        held: None,
-        hold_teller,
-        row_ms: 1_760_000_000_000,
-        down: None,
-        blind: false,
-    };
-    real.told = Some(real.st.face_start());
-    if hold_teller != HoldTeller::Never {
-        real.tell_hold();
-    }
-    real.st.observe(
-        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown),
-        real.now,
-    );
-    real.tell(false);
-    real
-}
-
 /// A walk's real side before any point is judged: no turn has ended under the loop yet.
 fn start_unjudged(base: Instant, teller: Teller) -> Real {
     let mut real = Real {
         st: TurnEndState::default(),
         now: base,
-        said: PROGRESS,
+        said: PROGRESS.to_string(),
         at: Seen::default(),
         told: None,
         teller,
@@ -709,8 +759,28 @@ fn start_unjudged(base: Instant, teller: Teller) -> Real {
         row_ms: 1_760_000_000_000,
         down: None,
         blind: false,
+        kept: Vec::new(),
+        unkept: None,
+        next_pid: 2606,
+        left_unread: false,
     };
     real.told = Some(real.st.face_start());
+    real
+}
+
+fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
+    let mut real = Real {
+        hold_teller,
+        ..start_unjudged(base, teller)
+    };
+    if hold_teller != HoldTeller::Never {
+        real.tell_hold();
+    }
+    real.st.observe(
+        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown, &[]),
+        real.now,
+    );
+    real.tell(false);
     real
 }
 
@@ -731,11 +801,20 @@ fn walk_all(
     hold_teller: HoldTeller,
 ) -> Result<BTreeMap<String, usize>, String> {
     let base = Instant::now() + Duration::from_secs(3600);
+    walk_from(m, start(base, teller, hold_teller))
+}
+
+/// Every state the model reaches, the real side `first` mirroring each step.
+fn walk_from(m: &Model, first: Real) -> Result<BTreeMap<String, usize>, String> {
     let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
-    let mut queue = VecDeque::from([(m.init_state(), start(base, teller, hold_teller))]);
+    let mut queue = VecDeque::from([(m.init_state(), first)]);
     let mut verdicts = BTreeMap::<String, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(crate::common::key(m, &st)) {
+        // The rows a keep line kept are the real side's alone (the model's `left` forgets a kept
+        // row), so a state a keep reaches and one an end reaches are each walked on.
+        let mut key = crate::common::key(m, &st);
+        key.push(i64::from(!real.kept.is_empty()));
+        if !seen.insert(key) {
             continue;
         }
         for inv in &m.invariants {
@@ -743,6 +822,26 @@ fn walk_all(
         }
         faces(&real, &st)?;
         holds(&real, &st)?;
+        assert_eq!(
+            real.unkept.is_some(),
+            st["left"] == 1,
+            "the unkept row at {st:?}"
+        );
+        // The episode's books hold the rows its keep lines kept, and only those.
+        let books = real.st.land_books();
+        let mut booked: Vec<String> = books.kept.iter().flatten().map(Identity::token).collect();
+        let mut kept: Vec<String> = real.kept.iter().map(Identity::token).collect();
+        booked.sort();
+        kept.sort();
+        assert_eq!(booked, kept, "the kept rows at {st:?}");
+        // An act typed settles the left hold of its yield, so the books count every one.
+        if st["pending"] > 0 {
+            assert_eq!(
+                i64::from(real.st.land_books().left_holds),
+                st["lholds"],
+                "the left holds at {st:?}"
+            );
+        }
         *verdicts
             .entry(format!("hold={} hlegs={}", st["hold"], st["hlegs"]))
             .or_default() += 1;
@@ -771,6 +870,14 @@ fn walk_all(
                 && !real.st.needs_ack_owed()
             {
                 assert_eq!(*text, nudge(&st), "the nudge at {st:?}");
+                let contradicted = matches!(st["said"], 2 | 3) && st["dirty"] == 1;
+                *verdicts
+                    .entry(format!(
+                        "nudge contradicted={} lheld={}",
+                        u8::from(contradicted),
+                        st["lheld"]
+                    ))
+                    .or_default() += 1;
             }
             if st["landed"] == 0
                 && st["failed"] == 0
@@ -1127,6 +1234,10 @@ fn tier1_the_real_teller_tells_what_holds_the_landing() {
         "hold=2 hlegs=4",
         "hold=2 hlegs=2",
         "hold=2 hlegs=1",
+        "hold=2 hlegs=64",
+        "hold=2 hlegs=65",
+        "hold=2 hlegs=66",
+        "hold=2 hlegs=68",
     ] {
         assert!(seen.contains_key(hold), "{hold} never told: {seen:?}");
     }
@@ -1264,6 +1375,159 @@ fn tier1_each_check_mutant_breaks_its_law_and_the_real_decider_takes_no_such_ste
     }
 }
 
+/// A PROCESS THE AGENT LEFT RUNNING HOLDS THE LANDING UNTIL ITS TURN ENDS IT OR A DEFENSE KEEPS IT
+/// (`docs/DESIGN-leftovers-by-default-2026-10-30.md` §2), [`LEFT_HOLDS`] times at most: a `Nothing
+/// left:` defense over the unkept row owes no check and Land's nudge carries the left suffix (the
+/// walk compares it, riding git's contradiction too); the check's `LANDED` over a row its turn
+/// left lands nothing and audits no defense, so once the row is ended the same defense said again
+/// in a short turn that ran a tool is owed the check again; once a turn ends the row, or a `keep
+/// <token>` line keeps it, the defense owes the check and its `LANDED` lands, the done line saying
+/// `left=0` or `left=kept:1`; past the third hold the check and its landing go ahead over the row
+/// (`left=1`). NEGATIVE CONTROLS: the `Buggy = 12` model lands that `LANDED` over the unkept row,
+/// breaking LandedOnlyByAudit and nothing else, where the committed model and the real decider
+/// land nothing; the third hold still holds; and a host whose readings carry none of the agent's
+/// rows tells a hold without the left leg where the model holds it, failing the walk.
+#[test]
+fn tier1_a_left_process_holds_the_landing_until_ended_or_kept() {
+    let m = supervisor_land_model();
+    let base = Instant::now() + Duration::from_secs(3600);
+    let lands_over = aterm_spec::interp::with_buggy(&m, 12);
+    assert!(m.mutant_dials().contains(&12), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&lands_over),
+        BTreeSet::from(["LandedOnlyByAudit"]),
+    );
+    assert_eq!(i64::from(LEFT_HOLDS), 3, "the model's cap is the loop's");
+
+    // The check's turn leaves a process: its `LANDED` lands nothing, in the model and in the real
+    // loop, and only the dialled model lands it.
+    let checked = ["Instruction", "YieldDefense", "Check", "LeaveProcess"];
+    let (st, _) = walk(&m, &checked, base);
+    let mut right = st.clone();
+    assert!(m.fire("YieldLanded", &mut right), "{st:?}");
+    assert_eq!(
+        (right["landed"], right["lholds"], right["lheld"]),
+        (0, 1, 1),
+        "{right:?}"
+    );
+    let mut wrong = st;
+    assert!(lands_over.fire("YieldLanded", &mut wrong));
+    assert_eq!(wrong["landed"], 1, "{wrong:?}");
+    assert!(!lands_over.check_invariant("LandedOnlyByAudit", &wrong));
+    let (_, real) = walk(&m, &[&checked[..], &["YieldLanded"]].concat(), base);
+    assert!(!real.st.landed() && !real.st.task_done());
+    assert!(
+        real.held.is_some_and(|h| h.holds(HoldLeg::Left)),
+        "{:?}",
+        real.held
+    );
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
+
+    // That held `LANDED` audits no defense: the nudge's turn ends the row, and the defense said
+    // again as it was, its turn's words the defense's, in a short turn that ran a tool (which
+    // clears nothing the check read), is owed the check again, as the model's YieldDefense owes it.
+    let (_, defended) = walk(&m, &checked[..2], base);
+    let ended = [
+        &checked[..],
+        &["YieldLanded", "BackoffDue", "Nudge", "EndProcess"],
+    ]
+    .concat();
+    let (st, mut real) = walk(&m, &ended, base);
+    let mut again = st.clone();
+    assert!(m.fire("YieldDefense", &mut again), "{st:?}");
+    assert_eq!(expected(&m, &again), Verdict::Check, "{again:?}");
+    real.st.took();
+    real.ended(
+        DEFENSE,
+        Seen {
+            tooled: true,
+            earlier: defended.at.earlier,
+            ..Seen::default()
+        },
+        SHORT,
+    );
+    assert_eq!(
+        verdict(&real.clone().decide()),
+        Verdict::Check,
+        "the held LANDED audited no defense"
+    );
+
+    // The walk compared the nudge with the left suffix riding it, and riding git's contradiction.
+    let verdicts = clean_walk()
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
+    for nudged in [
+        "nudge contradicted=0 lheld=1",
+        "nudge contradicted=1 lheld=1",
+    ] {
+        assert!(verdicts.contains_key(nudged), "{nudged}: {verdicts:?}");
+    }
+
+    // A defense over the row owes no check, and the nudge after its back-off names the row.
+    let held = ["Instruction", "LeaveProcess", "YieldDefense"];
+    let (st, real) = walk(&m, &held, base);
+    assert_eq!(
+        (st["owed"], st["lholds"], st["hlegs"]),
+        (0, 1, 64),
+        "{st:?}"
+    );
+    assert!(!real.st.land_check_owed());
+    let (_, real) = walk(&m, &[&held[..], &["BackoffDue"]].concat(), base);
+    let a = real.clone().decide();
+    assert!(
+        matches!(&a, TurnEndAction::Type { text, rule_id }
+            if *rule_id == RULE_LAND_NUDGE && text.contains(&left_suffix(1))),
+        "{a:?}"
+    );
+
+    // Ended in the nudge's turn, or kept by a keep line: the defense owes the check, which lands.
+    let nudged = [&held[..], &["BackoffDue", "Nudge"]].concat();
+    for (closes, word) in [
+        (&["EndProcess", "YieldDefense"][..], LeftWord::None),
+        (&["YieldDefenseKeeps"][..], LeftWord::Kept(1)),
+    ] {
+        let path = [&nudged[..], closes].concat();
+        let (st, real) = walk(&m, &path, base);
+        assert_eq!((st["left"], st["owed"]), (0, 1), "{path:?}");
+        assert_eq!(verdict(&real.clone().decide()), Verdict::Check, "{path:?}");
+        let path = [&path[..], &["Check", "YieldLanded"]].concat();
+        let (st, real) = walk(&m, &path, base);
+        assert_eq!(st["landed"], 1, "{path:?}");
+        assert!(real.st.landed(), "{path:?}");
+        assert_eq!(real.st.landed_left(), Some(word), "{path:?}");
+    }
+
+    // The third defense over the row is still held; the fourth owes the check, and its landing
+    // goes ahead over the row.
+    let mut path = held.to_vec();
+    for _ in 1..3 {
+        path.extend(["BackoffDue", "Nudge", "YieldDefense"]);
+    }
+    let (st, real) = walk(&m, &path, base);
+    assert_eq!((st["lholds"], st["owed"], st["lheld"]), (3, 0, 1), "{st:?}");
+    assert_eq!(
+        verdict(&real.clone().decide()),
+        Verdict::Wait,
+        "the third hold"
+    );
+    path.extend(["BackoffDue", "Nudge", "YieldDefense"]);
+    let (st, real) = walk(&m, &path, base);
+    assert_eq!((st["lholds"], st["owed"], st["lheld"]), (3, 1, 0), "{st:?}");
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
+    path.extend(["Check", "YieldLanded"]);
+    let (st, real) = walk(&m, &path, base);
+    assert_eq!((st["landed"], st["left"]), (1, 1), "{st:?}");
+    assert!(real.st.landed());
+    assert_eq!(real.st.landed_left(), Some(LeftWord::Left(1)));
+
+    let unread = Real {
+        left_unread: true,
+        ..start(base, Teller::Loop, HoldTeller::Loop)
+    };
+    let missed = walk_from(&m, unread).expect_err("a host that reads no left row passed");
+    assert!(missed.starts_with("Loop told the hold "), "{missed}");
+}
+
 /// A MANAGED WORKER'S `Could not finish:` ENDS THE WORK AND NOTHING IS TYPED INTO IT UNTIL A TURN
 /// RUNS. NEGATIVE CONTROLS: the `Buggy = 11` model, which nudges into it, breaks
 /// `NeverTypeIntoAFailedTask` (and nothing else), and a session no manager waits on gets no such
@@ -1338,7 +1602,15 @@ fn tier1_a_worker_that_could_not_finish_rests_failed_until_a_turn_runs() {
 #[test]
 fn tier1_only_a_managed_land_worker_s_whole_reply_concludes() {
     let now = Instant::now() + Duration::from_secs(3600);
-    let reading = |worked| point(COULD_NOT_FINISH, Seen::default(), worked, Reach::Unknown);
+    let reading = |worked| {
+        point(
+            COULD_NOT_FINISH,
+            Seen::default(),
+            worked,
+            Reach::Unknown,
+            &[],
+        )
+    };
     // The first point, managed only after it.
     let mut st = TurnEndState::default();
     st.observe(&reading(Some(LONG)), now);
@@ -1402,7 +1674,7 @@ fn tier1_a_failed_record_seeds_only_a_point_no_turn_ran_to() {
     let now = Instant::now() + Duration::from_secs(3600);
     let mut st = TurnEndState::default();
     st.observe(
-        &point(COULD_NOT_FINISH, Seen::default(), None, Reach::Unknown),
+        &point(COULD_NOT_FINISH, Seen::default(), None, Reach::Unknown, &[]),
         now,
     );
     assert!(st.seed_gave_up(GaveUp::Repeated));
@@ -1410,7 +1682,7 @@ fn tier1_a_failed_record_seeds_only_a_point_no_turn_ran_to() {
     assert!(st.task_done() && !st.landed());
     let mut st = TurnEndState::default();
     st.observe(
-        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown),
+        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown, &[]),
         now,
     );
     assert!(!st.seed_gave_up(GaveUp::CouldNotFinish));
@@ -1434,7 +1706,7 @@ fn tier1_a_managed_worker_that_repeats_itself_concludes_at_lands_stop() {
     let (st, mut real) = walk(&m, &held, base);
     assert_eq!(st["same"], 2);
     assert_eq!(verdict(&real.decide()), Verdict::Nothing);
-    let r = point(real.said, real.at, None, real.reach());
+    let r = real.reading(&real.said, real.at, None);
 
     let mut unmanaged = real.clone();
     unmanaged.st.conclude_repeated(&r, unmanaged.now);
@@ -1451,7 +1723,7 @@ fn tier1_a_managed_worker_that_repeats_itself_concludes_at_lands_stop() {
     assert_eq!(st["same"], 1);
     let mut once = once;
     once.st.set_managed(true);
-    let r = point(once.said, once.at, None, once.reach());
+    let r = once.reading(&once.said, once.at, None);
     once.st.conclude_repeated(&r, once.now);
     assert_eq!(once.st.gave_up(), None, "one reply kept stops nothing");
 }

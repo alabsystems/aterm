@@ -15,17 +15,20 @@
 //! the inbox (attach), with a paced publisher on the broker timing each of its acks across the
 //! restarts. Each world reads the base priority of the broker's every thread when it is ready and
 //! again when its phases are done, and fails unless the arm's band holds both times: every
-//! thread at 4 (background), the highest at 31 (interactive).
+//! thread at 4 (background), the highest at 31 (interactive). With a `backlog=` the attach
+//! world's log is seeded before its broker starts, and the broker's own process is read through
+//! its open and the world (`run/seeded.rs`, F09).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 
 use super::pingpong::{self, PACE};
 use super::{
     PID_POLL, SUPERVISOR_HEALTHY, await_attach, await_note, backlog, list_since, newest_id, post,
-    presence_subject, read_pid, spawn, wait_live, with_max,
+    presence_subject, read_pid, seeded, spawn, wait_live, with_max,
 };
 use crate::clock::{Clock, ms};
 use crate::harness::{self, DEADLINE, FLEET, SECRET, World, until};
@@ -42,77 +45,181 @@ const DEFAULT_PRIORITY: i32 = 31;
 /// What the broker's start line on its stderr begins with (`aterm link broker`'s banner).
 const BANNER: &str = "aterm link broker: unix socket on ";
 
+/// How often an ended broker's exit is looked for.
+const EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// A broker's root, made before its broker starts and kept until it is dropped, past the
+/// broker's end: a 0700 directory, the argv `aterm link broker` runs there, and the socket and
+/// log that argv names.
+struct Root {
+    /// `bus.sock`, `bus.log`, `mint.secret`, `rest.key`, `broker.err` (a plaintext root's log and
+    /// socket under `plain/`, its secret above them and no key: `at_rest::prepare` mints none
+    /// for a log with no mint secret beside it, which is why that broker serves plaintext).
+    dir: aterm_tempfile::TempDir,
+    argv: Vec<String>,
+    sock: String,
+    log: PathBuf,
+    /// The log's key where it is sealed at rest: what a seed seals the log under.
+    key: Option<[u8; 32]>,
+}
+
+impl Root {
+    /// What `aterm fabric on` makes for `spec`'s tier: `Paths::broker_argv` over a 0700
+    /// directory with the mint secret in it, and the log's key minted beside the log, where the
+    /// broker's first start would mint it (`at_rest::prepare`), so a seed can seal under it.
+    fn shipped(tag: &str, spec: &Spec) -> Self {
+        let dir = private_dir(tag);
+        let paths = paths(dir.path(), spec);
+        write_secret(&dir.path().join(aterm_link::enable::MINT_SECRET));
+        let argv = paths.broker_argv();
+        // The key goes beside the log the broker opens, read off its argv as it reads it.
+        let log = served_log(&argv);
+        aterm_link::at_rest::mint(&log, aterm_uds::backup::Backups::INERT)
+            .expect("mint the log's key")
+            .expect("a fresh root holds no key")
+            .expect("the key's backup mark");
+        let key = aterm_link::at_rest::prepare(&log, aterm_uds::backup::Backups::INERT)
+            .unwrap_or_else(|refused| panic!("{}: {}", refused.why, refused.remedy))
+            .key
+            .map(|k| k.bytes());
+        assert!(key.is_some(), "a root with a key beside its log seals it");
+        Self {
+            sock: dir.path().join("bus.sock").to_string_lossy().into_owned(),
+            dir,
+            argv,
+            log,
+            key,
+        }
+    }
+
+    /// The same argv for a log with no mint secret beside it (the secret one directory up), which
+    /// `at_rest::prepare` serves plaintext and mints no key for. No broker that ships runs so:
+    /// F09's plaintext open, which says what of an open's memory the seal is.
+    fn plaintext(tag: &str, spec: &Spec) -> Self {
+        let dir = private_dir(tag);
+        let root = dir.path().join("plain");
+        std::fs::create_dir(&root).expect("the plaintext root");
+        set_mode(&root, 0o700);
+        let secret = dir.path().join(aterm_link::enable::MINT_SECRET);
+        write_secret(&secret);
+        let mut argv = paths(&root, spec).broker_argv();
+        let at = argv
+            .iter()
+            .position(|w| w == "--secret-file")
+            .unwrap_or_else(|| panic!("the shipped argv names its secret: {argv:?}"));
+        argv[at + 1] = secret.to_string_lossy().into_owned();
+        let log = served_log(&argv);
+        Self {
+            sock: root.join("bus.sock").to_string_lossy().into_owned(),
+            dir,
+            argv,
+            log,
+            key: None,
+        }
+    }
+}
+
+/// A 0700 directory under the short `/tmp`, for a broker's socket ([`harness::sock_dir`]).
+fn private_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let dir = harness::sock_dir(tag);
+    set_mode(dir.path(), 0o700);
+    dir
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
+}
+
+fn write_secret(path: &Path) {
+    std::fs::write(path, SECRET).expect("write the mint secret");
+    set_mode(path, 0o600);
+}
+
+/// The fabric paths over `root` for `spec`'s tier.
+fn paths(root: &Path, spec: &Spec) -> aterm_link::enable::Paths {
+    aterm_link::enable::Paths {
+        home: root.to_path_buf(),
+        login_home: None,
+        root: root.to_path_buf(),
+        aterm: harness::aterm_to_launch().to_string(),
+        fleet: FLEET.to_string(),
+        config: None,
+        rendezvous: None,
+        // What `aterm fabric on` names: no tier for the default, ordered at its horizon.
+        durability: named_tier(spec),
+    }
+}
+
+/// The tier `aterm fabric on` names for `spec`'s: none for the default.
+fn named_tier(spec: &Spec) -> Option<aterm_link::durability::Durability> {
+    match spec.durability {
+        Tier::Ordered => None,
+        Tier::Strict => Some(aterm_link::durability::Durability::Strict),
+        Tier::Relaxed => Some(aterm_link::durability::Durability::Relaxed),
+    }
+}
+
+/// The tier the shipped broker serves `spec`'s on, as it resolves its argv's (guarded).
+fn served_tier(spec: &Spec) -> aterm_link::durability::Durability {
+    aterm_link::durability::resolve(named_tier(spec), true)
+}
+
+/// The log a broker `argv` serves, read as the broker reads it.
+fn served_log(argv: &[String]) -> PathBuf {
+    aterm_link::enable::Paths::served_log(argv)
+        .unwrap_or_else(|| panic!("the shipped argv serves a log: {argv:?}"))
+}
+
 /// One world's broker in a process of its own.
 struct ShippedBroker {
     child: aterm_uds::spawnfd::Child,
     /// Held while it serves: taken, the broker ends itself at its next wake.
     lifeline: Option<aterm_uds::lifeline::Lifeline>,
-    /// Its 0700 root: `bus.sock`, `bus.log`, `mint.secret`, `rest.key`, `broker.err`.
-    root: aterm_tempfile::TempDir,
-    sock: String,
-    argv: Vec<String>,
+    root: Root,
     /// Its start line: the tier it serves, its rules, its limit, its residency, its seal.
     banner: String,
     process: BrokerProcess,
+    /// When it was started: what its readings' times count from.
+    started: Instant,
+    /// Its open as sampled (F09); `None` for a broker started without the sampler.
+    open: Option<seeded::Open>,
 }
 
 impl ShippedBroker {
     /// Start `aterm link broker` for `spec`'s arm under `tag` and wait for its `listening` line.
     fn start(tag: &str, spec: &Spec) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = harness::sock_dir(tag);
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("the broker's root is private");
-        let paths = aterm_link::enable::Paths {
-            home: root.path().to_path_buf(),
-            login_home: None,
-            root: root.path().to_path_buf(),
-            aterm: harness::aterm_to_launch().to_string(),
-            fleet: FLEET.to_string(),
-            config: None,
-            rendezvous: None,
-            // What `aterm fabric on` names: no tier for the default, ordered at its horizon.
-            durability: match spec.durability {
-                Tier::Ordered => None,
-                Tier::Strict => Some(aterm_link::durability::Durability::Strict),
-                Tier::Relaxed => Some(aterm_link::durability::Durability::Relaxed),
-            },
-        };
-        let secret = root.path().join(aterm_link::enable::MINT_SECRET);
-        std::fs::write(&secret, SECRET).expect("write the mint secret");
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
-            .expect("the secret is owner-only");
-        let argv = paths.broker_argv();
-        // The key goes beside the log the broker opens, read off its argv as it reads it.
-        let log = aterm_link::enable::Paths::served_log(&argv)
-            .unwrap_or_else(|| panic!("the shipped argv serves a log: {argv:?}"));
-        if spec.at_rest {
-            aterm_link::at_rest::mint(&log, aterm_uds::backup::Backups::INERT)
-                .expect("mint the log's key")
-                .expect("a fresh root holds no key")
-                .expect("the key's backup mark");
-        }
-        let err = root.path().join("broker.err");
+        Self::launch(Root::shipped(tag, spec), spec.broker_process, false)
+    }
+
+    /// Start `aterm link broker` in `root` as `process`'s task type and wait for its `listening`
+    /// line; with `sample`, its process sampled from the start until it has answered a `Hello`
+    /// and [`seeded::SETTLE`] has passed ([`ShippedBroker::open`]).
+    fn launch(root: Root, process: BrokerProcess, sample: bool) -> Self {
+        let err = root.dir.path().join("broker.err");
         let err_file = std::fs::File::create(&err).expect("broker.err");
-        let (program, args) = argv.split_first().expect("a program word");
+        let (program, args) = root.argv.split_first().expect("a program word");
         let mut cmd = aterm_uds::spawnfd::command(program);
         harness::kept_from_runner(&mut cmd).args(args);
         harness::ship_durable_flushes(&mut cmd);
-        match spec.broker_process {
+        match process {
             BrokerProcess::Background => cmd.enter_background_band(),
             BrokerProcess::Interactive => cmd.start_as_interactive_daemon(),
             BrokerProcess::Inproc => unreachable!("the in-process arm serves its own broker"),
         };
         cmd.stdout(aterm_uds::spawnfd::Stdio::piped())
             .stderr(err_file);
-        let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, root.path())
+        let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, root.dir.path())
             .expect("arm the broker's lifeline");
+        let started = Instant::now();
         let mut child = cmd.spawn().expect("start `aterm link broker`");
-        let sock = root.path().join("bus.sock").to_string_lossy().into_owned();
+        let sampler = sample.then(|| seeded::Sampler::start(child.id(), started));
         let first = harness::first_line_within(&mut child, "the broker's `listening` line");
+        let listening = Instant::now();
         assert_eq!(
             first.trim_end(),
-            format!("listening {sock}"),
+            format!("listening {}", root.sock),
             "broker.err:\n{}",
             std::fs::read_to_string(&err).unwrap_or_default()
         );
@@ -125,14 +232,43 @@ impl ShippedBroker {
                 .find(|l| l.starts_with(BANNER) && l.ends_with('\n'))
                 .map(|l| l.trim_end().to_string())
         });
+        let open = sampler.map(|sampler| {
+            seeded::Open::finish(
+                sampler,
+                child.id(),
+                started,
+                listening,
+                &root.sock,
+                &root.log,
+            )
+        });
         Self {
             child,
             lifeline: Some(lifeline),
             root,
-            sock,
-            argv,
             banner,
-            process: spec.broker_process,
+            process,
+            started,
+            open,
+        }
+    }
+
+    /// Its process now.
+    fn reading(&self) -> seeded::Reading {
+        seeded::Reading::of(self.child.id(), self.started)
+    }
+
+    /// End it, its root kept: its lifeline taken, it closes its log and exits by itself, and one
+    /// still there after the hang detector is killed. Again, nothing.
+    fn end(&mut self) {
+        if self.lifeline.take().is_none() {
+            return;
+        }
+        let child = &mut self.child;
+        let exited =
+            aterm_spec::wait::within(DEADLINE, EXIT_POLL, || child.try_wait().ok().flatten());
+        if exited.is_none() {
+            aterm_uds::deadline::kill_within(&mut self.child, DEADLINE);
         }
     }
 
@@ -166,8 +302,8 @@ impl ShippedBroker {
     fn json(&self, start: &[i32], end: &[i32]) -> Value {
         json!({
             "process": self.process.word(),
-            "root": self.root.path().to_string_lossy().into_owned(),
-            "argv": self.argv.clone(),
+            "root": self.root.dir.path().to_string_lossy().into_owned(),
+            "argv": self.root.argv.clone(),
             "banner": self.banner.clone(),
             "thread_base_priorities": { "ready": start.to_vec(), "done": end.to_vec() },
         })
@@ -193,7 +329,7 @@ impl ShippedBroker {
              (`{asked}`), argv `{}`; its threads' base priorities read {} when it was ready and {} \
              when the phases were done ({shown}). Its start line: `{}`\n",
             self.process.runs_as(),
-            self.argv.join(" "),
+            self.root.argv.join(" "),
             spread(start),
             spread(end),
             self.banner.trim_start_matches("aterm link broker: ")
@@ -203,8 +339,7 @@ impl ShippedBroker {
 
 impl Drop for ShippedBroker {
     fn drop(&mut self) {
-        self.lifeline.take();
-        aterm_uds::deadline::kill_within(&mut self.child, DEADLINE);
+        self.end();
     }
 }
 
@@ -233,8 +368,12 @@ fn spread(read: &[i32]) -> String {
 
 /// One world booted on its own shipped broker, ready, with the broker's band read.
 fn boot(tag: &str, spec: &Spec) -> (ShippedBroker, World, Vec<i32>) {
-    let broker = ShippedBroker::start(&format!("{tag}-b"), spec);
-    let w = World::boot_at(tag, &[], &[], Some(&broker.sock));
+    boot_on(tag, ShippedBroker::start(&format!("{tag}-b"), spec))
+}
+
+/// [`boot`] on `broker`, started.
+fn boot_on(tag: &str, broker: ShippedBroker) -> (ShippedBroker, World, Vec<i32>) {
+    let w = World::boot_at(tag, &[], &[], Some(&broker.root.sock));
     w.wait_ready();
     let band = broker.band("once its world was ready");
     (broker, w, band)
@@ -403,12 +542,44 @@ struct Restart {
 /// The attach world: for each `attach` population, `rounds` kills of the bridge, each timed to
 /// its replacement's pid, to its attach rows reaching a subscriber, and to a live mail posted
 /// right after the kill reaching the inbox; a paced publisher times its acks all the while.
+/// With a backlog the log is seeded first and the broker's memory read throughout ([`Seeds`],
+/// F09).
 pub(super) fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
+    let (seeds, broker) = if spec.backlog > 0 {
+        let (seeds, broker) = Seeds::open(spec);
+        (Some(seeds), broker)
+    } else {
+        (None, ShippedBroker::start("fbench-att-b", spec))
+    };
     eprintln!(
         "fabric bench: booting the attach world on a {} broker",
         spec.broker_process.word()
     );
-    let (broker, w, ready) = boot("fbench-att", spec);
+    // F09: what the broker held between its reads, from the world's boot to its last read.
+    let world_sampler = seeds.as_ref().map(|_| {
+        seeded::Sampler::pausing(
+            broker.child.id(),
+            broker.started,
+            seeded::WORLD_SAMPLE_PAUSE,
+        )
+    });
+    let (mut broker, w, ready) = boot_on("fbench-att", broker);
+    // The broker's process where the world gets to (F09): its open's `Hello`, the world ready,
+    // each population's restarts, a retention tick.
+    let mut memory: Vec<seeded::Read> = Vec::new();
+    if let Some(open) = &broker.open {
+        memory.push((
+            "its open, once a `Hello` was answered".to_string(),
+            open.at_hello,
+            open.health,
+        ));
+    }
+    let mut remember = |what: String, broker: &ShippedBroker| {
+        if seeds.is_some() {
+            memory.push((what, broker.reading(), seeded::Health::of(&broker.root.log)));
+        }
+    };
+    remember("the world ready".to_string(), &broker);
     let first = until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
     });
@@ -491,10 +662,30 @@ pub(super) fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     t_mail,
                 });
             }
+            remember(
+                format!("after {size} session(s)' {} restart(s)", spec.rounds),
+                &broker,
+            );
         }
         stop_steady.store(true, Ordering::Relaxed);
         (restarts, steady.join().expect("the paced publisher"))
     });
+    if seeds.is_some() {
+        eprintln!(
+            "fabric bench: {} s for the broker's next retention tick",
+            seeded::TICK_WAIT.as_secs()
+        );
+        std::thread::sleep(seeded::TICK_WAIT);
+        remember(
+            format!(
+                "{} s later: a retention tick ({} s apart) since",
+                seeded::TICK_WAIT.as_secs(),
+                astream_broker::RETENTION_INTERVAL.as_secs()
+            ),
+            &broker,
+        );
+    }
+    let world_samples = world_sampler.map(seeded::Sampler::finish);
     let done = broker.band("once the attach phases were done");
     let windows: Vec<(u64, u64)> = restarts
         .iter()
@@ -539,7 +730,7 @@ pub(super) fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     ));
     md.push(row("an ack outside every restart", &outside));
     md.push(String::new());
-    let json = json!({
+    let mut json = json!({
         "broker": broker.json(&ready, &done),
         "by_size": by_size,
         "steady_every_ms": u64::try_from(backlog::STEADY_EVERY.as_millis()).unwrap_or(u64::MAX),
@@ -548,21 +739,252 @@ pub(super) fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "steady_ack_outside_ms": stats::to_json(&outside),
     });
     drop(w);
+    broker.end();
+    if let Some(seeds) = seeds {
+        let sampled = world_samples.unwrap_or_default();
+        let seeded = seeds.report(spec, &broker, &memory, &sampled, &mut md);
+        if let Some(fields) = json.as_object_mut() {
+            fields.insert("seeded".to_string(), seeded);
+        }
+    }
     drop(broker);
     (json, md)
 }
 
+/// F09's opens before the attach world: `aterm link broker` on an empty log (the process
+/// alone), on the seeded log plaintext (ended at once, its root kept for the cold reads), and
+/// on the seeded log sealed, which goes on to serve the world. Each is sampled through its open.
+struct Seeds {
+    /// The records seeded: `backlog` for each attach population.
+    records: usize,
+    empty: seeded::Open,
+    empty_banner: String,
+    plain: ShippedBroker,
+    plain_seed: seeded::Seeded,
+    sealed_seed: seeded::Seeded,
+}
+
+impl Seeds {
+    /// Seed both logs, open the three, and hand back the sealed one's broker, serving.
+    fn open(spec: &Spec) -> (Self, ShippedBroker) {
+        let records = spec.backlog * spec.attach.len();
+        let tier = served_tier(spec);
+        let process = spec.broker_process;
+        eprintln!("fabric bench: `aterm link broker` on an empty log, sampled");
+        let mut empty = ShippedBroker::launch(Root::shipped("f09e", spec), process, true);
+        empty.end();
+        let empty_open = empty.open.take().expect("a sampled open");
+        let empty_banner = empty.banner.clone();
+        drop(empty);
+        eprintln!("fabric bench: {records} records seeded plaintext, then its open, sampled");
+        let plain_root = Root::plaintext("f09p", spec);
+        let plain_seed = seeded::seed(&plain_root.log, None, tier, records);
+        let mut plain = ShippedBroker::launch(plain_root, process, true);
+        plain.end();
+        eprintln!("fabric bench: {records} records seeded sealed, then its open, sampled");
+        let sealed_root = Root::shipped("fbench-att-b", spec);
+        let sealed_seed = seeded::seed(&sealed_root.log, sealed_root.key, tier, records);
+        let sealed = ShippedBroker::launch(sealed_root, process, true);
+        for (broker, word) in [(&plain, "plaintext"), (&sealed, "sealed")] {
+            assert!(
+                broker.banner.contains(&format!("at-rest={word};")),
+                "the {word} seed's broker says otherwise: {}",
+                broker.banner
+            );
+            let open = broker.open.as_ref().expect("a sampled open");
+            let retained = open.health.map(|h| h.retained);
+            assert!(
+                retained.is_some_and(|n| n >= records as u64),
+                "the {word} seed's broker retains {retained:?} records of the {records} seeded"
+            );
+        }
+        (
+            Self {
+                records,
+                empty: empty_open,
+                empty_banner,
+                plain,
+                plain_seed,
+                sealed_seed,
+            },
+            sealed,
+        )
+    }
+
+    /// The report's F09 section, pushed onto `md`, and its JSON: the opens, the served broker's
+    /// `memory` where the world got to with the most its `sampled` held between those reads,
+    /// then (both brokers ended) the cold reads at rest, timed here.
+    fn report(
+        self,
+        spec: &Spec,
+        sealed: &ShippedBroker,
+        memory: &[seeded::Read],
+        sampled: &[seeded::Reading],
+        md: &mut Vec<String>,
+    ) -> Value {
+        let tier = served_tier(spec);
+        eprintln!(
+            "fabric bench: cold reads at rest, {} passes of {} records over each log",
+            seeded::COLD_PASSES,
+            seeded::COLD_RECORDS
+        );
+        let mut readers = [
+            seeded::ColdReader::open(&sealed.root.log, sealed.root.key, tier),
+            seeded::ColdReader::open(&self.plain.root.log, None, tier),
+        ];
+        seeded::cold_passes(&mut readers);
+        let sealed_open = sealed.open.as_ref().expect("a sampled open");
+        let plain_open = self.plain.open.as_ref().expect("a sampled open");
+        md.push(format!(
+            "### The broker's own process over a seeded log (F09): {} records\n",
+            self.records
+        ));
+        md.push(format!(
+            "Before the world boots, {} records of {} bytes on `{}` ({} for each of the {} \
+             populations: the total the in-process backlog world reaches by its last) are \
+             written in the bench's process through astream's broker opened as `aterm link \
+             broker` opens it (`open_escalating` on this tier, aterm's retention rules, no rate \
+             limit: the seed is history, not traffic), sealed under the root's key, and closed: \
+             {:.0} ms. No session marks its mail seen, so none has a refill watermark: each \
+             restart's refill starts {} records (the bridge's floor span) below the head, and \
+             while the head is within that span of the seed's end the refill's scan crosses the \
+             seed's newest records. This build's `aterm link broker` then opens that log as {}, \
+             and the bench reads its process by pid (`aterm_sysprobe::procs::processes`): the \
+             physical footprint (`ri_phys_footprint`, what `sys why` reports and ranks a \
+             process by), the resident pages (`ri_resident_size`, RSS, the measure C27's 50 MB \
+             names, the binary's mapped text among them) and the largest footprint it has had \
+             (`ri_lifetime_max_phys_footprint`). Each open is read from its start to {} s after \
+             this process's `Hello` was answered, a sweep of the process table and a {} ms \
+             pause a reading; the table gives the gaps its readings lay apart. Two more \
+             opens of the same binary say where its memory goes: an empty log's (the process \
+             alone) and the same records seeded plaintext ({:.0} ms), whose log lies in a \
+             directory with no mint secret, so it is served plaintext (no shipped root is).\n",
+            self.records,
+            backlog::FILL_BODY_LEN,
+            seeded::subject(),
+            spec.backlog,
+            spec.attach.len(),
+            self.sealed_seed.fill_ms,
+            aterm_link::bridge::REFILL_FLOOR_SPAN,
+            spec.broker_process.runs_as(),
+            seeded::SETTLE.as_secs(),
+            seeded::SAMPLE_PAUSE.as_millis(),
+            self.plain_seed.fill_ms,
+        ));
+        md.extend(seeded::opens_table(&[
+            ("an empty log, sealed", 0, 0, &self.empty),
+            (
+                "the seeded log, plaintext",
+                self.records,
+                self.plain_seed.log_bytes,
+                plain_open,
+            ),
+            (
+                "the seeded log, sealed (serves the world)",
+                self.records,
+                self.sealed_seed.log_bytes,
+                sealed_open,
+            ),
+        ]));
+        md.push(format!(
+            "The served broker, read where the world got to (its health snapshot, rewritten every \
+             {} s, says what it keeps decoded). Its peak is the open's from the first read on, \
+             so a sampler reads its process from the world's boot to the last read, a sweep of \
+             the process table and a {} ms pause a reading ({} readings, {} ms apart at the \
+             median and at most), and each row gives the most of those since the read before \
+             it. The last read waits {} s past the last restart's: its retention tick waits {} s \
+             from the end of its last (astream's `ticker_loop`), so one started in between, and \
+             this broker counts its ticks nowhere a client reads, so the tick is the interval's, \
+             not a count's.\n",
+            aterm_link::broker_health::HEALTH_EVERY.as_secs(),
+            seeded::WORLD_SAMPLE_PAUSE.as_millis(),
+            sampled.len(),
+            seeded::gaps_md(sampled),
+            seeded::TICK_WAIT.as_secs(),
+            astream_broker::RETENTION_INTERVAL.as_secs(),
+        ));
+        md.extend(seeded::readings_table(memory, sampled));
+        md.push(format!(
+            "**The cold reads at rest**, timed in the bench's process once both brokers had \
+             ended: each log opened at a residency budget of 0 (no record kept decoded but the \
+             newest) with no retention rules (no tick walks it beside the reads), served on a \
+             socket of its own, and {} passes over each, a pass `Fetch`ing its first {} seeded \
+             records at most {} a page, the two logs' passes alternating. `Broker::cold_reads` \
+             counted every record of every pass read back from the file (the column), which the \
+             run asserts. A record's time is its pass's over {}: the page cache warm, the \
+             unseal under the key (sealed) or not (plaintext), the decode, the wire and the \
+             reader.\n",
+            seeded::COLD_PASSES,
+            seeded::COLD_RECORDS,
+            seeded::COLD_PAGE,
+            seeded::COLD_RECORDS,
+        ));
+        md.extend(seeded::cold_table(&readers));
+        json!({
+            "records": self.records,
+            "per_population": spec.backlog,
+            "subject": seeded::subject(),
+            "body_bytes": backlog::FILL_BODY_LEN,
+            "seed": { "sealed": self.sealed_seed.json(), "plaintext": self.plain_seed.json() },
+            "opens": {
+                "empty": { "banner": self.empty_banner, "open": self.empty.json() },
+                "plaintext": { "banner": self.plain.banner.clone(), "open": plain_open.json() },
+                "sealed": { "banner": sealed.banner.clone(), "open": sealed_open.json() },
+            },
+            "readings": memory
+                .iter()
+                .scan(None, |before: &mut Option<f64>, (read, r, h)| {
+                    let since = before.map(|lo| seeded::most_between(sampled, lo, r.at_ms));
+                    *before = Some(r.at_ms);
+                    Some(json!({
+                        "read": read,
+                        "process": r.json(),
+                        "health": h.map_or(Value::Null, seeded::Health::json),
+                        "sampled_since_the_read_before": since.map_or(Value::Null, |(n, most)| {
+                            json!({
+                                "samples": n,
+                                "most": most.map_or(Value::Null, |(at, f)| {
+                                    json!({ "at_ms": stats::round3(at), "footprint_bytes": f })
+                                }),
+                            })
+                        }),
+                    }))
+                })
+                .collect::<Vec<_>>(),
+            "world_sample_pause_ms":
+                u64::try_from(seeded::WORLD_SAMPLE_PAUSE.as_millis()).unwrap_or(u64::MAX),
+            "world_samples": sampled.len(),
+            "world_sample_gap_ms": seeded::gaps_json(sampled),
+            "tick_wait_ms": u64::try_from(seeded::TICK_WAIT.as_millis()).unwrap_or(u64::MAX),
+            "cold_reads": {
+                "resident_budget": 0,
+                "records_per_pass": seeded::COLD_RECORDS,
+                "sealed": readers[0].json(),
+                "plaintext": readers[1].json(),
+            },
+        })
+    }
+}
+
 /// The report's broker note for an arm whose broker runs in a process of its own.
 pub(super) fn note(spec: &Spec) -> String {
+    let seeded = if spec.backlog > 0 {
+        format!(
+            " The attach world's log is seeded with {} records before its broker starts, and the \
+             broker's own process is read through its open and the world (`run/seeded.rs`).",
+            spec.backlog * spec.attach.len()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "each world's broker is this build's `aterm link broker` in a process of its own, started \
-         as {} with the argv its launchd job runs (`Paths::broker_argv`: durability {}, at-rest \
-         {}), retained by aterm's default rules and limited by its default rate limit as it \
-         ships. Only the outside stamps are measured, on the bench's clock (`run/outside.rs`): \
-         the messaging world times no burst, and the handoff, ask and cross-node worlds are not \
-         run.",
+         as {} with the argv its launchd job runs (`Paths::broker_argv`: durability {}, its log \
+         sealed at rest under the key beside it), retained by aterm's default rules and limited \
+         by its default rate limit as it ships. Only the outside stamps are measured, on the \
+         bench's clock (`run/outside.rs`): the messaging world times no burst, and the handoff, \
+         ask and cross-node worlds are not run.{seeded}",
         spec.broker_process.runs_as(),
         spec.durability.word(),
-        if spec.at_rest { "on" } else { "off" }
     )
 }

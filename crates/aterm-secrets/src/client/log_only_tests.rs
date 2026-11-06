@@ -30,7 +30,7 @@ fn fixture() -> &'static Fixture {
     })
 }
 
-fn applied_log() -> (aterm_tempfile::TempDir, Paths, Config, State) {
+pub(super) fn applied_log() -> (aterm_tempfile::TempDir, Paths, Config, State) {
     let fixture = fixture();
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(root.path());

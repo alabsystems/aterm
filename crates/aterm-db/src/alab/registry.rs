@@ -940,30 +940,30 @@ pub fn birth(
             ))
         })
     };
-    let address_of = |pk: &str| {
-        cell::project(&ADDRESS, cells)
-            .rows
-            .get(pk)
-            .filter(|row| row.live())
-            .and_then(|row| row.get("addr"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                Error::new(&format!(
-                    "{}: the address it names is not a live row here, or is conflicted",
-                    collection.name
-                ))
-            })
-    };
     match collection.name {
         "mailbox" => keys::mailbox_pk(need("login")?),
         "phone" => keys::random_pk(keys::Random::Phone),
         "address" => keys::address_pk(need("addr")?),
         "machine" => Ok(keys::machine_pk(need("label")?)),
         "account" => {
+            let addresses = cell::project(&ADDRESS, cells);
+            let address_of = |pk: &str| {
+                addresses
+                    .rows
+                    .get(pk)
+                    .filter(|row| row.live())
+                    .and_then(|row| row.get("addr"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(&format!(
+                            "{}: the address it names is not a live row here, or is conflicted",
+                            collection.name
+                        ))
+                    })
+            };
             let login = address_of(need("login")?)?;
             let identity = text("identity").map(address_of).transpose()?;
-            let email = keys::claims_email(identity.as_deref(), Some(&login))?;
+            let email = keys::claims_email(identity, Some(login))?;
             keys::account_pk(need("realm")?, &email)
         }
         "subaccount" => keys::subaccount_pk(need("account")?, need("key")?),

@@ -90,20 +90,18 @@ pub(crate) fn retired(trust: Trust) -> Vec<Retired> {
 pub(crate) fn sealed_at(entry: Option<&Entry>, descriptor: &Descriptor) -> Option<u64> {
     let entry = entry?;
     descriptor.version.checked_add(1)?;
-    if entry.state == State::Subscribed
-        || !entry
-            .declarations
-            .iter()
-            .all(|d| d.descriptor == *descriptor || d.descriptor.is_twin_of(descriptor))
-    {
+    if entry.state == State::Subscribed {
         return None;
     }
-    entry
-        .declarations
-        .iter()
-        .filter(|d| d.descriptor.is_twin_of(descriptor))
-        .map(|d| d.authored_ms)
-        .max()
+    let mut max_twin = None;
+    for d in &entry.declarations {
+        if d.descriptor.is_twin_of(descriptor) {
+            max_twin = Some(max_twin.map_or(d.authored_ms, |m: u64| m.max(d.authored_ms)));
+        } else if d.descriptor != *descriptor {
+            return None;
+        }
+    }
+    max_twin
 }
 
 /// Why a retired table's storage stays.
@@ -317,14 +315,14 @@ impl Directory {
         }
         let claims = claim_dir(session)?;
         let mut seen = read_seen(&claims)?;
-        let before = seen.clone();
+        let mut seen_changed = false;
         let mut doomed = Vec::new();
         let mut released = Released::default();
         for table in retired(self.trust) {
             let scope = table.descriptor.scope;
             let id = scope.digest();
             if scope == self.catalog_scope() || !self.stores(session, scope)? {
-                seen.remove(&id);
+                seen_changed |= seen.remove(&id).is_some();
                 continue;
             }
             let sealed_ms = sealed_at(snapshot.entries.get(&id), &table.descriptor);
@@ -339,9 +337,9 @@ impl Directory {
                 now_s,
                 carried,
             );
-            match stamp {
-                Some(at) => seen.insert(id, at),
-                None => seen.remove(&id),
+            seen_changed |= match stamp {
+                Some(at) => seen.insert(id, at) != Some(at),
+                None => seen.remove(&id).is_some(),
             };
             match decision {
                 Ok(()) => doomed.push(scope),
@@ -350,7 +348,7 @@ impl Directory {
         }
         // The stamps are durable before anything goes, so a pass cut short never restarts a
         // grace it already counted.
-        if seen != before {
+        if seen_changed {
             write_seen(&claims, &seen)?;
         }
         if doomed.is_empty() {

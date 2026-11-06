@@ -446,3 +446,80 @@ fn each_bounded_kinds_longest_record_takes_its_most_bytes() {
         );
     }
 }
+
+/// The kinds whose body depends on their audience and value take at most what
+/// [`entries::most_bytes`] counts for them (a re-key's room in bytes, one-mesh proofs P6 F6):
+/// an `Epoch` of a host list, a `Put` with an anchor and of the Commons descriptor, and a
+/// `Delete`, each signed with the parents the log gives it, take exactly that less 32 bytes for
+/// each parent short of [`MAX_PARENTS`].
+///
+/// NEGATIVE CONTROL (in the test): the same `Put` with a value one byte longer takes one byte
+/// more, and its bound is one byte more too, so a bound that read no value (or capped it) fails.
+/// The bound is new with P6, so no rule before it is run.
+#[test]
+fn a_rekeys_records_take_their_most_bytes() {
+    let mut log = found(&[(A, "m1")]);
+    let short = |record: &Record| 32 * (MAX_PARENTS - record.parents().len());
+    let hosts = EpochAudience::Hosts(vec!["m1".to_owned(), "m2".to_owned()]);
+    let minted = |log: &mut Log, audience: &EpochAudience| {
+        let (draft, key) = log.draft_epoch(&A.id(), 7, audience.clone(), 1).unwrap();
+        let epoch = log.keep(draft.sign(&A.seed(), A.incarnation()).unwrap());
+        assert_eq!(
+            epoch.bytes().len() + short(&epoch),
+            entries::most_bytes::epoch(audience),
+            "{audience:?}"
+        );
+        (*epoch.id(), key)
+    };
+    let (ring, ring_key) = minted(&mut log, &hosts);
+    let (commons, commons_key) = minted(&mut log, &EpochAudience::Commons);
+    let put = |log: &Log, value: usize| {
+        let entry = crate::text::Entry {
+            name: "ring-cred".to_owned(),
+            value: crate::SecretBytes::from(vec![b'v'; value]),
+            audience: Audience::Hosts(vec!["m1".to_owned(), "m2".to_owned()]),
+            if_absent: true,
+            anchor: Some("ring-anchor".to_owned()),
+        };
+        let record = log
+            .draft_put(&A.id(), 7, ring, &ring_key, &entry)
+            .unwrap()
+            .sign(&A.seed(), A.incarnation())
+            .unwrap();
+        let most = entries::most_bytes::put(&hosts, 9, Some(11), value);
+        (record.bytes().len() + short(&record), most)
+    };
+    let (taken, most) = put(&log, 300);
+    assert_eq!(taken, most, "a Put with an anchor");
+    assert_eq!(
+        put(&log, 301),
+        (taken + 1, most + 1),
+        "CONTROL: a byte more of value takes a byte more, and the bound reads it"
+    );
+    let descriptor = b"ACD1-descriptor".as_slice();
+    let record = log
+        .draft_commons_put(&A.id(), 7, commons, &commons_key, descriptor)
+        .unwrap()
+        .sign(&A.seed(), A.incarnation())
+        .unwrap();
+    assert_eq!(
+        record.bytes().len() + short(&record),
+        entries::most_bytes::put(
+            &EpochAudience::Commons,
+            crate::commons::ENTRY.len(),
+            None,
+            descriptor.len()
+        ),
+        "the Commons descriptor"
+    );
+    let record = log
+        .draft_delete(&A.id(), 7, ring, &ring_key, "ring-cred")
+        .unwrap()
+        .sign(&A.seed(), A.incarnation())
+        .unwrap();
+    assert_eq!(
+        record.bytes().len() + short(&record),
+        entries::most_bytes::delete(&hosts, 9),
+        "a Delete"
+    );
+}

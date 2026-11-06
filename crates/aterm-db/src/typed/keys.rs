@@ -102,6 +102,18 @@ pub(crate) fn is_stored_address(raw: &str) -> bool {
         && is_well_formed_address(raw)
 }
 
+fn address_cow(raw: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let trimmed = raw.trim_ascii();
+    if !is_well_formed_address(trimmed) {
+        return Err(Error::new("not an address"));
+    }
+    if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        Ok(std::borrow::Cow::Owned(trimmed.to_ascii_lowercase()))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(trimmed))
+    }
+}
+
 /// An address lower-cased and ASCII-trimmed, the claims spelling, once it looks like one:
 /// one `@` between a non-empty local part and a dotted domain, no space or control character,
 /// at most 254 bytes. The refusal never quotes it.
@@ -109,12 +121,7 @@ pub(crate) fn is_stored_address(raw: &str) -> bool {
 /// # Errors
 /// It does not look like an address.
 pub fn address(raw: &str) -> Result<String> {
-    let trimmed = raw.trim_ascii();
-    if is_well_formed_address(trimmed) {
-        Ok(trimmed.to_ascii_lowercase())
-    } else {
-        Err(Error::new("not an address"))
-    }
+    address_cow(raw).map(std::borrow::Cow::into_owned)
 }
 
 /// The address the claims ring keys an account by: its identity when set, else its login
@@ -130,6 +137,14 @@ pub fn claims_email(identity: Option<&str>, login: Option<&str>) -> Result<Strin
     )
 }
 
+fn prefix_hex(prefix: &str, bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(prefix.len() + 1 + bytes.len() * 2);
+    out.push_str(prefix);
+    out.push('-');
+    hex::push_lower(&mut out, bytes);
+    out
+}
+
 fn h8(prefix: &str, domain: &[u8], parts: &[&[u8]]) -> String {
     let mut sha = Sha256::new();
     sha.update(domain);
@@ -139,7 +154,7 @@ fn h8(prefix: &str, domain: &[u8], parts: &[&[u8]]) -> String {
         }
         sha.update(part);
     }
-    format!("{prefix}-{}", hex::encode_lower(&sha.finalize()[..8]))
+    prefix_hex(prefix, &sha.finalize()[..8])
 }
 
 /// A machine's key from its birth identity: its Commons machine uuid (32 hex) when it
@@ -168,13 +183,15 @@ pub fn hw_hint(network: &[u8; 16], platform_uuid: &str) -> String {
     let mut sha = Sha256::new();
     sha.update(b"aterm/alab/hw-hint-key/1\0");
     sha.update(network);
-    let tag = hmac_sha256_parts(
-        &sha.finalize(),
-        &[
-            b"aterm/alab/hw-hint/1",
-            platform_uuid.trim().to_ascii_uppercase().as_bytes(),
-        ],
-    );
+    let trimmed = platform_uuid.trim();
+    let upper;
+    let uuid_bytes = if trimmed.bytes().any(|b| b.is_ascii_lowercase()) {
+        upper = trimmed.to_ascii_uppercase();
+        upper.as_bytes()
+    } else {
+        trimmed.as_bytes()
+    };
+    let tag = hmac_sha256_parts(&sha.finalize(), &[b"aterm/alab/hw-hint/1", uuid_bytes]);
     hex::encode_lower(&tag[..8])
 }
 
@@ -183,11 +200,8 @@ pub fn hw_hint(network: &[u8; 16], platform_uuid: &str) -> String {
 /// # Errors
 /// `raw` is not an address.
 pub fn address_pk(raw: &str) -> Result<String> {
-    Ok(h8(
-        "ad",
-        b"aterm/alab/address/1\0",
-        &[address(raw)?.as_bytes()],
-    ))
+    let addr = address_cow(raw)?;
+    Ok(h8("ad", b"aterm/alab/address/1\0", &[addr.as_bytes()]))
 }
 
 /// **The canonical account key**: the canonical realm and the claims email
@@ -198,10 +212,11 @@ pub fn address_pk(raw: &str) -> Result<String> {
 /// An unknown realm or a malformed address.
 pub fn account_pk(realm: &str, claims_email: &str) -> Result<String> {
     let realm = canonical_realm(realm).ok_or_else(|| Error::new("unknown provider realm"))?;
+    let email = address_cow(claims_email)?;
     Ok(h8(
         "ac",
         b"aterm/alab/account/1\0",
-        &[realm.as_bytes(), address(claims_email)?.as_bytes()],
+        &[realm.as_bytes(), email.as_bytes()],
     ))
 }
 
@@ -251,10 +266,7 @@ pub fn random_pk(kind: Random) -> Result<String> {
     let prefix = match kind {
         Random::Phone => "ph",
     };
-    Ok(format!(
-        "{prefix}-{}",
-        hex::encode_lower(&crate::crypto::random::<8>()?)
-    ))
+    Ok(prefix_hex(prefix, &crate::crypto::random::<8>()?))
 }
 
 /// Sign-in methods and their codes of at most six characters, so an auth-route key fits.
@@ -302,7 +314,7 @@ pub fn preference_pk(machine: &str, account: &str) -> Result<String> {
     sha.update(machine.as_bytes());
     sha.update([0]);
     sha.update(account.as_bytes());
-    Ok(format!("pf-{}", hex::encode_lower(&sha.finalize()[..11])))
+    Ok(prefix_hex("pf", &sha.finalize()[..11]))
 }
 
 /// The CLI word a realm's default account label starts with: the CLI that signs in to it.
@@ -334,27 +346,23 @@ pub fn default_account_label(realm: &str, account: &str) -> Result<String> {
 
 /// An import source's key: a digest of its bytes, so a re-run of the same file collapses.
 pub fn source_pk(bytes: &[u8]) -> String {
-    format!("sr-{}", hex::encode_lower(&Sha256::digest(bytes)[..8]))
+    prefix_hex("sr", &Sha256::digest(bytes)[..8])
 }
 
 /// An archived owned record's key in a later table generation (design §3.8): a digest of the
 /// operation it carries, so every Mac that carries one record names one row.
 pub fn archived_pk(operation: &[u8; 32]) -> String {
-    let mut sha = Sha256::new();
-    sha.update(b"aterm/alab/archived/1\0");
-    sha.update(operation);
-    format!("ar-{}", hex::encode_lower(&sha.finalize()[..8]))
+    h8("ar", b"aterm/alab/archived/1\0", &[operation])
 }
 
 /// A table roll's cover row (design §3.8): one per generation rolled from and Mac that restated
 /// it, so a Mac's later restatement of what it still held replaces its own earlier cover.
 pub fn roll_pk(from: u32, uuid32: &str) -> String {
-    let mut sha = Sha256::new();
-    sha.update(b"aterm/alab/roll/1\0");
-    sha.update(from.to_le_bytes());
-    sha.update([0]);
-    sha.update(uuid32.as_bytes());
-    format!("rl-{}", hex::encode_lower(&sha.finalize()[..8]))
+    h8(
+        "rl",
+        b"aterm/alab/roll/1\0",
+        &[&from.to_le_bytes(), uuid32.as_bytes()],
+    )
 }
 
 /// A writer of a rolled table as its cover row names it: 32 hex digits of a digest of its

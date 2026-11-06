@@ -358,8 +358,9 @@ pub fn fold_agent(spans: &mut Vec<AgentSpan>, named: bool, since: Option<u64>, h
     }
 }
 
-/// A tab this instance saw close: its shell and the horizon its window closes at (§3.2). Kept in
-/// memory only.
+/// A closed tab: its shell and the horizon its window closes at (§3.2). Seen to close by this
+/// instance, or read at its start from the record an earlier aterm of this user wrote in this
+/// boot ([`Self::restored`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClosedTab {
     /// The host's key for its session.
@@ -372,16 +373,22 @@ pub struct ClosedTab {
     pub number: Option<usize>,
     /// Its shell's unique id: the window opens after it.
     pub shell_uniqueid: u64,
-    /// The highest unique id of this uid's table at the reading that missed the tab: the window
-    /// closes there, inclusive.
+    /// The highest unique id of this uid's table at the reading that missed the tab, or at the
+    /// quit of the aterm that hosted it while it was open: the window closes there, inclusive.
     pub horizon: u64,
-    /// When that reading was, unix ms.
+    /// When that reading or quit was, unix ms.
     pub closed_ms: u64,
     /// The stretches an agent ran in it while it lived ([`LiveTab::agent_spans`]).
     pub agent_spans: Vec<AgentSpan>,
     /// The processes it left that the newest reading offers a token for (the rows `end` takes):
     /// a daemon, a held program and a NEVER row it left are listed, never counted.
     pub left: usize,
+    /// Read from an earlier aterm's record: that aterm saw it close, or quit with it open, and
+    /// this instance never hosted it, so its own close index holds no exit of it.
+    pub restored: bool,
+    /// A `proc.left` record told what it left before this instance read it (the earlier aterm's):
+    /// none is told again.
+    pub told: bool,
 }
 
 /// What every candidate of a reading is judged against.
@@ -391,7 +398,7 @@ pub struct Ctx<'a> {
     pub launchd: Option<i32>,
     /// The live tabs.
     pub live: &'a [LiveTab],
-    /// The tabs this instance saw close.
+    /// The closed tabs this instance knows of: seen to close, or restored.
     pub closed: &'a [ClosedTab],
     /// Pids never ended from here (this instance, its ancestors, its keeper).
     pub spared: &'a [u32],
@@ -530,7 +537,7 @@ pub struct LeftView {
     pub runs: Vec<RunRow>,
     /// The recorded dangling links.
     pub links: Vec<LinkRow>,
-    /// The tabs this instance saw close, oldest first.
+    /// The closed tabs this instance knows of (seen to close, or restored), oldest first.
     pub closed: Vec<ClosedTab>,
     /// The live tabs the reading judged against: what `end` judges a row again against.
     pub live: Vec<LiveTab>,

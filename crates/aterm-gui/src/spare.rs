@@ -2802,6 +2802,8 @@ impl Wake {
             Wake::Bell { session, .. } => Some(*session),
             #[cfg(target_os = "linux")]
             Wake::WindowOp { session, .. } => Some(*session),
+            #[cfg(target_os = "macos")]
+            Wake::MachineName(..) => None,
             Wake::ProtectedRead { session, .. } => Some(*session),
             Wake::GrokSigninLooked { session } => Some(*session),
             Wake::LeaseChanged { .. }

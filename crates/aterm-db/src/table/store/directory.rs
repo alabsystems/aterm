@@ -51,18 +51,21 @@ fn legacy_of(identity: Identity) -> [u8; 16] {
     bytes
 }
 
-pub(super) fn check(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]) -> Result<()> {
+pub(super) fn check_observed(
+    identity: &Identity,
+    witness: Option<&[u8]>,
+    claim: &[u8],
+) -> Result<()> {
     if claim.len() != CLAIM_LEN {
         return Err(Error::new("table directory claim has an invalid length"));
     }
-    let identity = read(dir)?;
     let stored = &claim[ANCHOR_LEN..WITNESS_AT];
     if stored[8..] != identity.ino.to_le_bytes() {
         return Err(Error::new(
             "table directory has another inode; recovery required",
         ));
     }
-    if let Some(witness) = witness(claim_dir, claim_name)? {
+    if let Some(witness) = witness {
         if witness.len() != LEN || &witness[..5] != MAGIC || witness[5..37] != anchor(claim) {
             return Err(Error::new(
                 "table volume witness has another custody anchor",
@@ -85,13 +88,26 @@ pub(super) fn check(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]
     Ok(())
 }
 
-/// Called only from a writable open, after the ready claim and complete prefix checked.
-pub(super) fn remember(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]) -> Result<()> {
-    check(dir, claim_dir, claim_name, claim)?;
-    if witness(claim_dir, claim_name)?.is_some() {
-        return Ok(());
+pub(super) fn check(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]) -> Result<()> {
+    if claim.len() != CLAIM_LEN {
+        return Err(Error::new("table directory claim has an invalid length"));
     }
     let identity = read(dir)?;
+    let witness = witness(claim_dir, claim_name)?;
+    check_observed(&identity, witness.as_deref(), claim)
+}
+
+/// Called only from a writable open, after the ready claim and complete prefix checked.
+pub(super) fn remember(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[u8]) -> Result<()> {
+    if claim.len() != CLAIM_LEN {
+        return Err(Error::new("table directory claim has an invalid length"));
+    }
+    let identity = read(dir)?;
+    let existing = witness(claim_dir, claim_name)?;
+    check_observed(&identity, existing.as_deref(), claim)?;
+    if existing.is_some() {
+        return Ok(());
+    }
     if claim[ANCHOR_LEN..WITNESS_AT] != legacy_of(identity) {
         return Err(Error::new(
             "table directory changed before its persistent volume was witnessed",
@@ -100,9 +116,10 @@ pub(super) fn remember(dir: &Path, claim_dir: &Path, claim_name: &str, claim: &[
     let Some(volume) = identity.volume else {
         return Ok(());
     };
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&anchor(claim));
-    bytes.extend_from_slice(&volume);
+    let mut bytes = [0u8; LEN];
+    bytes[..5].copy_from_slice(MAGIC);
+    bytes[5..37].copy_from_slice(&anchor(claim));
+    bytes[37..].copy_from_slice(&volume);
     private_file::check_private_dir(claim_dir)?;
     aterm_secrets::fsx::write_new(&claim_dir.join(name(claim_name)), &bytes, 0o600)
         .map_err(super::super::failure)?;

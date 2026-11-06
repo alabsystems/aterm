@@ -2860,7 +2860,8 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         return line_section("Space now", "Space", vec!["not read yet".into()], false);
     };
     let d = watched(snap);
-    let space = words::disk_space_line(&v);
+    let space =
+        words::space_line(Resource::Disk, snap).unwrap_or_else(|| words::disk_space_line(&v));
     let lines: Vec<(&str, u64, bool)> = d.map_or_else(Vec::new, |d| {
         [
             ("warn", d.warn, false),
@@ -5210,19 +5211,25 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let mut seen = std::collections::HashSet::new();
     lines.retain(|l| seen.insert(l.clone()));
     let now_lines = wrap(c.m, &sentence, c.cw, BODY_PT);
+    // Line 1 names the GPU with its cores and the memory it holds in use
+    // ([`words::gpu_source`]), as speech and ⌘C do; shorter forms drop the memory, then the cores.
     let mut sources = Vec::new();
     if res == Resource::Gpu
-        && let Some(g) = f.gpu.as_ref()
+        && let Some(g) = snap.gpu_sample()
     {
         let model = g
             .name
             .as_deref()
             .filter(|name| !name.is_empty())
             .unwrap_or("GPU");
+        if let Some(source) = words::gpu_source(snap) {
+            sources.push(format!("{source} · as of {at}"));
+        }
         if let Some(cores) = g.cores {
             sources.push(format!("{model} · {cores} cores · as of {at}"));
         }
         sources.push(format!("{model} · as of {at}"));
+        sources.dedup();
     }
     sources.push(format!("as of {at}"));
     let sections = vec![

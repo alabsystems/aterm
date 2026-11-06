@@ -317,6 +317,8 @@ fn a_lab_sync_names_no_fleet_file_it_did_not_write() {
             records: accounts::AccountRecords::default(),
             enrolled: BTreeSet::new(),
             needs_renew: Vec::new(),
+            other_macs: accounts::OtherMacs::NONE,
+            no_route: None,
         };
         assert_eq!(
             write_sync_report(&report, NOW, json, &mut out, &mut err),

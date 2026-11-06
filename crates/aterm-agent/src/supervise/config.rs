@@ -899,11 +899,30 @@ impl SupervisorConfig {
     }
 
     fn from_doc_and_text(doc: &aterm_toml::Value, text: &str) -> (Self, Vec<String>) {
+        let (cfg, notes, _) = Self::read_doc(doc, text);
+        (cfg, notes)
+    }
+
+    /// [`Self::from_doc_and_text`], with each setting that turns one of the harness's switches
+    /// off on its own ([`SwitchedOff`]), in the order the reader reads them, kept where the
+    /// switch is off in the reading.
+    fn read_doc(doc: &aterm_toml::Value, text: &str) -> (Self, Vec<String>, Vec<SwitchedOff>) {
         let mut cfg = Self::default();
         let mut notes = Vec::new();
+        let mut off_by = Vec::new();
+        let mut switched = |turned: Vec<Switch>, by: &dyn Fn() -> OffSetting| {
+            off_by.extend(
+                turned
+                    .into_iter()
+                    .map(|switch| SwitchedOff { switch, by: by() }),
+            );
+        };
         if let Some(h) = doc.get("harness").filter(|h| h.as_table().is_none()) {
             if one_value_text(h).is_some_and(|t| spells_off(&t)) {
                 cfg.enabled = false;
+                switched(vec![Switch::Harness], &|| {
+                    OffSetting::HarnessWrittenOff(written(h))
+                });
                 notes.push(
                     "harness: written off itself — the master switch is off (write \
                      `enabled = false` under [harness])"
@@ -942,6 +961,10 @@ impl SupervisorConfig {
             if let Err(e) = cfg.set_value(&key, value) {
                 notes.push(e);
             }
+            switched(turned_off_alone(&key, value), &|| OffSetting::Harness {
+                key: key.clone(),
+                value: written(value),
+            });
         }
         for (at, table) in misplaced {
             for (key, value) in entries(table) {
@@ -952,6 +975,11 @@ impl SupervisorConfig {
                     cfg = before;
                 }
                 notes.push(misplaced_note(&at, &key, limits, refused));
+                switched(turned_off_alone(&key, value), &|| OffSetting::Misplaced {
+                    at: at.clone(),
+                    key: key.clone(),
+                    value: written(value),
+                });
             }
         }
         let mut scalars = Vec::new();
@@ -960,6 +988,10 @@ impl SupervisorConfig {
             if one_value_text(value).is_some_and(|t| spells_off(&t)) {
                 cfg.enabled = false;
                 notes.push(misplaced_note(&at, "enabled", true, None));
+                switched(vec![Switch::Harness], &|| OffSetting::MisplacedWrittenOff {
+                    at: at.clone(),
+                    value: written(value),
+                });
             }
         }
         if let Some(swarm) = doc.get("swarm") {
@@ -967,13 +999,18 @@ impl SupervisorConfig {
                 Some(swarm) => {
                     for (key, value) in entries(swarm) {
                         if key == "enabled" {
+                            let swarm_off = || {
+                                OffSetting::Swarm(format!("[swarm] enabled = {}", written(value)))
+                            };
                             match value.as_bool() {
                                 Some(false) => {
                                     cfg.accounts = crate::harness::accounts::Mode::Off;
+                                    switched(vec![Switch::Accounts], &swarm_off);
                                 }
                                 Some(true) => {}
                                 None if one_value_text(value).is_some_and(|t| spells_off(&t)) => {
                                     cfg.accounts = crate::harness::accounts::Mode::Off;
+                                    switched(vec![Switch::Accounts], &swarm_off);
                                     notes.push(
                                         "swarm.enabled: expected a boolean (true or false); \
                                          read as false"
@@ -991,6 +1028,9 @@ impl SupervisorConfig {
                 }
                 None if one_value_text(swarm).is_some_and(|t| spells_off(&t)) => {
                     cfg.accounts = crate::harness::accounts::Mode::Off;
+                    switched(vec![Switch::Accounts], &|| {
+                        OffSetting::Swarm(format!("swarm = {}", written(swarm)))
+                    });
                     notes.push(
                         "swarm: written off itself — write `enabled = false` under [swarm]"
                             .to_string(),
@@ -1002,7 +1042,8 @@ impl SupervisorConfig {
                 )),
             }
         }
-        (cfg, notes)
+        off_by.retain(|off| !cfg.switch_on(off.switch));
+        (cfg, notes, off_by)
     }
 
     fn from_invalid_aterm_toml(text: &str, err_msg: &str) -> (Self, Vec<String>) {
@@ -1067,18 +1108,19 @@ impl SupervisorConfig {
         (cfg, notes)
     }
 
-    /// What in aterm.toml's `text` turns account rotation off for `agent` (leaves
-    /// [`Self::accounts_for`] at [`crate::harness::accounts::Mode::Off`]): the harness's master
-    /// switch, `agent`'s own, then in the order [`Self::from_aterm_toml`] reads them `[harness]
-    /// accounts`, an `accounts` in a `harness` table filed below another table's header, and the
-    /// `[swarm]` switch. Empty where none does.
+    /// Each setting in aterm.toml's `text` that turns one of the harness's switches off on its
+    /// own ([`SwitchedOff`]), in the order [`Self::from_aterm_toml`] reads them: the harness
+    /// written off itself, the keys of the `[harness]` table (an agent's own table's
+    /// included), a `harness` key or table filed below another table's header, and the
+    /// `[swarm]` switch. A switch the reading leaves on is named by none; one it leaves off is
+    /// named by every setting that turns it off, so a switch is back on once they are all gone.
     ///
     /// # Errors
     ///
     /// Where `text` is not valid TOML, whose lines [`Self::from_aterm_toml`] reads one by one (its
     /// notes say what each did): where the parser stopped and why, on one line (`TOML error at
     /// line 3, column 8: …`).
-    pub fn accounts_off_by(text: &str, agent: Program) -> Result<Vec<AccountsOff>, String> {
+    pub fn switched_off_by(text: &str) -> Result<Vec<SwitchedOff>, String> {
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|why| {
             let at = why.log_words().to_string();
             match crate::supervise::limit::one_line(why.message_text()) {
@@ -1086,71 +1128,42 @@ impl SupervisorConfig {
                 reason => format!("{at}: {reason}"),
             }
         })?;
-        let turns_off = |value: &aterm_toml::Value| {
-            let mut cfg = Self::default();
-            // A refused value may still read as its limit, off.
-            let _ = cfg.set_value("accounts", value);
-            cfg.accounts == crate::harness::accounts::Mode::Off
-        };
-        let mut off = Vec::new();
-        let (read, _) = Self::from_doc_and_text(&doc, text);
-        if !read.enabled {
-            off.push(
-                match doc.get("harness").filter(|h| h.as_table().is_none()) {
-                    Some(value) => AccountsOff::HarnessWrittenOff(written(value)),
-                    None => AccountsOff::HarnessSwitch,
-                },
-            );
+        let (_, _, off_by) = Self::read_doc(&doc, text);
+        Ok(off_by)
+    }
+
+    /// What in aterm.toml's `text` turns account rotation off for `agent` (leaves
+    /// [`Self::accounts_for`] at [`crate::harness::accounts::Mode::Off`]), from
+    /// [`Self::switched_off_by`]: what turns the harness's master switch off, then `agent`'s own,
+    /// then rotation's, each in the order the reader reads them. Empty where none does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::switched_off_by`], where `text` is not valid TOML.
+    pub fn accounts_off_by(text: &str, agent: Program) -> Result<Vec<OffSetting>, String> {
+        let off_by = Self::switched_off_by(text)?;
+        // One setting turns one switch off, so none is named twice; two settings the reader
+        // files alike are each named.
+        Ok([Switch::Harness, Switch::Agent(agent), Switch::Accounts]
+            .into_iter()
+            .flat_map(|switch| {
+                off_by
+                    .iter()
+                    .filter(move |off| off.switch == switch)
+                    .map(|off| off.by.clone())
+            })
+            .collect())
+    }
+
+    /// Whether this reading leaves `switch` on.
+    #[must_use]
+    pub fn switch_on(&self, switch: Switch) -> bool {
+        match switch {
+            Switch::Harness => self.enabled,
+            Switch::Agent(agent) => !self.off.contains(&agent),
+            Switch::Accounts => self.accounts != Mode::Off,
+            Switch::Logins => self.logins,
         }
-        if read.off.contains(&agent) {
-            off.push(AccountsOff::AgentSwitch(agent));
-        }
-        if let Some(value) = doc
-            .get("harness")
-            .and_then(aterm_toml::Value::as_table)
-            .and_then(|harness| harness.get("accounts"))
-            && turns_off(value)
-        {
-            off.push(AccountsOff::Harness(written(value)));
-        }
-        let mut misplaced = Vec::new();
-        harness_tables(&doc, String::new(), &mut misplaced);
-        for (at, table) in misplaced {
-            if let Some(value) = table.get("accounts")
-                && turns_off(value)
-            {
-                off.push(AccountsOff::Misplaced {
-                    at,
-                    value: written(value),
-                });
-            }
-        }
-        // As the reader takes the switch: `false`, or a word that spells off.
-        let swarm_off = |v: &aterm_toml::Value| {
-            v.as_bool().map_or_else(
-                || one_value_text(v).is_some_and(|t| spells_off(&t)),
-                |on| !on,
-            )
-        };
-        if let Some(swarm) = doc.get("swarm") {
-            match swarm.as_table() {
-                Some(table) => {
-                    if let Some(enabled) = table.get("enabled")
-                        && swarm_off(enabled)
-                    {
-                        off.push(AccountsOff::Swarm(format!(
-                            "[swarm] enabled = {}",
-                            written(enabled)
-                        )));
-                    }
-                }
-                None if swarm_off(swarm) => {
-                    off.push(AccountsOff::Swarm(format!("swarm = {}", written(swarm))));
-                }
-                None => {}
-            }
-        }
-        Ok(off)
     }
 
     /// [`Self::from_aterm_toml`] over the file at `path`: no path or no file is the defaults.
@@ -1845,53 +1858,122 @@ pub fn is_unknown_key_note(note: &str) -> bool {
     note.contains(UNKNOWN_KEY)
 }
 
-/// A setting in aterm.toml that turns account rotation off
-/// ([`SupervisorConfig::accounts_off_by`]). Each value is spelled as TOML reads it, which may
+/// One of the harness's switches a setting in aterm.toml can turn off
+/// ([`SupervisorConfig::switched_off_by`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    /// The master switch ([`SupervisorConfig::enabled`]).
+    Harness,
+    /// One agent's own ([`SupervisorConfig::off`]).
+    Agent(Program),
+    /// Account rotation ([`SupervisorConfig::accounts`] at [`Mode::Off`]).
+    Accounts,
+    /// The login lifecycle ([`SupervisorConfig::logins`]).
+    Logins,
+}
+
+/// A setting in aterm.toml ([`OffSetting`]) that turns one of the harness's switches off on its
+/// own, and that switch ([`SupervisorConfig::switched_off_by`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchedOff {
+    /// The switch it turns off.
+    pub switch: Switch,
+    /// The setting.
+    pub by: OffSetting,
+}
+
+/// A setting in aterm.toml that turns one of the harness's switches off
+/// ([`SupervisorConfig::switched_off_by`]). Each value is spelled as TOML reads it, which may
 /// differ from the file's own spelling of an equal value (`0x0` reads `0`, `'off'` reads
 /// `"off"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccountsOff {
-    /// `[harness] accounts`, its value as TOML reads it: `"early"` or `"wall"` there turns
-    /// rotation back on, where nothing else turns it off.
-    Harness(String),
-    /// `harness.accounts` filed below the header of the table at `at`, which TOML files as
-    /// `<at>.harness.accounts` and which limits all the same; its value as TOML reads it.
+pub enum OffSetting {
+    /// A key of the `[harness]` table, its value as TOML reads it: `<agent>.<leaf>` is the key
+    /// `<leaf>` of the agent's own table, `[harness.<agent>]`. `"early"` or `"wall"` in place of
+    /// an `accounts` there turns rotation back on, where nothing else turns it off.
+    Harness {
+        /// The key, as the reader files it.
+        key: String,
+        /// Its value as TOML reads it.
+        value: String,
+    },
+    /// A key of a `harness` table filed below the header of the table at `at`, which TOML files
+    /// as `<at>.harness.<key>` and which limits all the same; its value as TOML reads it.
     Misplaced {
+        /// The table it is filed in.
+        at: String,
+        /// The key, as the reader files it.
+        key: String,
+        /// Its value as TOML reads it.
+        value: String,
+    },
+    /// The harness written off itself (`harness = false`), its value as TOML reads it.
+    HarnessWrittenOff(String),
+    /// The same below the header of the table at `at`, which TOML files as `<at>.harness` and
+    /// which turns the harness off all the same; its value as TOML reads it.
+    MisplacedWrittenOff {
         /// The table it is filed in.
         at: String,
         /// Its value as TOML reads it.
         value: String,
     },
-    /// The swarm switch, its value as TOML reads it (`[swarm] enabled = false`).
+    /// The swarm switch, as TOML reads it (`[swarm] enabled = false`, `swarm = false`).
     Swarm(String),
-    /// The harness's master switch ([`SupervisorConfig::on_for`]): `enabled = false` under
-    /// `[harness]`.
-    HarnessSwitch,
-    /// The same switch written as the harness itself (`harness = false`), its value as TOML reads
-    /// it.
-    HarnessWrittenOff(String),
-    /// This agent's own switch ([`SupervisorConfig::on_for`]): `[harness.<agent>] enabled = false`.
-    AgentSwitch(Program),
 }
 
-impl AccountsOff {
+impl OffSetting {
     /// The setting as aterm.toml says it, in backticks.
     #[must_use]
     pub fn words(&self) -> String {
         match self {
-            Self::Harness(value) => format!("`[harness] accounts = {value}`"),
-            Self::Misplaced { at, value } => format!(
-                "`{at}.harness.accounts = {value}` (a `harness.accounts` below another table's \
-                 header)"
+            Self::Harness { key, value } => match key.split_once('.') {
+                Some((agent, leaf)) => format!("`[harness.{agent}] {leaf} = {value}`"),
+                None => format!("`[harness] {key} = {value}`"),
+            },
+            Self::Misplaced { at, key, value } => format!(
+                "`{at}.harness.{key} = {value}` (a `harness.{key}` below another table's header)"
             ),
-            Self::Swarm(written) => format!("`{written}`"),
-            Self::HarnessSwitch => "`[harness] enabled = false`".to_string(),
             Self::HarnessWrittenOff(value) => format!("`harness = {value}`"),
-            Self::AgentSwitch(agent) => {
-                format!("`[harness.{}] enabled = false`", agent.name())
+            Self::MisplacedWrittenOff { at, value } => {
+                format!("`{at}.harness = {value}` (a `harness` below another table's header)")
             }
+            Self::Swarm(written) => format!("`{written}`"),
         }
     }
+
+    /// Whether this is `[harness] accounts` itself, whose `"early"` or `"wall"` turns rotation
+    /// back on.
+    #[must_use]
+    pub fn is_harness_accounts(&self) -> bool {
+        matches!(self, Self::Harness { key, .. } if key == "accounts")
+    }
+}
+
+/// The switches `key = value` turns off on its own as a key of the `[harness]` table, as the
+/// reader reads it ([`SupervisorConfig::set_value`]; a refused value may still read as its
+/// limit).
+fn turned_off_alone(key: &str, value: &aterm_toml::Value) -> Vec<Switch> {
+    let base = SupervisorConfig::default();
+    let mut alone = base.clone();
+    let _ = alone.set_value(key, value);
+    let mut turned = Vec::new();
+    if base.enabled && !alone.enabled {
+        turned.push(Switch::Harness);
+    }
+    turned.extend(
+        alone
+            .off
+            .iter()
+            .filter(|agent| !base.off.contains(agent))
+            .map(|agent| Switch::Agent(*agent)),
+    );
+    if base.accounts != Mode::Off && alone.accounts == Mode::Off {
+        turned.push(Switch::Accounts);
+    }
+    if base.logins && !alone.logins {
+        turned.push(Switch::Logins);
+    }
+    turned
 }
 
 /// `value` as TOML reads it, in TOML's spelling: a text quoted, a boolean or number bare (a
@@ -4449,14 +4531,30 @@ trust_dialog = false
     /// switch, the harness's master switch and that agent's own (CONTROL: another agent's own
     /// switch is not named), each where it turns rotation off and none where it does not, a
     /// `[swarm] enabled = true` or a misplaced `harness.accounts = "early"` beside a setting that
-    /// does included; it names one exactly where `accounts_for` leaves rotation off; and where the
-    /// file is not valid TOML it gives where the parser stopped and the parser's own reason, on
-    /// one line.
+    /// does included; every setting that does, where two do, two the reader files alike
+    /// included, and a master or agent switch said twice, once below another table's header
+    /// (NEGATIVE CONTROL: the rule that named a switch by the reading named that one setting
+    /// alone, so the line said rotation is back on once it is gone); a master or agent switch
+    /// filed below another table's header, or the harness written off there, as written there
+    /// (NEGATIVE CONTROL: that rule named `[harness] enabled = false` for the misplaced master
+    /// switch and for the harness written off there, and `[harness.codex] enabled = false` for the
+    /// misplaced agent switch, none of which aterm.toml says); it names one exactly where
+    /// `accounts_for` leaves rotation off; and where the file is not valid TOML it gives where the
+    /// parser stopped and the parser's own reason, on one line.
     #[test]
     fn accounts_off_by_names_only_what_turns_rotation_off() {
         use crate::harness::accounts::Mode;
-        let harness = |value: &str| AccountsOff::Harness(value.to_string());
-        let swarm = |written: &str| AccountsOff::Swarm(written.to_string());
+        let key = |key: &str, value: &str| OffSetting::Harness {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let harness = |value: &str| key("accounts", value);
+        let swarm = |written: &str| OffSetting::Swarm(written.to_string());
+        let misplaced = |key: &str, value: &str| OffSetting::Misplaced {
+            at: "theme".to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        };
         for (text, want) in [
             ("", Vec::new()),
             ("[harness]\naccounts = \"early\"\n", Vec::new()),
@@ -4480,25 +4578,67 @@ trust_dialog = false
             ("swarm = true\n[harness]\naccounts = \"wall\"\n", Vec::new()),
             (
                 "[theme]\nharness.accounts = \"off\"\n",
-                vec![AccountsOff::Misplaced {
+                vec![misplaced("accounts", "\"off\"")],
+            ),
+            (
+                "[harness]\naccounts = \"off\"\n[theme]\nharness.accounts = \"off\"\n",
+                vec![harness("\"off\""), misplaced("accounts", "\"off\"")],
+            ),
+            (
+                "[harness]\naccounts = \"off\"\n[swarm]\nenabled = false\n",
+                vec![harness("\"off\""), swarm("[swarm] enabled = false")],
+            ),
+            (
+                "[\"a.b\"]\nharness.accounts = \"off\"\n[a.b]\nharness.accounts = \"off\"\n",
+                vec![
+                    OffSetting::Misplaced {
+                        at: "a.b".to_string(),
+                        key: "accounts".to_string(),
+                        value: "\"off\"".to_string(),
+                    };
+                    2
+                ],
+            ),
+            (
+                "[harness]\nenabled = false\n[theme]\nharness.enabled = false\n",
+                vec![key("enabled", "false"), misplaced("enabled", "false")],
+            ),
+            (
+                "[harness.codex]\nenabled = false\n[theme]\nharness.codex.enabled = false\n",
+                vec![
+                    key("codex.enabled", "false"),
+                    misplaced("codex.enabled", "false"),
+                ],
+            ),
+            (
+                "[theme]\nharness.enabled = false\n",
+                vec![misplaced("enabled", "false")],
+            ),
+            (
+                "[theme]\nharness.codex.enabled = false\n",
+                vec![misplaced("codex.enabled", "false")],
+            ),
+            (
+                "[theme]\nharness = false\n",
+                vec![OffSetting::MisplacedWrittenOff {
                     at: "theme".to_string(),
-                    value: "\"off\"".to_string(),
+                    value: "false".to_string(),
                 }],
             ),
             ("[theme]\nharness.accounts = \"early\"\n", Vec::new()),
             ("[theme]\nswarm = false\n", Vec::new()),
             (
                 "[harness]\nenabled = false\n",
-                vec![AccountsOff::HarnessSwitch],
+                vec![key("enabled", "false")],
             ),
             (
                 "harness = false\n",
-                vec![AccountsOff::HarnessWrittenOff("false".to_string())],
+                vec![OffSetting::HarnessWrittenOff("false".to_string())],
             ),
             ("[harness]\nenabled = true\n", Vec::new()),
             (
                 "[harness.codex]\nenabled = false\n",
-                vec![AccountsOff::AgentSwitch(Program::Codex)],
+                vec![key("codex.enabled", "false")],
             ),
             ("[harness.claude]\nenabled = false\n", Vec::new()),
         ] {
@@ -4510,6 +4650,28 @@ trust_dialog = false
                 read(text).accounts_for(Program::Codex) != Mode::Off,
                 "{text}: the reader agrees"
             );
+        }
+        // Each says where aterm.toml says it.
+        for (setting, said) in [
+            (
+                key("codex.enabled", "false"),
+                "`[harness.codex] enabled = false`",
+            ),
+            (key("logins", "\"off\""), "`[harness] logins = \"off\"`"),
+            (
+                misplaced("enabled", "false"),
+                "`theme.harness.enabled = false` (a `harness.enabled` below another table's \
+                 header)",
+            ),
+            (
+                OffSetting::MisplacedWrittenOff {
+                    at: "theme".to_string(),
+                    value: "false".to_string(),
+                },
+                "`theme.harness = false` (a `harness` below another table's header)",
+            ),
+        ] {
+            assert_eq!(setting.words(), said);
         }
         let broken = "[harness]\naccounts = \"off\"\n[broken\n";
         let why =

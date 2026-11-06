@@ -175,9 +175,7 @@ pub const COULD_NOT_FINISH_WHY: &str = GaveUp::CouldNotFinish.word();
 /// came back the same with no work.
 pub const REPEATED_WHY: &str = GaveUp::Repeated.word();
 
-/// The `why=` when the harness marks a managed worker's task `failed` at its own usage limit,
-/// which resets too far off to wait for, where no move off it (another account, a fallback model)
-/// was made.
+/// A carried failure from the former usage-wall policy. The successor reopens this task.
 pub const USAGE_LIMIT_WHY: &str = GaveUp::UsageLimit.word();
 
 /// Whether the record `t` is a landing this harness published: `done
@@ -413,9 +411,11 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE TASK RECORD AHEAD OF THIS LOOP'S FIRST FOLD, read once per loop, right before that
-    /// fold: whether a manager waits on the session is known to the point the fold judges
-    /// ([`TurnEndState::set_managed`]), so a managed worker's opening exchange is its task's,
-    /// never left to a person, and its `Could not finish:` concludes at that point. A lost read
+    /// point's reading: whether a manager waits on the session is known to the point the fold
+    /// judges ([`TurnEndState::set_managed`]), so a managed worker's opening exchange is its
+    /// task's, never left to a person, its conversation is never read as taskless by its record
+    /// ([`IdleHost::taskless`], which can only lag the task its launch typed), and its
+    /// `Could not finish:` concludes at that point. A lost read
     /// leaves the session unmanaged, as a session with no record is, and is tried again at the
     /// next point. The rest the record seeds waits for the fold ([`Self::task_seed`]).
     pub(super) fn task_ahead(&mut self, opts: &SuperviseOpts) -> Result<Option<TaskRead>, Fail> {

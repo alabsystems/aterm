@@ -57,6 +57,14 @@ pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 /// GPU module size ceiling in bytes after `wasm-opt -O3`.
 pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 6_133_315.0;
 
+fn output_root(root: &Path) -> PathBuf {
+    output_root_with(root, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+fn output_root_with(root: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    configured.map_or_else(|| root.join("target"), |path| root.join(path))
+}
+
 fn answers(program: &Path, args: &[&str]) -> bool {
     command(program)
         .args(args)
@@ -139,6 +147,54 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     run
 }
 
+/// Static module ceilings need compilation and optimization, with no browser
+/// execution or timing admission. The ordinary wasm lane also judges floors.
+pub(crate) fn gate_wasm_size() -> LaneRun {
+    let root = workspace_root();
+    let rustup = match build_tools(true) {
+        Ok(rustup) => rustup,
+        Err(verdict) => return verdict,
+    };
+    let sizes = (|| {
+        let built = build_modules(
+            &root,
+            &rustup,
+            "release",
+            Some("-C target-feature=+simd128"),
+        )?;
+        let site = output_root(&root).join("wasm-size");
+        bind_modules(&built, &site, true)?;
+        module_sizes(&site)
+    })();
+    let (cpu, gpu) = match sizes {
+        Ok(sizes) => sizes,
+        Err(why) => return LaneRun::fail(why),
+    };
+    let report = json!({"wasm_cpu_module_bytes": cpu, "wasm_gpu_module_bytes": gpu});
+    let mut run = LaneRun::pass();
+    let findings = wasm_module_fences(&report);
+    if findings.is_empty() {
+        run.fence_held("wasm module sizes");
+    }
+    for finding in findings {
+        run.add_failure(finding);
+    }
+    run
+}
+
+fn module_sizes(site: &Path) -> Result<(u64, u64), String> {
+    let bytes = |module: &str| {
+        let path = site.join(module);
+        std::fs::symlink_metadata(&path)
+            .map(|meta| meta.len())
+            .map_err(|e| format!("could not read {}: {e}", path.display()))
+    };
+    Ok((
+        bytes("cpu/aterm_wasm_bg.wasm")?,
+        bytes("gpu/aterm_gpu_web_bg.wasm")?,
+    ))
+}
+
 fn floors_engine(product: &str, record: bool) -> Result<(), LaneRun> {
     let pinned = pinned_product();
     if product == pinned {
@@ -179,7 +235,7 @@ pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     };
     let mut record = || -> Result<(), Refused> {
         let built = build_modules(&root, &rustup, "dev", None).map_err(Refused::Failed)?;
-        let site = root.join("target/wasm-smoke");
+        let site = output_root(&root).join("wasm-smoke");
         bind_modules(&built, &site, false).map_err(Refused::Failed)?;
         wasm_page::lay_drivers(&root, &site).map_err(Refused::Failed)?;
         let mut page = Page::start(&browser, &site, &std::env::temp_dir())?;
@@ -286,7 +342,7 @@ fn build_modules(
         .map_err(|e| format!("could not create neutral build directory: {e}"))?;
     eprintln!("  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on stable");
     let mut build = stable.cargo();
-    let target = root.join("target");
+    let target = output_root(root);
     if let Some(value) =
         crate::fallback_build_dir(&crate::EnvSnapshot::capture(), neutral.path(), &target)
     {
@@ -324,7 +380,7 @@ fn build_modules(
         Err(e) => return Err(format!("could not run {}: {e}", stable.cargo.display())),
     }
     let dir = if profile == "dev" { "debug" } else { profile };
-    Ok(root.join("target/wasm32-unknown-unknown").join(dir))
+    Ok(target.join("wasm32-unknown-unknown").join(dir))
 }
 
 /// Bind both modules into `out/cpu` and `out/gpu` with `verify glue`'s generator, then apply the
@@ -363,7 +419,7 @@ fn build_and_bench(
     let failed = Refused::Failed;
     let built = build_modules(root, rustup, "release", Some("-C target-feature=+simd128"))
         .map_err(failed)?;
-    let site = root.join("target/wasm-bench");
+    let site = output_root(root).join("wasm-bench");
     bind_modules(&built, &site, true).map_err(failed)?;
     wasm_page::lay_drivers(root, &site).map_err(failed)?;
     let mut page = Page::start(browser, &site, &std::env::temp_dir())?;
@@ -388,16 +444,9 @@ fn build_and_bench(
     let Value::Object(fields) = &mut report else {
         return Err(failed(format!("bench.mjs answered no report: {report:?}")));
     };
-    for (key, module) in [
-        ("wasm_cpu_module_bytes", "cpu/aterm_wasm_bg.wasm"),
-        ("wasm_gpu_module_bytes", "gpu/aterm_gpu_web_bg.wasm"),
-    ] {
-        let path = site.join(module);
-        let bytes = std::fs::symlink_metadata(&path)
-            .map_err(|e| failed(format!("could not read {}: {e}", path.display())))?
-            .len();
-        fields.insert(key.to_string(), json!(bytes));
-    }
+    let (cpu, gpu) = module_sizes(&site).map_err(failed)?;
+    fields.insert("wasm_cpu_module_bytes".into(), json!(cpu));
+    fields.insert("wasm_gpu_module_bytes".into(), json!(gpu));
     Ok((product, report))
 }
 
@@ -468,6 +517,19 @@ pub(crate) fn wasm_module_fences(json: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_pilot_wasm_outputs_respect_the_private_target_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let sealed = cwd.join("sealed");
+        let private = cwd.join("private.noindex");
+        assert_eq!(output_root_with(&sealed, None), sealed.join("target"));
+        assert_eq!(
+            output_root_with(&sealed, Some(private.as_os_str())),
+            private
+        );
+        assert!(!output_root_with(&sealed, Some(private.as_os_str())).starts_with(&sealed));
+    }
 
     fn json(text: &str) -> Value {
         aterm_json::from_str(text).expect("test JSON parses")

@@ -6,7 +6,6 @@
 
 use std::ops::Range;
 
-use super::rules::test_path;
 use super::{Bound, Finding, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
 
 /// Crates whose shipped source is checked for per-agent decisions.
@@ -60,7 +59,10 @@ fn agent_gate(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .map(|t| t.trim_start_matches(':').to_ascii_lowercase())
         .collect();
     for file in tree.corpus.under(AGENT_CRATES) {
-        if test_path(&file.rel) || agents_own(&file.rel, &words) || !file.mentions(&tails) {
+        if tree.corpus.test_code().holds(&file.rel)
+            || agents_own(&file.rel, &words)
+            || !file.mentions(&tails)
+        {
             continue;
         }
         let code = file.shipped_code();

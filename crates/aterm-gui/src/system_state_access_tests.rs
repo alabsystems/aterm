@@ -215,9 +215,25 @@ fn line(label: &str, note: Option<&str>) -> Option<SystemStateLine> {
     })
 }
 
-/// `status`'s `setup=` names each managed row a person, a wait or a failure still holds, from the
-/// worker's last status alone; a finished plan with none left is `done`, and a row a finished
-/// setup set once that differs now is the person's, not pending.
+/// A complete reading with selected overrides, so these setup readiness tests never infer an
+/// unread grant from the finished record alone.
+fn fully_observed_setup(selection: Selection, changes: Vec<Observation>) -> SetupStatus {
+    let mut all: Vec<_> = Subject::all()
+        .into_iter()
+        .map(|subject| observed(subject, Standing::InPlace, None))
+        .collect();
+    for change in changes {
+        let slot = all
+            .iter_mut()
+            .find(|row| row.subject == change.subject)
+            .unwrap();
+        *slot = change;
+    }
+    status(selection, all)
+}
+
+/// `status`'s `setup=` names every managed row whose current evidence is unfinished. A personal
+/// change recorded by its probe is kept, while a finished plan alone never excuses drift.
 #[test]
 fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     let fda = Subject::Access(Access::FullDiskAccess);
@@ -230,7 +246,7 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     permissions_and_vault.set(Setting::Permissions, true);
     permissions_and_vault.set(Setting::Secrets, true);
     permissions_and_vault.set(Setting::Dock, true);
-    let pending = status(
+    let pending = fully_observed_setup(
         permissions_and_vault,
         vec![
             observed(fda, Standing::NeedsYou, None),
@@ -249,18 +265,22 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     );
     let finished = SetupStatus {
         finished: true,
-        ..status(
+        ..fully_observed_setup(
             permissions_and_vault,
             vec![
                 observed(fda, Standing::InPlace, None),
                 observed(devtools, Standing::NotNeeded, None),
                 observed(vault, Standing::InPlace, None),
-                observed(dock, Standing::Differs, None),
+                observed(
+                    dock,
+                    Standing::Differs,
+                    Some(aterm_types::macos_setup::CHANGED_BY_YOU),
+                ),
             ],
         )
     };
     assert_eq!(setup_field(&finished), "done");
-    let running = status(
+    let running = fully_observed_setup(
         permissions_and_vault,
         vec![observed(dock, Standing::Differs, None)],
     );
@@ -271,9 +291,94 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     );
 }
 
+#[test]
+fn setup_field_requires_current_evidence_after_the_plan_finishes() {
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let repositories = Subject::Setting(Setting::Repositories);
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Repositories, true);
+    let complete = || SetupStatus {
+        finished: true,
+        ..fully_observed_setup(selection, Vec::new())
+    };
+    assert_eq!(setup_field(&complete()), "done");
+    for note in [None, Some("The permission reading did not finish")] {
+        let mut unread = complete();
+        *unread
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == fda)
+            .unwrap() = observed(fda, Standing::Unknown, note);
+        assert_eq!(setup_field(&unread), "pending:fda", "{note:?}");
+    }
+    let mut absent = complete();
+    absent.observed.retain(|row| row.subject != fda);
+    assert_eq!(setup_field(&absent), "pending:fda");
+
+    let mut missing = complete();
+    let row = missing
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == repositories)
+        .unwrap();
+    row.standing = Standing::Differs;
+    row.now = Some("0 of 53".into());
+    row.wanted = "All 53".into();
+    assert_eq!(setup_field(&missing), "pending:repos");
+}
+
+#[test]
+fn setup_field_settles_an_idle_terminal_plan_with_no_managed_work() {
+    let cancelled = crate::system_state::fixture_status("older-cancel").unwrap();
+    assert!(cancelled.cancelled && cancelled.plan.as_ref().unwrap().selection.is_empty());
+    assert_eq!(setup_field(&cancelled), "done");
+    let completed = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(Selection::none(), Vec::new())
+    };
+    assert_eq!(setup_field(&completed), "done");
+
+    // A grant offered under the preceding plan is not managed after Permissions is off.
+    let no_grants = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(
+            Selection::none(),
+            vec![observed(
+                Subject::Access(Access::FullDiskAccess),
+                Standing::NotNeeded,
+                Some(aterm_types::macos_setup::ACCESS_OFFERED),
+            )],
+        )
+    };
+    assert_eq!(setup_field(&no_grants), "done");
+    let busy = SetupStatus {
+        busy: true,
+        ..completed.clone()
+    };
+    assert_eq!(setup_field(&busy), "pending");
+    let changing = SetupStatus {
+        changing: true,
+        ..completed.clone()
+    };
+    assert_eq!(setup_field(&changing), "pending");
+    let mut failed = completed.clone();
+    failed.rows.push(crate::system_state::SetupStatusRow {
+        name: crate::system_state::SETUP_ROW.into(),
+        status: "error".into(),
+        detail: "The setup records could not be read".into(),
+    });
+    assert_eq!(setup_field(&failed), "pending");
+    let unread = SetupStatus {
+        plan: None,
+        ..completed
+    };
+    assert!(!setup_field(&unread).starts_with("done"));
+}
+
 /// A run parked to ask again by itself reads `done`, nothing being left for anyone to do now,
 /// and names what it still asks for (`;asking:`), so `done` is never read as a finished record;
-/// grants on offer ride behind it without making it pending.
+/// grants still on offer remain pending personal steps.
 #[test]
 fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
     use aterm_types::macos_setup::{ACCESS_OFFERED, SECRETS_VAULT_ROW};
@@ -285,7 +390,7 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
     let offer = observed(debugger, Standing::NotNeeded, Some(ACCESS_OFFERED));
     let finished = SetupStatus {
         finished: true,
-        ..status(
+        ..fully_observed_setup(
             selection,
             vec![offer.clone(), observed(vault, Standing::InPlace, None)],
         )
@@ -293,7 +398,7 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
     assert_eq!(setup_field(&finished), "pending:debugger;needs:debugger");
     let no_offer = SetupStatus {
         finished: true,
-        ..status(selection, vec![observed(vault, Standing::InPlace, None)])
+        ..fully_observed_setup(selection, vec![observed(vault, Standing::InPlace, None)])
     };
     assert_eq!(setup_field(&no_offer), "done", "CONTROL: nothing on offer");
     // A vault that did not answer (`unreached`), or none on this network (`waiting`), on a Mac
@@ -1867,7 +1972,7 @@ fn folder_worker_owns_the_dialog_slot_before_its_first_probe() {
     assert!(!recv.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while app.consent_warmup_live() && Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(!app.consent_warmup.is_live(), "the inert pass completed");
     app.settle_access_steps(Instant::now());
@@ -6280,7 +6385,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     cleanup.release.take().unwrap().send(()).unwrap();
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while app.consent_warmup_live() && Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(
         !app.consent_warmup.is_live(),
@@ -6312,7 +6417,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     assert!(!gate.is_open(), "a retired worker's gate cannot be revived");
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while app.consent_warmup_live() && Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(!app.consent_warmup.is_live());
     app.note_launch_warmup_progress();

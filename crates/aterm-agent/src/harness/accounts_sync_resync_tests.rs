@@ -271,7 +271,7 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 10).expect("init");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let synced = run_accounts_sync_with(
-        &env_of(&desk, NOW + 20),
+        (&env_of(&desk, NOW + 20), None),
         (None, None, true),
         (&mut out, &mut err),
         &SyncHow {

@@ -8,11 +8,24 @@
 use std::sync::Mutex;
 use std::sync::mpsc;
 
+use aterm_net::fleet::heard::{ScriptedSight, Sight};
 use aterm_net::fleet::link::{
     BusLog, LinkClock as _, ManualClock, Neighbours, Proven, ProvenBy, REPROVE_EVERY,
 };
 
 use super::*;
+
+#[path = "mesh_heard.rs"]
+mod heard;
+
+/// The wall clock's reading when a node's link clock reads zero: a moment on day 20,833.
+const T0: u64 = 1_800_000_000_000;
+
+/// The wall clock a node service's sight reads: [`T0`] plus its link clock.
+fn wall(clock: &Arc<ManualClock>) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    let clock = Arc::clone(clock);
+    Arc::new(move || T0 + u64::try_from(clock.now().as_millis()).expect("a test's clock"))
+}
 
 /// One node service with the mesh on: its address, the neighbour table it holds, the clock its
 /// links read, the proofs its links noted, and the switch that ends it.
@@ -27,13 +40,32 @@ struct MeshNode {
 
 impl MeshNode {
     /// A windowless node service over `state`, serving `allow` to the members `members` seats,
-    /// with the mesh on, its links on a manual clock and its `Units` streams on `units`.
+    /// with the mesh on, its links on a manual clock and its `Units` streams on `units`. Its
+    /// sight of its network reads [`wall`] and no route, so it books no network and no day.
     fn start(
         root: &Path,
         relay_dir: &Path,
         state: &Path,
         members: Arc<LocalLog>,
         units: atpkg::store::Layout,
+    ) -> Self {
+        Self::start_seeing(root, relay_dir, state, (members, units), |clock| {
+            Arc::new(ScriptedSight {
+                now: wall(clock),
+                route: None,
+                ends: None,
+            })
+        })
+    }
+
+    /// [`Self::start`]'s node service, its sight of its network the one `sight` builds on its
+    /// link clock.
+    fn start_seeing(
+        root: &Path,
+        relay_dir: &Path,
+        state: &Path,
+        (members, units): (Arc<LocalLog>, atpkg::store::Layout),
+        sight: impl FnOnce(&Arc<ManualClock>) -> Arc<dyn Sight>,
     ) -> Self {
         let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind node job");
         let addr = prebound.local_addr().unwrap();
@@ -43,6 +75,7 @@ impl MeshNode {
             format!("[fleet]\nlisten = \"{addr}\"\nallow = \"content\"\n"),
         );
         let clock = ManualClock::new();
+        let sight = sight(&clock);
         let (noted, notes) = mpsc::channel();
         let noted = Mutex::new(noted);
         let (told, tables) = mpsc::channel();
@@ -66,13 +99,16 @@ impl MeshNode {
             mesh: NodeMesh {
                 on: true,
                 clock: Arc::clone(&clock) as Arc<dyn aterm_net::fleet::link::LinkClock>,
-                note: Arc::new(move |proven: &Proven| {
+                sight,
+                watch: Arc::new(move |proven: &Proven| {
                     let _ = lock(&noted).send(proven.clone());
                 }),
                 units: Arc::new(move || Some(units.clone())),
                 on_neighbours: Some(Arc::new(move |table: &Arc<Neighbours>| {
                     let _ = lock(&told).send(Arc::clone(table));
                 })),
+                bus: None,
+                ..NodeMesh::live()
             },
         };
         let server = std::thread::spawn(move || run_node_serve_with(cfg));

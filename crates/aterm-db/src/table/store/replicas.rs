@@ -151,11 +151,7 @@ impl Store {
         Ok(self)
     }
 
-    pub(crate) fn retains_replica_data(
-        &self,
-        session: &Session<'_>,
-        source: &Self,
-    ) -> Result<bool> {
+    fn check_single_pair(&self, session: &Session<'_>, source: &Self) -> Result<()> {
         self.check(session)?;
         source.check(session)?;
         if self.scope != source.scope
@@ -166,16 +162,24 @@ impl Store {
                 "replica comparison requires single stores of the same scope",
             ));
         }
-        let retained: BTreeSet<_> = self.inventory(session)?.copied().collect();
+        Ok(())
+    }
+
+    pub(crate) fn retains_replica_data(
+        &self,
+        session: &Session<'_>,
+        source: &Self,
+    ) -> Result<bool> {
+        self.check_single_pair(session, source)?;
         if source
-            .replication_inventory(session)?
-            .any(|id| !retained.contains(id))
+            .replication_inventory_unchecked()
+            .any(|id| !self.records.contains_key(id))
         {
             return Ok(false);
         }
-        let proofs = self.proof_inventory(session)?;
+        let proofs = self.proof_inventory_unchecked();
         Ok(source
-            .proof_inventory(session)?
+            .proof_inventory_unchecked()
             .iter()
             .all(|key| proof_retained(&proofs, key)))
     }
@@ -188,15 +192,15 @@ impl Store {
         source: &Self,
         limit: usize,
     ) -> Result<bool> {
-        self.retains_replica_data(session, source)?;
+        self.check_single_pair(session, source)?;
         if !self.is_recovery() || self.log.is_none() || limit == 0 || limit > MAX_RECORDS {
             return Err(Error::new(
                 "local retention requires a bounded recovery writer",
             ));
         }
-        let retained = self.proof_inventory(session)?;
+        let retained = self.proof_inventory_unchecked();
         let missing: Vec<_> = source
-            .proof_inventory(session)?
+            .proof_inventory_unchecked()
             .into_iter()
             .filter(|key| !proof_retained(&retained, key))
             .take(limit + 1)
@@ -210,7 +214,6 @@ impl Store {
         if missing.len() > limit {
             return Ok(false);
         }
-        let retained: BTreeSet<_> = self.inventory(session)?.copied().collect();
         let restricted = self.conflicted();
         let mut copied = 0;
         for id in source.replication_inventory(session)? {
@@ -221,7 +224,7 @@ impl Store {
             // A target's stronger restriction or exhausted positive quota must
             // not prevent its negative evidence reaching the next peer. Keep
             // the source unchanged; an ineligible row acquires no receipt here.
-            if retained.contains(id)
+            if self.records.contains_key(id)
                 || restricted.contains(&record.header.actor)
                 || self.admit(&record.header, record.wire.len()).is_err()
             {

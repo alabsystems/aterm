@@ -82,7 +82,10 @@ impl Proposal {
     /// Prepare bounded metadata for review. This signs nothing and grants no rights.
     pub fn prepare(trust: Trust, terms: Terms) -> Result<Self> {
         terms.validate(trust)?;
-        let mut bytes = MAGIC.to_vec();
+        let mut bytes = Vec::with_capacity(
+            MAGIC.len() + 80 + 64 + 8 + 1 + terms.unit.len() + 1 + terms.shares.len() * 56,
+        );
+        bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&trust.network);
         bytes.extend_from_slice(&trust.authority);
         bytes.extend_from_slice(&trust.genesis);
@@ -215,9 +218,10 @@ impl Allocation {
 }
 
 fn fingerprint(bytes: &[u8]) -> Digest {
-    let mut message = DOMAIN.to_vec();
-    message.extend_from_slice(bytes);
-    Sha256::digest(&message)
+    let mut hash = Sha256::new();
+    hash.update(DOMAIN);
+    hash.update(bytes);
+    hash.finalize()
 }
 
 #[cfg(test)]

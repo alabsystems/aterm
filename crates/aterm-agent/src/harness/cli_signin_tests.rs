@@ -2753,6 +2753,26 @@ fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
         "{report}"
     );
 
+    // A session here that runs on it, its login signed out, is this Mac's use of it: the
+    // session door signs it in here, so the report neither says nothing does nor offers another.
+    store
+        .transact(env.now, &mut None, |state| {
+            let mut events = accounts::note_session(state, "s-1", "kimi-one", None, env.now);
+            events.extend(accounts::note_auth(
+                state,
+                "kimi-one",
+                accounts::Auth::SignedOut,
+                env.now,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    let (_, report, _) = renew("accounts --cli kimi", &env, &host());
+    assert!(
+        !report.contains("gives it to m22") && !report.contains("list another"),
+        "a session here runs on it: {report}"
+    );
+
     let named = host();
     let _ = renew("accounts renew kimi-one --cli kimi", &env, &named);
     assert_eq!(*named.0.borrow(), ["kimi-one"], "a person named the row");

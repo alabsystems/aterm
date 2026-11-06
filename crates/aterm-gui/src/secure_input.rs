@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Focus-scoped macOS Secure Keyboard Entry (`EnableSecureEventInput`).
+//! Focus-scoped macOS Secure Keyboard Entry (`EnableSecureEventInput`): on while an aterm window
+//! is focused and the person asked for it (`secure_keyboard_entry`), or a focused window shows a
+//! private document in front (one-mesh design §4.8: what the person types there, a new password
+//! included, reaches no other process's event tap).
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -18,6 +21,8 @@ mod imp {
         desired: bool,
         /// Whether any aterm window is focused (the TN2150 gate).
         app_active: bool,
+        /// Whether a focused window shows a private document in front.
+        private_front: bool,
         /// Whether this process currently holds one enable count.
         engaged: bool,
     }
@@ -25,6 +30,7 @@ mod imp {
     static STATE: Mutex<State> = Mutex::new(State {
         desired: false,
         app_active: false,
+        private_front: false,
         engaged: false,
     });
 
@@ -51,7 +57,7 @@ mod imp {
     /// with what this process holds, and records the change only when its status is 0: a refused
     /// change is not recorded, so the next focus or config change asks again.
     fn sync_with(state: &mut State, carbon: impl FnOnce(bool) -> i32) -> Result<(), i32> {
-        let want = state.desired && state.app_active;
+        let want = (state.desired || state.private_front) && state.app_active;
         if want == state.engaged {
             return Ok(());
         }
@@ -74,7 +80,23 @@ mod imp {
     pub(crate) fn set_app_active(active: bool) {
         let mut state = STATE.lock().expect("secure-input state lock");
         state.app_active = active;
-        if let Err(status) = sync(&mut state) {
+        settle(&mut state);
+    }
+
+    /// Updates whether a focused window shows a private document in front, and syncs Carbon
+    /// event input best-effort.
+    pub(crate) fn set_private_front(private: bool) {
+        let mut state = STATE.lock().expect("secure-input state lock");
+        if state.private_front == private {
+            return;
+        }
+        state.private_front = private;
+        settle(&mut state);
+    }
+
+    /// [`sync`], a refusal logged: the next focus, front or config change asks again.
+    fn settle(state: &mut State) {
+        if let Err(status) = sync(state) {
             aterm_log::warn!(
                 "secure keyboard entry: focus-gated transition failed (OSStatus {status}); \
                  will retry on the next focus or config change"
@@ -93,6 +115,7 @@ mod imp {
             let mut s = State {
                 desired: true,
                 app_active: true,
+                private_front: false,
                 engaged: false,
             };
             assert_eq!(
@@ -126,6 +149,42 @@ mod imp {
             );
             assert!(s.engaged, "a refused disable keeps the hold");
         }
+
+        /// A private document in front of a focused window engages secure input though the
+        /// person never asked for it, and releases it when it leaves the front or the app loses
+        /// focus.
+        /// NEGATIVE CONTROL: with `sync_with`'s wish reading `desired` alone, the first sync asks
+        /// nothing and `` a private front engages `` fails.
+        #[test]
+        fn a_private_front_engages_secure_input_while_focused() {
+            let mut s = State {
+                desired: false,
+                app_active: true,
+                private_front: true,
+                engaged: false,
+            };
+            let mut asked = None;
+            assert_eq!(
+                sync_with(&mut s, |want| {
+                    asked = Some(want);
+                    0
+                }),
+                Ok(())
+            );
+            assert_eq!(asked, Some(true), "a private front engages");
+            assert!(s.engaged);
+            s.app_active = false;
+            assert_eq!(sync_with(&mut s, i32::from), Ok(()));
+            assert!(!s.engaged, "no focus, no hold");
+            s.app_active = true;
+            s.private_front = false;
+            assert_eq!(
+                sync_with(&mut s, |_| panic!(
+                    "neither wished nor private: nothing to ask"
+                )),
+                Ok(())
+            );
+        }
     }
 }
 
@@ -137,4 +196,6 @@ mod imp {
     pub(crate) fn set_app_active(_active: bool) {}
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use imp::set_private_front;
 pub(crate) use imp::{set_app_active, set_desired};

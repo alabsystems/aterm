@@ -1028,6 +1028,17 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     pub(in crate::harness) fn seed_local_swarm_roster(home: &Path, label: &str, aliases: &[&str]) {
+        seed_local_swarm_roster_denying(home, label, aliases, &[]);
+    }
+
+    /// [`seed_local_swarm_roster`] whose roster denies `deny_labels`.
+    #[cfg(unix)]
+    pub(in crate::harness) fn seed_local_swarm_roster_denying(
+        home: &Path,
+        label: &str,
+        aliases: &[&str],
+        deny_labels: &[&str],
+    ) {
         let srv_dir = aterm_tempfile::tempdir().expect("server dir");
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let running = aterm_secrets::server::start(
@@ -1065,7 +1076,7 @@ pub(super) mod tests {
                 node_id: None,
                 node_key: None,
             }],
-            deny_labels: Vec::new(),
+            deny_labels: deny_labels.iter().map(|s| (*s).to_owned()).collect(),
             deny_nodes: Vec::new(),
         };
         doc.set_entry(

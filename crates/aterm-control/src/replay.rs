@@ -129,8 +129,11 @@ impl ReplayEngine {
         let _ = self.term.take_reports();
     }
 
-    /// Apply a recorded host-side mutation ([`aterm_core::terminal::HostOp`]).
+    /// Apply a recorded host-side mutation ([`aterm_core::terminal::HostOp`]); a config the host installed is the one this engine and every [`Self::fork`] replay under from then on ([`Self::config`]).
     pub fn apply_host_op(&mut self, op: aterm_core::terminal::HostOp, clock: Option<ClockReading>) {
+        if let aterm_core::terminal::HostOp::Config { config, .. } = &op {
+            self.config = Some(Arc::clone(&config.0));
+        }
         match clock {
             Some(c) => self.term.apply_host_op_at(op, c),
             None => self.term.apply_host_op(op),
@@ -154,6 +157,13 @@ impl ReplayEngine {
     #[inline]
     pub fn drop_resize_undo(&mut self) {
         self.term.grid_mut().drop_resize_undo();
+    }
+
+    /// The config this engine replays under now: the one it was configured with ([`Self::with_config`]), or the last a replayed host install put in force.
+    #[must_use]
+    #[inline]
+    pub const fn config(&self) -> Option<&Arc<TerminalConfig>> {
+        self.config.as_ref()
     }
 
     /// The replayed engine, for reading.
@@ -236,6 +246,46 @@ mod tests {
                 "configured: {configured}, forked: {forked}"
             );
         }
+    }
+
+    /// A replayed config install is the config the engine replays under from there on, and so its forks: a soft reset after it takes the installed default cursor, as the live engine's does.
+    #[test]
+    fn a_replayed_config_install_is_the_config_the_engine_and_its_forks_replay_under() {
+        use aterm_core::terminal::CursorStyle;
+        let base = Arc::new(TerminalConfig {
+            cursor_style: CursorStyle::SteadyBar,
+            ..TerminalConfig::default()
+        });
+        let installed = Arc::new(TerminalConfig {
+            cursor_style: CursorStyle::SteadyUnderline,
+            ..TerminalConfig::default()
+        });
+        let mut live = Terminal::new(4, 20);
+        let _ = live.apply_config(&base);
+        let cp = live.checkpoint();
+        let from = live.host_ordinal();
+        let _ = live.apply_config_shared(installed.clone());
+        let (reports, _) = live.host_journal_since(from);
+        let [report] = reports.as_slice() else {
+            panic!("one install journaled: {reports:?}");
+        };
+        let mut replay =
+            ReplayEngine::from_checkpoint(&cp, ResizePolicy::Native).with_config(base.clone());
+        assert_eq!(replay.config(), Some(&base));
+        replay.apply_host_op(report.op.clone(), report.clock);
+        assert_eq!(
+            replay.config().map(|c| c.cursor_style),
+            Some(installed.cursor_style)
+        );
+        let mut fork = replay.fork().expect("a ground engine forks");
+        assert_eq!(
+            fork.config().map(|c| c.cursor_style),
+            Some(installed.cursor_style)
+        );
+        live.process(b"\x1b[2 q\x1b[!p");
+        fork.process(b"\x1b[2 q\x1b[!p");
+        assert_eq!(fork.terminal().cursor_style(), live.cursor_style());
+        assert_eq!(live.cursor_style(), CursorStyle::SteadyUnderline, "fixture");
     }
 
     #[test]

@@ -203,7 +203,7 @@ impl<T: Send + 'static> RetainedCapture<T> {
                         error: CompleteOutputError::Run(RunError::Wait(io::Error::other(
                             "positive child reap did not permit guard recovery",
                         ))),
-                        custody: Box::new(custody),
+                        custody,
                     }),
                 };
             }

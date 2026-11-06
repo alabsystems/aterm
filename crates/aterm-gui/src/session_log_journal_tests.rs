@@ -400,7 +400,7 @@ fn journal_false_creates_nothing() {
     let deadline = std::time::Instant::now() + HANG;
     while shared.wake.thread.get().is_none() {
         assert!(std::time::Instant::now() < deadline, "the thread never ran");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     shared.request(REQ_FINISH);
     rx.recv_timeout(HANG)
@@ -934,7 +934,7 @@ fn the_writer_never_blocks_a_producer() {
             std::time::Instant::now() < deadline,
             "the writer never wrote"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     for i in 0..1000 {
         assert!(
@@ -965,7 +965,7 @@ fn the_writer_never_blocks_a_producer() {
             std::time::Instant::now() < deadline,
             "the bad writer never locked"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     let (lock, cv) = &*gate;
     *lock.lock().expect("gate") = true;
@@ -2361,7 +2361,7 @@ fn pass_held_at_its_write<R>(
             std::time::Instant::now() < deadline,
             "the writer never wrote"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     let kept = meanwhile();
     {

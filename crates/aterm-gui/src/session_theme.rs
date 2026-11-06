@@ -253,38 +253,14 @@ impl App {
             .collect()
     }
 
-    /// Carry out a plan: each session's `apply_config` and, in the SAME
-    /// critical section, the `CSI ? 997 ; Ps n` push it queued when the
-    /// session's reported scheme moved and its program set mode 2031.
+    /// Carry out a plan: each session's install ([`install_session_config`]).
     fn apply_session_colors(&mut self, plan: Vec<SessionApply>) -> (u64, u64) {
         let (mut own_applies, mut applies) = (0u64, 0u64);
         for SessionApply { sid, apply, own } in plan {
             if let Some(tc) = apply
                 && let Some(session) = self.pool.get(sid)
             {
-                let push = {
-                    let mut term = crate::term_lock(&session.term);
-                    let changes = term.apply_config(&tc);
-                    session.ctx.crash_journal.host_settings(&term, Some(&tc));
-                    session
-                        .ctx
-                        .temporal
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .set_replay_config(Some(Arc::clone(&tc)));
-                    (changes.contains(&aterm_core::config::ConfigChange::ColorScheme)
-                        && term.report_color_scheme_enabled())
-                    .then(|| term.take_response())
-                    .flatten()
-                };
-                if let Some(push) = push {
-                    crate::app_input::write_ui_report(
-                        &session.term,
-                        &session.ctx.modes,
-                        &session.ctx.sink,
-                        &crate::input::InputEvent::KeySequence(push),
-                    );
-                }
+                install_session_config(session, &tc);
                 applies += 1;
                 if own.is_some() {
                     own_applies += 1;
@@ -386,6 +362,36 @@ impl App {
             hex(colors.scheme.foreground),
             hex(colors.scheme.background),
         )
+    }
+}
+
+/// Install `config` on `session`'s live engine as one recorded host change. In one critical section of its terminal lock: the engine's install, which journals it ([`aterm_core::terminal::Terminal::apply_config_shared`]); the crash journal's settings; the config the recording's later keyframes are taken under; the install handed to the recording when its queue has room, else by the reader's next slice ([`crate::temporal::SpineMark::send_host_ops`]); and the `CSI ? 997 ; Ps n` push the install queued when the reported scheme moved under a program's mode 2031, which is then written as a UI report.
+pub(crate) fn install_session_config(session: &crate::Session, config: &Arc<TerminalConfig>) {
+    let push = {
+        let mut term = crate::term_lock(&session.term);
+        let changes = term.apply_config_shared(Arc::clone(config));
+        session.ctx.crash_journal.host_settings(&term, Some(config));
+        session
+            .ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_replay_config(Some(Arc::clone(config)));
+        if let Some(tx) = &session.temporal_tx {
+            crate::temporal::SpineMark::attach(tx.spine()).send_host_ops(tx, &term);
+        }
+        (changes.contains(&aterm_core::config::ConfigChange::ColorScheme)
+            && term.report_color_scheme_enabled())
+        .then(|| term.take_response())
+        .flatten()
+    };
+    if let Some(push) = push {
+        crate::app_input::write_ui_report(
+            &session.term,
+            &session.ctx.modes,
+            &session.ctx.sink,
+            &crate::input::InputEvent::KeySequence(push),
+        );
     }
 }
 

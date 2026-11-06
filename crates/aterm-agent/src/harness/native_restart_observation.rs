@@ -226,10 +226,14 @@ pub(super) fn captured(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
 ) -> Option<(Registration, ObservationBinding)> {
-    let observed = snap
+    let record = snap
         .session
         .as_deref()
-        .and_then(|session| upgrade_drive::load(opts, session))
+        .map(|session| upgrade_drive::load_record(opts, session))
+        .transpose()
+        .ok()?
+        .flatten();
+    let observed = record
         .and_then(|state| state.native_observation)
         .filter(|saved| {
             saved.registration.vendor.pid == snap.pid

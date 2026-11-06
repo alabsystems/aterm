@@ -480,7 +480,45 @@ fn the_broker_process_is_named_only_out_of_process_and_refuses_what_its_argv_can
                 "{tiered}: the argv names a tier"
             );
         }
-        assert!(parse(&format!("broker_process={word} at_rest=off"), out).is_ok());
+        // F09: the attach world's backlog seeds the shipped broker's log, within the ev rule's
+        // bytes as the in-process world's fill is, and only where the attach world runs.
+        let seeded = format!("broker_process={word} scenario=attach attach=8,32 backlog=510000");
+        let spec = parse(&seeded, out).expect(&seeded);
+        assert_eq!(spec.backlog, 510_000);
+        assert_eq!(parse(&spec.words(), out).expect("round trip"), spec);
+        assert!(
+            parse(
+                &format!("broker_process={word} attach=8,32 backlog=630131"),
+                out
+            )
+            .is_err(),
+            "past the ev rule's bytes"
+        );
+        // Each cold-read pass fetches COLD_RECORDS seeded records, so a seed of fewer is
+        // refused here and not after the whole timed world: `backlog` times the populations.
+        let at_least = COLD_RECORDS / 2;
+        for (backlog, attach, ok) in [
+            (at_least, "8,32", true),
+            (at_least - 1, "8,32", false),
+            (1000, "1", false),
+            (COLD_RECORDS - 1, "1", false),
+            (COLD_RECORDS, "1", true),
+        ] {
+            let run = format!(
+                "broker_process={word} scenario=attach attach={attach} rounds=1 backlog={backlog}"
+            );
+            match parse(&run, out) {
+                Ok(_) => assert!(ok, "{run}: a pass would find too few records"),
+                Err(why) => assert!(
+                    !ok && why.contains(&format!("{COLD_RECORDS} seeded records")),
+                    "{run}: {why}"
+                ),
+            }
+        }
+        assert!(
+            parse("scenario=attach attach=1 rounds=1 backlog=1000", out).is_ok(),
+            "in the bench's process no cold read runs, so any backlog fills"
+        );
         for refused in [
             "scenario=handoff",
             "scenario=ask",
@@ -489,7 +527,9 @@ fn the_broker_process_is_named_only_out_of_process_and_refuses_what_its_argv_can
             "retention_interval_ms=1000",
             "rate_limit=off",
             "log=off",
-            "backlog=10 scenario=attach",
+            // `at_rest::prepare` mints a key beside a log with a mint secret, so the shipped
+            // argv on a fabric root always serves its log sealed.
+            "at_rest=off",
             "paced_notes=1 scenario=messaging",
             "bystanders=4",
             "tally=on",

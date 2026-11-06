@@ -619,8 +619,8 @@ usage: targo --unverified lab <command> [tag] [args]
                                    (--no-surfaces skips window checks); a chain aterm stops typing into is watched 60 s
                                    past its hold, brought in front twice, and must say `stopped typing` (the
                                    chip or hover, the state line, `status held=`, the journal's `held=`), with
-                                   one `Stopped typing` Messages row only for Land over a repository leg, gone
-                                   once same-land's person types their turn
+                                   no Messages row; Cruise holds no repeated reply: HC wants each act paced on
+                                   the ladder, then a request for a different approach, never a stop (~20 min)
                                  - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15
                                    worker, C4, Off control
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
@@ -660,9 +660,10 @@ usage: targo --unverified lab <command> [tag] [args]
                                  - switch: a running Cruise tab switched to Land (`meta set autopilot land`): at rest in its
                                    back-off (land@v1 within 5 s, before the due), under a standing draft (nothing typed until
                                    it clears and the hold for the person who typed it ends, then land@v1 within 5 s),
-                                   flipped to Land then Off within 300 ms (nothing typed), held at the same reply (still
-                                   held, its state line still `stopped typing:`), and 5 s into a long busy turn (noted in
-                                   the turn, nothing mid-turn, land@v1 within 3 s of its point, no back-off before it);
+                                   flipped to Land then Off within 300 ms (nothing typed), its reply repeated (the
+                                   person's switch to Land asks once, Land holds at the same answer), and 5 s into a
+                                   long busy turn (noted in the turn, nothing mid-turn, land@v1 within 3 s of its
+                                   point, no back-off before it);
                                    land, cruise and both also want aterm's own share of land@v1 within 10 s of the first
                                    point, the program's hold of the text said apart, land@v1 never twice in a row, and one
                                    held-text NOTE where the first look past its write saw nothing move (~10 min)
@@ -706,14 +707,19 @@ usage: targo --unverified lab <command> [tag] [args]
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
-           [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
+           [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep | --world DIR] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and build and hold it until
-                                 Ctrl-C (--window: a real window; --band: app (the default) runs it as its own launchd
-                                 job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
+                                 Ctrl-C or SIGTERM (--window: a real window; --band: app (the default) runs it as its own
+                                 launchd job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
                                  as this command's child, in its coalition; --image PNG: capture one settled frame, run
                                  --post, and end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
-                                 managed Claude Code's store build with its twin and reroute stub, and the instance reroutes)
+                                 managed Claude Code's store build with its twin and reroute stub, and the instance reroutes;
+                                 --world DIR: run in the lab world at DIR, laid out there when DIR is new (a short path under
+                                 /tmp/.ubd) and kept, so a later --world DIR starts on what this one left, its state and its
+                                 aterm.toml among it, and takes no --toml, --toml-after, --harness or --harness-key)
+                                 the signal ends the instance, waits for its end and says whether it came (a second signal cuts
+                                 that wait short); the world is removed only once the instance has ended
                                  --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
                                  --scene harness-layouts draws labeled synthetic footer states through the real renderer
                                  (debug/dev-seams build; no live agent, upgrade candidate or account is read)
@@ -725,7 +731,7 @@ Outside any lab (no jail, no stub):
                                  `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
                                  read-only Editor tab that `text|screen|image|window|video|key|doc read` refuse,
                                  leaving no value in the tab's text, blocks or log (debug lab image)
-  commons-lan prepare-recipient|prepare-source|join|run|node|pair|follow|stop|db|declare|write|read|emails-* …
+  commons-lan prepare-recipient|prepare-source|join|run|node|pair|follow|stop|db|secrets|declare|write|read|emails-* …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
                                  pair: run the owner and a local follower under one capacity reservation
@@ -733,7 +739,9 @@ Outside any lab (no jail, no stub):
                                  emails-fixture|emails-set|emails-wait: the owner's emails table across the
                                  profiles (seeded fleet_db replica and flag-only sheet, stdin-only edits,
                                  keyed-digest waits); no value crosses Macs or reaches a report
+                                 emails-reveal: A17 on that table in a windowed instance of the profile (debug image)
                                  db: run the shipped proposal/data CLI in that profile, online or offline
+                                 secrets: an admin's approval of a key, a join of a lab profile's vault file, status
                                  a world on the live default ALab vault (one an earlier run left admitted there) opens for no
                                  verb but behind --live-alab-vault-keeps-member: no run takes that member out again
   commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]
@@ -902,9 +910,10 @@ Outside any lab (no jail, no stub):
                                  pass, four tabs' chip lines, pads, state lines, hovers, This Mac and menu rows, judged by
                                  what the package's build tells, then END's idle window with Settings ▸ Harness open and
                                  shut; the default run leaves it out; --capacity-only: the full proof's last leg alone,
-                                 the package's `codex exec` recovering from a 503 with Retry-After and refusing a 403
-                                 in a jail of its own against the lab's loopback model, ~10 s, no aterm; one lane a
-                                 run); its scratch world is kept once its bus stands; the rollout leg expects what
+                                 the package's `codex exec` recovering from a 503 with Retry-After and from a 429
+                                 account quota (its reset, or a 30 s poll without one) and refusing a 403 and the
+                                 four terminal 429 types, in a jail of its own against the lab's loopback model,
+                                 ~1 min, no aterm; one lane a run); its scratch world is kept once its bus stands; the rollout leg expects what
                                  --expect-rollout says, else what the lab's compiled CODEX_MEASURED_BUILDS says of the
                                  package's build; one proof at a time on this Mac (it
                                  waits up to 20 min for another to end, then is NOT RUN); an --aterm older than the

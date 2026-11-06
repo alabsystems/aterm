@@ -79,6 +79,9 @@ struct OpenTicket {
     /// `ro=1`: the document opens read-only, a fresh buffer nothing can change or save
     /// (`amacs::store::DocumentStore::set_read_only`).
     read_only: bool,
+    /// `secret=`: the private grid's columns, by header, whose cells no reader of the window but
+    /// the person's eyes gets (`amacs::store::Concealed`); `None` when the request named none.
+    secret: Option<Vec<String>>,
     phase: Phase,
     /// Since when no waiter has been parked on it: the orphan clock.
     unwaited_since: Option<Instant>,
@@ -276,6 +279,12 @@ impl EditTickets {
         self.open.get(&ticket).is_some_and(|entry| entry.read_only)
     }
 
+    /// The grid columns `ticket` named concealed (`edit … secret=`), by header; `None` when it
+    /// named none or there is no such ticket.
+    pub(crate) fn secret(&self, ticket: Ticket) -> Option<&[String]> {
+        self.open.get(&ticket)?.secret.as_deref()
+    }
+
     fn ticket_of_view(&self, view: ViewId) -> Option<Ticket> {
         self.open
             .iter()
@@ -413,6 +422,7 @@ impl App {
                 for_word: request.for_word,
                 awaited: request.wait,
                 read_only: request.read_only,
+                secret: request.secret,
                 phase: Phase::Admitting { reply },
                 unwaited_since: None,
                 orphaned: false,
@@ -1537,6 +1547,7 @@ mod tests {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         }
     }
 

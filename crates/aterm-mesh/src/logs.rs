@@ -33,19 +33,33 @@
 //! seat, so its key is never revoked; a voided removal reads `Member` again, so the next pass
 //! un-revokes it on every broker with no restart. The revoked set is held in memory only: astream
 //! keeps none across a reopen, and the pass at start recomputes it.
+//!
+//! **`bus.log`** (§11 C2, §4.11). With the mesh on, the node service hosts the fabric's log too
+//! ([`BusKeeper`]): it retires the separate broker job (`aterm_link::enable::retire_broker_job`)
+//! and opens `bus.log` itself where the job did, in the fabric root, under the root's
+//! `mint.secret` (every `node.cap` and person cap was minted under it), sealed by aterm-link's
+//! rules, retained and rate limited by `aterm_link::broker_rules`, and served on the same
+//! `bus.sock`, so local clients and the rendezvous file stay as they were ([`open_bus`],
+//! [`BusHost`]). A poisoned log is reopened in process. The revocation pass covers it beside the
+//! two mesh logs ([`Mesh::join_bus`]), and a neighbour's `Bus` stream for it is served with the
+//! ring of §4.11 ([`BusHost::ring_for`]): mail to this Mac only and only as itself, its own
+//! topics, the halt rows, and the relay of origin-signed halts.
 
 use crate::relay::{self, Event, Observe, Origin, Published, Relayed};
 use astream_broker::{
     AnyClient, Boot, Broker, BrokerHandle, Capability, Escalate, Escalation, StreamLink,
 };
 use aterm_link::at_rest;
-use aterm_link::durability::Durability;
+/// The tier `bus.log` acks under, and aterm-link's verdicts the keeper reads: re-exported, so the
+/// node service names them without depending on aterm-link.
+pub use aterm_link::durability::Durability;
+pub use aterm_link::enable::{BusHosting, RetiredJob};
 use aterm_net::fleet::link::{Bell, BusLog, Incoming, LinkClock};
 use aterm_secrets::membership_log::{Log, NodeStanding};
 use aterm_types::MutexExt;
 use aterm_uds::backup::Backups;
 use aterm_uds::secret::Secret;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -191,6 +205,9 @@ pub struct Standings {
     pub removed: BTreeSet<[u8; 32]>,
     /// Keys a member bound and since replaced (`NodeStanding::Retired`): revoked only.
     pub retired: BTreeSet<[u8; 32]>,
+    /// Each retired key whose seat is current, and the seat's node key now: the key rotations a
+    /// sender carries held mail across (§11 C3).
+    pub rotated: BTreeMap<[u8; 32], [u8; 32]>,
 }
 
 impl Standings {
@@ -201,6 +218,8 @@ impl Standings {
     pub fn of_log(log: &Log) -> Self {
         let membership = log.membership();
         let mut standings = Self::default();
+        let mut seated = BTreeMap::new();
+        let mut retired_of = Vec::new();
         for (key, standing) in membership.nodes() {
             match standing {
                 NodeStanding::Member(id) => {
@@ -210,15 +229,22 @@ impl Standings {
                     });
                     if current {
                         standings.current.insert(*key);
+                        seated.insert(id, *key);
                     }
                 }
                 NodeStanding::Removed(_) => {
                     standings.removed.insert(*key);
                 }
-                NodeStanding::Retired(_) => {
+                NodeStanding::Retired(id) => {
                     standings.retired.insert(*key);
+                    retired_of.push((*key, id));
                 }
                 NodeStanding::Contested | NodeStanding::Unknown => {}
+            }
+        }
+        for (old, id) in retired_of {
+            if let Some(new) = seated.get(&id) {
+                standings.rotated.insert(old, *new);
             }
         }
         standings
@@ -238,6 +264,9 @@ impl Standings {
                 standings.retired.remove(key);
                 standings.removed.insert(*key);
             }
+            standings
+                .rotated
+                .retain(|_, new| !outs.removed.contains(new) && !outs.retired.contains(new));
             for key in &outs.retired {
                 if !standings.removed.contains(key) {
                     standings.current.remove(key);
@@ -266,13 +295,22 @@ impl Standings {
     #[must_use]
     pub fn read_records(file: &Path) -> Option<Self> {
         use aterm_secrets::membership_log::{Kind, decode_records};
+        use std::io::Read as _;
         const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
-        let meta = std::fs::symlink_metadata(file).ok()?;
-        if !meta.is_file() || meta.len() > MAX_STORE_BYTES {
+        let (open, meta) = aterm_uds::regular_file::open(file).ok()?;
+        if meta.len() > MAX_STORE_BYTES {
             return None;
         }
-        let records = decode_records(&std::fs::read(file).ok()?).ok()?;
-        let genesis = records.iter().find(|r| r.kind() == Kind::Genesis)?.clone();
+        let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).ok()?.saturating_add(1));
+        open.take(MAX_STORE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_STORE_BYTES {
+            return None;
+        }
+        let mut records = decode_records(&bytes).ok()?;
+        let pos = records.iter().position(|r| r.kind() == Kind::Genesis)?;
+        let genesis = records.remove(pos);
         let mut log = Log::new(genesis).ok()?;
         for record in records {
             if record.kind() != Kind::Genesis {
@@ -292,6 +330,88 @@ impl Standings {
     #[must_use]
     pub fn revoked(&self) -> BTreeSet<[u8; 32]> {
         self.removed.union(&self.retired).copied().collect()
+    }
+}
+
+/// The class a broker reads a key as: its producer id, `producer_id_of(identity_principal(key))`.
+/// A broker keys its origins and revocations by the principal (the key's first 8 bytes) and
+/// deduplicates relayed records by the producer id that principal hashes to, so two keys of one
+/// class are one origin to it, each able to shadow or pre-empt the other.
+fn class_of(key: &[u8; 32]) -> u64 {
+    astream_broker::producer_id_of(&astream_broker::identity_principal(key))
+}
+
+/// What the brokers take of a read, with keys judged by class ([`class_of`]), current winning:
+/// the origins, and what is revoked, by key and by principal.
+///
+/// - A current key that shares its class with no other current key (this Mac's own counted) is
+///   an origin, admitted and a seat. Two or more current keys of one class are contested: none
+///   is an origin, each is revoked by its key, and their principals are revoked, until one key
+///   is left. On this Mac its own key always wins its class.
+/// - A `Removed` or `Retired` key is revoked by its key, and by its principal unless an origin
+///   holds that principal: a removed key that shares an origin's principal (a member can bind and
+///   retire a key at will) never takes that origin out.
+/// - This Mac's own key and principal are never revoked on its own brokers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Verdict {
+    /// The origin keys every broker is given: this Mac's and each uncontested current seat's.
+    pub(crate) origins: BTreeSet<[u8; 32]>,
+    /// The keys revoked, each by its key alone.
+    pub(crate) keys: BTreeSet<[u8; 32]>,
+    /// The principals revoked.
+    pub(crate) principals: BTreeSet<String>,
+}
+
+impl Verdict {
+    /// The verdict on `read` for the Mac whose key is `me`, keys classed by `class`: every key the
+    /// read names, this Mac's first, interned to dense classes and principals and judged by
+    /// `aterm_mesh_core::relay::Verdict::of`, whose kernels and folds `relay_island.rs` proves.
+    pub(crate) fn of(read: &Standings, me: &[u8; 32], class: impl Fn(&[u8; 32]) -> u64) -> Self {
+        let others: BTreeSet<[u8; 32]> = read
+            .current
+            .iter()
+            .chain(&read.removed)
+            .chain(&read.retired)
+            .filter(|key| *key != me)
+            .copied()
+            .collect();
+        let all: Vec<[u8; 32]> = std::iter::once(*me).chain(others).collect();
+        let mut classes: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut principal_of: BTreeMap<String, usize> = BTreeMap::new();
+        let keys: Vec<aterm_mesh_core::relay::Key> = all
+            .iter()
+            .map(|key| {
+                let next = classes.len();
+                let class = *classes.entry(class(key)).or_insert(next);
+                let name = astream_broker::identity_principal(key);
+                let principal = *principal_of.entry(name.clone()).or_insert_with(|| {
+                    names.push(name);
+                    names.len() - 1
+                });
+                aterm_mesh_core::relay::Key {
+                    class,
+                    principal,
+                    current: read.is_current(key),
+                    gone: read.removed.contains(key) || read.retired.contains(key),
+                }
+            })
+            .collect();
+        let verdict = aterm_mesh_core::relay::Verdict::of(&keys, 0, names.len());
+        let pick = |judged: &dyn Fn(usize) -> bool| -> BTreeSet<[u8; 32]> {
+            (0..all.len())
+                .filter(|&k| judged(k))
+                .map(|k| all[k])
+                .collect()
+        };
+        Self {
+            origins: pick(&|k| verdict.is_origin(k)),
+            keys: pick(&|k| verdict.is_revoked(k)),
+            principals: (0..names.len())
+                .filter(|&p| verdict.is_principal_revoked(p))
+                .map(|p| names[p].clone())
+                .collect(),
+        }
     }
 }
 
@@ -430,7 +550,10 @@ fn guard_secret(dir: &Path) -> io::Result<Secret> {
     let path = dir.join(GUARD_SECRET);
     if std::fs::symlink_metadata(&path).is_err() {
         let mut fresh = [0u8; GUARD_LEN];
-        aterm_uds::rand::fill(&mut fresh)?;
+        if let Err(e) = aterm_uds::rand::fill(&mut fresh) {
+            aterm_uds::secret::scrub(&mut fresh);
+            return Err(e);
+        }
         let wrote =
             aterm_uds::private_file::write_private_new(dir, GUARD_SECRET, &fresh, |_| Ok(()));
         aterm_uds::secret::scrub(&mut fresh);
@@ -591,10 +714,12 @@ impl Hosted {
     }
 
     /// Stop serving: the socket's handle goes first, which (as the last listener) ends every
-    /// connection and closes the log cleanly; a broker never served closes when it drops.
+    /// connection. Explicit shutdown also flushes and closes a stream-only broker where the
+    /// socket path was too long to serve, even while the mesh still holds its `Arc`.
     fn shut(&self) {
         drop(self.local.lock_or_recover().take());
         drop(self.served.lock_or_recover().take());
+        self.broker.shutdown();
     }
 }
 
@@ -603,12 +728,18 @@ impl Hosted {
 struct Applied {
     /// The standings, `None` before the first read.
     read: Option<Standings>,
-    /// The keys revoked on both brokers.
-    revoked: BTreeSet<[u8; 32]>,
+    /// What every broker was given of them: the origins, and the keys and principals revoked.
+    verdict: Verdict,
     /// The `Removed` keys whose rows were retired.
     retired: BTreeSet<[u8; 32]>,
     /// The `Removed` keys whose rows could not be retired yet, each said once.
     unretired: BTreeSet<[u8; 32]>,
+    /// The job's `bus.log`, while one is hosted and joined ([`Mesh::join_bus`]).
+    bus: Option<Arc<BusHost>>,
+    /// The `Removed` keys whose halts were retired on that `bus.log`.
+    bus_retired: BTreeSet<[u8; 32]>,
+    /// The `Removed` keys whose halts could not be retired there yet, each said once.
+    bus_unretired: BTreeSet<[u8; 32]>,
 }
 
 /// The mesh of one node service: both logs, this Mac's node key, and the membership log's verdict.
@@ -629,6 +760,25 @@ pub struct Mesh {
     pub(crate) arrived: Mutex<BTreeSet<[u8; 32]>>,
     stopped: AtomicBool,
     watcher: Mutex<Option<(Arc<Bell>, std::thread::JoinHandle<()>)>>,
+    /// The job's bus slot this mesh joined, which it leaves as it closes.
+    joined: Mutex<Option<Arc<BusSlot>>>,
+    /// Held through each close, so a second caller (the orderly quit, racing the job's own close)
+    /// returns only once the logs are shut, not as soon as the first caller marked them stopping.
+    closing: Mutex<()>,
+    /// Presence's board while presence runs on this mesh: the rows [`Mesh::holders`] reads.
+    pub(crate) presence: Mutex<Weak<crate::presence::Shared>>,
+}
+
+/// The live generation, held weakly so orderly quit can close its logs without owning it.
+static QUIT_MESH: Mutex<Weak<Mesh>> = Mutex::new(Weak::new());
+
+/// Flush and mark both mesh logs closed before a quit signal ends the process. Where the job's
+/// own close is in progress, it returns once that close is done ([`Mesh::close`]).
+pub fn close_mesh_at_quit() {
+    let mesh = QUIT_MESH.lock_or_recover().upgrade();
+    if let Some(mesh) = mesh {
+        mesh.close();
+    }
 }
 
 impl std::fmt::Debug for Mesh {
@@ -666,7 +816,13 @@ impl Mesh {
             arrived: Mutex::new(BTreeSet::new()),
             stopped: AtomicBool::new(false),
             watcher: Mutex::new(None),
+            joined: Mutex::new(None),
+            closing: Mutex::new(()),
+            presence: Mutex::new(Weak::new()),
         });
+        // Registered as soon as it holds both logs, so a quit while it reads the standings or
+        // starts its watcher closes them too.
+        *QUIT_MESH.lock_or_recover() = Arc::downgrade(&mesh);
         let read = mesh.follow().is_some();
         if let Some(changed) = cfg.changed {
             let bell = Arc::new(Bell::default());
@@ -761,55 +917,102 @@ impl Mesh {
         (self.standings)().map(|read| self.apply(read))
     }
 
+    /// The other Macs whose newest presence row names a held topic, by principal (§4.11): the
+    /// Macs this Mac's topic broadcasts go to. None while presence does not run here.
+    #[must_use]
+    pub fn holders(&self) -> BTreeSet<String> {
+        let presence = self.presence.lock_or_recover().upgrade();
+        presence
+            .map(|presence| presence.seats())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|seat| {
+                !seat.me
+                    && seat
+                        .row
+                        .as_ref()
+                        .is_some_and(|(_, row)| !row.topics.is_empty())
+            })
+            .map(|seat| seat.principal)
+            .collect()
+    }
+
     /// The standings applied, `None` before the first read.
     #[must_use]
     pub fn standings(&self) -> Option<Standings> {
         self.applied.lock_or_recover().read.clone()
     }
 
-    /// Apply `read` to both brokers: revoke each key that entered the revoked set, un-revoke each
-    /// that left it, install the current seats' keys (and this Mac's own) as the origins, and
-    /// retire the rows of each key newly `Removed` (one whose retire fails is tried again at each
-    /// watch, [`Self::retire_due`]). This Mac's own key is never revoked. Answers whether anything
-    /// changed.
+    /// Apply `read` to every broker as its [`Verdict`] says: revoke each key and each principal that
+    /// entered the revoked sets, lift each that left them, install the origins (the uncontested
+    /// current seats' keys and this Mac's own), and retire the rows of each key newly `Removed`
+    /// whose principal no origin holds (one whose retire fails is tried again at each watch,
+    /// [`Self::retire_due`]). This Mac's own key and principal are never revoked. Broker state is a
+    /// function of the read: a key's principal is revoked or lifted with the class it stands in,
+    /// never with one key's change. Answers whether anything changed.
     pub fn apply(&self, read: Standings) -> bool {
         let mut applied = self.applied.lock_or_recover();
         if applied.read.as_ref() == Some(&read) {
             return false;
         }
-        let mut revoked = read.revoked();
-        revoked.remove(&self.me.key);
-        let entered: Vec<[u8; 32]> = revoked.difference(&applied.revoked).copied().collect();
-        let left: Vec<[u8; 32]> = applied.revoked.difference(&revoked).copied().collect();
-        let mut origins: BTreeSet<[u8; 32]> = read.current.difference(&revoked).copied().collect();
-        origins.insert(self.me.key);
-        for hosted in [&self.tables, &self.metrics] {
-            for key in &entered {
-                hosted.broker.revoke_identity(*key);
+        let verdict = Verdict::of(&read, &self.me.key, class_of);
+        let was = &applied.verdict;
+        let keys_in: Vec<[u8; 32]> = verdict.keys.difference(&was.keys).copied().collect();
+        let keys_out: Vec<[u8; 32]> = was.keys.difference(&verdict.keys).copied().collect();
+        let principals_in: Vec<String> = verdict
+            .principals
+            .difference(&was.principals)
+            .cloned()
+            .collect();
+        let principals_out: Vec<String> = was
+            .principals
+            .difference(&verdict.principals)
+            .cloned()
+            .collect();
+        let bus = applied.bus.as_ref().map(|host| Arc::clone(&host.broker));
+        for broker in [&self.tables.broker, &self.metrics.broker]
+            .into_iter()
+            .chain(bus.as_ref())
+        {
+            for key in &keys_in {
+                broker.revoke_key(*key);
             }
-            for key in &left {
-                // Lifts the key's derived principal too, as `revoke_identity` revoked it.
-                hosted.broker.unrevoke_identity(key);
+            for principal in &principals_in {
+                broker.revoke_principal(principal);
             }
-            hosted.broker.set_origin_keys(origins.iter().copied());
+            for key in &keys_out {
+                broker.unrevoke_key(key);
+            }
+            for principal in &principals_out {
+                broker.unrevoke_principal(principal);
+            }
+            broker.set_origin_keys(verdict.origins.iter().copied());
         }
         // A key that left `Removed` is retired again should it come back.
         applied.retired.retain(|key| read.removed.contains(key));
         applied.unretired.retain(|key| read.removed.contains(key));
-        for key in &entered {
-            aterm_log::info!(
-                "mesh: {} is revoked: the membership log took it out",
-                astream_broker::identity_principal(key)
-            );
+        applied.bus_retired.retain(|key| read.removed.contains(key));
+        applied
+            .bus_unretired
+            .retain(|key| read.removed.contains(key));
+        for key in &keys_in {
+            let principal = astream_broker::identity_principal(key);
+            if read.current.contains(key) {
+                aterm_log::info!(
+                    "mesh: {principal} is revoked: another current key shares its principal"
+                );
+            } else {
+                aterm_log::info!("mesh: {principal} is revoked: the membership log took it out");
+            }
         }
-        for key in &left {
+        for key in &keys_out {
             aterm_log::info!(
                 "mesh: {} is un-revoked: the membership log seats it again",
                 astream_broker::identity_principal(key)
             );
         }
-        let alone = origins.len() == 1;
-        applied.revoked = revoked;
+        let alone = verdict.origins.len() == 1;
+        applied.verdict = verdict;
         applied.read = Some(read);
         drop(applied);
         self.retire_due();
@@ -824,20 +1027,43 @@ impl Mesh {
         true
     }
 
-    /// Retire the rows of every `Removed` key (never this Mac's own) not retired yet. It runs
-    /// outside the lock every stream's admission reads: the keys are revoked already.
+    /// Retire the rows of every `Removed` key not retired yet whose principal stands revoked: rows
+    /// go by principal, so never those of a principal an origin holds (this Mac's own among them).
+    /// It runs outside the lock every stream's admission reads: the keys are revoked already.
     pub(crate) fn retire_due(&self) {
-        let due: Vec<[u8; 32]> = {
+        let (due, bus_due) = {
             let applied = self.applied.lock_or_recover();
             let Some(read) = applied.read.as_ref() else {
                 return;
             };
-            read.removed
+            let gone = |key: &&[u8; 32]| {
+                applied
+                    .verdict
+                    .principals
+                    .contains(&astream_broker::identity_principal(key))
+            };
+            let due: Vec<[u8; 32]> = read
+                .removed
                 .iter()
-                .filter(|key| **key != self.me.key && !applied.retired.contains(*key))
+                .filter(gone)
+                .filter(|key| !applied.retired.contains(*key))
                 .copied()
-                .collect()
+                .collect();
+            let bus_due: Vec<[u8; 32]> = match applied.bus.as_ref() {
+                Some(_) => read
+                    .removed
+                    .iter()
+                    .filter(gone)
+                    .filter(|key| !applied.bus_retired.contains(*key))
+                    .copied()
+                    .collect(),
+                None => Vec::new(),
+            };
+            (due, bus_due)
         };
+        for key in bus_due {
+            self.retire_halts(&key);
+        }
         for key in due {
             let retired = self.retire_rows(&key);
             let mut applied = self.applied.lock_or_recover();
@@ -881,31 +1107,148 @@ impl Mesh {
         Ok(())
     }
 
-    /// Whether `key` may stream to this Mac now: `None` before the standings were read.
-    pub(crate) fn admits(&self, key: &[u8; 32]) -> Option<bool> {
-        let applied = self.applied.lock_or_recover();
-        let read = applied.read.as_ref()?;
-        Some(*key != self.me.key && read.is_current(key) && !applied.revoked.contains(key))
+    /// Retire the halts the removed Mac `key` originated on the joined `bus.log`, so no halt
+    /// outlives its origin (§4.11): every `/f/<fleet>/halt/n-<id>` row it holds. A failure is
+    /// said once and tried again at the next watch, as a metrics retirement is.
+    fn retire_halts(&self, key: &[u8; 32]) {
+        let Some(host) = self.applied.lock_or_recover().bus.clone() else {
+            return;
+        };
+        let principal = astream_broker::identity_principal(key);
+        let retired = host.retire_halts_of(self.me.key, &principal);
+        let mut applied = self.applied.lock_or_recover();
+        // The host may have been replaced meanwhile: only its own retirement counts.
+        if !applied
+            .bus
+            .as_ref()
+            .is_some_and(|now| Arc::ptr_eq(now, &host))
+        {
+            return;
+        }
+        match retired {
+            Ok(()) => {
+                applied.bus_retired.insert(*key);
+                applied.bus_unretired.remove(key);
+            }
+            Err(e) => {
+                if applied.bus_unretired.insert(*key) {
+                    aterm_log::warn!(
+                        "mesh: the halts of {principal} could not be retired on bus.log yet: {e}"
+                    );
+                }
+            }
+        }
     }
 
-    /// The other current seats' keys, `None` before the standings were read.
+    /// Join the job's `bus.log` to this mesh's revocation pass and its `Bus` service: the host
+    /// `slot` holds now, and each host it holds later ([`BusSlot::set`]), takes every revoked
+    /// key, the origin keys and the retirement of each removed Mac's halts, and a neighbour's
+    /// `Bus` stream for `bus.log` is served with it. A mesh joins one slot; joining another
+    /// leaves the first.
+    pub fn join_bus(self: &Arc<Self>, slot: &Arc<BusSlot>) {
+        let was = self.joined.lock_or_recover().replace(Arc::clone(slot));
+        if let Some(was) = was.filter(|was| !Arc::ptr_eq(was, slot)) {
+            let mut was_inner = was.inner.lock_or_recover();
+            if was_inner
+                .mesh
+                .upgrade()
+                .is_some_and(|mesh| Arc::ptr_eq(&mesh, self))
+            {
+                was_inner.mesh = Weak::new();
+            }
+        }
+        let mut inner = slot.inner.lock_or_recover();
+        inner.mesh = Arc::downgrade(self);
+        self.bus_now(inner.host.clone());
+        drop(inner);
+        self.retire_due();
+    }
+
+    /// Make `host` the `bus.log` this mesh judges: a new broker takes the whole of what is
+    /// applied (astream keeps no revocation across a reopen), and its halts are retired anew.
+    /// Called with the slot's lock held, so a host's arrival and a join never cross.
+    fn bus_now(&self, host: Option<Arc<BusHost>>) {
+        let mut applied = self.applied.lock_or_recover();
+        let same = match (applied.bus.as_ref(), host.as_ref()) {
+            (Some(was), Some(is)) => Arc::ptr_eq(was, is),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        if let Some(host) = host.as_ref()
+            && applied.read.is_some()
+        {
+            for key in &applied.verdict.keys {
+                host.broker.revoke_key(*key);
+            }
+            for principal in &applied.verdict.principals {
+                host.broker.revoke_principal(principal);
+            }
+            host.broker
+                .set_origin_keys(applied.verdict.origins.iter().copied());
+        }
+        applied.bus = host;
+        applied.bus_retired.clear();
+        applied.bus_unretired.clear();
+    }
+
+    /// The `bus.log` joined now.
+    #[must_use]
+    pub fn bus(&self) -> Option<Arc<BusHost>> {
+        self.applied.lock_or_recover().bus.clone()
+    }
+
+    /// Whether `key` may stream to this Mac now, an origin other than this Mac ([`Verdict`]):
+    /// `None` before the standings were read.
+    pub(crate) fn admits(&self, key: &[u8; 32]) -> Option<bool> {
+        let applied = self.applied.lock_or_recover();
+        applied.read.as_ref()?;
+        Some(*key != self.me.key && applied.verdict.origins.contains(key))
+    }
+
+    /// The other current seats' keys, the origins but this Mac's ([`Verdict`]): `None` before the
+    /// standings were read.
     pub(crate) fn seats(&self) -> Option<BTreeSet<[u8; 32]>> {
         let applied = self.applied.lock_or_recover();
-        let read = applied.read.as_ref()?;
-        Some(
-            read.current
+        applied.read.as_ref()?;
+        let mut seats = applied.verdict.origins.clone();
+        seats.remove(&self.me.key);
+        Some(seats)
+    }
+
+    /// The origin keys every broker holds now ([`Verdict`]): this Mac's alone before the first read.
+    #[cfg(test)]
+    pub(crate) fn origins(&self) -> BTreeSet<[u8; 32]> {
+        let applied = self.applied.lock_or_recover();
+        if applied.read.is_none() {
+            return BTreeSet::from([self.me.key]);
+        }
+        applied.verdict.origins.clone()
+    }
+
+    /// Whether a relayed record of `owner`'s is still owed to a neighbour that did not take it
+    /// (`FederationBridge::hold_while`): this Mac seats `owner` as an origin, or has read no
+    /// standings yet, when it cannot tell and holds rather than passes.
+    pub(crate) fn still_seats(&self, owner: &str) -> bool {
+        let applied = self.applied.lock_or_recover();
+        applied.read.is_none()
+            || applied
+                .verdict
+                .origins
                 .iter()
-                .filter(|key| **key != self.me.key && !applied.revoked.contains(*key))
-                .copied()
-                .collect(),
-        )
+                .any(|key| astream_broker::identity_principal(key) == owner)
     }
 
     /// Serve a `Bus` stream a neighbour opened on its link: refused `unserved` for a log the mesh
-    /// does not host, `unread` before the standings were read, `out` for a key that is not a
-    /// current seat; otherwise accepted, handed its grants, and adopted by the log's broker under
+    /// does not host, `unread` before the standings were read, `out` for a key that is not an
+    /// origin ([`Verdict`]: removed, retired, never seated, or contested); otherwise accepted, handed its grants, and adopted by the log's broker under
     /// the peer's key, which refuses a revoked key and ends its stream when the key is revoked.
     pub fn serve_bus(&self, incoming: Incoming) {
+        if incoming.log() == Some(BusLog::Bus) {
+            return self.serve_bus_log(incoming);
+        }
         let Some(log) = incoming.log().and_then(MeshLog::of_bus) else {
             return incoming.refuse("unserved");
         };
@@ -941,6 +1284,44 @@ impl Mesh {
         self.poke();
     }
 
+    /// Serve a `Bus` stream for `bus.log` (§4.11): refused `unserved` with no `bus.log` joined,
+    /// `unread` before the standings were read and `out` for a key that is not an origin
+    /// ([`Verdict`]) (the node service checked the drive admission before it handed the stream here);
+    /// otherwise handed the ring minted for the peer under the root's `mint.secret`, and adopted
+    /// by the log's broker under the peer's key, which binds every grant of the ring to that peer,
+    /// refuses a revoked key and ends its stream when the key is revoked.
+    fn serve_bus_log(&self, incoming: Incoming) {
+        if self.is_stopped() {
+            return incoming.refuse("unserved");
+        }
+        let Some(host) = self.bus() else {
+            return incoming.refuse("unserved");
+        };
+        let key = *incoming.peer().key.bytes();
+        match self.admits(&key) {
+            None => return incoming.refuse("unread"),
+            Some(false) => return incoming.refuse("out"),
+            Some(true) => {}
+        }
+        let peer = astream_broker::identity_principal(&key);
+        let grants = match host.ring_for(&self.me.principal, &peer) {
+            Ok(grants) => grants,
+            Err(e) => {
+                aterm_log::warn!("mesh: no bus.log ring for {peer}: {e}");
+                return incoming.refuse("unserved");
+            }
+        };
+        let stream = incoming.accept();
+        let served = relay::hand_grants(&stream, &grants).and_then(|()| {
+            host.broker
+                .serve_stream(Arc::new(relay::BusLink::new(stream, Vec::new())), key)
+        });
+        match served {
+            Ok(handle) => drop(handle),
+            Err(e) => aterm_log::info!("mesh: {peer}'s bus.log stream ended: {e}"),
+        }
+    }
+
     /// Wake the membership watcher now, as its period passing would.
     #[cfg(test)]
     pub(crate) fn watch_now(&self) {
@@ -970,8 +1351,10 @@ impl Mesh {
     }
 
     /// Stop the mesh: the watcher ends, and each log stops serving and closes cleanly once the
-    /// last relay holding it ends. Detach the overlay ([`crate::Attached`]) first.
+    /// last relay holding it ends. Detach the overlay ([`crate::Attached`]) first. A second
+    /// caller waits for the close in progress and returns once it is done.
     pub fn close(&self) {
+        let _closing = self.closing.lock_or_recover();
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -982,6 +1365,18 @@ impl Mesh {
             }
         }
         self.poke();
+        let joined = self.joined.lock_or_recover().take();
+        if let Some(slot) = joined {
+            let mut inner = slot.inner.lock_or_recover();
+            if inner
+                .mesh
+                .upgrade()
+                .is_none_or(|mesh| std::ptr::eq(Arc::as_ptr(&mesh), self))
+            {
+                inner.mesh = Weak::new();
+            }
+        }
+        self.applied.lock_or_recover().bus = None;
         for hosted in [&self.tables, &self.metrics] {
             hosted.shut();
         }
@@ -991,5 +1386,607 @@ impl Mesh {
 impl Drop for Mesh {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// `bus.log`'s file name in the fabric root, where the broker job kept it.
+pub const BUS_LOG: &str = "bus.log";
+
+/// `bus.log`'s socket in the fabric root: the one every local client has always dialed.
+pub const BUS_SOCKET: &str = "bus.sock";
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the bus ring (`unbound-ring`): a host opened on a thread where it
+    /// is set mints each neighbour's mail grant unbound over every lane (`rw:/f/<fleet>/in/>`), so
+    /// the neighbour can post as any sender, another Mac or a person. A lab instance turns it on
+    /// for its whole process with `unbound-ring` in `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static UNBOUND_RING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`UNBOUND_RING`] is on: set on this thread, or named for this process.
+#[cfg(any(test, debug_assertions))]
+fn unbound_ring() -> bool {
+    UNBOUND_RING.with(std::cell::Cell::get) || aterm_types::negative_control::on("unbound-ring")
+}
+
+/// The grants a neighbour `peer` (its principal) is served this Mac's (`me`) `bus.log` with, for
+/// `fleet` (§4.11): [`aterm_link::federate::peer_ring`]'s, mail to this Mac sent as the peer
+/// itself, the peer's topics, the halt rows and the relay of halts.
+#[must_use]
+pub fn ring(fleet: &str, me: &str, peer: &str) -> Vec<String> {
+    aterm_link::federate::peer_ring(fleet, me, peer)
+}
+
+/// Open a `Bus` stream for a neighbour's `bus.log` over `link` and read the ring it hands this
+/// Mac: the stream as astream's link, and the grants to attach on it.
+/// # Errors
+/// What `Link::open` answers ([`io::ErrorKind::PermissionDenied`] with the neighbour's reason
+/// where it refused: `unserved` with no `bus.log` hosted there, the drive admission's refusal,
+/// `out` for a key that is no current seat), or a ring that cannot be read.
+pub fn dial_bus(
+    link: &aterm_net::fleet::link::Link,
+) -> io::Result<(relay::BusLink, Vec<Capability>)> {
+    let stream = link.open(
+        aterm_net::fleet::FleetOp::Bus,
+        Some(BusLog::Bus),
+        relay::IO_WITHIN,
+    )?;
+    let (grants, ahead) = relay::read_grants(&stream)?;
+    Ok((relay::BusLink::new(stream, ahead), grants))
+}
+
+/// The boot `bus.log` names for its legacy mark's verdict: the machine's, or on a test's thread
+/// [`BOOT`].
+fn boot_id() -> Option<[u8; 16]> {
+    match boot() {
+        Boot::Known(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Open `log` as the node service hosts `bus.log`, under `opts` (the tier's options and the
+/// guard its caller set), exactly as `aterm link broker` opened it: sealed at rest by aterm-link's
+/// rules unless `opts` names a key already (`at_rest::prepare`: a key beside the log, or one
+/// minted where `mint.secret` stands beside it), its legacy mark folded into the open
+/// (`durability::open_with`), retained by aterm's default rules and limited by its default rate
+/// limit (each journaled and skipped where it cannot be set, as the broker did). The fabric
+/// world suite opens its broker through this too, so it runs against what the node service
+/// hosts.
+/// # Errors
+/// A seal aterm-link refuses (an unfinished retire, a damaged or missing key), a log another
+/// broker holds (`AlreadyExists`), and astream's own refusal to open it.
+pub fn open_bus(
+    log: &Path,
+    mut opts: astream_broker::OpenOptions,
+    backups: Backups,
+) -> io::Result<Broker> {
+    let named = log.display();
+    if opts.at_rest_key.is_none() {
+        let prepared = at_rest::prepare(log, backups).map_err(|r| refused(&r))?;
+        for note in &prepared.notes {
+            aterm_log::info!("mesh: {named}: {note}");
+        }
+        opts.at_rest_key = prepared.key.as_ref().map(at_rest::Key::bytes);
+    }
+    opts.require_bound_at_rest = opts.at_rest_key.is_some();
+    let opened = aterm_link::durability::open_with(log, opts, boot_id())?;
+    if let Some(why) = &opened.renewed {
+        aterm_log::info!(
+            "mesh: {named}: {}: its generation moves, and every bridge and notifier resumes where \
+             it continues",
+            why.describe()
+        );
+    }
+    if let Some(kept) = &opened.mark_kept {
+        aterm_log::warn!(
+            "mesh: could not remove the legacy relaxed mark {kept}; the log's generation moves \
+             once more after the next reboot"
+        );
+    }
+    let broker = opened.broker;
+    if let Err(e) = aterm_link::broker_rules::retain(&broker) {
+        aterm_log::warn!(
+            "mesh: {named}: its retention rules could not be set ({e}); it serves unretained"
+        );
+    }
+    if let Err(e) = aterm_link::broker_rules::limit(&broker) {
+        aterm_log::warn!(
+            "mesh: {named}: its rate limit could not be set ({e}); it serves with no limit"
+        );
+    }
+    Ok(broker)
+}
+
+/// Where and how the node service hosts `bus.log`.
+#[derive(Clone, Debug)]
+pub struct BusSpec {
+    /// The fabric root: `bus.log`, `bus.sock` and `mint.secret` are in it.
+    pub root: PathBuf,
+    /// The fleet the local bridge serves: the ring's subjects name it.
+    pub fleet: String,
+    /// The tier `bus.log` acks under.
+    pub tier: Durability,
+    /// How `rest.key` is marked for backups.
+    pub backups: Backups,
+}
+
+impl BusSpec {
+    /// Whether `other` hosts the same log the same way (the backup mark aside).
+    fn same(&self, other: &Self) -> bool {
+        self.root == other.root && self.fleet == other.fleet && self.tier == other.tier
+    }
+}
+
+/// `bus.log` as the node service hosts it: its broker, served on `bus.sock`, and the root's mint
+/// secret, which guards it and mints each neighbour's ring.
+pub struct BusHost {
+    broker: Arc<Broker>,
+    served: Mutex<Option<BrokerHandle>>,
+    spec: BusSpec,
+    secret: Secret,
+    /// [`UNBOUND_RING`] as the opening thread read it.
+    #[cfg(any(test, debug_assertions))]
+    unbound: bool,
+}
+
+impl std::fmt::Debug for BusHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusHost")
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BusHost {
+    /// Open `bus.log` in `spec.root` under its `mint.secret` ([`open_bus`]), serve it on
+    /// `bus.sock`, and keep its health file, as the broker job did.
+    ///
+    /// # Errors
+    /// A mint secret aterm-link's rule refuses (`transport::read_mint_secret`), a socket path
+    /// past `sun_path` (`InvalidInput`), what [`open_bus`] refuses, and a socket that cannot be
+    /// served.
+    pub fn open(spec: BusSpec) -> io::Result<Self> {
+        let secret_path = spec.root.join(aterm_link::enable::MINT_SECRET);
+        let shown = secret_path.to_string_lossy().into_owned();
+        let read = aterm_link::transport::read_mint_secret(&shown)
+            .map_err(|e| io::Error::new(e.kind(), aterm_link::transport::describe(&shown, &e)))?;
+        let secret = Secret::from_vec(read);
+        let sock = spec.root.join(BUS_SOCKET);
+        if sock.as_os_str().len() >= SUN_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is too long a socket path", sock.display()),
+            ));
+        }
+        let log = spec.root.join(BUS_LOG);
+        let created = std::fs::symlink_metadata(&log).is_err();
+        let mut opts = spec.tier.options();
+        opts.guard = Some(secret.expose().to_vec());
+        let broker = open_bus(&log, opts, spec.backups)?;
+        let served = match broker.serve(&sock) {
+            Ok(served) => served,
+            Err(e) => {
+                drop(broker);
+                if created
+                    && std::fs::symlink_metadata(&log).is_ok_and(|m| m.is_file() && m.len() == 0)
+                {
+                    let _ = std::fs::remove_file(&log);
+                }
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("serve {}: {e}", sock.display()),
+                ));
+            }
+        };
+        if let Err(e) = broker.keep_health(aterm_link::broker_health::HEALTH_EVERY) {
+            aterm_log::warn!(
+                "mesh: {}: its health could not be written ({e}); astream tries again",
+                astream_broker::health_path(&log).display()
+            );
+        }
+        aterm_log::info!(
+            "mesh: hosts {} on {} for fleet {}, durability {}, at-rest={}, log {}",
+            log.display(),
+            sock.display(),
+            spec.fleet,
+            spec.tier.name(),
+            at_rest::word(&log),
+            broker.log_identity()
+        );
+        Ok(Self {
+            broker: Arc::new(broker),
+            served: Mutex::new(Some(served)),
+            spec,
+            secret,
+            #[cfg(any(test, debug_assertions))]
+            unbound: unbound_ring(),
+        })
+    }
+
+    /// Its broker.
+    #[must_use]
+    pub const fn broker(&self) -> &Arc<Broker> {
+        &self.broker
+    }
+
+    /// How it is hosted.
+    #[must_use]
+    pub const fn spec(&self) -> &BusSpec {
+        &self.spec
+    }
+
+    /// The socket it is served on.
+    #[must_use]
+    pub fn sock(&self) -> PathBuf {
+        self.spec.root.join(BUS_SOCKET)
+    }
+
+    /// Why its log is poisoned, if it is: the node service reopens it.
+    #[must_use]
+    pub fn poisoned(&self) -> Option<String> {
+        self.broker.poisoned()
+    }
+
+    /// Whether `bus.sock` names its listener still (`None`: unknown, or no longer served).
+    #[must_use]
+    pub fn names_listener(&self) -> Option<bool> {
+        self.served
+            .lock_or_recover()
+            .as_ref()
+            .and_then(BrokerHandle::names_listener)
+    }
+
+    /// A grant minted under the root's mint secret.
+    /// # Errors
+    /// A grant astream does not parse.
+    pub fn mint(&self, grant: &str) -> io::Result<Capability> {
+        astream_broker::mint(self.secret.expose(), grant)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// The ring neighbour `peer` is served with by this Mac (`me`) ([`ring`]), minted.
+    /// # Errors
+    /// A peer principal astream does not take in a grant.
+    pub fn ring_for(&self, me: &str, peer: &str) -> io::Result<Vec<Capability>> {
+        let grants = ring(&self.spec.fleet, me, peer);
+        #[cfg(any(test, debug_assertions))]
+        let grants = if self.unbound {
+            let mut unbound = grants;
+            unbound[0] = format!("rw:/f/{}/in/>", self.spec.fleet);
+            unbound
+        } else {
+            grants
+        };
+        grants.iter().map(|grant| self.mint(grant)).collect()
+    }
+
+    /// A client of this broker under `key` (this Mac's node key, which is never revoked here),
+    /// holding `grants` minted under the mint secret, each read and write bounded by
+    /// [`relay::IO_WITHIN`].
+    fn client(&self, key: [u8; 32], grants: &[String]) -> io::Result<AnyClient> {
+        let caps = grants
+            .iter()
+            .map(|grant| self.mint(grant))
+            .collect::<io::Result<Vec<_>>>()?;
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+        drop(self.broker.serve_stream(Arc::new(theirs), key)?);
+        let link: Arc<dyn StreamLink> = Arc::new(ours);
+        link.set_read_timeout(Some(relay::IO_WITHIN))?;
+        link.set_write_timeout(Some(relay::IO_WITHIN))?;
+        let (mut client, _closer) = astream_broker::connect_stream(link);
+        client.attach_all(caps.iter().map(|cap| (cap.filter.as_str(), &cap.tag[..])))?;
+        Ok(client)
+    }
+
+    /// Retire every halt row `principal` (a removed Mac) originated, on every fleet's halt
+    /// subject, under its producer id, as this Mac (`key`).
+    fn retire_halts_of(&self, key: [u8; 32], principal: &str) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions))]
+        if RETIRE_REFUSED.with(std::cell::Cell::get) {
+            return Err(io::Error::other("a test refused the retirement"));
+        }
+        let filter = format!("/f/*/halt/{principal}");
+        let mut client = self.client(key, &[format!("rw:{filter}")])?;
+        let pid = astream_broker::producer_id_of(principal);
+        let (rows, _) = client.last_all(&filter)?;
+        for (_, subject, _) in rows {
+            client.retire_subject(pid, &subject)?;
+        }
+        Ok(())
+    }
+
+    /// Stop serving: the socket's handle goes, which (as its last listener) ends every
+    /// connection and closes the log cleanly. Idempotent.
+    pub fn shut(&self) {
+        drop(self.served.lock_or_recover().take());
+    }
+}
+
+impl Drop for BusHost {
+    fn drop(&mut self) {
+        self.shut();
+    }
+}
+
+/// The job's `bus.log` slot: the host its keeper holds now, and the mesh that judges it. The
+/// keeper and the mesh live apart (the mesh opens and closes with the node key and the
+/// generations; `bus.log` serves local clients whatever they do), and meet here.
+#[derive(Default)]
+pub struct BusSlot {
+    inner: Mutex<SlotInner>,
+}
+
+#[derive(Default)]
+struct SlotInner {
+    host: Option<Arc<BusHost>>,
+    mesh: Weak<Mesh>,
+}
+
+impl std::fmt::Debug for BusSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusSlot")
+            .field("host", &self.inner.lock_or_recover().host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BusSlot {
+    /// The host now.
+    #[must_use]
+    pub fn host(&self) -> Option<Arc<BusHost>> {
+        self.inner.lock_or_recover().host.clone()
+    }
+
+    /// Hold `host` (or none), and hand it to the mesh that joined, which applies everything it
+    /// applied to the new broker before any stream of it is served.
+    pub fn set(&self, host: Option<Arc<BusHost>>) {
+        let mut inner = self.inner.lock_or_recover();
+        inner.host.clone_from(&host);
+        let mesh = inner.mesh.upgrade();
+        if let Some(mesh) = &mesh {
+            mesh.bus_now(host);
+        }
+        drop(inner);
+        if let Some(mesh) = mesh {
+            mesh.retire_due();
+        }
+    }
+}
+
+/// How the keeper reads whether, and how, `bus.log` is hosted now
+/// (`aterm_link::enable::bus_hosting` in the node service).
+pub type Hosting = Arc<dyn Fn() -> BusHosting + Send + Sync>;
+
+/// How the keeper retires the separate broker job before it opens `bus.log`
+/// (`aterm_link::enable::retire_broker_job` in the node service).
+pub type Retire = Arc<dyn Fn() -> Result<RetiredJob, String> + Send + Sync>;
+
+/// How the node service keeps `bus.log`.
+#[derive(Clone)]
+pub struct BusKeeperConfig {
+    /// The fabric root.
+    pub root: PathBuf,
+    /// How `rest.key` is marked for backups.
+    pub backups: Backups,
+    /// Whether, and how, it is hosted now: read at each pass.
+    pub hosting: Hosting,
+    /// Retires the broker job before each open; `None` where there is none to retire (a test).
+    pub retire: Option<Retire>,
+    /// How often the keeper looks, beside each [`BusKeeper::poke`].
+    pub every: Duration,
+}
+
+impl BusKeeperConfig {
+    /// The node service's: the fabric root of this login as aterm-link resolves it
+    /// (`enable::Paths::resolve`), whether the fabric is on there (`enable::bus_hosting`), the
+    /// broker job it retires (`enable::retire_broker_job`), `rest.key` marked for system backups,
+    /// looked at `every`.
+    /// # Errors
+    /// Where the root does not resolve (no `$HOME`, no aterm binary).
+    pub fn live(every: Duration) -> Result<Self, String> {
+        let paths = Arc::new(aterm_link::enable::Paths::resolve(None)?);
+        let root = paths.root.clone();
+        let (hosting, retire) = (Arc::clone(&paths), paths);
+        Ok(Self {
+            root,
+            backups: Backups::SYSTEM,
+            hosting: Arc::new(move || aterm_link::enable::bus_hosting(&hosting)),
+            retire: Some(Arc::new(move || {
+                aterm_link::enable::retire_broker_job(&retire)
+            })),
+            every,
+        })
+    }
+}
+
+/// The node service's keeper of `bus.log` (§11 C2): a thread that, at each pass, opens it where
+/// the fabric is on (retiring the broker job first, so the job's process lets go of its lock),
+/// reopens it in process where its log is poisoned, its socket path no longer names it, or its
+/// fleet or tier changed, and closes it where the fabric is off, unprovisioned, or handed to a
+/// person's broker. The job ends with the keeper, closing the log cleanly.
+pub struct BusKeeper {
+    slot: Arc<BusSlot>,
+    bell: Arc<Bell>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for BusKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusKeeper")
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The slot of this process's keeper, for the orderly quit ([`close_bus_at_quit`]).
+static QUIT_SLOT: Mutex<Weak<BusSlot>> = Mutex::new(Weak::new());
+
+/// Close the keeper's `bus.log` cleanly now: the node service's orderly quit, which ends the
+/// process without running the keeper's drop, calls it first, so a weak tier's log is flushed in
+/// full and marked closed.
+pub fn close_bus_at_quit() {
+    let slot = QUIT_SLOT.lock_or_recover().upgrade();
+    if let Some(host) = slot.as_ref().and_then(|slot| slot.host()) {
+        host.shut();
+    }
+}
+
+impl BusKeeper {
+    /// Start the keeper; its first pass runs at once on its own thread.
+    /// # Errors
+    /// Where the thread cannot be spawned.
+    pub fn start(cfg: BusKeeperConfig) -> io::Result<Self> {
+        let slot = Arc::new(BusSlot::default());
+        let bell = Arc::new(Bell::default());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (slot, bell, stopped) =
+                (Arc::clone(&slot), Arc::clone(&bell), Arc::clone(&stopped));
+            std::thread::Builder::new()
+                .name("aterm-mesh-bus".to_owned())
+                .spawn(move || {
+                    let mut keep = Keep { cfg, said: None };
+                    while !stopped.load(Ordering::Acquire) {
+                        keep.pass(&slot);
+                        bell.wait(Some(keep.cfg.every));
+                    }
+                    keep.close(&slot, "the node service ends");
+                })?
+        };
+        *QUIT_SLOT.lock_or_recover() = Arc::downgrade(&slot);
+        Ok(Self {
+            slot,
+            bell,
+            stopped,
+            thread: Some(thread),
+        })
+    }
+
+    /// The slot it keeps `bus.log` in: what a mesh joins ([`Mesh::join_bus`]).
+    #[must_use]
+    pub const fn slot(&self) -> &Arc<BusSlot> {
+        &self.slot
+    }
+
+    /// Look again now, as the period passing would.
+    pub fn poke(&self) {
+        self.bell.ring();
+    }
+}
+
+impl Drop for BusKeeper {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        self.bell.ring();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The keeper's own state: its configuration and the last failure it journaled.
+struct Keep {
+    cfg: BusKeeperConfig,
+    said: Option<String>,
+}
+
+impl Keep {
+    /// Journal `why` once, until something else happens.
+    fn say(&mut self, why: String) {
+        if self.said.as_deref() != Some(why.as_str()) {
+            aterm_log::warn!("{why}");
+            self.said = Some(why);
+        }
+    }
+
+    /// Close the host `slot` holds, saying `why`.
+    fn close(&self, slot: &BusSlot, why: &str) {
+        if let Some(host) = slot.host() {
+            aterm_log::info!(
+                "mesh: {} closes: {why}",
+                host.spec.root.join(BUS_LOG).display()
+            );
+            slot.set(None);
+            host.shut();
+        }
+    }
+
+    /// What `bus.log` is hosted as now: its spec where the fabric is on, else `None`, with the
+    /// host `slot` holds closed.
+    fn hosted(&self, slot: &BusSlot) -> Option<BusSpec> {
+        let (fleet, tier) = match (self.cfg.hosting)() {
+            BusHosting::On { fleet, tier } => (fleet, tier),
+            BusHosting::Unprovisioned => {
+                self.close(slot, "the fabric root holds no mint secret");
+                return None;
+            }
+            BusHosting::Off => {
+                self.close(slot, "the fabric was turned off");
+                return None;
+            }
+            BusHosting::Hand => {
+                self.close(
+                    slot,
+                    "`aterm fabric on --service none` hands the broker to its person",
+                );
+                return None;
+            }
+        };
+        Some(BusSpec {
+            root: self.cfg.root.clone(),
+            fleet,
+            tier,
+            backups: self.cfg.backups,
+        })
+    }
+
+    /// One look: hosted as the fabric now says, the host reopened where it must be. The broker
+    /// job is retired only before an open (a look at launchd or systemd each time), and a
+    /// retirement records the tier the job ran at, so the fabric is read again after one.
+    fn pass(&mut self, slot: &BusSlot) {
+        let Some(mut spec) = self.hosted(slot) else {
+            return;
+        };
+        if let Some(host) = slot.host() {
+            let why = if !host.spec.same(&spec) {
+                Some("its fleet or tier changed".to_owned())
+            } else if let Some(poisoned) = host.poisoned() {
+                Some(format!("its log is poisoned ({poisoned})"))
+            } else if host.names_listener() == Some(false) {
+                Some(format!("{} no longer names it", host.sock().display()))
+            } else {
+                None
+            };
+            let Some(why) = why else { return };
+            self.close(slot, &format!("{why}; it reopens"));
+        }
+        if let Some(retire) = &self.cfg.retire {
+            match retire() {
+                Ok(RetiredJob::Absent) => {}
+                Ok(RetiredJob::Retired { label, tier }) => {
+                    aterm_log::info!(
+                        "mesh: retired the broker job {label}{}: the node service hosts bus.log",
+                        tier.map_or_else(String::new, |tier| format!(
+                            " (durability {})",
+                            tier.name()
+                        ))
+                    );
+                    let Some(now) = self.hosted(slot) else {
+                        return;
+                    };
+                    spec = now;
+                }
+                Err(e) => self.say(format!("mesh: the broker job could not be retired: {e}")),
+            }
+        }
+        match BusHost::open(spec) {
+            Ok(host) => {
+                self.said = None;
+                slot.set(Some(Arc::new(host)));
+            }
+            Err(e) => self.say(format!("mesh: bus.log did not open: {e}")),
+        }
     }
 }

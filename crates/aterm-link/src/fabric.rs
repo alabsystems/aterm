@@ -26,9 +26,9 @@ usage: aterm fabric [status] [--json]
        aterm fabric tail [--bodies] [--json] [--from <offset>] [--filter <subject-filter>]
        aterm fabric brief [@<sid>[@<node>]] [--window <records>] [--budget <tokens>]
                           [--cap-file <path>] [--json]
-       aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
+       aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none|node]
                         [--durability strict|ordered|relaxed]
-       aterm fabric off [--dry-run] [--service launchd|systemd|none]
+       aterm fabric off [--dry-run] [--service launchd|systemd|none|node]
        aterm fabric doctor [--retire-ghosts [--yes]]
        aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>]
                              [--expires <N>d|<N>h]
@@ -91,7 +91,9 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
   --dry-run        on/off: print every step, change nothing
   --fleet <F>      on, mint-for: the fleet (`/f/<F>/`; default the configured one, else
                    `local`)
-  --service <s>    on/off: `launchd`, `systemd`, or `none` (a broker run some other way)
+  --service <s>    on/off: `launchd`, `systemd`, `none` (a broker run some other way), or
+                   `node` (the node service hosts bus.log: no broker job; the default with
+                   the mesh on)
   --durability strict|ordered|relaxed
                    on: what the broker's ack promises (default the installed job's, else
                    `ordered`):
@@ -973,11 +975,50 @@ fn launchd_label(_pid: u32) -> Option<String> {
     None
 }
 
+/// Who serves a fabric's socket, read off the argv of the one process holding its listener
+/// ([`BrokerView::locate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    /// `aterm link broker <socket> …` (or `aterm-link broker …`) serving this socket: a broker
+    /// process, kept by the job `aterm fabric on` installed or run by hand.
+    LinkBroker,
+    /// `<aterm> node serve` ([`crate::enable::NODE_SERVE`]) holding `<root>/bus.sock`: the node
+    /// service ([`crate::enable::NODE_JOB`]) hosts `<root>/bus.log` in its own process. Read only
+    /// where the mesh is on ([`BrokerView::mesh`]).
+    NodeService,
+}
+
+impl Host {
+    /// Its word in `aterm fabric --json`'s `broker.host`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Host::LinkBroker => "link-broker",
+            Host::NodeService => "node-service",
+        }
+    }
+}
+
 /// What the broker probe found.
 #[derive(Debug, Clone, Default)]
 pub struct BrokerView {
     /// The broker socket the command names.
     pub endpoint: String,
+    /// This build's mesh switch (`aterm_types::mesh_switch::MESH`), read once by the probe that
+    /// made this view (a test sets it either way): where it is on, a process serving the socket
+    /// as `aterm node serve` is the node service ([`Host::NodeService`]), and with none named the
+    /// node service is the bus's keeper ([`Self::keeper`]).
+    pub mesh: bool,
+    /// Who serves the socket, as its holder's argv says ([`Self::locate`]); `None` where no
+    /// holder is named or its argv is neither a broker of this socket nor the node service.
+    pub host: Option<Host>,
+    /// The holder's argv0, as its argv was read: the program it runs.
+    pub program: Option<String>,
+    /// Whether the node service serving the socket runs this process's own build: its argv0 names
+    /// this process's executable (canonically), its image is not [`Self::replaced`], and it maps
+    /// the same image this process does ([`runs_this_build`]). Read only for
+    /// [`Host::NodeService`].
+    pub own_build: bool,
     /// Whether a broker answered: a connect and a `Hello` round trip in this build's astream
     /// protocol.
     pub reachable: bool,
@@ -987,9 +1028,11 @@ pub struct BrokerView {
     /// what the other sends, so it is not `reachable`, and this names why.
     pub protocol: Option<astream_broker::ProtocolMismatch>,
     /// The last line the broker's supervisor captured from its stderr (`<root>/broker.err`) and
-    /// its age, read only when the broker does not answer: the broker's own reason it is not
-    /// running, such as a log it refuses to open or an address in use
-    /// ([`crate::enable::supervisor_last_word`]).
+    /// its age, read only when the broker does not answer and a broker job keeps the bus
+    /// ([`Self::keeper`]): the broker's own reason it is not running, such as a log it refuses to
+    /// open or an address in use ([`crate::enable::supervisor_last_word`]). Under the node
+    /// service it is never read: the node service writes no `broker.err`, and one in the root is
+    /// a retired job's.
     pub last_word: Option<String>,
     /// Whether every cap was attached, so the bus can be read.
     pub attached: bool,
@@ -1035,7 +1078,8 @@ pub struct BrokerView {
     /// write until reopened) and why, and the flushes issued since it opened.
     pub health: Option<astream_broker::HelloHealth>,
     /// The log the serving process's argv names ([`crate::broker_args::BrokerArgs::log_path`]),
-    /// beside which astream keeps its health snapshot.
+    /// or, for the node service, `<root>/bus.log` beside the `<root>/bus.sock` it serves (it
+    /// always hosts the two together): beside it astream keeps its health snapshot.
     pub log: Option<PathBuf>,
     /// The log a fabric root keeps beside the configured socket, when one is there: what
     /// [`Self::at_rest`] reads while no serving process names a log.
@@ -1083,14 +1127,43 @@ impl BrokerView {
     }
 
     /// The tier the report names: the one the serving process's argv names
-    /// ([`Self::durability`]), else, for a broker whose argv this host cannot read, the one its
-    /// `Hello` says it was opened at ([`Self::served`]).
+    /// ([`Self::durability`]); else, for the node service (whose argv names none), the one its
+    /// current health snapshot says the log was opened at ([`Self::snapshot_now`]); else, for a
+    /// process whose argv this host cannot read, the one its `Hello` says ([`Self::served`]). A
+    /// snapshot is read only beside a log the serving process names ([`Self::log`]: a broker's
+    /// argv, which then names its tier too, or the node service's root), so a broker's tier is
+    /// its argv's whenever there is one.
     #[must_use]
     pub fn tier(&self) -> Option<crate::durability::Durability> {
-        self.durability.or_else(|| {
-            self.served
-                .and_then(|s| crate::durability::Durability::of_tier(s.requested))
-        })
+        use crate::durability::Durability;
+        self.durability
+            .or_else(|| {
+                self.snapshot_now()
+                    .and_then(|h| Durability::of_tier(h.served.requested))
+            })
+            .or_else(|| self.served.and_then(|s| Durability::of_tier(s.requested)))
+    }
+
+    /// Who keeps the bus this view read, for the remedies `aterm fabric doctor` gives: the
+    /// node service where it serves the socket, a broker job (or a broker run by hand) where a
+    /// broker does, and with neither named this build's default keeper
+    /// ([`crate::enable::Service::default_for`] of [`Self::mesh`]).
+    #[must_use]
+    pub fn keeper(&self) -> crate::enable::Keeper {
+        use crate::enable::{Keeper, Service};
+        match self.host {
+            Some(Host::NodeService) => Keeper::Node,
+            Some(Host::LinkBroker) => Keeper::Job,
+            None if Service::default_for(self.mesh) == Service::Node => Keeper::Node,
+            None => Keeper::Job,
+        }
+    }
+
+    /// The build the node service serving the socket runs, where it is this process's own
+    /// ([`Self::own_build`]): `<version>+g<commit>` ([`aterm_types::version::build_id`]).
+    #[must_use]
+    pub fn build(&self) -> Option<String> {
+        self.own_build.then(aterm_types::version::build_id)
     }
 
     /// astream's health snapshot ([`Self::snapshot`]) only when it is the serving broker's own
@@ -1119,17 +1192,25 @@ impl BrokerView {
     /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), or why it is unknown, its
     /// launchd job, and what its own argv says it serves; no other process is read.
     pub(crate) fn locate(&mut self) {
-        self.locate_with(listener_pid, launchd_label, replaced_build, |pid| {
-            aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?)
-        });
+        self.locate_with(
+            listener_pid,
+            launchd_label,
+            replaced_build,
+            |pid| aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?),
+            runs_this_build,
+        );
     }
 
+    /// [`Self::locate`] through its seams: `holder` names the pid holding the socket, and
+    /// `label`, `replaced`, `argv` and `own` (whether it runs this process's own build, asked
+    /// only of the node service) read only that pid.
     fn locate_with(
         &mut self,
         mut holder: impl FnMut(&str) -> Result<Option<u32>, String>,
         mut label: impl FnMut(u32) -> Option<String>,
         mut replaced: impl FnMut(u32, &str) -> Option<String>,
         mut argv: impl FnMut(u32) -> Option<Vec<std::ffi::OsString>>,
+        mut own: impl FnMut(u32, &str) -> bool,
     ) {
         (self.pid, self.pid_unknown) = match holder(&self.endpoint) {
             Ok(pid) => (pid, None),
@@ -1137,11 +1218,14 @@ impl BrokerView {
         };
         self.launchd = self.pid.and_then(&mut label);
         let words = self.pid.and_then(&mut argv);
-        let exe = words
+        self.program = words
             .as_ref()
             .and_then(|w| w.first())
             .map(|w| w.to_string_lossy().into_owned());
-        self.replaced = self.pid.zip(exe).and_then(|(pid, exe)| replaced(pid, &exe));
+        self.replaced = self
+            .pid
+            .zip(self.program.as_deref())
+            .and_then(|(pid, exe)| replaced(pid, exe));
         let endpoint = aterm_uds::holders::SocketPath::of(Path::new(&self.endpoint));
         let parsed = words
             .as_deref()
@@ -1153,7 +1237,61 @@ impl BrokerView {
         self.log = parsed
             .as_ref()
             .and_then(crate::broker_args::BrokerArgs::log_path);
+        let node_log = words
+            .as_deref()
+            .filter(|_| self.mesh && parsed.is_none())
+            .filter(|words| is_node_serve(words))
+            .and_then(|_| node_service_log(&self.endpoint));
+        self.host = if parsed.is_some() {
+            Some(Host::LinkBroker)
+        } else if node_log.is_some() {
+            Some(Host::NodeService)
+        } else {
+            None
+        };
+        self.own_build = false;
+        if let Some(log) = node_log {
+            self.log = Some(log);
+            self.own_build = self.replaced.is_none()
+                && self
+                    .pid
+                    .zip(self.program.as_deref())
+                    .is_some_and(|(pid, exe)| own(pid, exe));
+        }
     }
+}
+
+/// Whether `argv` is the node service's: its program, then [`crate::enable::NODE_SERVE`]'s
+/// words (`node serve`), then any.
+fn is_node_serve(argv: &[std::ffi::OsString]) -> bool {
+    argv.get(1..=crate::enable::NODE_SERVE.len())
+        .is_some_and(|words| words.iter().eq(crate::enable::NODE_SERVE.iter()))
+}
+
+/// The log the node service hosts beside `endpoint`: `<root>/bus.log` where the endpoint is
+/// `<root>/bus.sock` with `<root>` absolute, the two the node service always serves together;
+/// `None` for any other socket, which it never serves.
+fn node_service_log(endpoint: &str) -> Option<PathBuf> {
+    if Path::new(endpoint).file_name()? != crate::enable::BUS_SOCK {
+        return None;
+    }
+    crate::enable::root_of(endpoint).map(|root| root.join(crate::enable::BUS_LOG))
+}
+
+/// Whether `pid`, started as `exe`, runs this process's own build: `exe` names this process's
+/// executable once both are canonical, and the two processes map the same executable image
+/// ([`running_image_inode`]), so neither runs a file an update has since replaced at that path.
+fn runs_this_build(pid: u32, exe: &str) -> bool {
+    let same_path = match (
+        std::fs::canonicalize(exe),
+        std::env::current_exe().and_then(std::fs::canonicalize),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    same_path
+        && running_image_inode(pid)
+            .is_some_and(|theirs| running_image_inode(std::process::id()) == Some(theirs))
 }
 
 fn replaced_build(pid: u32, exe: &str) -> Option<String> {
@@ -1263,13 +1401,26 @@ pub const POISONED_WARNING: &str = "says its log is POISONED";
 /// The words of the warning for a broker whose flushes failed without poisoning its log.
 pub const FLUSH_FAILED_WARNING: &str = "says a flush of its log failed";
 
+impl BrokerView {
+    /// A view of `cfg`'s broker socket before anything is read, under this build's mesh switch
+    /// (`aterm_types::mesh_switch::MESH`, read here once for the probe).
+    fn of(cfg: &Config) -> Self {
+        Self {
+            endpoint: cfg.broker.clone(),
+            mesh: aterm_types::mesh_switch::MESH,
+            ..Self::default()
+        }
+    }
+}
+
 /// Name the broker's process ([`BrokerView::locate`]), read the health snapshot beside its log,
 /// and reach it as [`reach_broker`] does.
 pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
-    let mut view = BrokerView {
-        endpoint: cfg.broker.clone(),
-        ..BrokerView::default()
-    };
+    probe_view(cfg, BrokerView::of(cfg))
+}
+
+/// [`probe_broker`] from `view`, its endpoint `cfg`'s and its mesh switch set.
+fn probe_view(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
     view.locate();
     view.snapshot = view
         .log
@@ -1287,13 +1438,7 @@ pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
 /// Reach the broker, naming no process: connect, `Hello`, the whole ring attached
 /// ([`transport::attach_ring`]), and a head query.
 pub(crate) fn reach_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
-    reach(
-        cfg,
-        BrokerView {
-            endpoint: cfg.broker.clone(),
-            ..BrokerView::default()
-        },
-    )
+    reach(cfg, BrokerView::of(cfg))
 }
 
 /// Whether a broker answers on `endpoint`: one connect and a `Hello` round trip, in this build's
@@ -1317,7 +1462,7 @@ fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
         Ok((c, _)) => c,
         Err(e) => {
             view.error = Some(format!("connect: {e}"));
-            view.last_word = supervisor_last_word(cfg);
+            view.last_word = supervisor_last_word(cfg, &view);
             return (view, None);
         }
     };
@@ -1331,7 +1476,7 @@ fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
             }
             None => {
                 view.error = Some(format!("the socket accepted but no broker answered: {e}"));
-                view.last_word = supervisor_last_word(cfg);
+                view.last_word = supervisor_last_word(cfg, &view);
             }
         }
         return (view, None);
@@ -1399,7 +1544,13 @@ fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
     (view, Some(conn))
 }
 
-fn supervisor_last_word(cfg: &Config) -> Option<String> {
+/// The broker job's last word in `cfg`'s root ([`crate::enable::supervisor_last_word`]), only
+/// where a broker job keeps the bus `view` reads ([`BrokerView::keeper`]): the node service
+/// writes no `broker.err`, so one there is a retired job's.
+fn supervisor_last_word(cfg: &Config, view: &BrokerView) -> Option<String> {
+    if view.keeper() == crate::enable::Keeper::Node {
+        return None;
+    }
     let root = crate::enable::root_of(&cfg.broker)?;
     crate::enable::supervisor_last_word(&root)
 }
@@ -1419,6 +1570,40 @@ pub fn health_row(b: &BrokerView) -> Option<String> {
     }
 }
 
+/// The BROKER section's `host` row, and doctor's `host:` line, where the node service serves the
+/// socket ([`Host::NodeService`]): its job and pid, the log it hosts, the tier it was opened at
+/// ([`BrokerView::tier`]), and its build where it is this aterm's ([`BrokerView::build`]), else
+/// the program it runs, said REPLACED where an update replaced that file since it started.
+/// `None` for any other holder, which the `pid` row names.
+#[must_use]
+pub fn host_row(b: &BrokerView) -> Option<String> {
+    if b.host != Some(Host::NodeService) {
+        return None;
+    }
+    let pid = b.pid.map_or_else(String::new, |pid| format!(", pid {pid}"));
+    let log = b.log.as_ref().map_or_else(
+        || "bus.log".to_string(),
+        |log| safe(&log.display().to_string(), 256),
+    );
+    let tier = b.tier().map_or_else(
+        || "a tier it does not say".to_string(),
+        |d| d.name().to_string(),
+    );
+    let build = match (b.build(), b.program.as_deref(), b.replaced.is_some()) {
+        (Some(id), _, _) => format!("build {} (this aterm's)", safe(&id, 64)),
+        (None, Some(program), true) => format!(
+            "program {} — A REPLACED BUILD: that path is another file now",
+            safe(program, 256)
+        ),
+        (None, Some(program), false) => format!("program {}", safe(program, 256)),
+        (None, None, _) => "build unknown".to_string(),
+    };
+    Some(format!(
+        "the node service ({}{pid}) hosts {log} at {tier}, {build}",
+        crate::enable::NODE_JOB
+    ))
+}
+
 /// The BROKER section's `holds` row at `now_ms`: what the log holds and who is attached, from
 /// astream's snapshot beside the log ([`crate::broker_health::snapshot_row`]), said as the
 /// serving broker's own only when astream's reader says so.
@@ -1431,6 +1616,11 @@ pub fn holds_row(b: &BrokerView, now_ms: u64) -> Option<String> {
             "- (astream's health snapshot beside {} could not be read: {})",
             safe(&log.display().to_string(), 256),
             safe(e, 256)
+        ),
+        None if b.host == Some(Host::NodeService) => format!(
+            "- (no health snapshot beside {}: the node service keeps one there, and journals why \
+             where it cannot write it)",
+            safe(&log.display().to_string(), 256)
         ),
         None => format!(
             "- (no health snapshot beside {}: a broker older than this aterm keeps none, and one \
@@ -1652,10 +1842,17 @@ fn summary_for(
 }
 
 /// [`doctor_summary`]'s verdict on one probe, pure: the broker's own words (its `Hello`'s
-/// served tier and health entries), never the argv's.
+/// served tier and health entries), never the argv's. Its subject is who serves the socket: the
+/// node service where it does, its socket where it keeps the bus and nothing is named, else the
+/// broker.
 #[must_use]
 pub fn summary_of(b: &BrokerView) -> DoctorSummary {
-    let at = safe(&b.endpoint, 256);
+    let socket = safe(&b.endpoint, 256);
+    let at = match (b.host, b.keeper()) {
+        (Some(Host::NodeService), _) => format!("node service at {socket}"),
+        (None, crate::enable::Keeper::Node) => format!("node service's socket {socket}"),
+        (Some(Host::LinkBroker) | None, _) => format!("broker at {socket}"),
+    };
     let fix = "`aterm fabric doctor` names the fix";
     let warn = |text: String, unmeasured| DoctorSummary {
         level: SummaryLevel::Warn,
@@ -1666,7 +1863,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if let Some(skew) = b.protocol {
         return warn(
             format!(
-                "the broker at {at} speaks astream protocol {} and this aterm speaks {}: no record \
+                "the {at} speaks astream protocol {} and this aterm speaks {}: no record \
              lands and none is delivered — {fix}",
                 skew.broker, skew.client
             ),
@@ -1676,7 +1873,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if !b.reachable {
         return warn(
             format!(
-                "the broker at {at} does not answer ({}) — {fix}",
+                "the {at} does not answer ({}) — {fix}",
                 safe(b.error.as_deref().unwrap_or("unknown"), 256)
             ),
             true,
@@ -1685,7 +1882,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if let Some(why) = b.poisoned() {
         return warn(
             format!(
-                "the broker at {at} {POISONED_WARNING} ({}): it refuses every write until the log \
+                "the {at} {POISONED_WARNING} ({}): it refuses every write until the log \
              is reopened — {fix}",
                 safe(why, 256)
             ),
@@ -1709,7 +1906,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if !b.read_ok() {
         return warn(
             format!(
-                "the broker at {at} answers and {served}, but the bus could not be read ({}) — {fix}",
+                "the {at} answers and {served}, but the bus could not be read ({}) — {fix}",
                 safe(b.error.as_deref().unwrap_or("unknown"), b.error_words())
             ),
             true,
@@ -1721,7 +1918,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
             unmeasured: false,
             serving: b.pid.map(Some),
             text: format!(
-                "the broker at {at} answers, {served}, and says its log is not poisoned \
+                "the {at} answers, {served}, and says its log is not poisoned \
                  (`aterm fabric` reads the rest)"
             ),
         },
@@ -1730,7 +1927,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
             unmeasured: true,
             serving: b.pid.map(Some),
             text: format!(
-                "the broker at {at} answers and {served}, and does not say whether its log is \
+                "the {at} answers and {served}, and does not say whether its log is \
                  poisoned (it predates the health entry; `aterm fabric` reads the rest)"
             ),
         },
@@ -3475,10 +3672,14 @@ pub(crate) fn warning_items(
         );
     }
     if let (Some(pid), Some(exe)) = (r.broker.pid, &r.broker.replaced) {
+        let who = match r.broker.host {
+            Some(Host::NodeService) => "the node service hosting bus.log",
+            Some(Host::LinkBroker) | None => "the broker",
+        };
         push(
             WarningKind::BrokerReplacedBuild,
             format!(
-                "the broker (pid {pid}) runs a replaced build: {} is another file than the one it \
+                "{who} (pid {pid}) runs a replaced build: {} is another file than the one it \
                  started from, so the broker-side fixes of the build on disk are not running",
                 safe(exe, 256)
             ),
@@ -3495,12 +3696,19 @@ pub(crate) fn warning_items(
         );
     }
     if let Some(why) = r.broker.poisoned() {
+        let reopens = match r.broker.keeper() {
+            crate::enable::Keeper::Job => {
+                "a broker of this build exits within seconds for its supervisor to reopen it"
+            }
+            crate::enable::Keeper::Node => {
+                "the node service reopens it at its next pass, within seconds"
+            }
+        };
         push(
             WarningKind::BrokerLogPoisoned,
             format!(
                 "the broker at {broker} {POISONED_WARNING} ({}): it refuses every write until the \
-                 log is reopened, so no record lands; a broker of this build exits within seconds \
-                 for its supervisor to reopen it",
+                 log is reopened, so no record lands; {reopens}",
                 safe(why, 256)
             ),
         );
@@ -4579,6 +4787,9 @@ pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> S
     out.push_str("\nBROKER\n");
     let b = &r.broker;
     let mut kvs: Vec<(&str, String)> = vec![("socket", safe(&b.endpoint, 256))];
+    if let Some(row) = host_row(b) {
+        kvs.push(("host", row));
+    }
     kvs.push((
         "reachable",
         if b.read_ok() {
@@ -4600,7 +4811,16 @@ pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> S
                 (Some(p), Some(l)) => format!("{p} (launchd {})", safe(l, 128)),
                 (Some(p), None) => format!("{p}"),
                 (None, _) => b.pid_unknown.as_deref().map_or_else(
-                    || "- (no `link broker` process serves this socket)".to_string(),
+                    || match b.keeper() {
+                        crate::enable::Keeper::Job => {
+                            "- (no `link broker` process serves this socket)".to_string()
+                        }
+                        crate::enable::Keeper::Node => format!(
+                            "- (no process serves this socket: the node service ({}) hosts \
+                             bus.log here, and `aterm node status` says whether it runs)",
+                            crate::enable::NODE_JOB
+                        ),
+                    },
                     |why| format!("- (unknown: {})", safe(why, 256)),
                 ),
             },
@@ -5153,6 +5373,9 @@ pub fn render_json(r: &Report) -> String {
                 ("error", J::opt_s(b.error.as_deref())),
                 ("pid", J::opt_n(b.pid.map(u64::from))),
                 ("launchd", J::opt_s(b.launchd.as_deref())),
+                ("host", J::opt_s(b.host.map(Host::word))),
+                ("program", J::opt_s(b.program.as_deref())),
+                ("build", J::opt_s(b.build().as_deref())),
                 ("head", J::opt_n(b.head)),
                 ("rtt_ms", J::opt_n(b.rtt_ms)),
                 ("guarded", b.guarded.map_or(J::Null, J::Bool)),
@@ -7863,10 +8086,15 @@ mod tests {
             presence: crate::presence::Mode::Meta,
             receipts: false,
             log: crate::mirror::LogMode::Off,
+            mesh: None,
         }
     }
 
     #[cfg(unix)]
+    /// `broker.err` is a broker job's word about its own root's socket, so it is read only for
+    /// that socket and only where a broker job keeps the bus: never where the node service
+    /// serves it, or, with the mesh on, where nothing names who does. NEGATIVE CONTROL: the same
+    /// root and file read under a broker's keeping, or with the mesh off, give the word.
     #[test]
     fn only_a_locally_served_broker_is_diagnosed_from_local_supervisor_stderr() {
         let dir = aterm_tempfile::Builder::new()
@@ -7876,15 +8104,37 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("broker.err"), "old-local-broker-refusal\n").unwrap();
         let unix = unix_config(&root.join("bus.sock"));
-        assert!(
-            supervisor_last_word(&unix).is_some(),
-            "the local socket keeps its supervisor's word"
-        );
+        let view = |mesh, host| BrokerView {
+            mesh,
+            host,
+            ..BrokerView::default()
+        };
+        for (mesh, host) in [
+            (false, None),
+            (false, Some(Host::LinkBroker)),
+            (true, Some(Host::LinkBroker)),
+        ] {
+            assert!(
+                supervisor_last_word(&unix, &view(mesh, host)).is_some(),
+                "the local socket keeps its supervisor's word (mesh {mesh}, {host:?})"
+            );
+        }
+        for (mesh, host) in [
+            (true, None),
+            (true, Some(Host::NodeService)),
+            (false, Some(Host::NodeService)),
+        ] {
+            assert_eq!(
+                supervisor_last_word(&unix, &view(mesh, host)),
+                None,
+                "the node service keeps the bus (mesh {mesh}, {host:?}): broker.err is a retired job's"
+            );
+        }
         let mut relative = unix.clone();
         relative.broker = "bus.sock".to_string();
         relative.cap_files = vec![root.join("node.cap").to_string_lossy().into_owned()];
         assert_eq!(
-            supervisor_last_word(&relative),
+            supervisor_last_word(&relative, &view(false, None)),
             None,
             "a cap directory alone does not prove where the broker runs"
         );
@@ -8192,9 +8442,8 @@ mod tests {
             for w in warnings(&alone) {
                 let f = fix(&w);
                 assert!(
-                    f.starts_with(
-                        "the broker exited over a poisoned log, and no `aterm fabric on`"
-                    ) && f.contains("broker.err")
+                    f.starts_with("the broker exited over a poisoned log, and no job `on`")
+                        && f.contains("broker.err")
                         && !f.contains("fix that first"),
                     "{f}\nfor: {}",
                     w.text
@@ -8488,6 +8737,168 @@ mod tests {
             "{}",
             render_json(&r)
         );
+    }
+
+    /// Where the node service serves the socket, the report names it: the text's `host` row (its
+    /// job and pid, the log it hosts, the tier its log was opened at, and its build where it is
+    /// this aterm's, else its program, REPLACED where it is), doctor's summary, `--json`'s
+    /// `broker.host`, `program` and `build`, and a poisoned log's warning, which says the node
+    /// service reopens it. With the mesh on and nothing serving the socket, the pid row and the
+    /// summary say the node service hosts bus.log there. NEGATIVE CONTROL: a broker's report has
+    /// no host row, says "the broker" and its supervisor, and its JSON host is `link-broker` with
+    /// a null build; with the mesh off a socket nobody holds reads as it did.
+    #[test]
+    fn the_report_names_the_node_service_where_it_hosts_bus_log() {
+        use astream_broker::{FlushCounts, HelloHealth, ServedInfo, ServedReason, Tier};
+        let row = |r: &Report, key: &str| -> Option<String> {
+            render_text(r)
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{key} ")))
+                .map(|l| l.trim().to_string())
+        };
+        let program = "/Applications/aterm.app/Contents/MacOS/aterm";
+        let mut r = healthy();
+        r.broker.endpoint = "/r/bus.sock".to_string();
+        r.broker.pid = Some(71);
+        r.broker.launchd = Some(crate::enable::NODE_JOB.to_string());
+        r.broker.mesh = true;
+        r.broker.host = Some(Host::NodeService);
+        r.broker.log = Some(PathBuf::from("/r/bus.log"));
+        r.broker.program = Some(program.to_string());
+        r.broker.own_build = true;
+        r.broker.served = Some(ServedInfo {
+            requested: Tier::Ordered,
+            served: Tier::Ordered,
+            reason: ServedReason::None,
+            horizon_ms: None,
+            rules: 0,
+        });
+        r.broker.health = Some(HelloHealth {
+            poisoned: None,
+            flushes: FlushCounts::default(),
+        });
+        let id = aterm_types::version::build_id();
+        assert_eq!(
+            row(&r, "host")
+                .as_deref()
+                .map(|l| l["host".len()..].trim_start()),
+            Some(
+                format!(
+                    "the node service (systems.alab.aterm-node, pid 71) hosts /r/bus.log at \
+                     ordered, build {id} (this aterm's)"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            host_row(&r.broker),
+            row(&r, "host").map(|l| l["host".len()..].trim_start().to_string())
+        );
+        let json = render_json(&r);
+        assert!(
+            json.contains(&format!(
+                "\"host\":\"node-service\",\"program\":\"{program}\",\"build\":\"{id}\""
+            )),
+            "{json}"
+        );
+        let summary = summary_of(&r.broker);
+        assert!(
+            summary
+                .text
+                .starts_with("the node service at /r/bus.sock answers, serves ordered"),
+            "{}",
+            summary.text
+        );
+        assert!(
+            row(&r, "holds").is_some_and(|h| h.contains("the node service keeps one there")),
+            "{:?}",
+            row(&r, "holds")
+        );
+        r.broker.own_build = false;
+        r.broker.replaced = Some(program.to_string());
+        assert!(
+            row(&r, "host").is_some_and(|h| h.ends_with(&format!(
+                "at ordered, program {program} — A REPLACED BUILD: that path is another file now"
+            ))),
+            "{:?}",
+            row(&r, "host")
+        );
+        assert!(render_json(&r).contains("\"build\":null"));
+        let replaced: Vec<Warning> = warned_items(&r)
+            .into_iter()
+            .filter(|w| w.kind == WarningKind::BrokerReplacedBuild)
+            .collect();
+        assert!(
+            replaced.len() == 1
+                && replaced[0]
+                    .text
+                    .starts_with("the node service hosting bus.log (pid 71)"),
+            "{replaced:?}"
+        );
+        r.broker.replaced = None;
+        if let Some(h) = r.broker.health.as_mut() {
+            h.poisoned = Some("a flush failed".to_string());
+        }
+        let poisoned = |r: &Report| {
+            warned_items(r)
+                .into_iter()
+                .find(|w| w.kind == WarningKind::BrokerLogPoisoned)
+                .map(|w| w.text)
+                .expect("a poisoned log's warning")
+        };
+        let node = poisoned(&r);
+        assert!(
+            node.ends_with("the node service reopens it at its next pass, within seconds")
+                && !node.contains("supervisor"),
+            "{node}"
+        );
+
+        let mut broker = r.clone();
+        broker.broker.host = Some(Host::LinkBroker);
+        broker.broker.launchd = Some(crate::enable::LABEL.to_string());
+        broker.broker.durability = Some(crate::durability::Durability::Ordered);
+        assert!(
+            poisoned(&broker).contains("for its supervisor to reopen it"),
+            "NEGATIVE CONTROL: a broker job's poison exit"
+        );
+        broker.broker.health = None;
+        assert_eq!(row(&broker, "host"), None, "a broker has no host row");
+        assert!(render_json(&broker).contains("\"host\":\"link-broker\""));
+        assert!(summary_of(&broker.broker)
+            .text
+            .starts_with("the broker at /r/bus.sock answers"));
+
+        let pid_row = |r: &Report| row(r, "pid").expect("a pid row");
+        r.broker = BrokerView {
+            endpoint: "/r/bus.sock".to_string(),
+            mesh: true,
+            error: Some("connect: refused".to_string()),
+            ..BrokerView::default()
+        };
+        assert!(
+            pid_row(&r).ends_with(
+                "- (no process serves this socket: the node service (systems.alab.aterm-node) \
+                 hosts bus.log here, and `aterm node status` says whether it runs)"
+            ),
+            "{}",
+            pid_row(&r)
+        );
+        assert!(
+            summary_of(&r.broker)
+                .text
+                .starts_with("the node service's socket /r/bus.sock does not answer"),
+            "{}",
+            summary_of(&r.broker).text
+        );
+        r.broker.mesh = false;
+        assert!(
+            pid_row(&r).ends_with("- (no `link broker` process serves this socket)"),
+            "NEGATIVE CONTROL: {}",
+            pid_row(&r)
+        );
+        assert!(summary_of(&r.broker)
+            .text
+            .starts_with("the broker at /r/bus.sock does not answer"));
     }
 
     #[test]
@@ -10383,6 +10794,7 @@ mod running_argv_tests {
                     read.push(pid);
                     argv.clone()
                 },
+                |_, _| unreachable!("a broker's build is not asked"),
             );
             assert_eq!(read, vec![71]);
             assert_eq!(view.pid, Some(71));
@@ -10427,6 +10839,10 @@ mod running_argv_tests {
                     asked.borrow_mut().push(("argv", pid));
                     Some(argv.clone())
                 },
+                |pid, _| {
+                    asked.borrow_mut().push(("own", pid));
+                    false
+                },
             );
             assert_eq!(
                 sockets,
@@ -10467,6 +10883,7 @@ mod running_argv_tests {
                 |_| None,
                 |_, _| None,
                 |_| Some(argv.clone()),
+                |_, _| false,
             );
             view.log
         };
@@ -10604,6 +11021,7 @@ mod running_argv_tests {
                     Some(exe.to_string())
                 },
                 |_| argv.clone(),
+                |_, _| false,
             );
             assert_eq!(
                 asked,
@@ -10611,6 +11029,153 @@ mod running_argv_tests {
             );
             assert_eq!(view.replaced.as_deref(), want);
         }
+    }
+
+    /// With the mesh on, the process holding `<root>/bus.sock` as `<aterm> node serve` is the node
+    /// service: the host, whose log is `<root>/bus.log` (so its health snapshot is read), whose
+    /// argv names no tier, and whose build is this one's only where `own` says it runs this
+    /// process's image and its own is not replaced. Another verb of `node`, another socket, or a
+    /// relative one is no host, and a broker's argv stays a broker's. NEGATIVE CONTROL: with the
+    /// mesh off the same argv reads as today, no host and no log, and `own` is never asked.
+    #[test]
+    fn the_node_service_is_read_as_the_host_of_bus_log_where_the_mesh_is_on() {
+        let program = "/Applications/aterm.app/Contents/MacOS/aterm";
+        let serve = words(&[program, "node", "serve"]);
+        let locate =
+            |mesh: bool, endpoint: &str, argv: &[OsString], is_own: bool, replaced: bool| {
+                let mut view = BrokerView {
+                    endpoint: endpoint.to_string(),
+                    mesh,
+                    ..BrokerView::default()
+                };
+                let mut asked = Vec::new();
+                view.locate_with(
+                    |_| Ok(Some(71)),
+                    |_| Some(crate::enable::NODE_JOB.to_string()),
+                    |_, exe| replaced.then(|| exe.to_string()),
+                    |_| Some(argv.to_vec()),
+                    |pid, exe| {
+                        asked.push((pid, exe.to_string()));
+                        is_own
+                    },
+                );
+                (view, asked)
+            };
+        let (node, asked) = locate(true, "/r/bus.sock", &serve, true, false);
+        assert_eq!(node.host, Some(Host::NodeService));
+        assert_eq!(node.log, Some(PathBuf::from("/r/bus.log")));
+        assert_eq!(
+            node.durability, None,
+            "the node service's argv names no tier"
+        );
+        assert_eq!(node.program.as_deref(), Some(program));
+        assert_eq!(
+            asked,
+            [(71, program.to_string())],
+            "its build is asked of it once"
+        );
+        assert!(node.own_build);
+        assert_eq!(node.build(), Some(aterm_types::version::build_id()));
+        assert_eq!(node.keeper(), crate::enable::Keeper::Node);
+        let (other, _) = locate(true, "/r/bus.sock", &serve, false, false);
+        assert_eq!((other.host, other.build()), (Some(Host::NodeService), None));
+        let (stale, asked) = locate(true, "/r/bus.sock", &serve, true, true);
+        assert_eq!(stale.host, Some(Host::NodeService));
+        assert!(
+            asked.is_empty() && !stale.own_build,
+            "a replaced image is no build of this one"
+        );
+        let mut trailing = serve.clone();
+        trailing.push(OsString::from("--verbose"));
+        assert_eq!(
+            locate(true, "/r/bus.sock", &trailing, false, false).0.host,
+            Some(Host::NodeService)
+        );
+        for (endpoint, argv) in [
+            ("/r/bus.sock", words(&[program, "node", "status"])),
+            ("/r/bus.sock", words(&[program, "node"])),
+            ("/r/other.sock", serve.clone()),
+            ("bus.sock", serve.clone()),
+        ] {
+            let (view, asked) = locate(true, endpoint, &argv, true, false);
+            assert_eq!(
+                (view.host, view.log.clone()),
+                (None, None),
+                "{endpoint} {argv:?}"
+            );
+            assert!(asked.is_empty() && !view.own_build);
+        }
+        let broker = words(&[program, "link", "broker", "/r/bus.sock", "/r/bus.log"]);
+        let (linked, asked) = locate(true, "/r/bus.sock", &broker, true, false);
+        assert_eq!(linked.host, Some(Host::LinkBroker));
+        assert_eq!(
+            linked.durability,
+            Some(crate::durability::default_for(false))
+        );
+        assert!(asked.is_empty() && linked.build().is_none());
+        assert_eq!(linked.keeper(), crate::enable::Keeper::Job);
+        let (off, asked) = locate(false, "/r/bus.sock", &serve, true, false);
+        assert_eq!(
+            (off.host, off.log.as_deref(), off.durability),
+            (None, None, None)
+        );
+        assert!(
+            asked.is_empty() && !off.own_build,
+            "NEGATIVE CONTROL: mesh off reads as today"
+        );
+        assert_eq!(off.keeper(), crate::enable::Keeper::Job);
+    }
+
+    /// The node service's tier is its current health snapshot's (the argv names none), else its
+    /// `Hello`'s; a snapshot another pid wrote is not its. NEGATIVE CONTROL: a broker's argv
+    /// tier wins over both, as it did.
+    #[test]
+    fn the_node_services_tier_is_the_one_its_snapshot_says() {
+        use astream_broker::{
+            BrokerHealth, HealthRead, HealthWriter, ServedInfo, ServedReason, Tier,
+        };
+        let served = |requested| ServedInfo {
+            requested,
+            served: requested,
+            reason: ServedReason::None,
+            horizon_ms: None,
+            rules: 0,
+        };
+        let snapshot = |pid, requested| {
+            let mut health = BrokerHealth::default();
+            health.pid = pid;
+            health.served = served(requested);
+            Some(Ok(HealthRead {
+                health,
+                writer: HealthWriter::Serving,
+            }))
+        };
+        let mut view = BrokerView {
+            endpoint: "/r/bus.sock".to_string(),
+            mesh: true,
+            host: Some(Host::NodeService),
+            pid: Some(71),
+            log: Some(PathBuf::from("/r/bus.log")),
+            snapshot: snapshot(71, Tier::Relaxed),
+            served: Some(served(Tier::Strict)),
+            ..BrokerView::default()
+        };
+        assert_eq!(view.tier(), Some(Durability::Relaxed));
+        view.snapshot = snapshot(72, Tier::Relaxed);
+        assert_eq!(
+            view.tier(),
+            Some(Durability::Strict),
+            "another pid's snapshot"
+        );
+        view.served = None;
+        assert_eq!(view.tier(), None);
+        view.snapshot = snapshot(71, Tier::Relaxed);
+        view.durability = Some(Durability::Ordered);
+        assert_eq!(
+            view.tier(),
+            Some(Durability::Ordered),
+            "NEGATIVE CONTROL: an argv's tier"
+        );
     }
 
     #[test]

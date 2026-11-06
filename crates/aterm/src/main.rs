@@ -198,7 +198,7 @@ fn run_init(entry: InitEntry) -> ExitCode {
             InitEntry::Typed(_) => &aterm_cli::init_permissions_walk,
             InitEntry::PackageFollowUp => &|_| None,
         },
-        converge: &converge::Live,
+        converge: &converge::Live::here(),
         alab: &aterm_cli::macos_doctor::alab_mac,
         present: aterm_gui::person_at_this_screen,
     };
@@ -215,7 +215,7 @@ fn run_init(entry: InitEntry) -> ExitCode {
             aterm_machines::init::WorkstationObservation::Unavailable("macOS only".into())
         },
         walk: &|_| None,
-        converge: &converge::Live,
+        converge: &converge::Live::here(),
         alab: &aterm_machines::init_secrets::alab_member_here,
         present: || false,
     };
@@ -840,6 +840,7 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
             aterm_cli::Verb::Pkg => package_entry(forwarded),
             aterm_cli::Verb::Agh => agh::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
+            aterm_cli::Verb::Name => aterm_agent::name_cli::main_entry(forwarded),
             #[cfg(unix)]
             aterm_cli::Verb::Node => dispatch_node(&forwarded),
             #[cfg(not(unix))]
@@ -5051,15 +5052,14 @@ mod alab_watch_tests {
                         );
                     }
                     Replacement::Person => {
+                        assert!(watch.recovered.is_empty(), "the person's plan stays chosen");
                         assert_eq!(
-                            watch.recovered.len(),
-                            1,
-                            "fleet membership expands a saved plan"
+                            watch.looks, 2,
+                            "the retained ticket retires without upgrading the person's plan"
                         );
-                        assert_eq!(
-                            watch.looks, 3,
-                            "the replacement plan receives its own upgrade"
-                        );
+                        let chosen = watch.setup.snapshot().unwrap();
+                        assert!(!chosen.provisional);
+                        assert_ne!(chosen.plan.selection, Selection::all());
                     }
                     Replacement::OldStop(_) => unreachable!(),
                 }

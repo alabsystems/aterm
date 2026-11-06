@@ -10,7 +10,7 @@
 
 use crate::{Error, Result, fsx};
 use aterm_digest::Sha256;
-use aterm_dirfd::{self as fd, Mode, OFlags, RenameFlags};
+use aterm_dirfd::{self as fd, AtFlags, FileType, Mode, OFlags, RenameFlags};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::MetadataExt as _;
@@ -37,12 +37,59 @@ fn syscall<T>(result: fd::Result<T>) -> Result<T> {
     result.map_err(std::io::Error::from).map_err(Error::from)
 }
 
+/// The data file a reader selected, with what it selected that file from as it stood.
+pub(crate) struct Selected {
+    entry: PathBuf,
+    path: PathBuf,
+    witnesses: Option<Witnesses>,
+}
+
+/// The stamps of a selection's pin, entry and intent.
+type Witnesses = [Option<fsx::FileStamp>; 3];
+
+impl Selected {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Hold the selection after reading its data: the pin, the entry and the intent still stand
+    /// as they were found, or the selection is resolved again, with what that refuses.
+    pub(crate) fn confirm(&self) -> Result<()> {
+        if self.witnesses.is_some() && selection_witnesses(&self.entry).ok() == self.witnesses {
+            return Ok(());
+        }
+        data_path(&self.entry).map(|_| ())
+    }
+}
+
+fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
+    Ok([
+        fsx::stamp_if_present(&pin_path(entry)?)?,
+        fsx::stamp_if_present(entry)?,
+        fsx::stamp_if_present(&intent_path(entry)?)?,
+    ])
+}
+
+/// [`data_path`], for a reader that holds the selection across its read
+/// ([`Selected::confirm`]).
+pub(crate) fn selected(entry: &Path) -> Result<Selected> {
+    let witnesses = selection_witnesses(entry).ok();
+    Ok(Selected {
+        entry: entry.to_path_buf(),
+        path: data_path(entry)?,
+        witnesses,
+    })
+}
+
 /// Resolve existing custody without changing it. An incomplete transition is unavailable.
 pub(crate) fn data_path(entry: &Path) -> Result<PathBuf> {
     let pin_path = pin_path(entry)?;
-    if fsx::read_private(&pin_path, META_LIMIT)?.is_some() {
+    if let Some(pin) = fsx::read_private(&pin_path, META_LIMIT)? {
         let context = Context::new(entry)?;
-        context.active()?;
+        context.active_under(|| {
+            context.pin_is_private()?;
+            Ok(pin.as_slice().to_vec())
+        })?;
         return Ok(entry.join(DATA));
     }
     match fsx::kind(entry)? {
@@ -281,6 +328,8 @@ impl Context {
     }
 
     fn header(&self, directory: &File) -> Result<Layout> {
+        #[cfg(test)]
+        fsx::count_read(&self.entry.join(HEADER));
         let wire = read_file(directory, HEADER, META_LIMIT)?;
         self.decode_layout(&wire)
     }
@@ -295,6 +344,8 @@ impl Context {
     }
 
     fn intent(&self) -> Result<Option<Layout>> {
+        #[cfg(test)]
+        fsx::count_read(&self.entry.with_file_name(&self.intent));
         optional_regular(&self.parent, &self.intent, META_LIMIT)?
             .map(|mut file| self.decode_layout(&read_bounded(&mut file, META_LIMIT)?))
             .transpose()
@@ -328,12 +379,41 @@ impl Context {
     }
 
     fn active(&self) -> Result<usize> {
+        self.active_under(|| {
+            #[cfg(test)]
+            fsx::count_read(&self.entry.with_file_name(&self.pin));
+            read_file(&self.parent, &self.pin, META_LIMIT)
+        })
+    }
+
+    /// The pinned capacity, with `pin` answering the pin's bytes once the layout it pins holds.
+    fn active_under(&self, pin: impl FnOnce() -> Result<Vec<u8>>) -> Result<usize> {
         let directory = self.directory()?;
         let header = self.header(&directory)?;
-        let capacity = header.pinned_capacity(&read_file(&self.parent, &self.pin, META_LIMIT)?)?;
+        let capacity = header.pinned_capacity(&pin()?)?;
         check_capacity(capacity)?;
+        #[cfg(test)]
+        fsx::count_read(&self.entry.join(DATA));
         regular(&directory, DATA, crate::membership_log::MAX_RECORDS_STREAM)?;
         Ok(capacity)
+    }
+
+    /// [`private_file`]'s checks of the pin in this parent, for a reader that read it within its
+    /// bound.
+    fn pin_is_private(&self) -> Result<()> {
+        let stat = match fd::fstatat(&self.parent, self.pin.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) if error.is_noent() => return Err(refused("a layout file is missing")),
+            Err(error) => return syscall(Err(error)),
+        };
+        if !FileType::from_raw_mode(stat.st_mode).is_file()
+            || stat.st_uid != fsx::euid()
+            || stat.st_mode & 0o7777 != 0o600
+            || stat.st_nlink != 1
+        {
+            return Err(refused("a layout file is not bounded, private and owned"));
+        }
+        Ok(())
     }
 
     fn raise_capacity(&self) -> Result<()> {
@@ -1057,6 +1137,47 @@ mod tests {
         assert!(!pin_path(&entry).unwrap().exists());
     }
 
+    /// NEGATIVE CONTROLS (2026-11-05): with `fsx::stamp_if_present(entry)` replaced by `None` in
+    /// `selection_witnesses`, the entry's arm confirms the replaced entry
+    /// (`the selection still stood`); with the intent's stamp replaced the same way, the intent's
+    /// arm does.
+    #[test]
+    fn a_selection_resolves_again_once_its_entry_or_its_intent_moved() {
+        let refusal = |held: &Selected| {
+            held.confirm()
+                .map(|()| "the selection still stood".to_owned())
+                .unwrap_or_else(|error| error.to_string())
+        };
+
+        // What an interrupted transition leaves, in place of the file the reader selected.
+        let (root, entry) = fixture();
+        let held = selected(&entry).unwrap();
+        held.confirm().unwrap();
+        std::fs::rename(&entry, root.path().join("aside")).unwrap();
+        fsx::ensure_private_dir(&entry).unwrap();
+        let refused = refusal(&held);
+        assert!(
+            refused.contains("an interrupted transition needs its writer lock"),
+            "{refused}"
+        );
+
+        // A preparation that names the original, appearing over the entry the reader found empty.
+        let (root, entry) = fixture();
+        assert!(stop_at(&Context::new(&entry).unwrap(), Step::Intent).is_err());
+        let intent = intent_path(&entry).unwrap();
+        let saved = root.path().join("saved-intent");
+        std::fs::rename(&intent, &saved).unwrap();
+        std::fs::rename(&entry, root.path().join("saved-original")).unwrap();
+        let held = selected(&entry).unwrap();
+        held.confirm().unwrap();
+        std::fs::rename(&saved, &intent).unwrap();
+        let refused = refusal(&held);
+        assert!(
+            refused.contains("the intended original records file is missing"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn symlinks_hard_links_and_public_layout_files_are_refused() {
         for slot in [DATA, HEADER, "pin"] {
@@ -1069,6 +1190,20 @@ mod tests {
             };
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(data_path(&entry).is_err(), "public {slot}");
+        }
+        // NEGATIVE CONTROL (2026-11-05): with `context.pin_is_private()?` gone from `data_path`,
+        // both arms resolve, since `fsx::read_private` admits either pin.
+        for read_only in [false, true] {
+            let (root, entry) = fixture();
+            write_path(&entry, true).unwrap();
+            let pin = pin_path(&entry).unwrap();
+            if read_only {
+                std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o400)).unwrap();
+            } else {
+                std::fs::hard_link(&pin, root.path().join("kept-pin")).unwrap();
+            }
+            assert!(data_path(&entry).is_err(), "read only: {read_only}");
+            assert!(selected(&entry).is_err(), "read only: {read_only}");
         }
         for link in [false, true] {
             let (_root, entry) = fixture();

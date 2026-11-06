@@ -173,9 +173,9 @@ const fn http_method(method: Method) -> aterm_http::Method {
 }
 
 fn names_a_proxy_variable(message: &str) -> bool {
-    message
-        .split_once(' ')
-        .is_some_and(|(name, _)| name.to_ascii_lowercase().ends_with("_proxy"))
+    message.split_once(' ').is_some_and(|(name, _)| {
+        name.len() >= 6 && name.as_bytes()[name.len() - 6..].eq_ignore_ascii_case(b"_proxy")
+    })
 }
 
 fn kind_of(phase: Phase, error: &aterm_http::Error) -> WireKind {

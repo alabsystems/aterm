@@ -2962,6 +2962,23 @@ impl NativeRuntime {
         })
     }
 
+    /// NEGATIVE CONTROL for the concealment tests: publish `instance`'s document as though
+    /// nothing were concealed ([`EditorApp::plain_for_negative_control`]), every view touched so
+    /// it recompiles. Whether `instance` is an Editor.
+    #[cfg(test)]
+    pub(crate) fn publish_plain_for_negative_control(&mut self, instance: AppInstanceId) -> bool {
+        let Some(NativeApp::Editor(editor)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        editor.plain_for_negative_control = true;
+        for state in self.views.values_mut() {
+            state.touch();
+            let common = state.common_mut();
+            common.presentation_revision = common.presentation_revision.wrapping_add(1);
+        }
+        true
+    }
+
     /// Test setup can mutate the projection directly; production mutations use the change-aware publications below.
     #[cfg(test)]
     pub(crate) fn system_state_mut(&mut self) -> Option<&mut crate::system_state::SystemStateApp> {
@@ -6593,6 +6610,13 @@ pub(crate) struct EditorApp {
     /// The scan a grid view of the last rendered revision draws ([`EditorApp::grid_table`]);
     /// boxed, so the Editor stays one of the small document apps in [`NativeApp`].
     table_cache: std::cell::RefCell<Box<amacs::table::TableMemo>>,
+    /// What of its document no reader but the person's eyes gets, as the document store marked
+    /// it when the document opened ([`EditorApp::concealment`]).
+    pub(crate) concealed: Option<crate::document_store::Concealed>,
+    /// NEGATIVE CONTROL for the concealment tests: publish the document as though nothing were
+    /// concealed, which puts each revealed value back in the window's accessibility tree.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) plain_for_negative_control: bool,
 }
 
 /// `(document id, document seq, line-start index)`: the memo behind
@@ -6658,8 +6682,26 @@ impl EditorApp {
             config_host_requested_revision: None,
             config_assist_cache: std::cell::RefCell::new(Vec::new()),
             line_index_cache: std::cell::RefCell::new(None),
+            concealed: None,
+            #[cfg(any(test, debug_assertions))]
+            plain_for_negative_control: false,
             table_cache: std::cell::RefCell::default(),
         }
+    }
+
+    /// What of its document no reader but the person's eyes gets (one-mesh design §4.8,
+    /// "Revealed values stay out of the accessibility tree"): what the document store marked
+    /// ([`crate::document_store::Concealed`]), and every cell of a private document
+    /// ([`crate::native_document_journal::private_uri`]) whatever path opened it.
+    fn concealment(&self) -> Option<crate::document_store::Concealed> {
+        #[cfg(any(test, debug_assertions))]
+        if self.plain_for_negative_control {
+            return None;
+        }
+        self.concealed.clone().or_else(|| {
+            crate::native_document_journal::private_uri(&self.canonical_uri)
+                .then_some(crate::document_store::Concealed::All)
+        })
     }
 
     /// The scan of `snapshot` that view `buffer`'s grid draws, built once per document revision:
@@ -6973,18 +7015,30 @@ impl NativeAppModel for EditorApp {
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
             .floor() as usize;
-        // A table's grid face draws its records in place of the text lines.
-        let grid = cx.document.and_then(|snapshot| {
-            let buffer = view.buffer.as_ref()?;
-            let table = self.grid_table(snapshot, buffer)?;
-            Some(crate::native_editor::project_grid(
-                &snapshot.text,
-                &table,
-                buffer,
-                line_capacity,
-                column_capacity,
-            ))
-        });
+        // A table's grid face draws its records in place of the text lines; its reading is what
+        // the window's accessibility tree gets of it, concealed cells hidden.
+        let concealed = self.concealment();
+        let (grid, grid_reading) = cx
+            .document
+            .and_then(|snapshot| {
+                let buffer = view.buffer.as_ref()?;
+                let table = self.grid_table(snapshot, buffer)?;
+                let grid = crate::native_editor::project_grid(
+                    &snapshot.text,
+                    &table,
+                    buffer,
+                    line_capacity,
+                    column_capacity,
+                );
+                let reading = crate::native_editor::read_grid(
+                    &snapshot.text,
+                    &table,
+                    &grid,
+                    concealed.as_ref(),
+                );
+                Some((Some(grid), Some(reading)))
+            })
+            .unwrap_or((None, None));
         let mut projection = cx.document.filter(|_| grid.is_none()).and_then(|snapshot| {
             view.buffer.as_ref().map(|buffer| {
                 let starts = self.line_index(snapshot);
@@ -7775,6 +7829,8 @@ impl NativeAppModel for EditorApp {
                     selectable: true,
                     projection,
                     grid: grid.map(Box::new),
+                    grid_reading: grid_reading.map(Box::new),
+                    concealed: concealed.is_some(),
                     preedit: document_preedit,
                     preedit_caret: view.preedit_caret,
                     status,

@@ -136,12 +136,13 @@ pub type Review<'a> = &'a mut dyn FnMut(&Path) -> Result<()>;
 
 /// The production review opener: `aterm edit --wait <file>` from this same executable
 /// ([`att::amacs`]), which inside aterm opens amacs in an Editor tab beside this one and
-/// returns when the tab closes.
+/// returns when the tab closes. A review file names no concealed column: where it is private,
+/// the window conceals every cell of it.
 ///
 /// # Errors
 /// This executable cannot be found or started, or amacs did not open the file.
 pub fn amacs_wait(file: &Path) -> Result<()> {
-    att::amacs(file, 1)
+    att::amacs(file, 1, None)
 }
 
 /// Run `aterm db alab <words>` on this Mac's Commons. `vendors` is the harness's reading of a
@@ -500,7 +501,8 @@ pub fn run(
     review: Review<'_>,
     now_ms: u64,
 ) -> Result<Value> {
-    let mut open = |file: &Path, line: usize| att::amacs(file, line);
+    let mut open =
+        |file: &Path, line: usize, secret: &[String]| att::amacs(file, line, Some(secret));
     let mut stdin = stdin_line;
     let mut io = Io {
         review,
@@ -556,11 +558,7 @@ pub fn run_io(
             let (view, usage) = match handle.usage() {
                 Ok(read) => read,
                 Err(error) => {
-                    return Ok(json!({
-                        "registry": "not imported",
-                        "why": error.to_string(),
-                        "next": "aterm db alab import --dry-run, then --apply",
-                    }));
+                    return unread(paths, error, "aterm db alab import --dry-run, then --apply");
                 }
             };
             // No import has run where no source row is: what `check` reads is the Macs' own rows.
@@ -1161,6 +1159,24 @@ pub(super) fn empty_view_wait<'r>(
     )
 }
 
+/// What a read of the registry that failed answers: "not imported", with `next`, only where this
+/// Mac's catalog declares no registry (or there is no Commons here). A declared registry's failed
+/// read (a sync racing it past its deadline, an expired pass on a loaded Mac, damaged storage) is
+/// that error, never a call to import, and so is one whose catalog cannot be read either (E1).
+///
+/// # Errors
+/// `error`, unless this Mac's catalog says it declares no registry.
+pub(super) fn unread(paths: &Paths, error: Error, next: &str) -> Result<Value> {
+    match Registry::at(paths.clone()).declared() {
+        Ok(false) => Ok(json!({
+            "registry": "not imported",
+            "why": error.to_string(),
+            "next": next,
+        })),
+        Ok(true) | Err(_) => Err(error),
+    }
+}
+
 /// What this Mac's catalog says for an import into a registry it holds nothing of, read once
 /// before the writer ([`Registry::catalog_word`]): the catalog's table id where no other Mac's
 /// declaration of the registry is in it, so its rounds speak ([`empty_view_wait`]).
@@ -1220,11 +1236,7 @@ struct Unheld;
 
 /// The token [`Unheld`] seals every value to: an authenticated cell's shape, holding nothing.
 fn unheld_token() -> String {
-    format!(
-        "sec1:{}:{}",
-        "0".repeat(64),
-        aterm_secrets::b64::encode_padded(&[0; 28])
-    )
+    "sec1:0000000000000000000000000000000000000000000000000000000000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_owned()
 }
 
 impl Sealer for Unheld {
@@ -1433,8 +1445,8 @@ fn import(
         let pass = std::time::Instant::now() + IMPORT_PASS;
         let (plan, applied) = handle.commit_sealed_until(true, pass, |view, sealer| {
             empty_view_guard(paths, view.ops.len(), catalog, now_ms)?;
-            let plan = import::plan(&sources.input(sealer), &view.cells)?;
-            let rows = plan.rows.clone();
+            let mut plan = import::plan(&sources.input(sealer), &view.cells)?;
+            let rows = std::mem::take(&mut plan.rows);
             Ok((plan, rows))
         })?;
         let mut report = summary(&plan, &sheets, &macs, "held", args.findings);
@@ -1469,18 +1481,15 @@ fn import(
         report_seeds(&mut report, seeded);
         return Ok(report);
     }
-    let (plan, registry, seeds) = dry_plan(&handle, &sources)?;
+    let (mut plan, registry, seeds) = dry_plan(&handle, &sources)?;
     let mut report = summary(&plan, &sheets, &macs, registry, args.findings);
+    let matches = matches_registry(&plan);
     insert(&mut report, "dry_run", json!(true));
     insert(&mut report, "unread", json!(unread));
-    let records = crate::att::pack(plan.rows.clone())?.len();
+    let records = crate::att::pack(std::mem::take(&mut plan.rows))?.len();
     insert(&mut report, "records", json!(records));
     insert(&mut report, "seeds", json!(seeds));
-    insert(
-        &mut report,
-        "matches_registry",
-        json!(matches_registry(&plan)),
-    );
+    insert(&mut report, "matches_registry", json!(matches));
     if args.review {
         // The folder lives while the owner looks: dropping it removes it, however the review
         // ends, so no note's text is left behind in a temporary folder.
@@ -1502,13 +1511,8 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
     let bytes = crate::import::read_bounded(csv)?;
-    let headers = crate::import::parse(&bytes)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::new("the sheet has no header row"))?;
-    let kind = SheetKind::detect(&headers)
-        .ok_or_else(|| Error::new("the sheet's header row names no sheet this build reads"))?;
-    let sheet = Sheet::parse(kind, name, &bytes)?;
+    let sheet = Sheet::parse_detected(name, &bytes)?;
+    let kind = sheet.kind;
     let (flagged, set, unkeyed) = sheet.password_flags();
     let sheets = [sheet];
     let macs = known_macs(paths)?;
@@ -1611,8 +1615,8 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if args.apply {
         let (plan, applied) = handle.commit_derived(false, |view| {
-            let plan = import::plan(&input, &view.cells)?;
-            let rows = plan.rows.clone();
+            let mut plan = import::plan(&input, &view.cells)?;
+            let rows = std::mem::take(&mut plan.rows);
             Ok((plan, rows))
         })?;
         let mut report = summary(&plan, &[], &macs, "held", args.findings);
@@ -1628,7 +1632,7 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
     insert(
         &mut report,
         "records",
-        json!(crate::att::pack(plan.rows.clone())?.len()),
+        json!(crate::att::pack(plan.rows)?.len()),
     );
     Ok(report)
 }
@@ -1849,15 +1853,14 @@ fn review_text(text: &str, reveal: bool) -> String {
 fn tsv(rows: &[Vec<String>]) -> String {
     let mut out = String::new();
     for row in rows {
-        let cells: Vec<String> = row
-            .iter()
-            .map(|c| {
-                c.chars()
-                    .map(|c| if c == '\t' || c.is_control() { ' ' } else { c })
-                    .collect()
-            })
-            .collect();
-        out.push_str(&cells.join("\t"));
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                out.push('\t');
+            }
+            for c in cell.chars() {
+                out.push(if c == '\t' || c.is_control() { ' ' } else { c });
+            }
+        }
         out.push('\n');
     }
     out

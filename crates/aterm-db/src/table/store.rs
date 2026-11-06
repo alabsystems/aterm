@@ -310,12 +310,13 @@ impl Store {
             private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN),
             Err(PrivateFileError::Missing)
         ) {
-            let mut claim = region.magic().to_vec();
-            claim.push(b'0');
-            claim.extend_from_slice(&scope.bytes());
-            claim.extend_from_slice(&session.actor());
-            claim.extend_from_slice(&crypto::random::<16>()?);
-            claim.extend_from_slice(&[0; 56]);
+            let mut claim = [0u8; CLAIM_LEN];
+            claim[..4].copy_from_slice(region.magic());
+            claim[4] = b'0';
+            claim[5..5 + super::SCOPE_LEN].copy_from_slice(&scope.bytes());
+            claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48]
+                .copy_from_slice(&session.actor());
+            claim[5 + super::SCOPE_LEN + 48..ANCHOR_LEN].copy_from_slice(&crypto::random::<16>()?);
             fsx::write_new(&claim_dir.join(&claim_name), &claim, 0o600).map_err(super::failure)?;
             // write_new's best-effort directory barrier is insufficient for this
             // enrollment: publishing a writer depends on its name surviving.
@@ -931,7 +932,8 @@ impl Store {
             .ok_or_else(|| Error::new("read-only table observation cannot append"))?;
         let received_ms =
             aterm_time::unix_millis().ok_or_else(|| Error::new("receipt clock unavailable"))?;
-        let mut body = received_ms.to_le_bytes().to_vec();
+        let mut body = Vec::with_capacity(8 + wire.len());
+        body.extend_from_slice(&received_ms.to_le_bytes());
         body.extend_from_slice(wire);
         let witness = self.witness.advance(self.witness.count, id, received_ms)?;
         self.poisoned = true;
@@ -1081,6 +1083,10 @@ impl Store {
     /// supersede quarantine. Knowing one source is not knowing the whole actor.
     pub fn proof_inventory(&self, session: &Session<'_>) -> Result<BTreeSet<ProofKey>> {
         self.check(session)?;
+        Ok(self.proof_inventory_unchecked())
+    }
+
+    pub(super) fn proof_inventory_unchecked(&self) -> BTreeSet<ProofKey> {
         let forks = self.conflicted();
         let mut keys: BTreeSet<_> = forks.iter().map(|actor| proof_key(*actor, None)).collect();
         keys.extend(
@@ -1101,7 +1107,7 @@ impl Store {
                 })
                 .map(|record| proof_key(record.header.actor, Some(record.header.id))),
         );
-        Ok(keys)
+        keys
     }
 
     /// Export signed negative evidence without granting either source operation
@@ -1109,16 +1115,24 @@ impl Store {
     pub fn conflict_wire(&self, session: &Session<'_>, actor: &Actor) -> Result<Option<Vec<u8>>> {
         self.check(session)?;
         let key = self
-            .proof_inventory(session)?
+            .proof_inventory_unchecked()
             .into_iter()
             .find(|key| &key[..48] == actor);
-        key.map(|key| self.proof_wire(session, &key))
+        key.map(|key| self.proof_wire_unchecked(session, &key))
             .transpose()
             .map(Option::flatten)
     }
 
     pub fn proof_wire(&self, session: &Session<'_>, key: &ProofKey) -> Result<Option<Vec<u8>>> {
         self.check(session)?;
+        self.proof_wire_unchecked(session, key)
+    }
+
+    pub(crate) fn proof_wire_unchecked(
+        &self,
+        session: &Session<'_>,
+        key: &ProofKey,
+    ) -> Result<Option<Vec<u8>>> {
         if let Some(stored) = self
             .conflicts
             .get(key)
@@ -1528,16 +1542,21 @@ impl Store {
         let sequence = previous
             .map_or(Some(1), |h| h.sequence.checked_add(1))
             .ok_or_else(|| Error::new("table writer sequence exhausted"))?;
-        let own = self
+        let visible: BTreeSet<_> = retained.iter().copied().collect();
+        let mut own_count = 0u64;
+        for record in self
             .records
             .values()
-            .filter(|record| record.header.actor == self.actor);
-        let visible: BTreeSet<_> = retained.iter().copied().collect();
-        if own
-            .clone()
-            .any(|record| !visible.contains(&record.header.id))
-            || own.count() as u64 != sequence - 1
+            .filter(|record| record.header.actor == self.actor)
         {
+            if !visible.contains(&record.header.id) {
+                return Err(Error::new(
+                    "local table writer has withheld or forked history; repair required",
+                ));
+            }
+            own_count += 1;
+        }
+        if own_count != sequence - 1 {
             return Err(Error::new(
                 "local table writer has withheld or forked history; repair required",
             ));
@@ -1590,7 +1609,8 @@ impl Store {
         // Peers cannot admit quarantine, so it and its withheld dependents do
         // not form transferable cutoff evidence. Exclude those local-only
         // frontiers; the full index below still retains restrictive forks.
-        let index = self.replication_index()?;
+        let withheld = self.quarantine_closure();
+        let index = self.replication_index_with(&withheld)?;
         let constraints = session_constraints(session)?;
         let table = self.scope.digest();
         let allowed = constraints.catalog(table, &index);
@@ -1610,21 +1630,25 @@ impl Store {
                 _ => None,
             })
             .collect();
-        let withheld = self.quarantine_closure();
+        let is_log_backed = session.is_log_backed();
+        let mut historical: BTreeMap<(Digest, Actor), bool> = BTreeMap::new();
         let mut excluded: BTreeSet<_> = self
             .records
             .iter()
             .filter(|(id, stored)| {
-                let authorized_writer = writers.contains(&stored.header.actor)
-                    || cutoffs.contains(&stored.header.actor)
-                    || (session.is_log_backed()
-                        && super::envelope_roster(&stored.wire).is_some_and(|roster| {
-                            session.historical_writer_in(&roster, &stored.header.actor)
-                        }));
                 withheld.contains(*id)
-                    || !allowed.permits(id)
                     || stored.quarantine.is_some()
-                    || !authorized_writer
+                    || !allowed.permits(id)
+                    || !(writers.contains(&stored.header.actor)
+                        || cutoffs.contains(&stored.header.actor)
+                        || (is_log_backed
+                            && super::envelope_roster(&stored.wire).is_some_and(|roster| {
+                                *historical
+                                    .entry((roster, stored.header.actor))
+                                    .or_insert_with(|| {
+                                        session.historical_writer_in(&roster, &stored.header.actor)
+                                    })
+                            })))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1754,12 +1778,14 @@ impl Store {
         session: &Session<'_>,
     ) -> Result<impl Iterator<Item = &Digest>> {
         self.check(session)?;
+        Ok(self.replication_inventory_unchecked())
+    }
+    pub(crate) fn replication_inventory_unchecked(&self) -> impl Iterator<Item = &Digest> {
         let excluded = self.quarantine_closure();
-        Ok(self
-            .records
+        self.records
             .iter()
             .filter(move |(id, _)| !excluded.contains(*id))
-            .map(|(id, _)| id))
+            .map(|(id, _)| id)
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -1847,8 +1873,7 @@ impl Store {
         }
         excluded
     }
-    fn replication_index(&self) -> Result<Index> {
-        let excluded = self.quarantine_closure();
+    fn replication_index_with(&self, excluded: &BTreeSet<Digest>) -> Result<Index> {
         let mut index = Index::new(MAX_RECORDS);
         for (id, stored) in &self.records {
             if !excluded.contains(id) {
@@ -2037,7 +2062,10 @@ impl Store {
     /// Exact acknowledged ciphertext for anti-entropy. Never export prepared bytes.
     pub fn wire(&self, session: &Session<'_>, id: &Digest) -> Result<Option<&[u8]>> {
         self.check(session)?;
-        Ok(self.records.get(id).map(|stored| stored.wire.as_slice()))
+        Ok(self.wire_unchecked(id))
+    }
+    pub(crate) fn wire_unchecked(&self, id: &Digest) -> Option<&[u8]> {
+        self.records.get(id).map(|stored| stored.wire.as_slice())
     }
     pub fn receipt(&self, session: &Session<'_>, id: &Digest) -> Result<Option<Receipt>> {
         self.check(session)?;
@@ -2116,7 +2144,15 @@ fn validate_claim_region(
     Ok(pending)
 }
 
+/// The file name of `table`'s enrollment claim inside [`claim_dir`].
+pub(crate) fn claim_name_for(table: &Digest) -> String {
+    let mut name = String::with_capacity(64 + 6);
+    aterm_codec::hex::push_lower(&mut name, table);
+    name.push_str(".claim");
+    name
+}
+
 /// The file name of `scope`'s enrollment claim inside [`claim_dir`].
 pub(crate) fn claim_name(scope: Scope) -> String {
-    format!("{}.claim", aterm_codec::hex::encode_lower(&scope.digest()))
+    claim_name_for(&scope.digest())
 }

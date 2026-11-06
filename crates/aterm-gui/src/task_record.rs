@@ -137,11 +137,8 @@ pub(crate) const WHY_EXPIRED: &str = "expired";
 /// (`aterm_agent::supervise::REPEATED_WHY`).
 pub(crate) const WHY_REPEATED: &str = aterm_agent::supervise::REPEATED_WHY;
 
-/// `why=` of a `failed` managed worker whose account hit a usage limit that resets too far off to
-/// wait for, with no other account or model to move to (`aterm_agent::supervise::USAGE_LIMIT_WHY`):
-/// the supervisor marks it and types nothing into it again, so its tab goes as any concluded
-/// worker's does (`worker_reaper::settled`), and whoever started it (its manager, or the credit
-/// claim's next try) may start it again.
+/// `why=` of a usage-limit failure recorded by an earlier harness. The successor reopens it
+/// and waits for quota.
 pub(crate) const WHY_USAGE_LIMIT: &str = aterm_agent::supervise::USAGE_LIMIT_WHY;
 
 /// `why=` of an agent that left its tab with nothing to bring it back.

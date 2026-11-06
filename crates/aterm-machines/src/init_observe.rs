@@ -64,10 +64,10 @@ pub enum Reading {
         /// The Trust toolchain aterm is using is still where Spotlight indexes it.
         toolchain: bool,
     },
-    /// `present` of the `count` repositories are cloned; `signed_in` is whether aterm's
-    /// GitHub route hands back the synced token.
+    /// `present` of the `count` repository checkouts and their selected required
+    /// dependencies are ready; `signed_in` is whether aterm's route returns the synced token.
     Repositories {
-        /// Repositories cloned.
+        /// Repositories whose checkouts and selected required dependencies are ready.
         present: usize,
         /// Repositories the plan names.
         count: usize,
@@ -99,6 +99,8 @@ pub enum Wait {
     OtherAccount,
     /// GitHub's answer about the repositories could not be read or used.
     GitHub,
+    /// The selected vault has not supplied a usable repository inventory yet.
+    RepositoryInventory,
     /// Something already in the home folder sits where a repository goes.
     InTheWay,
     /// The disk has no room for the repositories left: each clone would take free space below
@@ -108,7 +110,7 @@ pub enum Wait {
 
 impl Wait {
     /// Every reason, for the round trip.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::CommandLineTools,
         Self::Settings,
         Self::Token,
@@ -117,6 +119,7 @@ impl Wait {
         Self::TokenRefused,
         Self::OtherAccount,
         Self::GitHub,
+        Self::RepositoryInventory,
         Self::InTheWay,
         Self::DiskSpace,
     ];
@@ -131,6 +134,7 @@ impl Wait {
             Self::TokenRefused => "token-refused",
             Self::OtherAccount => "other-account",
             Self::GitHub => "github",
+            Self::RepositoryInventory => "repository-inventory",
             Self::InTheWay => "in-the-way",
             Self::DiskSpace => "disk-space",
         }
@@ -145,7 +149,9 @@ impl Wait {
     #[must_use]
     pub const fn kind(self) -> FailureKind {
         match self {
-            Self::Unreached | Self::GitHub | Self::DiskSpace => FailureKind::Transient,
+            Self::Unreached | Self::GitHub | Self::RepositoryInventory | Self::DiskSpace => {
+                FailureKind::Transient
+            }
             Self::CommandLineTools
             | Self::Settings
             | Self::Token
@@ -170,6 +176,7 @@ impl Wait {
             Self::TokenRefused => aterm_types::macos_setup::GITHUB_TOKEN_REFUSED,
             Self::OtherAccount => "Your GitHub token is for another account; replace it",
             Self::GitHub => "Can't read your repositories from GitHub",
+            Self::RepositoryInventory => "Waits for repository metadata from the Secrets vault",
             Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
             Self::DiskSpace => "Not enough free disk space for the rest",
         }
@@ -341,6 +348,18 @@ impl LastReading {
 /// A row fails only when a change was attempted and did not land (`Failed`).
 #[must_use]
 pub fn standing(row: &ItemReport) -> Standing {
+    // A successful operation is not evidence that every repository is present. Read-back's
+    // typed inventory owns that fact, including when an older or partial pass reports success.
+    if matches!(row.outcome, Outcome::Ok | Outcome::Changed)
+        && let Some(Reading::Repositories {
+            present,
+            count,
+            signed_in,
+        }) = Reading::of(row)
+        && (present != count || !signed_in)
+    {
+        return Standing::Differs;
+    }
     match row.outcome {
         Outcome::Ok => Standing::InPlace,
         Outcome::Planned => Standing::Differs,
@@ -1031,6 +1050,37 @@ mod tests {
         assert_eq!(read.standing, Standing::Waiting);
         assert_eq!((read.now, read.wanted.as_str()), (None, "All"));
         assert_eq!(read.detail.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn successful_repository_operations_need_a_complete_signed_in_readback() {
+        for outcome in [Outcome::Ok, Outcome::Changed] {
+            for (present, count, signed_in, expected) in [
+                (0, 53, true, Standing::Differs),
+                (17, 53, true, Standing::Differs),
+                (53, 53, false, Standing::Differs),
+                (53, 53, true, Standing::InPlace),
+                (0, 0, true, Standing::InPlace),
+            ] {
+                let report = ItemReport {
+                    detail: Some(
+                        Reading::Repositories {
+                            present,
+                            count,
+                            signed_in,
+                        }
+                        .token(),
+                    ),
+                    ..row(outcome, None, None)
+                };
+                let observed = observation(Setting::Repositories, &[&report]);
+                assert_eq!(observed.standing, expected, "{report:?}");
+                if present < count {
+                    assert_eq!(observed.now, Some(format!("{present} of {count}")));
+                    assert!(!observed.standing.settled());
+                }
+            }
+        }
     }
 
     /// A waiting row's note is the reason of the first waiting part whose item decided one, and a

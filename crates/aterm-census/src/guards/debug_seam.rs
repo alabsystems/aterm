@@ -23,7 +23,7 @@
 //! reader is `aterm_types::negative_control::on`, under `cfg(any(test, debug_assertions))`; a
 //! lab lane that sets it on a child names it under the same kind of `cfg`.
 
-use super::rules::{CENSUS_CRATE, PRODUCT, TestCode};
+use super::rules::{CENSUS_CRATE, PRODUCT};
 use super::{Finding, Rule, Tree};
 use crate::lex::Lexed;
 
@@ -46,7 +46,7 @@ pub(super) const DEBUG_SEAM: Rule = Rule {
 
 fn debug_seam(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let bound = bound_names(tree);
-    let test_code = TestCode::read(tree.corpus, PRODUCT);
+    let test_code = tree.corpus.test_code();
     let mut seen = vec![false; DEBUG_ONLY.len()];
     let words: Vec<&str> = DEBUG_ONLY
         .iter()
@@ -55,7 +55,6 @@ fn debug_seam(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .collect();
     for file in tree.corpus.under(PRODUCT) {
         if file.rel.starts_with(CENSUS_CRATE)
-            || (file.rel.ends_with("_tests.rs") && !test_code.ships(&file.rel))
             || test_code.holds(&file.rel)
             || !file.mentions(&words)
         {

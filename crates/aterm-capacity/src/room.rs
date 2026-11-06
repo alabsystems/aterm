@@ -87,17 +87,24 @@ impl RoomMeter {
     pub fn room(&self, now_s: i64, total: u64) -> u64 {
         let (lo, hi) = room_bounds(total);
         let today = now_s.div_euclid(DAY_S);
-        let mut falls: Vec<u64> = self
-            .days
-            .iter()
-            .filter(|(d, _)| *d <= today && today.saturating_sub(*d) < ROOM_DAYS)
-            .map(|(_, f)| *f)
-            .collect();
-        if falls.len() < 2 {
+        let mut first = 0u64;
+        let mut second = 0u64;
+        let mut count = 0usize;
+        for &(d, f) in &self.days {
+            if d <= today && today.saturating_sub(d) < ROOM_DAYS {
+                count += 1;
+                if f >= first {
+                    second = first;
+                    first = f;
+                } else if f > second {
+                    second = f;
+                }
+            }
+        }
+        if count < 2 {
             return lo;
         }
-        falls.sort_unstable_by(|a, b| b.cmp(a));
-        falls[1].clamp(lo, hi)
+        second.clamp(lo, hi)
     }
 
     /// The days read, `(UTC day, largest fall)`, oldest first.

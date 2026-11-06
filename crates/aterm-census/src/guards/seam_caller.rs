@@ -74,23 +74,23 @@ fn seam_caller(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let shipped = released_files(tree);
     let read =
         |file: &SourceFile| shipped.contains(&file.rel) && !file.rel.starts_with(CENSUS_CRATE);
-    let mut released: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut gated = Vec::new();
     for file in tree.corpus.under(SOURCE).filter(|f| read(f)) {
+        if !file.mentions(&["#[cfg("]) || !file.mentions(&["debug_assertions", "test"]) {
+            continue;
+        }
         let (krate, crate_ident) = crate_of(&file.rel);
         let code = &file.lexed().code;
         let compiled = unmasked_lines(code, &release_never_compiles);
         let lines: Vec<&str> = code.lines().collect();
         for (at, line) in lines.iter().enumerate() {
+            if compiled.get(at).copied().unwrap_or(true) {
+                continue;
+            }
             let Some((reach, name)) = item(line) else {
                 continue;
             };
-            if compiled.get(at).copied().unwrap_or(true) {
-                released
-                    .entry(krate.clone())
-                    .or_default()
-                    .insert(name.to_owned());
-            } else if seam_gate(&lines, at) {
+            if seam_gate(&lines, at) {
                 gated.push(Seam {
                     name: name.to_owned(),
                     file: file.rel.clone(),
@@ -101,6 +101,34 @@ fn seam_caller(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                     module: module_of(&file.rel),
                     root: crate_root(&file.rel),
                 });
+            }
+        }
+    }
+    if gated.is_empty() {
+        return;
+    }
+    let gated_crates: BTreeSet<&str> = gated.iter().map(|s| s.krate.as_str()).collect();
+    let gated_names: Vec<&str> = gated.iter().map(|s| s.name.as_str()).collect();
+    let mut released: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for file in tree.corpus.under(SOURCE).filter(|f| read(f)) {
+        if !gated_crates.iter().any(|k| file.rel.starts_with(k)) || !file.mentions(&gated_names) {
+            continue;
+        }
+        let (krate, _) = crate_of(&file.rel);
+        let code = &file.lexed().code;
+        let compiled = unmasked_lines(code, &release_never_compiles);
+        for (at, line) in code.lines().enumerate() {
+            if !compiled.get(at).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some((_, name)) = item(line) else {
+                continue;
+            };
+            if gated_names.contains(&name) {
+                released
+                    .entry(krate.clone())
+                    .or_default()
+                    .insert(name.to_owned());
             }
         }
     }

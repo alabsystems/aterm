@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test helpers for hanging up control sockets and reading to EOF under a hang detector.
+//! Test helpers for hanging up control sockets, reading to EOF under a hang detector, and leaving
+//! a socket file nothing listens on.
 
 use std::thread::JoinHandle;
 
@@ -95,6 +96,67 @@ pub(crate) fn read_to_end_of_file(
             Err(e) => panic!("read to end-of-file: {e}: {}", report(&read)),
         }
     }
+}
+
+/// Bind a Unix stream socket at `path` (whatever was there removed first) that never listens, and
+/// answer its descriptor: a socket file nothing listens on, as a crashed server leaves. It refuses
+/// every connect (`ECONNREFUSED`) for as long as its descriptor, or any copy of it, lives. A
+/// listener bound and closed at once does not: a child another test's thread spawned while it was
+/// open keeps a copy until its `exec`, or for its whole life when std's spawn (which takes no
+/// spawn lock) copied the descriptor between its `socket(2)` and its close-on-exec mark, and a
+/// connect to the file is queued on that copy's backlog and reads as answered. The descriptor is
+/// made through [`aterm_uds::kept_out`] and closes on exec.
+/// # Panics
+/// When the socket cannot be made or bound, or `path` does not fit `sun_path`.
+#[cfg(unix)]
+#[track_caller]
+pub(crate) fn never_listening_socket(path: &std::path::Path) -> std::os::fd::OwnedFd {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let _ = std::fs::remove_file(path);
+    let socket = aterm_uds::kept_out(|| {
+        // SAFETY: `socket(2)` takes three integers and touches no memory.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `socket(2)` just made this descriptor, and nothing else owns it.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: `F_SETFD` sets one descriptor's flags and touches no memory.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(socket)
+    })
+    .expect("a Unix stream socket");
+    // SAFETY: `sockaddr_un` is a plain C address; zero also terminates `sun_path`.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    assert!(
+        bytes.len() < address.sun_path.len(),
+        "{} fits sun_path",
+        path.display()
+    );
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = libc::c_char::from_ne_bytes([*byte]);
+    }
+    // SAFETY: `address` is initialized and its whole size is passed beside it.
+    let bound = unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        bound,
+        0,
+        "bind {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    socket
 }
 
 #[cfg(unix)]

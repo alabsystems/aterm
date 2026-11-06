@@ -19,6 +19,16 @@
 mod models_account_adopt_identity;
 mod models_account_continuation;
 pub use models_account_continuation::account_continuation_model;
+mod models_account_lineage_budget;
+pub use models_account_lineage_budget::account_lineage_budget_model;
+mod models_native_account_client_slot;
+pub use models_native_account_client_slot::native_account_client_slot_model;
+mod models_native_record;
+pub use models_native_record::native_record_model;
+mod models_native_write_identity;
+pub use models_native_write_identity::native_write_identity_model;
+mod models_noexec_phase;
+pub use models_noexec_phase::noexec_phase_model;
 mod models_native_observation_continuity;
 mod models_scoped_input;
 mod models_scoped_native;

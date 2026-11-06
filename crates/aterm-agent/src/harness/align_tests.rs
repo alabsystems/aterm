@@ -12,6 +12,196 @@ use super::*;
 /// The deadline of a capture whose child must finish.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
+#[test]
+fn lost_capture_custody_never_accepts_a_later_status_or_numeric_operation() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let positive = std::process::ExitStatus::from_raw(0);
+    let mut custody = CaptureCustody::Owned;
+    custody.observe(&Err(std::io::ErrorKind::WouldBlock.into()));
+    assert!(custody.owns_unreaped());
+    custody.observe(&Err(std::io::Error::from_raw_os_error(libc::ECHILD)));
+    assert_eq!(custody, CaptureCustody::Lost);
+    custody.observe(&Ok(Some(positive)));
+    assert_eq!(custody, CaptureCustody::Lost);
+    assert!(
+        !custody.owns_unreaped(),
+        "neither wait nor signal may use the old numeric identity"
+    );
+    assert_eq!(custody.reaped(), None);
+    let mut retained = CaptureCustody::Owned;
+    retained.observe(&Err(std::io::ErrorKind::Interrupted.into()));
+    retained.observe(&Ok(Some(positive)));
+    assert_eq!(retained.reaped(), Some(positive));
+    assert!(!retained.owns_unreaped());
+    let mut signal_check = CaptureCustody::Owned;
+    signal_check.observe_error(&std::io::Error::from_raw_os_error(libc::ECHILD));
+    signal_check.observe(&Ok(Some(positive)));
+    assert_eq!(signal_check, CaptureCustody::Lost);
+    assert!(!signal_check.owns_unreaped());
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_unwind_settles_the_actual_child_and_any_started_reader() {
+    for after_reader in [false, true] {
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        let hook: Box<dyn FnOnce() + Send> = Box::new(|| panic!("synthetic caller unwind"));
+        if after_reader {
+            *observed.after_reader.lock().unwrap() = Some(hook);
+        } else {
+            *observed.after_spawn.lock().unwrap() = Some(hook);
+        }
+        let mut first = true;
+        *observed.owning_wait.lock().unwrap() = Some(Box::new(move |child| {
+            if first {
+                first = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            child.wait()
+        }));
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_bounded_impl(
+                shell("exec \"$ATERM_TEST_SLEEP\" 120"),
+                HANG_DETECTOR,
+                1024,
+                None,
+                Some(observed.clone()),
+            )
+        }));
+        assert!(got.is_err());
+        assert!(observed.child_reaped.load(Ordering::Acquire));
+        assert_eq!(observed.reader_joined.load(Ordering::Acquire), after_reader);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reader_panic_and_its_payload_destructor_cannot_unwind_capture_custody() {
+    struct Payload;
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            panic!("synthetic reader payload destructor");
+        }
+    }
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    *observed.reader_step.lock().unwrap() = Some(Box::new(|| std::panic::panic_any(Payload)));
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capture_bounded_impl(
+            shell("exec \"$ATERM_TEST_SLEEP\" 120"),
+            HANG_DETECTOR,
+            1024,
+            None,
+            Some(observed.clone()),
+        )
+    }));
+    assert!(got.unwrap().is_err());
+    assert!(observed.child_reaped.load(Ordering::Acquire));
+    assert!(observed.reader_joined.load(Ordering::Acquire));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_external_capture_watch_reaps_and_joins_with_open_or_closed_stdout() {
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("synthetic payload destructor");
+        }
+    }
+    for owned in [false, true] {
+        for closed in [false, true] {
+            for panics in [false, true] {
+                let observed = Arc::new(CaptureLifecycleObservation::default());
+                let mut watch = || {
+                    if panics {
+                        std::panic::panic_any(PanicOnDrop);
+                    }
+                    true
+                };
+                let line = if closed {
+                    "exec 1>&-; exec \"$ATERM_TEST_SLEEP\" 120"
+                } else {
+                    "exec \"$ATERM_TEST_SLEEP\" 120"
+                };
+                let got = capture_with(
+                    shell(line),
+                    HANG_DETECTOR,
+                    1024,
+                    None,
+                    Some(observed.clone()),
+                    owned,
+                    Some(&mut watch),
+                );
+                let case = format!("owned {owned}, stdout closed {closed}, watch panics {panics}");
+                if panics {
+                    assert_eq!(got.unwrap_err(), "its capture watch panicked", "{case}");
+                } else {
+                    assert_eq!(got.unwrap(), Ended::Stopped, "{case}");
+                }
+                assert!(observed.child_reaped.load(Ordering::Acquire), "{case}");
+                assert!(observed.reader_done.load(Ordering::Acquire), "{case}");
+            }
+        }
+    }
+    let ran =
+        capture_bounded_owned_watching(shell("printf kept; exit 7"), HANG_DETECTOR, 1024, || false)
+            .unwrap();
+    assert_eq!(
+        ran,
+        Ended::Exited(Captured {
+            stdout: b"kept".to_vec(),
+            code: Some(7)
+        })
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn completed_output_and_observed_exit_win_over_a_terminal_capture_watch() {
+    for owned in [false, true] {
+        for code in [0, 1, 130] {
+            let observed = Arc::new(CaptureLifecycleObservation::default());
+            *observed.child_ready.lock().unwrap() = Some(Box::new(|child| {
+                let deadline = Instant::now() + HANG_DETECTOR;
+                let mut exit = aterm_uds::deadline::ExitWait::new(child);
+                while !child.exited().unwrap() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "the owned child never exited");
+                    exit.wait(remaining);
+                }
+            }));
+            let mut failed = || true;
+            let ran = capture_with(
+                shell(&format!("printf kept; exit {code}")),
+                HANG_DETECTOR,
+                1024,
+                None,
+                Some(observed.clone()),
+                owned,
+                Some(&mut failed),
+            )
+            .unwrap();
+            assert_eq!(
+                ran,
+                Ended::Exited(Captured {
+                    stdout: b"kept".to_vec(),
+                    code: Some(code)
+                }),
+                "owned {owned}"
+            );
+            assert!(
+                observed.child_reaped.load(Ordering::Acquire),
+                "owned {owned}"
+            );
+            assert!(
+                observed.reader_done.load(Ordering::Acquire),
+                "owned {owned}"
+            );
+        }
+    }
+}
+
 /// A unique temp directory, removed on drop.
 #[cfg(unix)]
 fn temp_dir(tag: &str) -> aterm_tempfile::TempDir {
@@ -379,7 +569,7 @@ impl Drop for EscapedHolderGuard {
 #[cfg(unix)]
 struct CaptureObservedState {
     child_reaped: bool,
-    reader_done: bool,
+    reader_joined: bool,
 }
 
 #[cfg(unix)]
@@ -387,13 +577,13 @@ impl From<&CaptureLifecycleObservation> for CaptureObservedState {
     fn from(observed: &CaptureLifecycleObservation) -> Self {
         Self {
             child_reaped: observed.child_reaped.load(Ordering::Acquire),
-            reader_done: observed.reader_done.load(Ordering::Acquire),
+            reader_joined: observed.reader_joined.load(Ordering::Acquire),
         }
     }
 }
 
-/// Tier-1: project actual child/pipe-worker completion from one invocation onto the derived
-/// lifecycle model.
+/// Tier-1: project actual owning reap and reader join from one invocation onto the derived
+/// lifecycle model. Its historical `reader_done` variable means the join receipt here.
 #[cfg(unix)]
 fn assert_capture_return_conforms(
     observed: CaptureObservedState,
@@ -403,7 +593,7 @@ fn assert_capture_return_conforms(
     let model = aterm_models_harness::harness_capture_worker_lifecycle_model();
     let mut state = model.init_state();
     state.insert("child_reaped", i64::from(observed.child_reaped));
-    state.insert("reader_done", i64::from(observed.reader_done));
+    state.insert("reader_done", i64::from(observed.reader_joined));
     state.insert("deadline", i64::from(deadline));
     assert_eq!(state["child_reaped"], 1, "the direct child was reaped");
     assert_eq!(state["reader_done"], 1, "the stdout worker was joined");
@@ -610,4 +800,317 @@ fn a_stop_on_stderr_returns_while_an_escaped_holder_keeps_stdout() {
         "the reader was freed only by the deadline: {took:?}"
     );
     assert_capture_return_conforms(returned, false, "reader_done");
+}
+
+/// An owned capture that runs out ends its provider by proof first: the provider says it got
+/// `SIGTERM`, and it and what it left in its group are gone, each by its pid and birth.
+#[cfg(unix)]
+#[test]
+fn an_owned_capture_past_its_deadline_ends_its_child_by_proof_then_its_group() {
+    let provider = owned_fixture::Provider::new("deadline");
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    settle_until(&observed, provider.ready());
+    let why = capture_with(
+        Command::new(provider.program()),
+        Duration::from_millis(200),
+        1024,
+        None,
+        Some(Arc::clone(&observed)),
+        true,
+        None,
+    )
+    .expect_err("a provider that waits for ever is an error, not a wait");
+    assert!(why.contains("deadline"), "{why}");
+    let [leader, member] = provider.said();
+    assert!(
+        provider.termed(),
+        "the provider (pid {}) got no SIGTERM before its group's kill",
+        leader.pid
+    );
+    assert!(
+        leader.gone_within_a_minute(),
+        "the provider (pid {}) ran on past its capture's deadline",
+        leader.pid
+    );
+    assert!(
+        member.gone_within_a_minute(),
+        "what the provider left in its group (pid {}) ran on past its capture's deadline",
+        member.pid
+    );
+    assert!(
+        observed.child_reaped.load(Ordering::Acquire),
+        "the provider was reaped"
+    );
+}
+
+/// A CAPTURE'S BUDGET COUNTS THE TIME ITS HOST SLEPT (KI-1105-14): where the host slept past
+/// the budget while the capture waited on its child, the capture ends the child and what it left
+/// in its group at its next look, owned (a renewal's) or not, though the clock that stops in
+/// sleep leaves an hour of the budget. NEGATIVE CONTROLS: the rule that measured the budget on
+/// that clock alone waited the hour out, and so did an unowned capture's single wait, which
+/// cannot see the other clock; the one-minute hang detector reports either.
+#[cfg(unix)]
+#[test]
+fn a_capture_budget_counts_the_time_its_host_slept() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    assert!(
+        aterm_uds::process::continuous_ns().is_some(),
+        "this host has a clock that counts through sleep"
+    );
+    for owned in [false, true] {
+        let provider = owned_fixture::Provider::new(if owned { "slept-owned" } else { "slept" });
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        settle_until(&observed, provider.ready());
+        // The host sleeps two hours once the capture waits on its child.
+        let sleeps = Arc::clone(&observed);
+        *observed
+            .in_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let two_hours = u64::try_from((2 * HOUR).as_nanos()).expect("in range");
+            sleeps.slept_ns.store(two_hours, Ordering::Release);
+        }));
+        let (tx, rx) = mpsc::channel();
+        let program = provider.program();
+        let run = Arc::clone(&observed);
+        std::thread::spawn(move || {
+            let _ = tx.send(capture_with(
+                Command::new(program),
+                HOUR,
+                1024,
+                None,
+                Some(run),
+                owned,
+                None,
+            ));
+        });
+        let why = rx
+            .recv_timeout(HANG_DETECTOR)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "owned={owned}: the capture waited on the clock that stops in sleep, past the \
+                     budget its host slept through"
+                )
+            })
+            .expect_err("a provider that waits for ever is an error, not a wait");
+        assert!(
+            why.contains(&format!("ran past its {} ms deadline", HOUR.as_millis())),
+            "owned={owned}: {why}"
+        );
+        let [leader, member] = provider.said();
+        assert!(
+            leader.gone_within_a_minute(),
+            "owned={owned}: the provider (pid {}) ran on past its slept deadline",
+            leader.pid
+        );
+        assert!(
+            member.gone_within_a_minute(),
+            "owned={owned}: what the provider left in its group (pid {}) ran on",
+            member.pid
+        );
+        assert!(
+            observed.child_reaped.load(Ordering::Acquire),
+            "owned={owned}: the provider was reaped"
+        );
+    }
+}
+
+/// THE WAIT FOR A CHILD THAT CLOSED ITS OUTPUT COUNTS THE TIME ITS HOST SLEPT TOO: a child whose
+/// group closed its stdout and runs on, the host sleeping past the budget once that end is read,
+/// is ended and reaped at the next look, owned or not, with the words for that end. NEGATIVE
+/// CONTROL: that wait measured on the clock that stops in sleep alone waited the hour out, which
+/// the one-minute hang detector reports.
+#[cfg(unix)]
+#[test]
+fn the_wait_for_a_child_that_closed_its_output_counts_the_time_its_host_slept() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    for owned in [false, true] {
+        let tmp = temp_dir(if owned {
+            "slept-closed-owned"
+        } else {
+            "slept-closed"
+        });
+        let pid_file = tmp.path().join("pid");
+        let mut cmd = shell("exec 1>&-; echo $$ > \"$PIDF\"; exec \"$ATERM_TEST_SLEEP\" 3600");
+        cmd.env("PIDF", &pid_file);
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        let report = pid_file.clone();
+        settle_until(&observed, move || {
+            std::fs::read_to_string(&report).is_ok_and(|r| r.ends_with('\n'))
+        });
+        // The end of its output is queued for the wait before the wait looks.
+        let read = Arc::clone(&observed);
+        *observed
+            .after_reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            aterm_spec::wait::until_within(HANG_DETECTOR, "the reader read the end", || {
+                read.reader_done.load(Ordering::Acquire).then_some(())
+            });
+        }));
+        // The host sleeps two hours once the wait has taken what is left of the budget.
+        let sleeps = Arc::clone(&observed);
+        *observed
+            .in_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let two_hours = u64::try_from((2 * HOUR).as_nanos()).expect("in range");
+            sleeps.slept_ns.store(two_hours, Ordering::Release);
+        }));
+        let (tx, rx) = mpsc::channel();
+        let run = Arc::clone(&observed);
+        std::thread::spawn(move || {
+            let _ = tx.send(capture_with(cmd, HOUR, 1024, None, Some(run), owned, None));
+        });
+        let why = rx
+            .recv_timeout(HANG_DETECTOR)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "owned={owned}: the wait for a child that closed its output counted only the \
+                     time its host was awake"
+                )
+            })
+            .expect_err("a child that closed its output and runs on is an error, not a wait");
+        assert!(
+            why.contains("it closed its output and did not exit before its deadline"),
+            "owned={owned}: {why}"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|r| r.trim().parse::<libc::pid_t>().ok())
+            .expect("the child's pid");
+        assert!(
+            observed.child_reaped.load(Ordering::Acquire),
+            "owned={owned}: the child was reaped"
+        );
+        assert!(
+            group_emptied(pid),
+            "owned={owned}: the child's group was left running"
+        );
+    }
+}
+
+/// An unwind out of an owned capture's wait (here its settle panics) ends the provider and its
+/// group on the way out, by pid and birth.
+#[cfg(unix)]
+#[test]
+fn an_unwind_out_of_an_owned_capture_ends_its_child() {
+    let provider = owned_fixture::Provider::new("unwind");
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    let ready = provider.ready();
+    *observed
+        .after_spawn
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let until = std::time::Instant::now() + HANG_DETECTOR;
+        while !ready() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the wait for the provider unwinds");
+    }));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capture_with(
+            Command::new(provider.program()),
+            HANG_DETECTOR,
+            1024,
+            None,
+            Some(Arc::clone(&observed)),
+            true,
+            None,
+        )
+    }));
+    assert!(unwound.is_err(), "the capture unwound");
+    let [leader, member] = provider.said();
+    assert!(
+        provider.termed(),
+        "an unwind out of the capture gave its provider (pid {}) no SIGTERM before its group's \
+         kill",
+        leader.pid
+    );
+    assert!(
+        leader.gone_within_a_minute(),
+        "an unwind out of the capture left its provider (pid {}) running",
+        leader.pid
+    );
+    assert!(
+        member.gone_within_a_minute(),
+        "an unwind out of the capture left the provider's group (pid {}) running",
+        member.pid
+    );
+}
+
+/// An owned capture whose provider signs in and exits by itself answers that exit at once, with
+/// what it printed, while what it left in its group still holds its stdout, and signals nothing
+/// it left there: the deadline is the hang detector, so a capture that waited for the pipe's end
+/// would run out first.
+#[cfg(unix)]
+#[test]
+fn an_owned_capture_answers_its_childs_own_exit_and_leaves_its_group_be() {
+    let provider = owned_fixture::Provider::signing_in("own-exit");
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    let got = capture_with(
+        Command::new(provider.program()),
+        HANG_DETECTOR,
+        1024,
+        None,
+        Some(Arc::clone(&observed)),
+        true,
+        None,
+    )
+    .expect("a provider that signs in and exits by itself is answered at its exit");
+    let Ended::Exited(got) = got else {
+        panic!("nothing was watched for, so nothing stops it: {got:?}");
+    };
+    assert_eq!(
+        (got.code, got.stdout.as_slice()),
+        (Some(0), owned_fixture::SIGNED_IN),
+        "its exit and what it printed"
+    );
+    assert!(
+        observed.child_reaped.load(Ordering::Acquire),
+        "the provider was reaped"
+    );
+    let member = provider
+        .member()
+        .expect("what the provider left in its group was signalled at its own exit");
+    assert!(
+        observed.group_kills.load(Ordering::Acquire) == 0 && member.runs(),
+        "what the provider left in its group (pid {}) was signalled at its own exit",
+        member.pid
+    );
+}
+
+/// An owned capture's end by proof reads the child's own unique id: a record whose unique id
+/// moved gets no signal, and the child's own record gets its `SIGTERM`.
+#[cfg(unix)]
+#[test]
+fn an_owned_end_signals_only_the_child_it_read() {
+    let mut child = shell("exec \"$ATERM_TEST_SLEEP\" 600")
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("start a sleep");
+    let pid = i32::try_from(child.id()).expect("a pid");
+    let lineage =
+        aterm_spec::wait::until_within(HANG_DETECTOR, "the sleep runs, its thread run", || {
+            (aterm_uds::process::thread_ran(pid) == Some(true))
+                .then(|| aterm_uds::process::read_lineage(pid))
+                .flatten()
+        });
+    let watched = aterm_uds::tether::Watched::of(&lineage);
+    let moved = aterm_uds::tether::Watched {
+        uniqueid: watched.uniqueid.wrapping_add(1),
+        ..watched
+    };
+    assert_eq!(
+        end_owned(moved),
+        Err(aterm_uds::process::EndRefusal::NotProven),
+        "a record whose unique id moved"
+    );
+    let ended = end_owned(watched);
+    let _ = child.kill();
+    let status = child.wait().expect("reap the sleep");
+    assert!(
+        ended.is_ok_and(|ended| ended.termed),
+        "the child's own record: {ended:?}, {status:?}"
+    );
 }

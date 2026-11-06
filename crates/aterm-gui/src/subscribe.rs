@@ -4990,7 +4990,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the loop never joined"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let other = crate::session_store::new_store();
         let stuck = RosterReader::join(&other, 0);

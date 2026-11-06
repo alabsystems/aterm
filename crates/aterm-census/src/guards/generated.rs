@@ -17,7 +17,6 @@
 //! itself but is not declared, so a prune that took its whole header would go unseen.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 
 use super::{Finding, Rule, Tree};
 use crate::seal::{self, HEAD_LINES, MARK, Seal};
@@ -64,22 +63,13 @@ fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             });
         }
     }
-    let held: BTreeMap<&str, &str> = tree
-        .corpus
-        .under(&[""])
-        .map(|f| (f.rel.as_str(), f.raw.as_str()))
-        .collect();
     for (rel, declared) in tree.corpus.paths.iter().zip(declared) {
         let rust = rel.ends_with(".rs") && !rel.starts_with("vendor/");
         if !declared && !rust {
             continue;
         }
-        let body = match held.get(rel.as_str()) {
-            Some(raw) => Cow::Borrowed(*raw),
-            None => match text(tree, rel) {
-                Some(body) => body,
-                None => continue,
-            },
+        let Some(body) = text(tree, rel) else {
+            continue;
         };
         let finding = |line: usize, detail: String| Finding {
             rule: GENERATED_SEAL.id,
@@ -161,19 +151,23 @@ fn matches(pattern: &str, rel: &str) -> bool {
             .next()
             .is_some_and(|name| component(pattern, name));
     }
-    let want: Vec<&str> = pattern.split('/').collect();
-    let have: Vec<&str> = rel.split('/').collect();
-    components(&want, &have)
+    components(pattern, rel)
 }
 
-fn components(want: &[&str], have: &[&str]) -> bool {
-    match (want.split_first(), have.split_first()) {
+fn split_component(path: &str) -> Option<(&str, &str)> {
+    match path.split_once('/') {
+        Some((head, tail)) => Some((head, tail)),
+        None if !path.is_empty() => Some((path, "")),
+        None => None,
+    }
+}
+
+fn components(want: &str, have: &str) -> bool {
+    match (split_component(want), split_component(have)) {
         (None, None) => true,
-        (Some((&"**", rest)), _) => {
+        (Some(("**", rest)), _) => {
             components(rest, have)
-                || have
-                    .split_first()
-                    .is_some_and(|(_, tail)| components(want, tail))
+                || split_component(have).is_some_and(|(_, tail)| components(want, tail))
         }
         (Some((w, rest)), Some((h, tail))) => component(w, h) && components(rest, tail),
         _ => false,

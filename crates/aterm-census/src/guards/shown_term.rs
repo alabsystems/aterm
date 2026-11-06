@@ -3,7 +3,6 @@
 
 //! shown-term: render and find code fetch a session's terminal as shown, never `Session.term` direct.
 
-use super::rules::test_path;
 use super::{Bound, Finding, Rule, Tree, hits, is_word};
 
 const RENDER: &[&str] = &[
@@ -29,7 +28,7 @@ pub(super) const SHOWN_TERM: Rule = Rule {
 
 fn shown_term(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(RENDER) {
-        if test_path(&file.rel) || !file.mentions(&["term"]) {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&["term"]) {
             continue;
         }
         let code = file.shipped_code();

@@ -2126,7 +2126,7 @@ fn the_vim_insert_reading_waits_for_the_reader_s_handoff() {
                 && !done.load(Ordering::Acquire)
                 && start.elapsed() < Duration::from_secs(60)
             {
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             drop(batch);
         })

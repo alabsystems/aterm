@@ -80,7 +80,7 @@ pub enum Authentication {
 }
 
 impl Authentication {
-    pub(crate) fn plain(&self) -> Option<String> {
+    pub(crate) fn plain(&self) -> Option<zeroize::Zeroizing<String>> {
         match self {
             Self::Password { username, password } => {
                 let secret = password.expose();
@@ -91,12 +91,19 @@ impl Authentication {
                 {
                     return None;
                 }
-                Some(format!("\0{username}\0{secret}"))
+                let mut out = zeroize::Zeroizing::new(String::with_capacity(
+                    1 + username.len() + 1 + secret.len(),
+                ));
+                out.push('\0');
+                out.push_str(username);
+                out.push('\0');
+                out.push_str(secret);
+                Some(out)
             }
             Self::OAuth { .. } => None,
         }
     }
-    pub(crate) fn xoauth2(&self) -> Option<String> {
+    pub(crate) fn xoauth2(&self) -> Option<zeroize::Zeroizing<String>> {
         match self {
             Self::OAuth {
                 username,
@@ -110,7 +117,15 @@ impl Authentication {
                 {
                     return None;
                 }
-                Some(format!("user={username}\x01auth=Bearer {token}\x01\x01"))
+                let mut out = zeroize::Zeroizing::new(String::with_capacity(
+                    5 + username.len() + 13 + token.len() + 2,
+                ));
+                out.push_str("user=");
+                out.push_str(username);
+                out.push_str("\x01auth=Bearer ");
+                out.push_str(token);
+                out.push_str("\x01\x01");
+                Some(out)
             }
             Self::Password { .. } => None,
         }

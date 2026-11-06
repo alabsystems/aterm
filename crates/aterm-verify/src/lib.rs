@@ -198,6 +198,35 @@ pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
     }
 }
 
+/// `path` spelled physically: its longest existing ancestor through every symlink
+/// (`aterm_uds::runs::canonical`), the rest appended. Off unix it is `path`, since there
+/// `canonicalize` spells a verbatim path no tool expects.
+#[must_use]
+pub fn physical(path: &Path) -> PathBuf {
+    if cfg!(unix) {
+        aterm_uds::runs::canonical(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The run's target directory, physical ([`physical`]): the caller's `CARGO_TARGET_DIR`, else
+/// `<root>/target`. Every child but a side lane's (handed its lane directory, physical too) gets it
+/// as `CARGO_TARGET_DIR` ([`Ctx::child_env_add`]), so cargo spells each `CARGO_BIN_EXE_*` and
+/// `CARGO_TARGET_TMPDIR` it compiles into a test through it and never through a link: a release
+/// clone reaches its target through `target -> target.noindex`, and a test that resolved one
+/// spelling and compared it with the other failed there. Cargo does not fingerprint either value,
+/// so a test binary compiled before keeps its spelling until it recompiles. A missing directory is
+/// not created: the spelling of its existing ancestor decides.
+#[must_use]
+pub fn physical_target(env: &EnvSnapshot, root: &Path) -> PathBuf {
+    physical(
+        &env.cargo_target_dir
+            .clone()
+            .unwrap_or_else(|| root.join("target")),
+    )
+}
+
 /// The `build.build-dir` for main-lane children when [`main_build_dir`] is `None` and `target` is pinned.
 #[must_use]
 pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Option<String> {
@@ -457,8 +486,10 @@ fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// Everything a stage needs, immutable for the whole run so stages share it across threads without a lock.
 #[derive(Debug)]
 pub struct Ctx {
+    /// The checkout's root, physical (every symlink resolved).
     pub root: PathBuf,
-    /// The caller's `CARGO_TARGET_DIR`, else `<root>/target`.
+    /// The caller's `CARGO_TARGET_DIR`, else `<root>/target`, physical ([`physical_target`]):
+    /// the `CARGO_TARGET_DIR` of every child but a side lane's ([`Self::child_env_add`]).
     pub target_dir: PathBuf,
     /// The checks this run runs, in [`checks::CHECKS`] order.
     pub checks: Vec<Check>,
@@ -481,7 +512,9 @@ pub struct Ctx {
     pub env: EnvSnapshot,
     /// Variables removed from every child's environment ([`CHILD_ENV_REMOVED`]).
     pub child_env_remove: Vec<&'static str>,
-    /// Variables given to every child, after the removals and before a stage's own ([`exec::ExecEnv::add_env`]).
+    /// Variables given to every child, after the removals and before a stage's own
+    /// ([`exec::ExecEnv::add_env`]): `CARGO_TARGET_DIR` (the physical [`Self::target_dir`]) and,
+    /// with a targo, `TRUST_STAGE2_BIN`.
     pub child_env_add: Vec<(OsString, OsString)>,
     /// The `build.build-dir` the main lane's children are handed as `--config`.
     pub main_build_dir: Option<String>,
@@ -592,22 +625,20 @@ impl Ctx {
             &tools.path_with_stage2_first(&env.path),
             env.native_packages.as_deref(),
         );
-        let target_dir = env
-            .cargo_target_dir
-            .clone()
-            .unwrap_or_else(|| root.join("target"));
+        let root = physical(&root);
+        let target_dir = physical_target(&env, &root);
         let shim_build_dir = main_build_dir(&env, &root);
+        // Physical as the target is: a side lane hands its children this as their target.
         let cached_lanes_dir = shim_build_dir
             .as_deref()
             .and_then(|value| disk::build_dir_path(value, &root))
-            .map(|dir| dir.join("verify").join(aterm_tempfile::QUIET));
-        let mut child_env_add: Vec<(OsString, OsString)> = Vec::new();
-        if shim_build_dir.is_none() {
-            child_env_add.push((
-                "CARGO_TARGET_DIR".into(),
-                target_dir.clone().into_os_string(),
-            ));
-        }
+            .map(|dir| physical(&dir.join("verify").join(aterm_tempfile::QUIET)));
+        // The main lane names its build directory itself (`--config build.build-dir`), so the
+        // target this pins never moves the shim's cache; a side lane sets its own.
+        let mut child_env_add: Vec<(OsString, OsString)> = vec![(
+            "CARGO_TARGET_DIR".into(),
+            target_dir.clone().into_os_string(),
+        )];
         let main_build_dir =
             shim_build_dir.or_else(|| fallback_build_dir(&env, &root, &target_dir));
         if tools.have_targo() {
@@ -1967,21 +1998,22 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     if let Some(lease) = &ctx.toolchain_lease {
         s.push_str(&format!("toolchain lease: {lease}\n"));
     }
-    let pinned = ctx
-        .child_env_add
-        .iter()
-        .any(|(k, _)| k == "CARGO_TARGET_DIR");
-    match (&ctx.main_build_dir, pinned) {
-        (Some(value), false) if value.contains(&format!("/{}/", aterm_tempfile::QUIET)) => {
+    // Only the shim's cache has a verification cache in it ([`Ctx::cached_lanes_dir`]).
+    let shared = ctx.cached_lanes_dir.is_some();
+    match (&ctx.main_build_dir, shared) {
+        (Some(value), true) if value.contains(&format!("/{}/", aterm_tempfile::QUIET)) => {
             s.push_str(&format!(
-                "build cache: the main lane shares plain targo's ({value})\n"
+                "build cache: the main lane shares plain targo's ({value}), its target {}\n",
+                ctx.target_dir.display()
             ));
         }
-        (Some(value), false) => s.push_str(&format!(
-            "build cache: the main lane shares plain targo's ({value}), outside .ubd: the targo \
-             shim on PATH predates the quiet cache, and an aterm update lays the new one\n"
-        )),
         (Some(value), true) => s.push_str(&format!(
+            "build cache: the main lane shares plain targo's ({value}), its target {}, outside \
+             .ubd: the targo shim on PATH predates the quiet cache, and an aterm update lays the \
+             new one\n",
+            ctx.target_dir.display()
+        )),
+        (Some(value), false) => s.push_str(&format!(
             "build cache: CARGO_TARGET_DIR={}, intermediates out of Spotlight ({value}; no shim cache here)\n",
             ctx.target_dir.display()
         )),
@@ -2914,7 +2946,14 @@ mod tests {
                 PathBuf::from("/tmp"),
             );
             assert_ne!(plan::lane_dir(&other, plan::Lane::TippyTarget), Some(lane));
-            assert!(!c.child_env_add.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+            assert_eq!(
+                c.child_env_add
+                    .iter()
+                    .find(|(k, _)| k == "CARGO_TARGET_DIR")
+                    .map(|(_, v)| PathBuf::from(v)),
+                Some(root.join("target")),
+                "pinned beside the shim's cache, which the main lane names by --config"
+            );
             assert_eq!(c.target_dir, root.join("target"));
             for var in &CARGO_LAYOUT_VARS[..3] {
                 let chosen = EnvSnapshot {
@@ -2966,6 +3005,72 @@ mod tests {
             assert_eq!(got, None, "the shim's cache is macOS only");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A checkout whose target is a link (a release clone's `target -> target.noindex`), itself
+    /// under a linked folder (`/tmp`): every child is handed the physical target, so cargo spells
+    /// each `CARGO_BIN_EXE_*` it compiles into a test (`<CARGO_TARGET_DIR>/debug/<bin>`, never
+    /// resolved) as verify's own paths are. NEGATIVE CONTROL: without [`physical_target`] the
+    /// target keeps the link's spelling, and without the pin a shim-mode child gets none.
+    #[cfg(unix)]
+    #[test]
+    fn every_child_builds_through_the_physical_target_however_the_checkout_reaches_it() {
+        let tmp = mktemp_dir("atv-physical").expect("mktemp");
+        // HOME is physical, so the shim's cache holds the checkout; the root is handed spelled
+        // through a link of its own (and, on macOS, the one `/tmp` is).
+        let home = std::fs::canonicalize(&tmp).expect("real").join("home");
+        std::fs::create_dir_all(home.join("Library/Caches")).expect("mkdir");
+        std::os::unix::fs::symlink("home", tmp.join("linked-home")).expect("link");
+        let root = tmp.join("linked-home/Developer/repo");
+        std::fs::create_dir_all(root.join("target.noindex")).expect("mkdir");
+        std::os::unix::fs::symlink("target.noindex", root.join("target")).expect("link");
+        let real_root = std::fs::canonicalize(&root).expect("real");
+        let physical = real_root.join("target.noindex");
+        let pinned = |c: &Ctx| {
+            c.child_env_add
+                .iter()
+                .find(|(k, _)| k == "CARGO_TARGET_DIR")
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        let shim = EnvSnapshot {
+            home: home.clone(),
+            ..EnvSnapshot::default()
+        };
+        let linked = root.join("target");
+        let theirs = EnvSnapshot {
+            cargo_target_dir: Some(linked.clone()),
+            cargo_layout: vec![("CARGO_TARGET_DIR", linked.into_os_string())],
+            ..EnvSnapshot::default()
+        };
+        let shares = cfg!(target_os = "macos");
+        // HOME spelled through the link holds no physical checkout, so no shim cache, as the
+        // shim decides from its own physical working directory: the target is pinned all the same.
+        let linked_home = EnvSnapshot {
+            home: tmp.join("linked-home"),
+            ..EnvSnapshot::default()
+        };
+        for (env, cache) in [
+            (shim, shares),
+            (linked_home, false),
+            (EnvSnapshot::default(), false),
+            (theirs, false),
+        ] {
+            let c = Ctx::new(
+                root.clone(),
+                Scope::workspace(),
+                env.clone(),
+                PathBuf::from("/tmp"),
+            );
+            assert_eq!(c.cached_lanes_dir.is_some(), cache, "{env:?}");
+            assert_eq!(c.root, real_root, "{env:?}");
+            assert_eq!(c.target_dir, physical, "{env:?}");
+            assert_eq!(pinned(&c), Some(physical.clone()), "{env:?}");
+            assert_eq!(stages::main_bin(&c, "aterm"), physical.join("debug/aterm"));
+            assert!(c.state_dir().starts_with(&physical), "{env:?}");
+            let lanes = plan::lanes_dir(&c);
+            assert_eq!(lanes, crate::physical(&lanes), "{env:?}");
+        }
+        std::fs::remove_dir_all(&tmp).expect("cleanup");
     }
 
     #[test]

@@ -33,13 +33,22 @@ impl Digest {
     /// The digest as 64 lowercase hex digits.
     #[must_use]
     pub fn hex(&self) -> String {
-        String::from_utf8(self.hex_bytes().to_vec()).unwrap_or_default()
+        let bytes = self.hex_bytes();
+        core::str::from_utf8(&bytes).unwrap_or_default().to_owned()
     }
 
     /// First 12 lowercase hex digits of the digest.
     #[must_use]
     pub fn short(&self) -> String {
-        String::from_utf8(self.short_bytes().to_vec()).unwrap_or_default()
+        let bytes = self.short_bytes();
+        core::str::from_utf8(&bytes).unwrap_or_default().to_owned()
+    }
+
+    /// Zero-allocation formatter for the first 12 lowercase hex digits of the digest.
+    #[inline]
+    #[must_use]
+    pub fn short_display(&self) -> ShortDigest {
+        ShortDigest(self.short_bytes())
     }
 
     #[inline]
@@ -76,6 +85,16 @@ impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let hex = self.hex_bytes();
         f.write_str(core::str::from_utf8(&hex).unwrap_or(""))
+    }
+}
+
+/// Stack-allocated 12-character hex display wrapper for [`Digest::short_display`].
+#[derive(Clone, Copy)]
+pub struct ShortDigest([u8; 12]);
+
+impl fmt::Display for ShortDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(core::str::from_utf8(&self.0).unwrap_or(""))
     }
 }
 

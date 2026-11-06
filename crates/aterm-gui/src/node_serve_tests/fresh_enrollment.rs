@@ -202,6 +202,10 @@ fn target(machine: &Machine, node: &NodeIdentity) -> Target {
 
 #[test]
 fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
+    // Both node jobs read their scratch homes' checkouts, this process's one last read: without
+    // the lock, a read one starts makes another test's own read return unstarted, then replaces
+    // the read that test waits for.
+    let _one = aterm_agent::harness::repo_work::home::one_test_at_a_time();
     // The vault server this thread reads is the test's own on loopback, which answers.
     let _answering = client::ServersAnswering::within(aterm_spec::wait::MUST_HAPPEN);
     let root = aterm_tempfile::tempdir().unwrap();

@@ -21,10 +21,10 @@ use crate::proto::{
     append_commit_frame, append_frame, append_publish_frame, append_relay_frame,
     append_retire_frame, decode_delivery_origin, decode_response_with_bt, encode_request,
     foreign_protocol, read_frame, Request, Response, WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
-    ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RATE_LIMITED, ERR_RECORD_REFUSED, ERR_REFUSED,
-    ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION,
-    RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX,
-    RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+    ERR_BAD_SUBJECT, ERR_ORIGIN_REFUSED, ERR_ORIGIN_UNKNOWN, ERR_PROTOCOL, ERR_RATE_LIMITED,
+    ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
+    LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
+    RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{Gap, NonceExt, ServedInfo};
 use astream_wire::frame::decode_frame_header_bytes;
@@ -877,6 +877,22 @@ impl<S: Read + Write> Client<S> {
     /// back and the next write lands), and against one that predates it.
     pub const fn supports_gap_fences(&self) -> bool {
         self.ext.supports_gap_fences()
+    }
+
+    /// Whether the latest `Hello` answer announced [`Request::Settle`]
+    /// ([`REQUEST_SETTLE`](crate::REQUEST_SETTLE)): a full flush issued after the broker read
+    /// the request, never skipped ([`send_settle`](Self::send_settle)). `false` before any
+    /// `Hello`, or against a broker that predates it.
+    pub const fn supports_settle(&self) -> bool {
+        self.ext.supports_settle()
+    }
+
+    /// The device the broker's log file is on and whether its full flush drains it, as the
+    /// latest `Hello` answer told it ([`LogDevice`](crate::LogDevice)). `None` before any
+    /// `Hello`, from a broker that predates the entry, or from one that could not read its
+    /// file's device: a writer then settles its own writes by a flush of its own.
+    pub const fn log_device(&self) -> Option<crate::LogDevice> {
+        self.ext.device
     }
 
     /// The log's health as the latest `Hello` answer told it
@@ -1925,6 +1941,42 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    /// PIPELINED SETTLE (send side, [`Request::Settle`]): ask the broker for a full flush of
+    /// its log issued after it read this request, never skipped, WITHOUT waiting for the
+    /// answer. Its ack is owed like a publish's and read in send order with
+    /// [`recv_publish_ack`](Self::recv_publish_ack) or
+    /// [`try_recv_publish_ack`](Self::try_recv_publish_ack): `(durable, false)`, where
+    /// `durable` is the log's durable head after the flush, or the refusal every write of
+    /// that batch got.
+    ///
+    /// What it is for: a writer whose own file is on the log's device
+    /// ([`log_device`](Self::log_device), [`LogDevice::settles`]) orders its writes by a
+    /// barrier (`astream_sys::barrier_sync`), then sends this, and holds what depends on
+    /// those writes until it reads the answer. Sent before the barrier returned, the answer
+    /// proves nothing about them: the flush may have run ahead of the barrier. A broker that
+    /// does not announce it ([`supports_settle`](Self::supports_settle)) answers `Error 5`
+    /// where the ack would be, which pays it.
+    pub fn send_settle(&mut self) -> io::Result<()> {
+        self.in_step()?;
+        let mut out = Vec::new();
+        crate::proto::append_frame(&mut out, &crate::proto::encode_request(&Request::Settle))?;
+        self.write_owed(&out)
+    }
+
+    /// [`send_settle`](Self::send_settle), refused first with [`AcksOwed`] while acks are
+    /// owed, and then its answer read at once: the log's durable head after a full flush
+    /// the broker issued once it read the request.
+    ///
+    /// # Errors
+    /// [`AcksOwed`]; the broker's refusal (a flush that failed, a poisoned log, a broker
+    /// that predates the verb, a ring with no read-write grant); a transport failure.
+    pub fn settle(&mut self) -> io::Result<u64> {
+        self.owes_nothing()?;
+        self.send_settle()?;
+        let (durable, _) = self.recv_publish_ack()?;
+        Ok(durable)
+    }
+
     fn ensure_broker_times(&mut self) -> io::Result<bool> {
         match self.broker_times {
             Some(took) => Ok(took),
@@ -2523,6 +2575,18 @@ impl<S: Read + Write> Client<S> {
         Ok(offset)
     }
 
+    /// Commit consumer `group` so it resumes at `next`: a group commit is inclusive (the group
+    /// resumes one past it), so this commits `next - 1`, and nothing for a `next` of 0, where the
+    /// group starts anyway. The one place the exclusive offset a reader scans next becomes the
+    /// inclusive commit, so no caller writes the `- 1` itself. A commit below the group's is a
+    /// no-op ([`commit`](Self::commit)). Answers the commit record's offset, if it made one.
+    pub fn commit_before(&mut self, group: &str, next: u64) -> io::Result<Option<u64>> {
+        match next.checked_sub(1) {
+            Some(through) => self.commit(group, through).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// The read-process-write TRANSACTION: append `out_body` to `out_subject` AND
     /// commit `group` to `upto` atomically (one durable record), deduped by
     /// `(producer_id, producer_seq)`. Returns `(offset, deduped)`. Refused with
@@ -2993,11 +3057,12 @@ impl BrokerRefusal {
     /// caller retrying it would loop: [`ERR_BAD_SUBJECT`], [`ERR_BAD_FILTER`],
     /// [`ERR_RECORD_REFUSED`], [`ERR_UNAUTHORIZED`], [`ERR_PROTOCOL`] (which this
     /// client reads as a [`ProtocolMismatch`] when the refusal names the broker's
-    /// version).
+    /// version), [`ERR_ORIGIN_REFUSED`] (a relayed record that is not its origin's).
     ///
     /// `false` is NOT "will succeed": it is every other code, [`ERR_REFUSED`] above
     /// all — a write that failed to append or commit, a quorum not reached — then
-    /// [`ERR_SUBJECT_BOUND`] (see [`is_subject_bound`](Self::is_subject_bound)), and
+    /// [`ERR_SUBJECT_BOUND`] (see [`is_subject_bound`](Self::is_subject_bound)),
+    /// [`ERR_ORIGIN_UNKNOWN`] (see [`is_origin_unknown`](Self::is_origin_unknown)), and
     /// every code this client does not know. A broker older than the permanent codes
     /// answered every refusal but 2, 3 and 6 with `ERR_REFUSED`, so against it this is
     /// `false` for a permanent refusal too: the fail-safe reading, under which a
@@ -3005,8 +3070,28 @@ impl BrokerRefusal {
     pub const fn is_permanent(&self) -> bool {
         matches!(
             self.code,
-            ERR_BAD_SUBJECT | ERR_BAD_FILTER | ERR_RECORD_REFUSED | ERR_UNAUTHORIZED | ERR_PROTOCOL
+            ERR_BAD_SUBJECT
+                | ERR_BAD_FILTER
+                | ERR_RECORD_REFUSED
+                | ERR_UNAUTHORIZED
+                | ERR_PROTOCOL
+                | ERR_ORIGIN_REFUSED
         )
+    }
+
+    /// Whether a relayed record's origin is one the broker does not take now
+    /// ([`ERR_ORIGIN_UNKNOWN`]): it holds no key for it, or that key stands revoked.
+    /// Nothing was appended.
+    ///
+    /// Not [`is_permanent`](Self::is_permanent): the identical request lands once the
+    /// broker's embedder gives it the origin's key or lifts the revocation. Whether to
+    /// wait for that is the CARRIER's question, because only it knows whether it still
+    /// seats the origin: one that does holds the record, and one that does not drops it.
+    ///
+    /// `false` against a broker that predates the code, which sends
+    /// [`ERR_ORIGIN_REFUSED`] for this refusal.
+    pub const fn is_origin_unknown(&self) -> bool {
+        self.code == ERR_ORIGIN_UNKNOWN
     }
 
     /// Whether the producer is at its DISTINCT-SUBJECT BUDGET and the request named a

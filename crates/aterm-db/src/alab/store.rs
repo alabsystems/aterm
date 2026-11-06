@@ -193,12 +193,9 @@ fn planned(
         heard,
         now_ms,
     };
-    let facts = view
-        .owned
-        .get(MACHINE_FACTS.name)
-        .cloned()
-        .unwrap_or_default();
-    register::plan(&input, &view.cells, &facts)
+    let empty = crate::typed::owned::OwnedRead::default();
+    let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
+    register::plan(&input, &view.cells, facts)
 }
 
 /// What one discovery pass decided and wrote.
@@ -344,7 +341,22 @@ impl Registry {
     /// # Errors
     /// Custody, membership or the catalog's storage cannot be read.
     pub fn catalog_word(&self) -> Result<Option<(Digest, bool)>> {
-        application::peek_declared_elsewhere(&self.paths, descriptor(self.generation()))
+        Ok(
+            application::peek_declaration(&self.paths, descriptor(self.generation()))?
+                .map(|declaration| (declaration.catalog, declaration.elsewhere)),
+        )
+    }
+
+    /// Whether this Mac's catalog declares the registry: what "imported" means to a Mac whose
+    /// read of it failed. `false` where there is no Commons here.
+    ///
+    /// # Errors
+    /// Custody, membership or the catalog's storage cannot be read.
+    pub fn declared(&self) -> Result<bool> {
+        Ok(
+            application::peek_declaration(&self.paths, descriptor(self.generation()))?
+                .is_some_and(|declaration| declaration.declared),
+        )
     }
 
     /// The Commons uuids of the current members, what `check` calls live.
@@ -480,43 +492,48 @@ impl Registry {
                     .find(|binding| binding.actor() == actor)
                     .map(|binding| keys::uuid32(binding.machine()))
                     .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
-                let obs = view
-                    .owned
-                    .get(MAILBOX_OBS.name)
-                    .cloned()
-                    .unwrap_or_default();
+                let empty = crate::typed::owned::OwnedRead::default();
+                let obs = view.owned.get(MAILBOX_OBS.name).unwrap_or(&empty);
                 let input = discover::Input {
                     uuid: &uuid,
                     listing,
                     keyed: keyed.as_deref(),
                     now_ms,
                 };
-                let plan = discover::plan(&input, &view.cells, &obs)?;
-                let done = |records| Discovered {
-                    outcome: plan.outcome.clone(),
-                    findings: plan.findings.clone(),
-                    records,
-                };
-                if plan.changes.is_empty() {
-                    return Ok(done(0));
+                let discover::Plan {
+                    outcome,
+                    findings,
+                    changes,
+                } = discover::plan(&input, &view.cells, obs)?;
+                if changes.is_empty() {
+                    return Ok(Discovered {
+                        outcome,
+                        findings,
+                        records: 0,
+                    });
                 }
-                let request = typed::request_id(APPLICATION, compiled.table.role, &plan.changes)?;
-                let command = Command::Write {
-                    request,
-                    changes: plan.changes.clone(),
-                };
+                let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
+                let command = Command::Write { request, changes };
                 if log.retry(session.actor(), &command)?.is_some() {
-                    return Ok(done(0));
+                    return Ok(Discovered {
+                        outcome,
+                        findings,
+                        records: 0,
+                    });
                 }
                 if !quota_room(session, &log, &view, discover::REGISTRATION_RESERVE) {
                     return Ok(Discovered {
                         outcome: discover::Outcome::QuotaSpent,
-                        findings: plan.findings.clone(),
+                        findings,
                         records: 0,
                     });
                 }
                 application::append(session, store, &command.encode()?)?;
-                Ok(done(1))
+                Ok(Discovered {
+                    outcome,
+                    findings,
+                    records: 1,
+                })
             },
         )
     }
@@ -587,11 +604,12 @@ impl Registry {
                         .iter()
                         .find(|binding| binding.actor() == actor)
                         .map(|binding| keys::uuid32(binding.machine()));
-                    let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
+                    let empty = crate::typed::owned::OwnedRead::default();
+                    let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
                     Ok(LabView::read(
                         &view.cells,
-                        &owned(MACHINE_FACTS.name),
-                        &owned(MAILBOX_OBS.name),
+                        owned(MACHINE_FACTS.name),
+                        owned(MAILBOX_OBS.name),
                         uuid.as_deref(),
                     ))
                 };

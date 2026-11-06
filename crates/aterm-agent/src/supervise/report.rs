@@ -5,10 +5,10 @@
 
 use std::fmt;
 
+use aterm_phase::phase::{panel_cut, rule_columns};
 use aterm_phase::{Program, ScreenReader};
 
 use super::blocks::{View, view_rows};
-use super::phase::transcript_end;
 use super::run::{Ctl, CtlReply, Fail, Session};
 
 /// [`ReportOpts::max_rows`]' default.
@@ -151,7 +151,9 @@ pub struct Report {
     pub marker: Marker,
     /// The ledger turn it starts from (`marker=ledger`).
     pub turn: Option<u64>,
-    /// The rows, from the start to where the transcript ends, verbatim.
+    /// The rows, from the start to where the transcript ends: the screen's as the transcript's
+    /// readers read them (beside Claude Code's side panel, each row's words up to the panel's
+    /// rule, the padding before it trimmed), an archived one as the archive stored it ([`join`]).
     pub rows: Vec<String>,
     /// How many of `rows`, from the top, came from the archive.
     pub archived: usize,
@@ -412,7 +414,22 @@ pub(super) struct Joined {
     pub(super) upto: u64,
 }
 
-/// Join an `offscreen … screen=1` read.
+/// JOIN AN `offscreen … screen=1` READ: the archived rows as the archive stored them, then the
+/// screen's rows to `reader`'s [`ScreenReader::transcript_end`], each as its
+/// [`ScreenReader::transcript`] reads it (Claude Code's: each row's words up to its side panel's
+/// rule, the padding before it trimmed). An archived row is the row's text whole as the grid read
+/// it back when it scrolled off (aterm-core's `AltArchive`: beside the panel, the padding, the
+/// panel's rule and its text with it), and nothing the read carries says which archived rows
+/// were drawn beside the screen's panel: the archive keeps no column or panel of its own, and a
+/// panel that opens or closes is no break of its own. Its diff rewrites the rows above the
+/// composer in place, archiving none of them and recording no break, when the rows it sees
+/// unchanged vote that nothing moved (a row under the composer, an agent's token count, changed in
+/// the same frame, so the composer's rows vote), when few of the rows it compares changed, or
+/// when both frames hold fewer than three rows with words; so a read that counts no break can hold
+/// rows drawn with no panel, a table's own `│` at the rule's column among them, before rows drawn
+/// beside it. An archived row is kept whole, the panel's text with it, rather than cut at a `│`
+/// that may be the worker's own (KI-1101-3); [`begins_with`] reads one cut at each `│` it draws
+/// only to find where the report starts.
 pub(super) fn join(off: &Offscreen, reader: &dyn ScreenReader) -> Joined {
     let count = u64::try_from(off.archived.len()).unwrap_or(u64::MAX);
     let upto = if count > 0 {
@@ -420,6 +437,7 @@ pub(super) fn join(off: &Offscreen, reader: &dyn ScreenReader) -> Joined {
     } else {
         off.last
     };
+    let transcript = reader.transcript(&off.screen);
     let end = reader.transcript_end(&off.screen).min(off.screen.len());
     let got = |index: u64| count > 0 && index >= off.first && index <= upto;
     let reshown = |r: usize| {
@@ -434,7 +452,7 @@ pub(super) fn join(off: &Offscreen, reader: &dyn ScreenReader) -> Joined {
     rows.extend(
         (0..end)
             .filter(|&r| !reshown(r))
-            .map(|r| off.screen[r].clone()),
+            .map(|r| transcript.rows()[r].clone()),
     );
     Joined {
         rows,
@@ -456,14 +474,15 @@ fn user_row(row: &str, caret: char) -> bool {
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
-/// The first `need` non-whitespace characters of the user block at `at`.
-pub(super) fn user_text(rows: &[String], at: usize, need: usize) -> String {
-    let mut chars = rows[at].chars();
+/// The first `need` non-whitespace characters of the user block at `at`, each of its rows cut at
+/// the side panel's rule at cell column `rule` ([`panel_cut`]; `None` reads each as it is).
+fn user_text(rows: &[String], at: usize, need: usize, rule: Option<usize>) -> String {
+    let mut chars = panel_cut(&rows[at], rule).chars();
     chars.next();
     let head = chars.as_str();
     let tail = rows[at + 1..]
         .iter()
-        .map(String::as_str)
+        .map(|r| panel_cut(r, rule))
         .take_while(|r| r.is_empty() || r.starts_with(char::is_whitespace));
     std::iter::once(head)
         .chain(tail)
@@ -471,6 +490,25 @@ pub(super) fn user_text(rows: &[String], at: usize, need: usize) -> String {
         .filter(|c| !c.is_whitespace())
         .take(need)
         .collect()
+}
+
+/// WHETHER THE USER BLOCK AT `at` BEGINS WITH `want`, a turn's first `need` (at most
+/// [`MARKER_CHARS`]) non-whitespace characters, read across the rows its text wraps onto
+/// ([`user_text`]): its rows as they are, or each cut at the cell column of a `│` its first row
+/// draws ([`rule_columns`], [`panel_cut`]). Beside Claude Code's side panel a turn wraps at the
+/// panel's rule and its rows end in the padding, the rule and the panel's text, which an archived
+/// row keeps ([`join`]), so read as stored a turn whose first `need` characters run past its first
+/// row is none of the block's; cut at the rule it was drawn beside, it is the turn's words. An
+/// archived row says by nothing which `│` that was, and the screen does not either (by the time
+/// it is read the panel may be closed or its rule at another column), so each is tried: a block
+/// whose rows were drawn beside one panel is found whatever the screen draws now. A screen's row
+/// comes cut at the screen's own rule already ([`join`], [`screen_only`]: the screen's
+/// transcript). The cuts are no more than readings for this match: a row a cut is wrong for (one
+/// drawn with no panel, its own `│` among its words) is matched as it is, and the report's rows
+/// stay as [`join`] reads them.
+pub(super) fn begins_with(rows: &[String], at: usize, want: &str, need: usize) -> bool {
+    user_text(rows, at, need, None) == want
+        || rule_columns(&rows[at]).any(|rule| user_text(rows, at, need, Some(rule)) == want)
 }
 
 /// Whether `text` may show as a `[Pasted text …]` row.
@@ -497,7 +535,8 @@ pub(super) fn paste_fits(row: &str, text: &str) -> bool {
 
 /// Where the report starts in `rows`: for the ledger, the last user row (one
 /// that opens with `caret`) whose text begins with the turn's first
-/// [`MARKER_CHARS`] characters (whitespace aside), else — for a paste-like
+/// [`MARKER_CHARS`] characters (whitespace aside), its rows read as they are or cut at each `│`
+/// its first row draws ([`begins_with`]), else — for a paste-like
 /// turn — the last `[Pasted text …]` row when it fits the text; without a
 /// ledger turn, the last user row; after `--since`, the top.
 fn find_start(rows: &[String], marker: Marker, text: Option<&str>, caret: char) -> Option<usize> {
@@ -522,7 +561,7 @@ fn find_start(rows: &[String], marker: Marker, text: Option<&str>, caret: char) 
                     .iter()
                     .rev()
                     .copied()
-                    .find(|&i| user_text(rows, i, need) == want)
+                    .find(|&i| begins_with(rows, i, &want, need))
             };
             let text = text.unwrap_or("");
             by_text.or_else(|| {
@@ -578,9 +617,12 @@ fn finish(
     }
 }
 
-/// A host without the archive: the screen's transcript alone.
+/// A host without the archive: the screen's transcript alone, its rows as [`join`] reads the
+/// screen's, by Claude Code's grammar.
 fn screen_only(marker: Marker, turn: Option<u64>, text: Option<&str>, screen: &[String]) -> Report {
-    let rows = &screen[..transcript_end(screen)];
+    let reader = Program::Claude.reader();
+    let transcript = reader.transcript(screen);
+    let rows = &transcript.rows()[..reader.transcript_end(screen).min(screen.len())];
     let start = find_start(rows, marker, text, CLAUDE_CARET);
     let mut reasons = vec![Reason::NoArchive];
     if start.is_none() {
@@ -664,7 +706,8 @@ impl<C: Ctl> Session<'_, C> {
             let screen = self.full_screen()?;
             return Ok(screen_only(marker, turn, text.as_deref(), &screen.rows));
         };
-        let joined = join(&off, Program::Claude.reader());
+        let reader = Program::Claude.reader();
+        let joined = join(&off, reader);
         let start = find_start(&joined.rows, marker, text.as_deref(), CLAUDE_CARET);
         let (mut reasons, recheck) = assess(&off, &joined, marker, mark, start);
         if let Some(k) = recheck

@@ -419,6 +419,7 @@ mod tests {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         };
         app.begin_edit(EditCall {
             ticket,

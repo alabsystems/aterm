@@ -293,16 +293,18 @@ pub fn seal_at(
     let salt = random::<32>()?;
     wire.extend_from_slice(&salt);
     wire.extend_from_slice(&((plaintext.len() + 16) as u32).to_le_bytes());
-    let mut body = Vec::with_capacity(plaintext.len() + 16);
-    body.extend_from_slice(plaintext);
-    cipher(key, &salt, &wire)?
-        .seal_in_place_append_tag(
+    let cipher = cipher(key, &salt, &wire)?;
+    let aad_end = wire.len();
+    wire.extend_from_slice(plaintext);
+    let (aad, in_out) = wire.split_at_mut(aad_end);
+    let tag = cipher
+        .seal_in_place_separate_tag(
             aead::Nonce::assume_unique_for_key([0; 12]),
-            aead::Aad::from(&wire),
-            &mut body,
+            aead::Aad::from(&*aad),
+            in_out,
         )
         .map_err(|_| Error::new("database encryption failed"))?;
-    wire.extend_from_slice(&body);
+    wire.extend_from_slice(tag.as_ref());
     wire.extend_from_slice(&signed(seed, b"aterm-db/operation/2", &wire)?);
     Ok(wire)
 }
@@ -373,11 +375,20 @@ pub fn open(manifest: &Manifest, key: &[u8; 32], wire: &[u8]) -> Result<Opened> 
 }
 pub(crate) fn cipher(key: &[u8; 32], salt: &[u8; 32], header: &[u8]) -> Result<aead::LessSafeKey> {
     const PREFIX: &[u8] = b"aterm-db/payload/1";
+    const STACK_INFO_CAP: usize = 576;
     let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(salt, key));
-    let mut info = Vec::with_capacity(PREFIX.len() + header.len());
-    info.extend_from_slice(PREFIX);
-    info.extend_from_slice(header);
-    let subkey = zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &info));
+    let total = PREFIX.len() + header.len();
+    let subkey = if total <= STACK_INFO_CAP {
+        let mut buf = [0u8; STACK_INFO_CAP];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        buf[PREFIX.len()..total].copy_from_slice(header);
+        zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &buf[..total]))
+    } else {
+        let mut info = Vec::with_capacity(total);
+        info.extend_from_slice(PREFIX);
+        info.extend_from_slice(header);
+        zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &info))
+    };
     Ok(aead::LessSafeKey::new(
         aead::UnboundKey::new(&aead::CHACHA20_POLY1305, subkey.as_ref())
             .map_err(|_| Error::new("invalid encryption key"))?,

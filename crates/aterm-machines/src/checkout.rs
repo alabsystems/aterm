@@ -734,11 +734,26 @@ pub(crate) fn align(
     path: &Path,
     origin: &Origin,
 ) -> Result<Stands, Unread> {
+    align_guarded(sys, user, path, origin, &|| Ok(()))
+}
+
+/// [`align`] with current authorization checked before its fetch and its worktree update.
+/// # Errors
+/// As [`align`], or authorization changed while origin was being read or fetched.
+pub(crate) fn align_guarded(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Stands, Unread> {
+    current().map_err(Unread::from)?;
     let before = read(sys, user, path, origin)?;
     let default = match &before {
         Stands::Behind { branch, .. } | Stands::Unfetched { branch, .. } => branch.clone(),
         Stands::Current { .. } | Stands::Kept(_) => return Ok(before),
     };
+    current().map_err(Unread::from)?;
     let fetch = run(
         sys,
         &network(sys, user, Some(path))
@@ -785,6 +800,7 @@ pub(crate) fn align(
     let Stands::Behind { .. } = &stands else {
         return Ok(stands);
     };
+    current().map_err(Unread::from)?;
     let merge = run(
         sys,
         &network(sys, user, Some(path))

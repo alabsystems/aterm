@@ -159,7 +159,9 @@ impl Policy {
     }
 
     pub fn text(&self) -> String {
-        let mut text = "version = 1\n".to_owned();
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(16 + self.grants.len() * 640);
+        text.push_str("version = 1\n");
         for grant in self.grants.values() {
             text.push_str("\n[[grant]]\n");
             for (name, bytes) in [
@@ -172,16 +174,17 @@ impl Policy {
                 ("credential", &grant.binding.credential),
                 ("policy", &grant.binding.policy),
             ] {
-                text.push_str(&format!(
-                    "{name} = {:?}\n",
-                    aterm_codec::hex::encode_lower(bytes)
-                ));
+                text.push_str(name);
+                text.push_str(" = \"");
+                aterm_codec::hex::push_lower(&mut text, bytes);
+                text.push_str("\"\n");
             }
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "adapter = {:?}\nlifetime_ms = {}\n",
                 grant.binding.adapter,
                 grant.lifetime.as_millis()
-            ));
+            );
         }
         text
     }

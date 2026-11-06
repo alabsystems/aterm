@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+use astream_wire::{ReceiptVerdict, WakeClass};
+use aterm_messages::presence::StoryVerb;
+
 /// Fallback token substituted for unrecognized vocabulary words.
 pub const UNKNOWN: &str = "unknown";
 
@@ -706,6 +709,7 @@ pub const BOX_WORDS: &[&str] = &[
     "goal-resume",
     "mcp-server",
     "auto-mode-setup",
+    "conversation-resume",
     "chrome-intro",
     "other",
 ];
@@ -794,6 +798,7 @@ pub const NEED_WORDS: &[&str] = &[
     "approval:goal-resume",
     "approval:mcp-server",
     "approval:auto-mode-setup",
+    "approval:conversation-resume",
     "approval:chrome-intro",
     "approval:other",
     "question",
@@ -824,62 +829,69 @@ pub const NEED_WORDS: &[&str] = &[
     "approval",
 ];
 
-/// Closed `word=` vocabulary across agent verdicts, acts, and needs.
-pub const WORD_WORDS: &[&str] = &[
-    "busy",
-    "prompt",
-    "question",
-    "idle",
-    "survey",
-    "unknown",
-    "-",
-    "wall:usage-session",
-    "wall:usage-weekly",
-    "wall:model-bucket",
-    "wall:spend",
-    "wall:context",
-    "wall:auth",
-    "wall:api-error",
-    "wall:overloaded",
-    "wall:memory",
-    "wall:unresponsive",
-    "approve",
-    "deny",
-    "answer",
-    "continue",
-    "relaunch",
-    "escalate",
-    "interrupt",
-    "dispatch",
-    "landed",
-    "on-track",
-    "off-track",
-    "blocked",
-    "done",
-    "failed",
-    "needs-human",
-    "unsure",
-    "review",
-    "decision",
-    "help",
-    "escalated",
-    "failure",
-    "unresponsive",
-    "exited",
-    "approved",
-    "dismissed",
-    "reconnected",
-    "timeout",
-    "exit",
-    "compacted",
-    "warned",
-    "chose",
-    "handled",
-    "refused",
-    "deferred",
-    "restart",
-    "signal",
-];
+/// Closed `word=` vocabulary across agent verdicts, acts, and needs. A `story` mark's words are
+/// aterm-messages' [`StoryVerb::TOLD_WORDS`] and a `mail-seen` mark's (an inbox receipt's
+/// verdict) are astream's [`ReceiptVerdict::ALL`], each spelled from its source: a word added
+/// to either fails to compile here until it is spelled.
+pub const WORD_WORDS: &[&str] = &{
+    let [chose] = StoryVerb::TOLD_WORDS;
+    let [a, b, c] = ReceiptVerdict::ALL;
+    [
+        "busy",
+        "prompt",
+        "question",
+        "idle",
+        "survey",
+        "unknown",
+        "-",
+        "wall:usage-session",
+        "wall:usage-weekly",
+        "wall:model-bucket",
+        "wall:spend",
+        "wall:context",
+        "wall:auth",
+        "wall:api-error",
+        "wall:overloaded",
+        "wall:memory",
+        "wall:unresponsive",
+        "approve",
+        "deny",
+        "answer",
+        "continue",
+        "relaunch",
+        "escalate",
+        "interrupt",
+        "dispatch",
+        "landed",
+        "on-track",
+        "off-track",
+        "blocked",
+        "done",
+        "failed",
+        "needs-human",
+        "unsure",
+        "review",
+        "decision",
+        "help",
+        "escalated",
+        "failure",
+        "unresponsive",
+        "exited",
+        "approved",
+        "dismissed",
+        "reconnected",
+        "timeout",
+        "exit",
+        "compacted",
+        "warned",
+        chose,
+        a.as_str(),
+        b.as_str(),
+        c.as_str(),
+        "restart",
+        "signal",
+    ]
+};
 
 /// Closed `gap why=` loss-reason vocabulary.
 pub const WHY_WORDS: &[&str] = &[
@@ -952,19 +964,24 @@ pub const POOL_WORDS: &[&str] = &["shared"];
 /// Closed `mail dir=` direction vocabulary.
 pub const DIR_WORDS: &[&str] = &["in", "out", "unknown"];
 
-/// Closed `mail kind=` vocabulary.
-pub const MAIL_KIND_WORDS: &[&str] = &[
-    "task",
-    "ask",
-    "answer",
-    "report",
-    "note",
-    "unknown",
-    "control",
-    "ack",
-    "expired",
-    "undeliverable",
-];
+/// Closed `mail kind=` vocabulary: astream's [`WakeClass::ALL`] spelled (the fabric's nine `in`
+/// kinds, highest priority first), then [`UNKNOWN`]. A kind added to `ALL` fails to compile here
+/// until it is spelled.
+pub const MAIL_KIND_WORDS: &[&str] = &{
+    let [a, b, c, d, e, f, g, h, i] = WakeClass::ALL;
+    [
+        a.as_str(),
+        b.as_str(),
+        c.as_str(),
+        d.as_str(),
+        e.as_str(),
+        f.as_str(),
+        g.as_str(),
+        h.as_str(),
+        i.as_str(),
+        UNKNOWN,
+    ]
+};
 
 /// Closed `status phase=` vocabulary.
 pub const PHASE_WORDS: &[&str] = &[

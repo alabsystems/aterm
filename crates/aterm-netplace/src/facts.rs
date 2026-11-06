@@ -56,31 +56,28 @@ fn route_facts(
     route: &aterm_uds::network::DefaultRoute,
     interfaces: &[aterm_uds::network::InterfaceAddress],
 ) -> Option<RouteFacts> {
-    let mut candidates = interfaces
-        .iter()
-        .filter_map(|address| match address.address {
-            IpAddr::V4(v4) if address.name == route.interface => {
-                Some((v4, prefix_of(address.netmask).unwrap_or(32)))
-            }
-            _ => None,
-        });
-    let all: Vec<(Ipv4Addr, u8)> = candidates.by_ref().collect();
-    let (address, prefix) = all
-        .iter()
-        .find(|(address, prefix)| {
-            route.gateway.is_some_and(|gw| {
-                RouteFacts {
-                    interface: String::new(),
-                    address: *address,
-                    prefix: *prefix,
-                    gateway: None,
-                    gateway_hw: None,
-                }
-                .on_link(IpAddr::V4(gw))
-            })
-        })
-        .or_else(|| all.first())
-        .copied()?;
+    let mut first = None;
+    let mut matched = None;
+    for address in interfaces {
+        let IpAddr::V4(v4) = address.address else {
+            continue;
+        };
+        if address.name != route.interface {
+            continue;
+        }
+        let prefix = prefix_of(address.netmask).unwrap_or(32);
+        if first.is_none() {
+            first = Some((v4, prefix));
+        }
+        if route
+            .gateway
+            .is_some_and(|gw| crate::place::on_link_v4(v4, prefix, gw))
+        {
+            matched = Some((v4, prefix));
+            break;
+        }
+    }
+    let (address, prefix) = matched.or(first)?;
     Some(RouteFacts {
         interface: route.interface.clone(),
         address,

@@ -23,6 +23,73 @@ fn state_path(opts: &Opts, session: &str) -> std::path::PathBuf {
     state_dir(opts).join(format!("{session}.json"))
 }
 
+#[test]
+fn stale_agent_pruners_preserve_new_retirement_debt() {
+    let mut retained = Vec::new();
+    for retired in [false, true] {
+        for agent in [
+            upgrade::Agent::Agy,
+            upgrade::Agent::Muse,
+            upgrade::Agent::Codex,
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let opts = drive(dir.path());
+            let tab = "s-000000000000000000ab";
+            let key = match agent {
+                upgrade::Agent::Agy => agy::key(tab),
+                upgrade::Agent::Codex => codex_alab_drive::key(tab),
+                _ => muse::key(tab),
+            };
+            save_checked(
+                &opts,
+                &key,
+                &St {
+                    agent,
+                    tab: tab.into(),
+                    phase: Phase::Done,
+                    ..St::default()
+                },
+            )
+            .unwrap();
+            let published = std::cell::Cell::new(false);
+            let life = |seen: &str| {
+                assert_eq!(seen, tab);
+                let mut debt = load(&opts, &key).unwrap();
+                if retired {
+                    debt.native_coordination = true;
+                    debt.native_retired_unissued = true;
+                } else {
+                    debt.phase = Phase::Pending;
+                }
+                save_checked(&opts, &key, &debt).unwrap();
+                published.set(true);
+                TabLife::Gone
+            };
+            // The injected prune clock makes both the old image and the replacement
+            // eligible by age: a fresh timestamp cannot make this preservation vacuous.
+            let now = now_s() + 8 * 86_400;
+            match agent {
+                upgrade::Agent::Agy => agy::prune(&opts, now, life),
+                upgrade::Agent::Codex => codex_alab_drive::prune(&opts, now, life),
+                _ => muse::prune(&opts, now, life),
+            }
+            assert!(published.get(), "the competing writer ran before removal");
+            retained.push((
+                agent,
+                retired,
+                load(&opts, &key).is_some_and(|st| {
+                    if retired {
+                        st.native_retired_unissued
+                    } else {
+                        st.phase == Phase::Pending
+                    }
+                }),
+            ));
+        }
+    }
+    assert!(retained.iter().all(|(_, _, kept)| *kept), "{retained:?}");
+}
+
 /// A `text --json trim tail=3` reply from a busy Claude Code tab: the cursor
 /// row is absolute (57) and `first` is where the reply's rows start, so the
 /// caret sits on reply row 0, column 2.
@@ -654,8 +721,8 @@ fn a_relaunch_only_lanes_record_is_its_lanes_never_the_upgrades() {
     assert_ne!(retired, muse, "PRECONDITION: the record names its agent");
     std::fs::write(&path, retired).expect("write");
     assert!(
-        load(&base, &name).is_none(),
-        "a retired agent's record is no record"
+        load_record(&base, &name).is_err(),
+        "a retired agent's record is unreadable, never absent"
     );
     assert!(
         in_flight(&base).is_empty(),
@@ -11833,7 +11900,15 @@ fn restart_driven(
         selected.as_ref(),
         &Script::new(shell.id(), usize::MAX, None),
     );
-    let saved = load(&opts, SESSION);
+    let saved = if claim_blocked {
+        assert!(
+            load_record(&opts, SESSION).is_err(),
+            "the blocked destination remains unreadable"
+        );
+        None
+    } else {
+        load(&opts, SESSION)
+    };
     if cancel_at.is_some() {
         assert!(
             agent.try_wait().unwrap().is_none(),
@@ -11853,7 +11928,7 @@ fn restart_driven(
 }
 
 /// The restart in place (memory, model, account) sends its signal only once its claim is on
-/// disk, as the upgrade's does: with the record unwritable it waits (`wait:claim-unwritten`) and
+/// disk, as the upgrade's does: with the existing record unreadable it waits (`wait:record-unreadable`) and
 /// nothing is signalled, so no agent ends that no record says to relaunch. The control: with the
 /// claim written the signal goes, and the claim names the grace its gate waited out and, for a
 /// line with no `cd` of its own, the shell's directory the line runs in.
@@ -11874,11 +11949,11 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
         true,
         None,
     );
-    assert_eq!(blocked.report.step, "wait:claim-unwritten", "{blocked:?}");
+    assert_eq!(blocked.report.step, "wait:record-unreadable", "{blocked:?}");
     assert_eq!(
         blocked.claim,
-        RestartClaim::Unclaimed,
-        "an unwritten claim holds none: {blocked:?}"
+        RestartClaim::Unread,
+        "an unreadable record cannot establish whether a claim exists: {blocked:?}"
     );
     assert!(
         !asked.iter().any(|l| l.contains(" signal ")),
@@ -23313,7 +23388,7 @@ fn a_record_of_an_unknown_agent_is_passed_by_and_left_as_it_lies() {
         }
     };
     for (name, _) in &theirs {
-        assert_eq!(load(&opts, name), None, "{name}");
+        assert!(load_record(&opts, name).is_err(), "{name}");
     }
     assert_eq!(
         load(&opts, claude_done).map(|st| st.agent),
@@ -23356,9 +23431,12 @@ fn a_record_of_an_unknown_agent_is_passed_by_and_left_as_it_lies() {
     assert_eq!(resume(&mine).step, "current");
     assert!(owed(&cdx), "control: its continuation owed");
     as_it_lies(&theirs);
-    assert!(hold_clock(&mine, now + 600));
+    assert!(!hold_clock(&mine, now + 600));
     as_it_lies(&theirs);
-    assert!(hold_clock(&cdx, now + 600));
+    assert!(
+        !hold_clock(&cdx, now + 600),
+        "unread records require another look"
+    );
     assert_eq!(
         load(&opts, &codex_name).map(|st| st.ready_since),
         Some(now + 600),
@@ -32383,7 +32461,7 @@ fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may
             started.elapsed() < Duration::from_secs(60),
             "the child never exited"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     half(pid);
     let with_zombie = session_files_in(&claude_dir).map(|f| f.len());

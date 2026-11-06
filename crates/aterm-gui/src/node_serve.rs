@@ -19,11 +19,12 @@ use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::node_service::{AlabTcpAdvertiser, NodeJobLock};
+use aterm_net::fleet::heard::{Heard, LiveSight, Sight};
 use aterm_net::fleet::link::{
     Incoming, LinkClock, LinkConfig, LinkStream, Neighbours, NoteProven, ServeFn, SystemClock,
 };
@@ -840,40 +841,68 @@ pub type UnitsFn = Arc<dyn Fn() -> Option<atpkg::store::Layout> + Send + Sync>;
 /// What is told each generation's neighbour table as it starts ([`NodeMesh::on_neighbours`]).
 pub type OnNeighbours = Arc<dyn Fn(&Arc<Neighbours>) + Send + Sync>;
 
-/// What a node service's mesh is (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4, §11 B5): with
-/// it on, the service holds neighbour links ([`Neighbours`]) and serves the ops only the mesh
-/// carries; with it off, its listener serves as before.
+/// What a node service's mesh is (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4, §11 B5, B6):
+/// with it on, the service holds neighbour links ([`Neighbours`]), serves the ops only the mesh
+/// carries, seeds this Mac's home-day ledger as it starts
+/// (`aterm_secrets::home_lan::seed_at`), and notes each peer the mesh proves, at each handshake
+/// its listener takes or its table dials and each link's re-proof, in the heard ledger of its
+/// network place ([`Heard`]); with it off, its listener serves, and notes, as before.
 #[derive(Clone)]
 pub struct NodeMesh {
     /// The mesh is on: `aterm_types::mesh_switch::MESH`, read once into this field.
     pub on: bool,
     /// The clock each link's re-proof reads.
     pub clock: Arc<dyn LinkClock>,
-    /// Where each node-proven answer of a link goes. B6 notes it in the heard ledger; until then
-    /// a link's proofs are noted nowhere.
-    pub note: NoteProven,
+    /// What the heard ledger's noting call reads of this Mac (B6): the wall clock, the default
+    /// route and the interface holding an address.
+    pub sight: Arc<dyn Sight>,
+    /// Told each node-proven answer of a link, a re-proof once the heard ledger noted it: a
+    /// test's tap.
+    pub watch: NoteProven,
     /// The toolset store whose units a `Units` stream takes, read for each one (`None`: none).
     pub units: UnitsFn,
     /// Told each generation's neighbour table as it starts: where the overlay (B7a) attaches,
     /// and a test reaches the table.
     pub on_neighbours: Option<OnNeighbours>,
+    /// How the job keeps the fabric's `bus.log` with the mesh on (§11 C2): the root aterm-link
+    /// resolves, whether the fabric is on there, and the broker job it retires. `None` keeps no
+    /// `bus.log` (a test of the links alone, or a root that does not resolve).
+    pub bus: Option<aterm_mesh::logs::BusKeeperConfig>,
+    /// The clock the vault pass and its timer read.
+    pub pass_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The vault pass's pace.
+    pub pass_pace: aterm_secrets::client::NodePassPace,
+    /// Starts the converge pass's runner after a version the vault pass applied.
+    pub pass_converge: Arc<dyn Fn() -> Option<aterm_uds::spawnfd::Child> + Send + Sync>,
 }
 
 impl NodeMesh {
-    /// The node job's: the switch as this build was compiled, the system's clock, and the
-    /// store atpkg is configured with.
+    /// The node job's: the switch as this build was compiled, the system's clock, this Mac's own
+    /// sight of its network, and the store atpkg is configured with.
     #[must_use]
     pub fn live() -> Self {
         Self {
             on: aterm_types::mesh_switch::MESH,
             clock: Arc::new(SystemClock::new()),
-            note: Arc::new(|_| {}),
+            sight: Arc::new(LiveSight),
+            watch: Arc::new(|_| {}),
             units: Arc::new(|| {
                 atpkg::manager_enabled()
                     .then(atpkg::store::resolve_configured)
                     .flatten()
             }),
             on_neighbours: None,
+            bus: live_bus(),
+            pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
+            pass_pace: aterm_secrets::client::NodePassPace::LIVE,
+            pass_converge: Arc::new(|| {
+                let exe = std::env::current_exe().ok()?;
+                aterm_secrets::converge::start(&exe, aterm_secrets::converge::SUBSCRIBER)
+                    .map_err(|error| {
+                        aterm_log::warn!("node: could not start the converge pass: {error}");
+                    })
+                    .ok()
+            }),
         }
     }
 
@@ -882,8 +911,43 @@ impl NodeMesh {
     pub(crate) fn off() -> Self {
         Self {
             on: false,
-            ..Self::live()
+            clock: Arc::new(SystemClock::new()),
+            sight: Arc::new(LiveSight),
+            watch: Arc::new(|_| {}),
+            units: Arc::new(|| None),
+            on_neighbours: None,
+            bus: None,
+            pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
+            pass_pace: aterm_secrets::client::NodePassPace::LIVE,
+            pass_converge: Arc::new(|| None),
         }
+    }
+}
+
+/// The node job's keeper of `bus.log` (§11 C2), resolved only where the mesh is on: the fabric
+/// root of this login (`aterm_link::enable::Paths`), looked at every [`retry`] beside each poke.
+/// A root that does not resolve keeps no `bus.log`, and says so.
+fn live_bus() -> Option<aterm_mesh::logs::BusKeeperConfig> {
+    if !aterm_types::mesh_switch::MESH {
+        return None;
+    }
+    aterm_mesh::logs::BusKeeperConfig::live(retry())
+        .inspect_err(|e| {
+            aterm_log::warn!("aterm node serve: keeps no bus.log: its fabric root: {e}");
+        })
+        .ok()
+}
+
+impl NodeMesh {
+    /// The keeper of `bus.log` this job starts: with the mesh on and a root resolved, `None`
+    /// otherwise, or where its thread cannot start (said).
+    fn keep_bus(&self) -> Option<aterm_mesh::logs::BusKeeper> {
+        let cfg = self.bus.clone().filter(|_| self.on)?;
+        aterm_mesh::logs::BusKeeper::start(cfg)
+            .inspect_err(|e| {
+                aterm_log::warn!("aterm node serve: bus.log's keeper did not start: {e}")
+            })
+            .ok()
     }
 }
 
@@ -1308,6 +1372,10 @@ fn claims_off_on_quit(relay_dir: &Path, off: &dyn Fn()) -> bool {
 fn arm_claims_off_on_quit(relay_dir: PathBuf, off: fn()) {
     if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |_sig| {
         claims_off_on_quit(&relay_dir, &off);
+        // The quit ends the process without the keepers' drops: all three logs close first, so
+        // its weak tier is flushed in full and marked closed (C2).
+        aterm_mesh::logs::close_bus_at_quit();
+        aterm_mesh::logs::close_mesh_at_quit();
         crate::owned_endpoint::die_of_quit_signal();
     }) {
         aterm_log::warn!(
@@ -1372,12 +1440,22 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         if let Some(updates) = cfg.updates.as_ref() {
             spawn_node_updates(updates, cfg.relay_dir.clone(), Arc::clone(&cfg.stop));
         }
+        let _ = spawn_node_vault_pass(&cfg);
     }
     // This Mac's network place is kept while no window runs too (the keeper is one per Mac:
     // whichever process holds its lock). A unit test's scratch state starts none.
     #[cfg(unix)]
     if !cfg!(test) {
         let _ = aterm_netplace::keeper::start(&cfg.state_dir);
+    }
+    // The first start of a build with the 7-day home condition credits each network the place
+    // remembers as the ALab LAN, once, so automatic LAN admission never stops across it (B6). A
+    // seed that cannot run now (an unread record, a held lock) runs at the vault's first look.
+    if cfg.mesh.on
+        && let Err(error) =
+            aterm_secrets::home_lan::seed_at(&cfg.state_dir, cfg.mesh.sight.now_ms())
+    {
+        aterm_log::info!("node: the home-day seed waits: {error}");
     }
     // Held only while this job serves the port or is about to bind it: a window leaves the port
     // to a job that holds it, and serves it (or says why it cannot) while this job idles.
@@ -1398,7 +1476,12 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
     let denied_cache: Arc<Mutex<DeniedCache>> = Arc::new(Mutex::new(DeniedCache::new()));
     let mut waits_for_step = false;
     let mut went_round = false;
+    // The fabric's bus.log, hosted here with the mesh on (C2), whatever the generations do:
+    // local clients reach it with no fleet key, no Local Network step and no node key. Held
+    // before the mesh logs, so it closes after them.
+    let bus_keeper = cfg.mesh.keep_bus();
     let mut mesh_logs = MeshHeld::default();
+    mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
 
     while !cfg.stop.load(Ordering::Acquire) {
         // Round again, the job has held the LAN for a tick as its configuration says, or served
@@ -1508,6 +1591,7 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         // One read of the node identity for the generation and the mesh logs it serves, so the
         // two never pair one key's links with another key's logs.
         let node = aterm_net::fleet_member::read_node_identity(&cfg.state_dir);
+        mesh_logs.listening(bound_addr.port());
         let mesh_now = mesh_logs.get(&cfg, &node);
         // A generation that served nothing (its watcher never started) gives the port back.
         if !serve_one_node_generation(
@@ -1532,6 +1616,39 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The vault pass (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, B10), with the mesh on and a
+/// vault this job reads: it needs no listener, so it runs while the job idles for the LAN, and it
+/// posts what it signed only where the LAN may be used. The vault's subscriber keeps running
+/// beside it until D4; the state lock orders the two.
+fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandle<()>> {
+    let (true, Some(paths)) = (cfg.mesh.on, cfg.vault_paths.clone()) else {
+        return None;
+    };
+    let stop = Arc::clone(&cfg.stop);
+    let state_dir = cfg.state_dir.clone();
+    let config_path = cfg.config_path.clone();
+    let lan_may_go = cfg.lan_may_go;
+    let now_ms = Arc::clone(&cfg.mesh.pass_now_ms);
+    let start_converge = Arc::clone(&cfg.mesh.pass_converge);
+    let pace = cfg.mesh.pass_pace;
+    std::thread::Builder::new()
+        .name("node-vault-pass".into())
+        .spawn(move || {
+            aterm_secrets::client::run_node_pass(&aterm_secrets::client::NodePassHost {
+                paths: &paths,
+                stop: &stop,
+                held: &|| sharing_held(&state_dir, config_path.as_deref()),
+                may_post: &lan_may_go,
+                start_converge: &*start_converge,
+                now_ms: &*now_ms,
+                log: &|line| aterm_log::info!("node: {line}"),
+                pace,
+            });
+        })
+        .map_err(|error| aterm_log::warn!("node: the vault pass did not start: {error}"))
+        .ok()
+}
+
 /// One generation's neighbour links: the table, its re-proof timer, and the mesh overlay over it,
 /// torn down in order however the generation ends. The overlay and its relays are told to stop,
 /// then the links close, which ends every relay still reading one; only then are they joined.
@@ -1539,14 +1656,20 @@ struct GenerationLinks {
     table: Arc<Neighbours>,
     timer: Option<std::thread::JoinHandle<()>>,
     attached: Option<aterm_mesh::Attached>,
+    /// The mail pushes over the links (§11 C3), told to stop first, joined after the links close.
+    mail: Option<Arc<aterm_mesh::mail::MailLinks>>,
 }
 
 impl Drop for GenerationLinks {
     fn drop(&mut self) {
+        if let Some(mail) = &self.mail {
+            mail.stop_soon();
+        }
         if let Some(attached) = &self.attached {
             attached.stop_soon();
         }
         self.table.stop();
+        drop(self.mail.take());
         drop(self.attached.take());
         if let Some(timer) = self.timer.take() {
             let _ = timer.join();
@@ -1554,17 +1677,56 @@ impl Drop for GenerationLinks {
     }
 }
 
+/// What the node job's listener serves each connection: [`node_serving_now`] of the running table
+/// `running` (`fallback` where it names none) and the aterm.toml at `config_path` as it is on disk
+/// (none: the empty one), its grants those that admit now in the fleet state at `state` under the
+/// vault `vault` ([`super::in_effect`], as the window's listener reads them).
+fn node_serving(
+    (config_path, state, vault): (
+        Option<PathBuf>,
+        PathBuf,
+        Option<aterm_secrets::client::Paths>,
+    ),
+    running: Wanted,
+    fallback: Wanted,
+) -> impl Fn() -> Serving + Clone + Send + Sync + 'static {
+    move || -> Serving {
+        let text = if config_path.is_none() {
+            Some(String::new())
+        } else {
+            read_config_text(config_path.as_deref())
+        };
+        let serving = node_serving_now(&running, &fallback, text.as_deref());
+        Serving {
+            grants: super::in_effect(serving.grants, &state, vault.as_ref()),
+            ..serving
+        }
+    }
+}
+
 /// The mesh logs the node job hosts (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 B7a): opened
 /// once the mesh is on and this Mac holds its node key, kept across generations (a sealed log's
 /// reopen reads it whole) while that key stays, and closed as the job ends, however it ends.
+/// Presence (B7c) runs on them while they are held: this Mac's row every 30 seconds, and every
+/// seat's standing read from the rows; it stops before they close.
 #[derive(Default)]
 struct MeshHeld {
     mesh: Option<Arc<aterm_mesh::Mesh>>,
+    presence: Option<aterm_mesh::presence::Presence>,
+    /// The node listener's port this generation bound, which this Mac's row names.
+    port: Arc<AtomicU16>,
     /// The last reason an open failed, journaled once.
     said: Option<String>,
+    /// The job's bus.log slot (C2), which each mesh opened here joins to its revocation pass.
+    bus: Option<Arc<aterm_mesh::logs::BusSlot>>,
 }
 
 impl MeshHeld {
+    /// The node listener's port this generation bound: this Mac's next row names it.
+    fn listening(&self, port: u16) {
+        self.port.store(port, Ordering::Release);
+    }
+
     /// The mesh under `node`, the node identity this generation read: opened now where it is not
     /// yet; `None` with the mesh off, with no node key, or where it cannot open. A key that changed
     /// (the Mac rejoined) or went (it left) closes the mesh first: its records sign, and its
@@ -1588,6 +1750,7 @@ impl MeshHeld {
             && key != Some(mesh.key())
         {
             aterm_log::info!("node: the node key changed, so the mesh logs reopen");
+            self.presence = None;
             mesh.close();
             self.mesh = None;
         }
@@ -1597,6 +1760,9 @@ impl MeshHeld {
             match open_mesh(cfg) {
                 Ok(mesh) if mesh.key() == key => {
                     self.said = None;
+                    if let Some(slot) = &self.bus {
+                        mesh.join_bus(slot);
+                    }
                     self.mesh = Some(mesh);
                 }
                 Ok(mesh) => mesh.close(),
@@ -1611,15 +1777,72 @@ impl MeshHeld {
                 }
             }
         }
+        if self.presence.is_none()
+            && let Some(mesh) = self.mesh.as_ref()
+        {
+            match aterm_mesh::presence::Presence::start(
+                mesh,
+                presence_config(cfg, &self.port, Arc::downgrade(mesh)),
+            ) {
+                Ok(presence) => self.presence = Some(presence),
+                Err(e) => {
+                    let why = format!("presence did not start: {e}");
+                    if self.said.as_deref() != Some(why.as_str()) {
+                        aterm_log::warn!("node: {why}");
+                        self.said = Some(why);
+                    }
+                }
+            }
+        }
         self.mesh.clone()
     }
 }
 
 impl Drop for MeshHeld {
     fn drop(&mut self) {
+        self.presence = None;
         if let Some(mesh) = self.mesh.take() {
             mesh.close();
         }
+    }
+}
+
+/// What this Mac's presence row reads before each row: its build, its fleet addresses with the
+/// node listener's port, the membership log it holds (the vault's store, or with no vault the
+/// record store the job was given), and the topics its sessions hold, as its fabric bridge named
+/// them on `mesh`'s `bus.log` (C3). The lab tables have no store in the node job yet, so their
+/// digest is not known.
+fn presence_config(
+    cfg: &NodeServeConfig,
+    port: &Arc<AtomicU16>,
+    mesh: std::sync::Weak<aterm_mesh::Mesh>,
+) -> aterm_mesh::presence::PresenceConfig {
+    use aterm_mesh::presence::{Build, Facts, PresenceConfig, fleet_addresses};
+    let (vault, members, port) = (
+        cfg.vault_paths.clone(),
+        cfg.members.clone(),
+        Arc::clone(port),
+    );
+    let build = Build::running();
+    PresenceConfig {
+        dir: cfg.state_dir.join(aterm_mesh::logs::MESH_DIR),
+        facts: Arc::new(move || Facts {
+            build: build.clone(),
+            addresses: fleet_addresses(port.load(Ordering::Acquire)),
+            membership: match (vault.as_ref(), members.as_ref()) {
+                (Some(paths), _) => aterm_mesh::presence::membership_of_vault(paths),
+                (None, Some(members)) => {
+                    aterm_mesh::presence::membership_of_records(members.file())
+                }
+                (None, None) => None,
+            },
+            tables: None,
+            topics: mesh
+                .upgrade()
+                .map(|mesh| aterm_mesh::mail::held_topics(&mesh))
+                .unwrap_or_default(),
+        }),
+        observe: None,
     }
 }
 
@@ -1697,8 +1920,12 @@ fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
 /// Whether the node job holds its LAN uses now: this Mac left the fleet, or its `aterm.toml`'s
 /// `[swarm] enabled` does not read on ([`swarm_holds`]).
 fn fleet_turned_off_or_swarm_disabled(cfg: &NodeServeConfig) -> bool {
-    aterm_agent::node_service::left_the_fleet(&cfg.state_dir)
-        || swarm_holds(cfg.config_path.as_deref())
+    sharing_held(&cfg.state_dir, cfg.config_path.as_deref())
+}
+
+/// [`fleet_turned_off_or_swarm_disabled`] of a job's state folder and `aterm.toml`.
+fn sharing_held(state_dir: &Path, config_path: Option<&Path>) -> bool {
+    aterm_agent::node_service::left_the_fleet(state_dir) || swarm_holds(config_path)
 }
 
 /// Whether `[swarm] enabled` in the `aterm.toml` at `config_path` holds sharing off: unless it
@@ -1986,6 +2213,13 @@ fn serve_one_node_generation(
         }
     };
     let automatic_handle = automatic_joins.as_ref().map(|joins| joins.handle());
+    // Where this generation notes each peer the mesh proves (B6): its listener's handshakes, its
+    // table's dials and its links' re-proofs, with the mesh on; nowhere with it off.
+    let heard = cfg
+        .mesh
+        .on
+        .then(|| Heard::under(&cfg.state_dir, Arc::clone(&cfg.mesh.sight)));
+    let node = node.map(|me| me.noting(heard.clone()));
     if let (Some(vp), Some(me)) = (cfg.vault_paths.as_ref(), node.as_ref()) {
         let initial_log = cfg.members.as_ref().and_then(|m| m.keys());
         let _ =
@@ -1993,19 +2227,15 @@ fn serve_one_node_generation(
     }
     let proved = node.as_ref().map(|n| (n.node().to_owned(), n.key()));
     let fallback_wanted = default_node_wanted();
-    let serving_fn = {
-        let running_wanted = initial_wanted.clone();
-        let fallback = fallback_wanted.clone();
-        let config_path = cfg.config_path.clone();
-        move || -> Serving {
-            let text = if config_path.is_none() {
-                Some(String::new())
-            } else {
-                read_config_text(config_path.as_deref())
-            };
-            node_serving_now(&running_wanted, &fallback, text.as_deref())
-        }
-    };
+    let serving_fn = node_serving(
+        (
+            cfg.config_path.clone(),
+            cfg.state_dir.clone(),
+            cfg.vault_paths.clone(),
+        ),
+        initial_wanted.clone(),
+        fallback_wanted.clone(),
+    );
 
     // This Mac's membership verdict, read for each handshake and each link's re-proof.
     let deny_now: aterm_net::fleet::DenyFn = {
@@ -2042,12 +2272,16 @@ fn serve_one_node_generation(
                 mesh: mesh_logs.cloned(),
             }
             .serving();
+            let note: NoteProven = heard.as_ref().map_or_else(
+                || Arc::clone(&cfg.mesh.watch),
+                |heard| heard.noting_then(Arc::clone(&cfg.mesh.watch)),
+            );
             let table = Neighbours::new(
                 me.clone().dialing_mesh(Some(Arc::clone(&deny_now))),
                 LinkConfig {
                     verdict: Arc::clone(&deny_now),
                     serve,
-                    note: Arc::clone(&cfg.mesh.note),
+                    note,
                     clock: Arc::clone(&cfg.mesh.clock),
                 },
             );
@@ -2064,10 +2298,20 @@ fn serve_one_node_generation(
                             })
                             .ok()
                     });
+                    // The mail pushes over them (C3), once the mesh hosts its logs.
+                    let mail = mesh_logs.and_then(|mesh| {
+                        aterm_mesh::mail::MailLinks::start(
+                            me,
+                            mesh,
+                            &table,
+                            mesh_hints(cfg.state_dir.clone()),
+                        )
+                    });
                     Some(GenerationLinks {
                         table,
                         timer: Some(timer),
                         attached,
+                        mail,
                     })
                 }
                 Err(error) => {
@@ -2079,6 +2323,9 @@ fn serve_one_node_generation(
         _ => None,
     };
     let neighbours_watch = neighbours.as_ref().map(|links| Arc::clone(&links.table));
+    let mail_watch = neighbours
+        .as_ref()
+        .and_then(|links| links.mail.as_ref().map(Arc::downgrade));
 
     let watch_handle = {
         let running = Arc::clone(&running);
@@ -2182,6 +2429,10 @@ fn serve_one_node_generation(
                     if let Some(table) = &neighbours_watch {
                         table.judge();
                     }
+                    // The mail pushes route by the log as the mesh applied it (C3).
+                    if let Some(mail) = mail_watch.as_ref().and_then(std::sync::Weak::upgrade) {
+                        mail.pass();
+                    }
 
                     if let (Some(watch), Some(keys)) = (browse_watch.as_ref(), log.as_deref()) {
                         let mut discovery =
@@ -2240,6 +2491,9 @@ fn serve_one_node_generation(
                         .due_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire))
                     {
                         super::say_heartbeat_woke("node job", woke);
+                        // A record of the vault the fleet state is of, adopted where an older
+                        // build left none.
+                        aterm_agent::fleet_vault::keep(&state_dir, vault_paths.as_ref());
                         if log.as_deref().is_some_and(|keys| {
                             proved.as_ref().is_some_and(|(_, key)| !keys.admits(key))
                         }) && let Some(vp) = vault_paths.as_ref()
@@ -3162,12 +3416,39 @@ impl LinkServe {
             return incoming.refuse("unread");
         };
         // `Bus` is each mesh log's broker (B7a), which judges the peer's key itself; B7b serves
-        // `Inventory`.
+        // `Inventory`. A stream for the fabric's `bus.log` (C2) is admitted as a driver is first
+        // (§4.11): the deny list, the membership log, the keyring binding and `[fleet]`'s drive
+        // grant; the mesh then judges the key against the seats and serves it the ring.
         if op == FleetOp::Bus {
-            return match &self.mesh {
-                Some(mesh) => mesh.serve_bus(incoming),
-                None => incoming.refuse("unserved"),
+            let Some(mesh) = &self.mesh else {
+                return incoming.refuse("unserved");
             };
+            if incoming.log() == Some(aterm_net::fleet::link::BusLog::Bus) {
+                if mesh.bus().is_none() {
+                    return incoming.refuse("unserved");
+                }
+                let serving = (self.serving)();
+                let log = self.members.as_ref().and_then(|members| members.keys());
+                if let Err((why, ungranted)) = admit_linked_driver_at(
+                    incoming.peer(),
+                    &self.state_dir,
+                    &serving.grants,
+                    &denied,
+                    log.as_deref(),
+                ) {
+                    aterm_log::info!(
+                        "aterm node serve: refused {}'s bus.log stream: {why}",
+                        incoming.peer().node
+                    );
+                    let head = if ungranted {
+                        aterm_types::control_verbs::DRIVE_UNGRANTED
+                    } else {
+                        "ERR denied: "
+                    };
+                    return incoming.refuse(&format!("{head}{why}"));
+                }
+            }
+            return mesh.serve_bus(incoming);
         }
         if op == FleetOp::Inventory {
             return incoming.refuse("unserved");

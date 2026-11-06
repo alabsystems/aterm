@@ -40,17 +40,29 @@ pub fn sealed_opts(mut opts: OpenOptions) -> OpenOptions {
     opts
 }
 
-/// A broker as `aterm link broker` opens one: retained by aterm's default rules and limited by
-/// its default rate limit.
+/// A broker as the node service hosts `bus.log` (`aterm_mesh::logs::open_bus`,
+/// `docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 C2), so every world runs against it: sealed by
+/// aterm-link's rules unless `opts` names a key (a world's log has no `mint.secret` beside it, so
+/// it stays plaintext as before), its legacy mark judged, retained by aterm's default rules and
+/// limited by its default rate limit.
 #[must_use]
 pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
-    let broker = open_broker_unretained(log, opts);
-    aterm_link::broker_rules::retain(&broker).expect("the default retention rules");
+    let broker = aterm_mesh::logs::open_bus(
+        log.as_ref(),
+        opts.clone(),
+        aterm_uds::backup::Backups::INERT,
+    )
+    .expect("bus.log opens as the node service opens it");
+    assert!(
+        broker.retention().is_some(),
+        "the default retention rules are set"
+    );
     broker
 }
 
-/// A broker as `aterm link broker` serves one whose retention rules could not be set: retaining
-/// nothing, and limited by aterm's default rate limit all the same.
+/// A broker whose retention rules could not be set: retaining nothing, and limited by aterm's
+/// default rate limit all the same, as `aterm link broker` and the node service's host each
+/// serve one then (the control arms of the retention worlds).
 #[must_use]
 pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     let broker =
@@ -1244,6 +1256,31 @@ impl World {
             },
             f,
         )
+    }
+
+    /// Whether this world's bridge fences its mirror pin by its broker's settle rather than by
+    /// two full flushes of its own (critic item F07): the broker's `Hello` offers the settle,
+    /// names the device of the state dir, and says its full flush drains that device. Then the
+    /// bridge's first take in each open costs the broker one full flush, the settle's, and the
+    /// broker's count of full flushes includes it.
+    pub fn bridge_settles_the_pin(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        let dev = std::fs::metadata(&self.state).expect("the state dir").dev();
+        self.read(|c| {
+            c.hello()?;
+            Ok(c.supports_settle() && c.log_device().is_some_and(|d| d.settles(dev)))
+        })
+        .expect("the broker's Hello")
+    }
+
+    /// Waits for the bridge's first mirror take on a fresh state dir. The take writes `logkey`
+    /// only once the open holds the pin's fence, so the settle
+    /// ([`World::bridge_settles_the_pin`]) has been answered by then.
+    pub fn mirror_fenced(&self) {
+        until(
+            "the bridge's first mirror take, behind its pin's fence",
+            || self.state.join("logkey").exists().then_some(()),
+        );
     }
 
     /// Reads the retained row body at `subject` over [`World::read`].

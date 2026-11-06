@@ -103,8 +103,8 @@ pub(crate) fn barrier_fsync(file: &File) -> io::Result<()> {
 /// the file's writes handed to the drive, without the drain of its cache `F_FULLFSYNC`
 /// waits for. [`crate::plain_fsync`] in every build, and [`crate::full_sync`] in a test's
 /// process in a debug build ([`crate::TEST_PLAIN_FSYNC_ENV`]).
-pub(crate) fn plain_fsync(file: &File) -> io::Result<()> {
-    let fd = file.as_raw_fd();
+pub(crate) fn plain_fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
     crate::retried_on_eintr!({
         if apple_ffi!(fsync(fd)) == -1 {
             Err(io::Error::last_os_error())

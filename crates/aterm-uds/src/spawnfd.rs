@@ -1865,15 +1865,15 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// (`PR_SET_PDEATHSIG`), which the kernel sends when the forking thread exits, so the spawn forks
 /// on one of the tether's threads, each of which lives as long as this process: the tie is the
 /// process's, whichever thread asked, and a child that ignores `SIGTERM` runs on. An exec in this
-/// process's place ends its other threads, so on Linux it sends the child the signal too, where
-/// Darwin's watcher waits for an exit. A spawn whose fork cannot reach such a thread (none was
-/// free and a new one could not start) fails, with nothing started. On Darwin the spawn runs
+/// process's place ends the child too: on Linux it ends the other threads, which sends the
+/// signal, and on Darwin the watcher sees it. A spawn whose fork cannot reach such a thread (none
+/// was free and a new one could not start) fails, with nothing started. On Darwin the spawn runs
 /// through this executable ([`crate::tether::executable`]), whose watcher sends `SIGKILL`
 /// [`END_GRACE`](crate::process::END_GRACE) after the `SIGTERM` to the same process only
-/// ([`crate::tether::end_watched`]); an unreadable identity or a thread that has not run gets no
+/// ([`crate::tether::end_watched`]), once its thread has run; an unreadable identity gets no
 /// signal and the watcher exits, so the child can run on. In a process whose `main` never called
-/// [`crate::tether::entry`] the child starts untethered. Neither an exec nor a suspended start
-/// can be tethered.
+/// [`crate::tether::entry`], or whose executable was replaced since ([`crate::tether::lost`]),
+/// the child starts untethered. Neither an exec nor a suspended start can be tethered.
 pub trait Tether {
     /// Tie the child to this process.
     fn tether(&mut self) -> &mut Self;

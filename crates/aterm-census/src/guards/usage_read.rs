@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::graph::{attribute, reach};
-use super::rules::test_path;
 use super::{Finding, Rule, SourceFile, Tree, is_word};
 
 const SCOPE: &[&str] = &[
@@ -186,7 +185,7 @@ fn usage_read_on_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let files: Vec<&SourceFile> = tree
         .corpus
         .under(SCOPE)
-        .filter(|file| !test_path(&file.rel))
+        .filter(|file| !tree.corpus.test_code().holds(&file.rel))
         .collect();
     let bodies = read_bodies(&files);
     let doors: BTreeSet<&str> = IN_USE.iter().map(|(door, _)| *door).collect();
@@ -273,6 +272,34 @@ mod tests {
 
     fn found(src: &str) -> Vec<Finding> {
         run(&USAGE_READ_ON_TIMER, &[(AT, src)])
+    }
+
+    /// The graph joins shipped code alone (`TestCode::holds`): a module the root declares
+    /// test-only (`rig.rs`, whose name says nothing) adds no body, and a shipped module whose
+    /// name opens with `test` does.
+    #[test]
+    fn the_walk_reads_shipped_bodies_whatever_their_names() {
+        let lib = "#[cfg(test)]\nmod rig;\npub mod test_binary;\n";
+        let helper = "fn helper() {\n    Use::launch_read_use(evidence);\n}\n";
+        let read = |rel: &str| {
+            let found = run(
+                &USAGE_READ_ON_TIMER,
+                &[
+                    ("crates/aterm/src/lib.rs", lib),
+                    (
+                        "crates/aterm/src/metrics.rs",
+                        "fn tick() {\n    helper();\n}\n",
+                    ),
+                    (rel, helper),
+                ],
+            );
+            found.into_iter().map(|f| f.path).collect::<Vec<_>>()
+        };
+        assert!(read("crates/aterm/src/rig.rs").is_empty());
+        assert_eq!(
+            read("crates/aterm/src/test_binary.rs"),
+            ["crates/aterm/src/test_binary.rs"]
+        );
     }
 
     #[test]

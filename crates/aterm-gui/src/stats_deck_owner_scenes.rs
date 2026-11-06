@@ -1364,7 +1364,9 @@ fn the_gauge_reads_each_scene() {
 /// device px or more of its own ink past the fill inside it, however close the two round and
 /// where their shares are equal (the Hot-hard scene's Disk, the machine's 0.68 and aterm's), as
 /// the column shows it a rim: in every owner scene, Folded at 550 and 350 pt and Full under
-/// slim's width, at 1× and 2×.
+/// slim's width, at 1× and 2×. The machine's fill is its share's px, never widened by the scopes
+/// inside it (`docs/DESIGN-stats-deck-units-2026-11-04.md` §4.6), so a scope inside a fill of
+/// one px has none to keep: there it gives way (the Idle scene's CPU at 1 % of a narrow line).
 #[test]
 fn every_scope_shows_its_own_ink_in_the_bar_under_the_percent() {
     let m = FaceMetrics::helvetica_neue();
@@ -1429,8 +1431,23 @@ fn every_scope_shows_its_own_ink_in_the_bar_under_the_percent() {
                         });
                         let (gs, ats, ts) =
                             (share(fill.global), share(fill.aterm), share(fill.tab));
+                        // Where each fill ends, read off its own ink and the ink inside it.
+                        let ends = [own[0] + own[1] + own[2], own[1] + own[2], own[2]];
+                        if gs > 0.0 {
+                            let px = (gs * lw).round().max(1.0).min(lw) as usize;
+                            assert_eq!(ends[0], px, "{at} {res:?}: the machine's fill is its %");
+                        }
+                        let around = [
+                            usize::MAX,
+                            ends[0],
+                            if fill.aterm.is_some() {
+                                ends[1]
+                            } else {
+                                ends[0]
+                            },
+                        ];
                         for (k, share) in [gs, ats, ts].into_iter().enumerate() {
-                            if share > 0.0 {
+                            if share > 0.0 && around[k] >= 2 {
                                 assert!(
                                     own[k] >= 1,
                                     "{at} {res:?}: {} shows no ink of its own: {own:?} px of \

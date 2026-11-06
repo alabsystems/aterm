@@ -34,7 +34,7 @@ const MAX_RECIPIENTS: usize = 8;
 /// `stop` marker ends it sooner.
 const MAX_RUN_S: u64 = 3600;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key>... | join <world> <capsule-file> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds>";
+const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key>... | join <world> <capsule-file> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | secrets <aterm> <world> approve <age1…> --name <host>|join <lab-profile>/fixture.vault|status | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds> | emails-reveal <aterm> <world> <seed> [<tag>...]";
 
 /// The flag that lets a `commons-lan` verb drive a world the live default ALab vault admitted: it
 /// names the vault and what stays in it, a member no run takes out.
@@ -596,6 +596,18 @@ fn db_output(
     args: &[String],
     stdin: aterm_uds::spawnfd::Stdio,
 ) -> Result<std::process::Output, Fail> {
+    world_output(aterm, world, "db", args, stdin)
+}
+
+/// Run the shipped `aterm <noun> <args>` in a prepared profile's environment, with `stdin` as its
+/// standard input; what it wrote.
+fn world_output(
+    aterm: &Path,
+    world: &World,
+    noun: &str,
+    args: &[String],
+    stdin: aterm_uds::spawnfd::Stdio,
+) -> Result<std::process::Output, Fail> {
     let mut env = world.env();
     env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
     let mut command = aterm_uds::spawnfd::command(std::fs::canonicalize(aterm).map_err(fail)?);
@@ -603,9 +615,51 @@ fn db_output(
         .env_clear()
         .envs(env)
         .current_dir(&world.home)
-        .arg("db")
+        .arg(noun)
         .args(args);
     aterm_uds::deadline::output_until_from(&mut command, stdin, Instant::now() + HANG).map_err(fail)
+}
+
+/// The shipped vault verbs a lab's own membership takes ([`vault_cli`]): an admin's approval of
+/// one `age1…` key under a machine name, a join of a lab profile's own vault file, pinned to its
+/// signer as `<file>#<signer>` or not (never a URL, so never the live ALab vault), and `status`.
+fn admitted_secrets(args: &[String]) -> bool {
+    match args {
+        [verb] => verb == "status",
+        [verb, vault] => {
+            let (file, signer) = vault.split_once('#').unwrap_or((vault, ""));
+            verb == "join"
+                && Path::new(file).file_name() == Some(std::ffi::OsStr::new("fixture.vault"))
+                && Path::new(file).is_absolute()
+                && std::fs::symlink_metadata(file).is_ok_and(|meta| meta.is_file())
+                && signer
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        }
+        [verb, key, flag, _] => verb == "approve" && key.starts_with("age1") && flag == "--name",
+        _ => false,
+    }
+}
+
+/// Run the shipped vault CLI in a prepared profile: only what [`admitted_secrets`] names.
+fn vault_cli(aterm: &Path, root: &Path, args: &[String], live: bool) -> Res {
+    if !admitted_secrets(args) {
+        return Err(Fail::usage(
+            "commons-lan secrets accepts `approve <age1…> --name <host>`, `join <lab \
+             profile>/fixture.vault` and `status` only",
+        ));
+    }
+    let (world, _) = open(root, live)?;
+    let output = world_output(
+        aterm,
+        &world,
+        "secrets",
+        args,
+        aterm_uds::spawnfd::Stdio::null(),
+    )?;
+    std::io::stdout().write_all(&output.stdout).map_err(fail)?;
+    std::io::stderr().write_all(&output.stderr).map_err(fail)?;
+    Ok(output.status.code().unwrap_or(1))
 }
 
 /// Run the shipped database CLI against a prepared profile, including while its
@@ -641,6 +695,9 @@ pub fn cmd(args: &[String]) -> Res {
         }
         [verb, aterm, root, rest @ ..] if verb == "db" => {
             return database(Path::new(aterm), Path::new(root), rest, live);
+        }
+        [verb, aterm, root, rest @ ..] if verb == "secrets" => {
+            return vault_cli(Path::new(aterm), Path::new(root), rest, live);
         }
         [verb, aterm, root, seconds] if verb == "run" => {
             if !seconds.bytes().all(|b| b.is_ascii_digit()) {
@@ -761,6 +818,19 @@ pub fn cmd(args: &[String]) -> Res {
             emit(&value)?;
             return Ok(code);
         }
+        #[cfg(debug_assertions)]
+        [verb, aterm, root, seed, tags @ ..] if verb == "emails-reveal" => {
+            let (world, _) = prepare_run(Path::new(root), live)?;
+            let (value, code) = emails::reveal(Path::new(aterm), &world, seed, tags)?;
+            emit(&value)?;
+            return Ok(code);
+        }
+        #[cfg(not(debug_assertions))]
+        [verb, ..] if verb == "emails-reveal" => {
+            return Err(Fail::die(
+                "emails-reveal needs a debug lab image, as reveal-tab does",
+            ));
+        }
         _ => return Err(Fail::usage(USAGE)),
     };
     emit(&value)?;
@@ -816,6 +886,55 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.code, 2, "{verb} must be a usage refusal before I/O");
+        }
+    }
+
+    /// The vault CLI passes an admin's approval of a key, a join of a lab profile's own vault
+    /// file and `status`, and refuses before any I/O every other verb, a join of the live ALab's
+    /// URL or of no file, and a write of a secret.
+    #[test]
+    fn vault_cli_passes_only_a_labs_own_membership_verbs() {
+        let parent = crate::instance::world_parent();
+        let vault = parent.path().join("fixture.vault");
+        std::fs::write(&vault, b"").unwrap();
+        let vault = vault.to_string_lossy().into_owned();
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+        for passed in [
+            words(&["status"]),
+            words(&["approve", "age1qqqq", "--name", "m4"]),
+            words(&["join", &vault]),
+            words(&[
+                "join",
+                &format!("{vault}#wfU3N368OzA1XVYhTwWSjwGzZf1DM/qCsRwdR+r4tLo="),
+            ]),
+        ] {
+            assert!(admitted_secrets(&passed), "{passed:?}");
+        }
+        for refused in [
+            words(&["join"]),
+            words(&["join", aterm_secrets::ALAB_DEFAULT_URL]),
+            words(&["join", &format!("{}#x", aterm_secrets::ALAB_DEFAULT_URL)]),
+            words(&["join", &format!("{vault}#x y")]),
+            words(&["join", "fixture.vault"]),
+            words(&["join", "/no/such/place/fixture.vault"]),
+            words(&["approve", "--all"]),
+            words(&["approve", "age1qqqq"]),
+            words(&["set", "name"]),
+            words(&["edit", "name"]),
+            words(&["revoke", "m2"]),
+        ] {
+            assert!(!admitted_secrets(&refused), "{refused:?}");
+            let error = vault_cli(
+                Path::new("missing-executable"),
+                Path::new("missing-world"),
+                &refused,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, 2,
+                "{refused:?} must be a usage refusal before I/O"
+            );
         }
     }
 

@@ -315,8 +315,8 @@ pub const RENEWED_DRAFT: NoticeText = NoticeText {
 /// A ROSTER ROW WITH NO EMAIL IS SIGNED OUT, its recorded error: aterm's sign-in ladder
 /// (`crate::harness::sign_in_ladder`) signs a row in by its email, so no route exists for this
 /// one, and no session is moved onto it. A row with an email is never this notice's: the report
-/// names its sign-in, the ladder makes it where a session here runs on the row or a person asks,
-/// and records each route tried where none can.
+/// names its sign-in, the ladder makes it where a session here runs on the row or ran on it
+/// within a week, or a person asks, and records each route tried where none can.
 pub const ACCOUNT_SIGNED_OUT: NoticeText = NoticeText {
     id: "account-signed-out",
     code: "so",

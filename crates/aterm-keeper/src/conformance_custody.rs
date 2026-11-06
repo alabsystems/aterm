@@ -1047,7 +1047,7 @@ fn the_classifier_judges_real_ends() {
                     return s;
                 }
                 assert!(started.elapsed().as_secs() < 60, "no status for {how}");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
         }
     };

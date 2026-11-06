@@ -213,14 +213,35 @@ impl Terminal {
     /// assert!(changes.contains(&ConfigChange::CursorStyle));
     /// assert!(changes.contains(&ConfigChange::CursorBlink));
     /// ```
-    #[allow(
-        clippy::too_many_lines,
-        reason = "flat field-by-field config application"
-    )]
     pub fn apply_config(
         &mut self,
         config: &crate::config::TerminalConfig,
     ) -> Vec<crate::config::ConfigChange> {
+        self.apply_config_shared(std::sync::Arc::new(config.clone()))
+    }
+
+    /// [`Self::apply_config`] of a config the host shares, journaled as one [`super::HostOp::Config`] so a recording replays the install where it ran ([`Self::host_journal_since`]).
+    pub fn apply_config_shared(
+        &mut self,
+        config: std::sync::Arc<crate::config::TerminalConfig>,
+    ) -> Vec<crate::config::ConfigChange> {
+        let (changes, recolored) = self.install_config(&config);
+        self.host_journal.push(super::HostOp::Config {
+            config: super::HostConfig(config),
+            recolored,
+        });
+        changes
+    }
+
+    /// What [`Self::apply_config`] changes, journaling nothing: the aspects that changed, and whether what the screen draws moved (the cursor colour, another colour or the style policy).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat field-by-field config application"
+    )]
+    fn install_config(
+        &mut self,
+        config: &crate::config::TerminalConfig,
+    ) -> (Vec<crate::config::ConfigChange>, bool) {
         use crate::config::ConfigChange;
 
         let mut changes = Vec::new();
@@ -358,14 +379,14 @@ impl Terminal {
             self.grid.damage_mut().mark_full();
         }
 
-        changes
+        (changes, visual_repaint)
     }
 
-    /// [`Self::apply_config`] for an engine a checkpoint restored: it takes `config`'s colour baseline, default cursor style, mode seeds, budgets and policies, keeps every mode and the history limit the restore installed, and leaves any colour-scheme report the rebase queued for the caller to drain.
+    /// [`Self::apply_config`] for an engine a checkpoint restored: it takes `config`'s colour baseline, default cursor style, mode seeds, budgets and policies, keeps every mode and the history limit the restore installed, and leaves any colour-scheme report the rebase queued for the caller to drain. It sets a replay up, so it journals nothing.
     pub fn apply_config_keeping_modes(&mut self, config: &crate::config::TerminalConfig) {
         let modes = self.modes;
         let limit = self.scrollback_line_limit();
-        let _ = self.apply_config(config);
+        let _ = self.install_config(config);
         self.modes = modes;
         if self.scrollback_line_limit() != limit {
             self.set_scrollback_line_limit(limit);
@@ -1049,6 +1070,82 @@ mod tests {
             t.configured_colors(),
             (t.color_baseline().foreground, t.color_baseline().background),
             "the baseline's pair"
+        );
+    }
+
+    /// A host install journals one config op (recolouring only when a colour moved) and a replay set-up none; the op replayed on a fresh engine is the live install, the scheme push the live host took dropped.
+    #[test]
+    fn apply_config_journals_one_config_op_and_keeping_modes_none() {
+        use crate::terminal::{ClockReading, HostOp};
+        let configs = |t: &Terminal, since: u64| -> Vec<HostOp> {
+            let (reports, lost) = t.host_journal_since(since);
+            assert_eq!(lost, 0);
+            reports.into_iter().map(|r| r.op).collect()
+        };
+        let light = TerminalConfig {
+            default_background: rgb(250, 250, 240),
+            default_foreground: rgb(10, 10, 10),
+            color_scheme: Some(aterm_types::Appearance::Light),
+            cursor_style: crate::terminal::CursorStyle::SteadyUnderline,
+            ..TerminalConfig::default()
+        };
+        let mut live = Terminal::new(4, 16);
+        live.process(b"\x1b[?2031h");
+        while live.take_response().is_some() {}
+        let from = live.host_ordinal();
+        let _ = live.apply_config(&light);
+        let ops = configs(&live, from);
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [HostOp::Config {
+                    recolored: true,
+                    ..
+                }]
+            ),
+            "{ops:?}"
+        );
+        assert_eq!(
+            live.take_response().as_deref(),
+            Some(&b"\x1b[?997;2n"[..]),
+            "fixture: the install pushed the scheme to the program"
+        );
+        let from = live.host_ordinal();
+        let _ = live.apply_config(&light);
+        assert!(
+            matches!(
+                configs(&live, from).as_slice(),
+                [HostOp::Config {
+                    recolored: false,
+                    ..
+                }]
+            ),
+            "the same install again moves no colour"
+        );
+        let from = live.host_ordinal();
+        live.apply_config_keeping_modes(&TerminalConfig::default());
+        assert!(
+            configs(&live, from).is_empty(),
+            "a replay set-up journals nothing"
+        );
+
+        let mut replay = Terminal::new(4, 16);
+        replay.process(b"\x1b[?2031h");
+        while replay.take_response().is_some() {}
+        let mut probe = Terminal::new(4, 16);
+        probe.process(b"\x1b[?2031h");
+        while probe.take_response().is_some() {}
+        let _ = probe.apply_config(&light);
+        let _ = probe.take_response();
+        replay.apply_host_op_at(ops.into_iter().next().expect("one op"), ClockReading::now());
+        assert_eq!(replay.take_response(), None, "the replay drops the push");
+        assert_eq!(replay.default_background(), probe.default_background());
+        assert_eq!(replay.cursor_style(), probe.cursor_style());
+        assert_eq!(replay.color_scheme(), probe.color_scheme());
+        assert_eq!(
+            replay.checkpoint_visible(),
+            probe.checkpoint_visible(),
+            "the replayed install is the live one"
         );
     }
 }

@@ -138,21 +138,28 @@ fn scratch() -> Result<aterm_tempfile::TempDir> {
 }
 
 /// Opens a grid file for the owner and returns once they have closed it, the caret on a
-/// 1-based line.
-pub type Opener<'a> = &'a mut dyn FnMut(&Path, usize) -> Result<()>;
+/// 1-based line, the headers of its `Secret` columns named to the window as concealed
+/// ([`grid::secret_headers`]; `edit … secret=`): no reader of the window but the person's eyes
+/// gets their cells (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8).
+pub type Opener<'a> = &'a mut dyn FnMut(&Path, usize, &[String]) -> Result<()>;
 
-/// The production opener: `aterm edit --wait +<line> <file>` from this same executable, which
-/// inside aterm opens amacs in an Editor tab beside this one (a `.tsv` opens in its spreadsheet
-/// mode) and elsewhere edits in this terminal.
+/// The production opener: `aterm edit --wait [--secret=…] +<line> <file>` from this same
+/// executable, which inside aterm opens amacs in an Editor tab beside this one (a `.tsv` opens
+/// in its spreadsheet mode) and elsewhere edits in this terminal. `secret`, where given, names
+/// the grid's concealed columns ([`Opener`]); a private file opened with none named conceals
+/// every cell.
 ///
 /// # Errors
 /// This executable cannot be found or started, or amacs did not open the file.
-pub fn amacs(file: &Path, line: usize) -> Result<()> {
+pub fn amacs(file: &Path, line: usize, secret: Option<&[String]>) -> Result<()> {
     let exe =
         std::env::current_exe().map_err(|_| Error::new("this executable's path is unknown"))?;
-    let status = aterm_uds::spawnfd::command(exe)
-        .arg("edit")
-        .arg("--wait")
+    let mut command = aterm_uds::spawnfd::command(exe);
+    command.arg("edit").arg("--wait");
+    if let Some(secret) = secret {
+        command.arg(format!("--secret={}", secret.join(",")));
+    }
+    let status = command
         .arg(format!("+{line}"))
         .arg(file)
         .status()
@@ -168,8 +175,9 @@ pub fn amacs(file: &Path, line: usize) -> Result<()> {
 
 /// The production opener in a person's aterm tab: `file` in an Editor tab beside session `sid`
 /// (the tab the reveal was allowed in, by the `reveal` answer, never by the environment), through
-/// the window's `edit` verb, read-only with `ro=1`; `opened` hears the window's answer once the
-/// tab is open, and this returns once it closes. It never edits in the terminal instead: plaintext
+/// the window's `edit` verb, read-only with `ro=1`, its `secret` columns concealed
+/// (`secret=`, [`Opener`]); `opened` hears the window's answer once the tab is open, and this
+/// returns once it closes. It never edits in the terminal instead: plaintext
 /// drawn there would stay in that tab's scrollback, blocks, recordings and session log
 /// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8), so a window that refuses ends the command.
 ///
@@ -181,6 +189,7 @@ pub fn in_editor_tab(
     file: &Path,
     line: usize,
     read_only: bool,
+    secret: &[String],
     opened: &mut dyn FnMut(&aterm_ctl::edit::EditOk),
 ) -> Result<()> {
     use aterm_ctl::edit::{AwaitKey, EditRequest};
@@ -193,6 +202,7 @@ pub fn in_editor_tab(
         for_word: Some(EDIT_FOR.to_owned()),
         wait: true,
         read_only,
+        secret: Some(secret.to_vec()),
     };
     let ok = aterm_ctl::edit::edit(sid, &request).map_err(|error| {
         Error::new(&format!(
@@ -241,7 +251,11 @@ pub fn show(
     let name = format!("{}.tsv", collection.name);
     aterm_uds::private_file::write_private(scratch.path(), &name, text.as_bytes())
         .map_err(|_| Error::new("the grid file could not be written"))?;
-    open(&scratch.path().join(&name), 1)?;
+    open(
+        &scratch.path().join(&name),
+        1,
+        &grid::secret_headers(collection, true),
+    )?;
     drop(scratch);
     Ok(rows)
 }
@@ -331,6 +345,7 @@ pub fn edit(
     };
     let name = format!("{}.tsv", collection.name);
     let path = scratch.path().join(&name);
+    let secret = grid::secret_headers(collection, secrets.is_some());
     let write = |text: &str| {
         aterm_uds::private_file::write_private(scratch.path(), &name, text.as_bytes())
             .map_err(|_| Error::new("the grid file could not be written"))
@@ -341,7 +356,7 @@ pub fn edit(
     let mut line = 1;
     let mut edited = Edited::default();
     loop {
-        open(&path, line)?;
+        open(&path, line, &secret)?;
         edited.rounds += 1;
         let saved = zeroize::Zeroizing::new(read_back(&path)?);
         if *saved == *presented {

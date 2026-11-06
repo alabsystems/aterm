@@ -462,7 +462,9 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
         .collect();
     let mut doc = opened.doc.clone();
     let mut admissions = opened.admissions.clone();
-    let log_base = admin_base(
+    // A cached open lands no pending set: its callers may hold the state lock, or an author's
+    // own observation of it (`log_entries::view_waiting`).
+    let (log_base, shown) = admin_base(
         paths,
         &config,
         &envelope,
@@ -470,6 +472,7 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
         &opened,
         &mut doc,
         &mut admissions,
+        false,
     );
     Ok(Admin {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
@@ -493,6 +496,8 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
         parented: !envelope.parents.is_empty(),
         log_base,
         resolve: BTreeSet::new(),
+        shown,
+        overtaken: super::unshown_overtaken(paths),
     })
 }
 

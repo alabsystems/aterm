@@ -4,8 +4,11 @@
 //! The vitals host's leftover pass (`sys left`, `docs/DESIGN-leftover-processes-2026-10-16.md`
 //! §3.2, §5.3, §5.4): on the probe thread after the jobs pass, it reads each candidate's kernel
 //! facts ([`aterm_uds::left`]), keeps each closed tab's two numbers (its shell's unique id and
-//! the horizon of the reading that missed it), appends a dead run's `dead_seen` once, and judges
-//! every row ([`aterm_vitals::left::judge`]). It ends nothing: it names and offers.
+//! the horizon of the reading that missed it) in memory and in the closed-tab record
+//! ([`crate::vitals_left_closed`], read once at its first reading and written at each close, at
+//! each close the host says it told of, and at the thread's stop), appends a dead run's
+//! `dead_seen` once, and judges every row ([`aterm_vitals::left::judge`]). It ends nothing: it
+//! names and offers.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -15,6 +18,7 @@ use std::time::SystemTime;
 use aterm_agent::harness::disk::discover::Dangling;
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_uds::left::{Inert, Known, LeftKernel, Live, Reader, Row};
+use aterm_uds::process::ProcessPresence;
 use aterm_uds::runs::Record;
 use aterm_vitals::jobs::{JobKind, JobsView, Verdict};
 use aterm_vitals::left::{
@@ -22,9 +26,14 @@ use aterm_vitals::left::{
 };
 
 use crate::vitals_host::Request;
+use crate::vitals_left_closed::Kept;
 
 /// The most closed tabs kept, oldest dropped first, as the closed-session index keeps its own.
 pub(crate) const CLOSED_KEPT: usize = 512;
+
+/// The first key a restored closed tab takes: the host's session keys count up from 1 and never
+/// reach it, so a restored tab's key names no session of this process.
+pub(crate) const RESTORED_KEYS: u64 = 1 << 63;
 
 /// How often the run records are read again with no change to their folder, ms.
 const RECORDS_EVERY_MS: u64 = 60_000;
@@ -44,6 +53,9 @@ pub(crate) struct LeftReaders {
     /// The dangling `target*` links the disk watch's last search recorded
     /// ([`crate::disk_board::Shelf::dangling`]).
     pub(crate) dangling: fn() -> Vec<Dangling>,
+    /// The closed-tab record in the state home ([`crate::vitals_left_closed::FILE`]); `None`
+    /// reads and writes none.
+    pub(crate) closed: Option<PathBuf>,
 }
 
 impl LeftReaders {
@@ -62,6 +74,8 @@ impl LeftReaders {
             boot: aterm_uds::process::boot_id,
             kept: || crate::disk_board::SHELF.kept_build_dirs(),
             dangling: || crate::disk_board::SHELF.dangling(),
+            closed: aterm_types::dirs::state_dir()
+                .map(|dir| dir.join(crate::vitals_left_closed::FILE)),
         }
     }
 
@@ -73,6 +87,7 @@ impl LeftReaders {
             boot: || None,
             kept: Vec::new,
             dangling: Vec::new,
+            closed: None,
         }
     }
 }
@@ -103,7 +118,16 @@ pub(crate) struct LeftPass {
     readers: LeftReaders,
     reader: Reader,
     live: BTreeMap<u64, Tab>,
-    closed: VecDeque<ClosedTab>,
+    /// The closed tabs, oldest close first: seen to close here, and restored.
+    closed: VecDeque<Kept>,
+    /// The closed-tab record was read (once, at the first reading).
+    restored: bool,
+    /// How many restored tabs took a key ([`RESTORED_KEYS`]).
+    restored_keys: u64,
+    /// The highest horizon a reading read, and this process's pid as the readings named it: what
+    /// the stop closes the tabs it holds at ([`Self::at_stop`]).
+    horizon: u64,
+    self_pid: u32,
     records: Records,
     /// Programs outside every job that have not started (held, translating, not started, or
     /// stopped or traced) that W-session ties to a live tab, by pid: the jobs pass names them by
@@ -140,6 +164,10 @@ impl LeftPass {
             reader: Reader::new(),
             live: BTreeMap::new(),
             closed: VecDeque::new(),
+            restored: false,
+            restored_keys: 0,
+            horizon: 0,
+            self_pid: 0,
             records: Records::default(),
             ties: BTreeMap::new(),
             view: None,
@@ -200,6 +228,15 @@ impl LeftPass {
         let Some(sweep) = sweep else {
             return self.view.clone();
         };
+        let kernel = Arc::clone(&self.readers.kernel);
+        let boot = (self.readers.boot)();
+        if !self.restored {
+            self.restored = true;
+            self.restore(&*kernel, boot.as_deref(), at_ms);
+        }
+        self.closed
+            .retain(|c| crate::vitals_left_closed::within(c.tab.closed_ms, at_ms));
+        self.self_pid = req.self_pid;
         let rows: Vec<Row> = aterm_uds::left::rows_of(sweep, req.self_pid);
         self.refresh_records(at_ms);
         let held = jobs
@@ -213,7 +250,6 @@ impl LeftPass {
             .filter(|t| t.shell_pid > 0)
             .map(|t| (t.key, t.shell_pid))
             .collect();
-        let boot = (self.readers.boot)();
         let known = Known {
             self_pid: req.self_pid,
             now_ms: at_ms,
@@ -223,9 +259,9 @@ impl LeftPass {
             waiting: &waiting,
             shells: &shells,
         };
-        let kernel = Arc::clone(&self.readers.kernel);
         let mut reading = self.reader.read(&*kernel, &rows, &known);
-        self.see_tabs(&*kernel, sweep, req, jobs, reading.horizon, at_ms);
+        self.horizon = self.horizon.max(reading.horizon);
+        let closed_now = self.see_tabs(&*kernel, sweep, req, jobs, reading.horizon, at_ms);
         self.append_dead_seen(&*kernel, req.self_pid, &mut reading.runs, at_ms);
 
         let fg: BTreeMap<u64, u32> = jobs
@@ -245,7 +281,7 @@ impl LeftPass {
                 agent_spans: t.agent_spans.clone(),
             })
             .collect();
-        let closed: Vec<ClosedTab> = self.closed.iter().cloned().collect();
+        let closed: Vec<ClosedTab> = self.closed.iter().map(|c| c.tab.clone()).collect();
         let tellers = jobs.map(|v| left::tellers(v, &live)).unwrap_or_default();
         let spared = [req.self_pid];
         let ctx = left::Ctx {
@@ -269,11 +305,15 @@ impl LeftPass {
                 (!tie.closed).then_some((f.pid, tie))
             })
             .collect();
-        for tab in &mut self.closed {
-            tab.left = rows
+        for kept in &mut self.closed {
+            let key = kept.tab.key;
+            kept.tab.left = rows
                 .iter()
-                .filter(|r| r.from == Source::Closed(tab.key) && r.token.is_some())
+                .filter(|r| r.from == Source::Closed(key) && r.token.is_some())
                 .count();
+        }
+        if closed_now {
+            self.keep_closed(boot.as_deref(), at_ms);
         }
         let runs = reading
             .runs
@@ -308,7 +348,7 @@ impl LeftPass {
             rows,
             runs,
             links: link_rows(&(self.readers.dangling)()),
-            closed: self.closed.iter().cloned().collect(),
+            closed: self.closed.iter().map(|c| c.tab.clone()).collect(),
             live,
             complete,
             bounded: reading.bounded,
@@ -326,7 +366,7 @@ impl LeftPass {
     /// open stretch closes at this reading's horizon, so what the person starts once the agent is
     /// gone reads as theirs; a tab the last reading had and this one lacks closed, and keeps its
     /// shell's unique id, its stretches and this reading's horizon, unless its shell was never
-    /// read.
+    /// read. Whether it kept a close.
     fn see_tabs(
         &mut self,
         kernel: &dyn LeftKernel,
@@ -335,7 +375,7 @@ impl LeftPass {
         jobs: Option<&JobsView>,
         horizon: u64,
         at_ms: u64,
-    ) {
+    ) -> bool {
         let start_of = |pid: u32| sweep.iter().find(|p| p.pid == pid).and_then(|p| p.start);
         let mut now = BTreeMap::new();
         for t in req.tabs.iter().filter(|t| t.shell_pid > 0) {
@@ -375,11 +415,22 @@ impl LeftPass {
             left::fold_agent(&mut tab.agent_spans, !leaders.is_empty(), since, horizon);
             now.insert(t.key, tab);
         }
+        let mut kept = false;
         for (key, tab) in std::mem::replace(&mut self.live, now) {
-            let Some(shell_uniqueid) = tab.shell_uniqueid else {
-                continue;
-            };
-            self.closed.push_back(ClosedTab {
+            kept |= self.close(key, tab, horizon, at_ms, false);
+        }
+        kept
+    }
+
+    /// Keeps tab `key`'s close at `horizon` and `at_ms` (by its aterm's quit where `at_quit`),
+    /// unless its shell was never read: with no unique id to open its window, nothing could be
+    /// proven its. Whether it kept one.
+    fn close(&mut self, key: u64, tab: Tab, horizon: u64, at_ms: u64, at_quit: bool) -> bool {
+        let Some(shell_uniqueid) = tab.shell_uniqueid else {
+            return false;
+        };
+        self.closed.push_back(Kept {
+            tab: ClosedTab {
                 key,
                 sid: tab.sid,
                 label: tab.label,
@@ -389,11 +440,103 @@ impl LeftPass {
                 closed_ms: at_ms,
                 agent_spans: tab.agent_spans,
                 left: 0,
-            });
-            while self.closed.len() > CLOSED_KEPT {
-                self.closed.pop_front();
+                restored: false,
+                told: false,
+            },
+            shell_pid: tab.shell_pid,
+            at_quit,
+            told_here: false,
+        });
+        while self.closed.len() > CLOSED_KEPT {
+            self.closed.pop_front();
+        }
+        true
+    }
+
+    /// Reads the closed-tab record once, into the table (§3.2): each record of this boot within
+    /// the bounds ([`crate::vitals_left_closed::read`]), under a key no session of this process
+    /// has ([`RESTORED_KEYS`]). One of a quit is taken only once its shell reads gone
+    /// ([`shell_gone`]): while a shell that outlived its aterm's quit runs, the session it names is
+    /// not gone, and a record held back stays in the file for a later start.
+    fn restore(&mut self, kernel: &dyn LeftKernel, boot: Option<&str>, at_ms: u64) {
+        let (Some(path), Some(boot)) = (self.readers.closed.as_deref(), boot) else {
+            return;
+        };
+        for mut kept in crate::vitals_left_closed::read(path, boot, at_ms) {
+            if kept.at_quit && !shell_gone(kernel, kept.shell_pid, kept.tab.shell_uniqueid) {
+                continue;
+            }
+            kept.tab.key = RESTORED_KEYS + self.restored_keys;
+            self.restored_keys += 1;
+            self.closed.push_back(kept);
+        }
+    }
+
+    /// Writes the table into the closed-tab record ([`crate::vitals_left_closed::write`]); a
+    /// write that fails leaves the record as it was, and the next write (a close, a telling, or
+    /// the stop) writes the whole table again. One that fails at the stop has none after it.
+    fn keep_closed(&self, boot: Option<&str>, at_ms: u64) {
+        let (Some(path), Some(boot)) = (self.readers.closed.as_deref(), boot) else {
+            return;
+        };
+        if let Err(error) = crate::vitals_left_closed::write(path, boot, &self.closed, at_ms) {
+            aterm_log::warn!(
+                "leftovers: the closed-tab record {} was not written: {error}",
+                path.display()
+            );
+        }
+    }
+
+    /// Takes the host's word that it told each closed tab of `told` (by key) what it left
+    /// ([`crate::message_reporters::newly_left`]): whether one is new.
+    fn told(&mut self, told: &[u64]) -> bool {
+        let mut new = false;
+        for kept in self
+            .closed
+            .iter_mut()
+            .filter(|k| !k.told_here && told.contains(&k.tab.key))
+        {
+            kept.told_here = true;
+            new = true;
+        }
+        new
+    }
+
+    /// [`Self::told`] at `at_ms` (unix ms), writing the table when a telling is new, so an aterm
+    /// that starts again tells none of them again, even after an exit with no stop (an update's
+    /// predecessor `_exit`s at its Commit).
+    pub(crate) fn keep_told(&mut self, told: &[u64], at_ms: u64) {
+        if self.told(told) {
+            let boot = (self.readers.boot)();
+            self.keep_closed(boot.as_deref(), at_ms);
+        }
+    }
+
+    /// The probe thread's stop (a quit, or the loop's end as the app unwinds) at `at_ms` (unix
+    /// ms), with the host's last tellings `told` ([`Self::told`]): every tab the pass holds as
+    /// live closes at it, as a close of its own would, its horizon the high-water unique id of
+    /// this uid's table read now ([`aterm_uds::runs::table`]), never below a reading's, and the
+    /// table is written; an empty one leaves the record as it is. A tab whose shell was never read
+    /// keeps none.
+    pub(crate) fn at_stop(&mut self, told: &[u64], at_ms: u64) {
+        self.told(told);
+        if self.live.values().any(|t| t.shell_uniqueid.is_some()) {
+            let kernel = Arc::clone(&self.readers.kernel);
+            let now = i32::try_from(self.self_pid)
+                .ok()
+                .filter(|&me| me > 0)
+                .and_then(|me| aterm_uds::runs::table(&*kernel, me))
+                .map_or(0, |(_, high)| high);
+            let horizon = self.horizon.max(now);
+            for (key, tab) in std::mem::take(&mut self.live) {
+                self.close(key, tab, horizon, at_ms, true);
             }
         }
+        if self.closed.is_empty() {
+            return;
+        }
+        let boot = (self.readers.boot)();
+        self.keep_closed(boot.as_deref(), at_ms);
     }
 
     /// Records the first `dead_seen` observation of each dead run's record that has none
@@ -418,6 +561,22 @@ impl LeftPass {
                 rec.dead_seen_ms = run.record.dead_seen_ms;
             }
         }
+    }
+}
+
+/// Whether the shell `pid` of unique id `uniqueid` reads gone on a direct read: its pid names
+/// another process, or none (absent, or exited and not yet reaped). A read that answers neither
+/// is no proof it is gone.
+fn shell_gone(kernel: &dyn LeftKernel, pid: u32, uniqueid: u64) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    match kernel.lineage(pid) {
+        Some(lineage) => lineage.uniqueid != uniqueid,
+        None => matches!(
+            kernel.presence(pid),
+            ProcessPresence::Absent | ProcessPresence::Exited
+        ),
     }
 }
 

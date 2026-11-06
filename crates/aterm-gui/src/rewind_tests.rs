@@ -544,7 +544,6 @@ fn replay(app: &App, at: Option<Ticks>) -> Terminal {
         plan,
         judge: None,
         around: Vec::new(),
-        colors: None,
     })
     .term
 }
@@ -1349,7 +1348,6 @@ fn shown_at(app: &App, at: Option<Ticks>) -> crate::rewind_worker::Show {
         plan,
         judge: None,
         around,
-        colors: None,
     }
 }
 
@@ -2616,7 +2614,6 @@ fn a_tab_menu_rewind_row_does_not_retarget_a_sibling_after_focus_or_close() {
                 plan,
                 judge: None,
                 around: Vec::new(),
-                colors: None,
             });
             let text = crate::control::screen_text(&folded.term);
             assert!(
@@ -3242,21 +3239,64 @@ fn the_band_row_is_chrome_that_the_past_cursor_does_not_draw_over() {
     );
 }
 
-/// The fold draws in the session's colours and keeps the cursor the program set: hidden, a steady bar.
+/// The fold draws the colours recorded with its instant, though the person chose another theme since, and keeps the cursor the program set: hidden, a steady bar.
 #[test]
-fn the_fold_draws_in_the_sessions_colours_and_keeps_the_programs_cursor() {
-    let app = scripted_app();
+fn the_fold_draws_the_colours_recorded_with_its_instant_and_keeps_the_programs_cursor() {
+    let mut app = scripted_app();
+    set_theme(&mut app, "Aterm Day");
+    let then = live_bg(&app);
     start_recording(&app);
     let at = slice(&app, b"\x1b[?25l\x1b[6 qa hidden bar");
-    let colors = aterm_core::config::TerminalConfig {
-        default_background: aterm_core::terminal::Rgb {
-            r: 250,
-            g: 250,
-            b: 240,
-        },
-        ..aterm_core::config::TerminalConfig::default()
-    };
-    let plan = app
+    let cursor = |t: &Terminal| (t.cursor_visible(), t.cursor_style());
+    let program = cursor(&term_lock(&live_term(&app)));
+    assert_eq!(
+        program,
+        (false, aterm_core::terminal::CursorStyle::SteadyBar),
+        "fixture"
+    );
+    set_theme(&mut app, "Aterm Night");
+    assert_ne!(
+        live_bg(&app),
+        then,
+        "fixture: the theme moved the live colours"
+    );
+    let _ = slice(&app, b"!");
+    let _ = ask(&mut app, crate::rewind_verb::Asked::Open(Target::At(at))).expect("open");
+    let shown = app.rewind_shown(0).expect("a shown fold");
+    let folded = term_lock(&shown);
+    assert_eq!(cursor(&folded), program, "the program's cursor");
+    assert_eq!(
+        folded.default_background(),
+        then,
+        "the colours recorded with the instant"
+    );
+}
+
+/// Set session 0's own theme to the built-in `name`, as `theme session set` does.
+fn set_theme(app: &mut App, name: &str) {
+    app.set_session_theme(
+        0,
+        Some(crate::session_theme::SessionTheme {
+            selector: name.to_string(),
+            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+        }),
+    );
+}
+
+fn live_bg(app: &App) -> aterm_core::terminal::Rgb {
+    term_lock(&live_term(app)).default_background()
+}
+
+/// The background session 0's view draws once it opens on `target`.
+fn shown_bg(app: &mut App, target: Target) -> aterm_core::terminal::Rgb {
+    let _ = ask(app, crate::rewind_verb::Asked::Open(target)).expect("open");
+    let shown = app.rewind_shown(0).expect("a shown fold");
+    term_lock(&shown).default_background()
+}
+
+/// Hand session 0's recording a queue on its own spine, as its reader holds one, so a theme change reaches the spine when it is made; the queue's far end.
+fn recording_queue(app: &mut App) -> crate::temporal::TemporalRx {
+    let spine = app
         .pool
         .get(0)
         .expect("session 0")
@@ -3264,33 +3304,165 @@ fn the_fold_draws_in_the_sessions_colours_and_keeps_the_programs_cursor() {
         .temporal
         .lock()
         .expect("recorder")
-        .replay_plan(Some(at))
-        .expect("a replay");
-    let folded = crate::rewind_worker::show_inline(crate::rewind_worker::Show {
-        session: 0,
-        token: NO_TOKEN,
-        plan,
-        judge: None,
-        around: Vec::new(),
-        colors: Some(Arc::new(colors.clone())),
-    })
-    .term;
-    let live = app.pool.get(0).expect("session 0").live_term().clone();
-    let cursor = |t: &Terminal| (t.cursor_visible(), t.cursor_style());
+        .spine_watermark();
+    let (tx, rx) = crate::temporal::queue_on(spine, 64);
+    app.pool.set_temporal_tx_for_test(0, Some(tx));
+    rx
+}
+
+/// Fold what `rx` holds into session 0's recorder, as its writer does; how many messages it held.
+fn drain_into_recorder(app: &App, rx: &crate::temporal::TemporalRx) -> usize {
+    let s = app.pool.get(0).expect("session 0");
+    let mut rec = s.ctx.temporal.lock().expect("recorder");
+    let mut n = 0;
+    while let Some(msg) = rx.try_recv() {
+        rec.apply(msg);
+        n += 1;
+    }
+    n
+}
+
+/// A past instant draws in the theme in force then, and a later one in the theme chosen since: on main every fold was repainted in today's colours.
+#[test]
+fn a_past_instant_draws_in_the_theme_in_force_then() {
+    let mut app = scripted_app();
+    set_theme(&mut app, "Aterm Night");
+    let old = live_bg(&app);
+    start_recording(&app);
+    let a = slice(&app, b"$ ls");
+    set_theme(&mut app, "Aterm Day");
+    let new = live_bg(&app);
+    assert_ne!(old, new, "fixture: the theme moved the live background");
+    let b = slice(&app, b"\r\n$ ");
+    assert_eq!(shown_bg(&mut app, Target::At(a)), old, "the theme then");
+    assert_eq!(shown_bg(&mut app, Target::At(b)), new, "the theme since");
+    assert_eq!(shown_bg(&mut app, Target::Latest), new);
+}
+
+/// A theme change is recorded when it is made, as a state of its own, with no output after it.
+#[test]
+fn a_theme_change_is_its_own_state_with_no_output_after_it() {
+    let mut app = scripted_app();
+    set_theme(&mut app, "Aterm Night");
+    start_recording(&app);
+    let rx = recording_queue(&mut app);
+    let a = slice(&app, b"$ ");
+    let before = instants(&app).len();
+    set_theme(&mut app, "Aterm Day");
+    let new = live_bg(&app);
     assert_eq!(
-        cursor(&term_lock(&live)),
-        (false, aterm_core::terminal::CursorStyle::SteadyBar),
-        "fixture"
+        drain_into_recorder(&app, &rx),
+        1,
+        "the change went out at once"
     );
+    assert_eq!(instants(&app).len(), before + 1, "{:?}", instants(&app));
+    assert_eq!(shown_bg(&mut app, Target::Latest), new);
+    assert_ne!(shown_bg(&mut app, Target::At(a)), new);
+}
+
+/// The light/dark switch of a `dark:…,light:…` theme is a theme change like any other: each side of it folds in its own colours.
+#[test]
+fn the_light_dark_switch_steps_like_any_theme_change() {
+    let mut app = scripted_app();
+    app.config.theme = Some("dark:Aterm Night,light:Aterm Day".to_string());
+    app.on_os_appearance(aterm_types::Appearance::Dark);
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    let dark = live_bg(&app);
     assert_eq!(
-        cursor(&folded),
-        cursor(&term_lock(&live)),
-        "the program's cursor"
+        dark,
+        aterm_types::scheme::builtin("Aterm Night")
+            .expect("built-in")
+            .background,
+        "fixture: the dark side draws"
     );
+    start_recording(&app);
+    let a = slice(&app, b"dark");
+    app.on_os_appearance(aterm_types::Appearance::Light);
+    let light = live_bg(&app);
+    assert_ne!(light, dark, "fixture: the switch moved the live background");
+    let b = slice(&app, b" light");
+    assert_eq!(shown_bg(&mut app, Target::At(a)), dark);
+    assert_eq!(shown_bg(&mut app, Target::At(b)), light);
+}
+
+/// A program's own palette (OSC 11, OSC 4) and its resets (OSC 111, OSC 104) replay with its output, then a theme change: the program's colours where it set them, the old theme's where it reset them, the new theme's after the change.
+#[test]
+fn a_program_palette_and_its_resets_draw_as_they_were() {
+    use aterm_core::terminal::Rgb;
+    let mut app = scripted_app();
+    set_theme(&mut app, "Aterm Night");
+    let night = aterm_types::scheme::builtin("Aterm Night").expect("built-in");
+    start_recording(&app);
+    let a = slice(&app, b"\x1b]11;rgb:10/20/30\x07\x1b]4;1;rgb:12/34/56\x07A");
+    let program = (Rgb::new(0x10, 0x20, 0x30), Rgb::new(0x12, 0x34, 0x56));
+    {
+        let live = live_term(&app);
+        let live = term_lock(&live);
+        assert_eq!(
+            (live.default_background(), live.palette_color(1)),
+            program,
+            "fixture: the session lets a program set its palette"
+        );
+    }
+    let b = slice(&app, b"\x1b]111\x07\x1b]104\x07B");
+    let then = {
+        let live = live_term(&app);
+        let live = term_lock(&live);
+        (live.default_background(), live.palette_color(1))
+    };
     assert_eq!(
-        folded.default_background(),
-        colors.default_background,
-        "the session's colours"
+        then.0, night.background,
+        "fixture: the reset restored the theme"
+    );
+    set_theme(&mut app, "Aterm Day");
+    let c = slice(&app, b"C");
+    let drawn = |app: &mut App, target| {
+        let _ = ask(app, crate::rewind_verb::Asked::Open(target)).expect("open");
+        let shown = app.rewind_shown(0).expect("a shown fold");
+        let shown = term_lock(&shown);
+        (shown.default_background(), shown.palette_color(1))
+    };
+    assert_eq!(drawn(&mut app, Target::At(a)), program, "the program's");
+    assert_eq!(drawn(&mut app, Target::At(b)), then, "the old theme's");
+    let live = {
+        let live = live_term(&app);
+        let live = term_lock(&live);
+        (live.default_background(), live.palette_color(1))
+    };
+    assert_ne!(live, then, "fixture: the change moved the reset colours");
+    assert_eq!(drawn(&mut app, Target::At(c)), live, "the new theme's");
+}
+
+/// A run of theme changes with nothing between them (a palette browse) is one Rewind state, which draws the last theme; a slice between two changes keeps them two.
+#[test]
+fn a_palette_browse_is_one_rewind_state() {
+    let mut app = scripted_app();
+    set_theme(&mut app, "Aterm Night");
+    start_recording(&app);
+    let rx = recording_queue(&mut app);
+    let _ = slice(&app, b"$ ");
+    let before = instants(&app).len();
+    for name in ["Aterm Day", "Nord", "Dracula", "Aterm Night", "Nord"] {
+        set_theme(&mut app, name);
+    }
+    assert_eq!(drain_into_recorder(&app, &rx), 5, "each change went out");
+    assert_eq!(instants(&app).len(), before + 1, "{:?}", instants(&app));
+    let nord = aterm_types::scheme::builtin("Nord")
+        .expect("built-in")
+        .background;
+    assert_eq!(shown_bg(&mut app, Target::Latest), nord);
+
+    let _ = slice(&app, b"y");
+    let before = instants(&app).len();
+    set_theme(&mut app, "Aterm Day");
+    let _ = drain_into_recorder(&app, &rx);
+    let _ = slice(&app, b"x");
+    set_theme(&mut app, "Dracula");
+    let _ = drain_into_recorder(&app, &rx);
+    assert_eq!(
+        instants(&app).len(),
+        before + 3,
+        "negative control: a slice between two changes"
     );
 }
 
@@ -3321,7 +3493,6 @@ fn a_fold_inside_an_open_frame_forces_out_no_replacement_glyph() {
         plan,
         judge: None,
         around: Vec::new(),
-        colors: None,
     });
     assert!(folded.mid_frame, "the fold ended the open frame");
     let shown = crate::control::screen_text(&folded.term);
@@ -4569,7 +4740,7 @@ fn rewind_status_says_the_worker_is_busy_until_its_work_is_done() {
             std::time::Instant::now() < deadline,
             "the thread never settled: {status}"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
 }
 

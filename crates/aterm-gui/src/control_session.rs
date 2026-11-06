@@ -1532,7 +1532,7 @@ impl TurnIo<'static> {
     }
 }
 
-/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as one paste. 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply.
+/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a time, the remainder going as one paste. 240 at the default cadence is ~17 s of typing, inside the default 240 s deadline with room for the reply; a turn whose keys go slower than its deadline allows pastes the rest sooner ([`TypingPace`]).
 pub(crate) const TYPED_CAP: usize = 240;
 
 /// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a time.
@@ -1609,10 +1609,119 @@ fn typed_key_event(g: &str) -> Option<InputEvent> {
     })
 }
 
-/// `turn typed=1`'s press list for `text`, one event per grapheme ([`typed_key_event`]), pure so the tuple a typed turn presses is pinned beside the tuple a keyboard presses without an event loop.
-pub(crate) fn typed_key_events(text: &str) -> Vec<InputEvent> {
+/// `turn typed=1`'s press list for `text`, one event per grapheme ([`typed_key_event`]), pure so the tuple a typed turn presses is pinned beside the tuple a keyboard presses without an event loop. Each event carries the byte offset of its grapheme in `text`: where the paste of the rest starts when the turn stops pressing before that key ([`TypingPace`]).
+pub(crate) fn typed_key_events(text: &str) -> Vec<(usize, InputEvent)> {
     use aterm_grapheme::GraphemeClusters;
-    text.graphemes().filter_map(typed_key_event).collect()
+    text.grapheme_indices()
+        .filter_map(|(at, g)| typed_key_event(g).map(|ev| (at, ev)))
+        .collect()
+}
+
+/// THE PACE OF A TYPED TURN: a `turn typed=1` never leaves part of its text in the composer for
+/// its deadline. Before each key it asks whether that key, one paste of everything after it, the
+/// longest wait a typing hold has needed so far, and the submit's share of the turn
+/// ([`TypingPace::new`]) still end by the deadline, at the pace its keys have gone so far and never
+/// faster than `cadence=`. The moment they would not, the rest of
+/// the text goes as one paste (bracketed where the program turned DEC 2004 on), a write nothing
+/// cuts part-way, and the turn goes on to its submit. Typing that keeps delivering is never cut:
+/// a drive's turn (`timeout=20000`) to a loaded Claude Code worker whose keys went at about 5 a
+/// second answered `skipped reason=deadline typed=106` and left the 106 in its composer, and each
+/// retry stacked another (m14 driving m108, 2026-11-04). Before its first key the turn can still
+/// end as it found the composer, and does when that key does not fit: `reason=deadline typed=0
+/// pasted=0`, never a paste whose submit the deadline leaves no time to see, which a retry would
+/// send again. The echo's settle after the paste ends in time for the submit's share
+/// ([`press_by`]); a Claude Code composer's echo is still waited for, which alone shows the
+/// program took the text before its Enter is judged. A
+/// fenced turn's wait for a program that draws nothing of what it was sent is a hang detector,
+/// and cuts where it waited ([`TypingHold::held`]); one as long as an earlier wait of the turn
+/// still fits, because the pace kept room for it.
+struct TypingPace {
+    cadence: std::time::Duration,
+    /// What the turn keeps after its typing: the echo's settle and the submit's window, at most
+    /// half the turn, so a short `timeout=` still types.
+    reserve: std::time::Duration,
+    /// When the first key was pressed, and the deadline then: what a typing hold gave back to the
+    /// deadline since is the program's drawing, no key's.
+    first: Option<(std::time::Instant, std::time::Instant)>,
+    /// The longest a typing hold has waited for the program in this turn, which the next key's
+    /// hold may wait again.
+    longest_hold: std::time::Duration,
+}
+
+impl TypingPace {
+    /// The pace of a turn of `timeout` whose keys go every `cadence`, the echo of its text settling
+    /// for `settle` and its submit verified within `submit_window` (none for `submit=none`).
+    fn new(
+        cadence: std::time::Duration,
+        timeout: std::time::Duration,
+        settle: std::time::Duration,
+        submit_window: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            cadence,
+            reserve: (settle + submit_window.unwrap_or_default()).min(timeout / 2),
+            first: None,
+            longest_hold: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Notes a key pressed at `at`, under `deadline`.
+    fn pressed(&mut self, at: std::time::Instant, deadline: std::time::Instant) {
+        self.first.get_or_insert((at, deadline));
+    }
+
+    /// Notes a typing hold that waited `waited` for the program before a key.
+    fn held(&mut self, waited: std::time::Duration) {
+        self.longest_hold = self.longest_hold.max(waited);
+    }
+
+    /// How long a key takes, after `typed` keys, judged at `now` under `deadline`: their mean
+    /// since the first, less what the holds gave back, and never less than the cadence.
+    fn per_key(
+        &self,
+        typed: usize,
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> std::time::Duration {
+        let Some((first, deadline_then)) = self.first else {
+            return self.cadence;
+        };
+        let given_back = deadline.saturating_duration_since(deadline_then);
+        let spent = now
+            .saturating_duration_since(first)
+            .saturating_sub(given_back);
+        let typed = u32::try_from(typed.max(1)).unwrap_or(u32::MAX);
+        (spent / typed).max(self.cadence)
+    }
+
+    /// Whether the next key, after `typed`, still fits at `now` under `deadline`: its hold's wait
+    /// at the longest so far, it, one paste of the rest, and the reserve, each key and the paste
+    /// at [`TypingPace::per_key`].
+    fn fits(&self, typed: usize, now: std::time::Instant, deadline: std::time::Instant) -> bool {
+        let per = self.per_key(typed, now, deadline);
+        per.checked_mul(2)
+            .and_then(|both| both.checked_add(self.reserve))
+            .and_then(|need| need.checked_add(self.longest_hold))
+            .and_then(|need| now.checked_add(need))
+            .is_some_and(|end| end <= deadline)
+    }
+}
+
+/// When the echo's settle after a turn's last write ends at the latest: early enough that the
+/// submit's `window` (its share of the turn, as [`TypingPace`] reserves it) still fits before
+/// `deadline`, never sooner than the `settle` after the typing ended at `typed`, and never past
+/// the deadline. The settle latches only once the program stops drawing, which a working agent's
+/// spinner never does, so without this bound it would spend the submit's window. A Claude Code
+/// composer's echo wait is not bounded so: it ends once the composer shows the text, and its
+/// Enter is judged by that text leaving, which a wait cut short would lose.
+fn press_by(
+    deadline: std::time::Instant,
+    typed: std::time::Instant,
+    settle: std::time::Duration,
+    window: std::time::Duration,
+) -> std::time::Instant {
+    let settled = typed.checked_add(settle).unwrap_or(typed);
+    deadline.min(deadline.checked_sub(window).unwrap_or(typed).max(settled))
 }
 
 /// Split `text` at the `cap`th grapheme ([`TYPED_CAP`] unless the turn said `cap=`): `(typed prefix, pasted remainder)`.
@@ -2891,27 +3000,36 @@ fn turn_attempt(
     if !text.is_empty() {
         if typed {
             use aterm_grapheme::GraphemeClusters;
-            let (head, remainder) = split_typed_cap(text, typed_cap);
-            let keys = typed_key_events(head);
+            let (head, _) = split_typed_cap(text, typed_cap);
+            // Where the paste of the rest starts: past the cap, or at the first key the pace
+            // leaves no room to press ([`TypingPace`]).
+            let mut rest_at = head.len();
+            let mut pace = TypingPace::new(
+                cadence,
+                Duration::from_millis(timeout_ms),
+                ECHO_SETTLE,
+                (submit != "none").then(|| Duration::from_millis(submit_window_ms)),
+            );
             let mut due = Instant::now();
-            let last_due =
-                due + cadence * u32::try_from(keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
-            if !keys.is_empty() && last_due >= deadline {
-                return typed_cut(term, "deadline", 0, 0, turn_id);
-            }
-            for ev in keys {
+            for (at, ev) in typed_key_events(head) {
                 let now = Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
                 }
-                if Instant::now() >= deadline {
-                    return typed_cut(term, "deadline", typed_keys, 0, turn_id);
+                if !pace.fits(typed_keys, Instant::now(), deadline) {
+                    // Nothing written yet: the turn can still end as it found the composer.
+                    if typed_keys == 0 {
+                        return typed_cut(term, "deadline", 0, 0, turn_id);
+                    }
+                    rest_at = at;
+                    break;
                 }
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
                 if let Some(h) = &mut hold {
                     let digit = is_digit_key(&ev);
+                    let before = deadline;
                     match h.held(
                         term,
                         ctx,
@@ -2920,7 +3038,11 @@ fn turn_attempt(
                         cadence,
                         &mut deadline,
                     ) {
-                        Ok(cursor) => sent_from = Some(cursor),
+                        Ok(cursor) => {
+                            sent_from = Some(cursor);
+                            // What it waited, it gave back: the next key keeps room for as much.
+                            pace.held(deadline.saturating_duration_since(before));
+                        }
                         Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
                     }
                 }
@@ -2930,7 +3052,9 @@ fn turn_attempt(
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
-                due = Instant::now() + cadence;
+                let pressed_at = Instant::now();
+                due = pressed_at + cadence;
+                pace.pressed(pressed_at, deadline);
                 let first = !wrote.replace(true);
                 if !(io.key)(ev) {
                     return undelivered(first, KEY_DELIVERY_FAILED);
@@ -2938,6 +3062,8 @@ fn turn_attempt(
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
             }
+            // The rest of the text, past the cap or from the key the pace stopped before.
+            let remainder = &text[rest_at..];
             if !remainder.is_empty() {
                 // The loop checks before each key only: a head of control characters, which
                 // `typed_key_events` drops, presses none and leaves this paste the first write.
@@ -3006,7 +3132,16 @@ fn turn_attempt(
         };
         let typed_at = Instant::now();
         typed_end = Some(typed_at);
-        match wait_committed(id, deadline.min(typed_at + EchoWait::CAP)) {
+        // The submit's share of the turn, as the pace reserves it: at most half of `timeout=`.
+        let window = if submit == "none" {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(submit_window_ms).min(Duration::from_millis(timeout_ms) / 2)
+        };
+        match wait_committed(
+            id,
+            press_by(deadline, typed_at, ECHO_SETTLE, window).min(typed_at + EchoWait::CAP),
+        ) {
             Parked::Exited => return "ERR exited\n".to_string(),
             Parked::Done(_) | Parked::Deadline | Parked::HungUp => {}
         }
@@ -3272,7 +3407,7 @@ fn turn_attempt(
                 break;
             }
         }
-        unjudged = by_screen && submit_by.is_none() && pressed > 0;
+        unjudged = submit_by.is_none() && pressed > 0;
     }
     let submitted = submit_by.is_some();
 
@@ -3403,8 +3538,11 @@ fn turn_attempt(
         use std::fmt::Write as _;
         let _ = write!(verdict, " yielded_ms={ms}");
     }
-    // A screen that showed no press is no proof the program left the line, nor one a codex-alab
-    // between turns began no turn for: the Enters are named.
+    // An Enter no look proved taken is no proof the program left the line: a screen that showed
+    // no press, a codex-alab between turns that began no turn, or a composer that still holds the
+    // text when the turn's time runs out (its echo can come so late that the Enter goes with
+    // little of its window left, and the program may yet take it). The Enters are named, so a
+    // caller never types the text again over one that may have gone.
     if submit_matcher.is_some() || unjudged {
         use std::fmt::Write as _;
         let _ = write!(verdict, " pressed={pressed}");
@@ -6693,7 +6831,7 @@ mod tests {
                     armed.elapsed() < std::time::Duration::from_secs(60),
                     "the waiter never parked"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             report(ProgramStateWord::Done, None);
             report(
@@ -6920,7 +7058,7 @@ mod tests {
                     parked.elapsed() < std::time::Duration::from_secs(60),
                     "the waiter never parked"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             mark_session_task(&workers[0].ctx, 1, &TaskMark::new(TaskState::Done))
                 .expect("unfenced");
@@ -7124,7 +7262,7 @@ mod tests {
                     parked.elapsed() < std::time::Duration::from_secs(60),
                     "the waiter never parked"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(note(FactWord::new(RuleId::HoldRoom, 1)), NoteOutcome::Noted);
             let reply = waiter.join().expect("the waiter");
@@ -10058,6 +10196,131 @@ mod composer_verify_tests {
             echo.look(true, t0 + s(1)),
             Some(t0 + s(2)),
             "nor past the deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typing_pace_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{TypingPace, press_by};
+
+    const SETTLE: Duration = Duration::from_millis(150);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The pace is the keys' own: keys going every 1.5 s in a 20 s turn stop while the next
+    /// key, the paste and the reserve (2 x 1.5 s + 2.15 s) still fit, not when the cadence's
+    /// 2 x 70 ms would, and time a typing hold gave back to the deadline is no key's.
+    #[test]
+    fn the_pace_is_measured_from_the_keys_less_what_the_holds_gave_back() {
+        let t0 = Instant::now();
+        // Four keys pressed 1.5 s apart, under `deadline` all along.
+        let paced = |deadline: Instant| {
+            let mut pace = TypingPace::new(ms(70), ms(20_000), SETTLE, Some(ms(2_000)));
+            for key in 0..4u32 {
+                pace.pressed(t0 + ms(1_500) * key, deadline);
+            }
+            pace
+        };
+        // When the fifth key is due.
+        let now = t0 + ms(6_000);
+        let need = ms(1_500) * 2 + ms(2_150);
+        let roomy = now + need + ms(500);
+        assert_eq!(paced(roomy).per_key(4, now, roomy), ms(1_500));
+        assert!(paced(roomy).fits(4, now, roomy));
+        let tight = now + need - ms(500);
+        assert!(
+            !paced(tight).fits(4, now, tight),
+            "keys at 1.5 s stop with {need:?} left, not at the cadence's 2.29 s"
+        );
+        // A hold gave 10 s back: the deadline moved, the keys' time did not.
+        let deadline = t0 + ms(20_000);
+        let at = t0 + ms(16_000);
+        assert_eq!(
+            paced(deadline).per_key(4, at, deadline + ms(10_000)),
+            ms(1_500),
+            "6 s of key time over 4 keys, the 10 s the hold gave back left out"
+        );
+        assert_eq!(
+            paced(deadline).per_key(4, at, deadline),
+            ms(4_000),
+            "the control"
+        );
+    }
+
+    /// The next key keeps room for as long a wait as a typing hold has needed so far, so a wait
+    /// like an earlier one fits before the paste instead of meeting the deadline part-way.
+    #[test]
+    fn the_pace_keeps_room_for_the_longest_wait_a_hold_has_needed() {
+        let t0 = Instant::now();
+        let deadline = t0 + ms(20_000);
+        let mut pace = TypingPace::new(ms(70), ms(20_000), SETTLE, Some(ms(2_000)));
+        pace.pressed(t0, deadline);
+        // 200 keys in 16 s: 80 ms each.
+        let now = deadline - ms(4_000);
+        assert!(
+            pace.fits(200, now, deadline),
+            "no hold yet: 4 s is room enough"
+        );
+        pace.held(ms(3_000));
+        pace.held(ms(1_000));
+        assert!(
+            !pace.fits(200, now, deadline),
+            "a 3 s wait does not fit in 4 s"
+        );
+        assert!(pace.fits(200, deadline - ms(5_500), deadline));
+    }
+
+    /// The reserve is the settle and the submit's window, at most half the turn; a turn whose
+    /// first key does not fit writes nothing, and huge numbers never overflow into a yes.
+    #[test]
+    fn the_reserve_is_at_most_half_the_turn_and_never_overflows() {
+        let t0 = Instant::now();
+        let pace = TypingPace::new(ms(1), ms(3_000), SETTLE, Some(ms(2_000)));
+        let deadline = t0 + ms(3_000);
+        assert!(
+            pace.fits(0, deadline - ms(1_503), deadline),
+            "1.5 s, not 2.15 s"
+        );
+        assert!(!pace.fits(0, deadline - ms(1_501), deadline));
+        let none = TypingPace::new(ms(1), ms(3_000), SETTLE, None);
+        assert!(
+            none.fits(0, deadline - ms(153), deadline),
+            "submit=none keeps the settle"
+        );
+        let huge = TypingPace::new(Duration::MAX, ms(3_000), SETTLE, Some(ms(2_000)));
+        assert!(!huge.fits(0, t0, t0 + ms(3_000_000)));
+    }
+
+    /// The waits after the last write end with the submit's window still to run, though the
+    /// program never stops drawing, but never before the echo's settle and never past the
+    /// deadline.
+    #[test]
+    fn the_waits_after_the_typing_leave_the_submit_its_window() {
+        let t0 = Instant::now();
+        let deadline = t0 + ms(20_000);
+        assert_eq!(
+            press_by(deadline, t0 + ms(17_000), SETTLE, ms(2_000)),
+            t0 + ms(18_000)
+        );
+        assert_eq!(
+            press_by(deadline, t0 + ms(19_000), SETTLE, ms(2_000)),
+            t0 + ms(19_150),
+            "the settle still runs"
+        );
+        assert_eq!(
+            press_by(deadline, t0 + ms(19_950), SETTLE, ms(2_000)),
+            deadline,
+            "never past the deadline"
+        );
+        assert_eq!(
+            press_by(deadline, t0 + ms(1_000), SETTLE, ms(0)),
+            deadline,
+            "submit=none: the deadline"
         );
     }
 }

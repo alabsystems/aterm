@@ -65,6 +65,7 @@ pub(crate) struct RetiredWorkers {
 impl RetiredWorkers {
     /// Keep `row` (one already kept for its session is replaced), and return the rows it pushed
     /// past [`RETIRED_MAX`], whose result files go ([`forget_results`]).
+    #[cfg(test)]
     pub(crate) fn keep(&mut self, row: Retired) -> Vec<Retired> {
         self.rows.retain(|kept| kept.sid != row.sid);
         self.rows.push_back(row);
@@ -111,12 +112,6 @@ impl RetiredWorkers {
             }
         }
         any
-    }
-
-    /// Drop the row of local id `local`, returned: a close that did not happen takes it back.
-    pub(crate) fn drop_local(&mut self, local: u64) -> Option<Retired> {
-        let at = self.rows.iter().position(|row| row.local == Some(local))?;
-        self.rows.remove(at)
     }
 
     /// Drop the rows kept [`RETIRED_FOR_MS`] by `now_unix_ms`, returned.
@@ -285,9 +280,7 @@ mod tests {
             "CONTROL: another window's rows stay listed"
         );
 
-        assert_eq!(kept.drop_local(2).map(|row| row.local), Some(Some(2)));
-        assert!(kept.drop_local(2).is_none());
-        assert_eq!(kept.drop_all().len(), RETIRED_MAX - 2);
+        assert_eq!(kept.drop_all().len(), RETIRED_MAX - 1);
         assert!(listed(&kept, 0).is_empty());
     }
 

@@ -2386,7 +2386,7 @@ fn the_disk_watchs_looks_tell_the_window_each_end_once() {
         let ran = Instant::now();
         while LOOKING.load(Ordering::SeqCst) {
             assert!(ran.elapsed() < Duration::from_secs(60), "the look ends");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
     let told = told.lock().unwrap().clone();
@@ -31768,7 +31768,7 @@ fn a_login_signed_back_in_at_the_tab_is_ok_again_for_its_own_account_alone() {
             &roster,
             &logins,
             &a.state(),
-            &accounts::enrolled(&roster),
+            &accounts::OtherMacs::NONE,
             a.clock(),
         )
     };

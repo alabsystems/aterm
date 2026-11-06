@@ -7,6 +7,9 @@ use super::{Plan, Row, Stage, item_rows, readiness_row};
 use aterm_machines::items::Ctx;
 use aterm_machines::model::Mode;
 use aterm_machines::port::System;
+use std::sync::Arc;
+
+type Current = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
 
 pub(super) fn run(
     sys: &dyn System,
@@ -35,7 +38,42 @@ pub(super) fn run_reading(
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Ran, String> {
-    Ok(match items(sys, ctx, vault, mode, false)? {
+    Ok(reading(items(sys, ctx, vault, mode, false)?))
+}
+
+/// Run with the current setup choice checked at each clone boundary, including when the
+/// Secrets group is left as it is and the inputs are this account's local files.
+pub(super) fn run_reading_guarded(
+    sys: &dyn System,
+    ctx: &Ctx,
+    vault: Option<&Plan>,
+    mode: Mode,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<Ran, String> {
+    let current: Current = Arc::new(current);
+    let result = items_current(sys, ctx, vault, mode, false, Some(Arc::clone(&current)));
+    if let Err(why) = current().and_then(|ready| {
+        ready
+            .then_some(())
+            .ok_or_else(|| "repository setup was held while cloning".to_owned())
+    }) {
+        return Ok(Ran {
+            rows: vec![Row {
+                name: Stage::Repositories.name().into(),
+                status: super::WAITING.into(),
+                detail: why,
+                elapsed_ms: None,
+            }],
+            developer_tools: false,
+            failure: None,
+            token: false,
+        });
+    }
+    result.map(reading)
+}
+
+fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
+    match rows {
         Some(rows) => Ran {
             developer_tools: want_developer_tools(&rows),
             failure: failure_note(&rows),
@@ -52,7 +90,7 @@ pub(super) fn run_reading(
             failure: None,
             token: false,
         },
-    })
+    }
 }
 
 /// Why the repositories' item `rows` failed, where the step that stopped decided it: the
@@ -115,8 +153,41 @@ fn items(
     mode: Mode,
     own: bool,
 ) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
+    items_current(sys, ctx, vault, mode, own, None)
+}
+
+fn local_items(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    current: Option<Current>,
+) -> Result<Vec<aterm_machines::model::ItemReport>, String> {
+    match current {
+        None => aterm_machines::init_github::run_initial_repositories(sys, ctx, mode),
+        Some(current) => {
+            let inputs =
+                aterm_machines::init_github::InitialRepositoryInputs::capture_ready(sys, ctx)?;
+            aterm_machines::init_github::run_initial_repositories_captured(
+                sys,
+                ctx,
+                mode,
+                inputs,
+                move || current(),
+            )
+        }
+    }
+}
+
+fn items_current(
+    sys: &dyn System,
+    ctx: &Ctx,
+    vault: Option<&Plan>,
+    mode: Mode,
+    own: bool,
+    current: Option<Current>,
+) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
     let Some(vault) = vault else {
-        return aterm_machines::init_github::run_initial_repositories(sys, ctx, mode).map(Some);
+        return local_items(sys, ctx, mode, current).map(Some);
     };
     let [user] = ctx.users.as_slice() else {
         return Err("repository setup needs exactly one console account".into());
@@ -132,13 +203,21 @@ fn items(
         if !own {
             return Ok(None);
         }
-        return aterm_machines::init_github::run_initial_repositories(sys, ctx, mode)
+        return local_items(sys, ctx, mode, current)
             .map(|rows| (!want_token(&rows)).then_some(rows));
     };
-    let captured = aterm_secrets::client::with_materialization_ready(&paths, expected, || {
+    let entries = aterm_machines::init_github::uses_vault_inventory(sys, ctx)?
+        .then_some(aterm_machines::init_github::VAULT_INPUT_ENTRIES.as_slice());
+    let read = || {
         aterm_machines::init_github::InitialRepositoryInputs::capture(sys, ctx)
             .map_err(aterm_secrets::Error::new)
-    })
+    };
+    let captured = match entries {
+        Some(entries) => aterm_secrets::client::with_materialization_ready_for_entries(
+            &paths, expected, entries, read,
+        ),
+        None => aterm_secrets::client::with_materialization_ready(&paths, expected, read),
+    }
     .map_err(|error| error.to_string())?;
     let Some(captured) = captured else {
         return Ok(None);
@@ -149,6 +228,11 @@ fn items(
         mode,
         captured.inputs,
         move || {
+            if let Some(current) = &current
+                && !current()?
+            {
+                return Ok(false);
+            }
             captured
                 .snapshot
                 .is_current(&paths)
@@ -170,11 +254,12 @@ mod tests {
     use std::time::Duration;
 
     const TOKEN: &str = "fixture_repository_token_only";
+    const INVENTORY: &str = r#"{"schema":2,"account":"alice","repositories":[]}"#;
 
     fn joined(home: &Path, source: &Path) -> Paths {
         std::fs::write(
             source,
-            format!("gh_access_token={TOKEN}\n~/.tool/other=before\n"),
+            format!("gh_access_token={TOKEN}\ngithub-repositories.json={INVENTORY}\n~/.tool/other=before\n"),
         )
         .unwrap();
         std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -230,6 +315,12 @@ mod tests {
         let bytes = std::fs::read(&token).unwrap();
         sys.file(token.to_str().unwrap(), &bytes)
             .stat_of(token.to_str().unwrap(), stat(false, bytes.len() as u64));
+        let inventory = home.join(".secrets/github-repositories.json");
+        sys.file(inventory.to_str().unwrap(), INVENTORY.as_bytes())
+            .stat_of(
+                inventory.to_str().unwrap(),
+                stat(false, INVENTORY.len() as u64),
+            );
         for (endpoint, body) in [
             ("/user", aterm_json::json!({"login":"alice"})),
             (
@@ -298,10 +389,35 @@ mod tests {
     }
 
     #[test]
+    fn leaving_the_secrets_group_as_is_still_checks_the_configured_default_vault() {
+        let (_root, _plan, sys, ctx) = after_sync_failure();
+        let ran = run_reading_guarded(&sys, &ctx, None, Mode::Apply, || Ok(true)).unwrap();
+        assert!(
+            ran.rows
+                .iter()
+                .any(|row| row.detail.contains("configured secrets vault is not ready")),
+            "{:?}",
+            ran.rows
+        );
+        assert!(
+            ran.rows
+                .iter()
+                .any(|row| row.status == "blocked" || row.status == super::super::WAITING),
+            "an unready source is unfinished: {:?}",
+            ran.rows
+        );
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.contains(" clone ") || call.contains(" agh GET "))
+        );
+    }
+
+    #[test]
     fn leaving_secrets_as_is_uses_the_existing_local_repository_token() {
         let (_root, _plan, sys, ctx) = after_sync_failure();
         let _result = run(&sys, &ctx, None, Mode::Plan);
-        assert!(sys.calls().iter().any(|call| call.contains(" agh GET ")));
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
     #[test]
@@ -315,8 +431,17 @@ mod tests {
             ..Plan::default()
         };
         let (sys, ctx) = fake(&home);
-        let _result = run(&sys, &ctx, Some(&plan), Mode::Plan);
-        assert!(sys.calls().iter().any(|call| call.contains(" agh GET ")));
+        let result = items(&sys, &ctx, Some(&plan), Mode::Plan, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.iter().any(|row| matches!(
+                aterm_machines::init_observe::Reading::of(row),
+                Some(aterm_machines::init_observe::Reading::Repositories { count: 0, .. })
+            )),
+            "{result:?}"
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
     #[test]
@@ -370,6 +495,20 @@ mod tests {
         let home = root.path().join("home");
         joined(&home, &root.path().join("team.secrets"));
         let (sys, ctx) = fake(&home);
+        // A personal explicit scope still authenticates its independently configured source.
+        let profile = home.join(".config/aterm/init.toml");
+        let profile_bytes = b"[github]\naccount='alice'\n";
+        sys.file(profile.to_str().unwrap(), profile_bytes).stat_of(
+            profile.to_str().unwrap(),
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: profile_bytes.len() as u64,
+            },
+        );
         sys.fail_github_api(&ctx.users[0], "/user", GithubFailure::Unauthenticated);
         // GitHub signs the token in once, then refuses it: it expired between two reads.
         let first = observe(&sys, &ctx, None, false).unwrap();

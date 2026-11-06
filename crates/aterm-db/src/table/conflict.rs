@@ -128,13 +128,17 @@ impl Conflict {
         a: &[u8],
         b: &[u8],
     ) -> Result<Self> {
-        let mut sources = [a, b];
-        sources.sort_by_key(|source| Sha256::digest(source));
-        let mut wire = b"ACTF1".to_vec();
+        if a.len() > MAX_OPERATION || b.len() > MAX_OPERATION {
+            return Err(Error::new("table conflict source exceeds its bound"));
+        }
+        let sources = if Sha256::digest(a) <= Sha256::digest(b) {
+            [a, b]
+        } else {
+            [b, a]
+        };
+        let mut wire = Vec::with_capacity(5 + 8 + a.len() + b.len());
+        wire.extend_from_slice(b"ACTF1");
         for source in sources {
-            if source.len() > MAX_OPERATION {
-                return Err(Error::new("table conflict source exceeds its bound"));
-            }
             wire.extend_from_slice(&(source.len() as u32).to_le_bytes());
             wire.extend_from_slice(source);
         }
@@ -153,7 +157,8 @@ impl Conflict {
         let recovery = session
             .discarding_recovery(&envelope)
             .ok_or_else(|| Error::new("no signed recovery discarded this source"))?;
-        let mut wire = b"ACTQ1".to_vec();
+        let mut wire = Vec::with_capacity(5 + 32 + 4 + source.len());
+        wire.extend_from_slice(b"ACTQ1");
         wire.extend_from_slice(&recovery);
         wire.extend_from_slice(&(source.len() as u32).to_le_bytes());
         wire.extend_from_slice(source);

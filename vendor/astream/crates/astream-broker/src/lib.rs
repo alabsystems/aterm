@@ -68,9 +68,12 @@
 //! - **HEALTH, FROM THE BROKER ITSELF**: the answer to every `Hello` says whether the
 //!   log is POISONED (it refuses every write until it is reopened) and why, and what its
 //!   flushes did ([`HelloHealth`], [`Client::broker_health`]) — read by the broker without
-//!   the log's lock, as are [`Broker::poisoned`] and [`Broker::wait_poisoned`]. The rest
-//!   of the operator's snapshot ([`BrokerHealth`]: what the log holds, who is attached,
-//!   what is parked) is kept beside the log in `<log>.health`
+//!   the log's lock, as are [`Broker::poisoned`] and [`Broker::wait_poisoned`]. It names
+//!   the log's DEVICE too, and whether its full flush drains it ([`LogDevice`],
+//!   [`Client::log_device`]), so a writer of its own on that device settles its
+//!   barriered writes by the broker's flush ([`Client::settle`]) rather than draining the
+//!   device again. The rest of the operator's snapshot ([`BrokerHealth`]: what the log
+//!   holds, who is attached, what is parked) is kept beside the log in `<log>.health`
 //!   ([`OpenOptions::health_every`], [`Broker::keep_health`]), which another process
 //!   reads with [`read_health`] and is told whether the broker that wrote it still serves
 //!   the log.
@@ -183,9 +186,10 @@ pub use federation::{
     FederationEndpoint, FederationError, FederationLink, FederationMesh, FederationMeshConfig,
     FederationMeshReport, FederationReport, FederationRule, FederationRunner,
     FederationRunnerCloser, FederationWire, PeerAdvertisement, PeerHealthState, PeerRouteEntry,
-    PeerTransportKind, RegionRouteDecision, SubjectRewrite, DEFAULT_FEDERATION_BATCH,
-    DEFAULT_PEER_REGISTRY_PREFIX, DEFAULT_ROUTE_HYSTERESIS_US, MAX_FEDERATION_PEERS,
-    MAX_FEDERATION_REGIONS, MAX_FEDERATION_RTT_US, MAX_FEDERATION_RULES, MAX_PEER_EXPORT_PREFIXES,
+    PeerTransportKind, RegionRouteDecision, Seated, SubjectRewrite, DEFAULT_FEDERATION_BATCH,
+    DEFAULT_PEER_REGISTRY_PREFIX, DEFAULT_ROUTE_HYSTERESIS_US, HELD_BYTES, HELD_CAP,
+    MAX_FEDERATION_PEERS, MAX_FEDERATION_REGIONS, MAX_FEDERATION_RTT_US, MAX_FEDERATION_RULES,
+    MAX_PEER_EXPORT_PREFIXES,
 };
 #[cfg(feature = "stream")]
 pub use stream_link::{StreamDial, StreamLink};
@@ -225,10 +229,11 @@ pub use logid::{
     identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
 };
 pub use proto::{
-    AttachedProducerStats, FaceStats, Gap, HelloHealth, NonceExt, Request, Response, ServedInfo,
-    ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED, HELLO_REASON_MAX,
-    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_BURST_MARKS, REQUEST_GAP_FENCES,
-    REQUEST_GAP_NOTICES, REQUEST_RELAY, REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
+    AttachedProducerStats, FaceStats, Gap, HelloHealth, LogDevice, NonceExt, Request, Response,
+    ServedInfo, ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED,
+    HELLO_REASON_MAX, RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_BURST_MARKS,
+    REQUEST_GAP_FENCES, REQUEST_GAP_NOTICES, REQUEST_RELAY, REQUEST_RETIRE, REQUEST_SETTLE,
+    REQUEST_STATS, REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 pub use refill::{

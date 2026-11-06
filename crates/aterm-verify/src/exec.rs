@@ -253,8 +253,8 @@ pub trait StageGroupEnd: Sync + std::fmt::Debug {
     /// Sweep a stage process group whose leader has exited but is not yet reaped.
     fn group_ended(&self, pgid: u32, label: &str);
     /// Record the group [`Self::group_ended`] swept, once its leader is reaped: the leader no
-    /// longer holds the group's id then, so one answer of the kernel about the whole group finds
-    /// it empty only when no member is left in it either, and can prove it empty where the
+    /// longer holds the group's id then, so the kernel's answer about the whole group finds it
+    /// empty only when no process is left in it either, and can prove it empty where the
     /// sweep's listing could not ([`group::empty`]).
     fn group_reaped(&self, pgid: u32, label: &str);
 }
@@ -1271,6 +1271,7 @@ fn finish(
                     aterm_json::json!({
                         "schema": 1, "event": "test-case-failed", "outcome": "FAIL",
                         "test": cmd.test_progress, "case": case,
+                        "at_unix_ms": aterm_time::unix_millis(),
                         "elapsed_s": begun.elapsed().as_secs_f64(),
                         "binary_completed": false,
                         "detail": "libtest reported a failed case; final binary result is pending",
@@ -1785,26 +1786,51 @@ pub mod group {
         }
     }
 
-    /// Whether process group `pgid` has no member left, by one answer of the kernel about the
-    /// whole group (`killpg(pgid, 0)`, which sends nothing): `Some(true)` when no process is in
-    /// it (`ESRCH`); `Some(false)` when one is, whether or not this user may signal it (`0`, or
-    /// `EPERM`: another user's, and on macOS a zombie its parent has not reaped, which Linux
-    /// answers `0` for when it is this user's) and whether or not a listing shows it; `None`
-    /// for a `pgid` of 1 or less (`killpg` reads 0 as this process's own group and 1 as every
-    /// process this user may signal) or past `i32::MAX`, unasked, and for any other answer.
-    /// Until its leader is reaped the leader keeps the group, so it is asked after the reap; a
-    /// group made since under the freed id then reads as not empty, never as empty.
+    /// Whether process group `pgid` has no process left in it, by the kernel's answer about the
+    /// whole group (`killpg(pgid, 0)`, which sends nothing): `Some(true)` when the group is gone
+    /// (`ESRCH`); `Some(false)` when a process is in it, whether or not this user may signal it
+    /// (`0`, or `EPERM`: another user's, and on macOS a zombie its parent has not reaped, which
+    /// Linux answers `0` for when it is this user's); `None` for a `pgid` of 1 or less
+    /// (`killpg` reads 0 as this process's own group and 1 as every process this user may
+    /// signal) or past `i32::MAX`, unasked, and for any other answer. macOS also answers `EPERM`
+    /// for a group that holds no process, only the old image a member's exec left, which the
+    /// kernel tears down after the exec, on a loaded machine after the member itself is reaped;
+    /// there an `EPERM` is settled by the group's listing ([`judged`]). Until its leader is
+    /// reaped the leader keeps the group, so it is asked after the reap; a group made since
+    /// under the freed id then reads as not empty, never as empty.
     #[must_use]
     pub fn empty(pgid: u32) -> Option<bool> {
         let g = i32::try_from(pgid).ok().filter(|&g| g > 1)?;
         // SAFETY: two integers; signal 0 sends nothing, and `g` > 1 names one group.
-        if unsafe { killpg(g, 0) } == 0 {
-            return Some(false);
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(true),
-            Some(libc::EPERM) => Some(false),
-            _ => None,
+        let answer = if unsafe { killpg(g, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error())
+        };
+        judged(answer, || aterm_uds::process::group_members(pgid))
+    }
+
+    /// [`empty`]'s verdict on `killpg`'s `answer` (`Ok` for 0, else its errno). An `EPERM` on
+    /// Apple reads `listing`, the group's members as `proc_listpids` finds them: it lists every
+    /// live and zombie process of every user and skips only what an exec left of an old image
+    /// (measured on macOS 27: a reaped `/bin/sh` leader, whose shim execs `bash`, answered
+    /// `EPERM` and listed nothing for up to 1.6 s on a loaded machine, then `ESRCH`), so a whole
+    /// listing that finds no process proves the group empty, as the sweep's whole listing does
+    /// ([`crate::runs::sweep_group`]); a listing cut short, or none, leaves it not empty. A
+    /// process still being created in the group is in neither answer, as in no listing.
+    #[must_use]
+    pub(crate) fn judged(
+        answer: Result<(), Option<i32>>,
+        listing: impl FnOnce() -> Option<aterm_uds::process::GroupMembers>,
+    ) -> Option<bool> {
+        match answer {
+            Ok(()) => Some(false),
+            Err(Some(libc::ESRCH)) => Some(true),
+            Err(Some(libc::EPERM)) => Some(
+                cfg!(target_vendor = "apple")
+                    && listing().is_some_and(|members| members.complete && members.pids.is_empty()),
+            ),
+            Err(_) => None,
         }
     }
 
@@ -2672,6 +2698,48 @@ mod tests {
         );
         leader.wait().expect("the leader, reaped");
         assert_eq!(group::empty(pid), Some(true), "reaped, it holds no one");
+    }
+
+    /// [`group::judged`] on each answer `killpg` gives: `ESRCH` is empty and `0` is not, neither
+    /// reading the listing; any other errno is unknown; and `EPERM` is not empty, unless on Apple
+    /// the group's whole listing finds no process, which is all an exec's leftover image holds
+    /// there after its process is reaped. A listing cut short, none, or one that names a process
+    /// (a zombie, another user's) keeps `EPERM` not empty. NEGATIVE CONTROL: answer
+    /// `Some(false)` for every `EPERM` in `group::judged`, as it was, and the leftover's group
+    /// reads not empty on Apple.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_held_only_by_an_exec_leftover_reads_empty() {
+        use aterm_uds::process::GroupMembers;
+        let unread = || -> Option<GroupMembers> { panic!("the listing is not read") };
+        assert_eq!(group::judged(Err(Some(libc::ESRCH)), unread), Some(true));
+        assert_eq!(group::judged(Ok(()), unread), Some(false));
+        assert_eq!(group::judged(Err(Some(libc::EINVAL)), unread), None);
+        assert_eq!(group::judged(Err(None), unread), None);
+        let whole = GroupMembers {
+            pids: Vec::new(),
+            complete: true,
+        };
+        assert_eq!(
+            group::judged(Err(Some(libc::EPERM)), || Some(whole.clone())),
+            Some(cfg!(target_vendor = "apple")),
+            "a whole listing that finds no process"
+        );
+        let cut = GroupMembers {
+            pids: Vec::new(),
+            complete: false,
+        };
+        let named = GroupMembers {
+            pids: vec![4242],
+            complete: true,
+        };
+        for listing in [Some(cut), Some(named), None] {
+            assert_eq!(
+                group::judged(Err(Some(libc::EPERM)), || listing.clone()),
+                Some(false),
+                "{listing:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

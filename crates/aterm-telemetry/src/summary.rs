@@ -25,7 +25,7 @@ pub struct Spread {
 
 impl Spread {
     fn of(figs: impl Iterator<Item = Option<u64>>) -> Self {
-        let mut known = Vec::new();
+        let mut known = Vec::with_capacity(figs.size_hint().0);
         let mut unknown = 0;
         for f in figs {
             match f {
@@ -122,33 +122,64 @@ pub fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
     Ok(now_ms.saturating_sub(ms))
 }
 
-fn opt(v: Option<u64>) -> String {
-    v.map_or_else(|| "-".to_owned(), |v| v.to_string())
+fn push_opt(out: &mut String, v: Option<u64>) {
+    match v {
+        Some(v) => {
+            let _ = write!(out, "{v}");
+        }
+        None => out.push('-'),
+    }
 }
 
-fn mib(v: Option<u64>) -> String {
-    v.map_or_else(|| "-".to_owned(), |b| (b >> 20).to_string())
+fn push_mib(out: &mut String, v: Option<u64>) {
+    match v {
+        Some(b) => {
+            let _ = write!(out, "{}", b >> 20);
+        }
+        None => out.push('-'),
+    }
 }
 
 /// The reader's head line: what was read and how far back it reaches.
 #[must_use]
 pub fn head(reading: &Reading, since_ms: Option<u64>, dir: &str) -> String {
     let facts = reading.hosts.last();
-    format!(
-        "telemetry schema={} rows={} dropped={} torn={} files={} bytes={} since={} oldest={} \
-         host={} facts={} dir={}",
+    let mut out = String::with_capacity(160 + dir.len());
+    let _ = write!(
+        out,
+        "telemetry schema={} rows={} dropped={} torn={} files={} bytes={} since=",
         crate::row::SCHEMA,
         reading.rows.len(),
         reading.dropped,
         reading.torn,
         reading.files,
         reading.bytes,
-        opt(since_ms),
-        opt(reading.oldest_ms),
+    );
+    push_opt(&mut out, since_ms);
+    out.push_str(" oldest=");
+    push_opt(&mut out, reading.oldest_ms);
+    let _ = write!(
+        out,
+        " host={} facts=",
         facts.map_or("-", |h| h.spelled.host.as_str()),
-        facts.map_or_else(|| "-".to_owned(), |h| h.facts.hex()),
-        dir.replace(' ', "%20"),
-    )
+    );
+    match facts {
+        Some(h) => out.push_str(&h.facts.hex()),
+        None => out.push('-'),
+    }
+    out.push_str(" dir=");
+    if dir.contains(' ') {
+        for ch in dir.chars() {
+            if ch == ' ' {
+                out.push_str("%20");
+            } else {
+                out.push(ch);
+            }
+        }
+    } else {
+        out.push_str(dir);
+    }
+    out
 }
 
 /// The summary: [`head`], then one `kind=` line a kind.
@@ -157,25 +188,23 @@ pub fn render(reading: &Reading, since_ms: Option<u64>, dir: &str) -> String {
     let mut out = head(reading, since_ms, dir);
     out.push('\n');
     for k in by_kind(&reading.rows) {
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "kind={} n={} failed={} stalled={} wall_p50_ms={} wall_p90_ms={} wall_unknown={} \
-             cpu_p50_ms={} cpu_p90_ms={} cpu_unknown={} peak_p50_mib={} peak_p90_mib={} \
-             peak_unknown={}",
-            k.kind,
-            k.n,
-            k.failed,
-            k.stalled,
-            opt(k.wall.p50),
-            opt(k.wall.p90),
-            k.wall.unknown,
-            opt(k.cpu.p50),
-            opt(k.cpu.p90),
-            k.cpu.unknown,
-            mib(k.peak.p50),
-            mib(k.peak.p90),
-            k.peak.unknown,
+            "kind={} n={} failed={} stalled={} wall_p50_ms=",
+            k.kind, k.n, k.failed, k.stalled
         );
+        push_opt(&mut out, k.wall.p50);
+        out.push_str(" wall_p90_ms=");
+        push_opt(&mut out, k.wall.p90);
+        let _ = write!(out, " wall_unknown={} cpu_p50_ms=", k.wall.unknown);
+        push_opt(&mut out, k.cpu.p50);
+        out.push_str(" cpu_p90_ms=");
+        push_opt(&mut out, k.cpu.p90);
+        let _ = write!(out, " cpu_unknown={} peak_p50_mib=", k.cpu.unknown);
+        push_mib(&mut out, k.peak.p50);
+        out.push_str(" peak_p90_mib=");
+        push_mib(&mut out, k.peak.p90);
+        let _ = writeln!(out, " peak_unknown={}", k.peak.unknown);
     }
     out
 }
@@ -192,12 +221,15 @@ pub fn render_rows(
 ) -> String {
     let mut out = head(reading, since_ms, dir);
     out.push('\n');
-    let rows: Vec<&Row> = reading
+    let mut tail: Vec<&Row> = reading
         .rows
         .iter()
+        .rev()
         .filter(|r| kind.is_none_or(|k| r.kind.word() == k))
+        .take(limit)
         .collect();
-    for row in rows.iter().skip(rows.len().saturating_sub(limit)) {
+    tail.reverse();
+    for row in tail {
         out.push_str(&row.body());
         out.push('\n');
     }

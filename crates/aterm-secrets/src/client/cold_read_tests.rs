@@ -38,7 +38,7 @@ pub(crate) fn cold_read_transition(
                 "visible",
                 i64::from(log_entries::applied_log_available(
                     &native,
-                    (state["log"] == 1).then_some(seeded),
+                    (state["log"] == 1).then_some(seeded.1),
                 )),
             );
         }

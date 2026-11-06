@@ -181,7 +181,7 @@ impl Prepare {
     }
 }
 
-fn active_command(plan: &NativePlan, phase: ImagePhase) -> Option<&RestartCommand> {
+pub(super) fn active_command(plan: &NativePlan, phase: ImagePhase) -> Option<&RestartCommand> {
     match plan {
         NativePlan::Restart {
             forward,

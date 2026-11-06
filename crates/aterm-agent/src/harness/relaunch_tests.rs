@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::harness::upgrade_drive::load;
 
 #[path = "relaunch_account_source_tests.rs"]
 mod account_restart_source;

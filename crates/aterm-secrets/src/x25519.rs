@@ -243,11 +243,7 @@ fn carry(a: &Loose) -> Fe {
 /// `a + b` (fiat-crypto's `add`): each limb at most 2^52.
 #[inline]
 fn add(a: &Fe, b: &Fe) -> Loose {
-    let mut o = [0u64; 5];
-    for i in 0..5 {
-        o[i] = a.0[i] + b.0[i];
-    }
-    Loose(o)
+    Loose(std::array::from_fn(|i| a.0[i] + b.0[i]))
 }
 
 /// `a - b` (fiat-crypto's `sub`): `2p + a - b` limb by limb, so no limb goes below zero (2p's
@@ -278,11 +274,7 @@ fn cswap(p: &mut Fe, q: &mut Fe, bit: u64) {
 #[inline]
 fn select(a: &Fe, b: &Fe, bit: u64) -> Fe {
     let mask = std::hint::black_box(0u64.wrapping_sub(bit));
-    let mut o = a.0;
-    for i in 0..5 {
-        o[i] ^= mask & (a.0[i] ^ b.0[i]);
-    }
-    Fe(o)
+    Fe(std::array::from_fn(|i| a.0[i] ^ (mask & (a.0[i] ^ b.0[i]))))
 }
 
 /// 1 when `a` and `b` are the same element of GF(p), whatever their limbs, else 0. Both are

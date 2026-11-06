@@ -41,6 +41,7 @@ pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<
             token_key: config.token_key.clone(),
         },
         recorded,
+        hooks: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -48,12 +49,16 @@ struct Repositories {
     user: User,
     config: Github,
     recorded: Vec<PathBuf>,
+    /// What the last apply's clones made of their hook installers ([`Cloned::hooks`]), which
+    /// the read-back's row says.
+    hooks: std::sync::Mutex<Vec<String>>,
 }
 
 struct Scan {
     all: usize,
     missing: Vec<Repo>,
     existing: Vec<(Repo, PathBuf, Stands)>,
+    dependencies: Vec<(Repo, PathBuf)>,
     recorded: usize,
     /// The listed repositories left untouched ([`Inventory::notes`], [`Partition::notes`]).
     notes: Vec<String>,
@@ -101,7 +106,30 @@ impl Item for Repositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        let token = match auth_ready(sys, &self.user, &self.config) {
+        // What the last apply's clones made of their hook installers: whatever this read says,
+        // the switch turned off or the profile changed since included, its row says that too.
+        let hooks = std::mem::take(
+            &mut *self
+                .hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let read = (|| -> Probe {
+            if matches!(super::settings_managed(sys, &self.user), Ok(false)) {
+                return Probe::NotApplicable {
+                    why: "repository setup is disabled in init.toml".into(),
+                };
+            }
+            match super::source::Stamp::matches_config(sys, &self.user, &self.config) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Probe::Blocked {
+                        why: "the configured repository profile changed before probing".into(),
+                    };
+                }
+                Err(why) => return Probe::Unusable { why },
+            }
+            let token = match auth_ready(sys, &self.user, &self.config) {
             Err(why) => return Probe::Unusable { why },
             Ok(None) => return Probe::Waits {
                 on: auth_id(&self.user),
@@ -109,62 +137,132 @@ impl Item for Repositories {
             },
             Ok(Some(token)) => token,
         };
-        match self.scan(sys, &token) {
-            Err(why) => Probe::Unusable { why },
-            Ok(scan) if scan.missing.is_empty() && scan.moving() == 0 => {
-                let mut now = format!("{} matching worktrees present", scan.all);
-                if scan.recorded > 0 {
-                    now.push_str(&format!(
-                        "; {} recorded in [develop], which the develop items align",
-                        scan.recorded
-                    ));
+            match self.scan(sys, &token) {
+                Err(why) => Probe::Unusable { why },
+                Ok(scan)
+                    if scan.missing.is_empty()
+                        && scan.dependencies.is_empty()
+                        && scan.moving() == 0 =>
+                {
+                    let mut now = format!("{} matching worktrees present", scan.all);
+                    if scan.recorded > 0 {
+                        now.push_str(&format!(
+                            "; {} recorded in [develop], which the develop items align",
+                            scan.recorded
+                        ));
+                    }
+                    match scan.kept() {
+                        Some(kept) => now.push_str(&format!("; left as they are: {kept}")),
+                        None => now.push_str("; the others up to date with GitHub"),
+                    }
+                    Probe::Ok { now }
                 }
-                match scan.kept() {
-                    Some(kept) => now.push_str(&format!("; left as they are: {kept}")),
-                    None => now.push_str("; the others up to date with GitHub"),
-                }
-                Probe::Ok { now }
-            }
-            Ok(scan) => Probe::Change {
-                from: format!(
-                    "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub",
-                    scan.missing.len(),
-                    scan.all,
-                    unfit(sys, &self.user, &scan.missing),
-                    scan.moving()
-                ),
-                to: "clone missing repositories with full history; fast-forward each clean \
+                Ok(scan) => Probe::Change {
+                    from: format!(
+                        "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub{}",
+                        scan.missing.len(),
+                        scan.all,
+                        unfit(sys, &self.user, &scan.missing),
+                        scan.moving(),
+                        if scan.dependencies.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; {} checkout(s) need required dependencies",
+                                scan.dependencies.len()
+                            )
+                        }
+                    ),
+                    to: "clone missing repositories with full history; fast-forward each clean \
                      worktree that is behind; preserve every other worktree"
-                    .into(),
-            },
-        }
+                        .into(),
+                },
+            }
+        })();
+        with_hooks(read, &hooks)
     }
 
-    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let source = super::source::Stamp::read(sys, &self.user)?;
+        let current = || {
+            authorized()?;
+            if !super::settings_managed(sys, &self.user)? {
+                return Err("repository setup was disabled in init.toml while cloning".into());
+            }
+            if !super::source::Stamp::matches_config(sys, &self.user, &self.config)? {
+                return Err("the configured repository profile changed before cloning".into());
+            }
+            if !source.is_current(sys, &self.user)? {
+                return Err("repository input source changed while cloning".into());
+            }
+            Ok(())
+        };
+        current()?;
         let Some(token) = auth_ready(sys, &self.user, &self.config)? else {
             return Err("GitHub authentication changed; no repositories cloned".into());
         };
         let scan = self.scan(sys, &token)?;
         let home = Path::new(&self.user.home);
-        let cloned = clone_all(sys, &self.user, &scan.missing, None);
-        let mut failed = cloned.failed;
-        for (repo, path, stands) in scan.existing {
-            if !stands.moves() {
-                continue;
+        let guard = CloneGuard::new(&current);
+        let Cloned {
+            left,
+            failed,
+            hooks,
+            ..
+        } = clone_all(sys, &self.user, &scan.missing, Some(&guard));
+        let after = (|| {
+            current()?;
+            let mut failed = failed;
+            for (repo, path) in scan.dependencies {
+                current()?;
+                if let Err(why) =
+                    super::dependencies::repair(sys, &self.user, &path, &repo, &current)
+                {
+                    failed.push(format!("~/{}: {why}", repo.name));
+                }
             }
-            if let Err(unread) = crate::checkout::align(sys, &self.user, &path, &repo.origin()) {
-                failed.push(format!("~/{}: {}", repo.name, unread.why));
+            for (repo, path, stands) in scan.existing {
+                if !stands.moves() {
+                    continue;
+                }
+                current()?;
+                if let Err(unread) =
+                    crate::checkout::align_guarded(sys, &self.user, &path, &repo.origin(), &current)
+                {
+                    failed.push(format!("~/{}: {}", repo.name, unread.why));
+                }
             }
-        }
-        failed.extend(short_of_room(
-            sys.volume(home).as_ref(),
-            &cloned.left,
-            INIT_AGAIN,
-        ));
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(failed.join("; "))
+            failed.extend(short_of_room(sys.volume(home).as_ref(), &left, INIT_AGAIN));
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(failed.join("; "))
+            }
+        })();
+        // A failed row is read back by nothing: it says what the clones that went made of their
+        // hook installers, after why it failed, a guard that stopped the rest included; a done
+        // one leaves that to the read-back's row.
+        match after {
+            Ok(()) => {
+                *self
+                    .hooks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
+                Ok(())
+            }
+            Err(why) => Err(std::iter::once(why)
+                .chain(hooks)
+                .collect::<Vec<_>>()
+                .join("; ")),
         }
     }
 }
@@ -190,6 +288,7 @@ impl Repositories {
         let Partition {
             missing,
             present,
+            dependencies,
             notes,
         } = partition(sys, &self.user, &listed.repositories)?;
         let mut aligned = Vec::new();
@@ -207,6 +306,7 @@ impl Repositories {
             all: listed.repositories.len() - notes.len(),
             missing,
             existing: aligned,
+            dependencies,
             recorded,
             notes: listed.notes.into_iter().chain(notes).collect(),
         })
@@ -233,21 +333,17 @@ pub(super) fn aterm_checkouts(
 
 /// Where each listed repository stands in `~`: missing, present as its own worktree, or left
 /// untouched for the reason its note gives (a folder in the way, another origin, a standard
-/// home folder). A repository with a note is not the stage's to clone: the stage is done when
-/// none is missing.
+/// home folder). A present repository includes all explicitly required dependencies; a
+/// matching parent whose gitlinks need work remains unfinished in `dependencies`.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Partition {
     pub(super) missing: Vec<Repo>,
     pub(super) present: Vec<(Repo, PathBuf)>,
+    pub(super) dependencies: Vec<(Repo, PathBuf)>,
     pub(super) notes: Vec<String>,
 }
 
 impl Partition {
-    /// The repositories the stage has in `~` or clones: every listed one without a note.
-    pub(super) fn admissible(&self) -> usize {
-        self.missing.len() + self.present.len()
-    }
-
     /// Read back the repositories in `touched`, which a pass just cloned: each that reads as its
     /// own worktree moves from missing to present; the others stay missing. Nothing else is read
     /// again.
@@ -255,8 +351,12 @@ impl Partition {
         let home = Path::new(&user.home);
         for repo in touched {
             let path = home.join(&repo.name);
-            if verify_existing(sys, user, &repo.owner, repo, &path).is_ok() {
+            if verify_existing(sys, user, &repo.owner, repo, &path).is_ok()
+                && super::dependencies::ready(sys, user, &path, repo).unwrap_or(false)
+            {
                 self.missing.retain(|missing| missing.name != repo.name);
+                self.dependencies
+                    .retain(|(pending, _)| pending.name != repo.name);
                 self.present.push((repo.clone(), path));
             }
         }
@@ -317,7 +417,11 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
             }
             Ok(stat) if stat.dir && !stat.symlink => {
                 match verify_existing(sys, user, &repo.owner, repo, &path) {
-                    Ok(()) => standing.present.push((repo.clone(), path)),
+                    Ok(()) => match super::dependencies::ready(sys, user, &path, repo) {
+                        Ok(true) => standing.present.push((repo.clone(), path)),
+                        Ok(false) => standing.dependencies.push((repo.clone(), path)),
+                        Err(why) => standing.notes.push(format!("~/{}: {why}", repo.name)),
+                    },
                     Err(why) => standing.notes.push(why),
                 }
             }
@@ -441,6 +545,9 @@ pub(super) struct Repo {
     pub(super) fork: bool,
     /// GitHub lists it as archived (read-only).
     pub(super) archived: bool,
+    /// Only these tracked gitlinks are required by the private inventory. An ordinary
+    /// GitHub listing carries none, and no other submodule is acquired implicitly.
+    pub(super) required_submodules: Vec<String>,
 }
 
 impl Repo {
@@ -541,12 +648,33 @@ pub(super) fn enumerate_pages(
     api: impl FnMut(&str) -> Result<Page, String>,
 ) -> Result<Inventory, String> {
     let values = crate::github_pages::all(crate::github_pages::API, base, PAGE_SIZE, api)?;
+    inventory(&values, owner, prefer)
+}
+
+/// Validate one complete inventory, whether read from the private vault or an explicitly
+/// configured GitHub source. Counts are derived from these entries, never a separate total.
+pub(super) fn inventory(
+    values: &[Value],
+    owner: Option<&str>,
+    prefer: Option<&str>,
+) -> Result<Inventory, String> {
+    inventory_filtered(values, owner, prefer, |_| true)
+}
+
+/// Validate every listed identity, then apply the intended scope before resolving home
+/// folders. An excluded repository cannot take a folder away from an included one.
+pub(super) fn inventory_filtered(
+    values: &[Value],
+    owner: Option<&str>,
+    prefer: Option<&str>,
+    include: fn(&Repo) -> bool,
+) -> Result<Inventory, String> {
     let mut named: BTreeMap<String, Repo> = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut notes = Vec::new();
     let preferred =
         |repo: &Repo| prefer.is_some_and(|login| repo.owner.eq_ignore_ascii_case(login));
-    for value in &values {
+    for value in values {
         let repo = repo(value, owner)?;
         let id = value
             .get("id")
@@ -558,6 +686,9 @@ pub(super) fn enumerate_pages(
                 "a repository is listed twice in the GitHub inventory; no repositories changed"
                     .into(),
             );
+        }
+        if !include(&repo) {
+            continue;
         }
         let folder = repo.name.to_ascii_lowercase();
         let (kept, left) = match named.remove(&folder) {
@@ -621,6 +752,7 @@ fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
             .get("archived")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        required_submodules: super::dependencies::paths(value.get("required_submodules"))?,
     })
 }
 
@@ -632,7 +764,7 @@ fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result
     )
 }
 
-fn verify_existing(
+pub(super) fn verify_existing(
     sys: &dyn System,
     user: &User,
     owner: &str,
@@ -688,7 +820,7 @@ fn verify_existing(
     Ok(())
 }
 
-fn verify_integrity(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
+pub(super) fn verify_integrity(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
     if git_read(sys, user, path, &["rev-parse", "--is-shallow-repository"])?.trim() != "false" {
         return Err("the new clone is shallow; not published".into());
     }
@@ -716,7 +848,7 @@ struct Remote {
     refs: BTreeMap<String, String>,
 }
 
-fn oid(value: &str) -> bool {
+pub(super) fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -806,7 +938,7 @@ impl<'a> CloneGuard<'a> {
 /// The command a clone's network step runs: `ordinary` with aterm's own credential route
 /// ([`crate::git_credential::pinned`]), once its effective URL reads as the listed repository's
 /// ([`admit_endpoint`]). The person's URL rewrites stay theirs; no helper their files name runs.
-fn clone_command(
+pub(super) fn clone_command(
     sys: &dyn System,
     user: &User,
     ordinary: Cmd,
@@ -827,7 +959,7 @@ pub(super) fn clone_one_guarded(
     user: &User,
     repo: &Repo,
     current: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(), String> {
+) -> Result<Placed, String> {
     clone_one_with(
         sys,
         user,
@@ -844,7 +976,7 @@ pub(super) fn clone_one(
     user: &User,
     owner: &str,
     repo: &Repo,
-) -> Result<(), String> {
+) -> Result<Placed, String> {
     clone_one_with(sys, user, owner, repo, None, None)
 }
 
@@ -860,7 +992,39 @@ pub(super) struct Cloned {
     pub(super) left: Vec<String>,
     /// Why each clone that failed did, `~/<name>: <why>`, in list order.
     pub(super) failed: Vec<String>,
+    /// What each clone it published made of the hook installer it carries
+    /// ([`install_hooks`]), `~/<name>: <outcome>`, in list order: a note, never a failure.
+    pub(super) hooks: Vec<String>,
 }
+
+/// Where [`clone_one_with`] left its repository, once it is in `~`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Placed {
+    /// This clone published it: the setup made the worktree.
+    Published,
+    /// This clone published it, but its private staging directory, empty once the repository
+    /// moved out of it, could not be removed: the worktree is the setup's all the same, and the
+    /// row says what was left behind.
+    PublishedStagingLeft,
+    /// Another clone published it first (`sync.clone`, a second `aterm init`), and it reads as
+    /// the repository's own worktree: this one made nothing there.
+    InPlace,
+}
+
+/// The installer a repository carries for its own clones' hooks: the fleet's convention
+/// (trust's and clean's), which points the clone's `core.hooksPath` at its tracked hooks and, in
+/// trust, sets the clone's git client tuning (trust's GIT-CLIENT-TUNING-1).
+pub(super) const HOOK_INSTALLER: &str = "scripts/install-git-hooks.sh";
+
+/// The shell a [`HOOK_INSTALLER`] runs under, as its usage spells it (`bash <installer>`).
+const BASH: &str = "/bin/bash";
+
+/// How long a clone's [`HOOK_INSTALLER`] may run before its process group is killed: minutes,
+/// because an installer may run git over a large worktree (trust's moves the index to format 4).
+const HOOK_INSTALLER_BUDGET: Duration = Duration::from_secs(300);
+
+/// The longest outcome line [`install_hooks`] keeps of what an installer printed.
+const HOOK_LINE: usize = 160;
 
 /// Clone `missing` into `~`, up to [`LANES`] at once. The disk is read once: each clone runs only
 /// while it fits beside the clones taken before it ([`no_room`]); the rest are left. A lane makes
@@ -908,7 +1072,7 @@ pub(super) fn clone_all(
                         (repo, Scratch::new_in(sys, home, "github-clone"))
                     };
                     // It reads the snapshot first and between its steps.
-                    let result = match staging {
+                    let parent = match staging {
                         Ok(staging) => {
                             clone_one_with(sys, user, &repo.owner, repo, guard, Some(staging))
                         }
@@ -917,13 +1081,30 @@ pub(super) fn clone_all(
                                 .to_owned())
                         }
                     };
+                    let published =
+                        matches!(parent, Ok(Placed::Published | Placed::PublishedStagingLeft));
+                    let result = parent.and_then(|placed| {
+                        let current = || guard.map_or(Ok(()), |guard| (guard.current)());
+                        super::dependencies::repair(
+                            sys,
+                            user,
+                            &home.join(&repo.name),
+                            repo,
+                            &current,
+                        )?;
+                        Ok(placed)
+                    });
                     if result.is_err() && guard.is_some_and(|guard| (guard.current)().is_err()) {
                         stopped.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // Only a clone this lane published: one found in place is another's.
+                    let hooks = published
+                        .then(|| install_hooks(sys, user, &repo.name, guard))
+                        .flatten();
                     results
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((repo, result));
+                        .push((repo, result, hooks));
                 }
             });
         }
@@ -932,14 +1113,154 @@ pub(super) fn clone_all(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let order = |repo: &Repo| missing.iter().position(|listed| listed.name == repo.name);
-    results.sort_by_key(|(repo, _)| order(repo));
-    for (repo, result) in results {
+    results.sort_by_key(|(repo, _, _)| order(repo));
+    for (repo, result, hooks) in results {
         match result {
-            Ok(()) => done.cloned.push(repo.clone()),
+            Ok(placed) => {
+                done.cloned.push(repo.clone());
+                if placed == Placed::PublishedStagingLeft {
+                    done.failed.push(format!(
+                        "~/{}: repository published, but its private empty staging directory \
+                         could not be removed",
+                        repo.name
+                    ));
+                }
+            }
             Err(why) => done.failed.push(format!("~/{}: {why}", repo.name)),
         }
+        done.hooks.extend(hooks);
     }
     done
+}
+
+/// Run the [`HOOK_INSTALLER`] of `~/<name>`, which this pass just published
+/// ([`Placed::Published`], or [`Placed::PublishedStagingLeft`]), where the clone carries one: hook state is per clone and starts
+/// unset, so a clone the setup makes has no hooks and no git tuning until its installer runs.
+/// It runs once, as `user`, with [`BASH`] in the clone and the git the setup runs first on
+/// `PATH`. Its outcome is a line for the row (`~/<name>: …`), never a failure of the clone or
+/// of the setup. No clone the setup did not make reaches here, so no existing worktree runs
+/// it; nor does an installer reached through a link (a tracked `scripts` link included, which
+/// would run a file outside the clone) or a directory in its place, nor a guarded pass whose
+/// vault snapshot stopped being current (the check every step of a guarded clone makes first).
+/// Selected required dependencies are attempted first. An ordinary dependency failure does
+/// not suppress the new parent's advisory installer; an invalidated source still does.
+fn install_hooks(
+    sys: &dyn System,
+    user: &User,
+    name: &str,
+    guard: Option<&CloneGuard<'_>>,
+) -> Option<String> {
+    let clone = Path::new(&user.home).join(name);
+    let outcome = match installer_in(sys, &clone)? {
+        Err(why) => format!("its {HOOK_INSTALLER} {why}; not run"),
+        Ok(()) => match guard.map_or(Ok(()), |guard| (guard.current)()) {
+            Err(why) => format!("its {HOOK_INSTALLER} not run: {why}"),
+            Ok(()) => hook_outcome(&sys.run(&installer_command(sys, user, &clone))),
+        },
+    };
+    Some(format!("~/{name}: {outcome}"))
+}
+
+/// Whether `clone` carries a [`HOOK_INSTALLER`] to run: `None` when it has none, else `Ok` for
+/// a file that is neither a directory nor a link, reached through directories alone, or why not.
+/// Each step in is read without following it ([`System::stat`] is an `lstat`), so a link
+/// anywhere on the way is seen. [`Stat`](crate::port::Stat) tells no other kind apart, so a FIFO
+/// or socket there reads as a file: a checkout git made holds none, and one planted after this
+/// look would beat any look here, since `bash` opens the path itself; the installer's time
+/// budget bounds what such a file can do, and its outcome line says so.
+fn installer_in(sys: &dyn System, clone: &Path) -> Option<Result<(), &'static str>> {
+    let steps: Vec<_> = Path::new(HOOK_INSTALLER).components().collect();
+    let mut at = clone.to_path_buf();
+    for (index, step) in steps.iter().enumerate() {
+        at.push(step);
+        let file = index + 1 == steps.len();
+        match sys.stat(&at) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(Err("cannot be inspected")),
+            Ok(stat) if stat.symlink => return Some(Err("is reached through a link")),
+            // A file where a folder on the way goes: nothing can be under it, so no installer.
+            Ok(stat) if !file && !stat.dir => return None,
+            Ok(stat) if stat.dir == file => return Some(Err("is not a regular file")),
+            Ok(_) => {}
+        }
+    }
+    Some(Ok(()))
+}
+
+/// `probe` with `hooks` (what the last apply's clones made of their hook installers,
+/// [`Cloned::hooks`]) after its line, every one of them, whatever the read-back answers: an
+/// installer runs once, when its clone is published, so the row after it is the only one that
+/// can say how it went.
+pub(super) fn with_hooks(probe: Probe, hooks: &[String]) -> Probe {
+    if hooks.is_empty() {
+        return probe;
+    }
+    let after = |line: String| format!("{line}; {}", hooks.join("; "));
+    match probe {
+        Probe::Ok { now } => Probe::Ok { now: after(now) },
+        Probe::Change { from, to } => Probe::Change {
+            from: after(from),
+            to,
+        },
+        Probe::Person { step, how } => Probe::Person {
+            step,
+            how: after(how),
+        },
+        Probe::Blocked { why } => Probe::Blocked { why: after(why) },
+        Probe::Waits { on, why } => Probe::Waits {
+            on,
+            why: after(why),
+        },
+        Probe::NotApplicable { why } => Probe::NotApplicable { why: after(why) },
+        Probe::Deferred { why } => Probe::Deferred { why: after(why) },
+        Probe::Unusable { why } => Probe::Unusable { why: after(why) },
+    }
+}
+
+/// The run of `clone`'s [`HOOK_INSTALLER`] ([`install_hooks`]).
+pub(super) fn installer_command(sys: &dyn System, user: &User, clone: &Path) -> Cmd {
+    let git = crate::items::github::git_program(sys);
+    let bin = git.parent().unwrap_or_else(|| Path::new("/usr/bin"));
+    Cmd::new(BASH)
+        .as_user(user)
+        .current_dir(clone)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .budget(HOOK_INSTALLER_BUDGET)
+        .arg(HOOK_INSTALLER)
+}
+
+/// What a [`HOOK_INSTALLER`]'s run says, in one line: the first line it printed when it
+/// succeeded, else how it ended, and that the clone stands.
+fn hook_outcome(ran: &Result<crate::port::Ran, crate::port::RunFailed>) -> String {
+    let line = |text: &str| {
+        let line: String = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(HOOK_LINE)
+            .collect();
+        (!line.is_empty()).then_some(line)
+    };
+    match ran {
+        Ok(ran) if ran.success() => match line(&ran.out()) {
+            Some(said) => format!("ran its {HOOK_INSTALLER}: {said}"),
+            None => format!("ran its {HOOK_INSTALLER}"),
+        },
+        Ok(ran) => format!(
+            "its {HOOK_INSTALLER} failed ({}); the clone stands",
+            line(&ran.describe()).unwrap_or_default()
+        ),
+        Err(failed) => {
+            format!("its {HOOK_INSTALLER} did not run to the end ({failed}); the clone stands")
+        }
+    }
 }
 
 /// Clone `repo` into `~`, in `staging` when its place is already made ([`clone_all`]), else
@@ -951,7 +1272,7 @@ fn clone_one_with(
     repo: &Repo,
     guard: Option<&CloneGuard<'_>>,
     staging: Option<Scratch<'_>>,
-) -> Result<(), String> {
+) -> Result<Placed, String> {
     let current = || guard.map_or(Ok(()), |guard| (guard.current)());
     current()?;
     let home = Path::new(&user.home);
@@ -960,7 +1281,9 @@ fn clone_one_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         // Another clone of it (`sync.clone`, a second `aterm init`) published it since the step
         // read what was missing: a worktree in place at this repository's origin is done.
-        Ok(_) if verify_existing(sys, user, owner, repo, &destination).is_ok() => return Ok(()),
+        Ok(_) if verify_existing(sys, user, owner, repo, &destination).is_ok() => {
+            return Ok(Placed::InPlace);
+        }
         _ => {
             return Err(format!(
                 "~/{} appeared before cloning; left untouched",
@@ -1077,17 +1400,18 @@ fn clone_one_with(
             staging.close().map_err(|_| {
                 "the repository is in place, but this clone's private staging could not be removed"
             })?;
-            return Ok(());
+            return Ok(Placed::InPlace);
         }
         return Err(format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
             repo.name
         ));
     }
-    staging.close().map_err(
-        |_| "repository published, but its private empty staging directory could not be removed",
-    )?;
-    Ok(())
+    Ok(if staging.close().is_ok() {
+        Placed::Published
+    } else {
+        Placed::PublishedStagingLeft
+    })
 }
 
 /// Remove what clones left in `user`'s home when their process ended mid-clone (a crash, a kill,
@@ -1264,6 +1588,7 @@ pub(super) mod tests {
     use std::path::PathBuf;
 
     mod clone_route_tests;
+    mod hook_installer_tests;
     mod staging_tests;
 
     const TOKEN: &str = "fixture_synced_token_only";
@@ -1304,6 +1629,19 @@ pub(super) mod tests {
         sys.euid = who.uid;
         sys.stat_of(&who.home, directory(who.uid));
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        let profile = "/Users//alice/.config/aterm/init.toml";
+        let bytes = format!("[github]\naccount='alice'\nowner='alice'\ntoken_file='{SOURCE}'\n");
+        sys.file(profile, bytes.as_bytes()).stat_of(
+            profile,
+            Stat {
+                uid: who.uid,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
         // Her token file, which aterm's route over that file hands back.
         sys.file(SOURCE, TOKEN.as_bytes()).stat_of(
             SOURCE,
@@ -1404,6 +1742,43 @@ pub(super) mod tests {
                 .len(),
             30
         );
+    }
+
+    #[test]
+    fn a_profile_changed_after_probe_refuses_the_prepared_repository_source() {
+        let (sys, who, config) = fixture();
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=1"),
+            page(vec![value("new", 1, true)], None),
+        );
+        let ctx = ctx(std::slice::from_ref(&who));
+        let item = item(&who, &config, Vec::new());
+        assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
+        let path = "/Users//alice/.config/aterm/init.toml";
+        let bytes = format!("[github]\naccount='alice'\nowner='team'\ntoken_file='{SOURCE}'\n");
+        sys.file(path, bytes.as_bytes()).stat_of(
+            path,
+            Stat {
+                uid: who.uid,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
+        sys.on_github_api(&who, &format!("{BASE}&page=1"), page(Vec::new(), None));
+        assert!(
+            matches!(item.probe(&sys, &ctx), Probe::Blocked { .. }),
+            "a stale source cannot read green even if its old inventory is empty"
+        );
+        assert!(
+            item.apply(&sys, &ctx)
+                .unwrap_err()
+                .contains("profile changed")
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
     }
 
     #[test]
@@ -1600,8 +1975,16 @@ pub(super) mod tests {
                     }
                     let mut state = state.lock().unwrap();
                     let (head, fetched) = (state.0.clone(), state.1);
-                    let line = args[2..].join(" ");
-                    Some(match script::without_route(&line) {
+                    let mut operation = &args[2..];
+                    while operation.first().map(String::as_str) == Some("-c")
+                        && operation
+                            .get(1)
+                            .is_some_and(|value| value.starts_with("credential."))
+                    {
+                        operation = &operation[2..];
+                    }
+                    let line = operation.join(" ");
+                    Some(match line.as_str() {
                         "rev-parse --verify --quiet HEAD^{commit}" => Ran::ok(&format!("{head}\n")),
                         "ls-remote --symref origin HEAD" => {
                             Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n"))
@@ -1751,6 +2134,7 @@ pub(super) mod tests {
             size_kib,
             fork: false,
             archived: false,
+            required_submodules: Vec::new(),
         };
         assert_eq!(no_room(None, &repo(u64::MAX)), None);
         assert_eq!(short_of_room(None, &[], INIT_AGAIN), None);
@@ -1901,6 +2285,7 @@ pub(super) mod tests {
                 user: who.clone(),
                 config: config.clone(),
                 recorded: Vec::new(),
+                hooks: std::sync::Mutex::new(Vec::new()),
             }
             .scan(&sys, &token())
             .unwrap();
@@ -2098,6 +2483,32 @@ pub(super) mod tests {
         script_clone_named_route(sys, who, name, sequence, empty, false)
     }
 
+    /// Where the `sequence`th clone of github.com/alice/`name` stages its repository, and the
+    /// display of that clone's command, under which a script adds what the clone writes.
+    pub(in crate::init_github) fn clone_key(
+        sys: &Fake,
+        who: &User,
+        name: &str,
+        sequence: u64,
+    ) -> (PathBuf, String) {
+        let staged =
+            Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
+        let command = crate::checkout::network(sys, who, None)
+            .budget(CLONE_BUDGET)
+            .args([
+                "clone",
+                "--no-single-branch",
+                "--tags",
+                "--origin",
+                "origin",
+                "--template=",
+                "--",
+                &format!("https://github.com/alice/{name}.git"),
+            ])
+            .arg(&staged);
+        (staged, command.display())
+    }
+
     /// [`script_clone_named`], its effective URL a same-repository SSH rewrite when `rewritten`:
     /// the person's own URL, which the clone keeps, under aterm's credential route.
     pub(in crate::init_github) fn script_clone_named_route(
@@ -2115,6 +2526,7 @@ pub(super) mod tests {
             size_kib: 0,
             fork: false,
             archived: false,
+            required_submodules: Vec::new(),
         };
         let url = format!("https://github.com/alice/{name}.git");
         let url = url.as_str();
@@ -2147,22 +2559,7 @@ pub(super) mod tests {
             "refs/tags/*",
         ]);
         sys.on(&command.display(), Ran::ok(&remote));
-        let staged =
-            Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
-        let command = route()
-            .budget(CLONE_BUDGET)
-            .args([
-                "clone",
-                "--no-single-branch",
-                "--tags",
-                "--origin",
-                "origin",
-                "--template=",
-                "--",
-                url,
-            ])
-            .arg(&staged);
-        let clone_key = command.display();
+        let (staged, clone_key) = clone_key(sys, who, name, sequence);
         sys.on(&clone_key, Ran::ok(""));
         sys.on_stat(&clone_key, &staged, directory(who.uid));
         sys.on_write(&clone_key, &staged.join(".git/fixture"), b"complete clone");
@@ -2277,7 +2674,7 @@ pub(super) mod tests {
                         std::time::Instant::now() < deadline,
                         "the publish never waited"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 changed.store(changes, Ordering::SeqCst);
                 drop(latch);
@@ -2421,7 +2818,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 clone_one(&sys, &who, "alice", &repo),
-                Ok(()),
+                Ok(Placed::InPlace),
                 "{at_publish}"
             );
             assert_eq!(
@@ -2584,6 +2981,7 @@ pub(super) mod tests {
             size_kib: 0,
             fork: false,
             archived: false,
+            required_submodules: Vec::new(),
         };
         verify_existing(&sys, &who, "alice", &repo, &path).unwrap();
         assert_eq!(
@@ -2617,6 +3015,7 @@ pub(super) mod tests {
             size_kib: 0,
             fork: false,
             archived: false,
+            required_submodules: Vec::new(),
         };
         verify_existing(&sys, &who, "alice", &repo, &path).unwrap();
         assert!(sys.calls().iter().all(|call| !call.contains("shallow")

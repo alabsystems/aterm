@@ -37,11 +37,14 @@ pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
 
 pub(super) fn coordinated(st: &St) -> bool {
     st.native_coordination
+        || st.native_rollback
         || st.native_retired_unissued
+        || st.native_account_candidate.is_some()
         || st.native.is_some()
         || !st.native_prepare.is_empty()
         || st.native_completed_prepare.is_some()
         || st.native_observation.is_some()
+        || super::native_record::was_coordinated(st)
 }
 
 pub(super) fn constructor_enabled(client: &mut Client, tab: &str) -> bool {
@@ -175,6 +178,11 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         st.stop("native-cohort-retired", upgrade_drive::now_s());
     }
     Some(outcome)
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn terminal_for_test(st: &mut St, reply: &Reply) -> Option<Recovery> {
+    terminal_reply(st, reply)
 }
 
 #[cfg_attr(

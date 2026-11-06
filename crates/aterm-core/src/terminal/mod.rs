@@ -167,7 +167,7 @@ pub use frame_watchers::FrameWatchers;
 pub use holder_fence::{
     CutKind, HolderAdoption, HolderCut, HolderFence, HolderView, MAX_HOLDER_MARKS, MAX_HOLDER_SPANS,
 };
-pub use host_journal::{HOST_JOURNAL_CAP, HostOp, HostReport};
+pub use host_journal::{HOST_JOURNAL_CAP, HostConfig, HostOp, HostReport};
 pub use mode_mirror::ModeMirror;
 pub use observe::{
     FRAME_HANG, Frame, GONE_SETTLE, RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource,

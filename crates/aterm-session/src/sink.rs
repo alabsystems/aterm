@@ -2941,7 +2941,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "blocking writer never reserved its earlier attempt"
             );
-            thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
 
         let first = sink
@@ -3569,7 +3569,7 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
                 t0.elapsed() < std::time::Duration::from_secs(60),
                 "drainer never emptied"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!sink.shared.spill.lock().unwrap().arrange_pending);
     }

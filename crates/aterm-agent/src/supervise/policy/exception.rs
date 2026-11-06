@@ -709,9 +709,7 @@ pub(crate) fn draft_holds_limit_switch(
 
 /// Exception when the owner is in `/login` at a usage limit ([`notice::LOGIN_STOPPED`]): their
 /// sign-in under way ends the chain with none, and one that failed is told. A managed worker's
-/// tab is no exception: a `/login` dialog standing over its wall keeps its work from concluding
-/// there ([`super::turn_end::managed_wall_ends`]), so the sign-in a person makes in it is theirs to
-/// hear of, and once a far wall concluded the work (`task_done`) nothing here is told.
+/// tab follows the same rule while it waits for quota.
 fn claude_limit_login(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -838,8 +836,9 @@ fn limit_roster_step<'a>(
             }),
         },
         // A row still to sign in raises no notice: nothing here signs in a row no session here
-        // runs on (`crate::harness::sign_in_ladder`), a report a person reads names its sign-in,
-        // and the tab is decided again at the accounts' news or resumes at the reset.
+        // runs on or ran on within a week (`crate::harness::sign_in_ladder`), a report a person
+        // reads names its sign-in, and the tab is decided again at the accounts' news or resumes
+        // at the reset.
         (Ok(()), None, Some(_)) => None,
     })
 }

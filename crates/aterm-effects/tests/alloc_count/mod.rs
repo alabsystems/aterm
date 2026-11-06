@@ -98,6 +98,10 @@ pub fn assert_counter_is_per_thread() {
         let (go, done) = (Arc::clone(&go), Arc::clone(&done));
         std::thread::spawn(move || {
             while !go.load(Ordering::Acquire) {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a test's poll for what must happen, bounded by its hang detector, which no deadline waits on; this crate's tests do not link aterm_uds::deadline::poll_yield"
+                )]
                 std::thread::yield_now();
             }
             std::hint::black_box(Box::new([0u8; 48]));
@@ -107,6 +111,10 @@ pub fn assert_counter_is_per_thread() {
     let ((), allocs, sizes) = allocations_during(|| {
         go.store(true, Ordering::Release);
         while !done.load(Ordering::Acquire) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test's poll for what must happen, bounded by its hang detector, which no deadline waits on; this crate's tests do not link aterm_uds::deadline::poll_yield"
+            )]
             std::thread::yield_now();
         }
         std::hint::black_box(Box::new([0u8; 24]));

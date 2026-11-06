@@ -306,6 +306,13 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
     let whole = text.strip_suffix(b"\n").expect("the file ends its line");
     let mut want: Vec<&[u8]> = Vec::new();
+    // With no starter of this CLI, its worker carries the permission floor before the
+    // ordinary launch flags. Keep this oracle independent of the worker's flag builder.
+    match word {
+        "agy" => want.extend([b"--mode".as_slice(), b"auto".as_slice()]),
+        "muse" => want.extend([b"--approval-mode".as_slice(), b"never".as_slice()]),
+        _ => {}
+    }
     if word == "muse" {
         want.push(b"--trust-workspace");
     }

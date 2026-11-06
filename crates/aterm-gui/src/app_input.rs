@@ -1493,7 +1493,7 @@ pub(crate) mod paste_order {
                     since.elapsed() < Duration::from_secs(60),
                     "hang: scope renewal never became visible"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert!(
                 rx.try_recv().is_err(),
@@ -10048,7 +10048,16 @@ impl App {
                 }
             }
             MenuAction::Copy => {
-                let _ = self.copy_selection();
+                // Greyed over a private document ([`App::menu_copies`]); one chosen before the
+                // greying reached the menu copies nothing there either.
+                if self
+                    .frontmost_window
+                    .is_some_and(|wid| self.front_view_is_private(wid))
+                {
+                    crate::app_take_over::note_clipboard_refused("copy");
+                } else {
+                    let _ = self.copy_selection();
+                }
             }
             MenuAction::Paste => self.paste_into_front_field(),
             MenuAction::CopySessionId | MenuAction::CopyCwd | MenuAction::RenameSession => {

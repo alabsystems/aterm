@@ -5,7 +5,8 @@
 //! Raw records remain repairable; authority reads use the acknowledged causal prefix.
 
 use super::{
-    Config, Paths, fsx, log_entries, retained_frontier::Delta, retained_frontier::Frontier,
+    Config, Paths, fsx, log_entries, reads::Reads, retained_frontier::Delta,
+    retained_frontier::Frontier,
 };
 use crate::membership_log::{Body, Log, RecordId, Store};
 use crate::{Error, Result};
@@ -95,6 +96,9 @@ impl ReadCache {
     fn read(&self, paths: &Paths) -> Result<Arc<History>> {
         // Do not hold a process-wide mutex across filesystem reads or replay. Concurrent
         // readers can retain their own coherent checkpoint snapshots.
+        // The journal reads its own files, and every ask of it is one read of the journal.
+        #[cfg(test)]
+        fsx::count_read(&journal_file(paths, "checkpoint"));
         #[cfg(any(test, debug_assertions))]
         let mut lookup = read_counts::Lookup::Unavailable;
         let known = self.0.lock().ok().and_then(|entry| {
@@ -319,14 +323,14 @@ impl History {
         Ok(())
     }
 
-    fn context(&self, paths: &Paths, config: &Config, log: &Log) -> Result<Option<&Context>> {
+    fn context(&self, reads: &Reads<'_>, config: &Config, log: &Log) -> Result<Option<&Context>> {
         if let Some(held) = self.0.get(log.network()) {
             let direct = held.matches(&configured_keys(config));
             if held.name != config.name
-                || replaced(paths, config, held)
+                || replaced(reads, config, held)
                 || (!direct
                     && compiled_network(config) != Some(*log.network())
-                    && !held.matches(&lineage(paths, config)))
+                    && !held.matches(&reads.lineage(config)))
             {
                 return Err(Error::new(
                     "retained membership context is foreign or retired",
@@ -334,10 +338,10 @@ impl History {
             }
             return Ok(Some(held));
         }
-        let keys = lineage(paths, config);
+        let keys = reads.lineage(config);
         if self
             .related(config, &keys)
-            .any(|old| !replaced(paths, config, old))
+            .any(|old| !replaced(reads, config, old))
         {
             return Err(Error::new(
                 "another genesis cannot reset retained membership history",
@@ -361,24 +365,24 @@ impl History {
 
     fn plan(
         &self,
-        paths: &Paths,
+        reads: &Reads<'_>,
         config: &Config,
         log: &Log,
         replacement: bool,
     ) -> Result<Option<Vec<u8>>> {
         validate_name(&config.name)?;
-        let context = self.context(paths, config, log)?;
+        let context = self.context(reads, config, log)?;
         let Body::Genesis { signer, .. } = log.genesis().body() else {
             return Ok(None);
         };
         let keys = if context.is_some() {
             configured_keys(config)
         } else {
-            lineage(paths, config)
+            reads.lineage(config).to_vec()
         };
         if context.is_none()
             && (!keys.contains(signer)
-                || (!replacement && !log_entries::check_legacy_frontier(paths, config, log)?))
+                || (!replacement && !log_entries::check_legacy_frontier(reads, config, log)?))
         {
             return Ok(None);
         }
@@ -437,22 +441,16 @@ fn configured_keys(config: &Config) -> Vec<[u8; 32]> {
 
 /// The configured key line plus a cryptographically verified cached handoff. A disconnected
 /// compiled replacement is a different context, not an endorsement of the retired line.
-pub(super) fn lineage(paths: &Paths, config: &Config) -> Vec<[u8; 32]> {
+pub(super) fn lineage_of(reads: &Reads<'_>, config: &Config) -> Vec<[u8; 32]> {
     let mut keys = configured_keys(config);
     if let Some(pin) = config.signer
-        && let Ok(Some(bytes)) =
-            fsx::read_private(&paths.cache_file(), crate::envelope::MAX_ENVELOPE)
-        && let Ok((envelope, pin, _)) = crate::envelope::verify_for_reader(
-            bytes.as_slice(),
-            &config.name,
-            &pin,
-            &config.followed,
-            None,
-        )
+        && let Ok(Some(vault)) = reads.vault()
+        && let Ok((envelope, pin, _)) =
+            vault.verify_for_reader(&config.name, &pin, &config.followed, None)
         && !matches!(pin, crate::envelope::Pin::Replaced(_))
     {
         keys.push(envelope.signer);
-        keys.extend(envelope.reached_from());
+        keys.extend_from_slice(vault.prior_keys());
     }
     keys.sort_unstable();
     keys.dedup();
@@ -465,7 +463,7 @@ fn compiled_network(config: &Config) -> Option<RecordId> {
         .flatten()
 }
 
-fn replaced(paths: &Paths, config: &Config, old: &Context) -> bool {
+fn replaced(reads: &Reads<'_>, config: &Config, old: &Context) -> bool {
     if let Some(network) = compiled_network(config) {
         return &network != old.frontier.network();
     }
@@ -475,7 +473,7 @@ fn replaced(paths: &Paths, config: &Config, old: &Context) -> bool {
         && !config.followed.contains(&old.signer)
         // An authenticated cached handoff retains custody of the old genesis even when
         // config has already moved to the new signer without its followed list.
-        && !lineage(paths, config).contains(&old.signer)
+        && !reads.lineage(config).contains(&old.signer)
         && !old.matches(&configured_keys(config))
 }
 
@@ -500,62 +498,84 @@ pub(super) fn files(paths: &Paths) -> [PathBuf; 4] {
     ]
 }
 
-fn established(paths: &Paths) -> Result<bool> {
+/// The enrollment claim as it stands: `None` with none, or whether it is ready.
+fn claim_ready(paths: &Paths) -> Result<Option<bool>> {
     match fsx::read_private(&claim(paths), PENDING.len())? {
-        Some(bytes)
-            if bytes.as_slice() == PENDING
-                || bytes.as_slice() == READY
-                || bytes.as_slice() == ANCHOR =>
-        {
-            Ok(true)
-        }
+        Some(bytes) if bytes.as_slice() == PENDING => Ok(Some(false)),
+        Some(bytes) if bytes.as_slice() == READY || bytes.as_slice() == ANCHOR => Ok(Some(true)),
         Some(_) => Err(Error::new("invalid retained membership enrollment")),
-        None => Ok(false),
+        None => Ok(None),
     }
 }
 
-fn read(paths: &Paths) -> Result<Arc<History>> {
-    read_history(paths, false)
+fn established(paths: &Paths) -> Result<bool> {
+    Ok(claim_ready(paths)?.is_some())
 }
 
 fn ready(paths: &Paths) -> Result<bool> {
-    established(paths)?;
-    Ok(fsx::read_private(&claim(paths), PENDING.len())?
-        .is_some_and(|bytes| bytes.as_slice() == READY || bytes.as_slice() == ANCHOR))
+    Ok(claim_ready(paths)? == Some(true))
 }
 
-fn read_history(paths: &Paths, allow_pending: bool) -> Result<Arc<History>> {
-    if !established(paths)? {
+/// What one read of the enrollment claim, and of the journal it establishes, found.
+pub(super) struct Enrollment {
+    established: bool,
+    ready: bool,
+    history: Arc<History>,
+}
+
+impl Enrollment {
+    fn history(&self, allow_pending: bool) -> Result<&Arc<History>> {
+        if !self.ready && !allow_pending && !self.history.0.is_empty() {
+            return Err(Error::of_kind(
+                crate::ErrorKind::MembershipHistoryUnavailable,
+                "initial membership enrollment needs exclusive recovery",
+            ));
+        }
+        // An empty pending attempt has acknowledged no log authority. It does not prevent an
+        // independent envelope-only context from reading its existing envelope; a candidate log
+        // still fails the missing-context check until its first receipt becomes ready.
+        Ok(&self.history)
+    }
+}
+
+pub(super) fn read_enrollment(paths: &Paths) -> Result<Enrollment> {
+    let Some(ready) = claim_ready(paths)? else {
         if fsx::kind(&journal_file(paths, "anchor"))? != fsx::Kind::Missing {
             return Err(Error::new(
                 "retained membership enrollment needs exclusive recovery",
             ));
         }
-        return Ok(Arc::new(History::default()));
-    }
-    let ready = ready(paths)?;
+        return Ok(Enrollment {
+            established: false,
+            ready: false,
+            history: Arc::new(History::default()),
+        });
+    };
     let history = CACHE.read(paths)?;
     if ready && history.0.is_empty() {
         return Err(Error::new(
             "established membership journal lost its initial receipt",
         ));
     }
-    if !ready && !allow_pending && !history.0.is_empty() {
-        return Err(Error::of_kind(
-            crate::ErrorKind::MembershipHistoryUnavailable,
-            "initial membership enrollment needs exclusive recovery",
-        ));
-    }
-    // An empty pending attempt has acknowledged no log authority. It does not prevent an
-    // independent envelope-only context from reading its existing envelope; a candidate log
-    // still fails the missing-context check until its first receipt becomes ready.
-    Ok(history)
+    Ok(Enrollment {
+        established: true,
+        ready,
+        history,
+    })
+}
+
+fn read(paths: &Paths) -> Result<Arc<History>> {
+    read_history(paths, false)
+}
+
+fn read_history(paths: &Paths, allow_pending: bool) -> Result<Arc<History>> {
+    read_enrollment(paths)?.history(allow_pending).cloned()
 }
 
 /// Exact-root custody also constrains raw recovery, so a competing genesis cannot displace
 /// the records needed for repair. An explicit compiled replacement selects a new context.
-pub(super) fn pinned_network(paths: &Paths, config: &Config) -> Result<Option<RecordId>> {
-    let history = read_history(paths, true)?;
+pub(super) fn pinned_network(reads: &Reads<'_>, config: &Config) -> Result<Option<RecordId>> {
+    let history = reads.enrollment()?.history(true)?;
     let mut named = history
         .0
         .iter()
@@ -565,17 +585,17 @@ pub(super) fn pinned_network(paths: &Paths, config: &Config) -> Result<Option<Re
     };
     if named.next().is_none()
         && (context.matches(&configured_keys(config)) || compiled_network(config) == Some(*network))
-        && !replaced(paths, config, context)
+        && !replaced(reads, config, context)
     {
         // The sole context is already pinned directly. A new competing genesis still
         // takes the full lineage check in History::context before it can be retained.
         return Ok(Some(*network));
     }
-    let keys = lineage(paths, config);
+    let keys = reads.lineage(config);
     let mut matching = history.0.iter().filter(|(_, old)| {
         old.name == config.name
             && (old.matches(&keys) || compiled_network(config) == Some(*old.frontier.network()))
-            && !replaced(paths, config, old)
+            && !replaced(reads, config, old)
     });
     let network = matching.next().map(|(network, _)| *network);
     if matching.next().is_some() {
@@ -585,7 +605,7 @@ pub(super) fn pinned_network(paths: &Paths, config: &Config) -> Result<Option<Re
     }
     if network.is_none()
         && history.0.values().any(|context| {
-            context.name == config.name && context.legacy && !replaced(paths, config, context)
+            context.name == config.name && context.legacy && !replaced(reads, config, context)
         })
     {
         return Err(Error::of_kind(
@@ -598,12 +618,21 @@ pub(super) fn pinned_network(paths: &Paths, config: &Config) -> Result<Option<Re
 
 /// A completed receipt independently preserves the configured key's association with this
 /// genesis. A transient cached handoff alone is not this durable evidence.
-pub(super) fn durably_bound(paths: &Paths, config: &Config, network: &RecordId) -> Result<bool> {
-    Ok(read(paths)?.0.get(network).is_some_and(|context| {
-        context.name == config.name
-            && context.matches(&configured_keys(config))
-            && !replaced(paths, config, context)
-    }))
+pub(super) fn durably_bound(
+    reads: &Reads<'_>,
+    config: &Config,
+    network: &RecordId,
+) -> Result<bool> {
+    Ok(reads
+        .enrollment()?
+        .history(false)?
+        .0
+        .get(network)
+        .is_some_and(|context| {
+            context.name == config.name
+                && context.matches(&configured_keys(config))
+                && !replaced(reads, config, context)
+        }))
 }
 
 /// Receipt changes invalidate health and setup observations even when raw records did not move.
@@ -712,12 +741,16 @@ fn acknowledge_selected(
     } else {
         Arc::new(History::default())
     };
-    if before.plan(paths, config, log, replacement)?.is_none() {
+    if before
+        .plan(&Reads::new(paths), config, log, replacement)?
+        .is_none()
+    {
         return Ok(());
     }
+    // Opening completes a previous uncertain append, so its plan reads the files afterwards.
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, enrolled, limits())?;
     let mut history = replay(&journal)?;
-    let Some(bytes) = history.plan(paths, config, log, replacement)? else {
+    let Some(bytes) = history.plan(&Reads::new(paths), config, log, replacement)? else {
         return Ok(());
     };
     // Key associations and the frontier are acknowledged in the same journal frame.
@@ -758,17 +791,45 @@ pub(super) fn validate_configured(
     let Some(log) = store.log() else {
         return Ok(());
     };
-    let history = read_history(paths, true)?;
+    let reads = Reads::new(paths);
+    let history = reads.enrollment()?.history(true)?;
     if eligible(config) {
-        let _ = history.plan(paths, config, log, afresh)?;
+        let _ = history.plan(&reads, config, log, afresh)?;
     } else {
-        let _ = history.context(paths, config, log)?;
+        let _ = history.context(&reads, config, log)?;
     }
     Ok(())
 }
 
 fn eligible(config: &Config) -> bool {
     config.signer.is_some() && super::pin_admitted(config, None)
+}
+
+/// Fill this Mac's acknowledged history with other vaults' contexts, to [`MAX_CONTEXTS`].
+#[cfg(test)]
+pub(super) fn fill_contexts(paths: &Paths) {
+    let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, true, limits()).unwrap();
+    journal.finish_open().unwrap();
+    let held = replay(&journal).unwrap().0.len();
+    for n in held..MAX_CONTEXTS {
+        let tag = u8::try_from(n).unwrap().wrapping_add(1);
+        let (network, key) = ([tag; 32], [tag.wrapping_add(128); 32]);
+        let name = format!("other-{n}");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&network);
+        frame.extend_from_slice(&key);
+        frame.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(name.as_bytes());
+        frame.extend_from_slice(&key);
+        frame.extend_from_slice(b"VFD1");
+        frame.extend_from_slice(&Frontier::empty(network).digest());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&[tag; 32]);
+        journal.append(SUBJECT, frame).unwrap();
+    }
+    assert_eq!(replay(&journal).unwrap().0.len(), MAX_CONTEXTS);
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -812,28 +873,33 @@ fn validate_name(name: &str) -> Result<()> {
         project = "aterm_secrets::client::retained_history_tests::retained_commit_transition"
     )
 )]
-pub(super) fn project_store(paths: &Paths, config: &Config, store: Store) -> Result<Store> {
-    project_selected(paths, config, store, false)
+pub(super) fn project_store(reads: &Reads<'_>, config: &Config, store: Store) -> Result<Store> {
+    project_selected(reads, config, store, false)
 }
 
 /// Inspect a verified replacement's candidate for causal completeness, without granting
 /// current authority to an unacknowledged new context. Existing contexts still enforce F.
-pub(super) fn replacement_candidate(paths: &Paths, config: &Config, store: Store) -> Result<Store> {
-    project_selected(paths, config, store, true)
+pub(super) fn replacement_candidate(
+    reads: &Reads<'_>,
+    config: &Config,
+    store: Store,
+) -> Result<Store> {
+    project_selected(reads, config, store, true)
 }
 
 fn project_selected(
-    paths: &Paths,
+    reads: &Reads<'_>,
     config: &Config,
     store: Store,
     replacement: bool,
 ) -> Result<Store> {
-    let history = read(paths)?;
+    let enrollment = reads.enrollment()?;
+    let history = enrollment.history(false)?;
     let Some(log) = store.log() else {
-        let keys = lineage(paths, config);
+        let keys = reads.lineage(config);
         if history
             .related(config, &keys)
-            .any(|old| !replaced(paths, config, old))
+            .any(|old| !replaced(reads, config, old))
         {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipHistoryUnavailable,
@@ -842,16 +908,14 @@ fn project_selected(
         }
         return Ok(store);
     };
-    let Some(context) = history.context(paths, config, log)? else {
-        if !replacement && established(paths)? {
+    let Some(context) = history.context(reads, config, log)? else {
+        if !replacement && enrollment.established {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipHistoryUnavailable,
                 "membership history awaits its first durable acknowledgement",
             ));
         }
-        if !replacement
-            && !log_entries::legacy_applied_log_available(&super::load_state(paths)?, log)
-        {
+        if !replacement && !log_entries::legacy_applied_log_available(reads.state()?, log) {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipHistoryUnavailable,
                 "the legacy applied membership frontier is unavailable",
@@ -867,10 +931,11 @@ fn project_selected(
 }
 
 /// Uncommitted drafts may extend retained history but may never omit it.
-pub(super) fn require_covers(paths: &Paths, config: &Config, log: &Log) -> Result<()> {
-    if let Some(context) = read(paths)?.context(paths, config, log)? {
+pub(super) fn require_covers(reads: &Reads<'_>, config: &Config, log: &Log) -> Result<()> {
+    let enrollment = reads.enrollment()?;
+    if let Some(context) = enrollment.history(false)?.context(reads, config, log)? {
         context.frontier.project(log)?;
-    } else if established(paths)? {
+    } else if enrollment.established {
         return Err(Error::of_kind(
             crate::ErrorKind::MembershipHistoryUnavailable,
             "membership history awaits its first durable acknowledgement",
@@ -928,11 +993,11 @@ mod tests {
         unproven.signer = Some([55; 32]);
         unproven.followed.clear();
         assert!(
-            pinned_network(&paths, &unproven).is_err(),
+            pinned_network(&Reads::new(&paths), &unproven).is_err(),
             "an old receipt with no adopting-key evidence cannot be silently abandoned"
         );
-        assert!(project_store(&paths, &unproven, Store::with_compiled(None)).is_err());
-        assert!(project_store(&paths, &config, old).is_ok());
+        assert!(project_store(&Reads::new(&paths), &unproven, Store::with_compiled(None)).is_err());
+        assert!(project_store(&Reads::new(&paths), &config, old).is_ok());
 
         let admin = crate::client::admin_open(&lab.m22).unwrap();
         let mut doc = admin.doc.clone();
@@ -950,7 +1015,7 @@ mod tests {
         assert_eq!(records[0].subject, LEGACY_SUBJECT);
         assert_eq!(records[0].body, legacy);
         assert_eq!(records[1].subject, SUBJECT);
-        assert!(project_store(&paths, &config, new).is_ok());
+        assert!(project_store(&Reads::new(&paths), &config, new).is_ok());
         lab.server.stop();
     }
 
@@ -990,10 +1055,10 @@ mod tests {
                 0o600,
             )
             .unwrap();
-            assert!(project_store(&paths, &config, source.clone()).is_err());
+            assert!(project_store(&Reads::new(&paths), &config, source.clone()).is_err());
             if !committed {
                 assert!(
-                    project_store(&paths, &config, Store::with_compiled(None))
+                    project_store(&Reads::new(&paths), &config, Store::with_compiled(None))
                         .unwrap()
                         .log()
                         .is_none(),
@@ -1016,12 +1081,12 @@ mod tests {
             } else {
                 drop(repaired.unwrap());
                 assert!(ready(&paths).unwrap());
-                assert!(project_store(&paths, &config, source.clone()).is_ok());
+                assert!(project_store(&Reads::new(&paths), &config, source.clone()).is_ok());
                 // A crash after the first delta but before its ready marker can finish locally.
                 fsx::write_atomic(&claim(&paths), PENDING, 0o600).unwrap();
-                assert!(project_store(&paths, &config, source.clone()).is_err());
+                assert!(project_store(&Reads::new(&paths), &config, source.clone()).is_err());
                 drop(crate::client::StateLock::take(&paths).unwrap());
-                assert!(project_store(&paths, &config, source.clone()).is_ok());
+                assert!(project_store(&Reads::new(&paths), &config, source.clone()).is_ok());
             }
         }
         fixture.server.stop();
@@ -1043,7 +1108,7 @@ mod tests {
         crate::client::write_records(&paths, &sa).unwrap();
         let mut other_name = ca.clone();
         other_name.name = "another-vault".into();
-        assert!(project_store(&paths, &other_name, sa.clone()).is_err());
+        assert!(project_store(&Reads::new(&paths), &other_name, sa.clone()).is_err());
         other_name.signer = None;
         other_name.followed.clear();
         crate::client::save_config(&paths, &other_name).unwrap();
@@ -1052,9 +1117,9 @@ mod tests {
             no_pin.log().is_none(),
             "an envelope-only source cannot inherit another vault's raw authority"
         );
-        assert!(project_store(&paths, &other_name, no_pin).is_ok());
+        assert!(project_store(&Reads::new(&paths), &other_name, no_pin).is_ok());
         crate::client::save_config(&paths, &cb).unwrap();
-        assert!(project_store(&paths, &cb, sa.clone()).is_err());
+        assert!(project_store(&Reads::new(&paths), &cb, sa.clone()).is_err());
         assert!(
             crate::client::load_records(&paths).unwrap().log().is_none(),
             "the new key line cannot load the previous vault's raw root"
@@ -1062,17 +1127,31 @@ mod tests {
         crate::client::write_records(&paths, &sb).unwrap();
         assert_eq!(read(&paths).unwrap().0.len(), 2);
         assert_eq!(
-            pinned_network(&paths, &ca).unwrap(),
+            pinned_network(&Reads::new(&paths), &ca).unwrap(),
             Some(*sa.log().unwrap().network())
         );
         assert_eq!(
-            pinned_network(&paths, &cb).unwrap(),
+            pinned_network(&Reads::new(&paths), &cb).unwrap(),
             Some(*sb.log().unwrap().network())
         );
         crate::client::save_config(&paths, &ca).unwrap();
-        assert!(project_store(&paths, &ca, crate::client::load_records(&paths).unwrap()).is_err());
+        assert!(
+            project_store(
+                &Reads::new(&paths),
+                &ca,
+                crate::client::load_records(&paths).unwrap()
+            )
+            .is_err()
+        );
         crate::client::save_records(&paths, &sa.encode()).unwrap();
-        assert!(project_store(&paths, &ca, crate::client::load_records(&paths).unwrap()).is_ok());
+        assert!(
+            project_store(
+                &Reads::new(&paths),
+                &ca,
+                crate::client::load_records(&paths).unwrap()
+            )
+            .is_ok()
+        );
         assert_eq!(
             read(&paths).unwrap().0.len(),
             2,
@@ -1117,7 +1196,7 @@ mod tests {
         crate::client::write_records(&paths, &source).unwrap();
         assert!(ready(&paths).unwrap());
         assert_eq!(
-            pinned_network(&paths, &config).unwrap(),
+            pinned_network(&Reads::new(&paths), &config).unwrap(),
             Some(*source.log().unwrap().network())
         );
         let before = std::fs::read(paths.records_data_file().unwrap()).unwrap();
@@ -1128,11 +1207,11 @@ mod tests {
         );
         std::fs::rename(paths.cache_file(), paths.dir.join("cache.saved")).unwrap();
         assert_eq!(
-            pinned_network(&paths, &config).unwrap(),
+            pinned_network(&Reads::new(&paths), &config).unwrap(),
             Some(*source.log().unwrap().network()),
             "cache loss cannot forget the key that admitted this retained genesis"
         );
-        assert!(project_store(&paths, &config, Store::with_compiled(None)).is_err());
+        assert!(project_store(&Reads::new(&paths), &config, Store::with_compiled(None)).is_err());
         assert!(
             crate::client::log_entries::trusted_configured_log(&paths, &config)
                 .unwrap()
@@ -1192,13 +1271,13 @@ mod tests {
         let records = full.1;
         full.1 = limits().records;
         assert!(
-            full.plan(&lab.m7, &config, source.log().unwrap(), false)
+            full.plan(&Reads::new(&lab.m7), &config, source.log().unwrap(), false)
                 .is_err()
         );
         full.1 = records;
         full.2 = limits().bytes;
         assert!(
-            full.plan(&lab.m7, &config, source.log().unwrap(), false)
+            full.plan(&Reads::new(&lab.m7), &config, source.log().unwrap(), false)
                 .is_err()
         );
         acknowledge_for(&lab.m7, &source, &config).unwrap();
@@ -1209,11 +1288,11 @@ mod tests {
         );
         std::fs::rename(lab.m7.cache_file(), lab.m7.dir.join("cache.saved")).unwrap();
         assert_eq!(
-            pinned_network(&lab.m7, &config).unwrap(),
+            pinned_network(&Reads::new(&lab.m7), &config).unwrap(),
             Some(*source.log().unwrap().network())
         );
-        assert!(project_store(&lab.m7, &config, Store::with_compiled(None)).is_err());
-        assert!(project_store(&lab.m7, &config, source).is_ok());
+        assert!(project_store(&Reads::new(&lab.m7), &config, Store::with_compiled(None)).is_err());
+        assert!(project_store(&Reads::new(&lab.m7), &config, source).is_ok());
         lab.server.stop();
     }
 }

@@ -293,7 +293,10 @@ fn handover_bundle_until(
             return Err(none());
         }
         let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-        if !super::log_entries::applied_log_available(&state, seeded.as_ref()) {
+        if !super::log_entries::applied_log_available(
+            &state,
+            seeded.as_ref().map(|(_, digest)| *digest),
+        ) {
             return Err(none());
         }
         if let Some((log, _)) = &seeded
@@ -576,7 +579,7 @@ pub(super) fn checked_files_bundle(paths: &Paths, bundle: &Bundle) -> crate::Res
     super::retained_history::validate_configured(
         paths,
         &config,
-        &super::load_records_for(paths, &config)?,
+        &super::load_records_for(&super::reads::Reads::new(paths), &config)?,
         afresh,
     )?;
     Ok(CheckedFiles {

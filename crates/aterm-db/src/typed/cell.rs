@@ -48,12 +48,17 @@ impl<'a> CellKey<'a> {
         {
             return Err(Error::new("a typed cell key breaks its grammar"));
         }
-        let key = match self.elem {
-            Some(elem) => format!("{}.{}.{elem}", self.pk, self.col),
-            None => format!("{}.{}", self.pk, self.col),
-        };
-        if key.len() > MAX_KEY {
+        let len = self.pk.len() + 1 + self.col.len() + self.elem.map_or(0, |e| 1 + e.len());
+        if len > MAX_KEY {
             return Err(Error::new("a typed cell key passes 64 bytes"));
+        }
+        let mut key = String::with_capacity(len);
+        key.push_str(self.pk);
+        key.push('.');
+        key.push_str(self.col);
+        if let Some(elem) = self.elem {
+            key.push('.');
+            key.push_str(elem);
         }
         Ok(key)
     }
@@ -751,10 +756,10 @@ pub fn origins(cell: &Cell) -> Vec<(Digest, Value)> {
 )]
 pub fn project(collection: &Collection, cells: &Cells) -> Projection {
     let mut projection = Projection::default();
-    for ((name, key), cell) in cells {
-        if name != collection.name {
-            continue;
-        }
+    for ((_, key), cell) in cells
+        .range((collection.name.to_owned(), String::new())..)
+        .take_while(|((name, _), _)| name == collection.name)
+    {
         let Ok(parsed) = CellKey::parse(key) else {
             projection.malformed += 1;
             continue;
@@ -765,17 +770,27 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
         }
         let mut candidates = Vec::new();
         let mut unreadable = false;
-        for (operation, value) in origins(cell) {
+        let mut decode_candidate = |operation: Digest, value: &Value| {
             // A revert that restores absence leaves a bare null: the cell reads as empty.
             let value = if value.is_null() {
                 CellValue::owner(0, Value::Null)
-            } else if let Ok(value) = CellValue::decode(&value) {
+            } else if let Ok(value) = CellValue::decode(value) {
                 value
             } else {
                 unreadable = true;
-                continue;
+                return;
             };
             candidates.push(Candidate { operation, value });
+        };
+        for candidate in &cell.candidates {
+            match carried(&candidate.value) {
+                Some(items) => {
+                    for (operation, value) in items {
+                        decode_candidate(operation, &value);
+                    }
+                }
+                None => decode_candidate(candidate.operation, &candidate.value),
+            }
         }
         let row = projection.rows.entry(parsed.pk.to_owned()).or_default();
         let column = collection.column(parsed.col);
@@ -809,10 +824,9 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
                 }
             }
             None => {
-                if row.fields.contains_key(parsed.col) {
+                if row.fields.insert(parsed.col.to_owned(), field).is_some() {
                     row.raw.insert(parsed.col.to_owned());
                 }
-                row.fields.insert(parsed.col.to_owned(), field);
             }
         }
     }

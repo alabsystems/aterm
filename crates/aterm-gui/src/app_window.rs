@@ -1090,6 +1090,11 @@ impl App {
             crate::tab_spawn::serve_native_menu_marks(&self.tab_spawns.menu);
             self._menu = self.apprt.install_menu(proxy);
             self.apprt.install_quit_confirm();
+            // The machine title's reader starts once there is a bar to title (never headless).
+            #[cfg(target_os = "macos")]
+            if self._menu.is_some() {
+                crate::machine_title::spawn(proxy.clone());
+            }
         }
         if self._status_item.is_none()
             && let Some(proxy) = self.proxy.clone()

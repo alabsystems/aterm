@@ -66,17 +66,18 @@ pub(crate) fn archived(spool: &Path, since: u64) -> io::Result<BTreeMap<String, 
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(held),
         Err(error) => return Err(error),
     };
+    let judged = match aterm_uds::private_file::JudgedDir::judge(&dir) {
+        Ok(judged) => judged,
+        Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
+        Err(other) => return Err(io::Error::other(other.to_string())),
+    };
     for entry in entries {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
         if canonical_day(name).is_none_or(|day| day < since / DAY) {
             continue;
         }
-        let bytes = match aterm_uds::private_file::read_private(
-            &dir,
-            name,
-            usize::try_from(HEARD_MAX).unwrap_or(usize::MAX),
-        ) {
+        let bytes = match judged.read(name, usize::try_from(HEARD_MAX).unwrap_or(usize::MAX)) {
             Ok(bytes) => bytes,
             Err(aterm_uds::private_file::PrivateFileError::Missing) => continue,
             Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
@@ -118,14 +119,18 @@ pub(crate) fn batches(spool: &Path, since: u64) -> io::Result<Vec<Batch>> {
             days.push((day, name.to_owned()));
         }
     }
+    if days.is_empty() {
+        return Ok(Vec::new());
+    }
     days.sort();
+    let judged = match aterm_uds::private_file::JudgedDir::judge(&dir) {
+        Ok(judged) => judged,
+        Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
+        Err(other) => return Err(io::Error::other(other.to_string())),
+    };
     let mut out = Vec::new();
     for (_, name) in days {
-        let bytes = match aterm_uds::private_file::read_private(
-            &dir,
-            &name,
-            usize::try_from(HEARD_MAX).unwrap_or(usize::MAX),
-        ) {
+        let bytes = match judged.read(&name, usize::try_from(HEARD_MAX).unwrap_or(usize::MAX)) {
             Ok(bytes) => bytes,
             Err(aterm_uds::private_file::PrivateFileError::Missing) => continue,
             Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),

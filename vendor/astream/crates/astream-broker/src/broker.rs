@@ -61,9 +61,9 @@ use crate::proto::{
     append_frame, compute_delivery_crc, decode_request_with_bt, decode_response,
     encode_protocol_refusal, encode_replicate_stamped, encode_response, read_frame, write_frame,
     AttachedProducerStats, FaceStats, Request, Response, WireStats, CAP_EXPIRED_PREFIX,
-    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_ORIGIN_REFUSED, ERR_RATE_LIMITED, ERR_RECORD_REFUSED,
-    ERR_REFUSED, ERR_RELAY_NOT_READY, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS,
-    ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX,
+    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_ORIGIN_REFUSED, ERR_ORIGIN_UNKNOWN, ERR_RATE_LIMITED,
+    ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RELAY_NOT_READY, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND,
+    ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX,
     RETAINED_FROM_PREFIX,
 };
 use crate::store::{
@@ -497,6 +497,10 @@ enum WriteKind {
     /// issues the flush outside the log lock once this batch is committed (skipped when a
     /// full flush already covers the head) and answers with the durable head.
     Flush,
+    /// Settle the log's device ([`Request::Settle`]): [`Flush`](Self::Flush), whose full flush
+    /// the writer issues whatever already covers the head, so it is always one issued after
+    /// the request was read.
+    Settle,
     /// Un-fence every fenced follower link on the writer thread ([`Broker::rejoin_followers`]),
     /// resetting each un-fenced link's cursor to the leader's retention base, redialing,
     /// and catching up `[base..head)` in this batch. Answers with the number of un-fenced links.
@@ -509,6 +513,20 @@ enum WriteKind {
         producer_seq: u64,
         err: Refusal,
     },
+}
+
+/// The full flush a batch's `Flush` and `Settle` ops ask the writer for, beyond any its
+/// commit owes (`process_batch`): ordered so that the strongest ask in a batch wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FlushAsked {
+    /// Neither rode the batch.
+    No,
+    /// A [`WriteKind::Flush`]: one, unless a full flush already covers the head (skipped,
+    /// and counted so).
+    Covering,
+    /// A [`WriteKind::Settle`]: one whatever already covers the head, so the device is
+    /// drained after the request was read.
+    Always,
 }
 
 /// Upper bound on records folded into one group-commit fsync. The batch self-tunes to
@@ -1968,7 +1986,7 @@ struct HelloCopy {
 
 impl HelloCopy {
     /// The log's own answer now: its identity, the tier this open serves, its lineage,
-    /// and the retention rules this open retains it by (never rules only read back from
+    /// the device its file is on, and the retention rules this open retains it by (never rules only read back from
     /// its held store, which compact nothing: `BrokerLog::retention_active`). Taken under
     /// the log lock (the caller holds the log); taken again when the rules are set.
     fn of(log: &BrokerLog) -> HelloCopy {
@@ -1992,11 +2010,13 @@ impl HelloCopy {
                         | crate::proto::REQUEST_BROKER_TIMES
                         | crate::proto::REQUEST_STATS
                         | crate::proto::REQUEST_BURST_MARKS
-                        | crate::proto::REQUEST_RELAY,
+                        | crate::proto::REQUEST_RELAY
+                        | crate::proto::REQUEST_SETTLE,
                 ),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
                 health: None,
+                device: log.device(),
             },
         }
     }
@@ -2161,6 +2181,9 @@ struct Shared {
     origin_keys: Mutex<std::collections::BTreeMap<String, [u8; 32]>>,
     /// Relayed records refused for what they are ([`ERR_ORIGIN_REFUSED`]).
     origin_refused: AtomicU64,
+    /// Relayed records answered [`ERR_ORIGIN_UNKNOWN`]: each answer, so a record offered again
+    /// counts again.
+    origin_unknown: AtomicU64,
     /// Revocation file tracked for automatic Apple `SIGHUP` reload (`REQUIREMENTS` R6).
     revocation_file: Mutex<Option<RevocationFileState>>,
     /// Fast atomic flag set once [`Broker::load_revocation_file`] has been called.
@@ -3635,8 +3658,13 @@ impl Drop for ConnGuard<'_> {
 /// Operational snapshot of a running [`Broker`] (`REQUIREMENTS` R5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerStats {
-    /// Relayed records refused for what they are: a bad signature, or a revoked or unknown origin.
+    /// Relayed records refused for what they are ([`ERR_ORIGIN_REFUSED`]): a bad signature, or a
+    /// record that is not its origin's.
     pub origin_refused: u64,
+    /// Answers that a relayed record's origin is not one this broker takes now
+    /// ([`ERR_ORIGIN_UNKNOWN`]): no key, or a revoked one. Each answer counts, so a record its
+    /// carrier holds and offers again counts each time.
+    pub origin_unknown: u64,
     /// Snapshot of the underlying durable [`BrokerLog`].
     pub log: LogStats,
     /// Subscriber-visible head offset (the durable head in Strict/Relaxed, or the
@@ -4769,6 +4797,49 @@ impl Broker {
         removed
     }
 
+    /// Revoke `pubkey` alone: every connection and stream under that key is refused and ended as
+    /// [`revoke_identity`](Self::revoke_identity) does, but its derived `n-<16 hex>` principal is
+    /// left as it stands, so grants bound to that principal keep their standing. For an embedder
+    /// that knows another key derives the same principal (a 64-bit prefix holds no more) and
+    /// decides that principal's revocation itself ([`revoke_principal`](Self::revoke_principal)).
+    /// Returns `true` if `pubkey` was newly added to the revocation set.
+    pub fn revoke_key(&self, pubkey: [u8; 32]) -> bool {
+        let added = self
+            .shared
+            .revoked_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pubkey);
+        if added {
+            self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
+            notify_all_tails(&self.shared);
+            #[cfg(feature = "stream")]
+            end_revoked_streams(&self.shared);
+        }
+        added
+    }
+
+    /// Remove `pubkey` alone from the live identity revocation set, leaving its derived principal
+    /// as it stands ([`revoke_key`](Self::revoke_key)). Returns `true` if `pubkey` was present.
+    pub fn unrevoke_key(&self, pubkey: &[u8; 32]) -> bool {
+        let _file_state = self
+            .shared
+            .revocation_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = self
+            .shared
+            .revoked_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(pubkey);
+        if removed {
+            self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
+            notify_all_tails(&self.shared);
+        }
+        removed
+    }
+
     /// Whether `pubkey` is currently in the live identity revocation set.
     pub fn is_identity_revoked(&self, pubkey: &[u8; 32]) -> bool {
         maybe_reload_revocation_file(&self.shared);
@@ -4922,6 +4993,7 @@ impl Broker {
             #[cfg(feature = "relay")]
             origin_keys: Mutex::new(std::collections::BTreeMap::new()),
             origin_refused: AtomicU64::new(0),
+            origin_unknown: AtomicU64::new(0),
             revocation_file: Mutex::new(None),
             has_revocation_file: AtomicBool::new(false),
             sighup_seen: AtomicU64::new(0),
@@ -6589,6 +6661,7 @@ fn stats_of(shared: &Shared) -> BrokerStats {
     let (retention_ticks, retention_skips) = (0, 0);
     BrokerStats {
         origin_refused: shared.origin_refused.load(Ordering::Relaxed),
+        origin_unknown: shared.origin_unknown.load(Ordering::Relaxed),
         log,
         visible_head,
         active_conns,
@@ -6836,6 +6909,23 @@ impl Drop for Broker {
             }
             stop_writer(&self.shared);
         }
+    }
+}
+
+impl Broker {
+    /// Stop serving connections, finish queued writes, flush the log and mark its run closed.
+    /// This also closes a broker served only through adopted streams, without waiting for its
+    /// owner to drop. Listener handles should be shut down first to remove their endpoints.
+    /// Repeated calls after shutdown has completed do nothing.
+    pub fn shutdown(&self) {
+        self.shared.running.store(false, Ordering::Relaxed);
+        notify_all_tails(&self.shared);
+        self.shared.vitals.wake();
+        if let Some(rep) = &self.shared.replicator {
+            rep.shutdown_links();
+        }
+        BrokerHandle::force_close_conns(&self.shared);
+        stop_writer(&self.shared);
     }
 }
 
@@ -8226,6 +8316,8 @@ fn dispatch_request(
             if let Some(err) = origin_refusal(shared, producer_id, producer_seq, &subject, &body) {
                 if err.0 == ERR_ORIGIN_REFUSED {
                     shared.origin_refused.fetch_add(1, Ordering::Relaxed);
+                } else if err.0 == ERR_ORIGIN_UNKNOWN {
+                    shared.origin_unknown.fetch_add(1, Ordering::Relaxed);
                 }
                 return emit_producer_refusal(
                     shared,
@@ -8275,6 +8367,10 @@ fn dispatch_request(
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
+        // Through the writer, in send order behind this connection's writes, and answered in
+        // the ack stream with the durable head after a full flush the writer issues once it
+        // took the request, whatever already covers the head (`FlushAsked::Always`).
+        Request::Settle => emit_op(shared, stream, pipe, WriteKind::Settle),
         Request::ClearGapFences => {
             // Answered in the request loop after the pending acks: every write this
             // connection sent before the request has been judged by then, each refused
@@ -9032,14 +9128,13 @@ fn retained_from_msg(filter: &str, floor: u64) -> String {
     )
 }
 
-/// Why a client-chosen subject cannot be appended to: not a valid `Subject`, or the
-/// broker-internal commit subject (a record there would bypass exactly-once dedup
-/// and never be delivered — consumer-group commits go through `Commit` /
-/// `ProcessAndProduce`). Either is permanent.
 /// Why a relayed record may not be appended, if it may not: it is checked before the dedup index,
 /// so a forged record cannot take a real one's key, and off the writer, so a neighbour's burst of
 /// signatures holds up no other connection. On every broker, guarded or not: this is the record's
-/// own proof, where a grant only says who may carry it.
+/// own proof, where a grant only says who may carry it. A record that is not its origin's is
+/// refused for good ([`ERR_ORIGIN_REFUSED`]); one whose origin this broker does not take now (no
+/// key, or a revoked one) is not judged, and is answered so its carrier may wait
+/// ([`ERR_ORIGIN_UNKNOWN`]).
 #[cfg(feature = "relay")]
 fn origin_refusal(
     shared: &Shared,
@@ -9076,10 +9171,16 @@ fn origin_refusal(
         keys.get(owner).copied()
     };
     let Some(key) = key else {
-        return refused(format!("relay: {owner} is not a known origin"));
+        return Some(refusal(
+            ERR_ORIGIN_UNKNOWN,
+            format!("relay: {owner} is not a known origin"),
+        ));
     };
     if is_peer_revoked(shared, Some(key)) {
-        return refused(format!("relay: origin {owner} is revoked"));
+        return Some(refusal(
+            ERR_ORIGIN_UNKNOWN,
+            format!("relay: origin {owner} is revoked"),
+        ));
     }
     if !crate::origin::verify(&key, subject, producer_seq, body) {
         return refused(format!("relay: bad signature from {owner} on {subject:?}"));
@@ -9102,6 +9203,10 @@ fn origin_refusal(
     ))
 }
 
+/// Why a client-chosen subject cannot be appended to: not a valid `Subject`, or the
+/// broker-internal commit subject (a record there would bypass exactly-once dedup
+/// and never be delivered — consumer-group commits go through `Commit` /
+/// `ProcessAndProduce`). Either is permanent.
 fn publish_subject_error(subject: &str) -> Option<Refusal> {
     if Subject::new(subject).is_err() {
         Some(refusal(ERR_BAD_SUBJECT, format!("bad subject {subject:?}")))
@@ -9272,10 +9377,10 @@ fn attach_grant(
                 // Writes under an origin's id only where a subject names that origin.
             } else {
                 eprintln!(
-                "astream-broker: warn: attached an UNBOUND read-write grant {grant:?} — it may \
+                    "astream-broker: warn: attached an UNBOUND read-write grant {grant:?} — it may \
                  publish under ANY producer id (no principal binding); mint it as \
                  \"rw,p=<principal>:<filter>\" unless it is deliberately the fleet root"
-            );
+                );
             }
         }
         // A read-only grant publishes nothing, so it binds nothing: binding it would
@@ -9394,6 +9499,8 @@ fn cap_authorized_until(
         AnyValid,
         // A genuine, unexpired read-write grant that publishes as `producer_id`.
         Budget(u64),
+        // A genuine, unexpired read-write grant of any filter or principal.
+        AnyWrite,
     }
 
     let stats_scope = match req {
@@ -9533,6 +9640,9 @@ fn cap_authorized_until(
         // filter is matched; a read-only grant, or one bound to another principal,
         // learns nothing about this producer.
         Request::Budget { producer_id } => (CapPred::Budget(*producer_id), None),
+        // A settle appends nothing and names nothing, but it spends the device's time on a
+        // full flush, as an escalated write does: whoever may write here may ask for one.
+        Request::Settle => (CapPred::AnyWrite, None),
     };
 
     let mut min_until = u64::MAX;
@@ -9561,6 +9671,14 @@ fn cap_authorized_until(
                 CapPred::AnyValid => {
                     astream_cap::verify(secret, c)
                         && !astream_cap::is_expired(c.filter.as_str(), now_ms)
+                }
+                CapPred::AnyWrite => {
+                    astream_cap::verify(secret, c)
+                        && !astream_cap::is_expired(c.filter.as_str(), now_ms)
+                        && matches!(
+                            astream_cap::Grant::parse(c.filter.as_str()),
+                            Ok(g) if g.mode == astream_cap::Mode::ReadWrite
+                        )
                 }
                 CapPred::Budget(producer_id) => {
                     astream_cap::verify(secret, c)
@@ -9640,6 +9758,7 @@ fn oversized_name(req: &Request) -> Option<String> {
         | Request::OriginStamps
         | Request::FenceGaps
         | Request::ClearGapFences
+        | Request::Settle
         | Request::Budget { .. } => [NONE, NONE],
     };
     for (what, name) in names {
@@ -10525,7 +10644,7 @@ fn stage_batch_ops(
     Vec<Sender<AckResult>>,
     Vec<AckResult>,
     Vec<bool>,
-    bool,
+    FlushAsked,
     Vec<bool>,
     Vec<Option<StickyOpMeta>>,
     bool,
@@ -10536,7 +10655,7 @@ fn stage_batch_ops(
     // Which ops are `Flush` requests: answered with the durable head once the batch's
     // full flush (if any) has run.
     let mut flushes: Vec<bool> = Vec::new();
-    let mut wants_flush = false;
+    let mut wants_flush = FlushAsked::No;
     // Which ops are acked on the LOCAL commit alone, with no quorum gate. See the
     // `local_only` arm of the ack loop below: a `/a/will` registration is the broker's
     // own bookkeeping, never delivered to anyone, and its acknowledgement decides what
@@ -10573,7 +10692,7 @@ fn stage_batch_ops(
     for op in batch {
         acks.push(op.ack);
         let mut is_local = matches!(op.kind, WriteKind::WillRegister { .. });
-        flushes.push(matches!(op.kind, WriteKind::Flush));
+        flushes.push(matches!(op.kind, WriteKind::Flush | WriteKind::Settle));
         let op_sticky = match (op.conn_id, &op.kind) {
             (
                 Some(cid),
@@ -10771,7 +10890,11 @@ fn stage_batch_ops(
             },
             // Stages nothing; answered below, with the durable head.
             WriteKind::Flush => {
-                wants_flush = true;
+                wants_flush = wants_flush.max(FlushAsked::Covering);
+                Ok((Offset::ZERO, false))
+            }
+            WriteKind::Settle => {
+                wants_flush = FlushAsked::Always;
                 Ok((Offset::ZERO, false))
             }
             WriteKind::RejoinFollowers => {
@@ -10982,7 +11105,9 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
     // THE FULL FLUSH OWED, if any (step 1 of the held head): what the commit names —
     // an escalated record, or a resend of one, no full flush covers — or, for a
     // `Flush` request, the head (skipped, and counted so, when a full flush already
-    // covers it; a flush the commit owes covers the request too). Its handle is taken
+    // covers it; a flush the commit owes covers the request too), and for a `Settle`,
+    // the head whatever covers it: every flush here is issued after the batch's requests
+    // were read, which is what a settle answers for. Its handle is taken
     // here, under the lock (step 2); the flush itself runs outside it (step 4). Taking
     // it cannot fail — it shares the log's own descriptor — so a broker short of
     // descriptors never mistakes a flush it could not issue for one that failed.
@@ -10991,11 +11116,14 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
             Some(o) => Some(o.0),
             None => {
                 let head = guard.head().0;
-                if wants_flush && guard.full_flush_owed(head) {
-                    Some(head)
-                } else {
-                    None
-                }
+                let issue = match wants_flush {
+                    // A settle's flush is the point, whatever it covers; none on a
+                    // poisoned log, whose every op the batch already refused.
+                    FlushAsked::Always => guard.poisoned().is_none(),
+                    FlushAsked::Covering => guard.full_flush_owed(head),
+                    FlushAsked::No => false,
+                };
+                issue.then_some(head)
             }
         },
         Err(_) => None,
@@ -12514,6 +12642,43 @@ fn peer_gone(stream: &mut Conn) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "stream"))]
+    #[test]
+    fn shutdown_flushes_and_closes_a_stream_only_broker_without_dropping_it() {
+        for tier in [Durability::Ordered { horizon: None }, Durability::Relaxed] {
+            let root = crate::test_scratch::Scratch::new("stream-shutdown");
+            let path = root.path().join("log");
+            let broker = Broker::open_with(&path, tier).unwrap();
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let serving = broker.serve_stream(Arc::new(theirs), [7; 32]).unwrap();
+            let link: Arc<dyn crate::stream_link::StreamLink> = Arc::new(ours);
+            link.set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let (mut client, _closer) = crate::connect_stream(link);
+            client.publish(7, 1, "/shutdown", b"kept").unwrap();
+            assert_eq!(
+                BrokerLog::check_open(&path, None).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            broker.shutdown();
+            let _ended =
+                within_a_minute("shutdown ends the adopted stream", move || serving.join())
+                    .unwrap();
+            assert_eq!(
+                broker.durable_head(),
+                broker.head(),
+                "shutdown covers every acknowledged record"
+            );
+            assert!(
+                matches!(crate::logid::read(&crate::storage::Dir::Os(path.clone())).unwrap(),
+                crate::logid::Prior::Recorded(s) if s.state == crate::logid::State::Closed)
+            );
+            let reopened = Broker::open_with(&path, Durability::Strict).unwrap();
+            assert_eq!(reopened.head(), 1);
+            broker.shutdown();
+        }
+    }
 
     #[cfg(feature = "cap")]
     #[test]

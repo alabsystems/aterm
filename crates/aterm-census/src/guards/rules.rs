@@ -4,7 +4,10 @@
 
 //! The token guards: a banned name or literal in a scoped set of files.
 
-use super::{Bound, Corpus, Finding, Line, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
+use super::{
+    Bound, Corpus, Finding, Line, Rule, SourceFile, Tree, after_ws, has, hits, is_word,
+    named_for_tests,
+};
 
 /// Product source: everything the guards call the tree, vendored code aside.
 pub(super) const PRODUCT: &[&str] = &["crates/", "apps/"];
@@ -66,7 +69,11 @@ const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
     ("AppKit", Bound::Sub),
 ];
 
-/// Is `rel` an engine crate's shipped default build?
+/// Is `rel` an engine crate's shipped default build, a file whose path names tests aside
+/// ([`test_path`])? Test support a crate mounts under `cfg(any(test, debug_assertions))` for its
+/// suites (aterm-effects' `test_pool.rs`, their thread pool) is in a debug build, so
+/// [`TestCode::holds`] reads it as shipped; this rule leaves it out by its name, and so also
+/// leaves out a shipped file whose name opens with `test`.
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
@@ -130,47 +137,33 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     }
 }
 
-/// Which files under some prefixes are test code, and which ship whatever their names or their
-/// parents say.
+/// Which files of the corpus are test code, and which ship whatever their names or their parents
+/// say: the one answer every guard that skips test code reads ([`Corpus::test_code`]).
 pub(super) struct TestCode {
     /// The files and directories [`declared_test_modules`] names.
     declared: Vec<String>,
-    /// Which files are test code by their paths alone ([`TestCode::read_named`]).
-    named: fn(&str) -> bool,
     /// What a shipped line of a shipped file loads ([`Corpus::shipped_loads`]).
     shipped: std::collections::BTreeSet<String>,
 }
 
 impl TestCode {
-    pub(super) fn read(corpus: &Corpus, prefixes: &[&str]) -> Self {
-        Self::read_named(corpus, prefixes, |_| false)
-    }
-
-    /// [`TestCode::read`], where a file `named` calls test code by its path alone (one in a
-    /// `tests` directory) is test code too: it ships only once a shipped line loads it, and what
-    /// it loads ships only then.
-    pub(super) fn read_named(corpus: &Corpus, prefixes: &[&str], named: fn(&str) -> bool) -> Self {
-        let declared = declared_test_modules(corpus, prefixes);
-        let test = |rel: &str| in_declared(&declared, rel) || named(rel);
-        let shipped = corpus.shipped_loads(prefixes, &test);
-        Self {
-            declared,
-            named,
-            shipped,
-        }
+    /// The test code of the whole corpus: a file its parent declares test-only
+    /// ([`declared_test_modules`]) or one [`named_for_tests`] is test code, which ships only once
+    /// a shipped line loads it, and what it loads ships only then ([`Corpus::shipped_loads`]). So
+    /// a test target's `mod common;`, or its `#[path]` to a `_tests.rs`, ships nothing; nor does
+    /// a bench's or an example's.
+    pub(super) fn read(corpus: &Corpus) -> Self {
+        let declared = declared_test_modules(corpus, PRODUCT);
+        let shipped = corpus.shipped_loads(PRODUCT, &|rel| in_declared(&declared, rel));
+        Self { declared, shipped }
     }
 
     /// Is `rel` test code by its parent's say (the file a test-only `mod` loads, or one in that
-    /// module's own directory: [`declared_test_modules`]) or by its path
-    /// ([`TestCode::read_named`]), that nothing ships? A file that a shipped `mod` or `include!`
-    /// of a shipped file also loads ships, and is read.
+    /// module's own directory: [`declared_test_modules`]) or by its path ([`named_for_tests`]),
+    /// that nothing ships? A file that a shipped `mod` or `include!` of a shipped file also loads
+    /// ships, and is read.
     pub(super) fn holds(&self, rel: &str) -> bool {
-        (in_declared(&self.declared, rel) || (self.named)(rel)) && !self.shipped.contains(rel)
-    }
-
-    /// Does a shipped line of a shipped file load `rel`, whatever its name?
-    pub(super) fn ships(&self, rel: &str) -> bool {
-        self.shipped.contains(rel)
+        (in_declared(&self.declared, rel) || named_for_tests(rel)) && !self.shipped.contains(rel)
     }
 }
 
@@ -191,18 +184,15 @@ pub(super) const ENGINE_PLATFORM: Rule = Rule {
 };
 
 fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let test_code = TestCode::read(tree.corpus, ENGINE_CRATES);
+    let test_code = tree.corpus.test_code();
+    let needles: Vec<&str> = ENGINE_BANNED
+        .iter()
+        .map(|b| b.0)
+        .chain(ENGINE_FRAMEWORKS.iter().map(|f| f.0))
+        .chain(["link", "std"])
+        .collect();
     for file in tree.corpus.under(ENGINE_CRATES) {
-        if !engine_shipped(&file.rel) || test_code.holds(&file.rel) {
-            continue;
-        }
-        let needles: Vec<&str> = ENGINE_BANNED
-            .iter()
-            .map(|b| b.0)
-            .chain(ENGINE_FRAMEWORKS.iter().map(|f| f.0))
-            .chain(["link", "std"])
-            .collect();
-        if !file.mentions(&needles) {
+        if !engine_shipped(&file.rel) || test_code.holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         let shipped: std::collections::BTreeSet<usize> =
@@ -309,7 +299,7 @@ pub(super) const RENDERER_TERMINAL: Rule = Rule {
 
 fn renderer_terminal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(RENDERERS) {
-        if test_path(&file.rel) || !file.mentions(&["Terminal"]) {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&["Terminal"]) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -458,12 +448,11 @@ fn protected_folder(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .copied()
         .chain(["Volumes", "Containers", "CloudStorage"])
         .collect();
-    // Test code by its name (`_tests.rs`) or by its parent's say (the file a
+    // Test code by its path (`_tests.rs`, a `tests` directory) or by its parent's say (the file a
     // `#[cfg(test)] mod tests;` loads) is skipped unless a shipped line loads it too.
-    let test_code = TestCode::read(tree.corpus, PROTECTED_SCOPE);
+    let test_code = tree.corpus.test_code();
     for file in tree.corpus.under(PROTECTED_SCOPE) {
-        let named_test = file.rel.ends_with("_tests.rs") && !test_code.ships(&file.rel);
-        if named_test || test_code.holds(&file.rel) || !file.mentions(&needles) {
+        if test_code.holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -532,12 +521,11 @@ pub(super) const RUNLOOP_TIMER: Rule = Rule {
     check: runloop_timer,
 };
 
-/// Shipped Rust that runs a run loop: product source, the absorbed winit among it.
+/// Rust that runs a run loop, build scripts and dev targets aside: product source, the absorbed
+/// winit among it. Its caller leaves test code out ([`TestCode::holds`]).
 fn runloop_scope(rel: &str) -> bool {
-    let shipped = !(rel.contains("/tests/")
-        || rel.ends_with("/build.rs")
-        || rel.contains("/examples/")
-        || rel.contains("/benches/"));
+    let shipped =
+        !(rel.ends_with("/build.rs") || rel.contains("/examples/") || rel.contains("/benches/"));
     shipped && rel != "crates/aterm-objc/src/wake_timer.rs" && !rel.starts_with(CENSUS_CRATE)
 }
 
@@ -545,8 +533,10 @@ fn runloop_scope(rel: &str) -> bool {
 const WINDOW_SOURCE: &[&str] = &["crates/aterm-window/src/"];
 
 fn runloop_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    let test_code = tree.corpus.test_code();
     for file in tree.corpus.under(PRODUCT) {
-        if !runloop_scope(&file.rel) || !file.mentions(RUNLOOP_TIMERS) {
+        if !runloop_scope(&file.rel) || test_code.holds(&file.rel) || !file.mentions(RUNLOOP_TIMERS)
+        {
             continue;
         }
         for line in file.shipped_lines() {
@@ -641,7 +631,7 @@ pub(super) const KEEPER_NO_MMAP: Rule = Rule {
 
 fn keeper_no_mmap(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(KEEPER_OWN) {
-        if test_path(&file.rel) {
+        if tree.corpus.test_code().holds(&file.rel) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -704,7 +694,7 @@ pub(super) const RESTORE_STAYS_LOCAL: Rule = Rule {
 fn restore_stays_local(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     use crate::scan_set::member_reach;
     for file in tree.corpus.under(RESTORE_OWN) {
-        if test_path(&file.rel) {
+        if tree.corpus.test_code().holds(&file.rel) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -1446,10 +1436,11 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
                     why == INJECTED && name == func && file.rel.ends_with(home)
                 })
             };
+            let attributed = super::graph::attribute(file);
             let mut callers: std::collections::BTreeMap<&str, Vec<&str>> =
                 std::collections::BTreeMap::new();
             let mut lines: Vec<(&str, &str)> = Vec::new();
-            for l in super::graph::attribute(file) {
+            for l in &attributed {
                 let Some(func) = l.func.filter(|f| !l.in_test && !injected(f)) else {
                     continue;
                 };
@@ -1460,13 +1451,13 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
                     }
                 }
             }
-            (*file, homes, callers, lines)
+            (*file, homes, callers, lines, attributed)
         })
         .collect();
     let mut readers: Vec<LiveReader<'t>> = Vec::new();
     loop {
         let mut grown = Vec::new();
-        for (file, homes, callers, lines) in &graphs {
+        for (file, homes, callers, lines, attributed) in &graphs {
             let across = lines
                 .iter()
                 .filter(|(_, code)| live_call(code, &file.rel, &readers).is_some())
@@ -1476,7 +1467,7 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
                 if readers.iter().chain(&grown).any(known) {
                     continue;
                 }
-                let Some((method, public)) = signature(file, name) else {
+                let Some((method, public)) = signature(attributed, name) else {
                     continue;
                 };
                 let module = file.name().strip_suffix(".rs").unwrap_or(file.name());
@@ -1496,10 +1487,9 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
     }
 }
 
-/// Whether the shipped `fn name` of `file` takes `self`, and whether it is visible outside its
-/// module.
-fn signature(file: &SourceFile, name: &str) -> Option<(bool, bool)> {
-    let attributed = super::graph::attribute(file);
+/// Whether the shipped `fn name` of `attributed` takes `self`, and whether it is visible outside
+/// its module.
+fn signature(attributed: &[super::graph::FnLine<'_>], name: &str) -> Option<(bool, bool)> {
     let start = attributed.iter().position(|l| {
         !l.in_test
             && l.func == Some(name)
@@ -1864,10 +1854,10 @@ pub(super) const SUPERVISE_FX: Rule = Rule {
     check: supervise_fx,
 };
 
-/// A shipped supervisor file outside the clock's homes.
+/// A supervisor file outside the clock's homes. Its caller leaves test code out
+/// ([`TestCode::holds`]).
 fn supervise_fx_scope(rel: &str) -> bool {
     rel.starts_with(SUPERVISE[0])
-        && !test_path(rel)
         && !SUPERVISE_CLOCK_HOMES
             .iter()
             .any(|home| rel.starts_with(home))
@@ -1891,19 +1881,24 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let readers = live_readers(tree);
     needles.extend(readers.iter().map(|r| r.name));
     for file in tree.corpus.under(SUPERVISE) {
-        if !supervise_fx_scope(&file.rel) || !file.mentions(&needles) {
+        if !supervise_fx_scope(&file.rel)
+            || tree.corpus.test_code().holds(&file.rel)
+            || !file.mentions(&needles)
+        {
             continue;
         }
-        let homes = reader_homes(file);
-        let read_homes = read_homes(file);
+        let attributed = super::graph::attribute(file);
+        let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
+        let homes = reader_homes(rel, &attributed);
+        let read_homes = read_homes(rel, &attributed);
         let at_home = |no: usize, needle: &str| {
             (homes.contains(&no) && wall_read(needle)) || read_homes.get(&no) == Some(&needle)
         };
         let uses = use_statements(file);
-        let mut look_homes = look_homes(file);
+        let mut look_homes = look_homes(rel, &attributed);
         if file.rel == SUPERVISE_LEDGER {
             look_homes.extend(
-                super::graph::attribute(file)
+                attributed
                     .iter()
                     .filter(|l| l.func.is_some_and(|f| by_path.contains(f)))
                     .map(|l| l.line.no),
@@ -2021,10 +2016,15 @@ fn ledger_read<'a>(code: &str, by_path: &std::collections::BTreeSet<&'a str>) ->
     None
 }
 
-/// Line numbers in `file` belonging to a phase-3 look's home `fn` ([`SUPERVISE_LOOK_HOMES`]).
-fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
-    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
-    super::graph::attribute(file)
+/// Line numbers in `attributed` belonging to a phase-3 look's home `fn` ([`SUPERVISE_LOOK_HOMES`]).
+fn look_homes(
+    rel: &str,
+    attributed: &[super::graph::FnLine<'_>],
+) -> std::collections::BTreeSet<usize> {
+    if !SUPERVISE_LOOK_HOMES.iter().any(|(home, _, _)| *home == rel) {
+        return std::collections::BTreeSet::new();
+    }
+    attributed
         .iter()
         .filter(|l| {
             l.func.is_some_and(|func| {
@@ -2037,10 +2037,15 @@ fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
         .collect()
 }
 
-/// Line numbers in `file` belonging to a phase-2 read's home `fn` ([`SUPERVISE_READ_HOMES`]).
-fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static str> {
-    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
-    super::graph::attribute(file)
+/// Line numbers in `attributed` belonging to a phase-2 read's home `fn` ([`SUPERVISE_READ_HOMES`]).
+fn read_homes(
+    rel: &str,
+    attributed: &[super::graph::FnLine<'_>],
+) -> std::collections::BTreeMap<usize, &'static str> {
+    if !SUPERVISE_READ_HOMES.iter().any(|(home, _, _)| *home == rel) {
+        return std::collections::BTreeMap::new();
+    }
+    attributed
         .iter()
         .filter_map(|l| {
             let func = l.func?;
@@ -2052,10 +2057,15 @@ fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static s
         .collect()
 }
 
-/// Line numbers in `file` belonging to a wall reader's home `fn` ([`SUPERVISE_READER_HOMES`]).
-fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
-    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
-    super::graph::attribute(file)
+/// Line numbers in `attributed` belonging to a wall reader's home `fn` ([`SUPERVISE_READER_HOMES`]).
+fn reader_homes(
+    rel: &str,
+    attributed: &[super::graph::FnLine<'_>],
+) -> std::collections::BTreeSet<usize> {
+    if !SUPERVISE_READER_HOMES.iter().any(|(home, _)| *home == rel) {
+        return std::collections::BTreeSet::new();
+    }
+    attributed
         .iter()
         .filter(|l| {
             l.func.is_some_and(|f| {
@@ -2165,19 +2175,22 @@ pub(super) const STORE_CURRENT: Rule = Rule {
 /// How many lines after a `current` join its resolve may sit.
 const RESOLVE_REACH: usize = 6;
 
-/// Shipped Rust outside atpkg, which owns the store and the link.
+/// Rust outside atpkg, which owns the store and the link, build scripts and dev targets aside.
+/// Its caller leaves test code out ([`TestCode::holds`]).
 fn store_current_scope(rel: &str) -> bool {
     !(rel.starts_with("crates/atpkg/")
-        || rel.contains("/tests/")
-        || rel.ends_with("_tests.rs")
         || rel.ends_with("/build.rs")
         || rel.contains("/examples/")
         || rel.contains("/benches/"))
 }
 
 fn store_current(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    let test_code = tree.corpus.test_code();
     for file in tree.corpus.under(PRODUCT) {
-        if !store_current_scope(&file.rel) || !file.mentions(&["\"current\"", "/current"]) {
+        if !store_current_scope(&file.rel)
+            || test_code.holds(&file.rel)
+            || !file.mentions(&["\"current\"", "/current"])
+        {
             continue;
         }
         let lines: Vec<Line<'_>> = file.shipped_lines().collect();
@@ -2265,13 +2278,23 @@ fn licence_header(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let n = needle.len();
+    n == 0
+        || haystack
+            .as_bytes()
+            .windows(n)
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// What the file's header lacks, if anything.
 fn header_gap(file: &SourceFile) -> Option<&'static str> {
-    let head: Vec<&str> = file.raw.lines().take(HEADER_LINES).collect();
-    let spdx = head.iter().any(|l| l.contains("SPDX-License-Identifier:"));
-    let copyright = head
-        .iter()
-        .any(|l| l.to_ascii_lowercase().contains("copyright"));
+    let mut spdx = false;
+    let mut copyright = false;
+    for l in file.raw.lines().take(HEADER_LINES) {
+        spdx |= l.contains("SPDX-License-Identifier:");
+        copyright |= contains_ignore_ascii_case(l, "copyright");
+    }
     match (spdx, copyright) {
         (true, true) => change_gap(&file.raw),
         (false, true) => Some("no SPDX-License-Identifier line in its first 8 lines"),
@@ -2283,17 +2306,25 @@ fn header_gap(file: &SourceFile) -> Option<&'static str> {
 /// A head (the plain `//` lines before the module doc or the first code) that says the file
 /// is derived from upstream code and names no change. A generator writes its own output's head.
 fn change_gap(raw: &str) -> Option<&'static str> {
-    let head = raw
-        .lines()
-        .map(str::trim)
-        .take_while(|l| {
-            l.is_empty() || (l.starts_with("//") && !l.starts_with("//!") && !l.starts_with("///"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
-    let generated = head.contains("@generated") || head.contains("generated from");
-    (head.contains("derived from") && !generated && !CHANGE_WORDS.iter().any(|w| head.contains(w)))
+    let head = raw.lines().map(str::trim).take_while(|l| {
+        l.is_empty() || (l.starts_with("//") && !l.starts_with("//!") && !l.starts_with("///"))
+    });
+    if !head
+        .clone()
+        .any(|l| contains_ignore_ascii_case(l, "derived from"))
+    {
+        return None;
+    }
+    let generated = head.clone().any(|l| {
+        contains_ignore_ascii_case(l, "@generated")
+            || contains_ignore_ascii_case(l, "generated from")
+    });
+    let changed = head.into_iter().any(|l| {
+        CHANGE_WORDS
+            .iter()
+            .any(|w| contains_ignore_ascii_case(l, w))
+    });
+    (!generated && !changed)
         .then_some("says it is derived from upstream code but not what aterm changed in it")
 }
 
@@ -2632,6 +2663,287 @@ mod tests {
         // The test module's own child stays test code.
         let own = ("crates/aterm-gui/src/page/tests.rs", "mod forge;\n");
         assert!(found(tests, &[own]).is_empty());
+    }
+
+    /// A crate whose `src` folder is `krate`/`src` (its root `lib.rs`, or `mod.rs` deeper) with
+    /// `body` in every file but the loaders: a plain shipped module, a shipped one whose name
+    /// opens with `test`, a `_tests.rs` an ungated `#[path]` mounts, a module the root declares
+    /// test-only (which a test target mounts too), a `_tests.rs` only a test target mounts, one
+    /// only an example mounts, a `tests.rs` nothing loads, a test target and its `mod common;`,
+    /// and a test support file only a bench and a test-only mount load.
+    fn test_code_layout(krate: &str, src: &str, body: &str) -> Vec<(String, String)> {
+        let root = if src == "src" { "lib.rs" } else { "mod.rs" };
+        let up = "../".repeat(src.split('/').count());
+        let loads = format!(
+            "pub mod host;\npub mod test_binary;\n#[path = \"shipped_tests.rs\"]\nmod shipped;\n\
+             #[cfg(test)]\nmod rig;\n#[cfg(test)]\n#[path = \"{up}tests/support/files.rs\"]\n\
+             mod files;\n"
+        );
+        let suite = format!(
+            "#[path = \"../{src}/shared_tests.rs\"]\nmod shared;\n\
+             #[path = \"../{src}/rig.rs\"]\nmod rig;\nmod common;\n{body}"
+        );
+        let mut files = vec![
+            (format!("{krate}/{src}/{root}"), loads),
+            (format!("{krate}/tests/suite.rs"), suite),
+            (
+                format!("{krate}/benches/drift.rs"),
+                "#[path = \"../tests/support/files.rs\"]\nmod files;\n".to_string(),
+            ),
+            (
+                format!("{krate}/examples/demo.rs"),
+                format!("#[path = \"../{src}/demo_tests.rs\"]\nmod demo;\n"),
+            ),
+        ];
+        for file in [
+            "host.rs",
+            "test_binary.rs",
+            "shipped_tests.rs",
+            "rig.rs",
+            "shared_tests.rs",
+            "demo_tests.rs",
+            "old/tests.rs",
+        ] {
+            files.push((format!("{krate}/{src}/{file}"), body.to_string()));
+        }
+        for file in ["tests/common/mod.rs", "tests/support/files.rs"] {
+            files.push((format!("{krate}/{file}"), body.to_string()));
+        }
+        files
+    }
+
+    /// Every guard that skips test code asks [`TestCode::holds`], so each reads the same files of
+    /// [`test_code_layout`]: the plain shipped module, `test_binary.rs` and the mounted
+    /// `shipped_tests.rs`, and nothing else, though a test target, an example and a bench load
+    /// test code and the name of `rig.rs` says nothing of tests. Each row is a guard, a crate in
+    /// its scope with the `src` folder its scope reads, a line it fails, and the files the guard
+    /// needs beside them to read anything.
+    #[test]
+    fn every_guard_skips_the_same_test_code() {
+        let enums = [
+            (
+                "crates/aterm-phase/src/reader.rs",
+                "pub enum Program {\n    Claude,\n    Codex,\n    Generic,\n}\n",
+            ),
+            (
+                "crates/aterm-agent/src/harness/upgrade.rs",
+                "pub enum Agent {\n    #[default]\n    Claude,\n    Codex,\n}\n",
+            ),
+        ];
+        type Row<'a> = (
+            &'a Rule,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [(&'a str, &'a str)],
+        );
+        let rows: &[Row<'_>] = &[
+            (
+                &PROTECTED_FOLDER,
+                "crates/amacs-files",
+                "src",
+                "const P: &str = \"/Volumes/aterm/aterm.app\";\n",
+                &[],
+            ),
+            (
+                &super::super::debug_seam::DEBUG_SEAM,
+                "crates/aterm-lab",
+                "src",
+                "fn f() {\n    let _ = std::env::var_os(\"ATERM_DEBUG_NETPLACE\");\n}\n",
+                &[],
+            ),
+            (
+                &super::super::doors::DEVTOOLS_DOOR,
+                "crates/aterm-gui",
+                "src",
+                "impl App {\n    fn f(&mut self) {\n        self.interact_system_state(x);\n    \
+                 }\n}\n",
+                &[],
+            ),
+            (
+                &super::super::doors::DEVTOOLS_DOOR,
+                "crates/aterm-cli",
+                "src",
+                "fn a() { run_devtools_change(c, g, f); }\n",
+                &[],
+            ),
+            (
+                &STORE_CURRENT,
+                "crates/aterm-verify",
+                "src",
+                "fn a(p: &Path) -> PathBuf {\n    p.join(\"current\")\n}\n",
+                &[],
+            ),
+            (
+                &RUNLOOP_TIMER,
+                "crates/aterm-window",
+                "src",
+                "fn f() {\n    let t = CFRunLoopTimerCreate(a, b);\n}\n",
+                &[],
+            ),
+            (
+                &super::super::stock_label::STOCK_LABEL,
+                "crates/aterm-c",
+                "src",
+                "fn f(cmd: &mut Cmd) {\n    cmd.env(\"RUSTUP_TOOLCHAIN\", \"stable\");\n}\n",
+                &[],
+            ),
+            (
+                &RENDERER_TERMINAL,
+                "crates/aterm-render",
+                "src",
+                "use aterm_core::terminal::Terminal;\n",
+                &[],
+            ),
+            (
+                &KEEPER_NO_MMAP,
+                "crates/aterm-keeper",
+                "src",
+                "fn f() {\n    unsafe { libc::mmap(p, n, 1, 1, fd, 0) };\n}\n",
+                &[],
+            ),
+            (
+                &RESTORE_STAYS_LOCAL,
+                "crates/aterm-restore",
+                "src",
+                "use std::net::TcpStream;\n",
+                &[],
+            ),
+            (
+                &SUPERVISE_FX,
+                "crates/aterm-agent",
+                "src/supervise",
+                "fn f() {\n    let t = Instant::now();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::grants::PROMPT_GRANT,
+                "crates/aterm-gui",
+                "src",
+                "fn mint() {\n    let _ = Occupancy::Prompt.grant();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::machines::MACHINES_ROOT_DOOR,
+                "crates/aterm-cli",
+                "src",
+                "fn a() {\n    run(\"/usr/sbin/installer\", &[\"-pkg\", p]);\n}\n",
+                &[],
+            ),
+            (
+                &super::super::doors::FFI_DOOR,
+                "crates/aterm-cli",
+                "src",
+                "extern \"system\" {\n    fn WinExec();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::doors::HANDOFF_NAME,
+                "crates/aterm-gui",
+                "src",
+                "fn s() {\n    let k = \"ATERM_HANDOFF_CLAIM\".to_string();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::aos_step::AOS_STEP_CLOCK,
+                "crates/aterm-aos",
+                "src",
+                "fn a() {\n    let t = Instant::now();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::term_write::TERM_WRITE,
+                "crates/aterm-gui",
+                "src",
+                "fn f(term: &Mutex<Terminal>) {\n    term.lock().unwrap().process(b\"x\");\n}\n",
+                &[],
+            ),
+            (
+                &super::super::agent_gate::AGENT_GATE,
+                "crates/aterm-gui-x",
+                "src",
+                "fn f(a: Program) -> bool {\n    a == Program::Claude\n}\n",
+                &enums,
+            ),
+            (
+                &super::super::slog_inert::SLOG_INERT,
+                "crates/aterm-slog",
+                "src",
+                "fn f(w: SinkWriter) {}\n",
+                &[],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (rule, krate, src, body, beside) in rows {
+            let mut files = test_code_layout(krate, src, body);
+            files.extend(
+                beside
+                    .iter()
+                    .map(|(p, b)| ((*p).to_string(), (*b).to_string())),
+            );
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(p, b)| (p.as_str(), b.as_str()))
+                .collect();
+            let read: std::collections::BTreeSet<String> = run(rule, &files)
+                .into_iter()
+                .map(|f| f.path)
+                .filter(|p| p.starts_with(&format!("{krate}/")))
+                .collect();
+            let want: std::collections::BTreeSet<String> =
+                ["host.rs", "test_binary.rs", "shipped_tests.rs"]
+                    .iter()
+                    .map(|f| format!("{krate}/{src}/{f}"))
+                    .collect();
+            if read != want {
+                wrong.push(format!("{} over {krate}: read {read:?}", rule.id));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// engine-platform leaves out a file whose path names tests ([`engine_shipped`]) and reads
+    /// the rest as every guard does: a module its parent declares test-only stays test code
+    /// though a test target, a bench or an example mounts it too, and is read once a shipped
+    /// line mounts it.
+    #[test]
+    fn an_engine_module_a_test_target_also_mounts_stays_test_code() {
+        let body = "use std::fs::File;\n";
+        let read = |root: &str, mounter: Option<&str>| {
+            let mut files = vec![
+                ("crates/aterm-aos/src/lib.rs", root),
+                ("crates/aterm-aos/src/host.rs", body),
+                ("crates/aterm-aos/src/rig.rs", body),
+            ];
+            let mount = "#[path = \"../src/rig.rs\"]\nmod rig;\n";
+            files.extend(mounter.map(|rel| (rel, mount)));
+            let found: std::collections::BTreeSet<String> = run(&ENGINE_PLATFORM, &files)
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            found.into_iter().collect::<Vec<_>>()
+        };
+        let declared = "pub mod host;\n#[cfg(test)]\nmod rig;\n";
+        for mounter in [
+            None,
+            Some("crates/aterm-aos/tests/suite.rs"),
+            Some("crates/aterm-aos/benches/replay.rs"),
+            Some("crates/aterm-aos/examples/demo.rs"),
+        ] {
+            assert_eq!(
+                read(declared, mounter),
+                ["crates/aterm-aos/src/host.rs"],
+                "{mounter:?}"
+            );
+        }
+        let shipped = "pub mod host;\n#[cfg(test)]\nmod rig;\n#[path = \"rig.rs\"]\nmod again;\n";
+        assert_eq!(
+            read(shipped, None),
+            [
+                "crates/aterm-aos/src/host.rs",
+                "crates/aterm-aos/src/rig.rs"
+            ]
+        );
     }
 
     #[test]

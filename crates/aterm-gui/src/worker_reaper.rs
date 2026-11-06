@@ -1,29 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REAPER OF WORKERS' TABS: a tab a task opened for itself ([`crate::tab_model::Tab::ephemeral`]:
-//! every `spawn agent=` worker, the disk worker and the credit claim worker land so) goes once its
-//! task is over, and a person's tab never does. The disk watch's look (`HostNote::DiskLooked`, once a
-//! minute whatever any session does) moves each such tab one step of [`ending`] on, parked or not:
-//!
-//! - A task that concluded ([`settled`]: done, failed or exited, a failure at a usage limit too,
-//!   into which nothing types again; not a stall, which may move on) is over once its end has
-//!   stood [`LINGER`], or at once where the look already asked its program to end for that task
-//!   ([`over`]). A person who typed in its tab since its end took the tab up: it stays
-//!   while that end stands, and a turn they type reopens the task `working`, so its next end counts
-//!   anew.
-//! - A credit claim worker whose task never concludes is over once it ran
-//!   [`credit_claim::WORKER_FOR`] since it started or a person last typed in its tab
-//!   ([`credit_claim::ran_out`]): its program is ended and its task marked `exited`, which concludes
-//!   it, and its tab then goes as any concluded worker's does.
-//!
-//! A tab over is left while anything holds it: on screen in a focused window, a hold or a driver,
-//! a program someone else started running in front, its window's last tab (which asks before it
-//! goes), and a seamless update under way. Otherwise its agent is asked to end (`SIGTERM`, then
-//! `SIGKILL` once [`DEAF_FOR`] has passed), so its pane closes with no confirmation to raise, and the
-//! pane closes. Each close logs one INFO line naming the session and why, and leaves the worker a
-//! retired row ([`crate::retired_workers`]), so `result` still answers and its Workers row reads
-//! Finished. Keep as Tab (`App::keep_as_tab`) takes the mark off: the tab is a person's from then on.
+//! Bounds unfinished credit-claim workers without taking away their panes.
+//! A concluded task keeps both its pane and any program still running there. A seamless update
+//! protects every worker before any signal or task mark. Open claim workers alone retain their
+//! execution budget; their processes end and their task records become exited.
 
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
@@ -34,10 +15,8 @@ use crate::harness_host::credit_claim;
 use crate::retired_workers::{Retired, forget_results};
 use crate::task_record::{TaskRecord, TaskState};
 
-/// How long a worker's tab stays after its task concluded, for its end to be read on screen,
-/// before it goes: long enough to glance at a worker that just finished, short enough that a
-/// screen of finished workers clears itself. What it left stays readable after
-/// ([`crate::retired_workers`]).
+/// The former retirement delay, retained only as a regression-test age.
+#[cfg(test)]
 pub(crate) const LINGER: Duration = Duration::from_secs(3 * 60);
 
 /// How long a worker's program has to end after the first `SIGTERM` the look delivered to it
@@ -45,40 +24,23 @@ pub(crate) const LINGER: Duration = Duration::from_secs(3 * 60);
 /// stopped reading its terminal.
 pub(crate) const DEAF_FOR: Duration = Duration::from_secs(2 * 60);
 
-/// Whether `record`'s end is one its tab goes for: a conclusion a person can read (done, failed or
-/// exited, [`TaskState::has_an_end_to_read`]). A failure at a usage limit is one: aterm-agent's
-/// supervisor ends a managed worker there once its reset is too far off to wait for, and types
-/// nothing into it again ([`crate::task_record::WHY_USAGE_LIMIT`]), so its tab would only stand
-/// blocked; whoever started it may start it again.
+/// Whether the record has a concluded task, whose program and pane must be preserved.
 pub(crate) fn settled(record: &TaskRecord) -> bool {
     record.state.has_an_end_to_read()
 }
 
-/// Why a look ends a worker's tab ([`over`]).
+/// Why a look ends a worker's program ([`over`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Over {
-    /// Its task concluded ([`settled`]) and that end has stood [`LINGER`].
-    Concluded,
     /// It is a credit claim worker whose open task ran out of its time
     /// ([`credit_claim::ran_out`]).
     RanOut,
 }
 
-/// Whether, and why, the worker whose task is `record` is over at `now`, `typed` after a person last
-/// typed in its tab, with `ending` where the look already asked its program to end for this task
-/// (its record's start): a concluded task once its end stood [`LINGER`], or at once where it is
-/// ending, unless a person typed in its tab since that end; an open one where a claim worker's ran
-/// out of its time.
-pub(crate) fn over(
-    record: &TaskRecord,
-    now: Instant,
-    typed: Option<Duration>,
-    ending: bool,
-) -> Option<Over> {
+/// Whether an unfinished credit-claim task has exhausted its execution budget.
+pub(crate) fn over(record: &TaskRecord, now: Instant, typed: Option<Duration>) -> Option<Over> {
     if settled(record) {
-        let stood = now.saturating_duration_since(record.since);
-        let theirs = typed.is_some_and(|typed| typed < stood);
-        return (!theirs && (ending || stood >= LINGER)).then_some(Over::Concluded);
+        return None;
     }
     let stood = credit_claim::stood(record, now, typed);
     credit_claim::ran_out(record.trusted_cwd.as_deref(), stood).then_some(Over::RanOut)
@@ -95,8 +57,6 @@ pub(crate) enum Ending {
     Kill,
     /// Mark its open task `exited`, its program gone, which concludes it.
     MarkExited,
-    /// Close its pane.
-    ClosePane,
 }
 
 /// What a look reads of a worker whose task is over ([`ending`]).
@@ -115,27 +75,21 @@ pub(crate) struct Stand {
     /// worker's own; any other program is someone else's, a runtime such as `node` among them,
     /// whatever its screen shows (an exited worker's last frame can stand on it).
     pub(crate) worker: bool,
-    /// Closing its pane would close its window.
-    pub(crate) ends_window: bool,
-    /// A seamless update is under way, which a close would call off.
+    /// A seamless update is under way; no signal or mark may race its capture.
     pub(crate) updating: bool,
     /// The program in front, its process group, has had [`DEAF_FOR`] to end since the first
     /// `SIGTERM` delivered to it ([`deaf`]).
     pub(crate) deaf: bool,
-    /// A program someone else ran in the tab since its task concluded was seen by a look less than
-    /// [`LINGER`] ago, so its output is still to be read.
-    pub(crate) reading: bool,
 }
 
-/// What to do with a worker whose task is over: nothing to a tab in someone's hand or to a job that
-/// is not the worker's (its task already `exited`, or another program in front); its program
-/// first, which leaves a pane that closes with no confirmation to raise; then an open task marked
-/// `exited`, unless something already concluded it; and its pane only where that leaves its window
-/// standing, since a window's last tab asks before it goes, and once the output of a program
-/// someone ran there since has stood [`LINGER`]. A seamless update under way gets neither a mark,
-/// which would wait on its fence, nor a close, which would call it off.
+/// Preserve updates, concluded tasks and occupied tabs. An unfinished claim worker alone
+/// may be signalled after its budget; once its process ends, mark it exited and keep its pane.
 pub(crate) const fn ending(stand: Stand) -> Ending {
-    if stand.in_hand || (stand.job && (stand.exited || !stand.worker)) {
+    if stand.updating
+        || stand.concluded
+        || stand.in_hand
+        || (stand.job && (stand.exited || !stand.worker))
+    {
         Ending::Leave
     } else if stand.job {
         if stand.deaf {
@@ -143,14 +97,8 @@ pub(crate) const fn ending(stand: Stand) -> Ending {
         } else {
             Ending::Term
         }
-    } else if stand.updating {
-        Ending::Leave
-    } else if !stand.concluded {
-        Ending::MarkExited
-    } else if stand.ends_window || stand.reading {
-        Ending::Leave
     } else {
-        Ending::ClosePane
+        Ending::MarkExited
     }
 }
 
@@ -160,6 +108,8 @@ pub(crate) struct Look {
     pub(crate) record: TaskRecord,
     /// The program in front names itself the agent its record names ([`Stand::worker`]).
     pub(crate) worker: bool,
+    /// The worker is waiting for its own quota reset.
+    pub(crate) limited: bool,
 }
 
 /// The first `SIGTERM` the look delivered to a worker's program ([`note_term`]).
@@ -231,7 +181,7 @@ pub(crate) fn note_term(
 /// `read`: as the harness's own exit mark does (`aterm_agent::supervise::mark_task_exited`), the
 /// mark takes down the attention a deadline raised for the worker (the held or startup ask), which
 /// a program that ended no longer owes. It runs once the claim's time is up on a task still open
-/// (working or stalled: a concluded one is [`settled`], and goes as concluded), so it ends `why=`
+/// (working or stalled: a concluded one is [`settled`] and left alone), so it ends `why=`
 /// its stall's reason where it never got going (signed out, never started, held), and anything
 /// else ends `expired`; the claim's one report says which. It waits on no update's fence (`Err`
 /// until a later look). `Ok(None)` when the record moved since it was read.
@@ -274,14 +224,8 @@ impl crate::App {
         })
     }
 
-    /// The disk watch's look ([`HostNote::DiskLooked`], on a timer of its own, whatever any session
-    /// does): every live worker on an ephemeral tab whose task is over ([`over`]) is moved on by one
-    /// step of [`ending`], so its program ends at one look, an open task is marked `exited` at a
-    /// later one, and its pane closes once its end has stood [`LINGER`]; and the retired rows a day
-    /// old go. Nothing here raises a confirmation: a pane closes only with no job in it and with its
-    /// window left standing. Returns each such worker's session and the step taken.
-    ///
-    /// [`HostNote::DiskLooked`]: crate::harness_host::HostNote::DiskLooked
+    /// Move expired claim workers one step toward an exited task, preserving every pane.
+    /// Also age out retained results from earlier closes.
     pub(crate) fn reap_workers(&mut self, now: Instant) -> Vec<(u64, Ending)> {
         // In session order, so the rows a look retires stand in the order the sessions began.
         let mut handles: Vec<_> = {
@@ -310,6 +254,10 @@ impl crate::App {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 timeline.task().map(|task| Look {
+                    limited: matches!(
+                        timeline.agent().word,
+                        "wall:usage-session" | "wall:usage-weekly" | "wall:model-bucket"
+                    ),
                     worker: task.agent.is_some_and(|agent| {
                         timeline
                             .agent()
@@ -324,9 +272,10 @@ impl crate::App {
             let Some(look) = look else {
                 continue;
             };
-            // A program someone else runs in the tab of a worker whose task concluded is seen at
-            // every look, not only once the tab's end is due, so its output keeps the tab open
-            // [`LINGER`] after it ends ([`Stand::reading`]).
+            if look.worker && look.limited {
+                continue;
+            }
+            // Keep the last observed activity in the handoff metadata for older successors.
             if settled(&look.record) {
                 concluded.push(handle.local_id);
                 let exited = look.record.state == TaskState::Exited;
@@ -334,11 +283,7 @@ impl crate::App {
                     self.worker_job_seen.insert(handle.local_id, now);
                 }
             }
-            let ending_now = self
-                .worker_termed
-                .get(&handle.local_id)
-                .is_some_and(|sent| sent.record == look.record.started);
-            if let Some(over) = over(&look.record, now, typed, ending_now) {
+            if let Some(over) = over(&look.record, now, typed) {
                 steps.push((handle.local_id, self.reap_worker(&handle, &look, over, now)));
             }
         }
@@ -361,11 +306,7 @@ impl crate::App {
         steps
     }
 
-    /// One step of [`ending`] at `now` for the worker `handle`, read as `look`, over for `over`. A
-    /// claim worker that ran out has its Autopilot turned Off at every look, since Land would
-    /// otherwise keep typing in a tab a person left in front, or bring its program back; a
-    /// concluded worker's goes Off only as its program is asked to end, so a manager's next turn
-    /// into a worker someone still holds finds Land there.
+    /// One step for an expired claim worker. Concluded workers keep their Autopilot and pane.
     fn reap_worker(
         &mut self,
         handle: &crate::session_store::SessionHandle,
@@ -383,11 +324,10 @@ impl crate::App {
         let driven = crate::input_stall::other_hand(&handle.ctx, crate::metrics::now_us());
         let step = ending(Stand {
             in_hand: looked_at || driven.is_some(),
-            concluded: over == Over::Concluded,
+            concluded: settled(&look.record),
             exited: look.record.state == TaskState::Exited,
             job: self.session_foreground_busy(session),
             worker: look.worker,
-            ends_window: self.close_ends_window(session),
             updating: self.update_handoff_in_flight(),
             deaf: deaf(
                 self.worker_termed.get(&session),
@@ -395,23 +335,14 @@ impl crate::App {
                 crate::quit_safety::foreground_pgrp(handle.master),
                 now,
             ),
-            reading: over == Over::Concluded
-                && self
-                    .worker_job_seen
-                    .get(&session)
-                    .is_some_and(|&seen| now.saturating_duration_since(seen) < LINGER),
         });
         let title = self.tab_label_of_session(session);
         let why = match over {
-            Over::Concluded => "its task concluded",
             Over::RanOut => "the credit claim worker ran out of its time",
         };
         match step {
             Ending::Leave => {}
             Ending::Term | Ending::Kill => {
-                if over == Over::Concluded {
-                    self.reaped_autopilot_off(handle);
-                }
                 let word = if step == Ending::Kill { "kill" } else { "term" };
                 let said = crate::control::control_input::signal_verb(
                     handle.master,
@@ -445,13 +376,12 @@ impl crate::App {
                     "{}: {why}; its program ended, its task {}",
                     named(sid, &title),
                     match marked {
-                        Ok(Some(_)) => "marked exited: its tab closes after its end has stood",
+                        Ok(Some(_)) => "marked exited: its pane stays",
                         Ok(None) => "moved since the look: a later look marks it",
                         Err(crate::task_record::MarkFenced) => "waits for a later look to mark",
                     }
                 );
             }
-            Ending::ClosePane => self.close_reaped(handle, &look.record, &title),
         }
         step
     }
@@ -467,70 +397,6 @@ impl crate::App {
         if autopilot != Some(Autopilot::Off) {
             self.worker_autopilot_off(handle.sid.as_str());
         }
-    }
-
-    /// Close worker `handle`'s pane, its task's end `record`, keeping a retired row first, so the
-    /// close keeps its result files and `result` answers once its session is gone; a close that
-    /// does not happen takes the row back.
-    fn close_reaped(
-        &mut self,
-        handle: &crate::session_store::SessionHandle,
-        record: &TaskRecord,
-        title: &str,
-    ) {
-        let (session, sid) = (handle.local_id, handle.sid.as_str());
-        let Some(window) = self.window_of_session(session) else {
-            return;
-        };
-        let hosting = self.harness_hosting();
-        let row = self.worker_row(handle, &hosting);
-        let pushed = self
-            .store
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retired_workers_mut()
-            .keep(Retired {
-                sid: handle.sid.clone(),
-                local: Some(session),
-                window: Some(window),
-                title: row.title,
-                last_words: row.last_words,
-                record: record.clone(),
-                closed_unix_ms: aterm_time::unix_millis().unwrap_or(0),
-            });
-        forget_results(&pushed);
-        let _closing = crate::session_store::CloseAttribution::enter(
-            crate::session_store::ExitReason::Reaper,
-            crate::session_store::ExitActor::Harness,
-        );
-        let end = match record.conclusion() {
-            Some(conclusion) => conclusion.word(),
-            None => record.state.as_str(),
-        };
-        let age = crate::app_overview::coarse_age(record.since_ms());
-        let why = record
-            .why
-            .map_or_else(String::new, |why| format!(" why={why}"));
-        match self.close_session_by_id(session) {
-            Ok(_) => aterm_log::info!(
-                "{}: its tab closed: its task {end}{why} {age} ago and nobody held the tab; \
-                 `result` answers for it {} more",
-                named(sid, title),
-                crate::app_overview::coarse_age(crate::retired_workers::RETIRED_FOR_MS),
-            ),
-            Err(refused) => {
-                self.store
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retired_workers_mut()
-                    .drop_local(session);
-                aterm_log::info!(
-                    "{}: its task {end}; its tab stays for now: {refused}",
-                    named(sid, title)
-                );
-            }
-        }
-        self.settle_workers_tab(window);
     }
 
     /// Settle the Workers tab of each window whose page listed one of the retired rows `dropped`.

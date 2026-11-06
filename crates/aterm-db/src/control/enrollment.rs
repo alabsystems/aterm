@@ -39,7 +39,7 @@ pub(super) fn client(
     let hello = repair.receive_answer(stream, Side::Initiator)?;
     let peer = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
     let actor = peer.actor;
-    verify_peer_against_local_log(
+    let pass = verify_peer_against_local_log(
         endpoint.custody(),
         endpoint.trust,
         &peer.request,
@@ -47,6 +47,8 @@ pub(super) fn client(
     )?;
     let authenticated_at = Instant::now();
     let challenge = receive_frame(stream, MAX_CHALLENGE)?;
+    // Answering commits this device to the member its check passed.
+    pass.spend();
     let response = bootstrap
         .device()
         .answer(&request, &challenge)
@@ -246,10 +248,6 @@ pub(super) fn serve(
     let request = Request::decode(&hello[84..]).map_err(failure)?;
     let actor = authenticate_identity(endpoint.actor, proof, &request)?;
     let authenticated_at = Instant::now();
-    repair.phase = Phase::PeerAdmission;
-    let mut lease = endpoint.peers.acquire(actor, repair)?;
-    lease.begin_round();
-    lease.phase = Phase::Membership;
     let paths = endpoint
         .paths
         .as_ref()
@@ -265,9 +263,14 @@ pub(super) fn serve(
         }
         bootstrap.is_log_backed().map_err(failure)?
     };
+    // A challenge is work for an eligible candidate, never an admission grant: the check runs
+    // before the lease, and again before the member authors the device's seat.
+    let check = || self::check(endpoint, paths, &request, log_backed);
+    repair.phase = Phase::PeerAdmission;
+    let mut lease = endpoint.lease(check()?, actor, repair)?;
+    lease.begin_round();
+    lease.phase = Phase::Membership;
     if log_backed {
-        client::check_log_commons_enrollment(paths, endpoint.trust, request.binding())
-            .map_err(failure)?;
         endpoint.require_legacy_records()?;
         send_frame(stream, &endpoint.hello)?;
         let (mut pending, challenge) =
@@ -286,11 +289,14 @@ pub(super) fn serve(
                 return Err(Error::new("enrollment peer custody changed"));
             }
         }
+        check()?.spend();
         let chain =
             client::enroll_commons_member_in_log(paths, endpoint.trust, request, possession)
                 .map_err(failure)?;
-        let mut wire = b"ACW2".to_vec();
-        wire.extend_from_slice(&aterm_secrets::membership_log::encode_records(&chain));
+        let encoded_records = aterm_secrets::membership_log::encode_records(&chain);
+        let mut wire = Vec::with_capacity(4 + encoded_records.len());
+        wire.extend_from_slice(b"ACW2");
+        wire.extend_from_slice(&encoded_records);
         endpoint.require_legacy_records()?;
         send_frame(stream, &wire)?;
         lease.prepare(endpoint.trust, actor);
@@ -300,15 +306,8 @@ pub(super) fn serve(
             ..Report::default()
         });
     }
-    // A challenge is work for an eligible candidate, never an admission grant.
-    // Drop all local observations and locks before interacting with the peer.
-    {
-        let (admin, bootstrap) = local_authority(endpoint, paths)?;
-        let journal = Journal::read_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
-        admin
-            .check_commons_enrollment(&bootstrap, &journal, request.binding())
-            .map_err(failure)?;
-    }
+    // The check above dropped all its local observations and locks before this interacts with
+    // the peer.
     endpoint.require_legacy_records()?;
     send_frame(stream, &endpoint.hello)?;
     let (mut pending, challenge) =
@@ -319,6 +318,7 @@ pub(super) fn serve(
     let possession = pending.verify(&response).map_err(failure)?;
     // All cache/state/custody reads finish before taking the journal lock.
     // No vault-server request or peer I/O occurs while that lock is held.
+    check()?.spend();
     let (admin, bootstrap) = local_authority(endpoint, paths)?;
     let wire = {
         let mut journal = Journal::open_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
@@ -336,6 +336,43 @@ pub(super) fn serve(
         sent: 1,
         ..Report::default()
     })
+}
+
+/// Check `request`, a pending device asking this member to enroll it
+/// ([`super::peer_check::check`]): the roster, every record this member holds (at an endpoint
+/// built from its log), then its own enrollment judgement, on its acknowledged log
+/// ([`client::check_log_commons_enrollment`]) where it is `log_backed`, and on its journal
+/// otherwise. The pass the enrollment's next grant takes.
+///
+/// # Errors
+/// The kernel refused the device: the roster or a record held removes it, a view the kernel
+/// requires did not read, or the member's judgement refused it.
+pub(super) fn check(
+    endpoint: &Endpoint,
+    paths: &client::Paths,
+    request: &Request,
+    log_backed: bool,
+) -> Result<super::Pass> {
+    let acknowledged = || -> Result<()> {
+        if log_backed {
+            client::check_log_commons_enrollment(paths, endpoint.trust, request.binding())
+                .map_err(failure)
+        } else {
+            let (admin, bootstrap) = local_authority(endpoint, paths)?;
+            let journal = Journal::read_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
+            admin
+                .check_commons_enrollment(&bootstrap, &journal, request.binding())
+                .map_err(failure)
+        }
+    };
+    super::peer_check::check(
+        endpoint.custody(),
+        endpoint.trust,
+        &super::peer_check::Judged::Enrollment {
+            binding: request.binding(),
+            acknowledged: &acknowledged,
+        },
+    )
 }
 
 pub(super) fn local_authority(

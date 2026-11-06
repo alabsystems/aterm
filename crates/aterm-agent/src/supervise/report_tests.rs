@@ -1225,3 +1225,487 @@ fn a_final_view_of_a_headless_message_keeps_its_words_and_its_done_row() {
         "the footer is not a report row"
     );
 }
+
+/// The measured 2.1.316 side-panel capture
+/// (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`) and the cell column of its
+/// rule.
+fn panel_capture() -> (Vec<String>, usize) {
+    let capture = super::super::prompt::fixtures::screen(
+        super::super::prompt::fixtures::WAITING_AGENTS_WORKFLOWS_2_1_316,
+    );
+    let rule = capture[0]
+        .split_once('│')
+        .expect("the panel's rule")
+        .0
+        .chars()
+        .count();
+    (capture, rule)
+}
+
+/// SCREENS CONSTRUCTED BESIDE THE MEASURED SIDE PANEL: a transcript's words, as Claude Code lays
+/// them out in the rule's room, each row padded to the measured 2.1.316 capture's rule with the
+/// rule after it and, where asked, the panel's measured text of the capture's row at that height
+/// after the rule; then the capture's composer, footer and agents panel, which the panel is drawn
+/// beside none of. Every measured panel capture draws the panel so (aterm-phase's `panel_rule`).
+struct Beside {
+    capture: Vec<String>,
+    rule: usize,
+    /// The capture's composer's top rule.
+    top: usize,
+}
+
+impl Beside {
+    fn new() -> Self {
+        let (capture, rule) = panel_capture();
+        let top = capture
+            .iter()
+            .position(|r| r.starts_with('─'))
+            .expect("the composer's top rule");
+        Self { capture, rule, top }
+    }
+
+    /// The capture's row `i`, its words left of the rule.
+    fn left(&self, i: usize) -> String {
+        let row = self.capture[i].as_str();
+        row.split_once('│')
+            .map_or(row, |(left, _)| left)
+            .trim_end()
+            .to_string()
+    }
+
+    /// The capture's rows from the one that starts with `head`, up to the one before `until`'s, each its
+    /// words left of the rule.
+    fn words(&self, head: &str, until: &str) -> Vec<String> {
+        let from = self
+            .capture
+            .iter()
+            .rposition(|r| r.starts_with(head))
+            .expect("the capture's row");
+        let to = (from..self.capture.len())
+            .find(|&i| self.capture[i].starts_with(until))
+            .expect("the capture's row under it");
+        (from..to).map(|i| self.left(i)).collect()
+    }
+
+    /// The panel's measured text after the rule on the capture's row `i` (none past its last).
+    fn side(&self, i: usize) -> &str {
+        self.capture[..self.top]
+            .get(i)
+            .and_then(|r| r.split_once('│'))
+            .map_or("", |(_, side)| side)
+    }
+
+    /// `words` beside the panel, from the screen's top, with the panel's measured text after the
+    /// rule (`side`) or none, then the capture's composer and the rows under it.
+    fn screen(&self, words: &[String], side: bool) -> Vec<String> {
+        let rule = self.rule;
+        let mut rows: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| format!("{w:<rule$}│{}", if side { self.side(i) } else { "" }))
+            .collect();
+        rows.extend(self.capture[self.top..].iter().cloned());
+        rows
+    }
+
+    /// `words` on a screen drawn after the panel changed: with `rule` none, the panel closed (each
+    /// row its words alone, in the capture's pane); with `rule`, its rule moved to that cell
+    /// column (each row padded to it, the rule after it); then the capture's composer and the
+    /// rows under it, which the panel is drawn beside none of.
+    fn since(&self, words: &[String], rule: Option<usize>) -> Vec<String> {
+        let mut rows: Vec<String> = words
+            .iter()
+            .map(|w| rule.map_or_else(|| w.clone(), |rule| format!("{w:<rule$}│")))
+            .collect();
+        rows.extend(self.capture[self.top..].iter().cloned());
+        rows
+    }
+
+    /// CONTROL: `words` with no panel, in a pane as wide as the rule's column: the composer's
+    /// rules that wide, its caret row and the rows under it the capture's.
+    fn alone(&self, words: &[String]) -> Vec<String> {
+        let mut rows = words.to_vec();
+        rows.push("─".repeat(self.rule));
+        rows.push(self.capture[self.top + 1].clone());
+        rows.push("─".repeat(self.rule));
+        rows.extend(self.capture[self.top + 3..].iter().cloned());
+        rows
+    }
+
+    /// A turn's rows as Claude Code draws them in the rule's room: `❯ ` and then two spaces
+    /// before each row of its text, each of its lines wrapped at the room
+    /// (`aterm_phase::prompt::fixtures::ink_wrap`).
+    fn turn(&self, text: &str) -> Vec<String> {
+        text.split('\n')
+            .flat_map(|line| super::super::prompt::fixtures::ink_wrap(line, self.rule - 2))
+            .enumerate()
+            .map(|(k, row)| format!("{}{row}", if k == 0 { "❯ " } else { "  " }))
+            .collect()
+    }
+
+    /// The measured capture's turn under the panel: its harness's line, as its rows show it.
+    fn harness_turn(&self) -> (String, Vec<String>) {
+        let rows = self.words("❯ [aterm harness]", "⏺ While the landings run");
+        let rows: Vec<String> = rows.into_iter().take_while(|r| !r.is_empty()).collect();
+        let text: Vec<&str> = rows
+            .iter()
+            .map(|r| r.trim_start_matches('❯').trim())
+            .collect();
+        (text.join(" "), rows)
+    }
+
+    /// The measured capture's rows above its last harness turn, each its words left of the rule.
+    fn above(&self) -> Vec<String> {
+        let turn = self
+            .capture
+            .iter()
+            .rposition(|r| r.starts_with("❯ [aterm harness]"))
+            .expect("the capture's last turn");
+        (0..turn).map(|i| self.left(i)).collect()
+    }
+
+    /// The measured capture's reply under its last harness turn, down to its last said row, and
+    /// its waiting row: the rows of a report after the turn's.
+    fn reply(&self) -> Vec<String> {
+        let mut rows = vec![String::new()];
+        rows.extend(self.words("⏺ While the landings run", "✻ Waiting for 2 background"));
+        let waiting = self
+            .capture
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background"))
+            .expect("the capture's waiting row");
+        rows.push(self.left(waiting));
+        rows.push(String::new());
+        rows
+    }
+}
+
+/// The measured report fixture's turn (`wait_bg2.out`, Claude Code's rows of a person's turn at
+/// 138 columns), its rows rejoined.
+fn bg2_turn() -> String {
+    let screen = fixture(super::super::prompt::fixtures::WAIT_BG2);
+    let at = screen
+        .iter()
+        .position(|r| r.starts_with("❯ Go on the amended lever"))
+        .expect("the turn's row");
+    let mut words = vec![screen[at].trim_start_matches('❯').trim().to_string()];
+    words.extend(
+        screen[at + 1..]
+            .iter()
+            .take_while(|r| r.starts_with("  ") && !r.trim().is_empty())
+            .map(|r| r.trim().to_string()),
+    );
+    words.join(" ")
+}
+
+/// A REPORT BESIDE THE SIDE PANEL IS THE TRANSCRIPT'S WORDS UP TO ITS RULE: the report's screen
+/// rows are the screen's transcript as its readers read it (`ScreenReader::transcript`, Claude
+/// Code's `aterm_phase::phase::Transcript`): each row cut at the panel's rule, the padding before
+/// it trimmed, by the one cut the transcript's readers read. Kept whole before (KI-1101-3), each
+/// row ended in its padding and the rule and, beside the panel's text, in that text, so a report
+/// beside the panel handed the manager the panel's words in the worker's. No capture draws a
+/// report's turn beside the panel's text, so these screens are CONSTRUCTED: the measured report
+/// fixture's turn (`wait_bg2.out`'s, a person's lever) wrapped in the measured rule's room, then
+/// the measured 2.1.316 capture's reply and waiting row under its last turn, each padded to the
+/// capture's rule with no panel text after it or the panel's measured text of the capture's row
+/// at that height, then the capture's composer and the rows under it; read from the archive's
+/// offscreen read and from the screen alone (an old host's). CONTROL: the same words with no
+/// panel in a pane as wide as the rule report the same rows, and those are the words the screens
+/// were built from.
+#[test]
+fn a_report_beside_the_side_panel_is_the_transcripts_words_up_to_its_rule() {
+    let b = Beside::new();
+    let (measured, rows) = b.harness_turn();
+    assert_eq!(
+        b.turn(&measured),
+        rows,
+        "PRECONDITION: a turn wrapped in the rule's room is drawn as the capture draws its own"
+    );
+    let text = bg2_turn();
+    let mut words = b.turn(&text);
+    let turn_rows = words.len();
+    words.extend(b.reply());
+    let said = words
+        .iter()
+        .rposition(|w| w.starts_with("  NEEDS YOU: an xAI account"))
+        .expect("the last said row");
+    let want: Vec<String> = words[..=said].to_vec();
+    assert!(
+        turn_rows > 1 && b.side(1).contains("1 file changed"),
+        "PRECONDITION: the turn wraps at the rule, the panel's heading beside it"
+    );
+    let mut misread = Vec::new();
+    for (pane, screen) in [
+        ("beside the panel, no panel text", b.screen(&words, false)),
+        ("beside the panel's text", b.screen(&words, true)),
+        ("CONTROL with no panel", b.alone(&words)),
+    ] {
+        let mut host = Host::default()
+            .on("history", history(&[(9, true, "7730:0", text.as_str())]))
+            .on("offscreen", Read::new(1, &[], screen.clone()).ctl());
+        let report = run(&mut host, ReportOpts::default());
+        let alone = screen_only(Marker::Ledger, Some(9), Some(&text), &screen);
+        for (how, report, header) in [
+            (
+                "offscreen",
+                report,
+                format!(
+                    "report complete=1 marker=ledger turn=9 rows={n} archived=0 screen={n} \
+                     last=7730:0",
+                    n = want.len()
+                ),
+            ),
+            (
+                "screen alone",
+                alone,
+                format!(
+                    "report complete=0 reason=no-archive marker=ledger turn=9 rows={n} \
+                     archived=0 screen={n} last=-",
+                    n = want.len()
+                ),
+            ),
+        ] {
+            if report.header() != header || report.rows != want {
+                misread.push(format!(
+                    "{pane}, {how}: {}\n{}",
+                    report.header(),
+                    report.rows.join("\n")
+                ));
+            }
+        }
+    }
+    assert!(misread.is_empty(), "{}", misread.join("\n\n"));
+}
+
+/// AN ARCHIVED ROW IS READ AS THE ARCHIVE STORED IT: an archived row is the row's text whole as it
+/// scrolled off (aterm-core's `AltArchive` stores the grid's row text: beside the side panel, the
+/// padding, the rule and the panel's text with it), the archive keeps no panel or column of its
+/// own, and a panel that opens or closes is no break of its own: the archive's diff rewrites the
+/// rows above the composer in place, archiving none of them and recording no break, when the rows
+/// it sees unchanged vote that nothing moved (a row under the composer, an agent's token count,
+/// changed in the same frame) or when few rows lie above the composer. So nothing a read carries
+/// tells a row drawn beside the screen's panel from one drawn with none, and the report keeps
+/// every archived row whole. Cut at the screen's rule in a read that counts no break, as this
+/// branch first did, a table drawn with no panel, its own `│` at the rule's column, archived
+/// before a panel opened that the archive recorded no break for, lost the words after that `│` in
+/// a report that said it was complete. CONSTRUCTED as
+/// `a_report_beside_the_side_panel_is_the_transcripts_words_up_to_its_rule`'s screens: its top
+/// rows (the turn and the reply's first rows) archived beside the panel's measured text as they
+/// were drawn, the rest on the screen beside the panel from its top, read with no break, a break
+/// before the report's start and a break after it (`archive-gap`): the archived rows whole, the
+/// screen's cut at the rule. Then a table drawn with no panel, archived before the screen beside
+/// the panel, keeps its `│` and the words after it in a read with no break and in one with a
+/// break. CONTROL: the same reads with no panel report the words the screens were built from.
+#[test]
+fn an_archived_row_is_read_as_the_archive_stored_it() {
+    let b = Beside::new();
+    let text = bg2_turn();
+    let mut words = b.turn(&text);
+    let kept = words.len() + 4;
+    words.extend(b.reply());
+    let said = words
+        .iter()
+        .rposition(|w| w.starts_with("  NEEDS YOU: an xAI account"))
+        .expect("the last said row");
+    let want: Vec<String> = words[..=said].to_vec();
+    let read = |whole: &[String], screen: Vec<String>, breaks: u64| {
+        let mut read = Read::new(101, &[], screen);
+        read.archived = whole[..kept].to_vec();
+        read.last = 100 + u64::try_from(kept).expect("fits");
+        read.breaks = breaks;
+        read
+    };
+    let mut misread = Vec::new();
+    for (pane, whole, screen) in [
+        (
+            "beside the panel's text",
+            b.screen(&words, true),
+            b.screen(&words[kept..], true),
+        ),
+        (
+            "CONTROL with no panel",
+            b.alone(&words),
+            b.alone(&words[kept..]),
+        ),
+    ] {
+        let rows: Vec<String> = whole[..kept].iter().chain(&want[kept..]).cloned().collect();
+        for (case, breaks, after_start, reasons) in [
+            ("no break", 0, None, vec![]),
+            ("a break before the start", 1, Some(0), vec![]),
+            (
+                "a break after the start",
+                1,
+                Some(1),
+                vec![Reason::ArchiveGap],
+            ),
+        ] {
+            let mut host = Host::default()
+                .on("history", history(&[(9, true, "7730:100", text.as_str())]))
+                .on("offscreen", read(&whole, screen.clone(), breaks).ctl());
+            if let Some(after_start) = after_start {
+                host = host.on("offscreen", recheck(after_start));
+            }
+            let report = run(&mut host, ReportOpts::default());
+            if report.reasons != reasons
+                || report.rows != rows
+                || (report.archived, report.screen) != (kept, want.len() - kept)
+            {
+                misread.push(format!(
+                    "{pane}, {case}: {}\n{}",
+                    report.header(),
+                    report.rows.join("\n")
+                ));
+            }
+        }
+    }
+    let rule = b.rule;
+    let table = format!("{:<rule$}│ unsafe │", "  │ evict.rs");
+    let before = rows(&["⏺ The sites, before the panel opened:", table.as_str()]);
+    for (breaks, reasons) in [(0, vec![]), (1, vec![Reason::ArchiveGap])] {
+        let mut opened = Read::new(101, &[], b.screen(&words[kept..], true));
+        opened.archived.clone_from(&before);
+        opened.last = 102;
+        opened.breaks = breaks;
+        let mut host = Host::default().on("offscreen", opened.ctl());
+        let since = run(
+            &mut host,
+            ReportOpts {
+                since: Mark::parse("7730:100"),
+                ..ReportOpts::default()
+            },
+        );
+        if since.reasons != reasons || since.rows[..2] != before[..] {
+            misread.push(format!(
+                "a table drawn with no panel, archived before the screen beside it, breaks={breaks}: \
+                 {}\n{}",
+                since.header(),
+                since.rows.join("\n")
+            ));
+        }
+    }
+    assert!(misread.is_empty(), "{}", misread.join("\n\n"));
+}
+
+/// THE TURN'S `❯` ROW BESIDE THE SIDE PANEL IS FOUND BY ITS TEXT WHERE THE TEXT WRAPS:
+/// `find_start` holds the turn's `❯` row to the first `MARKER_CHARS` (60) characters of its text
+/// (whitespace aside), read across the rows the text wraps onto (`begins_with`): on the screen,
+/// the transcript's rows, each row's words up to the rule; an archived row, which the report
+/// keeps whole, as it is or cut at each `│` its first row draws, whatever the screen draws now.
+/// Read whole before (KI-1101-3), a turn whose first 60 characters run past its first row (one of
+/// two lines, or one the rule's room wraps sooner) read that row's padding and rule (and any
+/// panel text after it) among them: no row matched, and the report said `marker-not-found` and
+/// started at the top; read cut at the screen's rule, as this branch first did, an archived turn
+/// was found only while the screen still drew the panel's rule at the cell it was drawn beside,
+/// so after the panel closed or its rule moved the report said `marker-not-found` again.
+/// CONSTRUCTED as `a_report_beside_the_side_panel_is_the_transcripts_words_up_to_its_rule`'s
+/// screens: the measured 2.1.316 capture's rows above its last turn, then a turn of two lines
+/// (`a_message_that_starts_with_a_number_is_found`'s), then the capture's reply under its last
+/// turn, read on the screen alone and with the rows from the screen's top to the turn's archived
+/// as they were drawn, in a read that counts no break and in one that counts a break before the
+/// turn, under a screen still beside the panel, one drawn after it closed and one drawn after its
+/// rule moved 8 cells right. CONTROL: the measured capture's own last turn, its first row holding
+/// 60, is found beside the panel before and after, and both turns are found with no panel; and a
+/// turn drawn with no panel whose own `│` stands at the rule's column, archived under the screen
+/// beside the panel, is found as the archive stored it (cut at that `│`, its row is none of its
+/// words).
+#[test]
+fn a_turn_wrapped_beside_the_side_panel_is_found_by_its_text() {
+    let b = Beside::new();
+    let (measured, _) = b.harness_turn();
+    let mut misread = Vec::new();
+    let reads = |text: &str, archived: &[String], screen: Vec<String>| {
+        [0, 1].map(|breaks: u64| {
+            let mut read = Read::new(101, &[], screen.clone());
+            read.archived = archived.to_vec();
+            read.last = 100 + u64::try_from(archived.len()).expect("fits");
+            read.breaks = breaks;
+            let mut host = Host::default()
+                .on("history", history(&[(5, true, "7730:100", text)]))
+                .on("offscreen", read.ctl())
+                .on("offscreen", recheck(0));
+            run(&mut host, ReportOpts::default())
+        })
+    };
+    for text in [
+        "1. Fix the parser\n2. Then rerun the tests",
+        measured.as_str(),
+    ] {
+        let mut words = b.above();
+        let at = words.len();
+        words.extend(b.turn(text));
+        let archived = words.len();
+        words.extend(b.reply());
+        for (pane, drawn, now) in [
+            (
+                "beside the panel's text",
+                b.screen(&words, true),
+                vec![
+                    ("", b.screen(&words[archived..], true)),
+                    (
+                        ", the panel closed since",
+                        b.since(&words[archived..], None),
+                    ),
+                    (
+                        ", its rule moved since",
+                        b.since(&words[archived..], Some(b.rule + 8)),
+                    ),
+                ],
+            ),
+            (
+                "CONTROL with no panel",
+                b.alone(&words),
+                vec![("", b.alone(&words[archived..]))],
+            ),
+        ] {
+            let mut found = vec![(
+                "on the screen".to_string(),
+                screen_only(Marker::Ledger, Some(5), Some(text), &drawn),
+                vec![Reason::NoArchive],
+            )];
+            for (since, screen) in now {
+                let [unbroken, broken] = reads(text, &drawn[..archived], screen);
+                found.push((format!("archived{since}, no break"), unbroken, vec![]));
+                found.push((
+                    format!("archived{since}, a break before the turn"),
+                    broken,
+                    vec![],
+                ));
+            }
+            for (how, report, reasons) in found {
+                let first = report.rows.first().map_or("", String::as_str);
+                if report.reasons != reasons || !first.starts_with(words[at].as_str()) {
+                    misread.push(format!(
+                        "{pane}, {text:?} {how}: {}\n{first:?}",
+                        report.header()
+                    ));
+                }
+            }
+        }
+    }
+    let rule = b.rule;
+    let own = format!(
+        "{:<w$}│ then the rest of the words",
+        "compare the left",
+        w = rule - 2
+    );
+    let mut drawn = b.above();
+    drawn.push(format!("❯ {own}"));
+    assert_eq!(
+        drawn.last().and_then(|r| r.chars().position(|c| c == '│')),
+        Some(rule),
+        "PRECONDITION: the turn's own `│` stands at the rule's column"
+    );
+    for (breaks, report) in reads(&own, &drawn, b.screen(&b.reply(), true))
+        .into_iter()
+        .enumerate()
+    {
+        if !report.reasons.is_empty() || report.rows.first() != drawn.last() {
+            misread.push(format!(
+                "CONTROL a turn's own `│` at the rule's column, archived, breaks={breaks}: {}\n{:?}",
+                report.header(),
+                report.rows.first()
+            ));
+        }
+    }
+    assert!(misread.is_empty(), "{}", misread.join("\n"));
+}

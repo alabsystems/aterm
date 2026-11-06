@@ -50,8 +50,10 @@ pub struct Written {
     pub record: Record,
 }
 
-fn path_line(path: &PathFacts) -> String {
-    format!(
+fn write_path_line(out: &mut String, path: &PathFacts) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
         "usable={} expensive={} constrained={} link={}",
         match path.usable {
             Some(true) => "1",
@@ -61,7 +63,7 @@ fn path_line(path: &PathFacts) -> String {
         u8::from(path.expensive),
         u8::from(path.constrained),
         path.link.word()
-    )
+    );
 }
 
 fn parse_path(text: &str) -> Option<PathFacts> {
@@ -115,9 +117,8 @@ fn valid_subnet(subnet: &str) -> bool {
         && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
 }
 
-fn stay_line(stay: &Stay) -> String {
+fn write_stay_line(out: &mut String, stay: &Stay) {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(64);
     let _ = write!(out, "{} ", stay.start_ms);
     match stay.end_ms {
         Some(ms) => {
@@ -139,7 +140,6 @@ fn stay_line(stay: &Stay) -> String {
         None => out.push_str("- "),
     }
     let _ = write!(out, "{}", u8::from(stay.from_start));
-    out
 }
 
 fn parse_stay(text: &str) -> Option<Stay> {
@@ -180,15 +180,6 @@ fn parse_stay(text: &str) -> Option<Stay> {
     })
 }
 
-fn known_line(known: &Known) -> String {
-    format!(
-        "{} {} {}",
-        known.network.as_str(),
-        known.learned_ms,
-        known.confirmed_ms
-    )
-}
-
 fn parse_known(text: &str) -> Option<Known> {
     let mut words = text.split(' ');
     let network = NetworkId::parse(words.next()?).filter(NetworkId::is_strong)?;
@@ -201,16 +192,16 @@ fn parse_known(text: &str) -> Option<Known> {
     })
 }
 
-/// A TOML basic string of `text`, which holds no quote, backslash or control character.
-fn quoted(text: &str) -> String {
-    format!("\"{text}\"")
-}
-
 /// The record's text.
 #[must_use]
 pub fn format(written: &Written) -> String {
     use std::fmt::Write as _;
-    let mut out = format!(
+    let mut out = String::with_capacity(
+        256 + written.record.stays.len().saturating_mul(72)
+            + written.record.remembered.len().saturating_mul(48),
+    );
+    let _ = write!(
+        out,
         "# aterm's network place: the keeper's memory (aterm-netplace). Rewritten whole; never edit.\n\
          schema = {SCHEMA}\nrevision = {}\n",
         written.revision
@@ -223,15 +214,25 @@ pub fn format(written: &Written) -> String {
     }
     let _ = writeln!(out, "written_ms = {}", written.written_ms);
     if let Some(path) = &written.record.path {
-        let _ = writeln!(out, "path = {}", quoted(&path_line(path)));
+        out.push_str("path = \"");
+        write_path_line(&mut out, path);
+        out.push_str("\"\n");
     }
     out.push_str("stays = [\n");
     for stay in &written.record.stays {
-        let _ = writeln!(out, "  {},", quoted(&stay_line(stay)));
+        out.push_str("  \"");
+        write_stay_line(&mut out, stay);
+        out.push_str("\",\n");
     }
     out.push_str("]\nremembered = [\n");
     for known in &written.record.remembered {
-        let _ = writeln!(out, "  {},", quoted(&known_line(known)));
+        let _ = writeln!(
+            out,
+            "  \"{} {} {}\",",
+            known.network.as_str(),
+            known.learned_ms,
+            known.confirmed_ms
+        );
     }
     out.push_str("]\n");
     out

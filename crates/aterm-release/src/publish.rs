@@ -497,13 +497,16 @@ pub fn acquire_lease_action(
             "release lease owner {expected_owner:?} is not a full git object id"
         )));
     }
-    let expected_owner = expected_owner.to_ascii_lowercase();
-    match observed.map(str::to_ascii_lowercase).as_deref() {
+    match observed {
         None => Ok(LeaseAcquireAction::Create),
-        Some(owner) if owner == expected_owner => Ok(LeaseAcquireAction::AlreadyOwned),
+        Some(owner) if owner.eq_ignore_ascii_case(expected_owner) => {
+            Ok(LeaseAcquireAction::AlreadyOwned)
+        }
         Some(owner) => Err(Error::new(format!(
-            "release lease {RELEASE_LEASE_REF} is owned by {owner}, not {expected_owner}; \
-             refusing to steal or force-update it"
+            "release lease {RELEASE_LEASE_REF} is owned by {}, not {}; \
+             refusing to steal or force-update it",
+            owner.to_ascii_lowercase(),
+            expected_owner.to_ascii_lowercase(),
         ))),
     }
 }
@@ -1257,15 +1260,17 @@ pub fn reclaim_dead_publisher_fence(
             None => base,
         }
     };
-    let expected_owner = expected_owner.to_ascii_lowercase();
-    if !fence.owner.eq_ignore_ascii_case(&expected_owner) {
+    if !fence.owner.eq_ignore_ascii_case(expected_owner) {
         return Ok(FenceReclaim::Kept {
             refusal: refusal(Some(
                 "not reclaimable: the fence peels to a different claim than this resume's",
             )),
         });
     }
-    if release_lease_owner(git)?.as_deref() != Some(expected_owner.as_str()) {
+    if !release_lease_owner(git)?
+        .as_deref()
+        .is_some_and(|o| o.eq_ignore_ascii_case(expected_owner))
+    {
         return Ok(FenceReclaim::Kept {
             refusal: refusal(Some(
                 "not reclaimable: the release lease does not name this claim, so the fence and \
@@ -1498,16 +1503,19 @@ fn confirm_release_lease_owner(
     git: &dyn GitRunner,
     expected_owner: &str,
 ) -> Result<ReleaseLeaseGuard> {
-    let expected_owner = expected_owner.to_ascii_lowercase();
     let observed = release_lease_owner(git)?;
-    if observed.as_deref() != Some(expected_owner.as_str()) {
+    if !observed
+        .as_deref()
+        .is_some_and(|o| o.eq_ignore_ascii_case(expected_owner))
+    {
         return Err(Error::new(format!(
-            "release lease ownership changed: expected {expected_owner}, observed {}",
+            "release lease ownership changed: expected {}, observed {}",
+            expected_owner.to_ascii_lowercase(),
             observed.as_deref().unwrap_or("absent")
         )));
     }
     Ok(ReleaseLeaseGuard {
-        owner: expected_owner,
+        owner: observed.unwrap_or_else(|| expected_owner.to_ascii_lowercase()),
     })
 }
 
@@ -1516,7 +1524,7 @@ pub fn acquire_publisher_fence(
     git: &dyn GitRunner,
     expected_owner: &str,
 ) -> Result<PublisherFenceGuard> {
-    confirm_release_lease_owner(git, expected_owner)?;
+    let lease = confirm_release_lease_owner(git, expected_owner)?;
     ensure_no_publisher_fence(git)?;
     let token = new_publisher_fence_token(git, expected_owner)?;
     let spec = format!("{token}:{PUBLISHER_FENCE_REF}");
@@ -1526,7 +1534,7 @@ pub fn acquire_publisher_fence(
         fence.token == token && fence.owner.eq_ignore_ascii_case(expected_owner)
     }) {
         return Ok(PublisherFenceGuard {
-            owner: expected_owner.to_ascii_lowercase(),
+            owner: lease.owner,
             token,
         });
     }
@@ -1542,7 +1550,7 @@ pub fn rotate_publisher_fence_for_recovery(
     git: &dyn GitRunner,
     expected_owner: &str,
 ) -> Result<PublisherFenceGuard> {
-    confirm_release_lease_owner(git, expected_owner)?;
+    let lease = confirm_release_lease_owner(git, expected_owner)?;
     let observed = publisher_fence(git)?;
     if let Some(fence) = &observed
         && !fence.owner.eq_ignore_ascii_case(expected_owner)
@@ -1570,7 +1578,7 @@ pub fn rotate_publisher_fence_for_recovery(
         fence.token == token && fence.owner.eq_ignore_ascii_case(expected_owner)
     }) {
         return Ok(PublisherFenceGuard {
-            owner: expected_owner.to_ascii_lowercase(),
+            owner: lease.owner,
             token,
         });
     }
@@ -3378,7 +3386,6 @@ pub(crate) const ASSET_TRANSFER_BACKOFFS: &[u64] = &[2, 5];
 /// Decide, from a diagnostic (the CDN curl's stderr, or the REST client's message), whether the transport failed or the server answered; unrecognised is `Answered`.
 #[must_use]
 pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransferFault {
-    let d = diagnostic.to_ascii_lowercase();
     const ANSWERED: &[&str] = &[
         "http 401",
         "http 403",
@@ -3437,10 +3444,16 @@ pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransfer
         "curl reached no answer",
         "server error",
     ];
-    if ANSWERED.iter().any(|m| d.contains(m)) {
+    let bytes = diagnostic.as_bytes();
+    let has = |needle: &str| {
+        bytes
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    if ANSWERED.iter().any(|m| has(m)) {
         return AssetTransferFault::Answered;
     }
-    if TRANSPORT.iter().any(|m| d.contains(m)) {
+    if TRANSPORT.iter().any(|m| has(m)) {
         return AssetTransferFault::Transport;
     }
     AssetTransferFault::Answered

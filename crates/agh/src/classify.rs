@@ -114,10 +114,11 @@ pub fn answer(
         401 => of(Kind::Unauthenticated),
         403 if spent(headers) => primary(of(Kind::RateLimited), headers),
         403 if header(headers, "retry-after").is_some()
-            || github
-                .message
-                .as_deref()
-                .is_some_and(|m| m.to_ascii_lowercase().contains("secondary rate limit")) =>
+            || github.message.as_deref().is_some_and(|m| {
+                m.as_bytes()
+                    .windows(b"secondary rate limit".len())
+                    .any(|w| w.eq_ignore_ascii_case(b"secondary rate limit"))
+            }) =>
         {
             secondary(of(Kind::RateLimited), headers)
         }

@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use aterm_agent::harness::acts::{FACT_SEPARATOR, HeldBy, StopForm, stop_words};
+use aterm_agent::harness::acts::{ATERM_DRIVES, FACT_SEPARATOR, HeldBy, StopForm, stop_words};
 use aterm_agent::supervise::policy::turn_end;
 
 use super::super::switch::SWITCH_SETTLE_MS;
@@ -246,34 +246,45 @@ pub fn back_to(back: Option<&str>, chrome: impl FnOnce() -> String) -> Option<St
     }
 }
 
-/// A chain that is no same-reply chain, of the measured pass or the coverage chains, held: aterm
-/// stopped typing into a conversation whose script answers its acts otherwise, so whatever its own
-/// judge says, it failed. The other modes' chains (the walls, the cap, the residuals, the ladder)
-/// keep their own judges.
+/// A chain of the measured pass or the coverage chains held where no hold belongs, so whatever its
+/// own judge says, it failed: a chain that is no same-reply chain (aterm stopped typing into a
+/// conversation whose script answers its acts otherwise), or a same-reply chain under Cruise,
+/// which holds no repeated report since the continuous-forward design of 2026-11-01 (it paces it
+/// on the ladder and asks for a different approach). `same-cruise`'s hold is HC's own
+/// ([`super::super::paced`]: STOPPED FOR GOOD); the other modes' chains (the walls, the cap, the
+/// residuals, the ladder) keep their own judges.
 #[must_use]
 pub fn stall_fault(chain: Chain, seen: &Seen, t0: i64) -> Option<String> {
-    if chain.same_reply() || !(Chain::ALL.contains(&chain) || Chain::COVER.contains(&chain)) {
+    if !(Chain::ALL.contains(&chain) || Chain::COVER.contains(&chain)) || chain == Chain::SameCruise
+    {
+        return None;
+    }
+    let cruise = chain.same_reply() && chain.autopilot() == "cruise";
+    if chain.same_reply() && !cruise {
         return None;
     }
     let (t, l) = stall_of(seen, t0)?;
+    let why = if cruise {
+        "STOPPED FOR GOOD, though Cruise holds no repeated report (the continuous-forward design \
+         of 2026-11-01: it waits the ladder's step and asks for a different approach)"
+    } else {
+        "though its script answers no act it meets with a reply it gave before"
+    };
     Some(format!(
-        "aterm stopped typing into it at +{} ({}), though its script answers no act it meets with \
-         a reply it gave before",
+        "aterm stopped typing into it at +{} ({}), {why}",
         at(t0, *t),
         one_line(l, 160)
     ))
 }
 
-/// HL and HC: the chain's acts (land@v1 then the nudge under Land, two done checks under Cruise)
-/// answered alike (the reply each act's point read, word for word), the hold at the second answer
-/// (ruling F), never landed or ended, no need, and nothing typed past the hold.
+/// HL: the chain's acts (land@v1, then Land's next act) answered alike (the reply each act's point
+/// read, word for word), the hold at the second answer (ruling F, which stands under Land), never
+/// landed or ended, no need, and nothing typed past the hold. Cruise holds no repeated report
+/// (the continuous-forward design of 2026-11-01): HC is [`super::super::paced`]'s, and a chain
+/// whose first act is no land@v1 fails here.
 #[must_use]
-pub fn judge_hold(chain: Chain, seen: &Seen, t0: i64) -> Verdict {
-    let first_rule = if chain.autopilot() == "land" {
-        turn_end::RULE_LAND
-    } else {
-        turn_end::RULE_DONE_CHECK
-    };
+pub fn judge_hold(seen: &Seen, t0: i64) -> Verdict {
+    let first_rule = turn_end::RULE_LAND;
     let acts = seen.all_acts();
     let Some(first) = acts.first() else {
         return Verdict::Fail(format!("no act typed within {}", at(t0, seen.end_ms)));
@@ -362,14 +373,18 @@ pub fn judge_hold(chain: Chain, seen: &Seen, t0: i64) -> Verdict {
     ))
 }
 
-/// Folds the hold's wants into the verdict `v` of a same-reply chain's last scenario `s`, where a
-/// hold was journaled ([`said`], [`stands`], [`three_a`]); every other verdict as it was. Under
+/// Folds the hold's wants into the verdict `v` of a Land same-reply chain's last scenario `s`, where
+/// a hold was journaled ([`said`], [`stands`], [`three_a`]); every other verdict as it was (a
+/// Cruise chain's hold is a fault of its records, [`stall_fault`], and HC's its own). Under
 /// `--no-surfaces` what it says is a named skip that keeps `v`'s word, as the window's wants are
 /// ([`super::with_window`]); whether it stands reads the journal and the stub, so it is judged
 /// either way.
 #[must_use]
 pub fn with_held(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdict {
-    if !cx.chain.same_reply() || cx.chain.scenarios().last() != Some(&s) {
+    if !cx.chain.same_reply()
+        || cx.chain.autopilot() != "land"
+        || cx.chain.scenarios().last() != Some(&s)
+    {
         return v;
     }
     let Some(stall) = stall_of(seen, cx.t0) else {
@@ -467,7 +482,7 @@ pub fn stop_heads(mode: &str, arm: HeldBy) -> [String; 3] {
             stop_words(arm, StopForm::Title, switch)
         ),
         format!(
-            "driven by aterm ({mode}: {}",
+            "{ATERM_DRIVES} ({mode}: {}",
             stop_words(arm, StopForm::Hover, switch)
         ),
     ]

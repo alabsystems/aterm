@@ -1034,42 +1034,26 @@ struct AiAccountsItem;
 #[cfg(target_os = "macos")]
 pub(crate) fn ai_accounts_setup_observation() -> aterm_types::macos_setup::Observation {
     use aterm_converge::Probe;
-    use aterm_types::macos_setup::{Observation, Standing, Subject, SyncKind};
     let env = aterm_agent::harness::cli::Env::from_process();
     let probe = env.as_ref().map_or_else(
         |why| Probe::Unusable { why: why.clone() },
         ai_accounts_probe,
     );
+    ai_accounts_observation(probe)
+}
+
+/// Present the aggregate account probe's own evidence, including which provider remains due.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn ai_accounts_observation(probe: aterm_converge::Probe) -> aterm_types::macos_setup::Observation {
+    use aterm_converge::Probe;
+    use aterm_types::macos_setup::{Observation, Standing, Subject, SyncKind};
     let (standing, now, note) = match probe {
         Probe::Ok { now } => (Standing::InPlace, now, None),
         Probe::NotApplicable { why } => {
             (Standing::NotNeeded, "Not configured".to_owned(), Some(why))
         }
         Probe::Change { from, to } => {
-            let mut why = format!("{from}; waiting for automatic provisioning to finish: {to}");
-            if let Ok(env) = &env
-                && !ai_accounts_others_only(env)
-                && aterm_agent::harness::accounts_sync::configured_source(
-                    env.config.as_deref(),
-                    env.accounts_roster().as_deref(),
-                )
-                .is_none_or(|source| {
-                    let source = source.source();
-                    !source.starts_with("https://") && !source.starts_with("http://")
-                })
-                && let Ok(fleet) = aterm_agent::harness::accounts_sync::load_fleet_source(env, None)
-                && let Some(machine) = fleet.alab.clone().or_else(|| {
-                    aterm_agent::harness::accounts_sync::detect_machine_id(
-                        None,
-                        env.config.as_deref(),
-                    )
-                })
-                && fleet.accounts_for_machine(&machine).is_empty()
-            {
-                why = format!(
-                    "No active Claude account is assigned to {machine}. Automatic provisioning resumes when the synced account roster changes."
-                );
-            }
+            let why = format!("{from}; waiting for automatic provisioning to finish: {to}");
             (Standing::Waiting, "Not provisioned".to_owned(), Some(why))
         }
         other => {
@@ -1126,29 +1110,7 @@ impl Item for AiAccountsItem {
     }
 
     fn apply(&self) -> Result<(), String> {
-        use aterm_agent::harness::{
-            accounts_sync::{sync_accounts_for_init, sync_cli_accounts_for_init},
-            cli::Env,
-        };
-        let env = Env::from_process()?;
-        let home = env
-            .home
-            .as_deref()
-            .ok_or_else(|| "no user home directory".to_owned())?;
-        let roster_path = env
-            .accounts_roster()
-            .ok_or_else(|| "no config directory".to_owned())?;
-        let others = sync_cli_accounts_for_init(home, &env.state, &roster_path, env.now);
-        let claude = sync_accounts_for_init(home, &env.state, &roster_path, env.now).map(|_| ());
-        let failed: Vec<String> = others
-            .into_iter()
-            .filter_map(|(cli, synced)| synced.err().map(|why| format!("{}: {why}", cli.id())))
-            .collect();
-        match claude {
-            Err(why) if !ai_accounts_others_only(&env) => Err(why),
-            _ if failed.is_empty() => Ok(()),
-            _ => Err(failed.join("; ")),
-        }
+        ai_accounts_apply(&aterm_agent::harness::cli::Env::from_process()?)
     }
 
     fn explain(&self, probe: &aterm_converge::Probe) -> aterm_converge::Explain {
@@ -1163,6 +1125,24 @@ impl Item for AiAccountsItem {
                 only: "base.ai.accounts".to_owned(),
             },
         }
+    }
+}
+
+#[cfg(unix)]
+fn ai_accounts_apply(env: &aterm_agent::harness::cli::Env) -> Result<(), String> {
+    use aterm_agent::harness::accounts_sync::{sync_accounts_for_init, sync_cli_accounts_for_init};
+    let home = env.home.as_deref().ok_or("no user home directory")?;
+    let roster_path = env.accounts_roster().ok_or("no config directory")?;
+    let others = sync_cli_accounts_for_init(home, &env.state, &roster_path, env.now);
+    let claude = sync_accounts_for_init(home, &env.state, &roster_path, env.now).map(|_| ());
+    let failed: Vec<String> = others
+        .into_iter()
+        .filter_map(|(cli, synced)| synced.err().map(|why| format!("{}: {why}", cli.id())))
+        .collect();
+    match claude {
+        Err(why) if !ai_accounts_others_only(env) => Err(why),
+        _ if failed.is_empty() => Ok(()),
+        _ => Err(failed.join("; ")),
     }
 }
 
@@ -1472,8 +1452,8 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
     use aterm_agent::harness::{
         accounts,
         accounts_sync::{
-            FLEET_ROSTER_FILE, configured_source, has_init_accounts_source,
-            needs_init_accounts_sync,
+            FLEET_ROSTER_FILE, InitAccountsAssignment, configured_source, has_init_accounts_source,
+            init_accounts_assignment, needs_init_accounts_sync,
         },
     };
     use aterm_converge::Probe;
@@ -1487,6 +1467,15 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
             why: "no config directory is configured".to_owned(),
         };
     };
+    match init_accounts_assignment(env) {
+        Ok(InitAccountsAssignment::Unassigned { machine, .. }) => {
+            return Probe::NotApplicable {
+                why: format!("the shared vault assigns no Claude account to {machine}"),
+            };
+        }
+        Ok(InitAccountsAssignment::Required) => {}
+        Err(why) => return Probe::Unusable { why },
+    }
     let store = env.accounts_store();
     let fleet_path = roster_path
         .parent()
@@ -1538,7 +1527,7 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
         };
     }
     Probe::Change {
-        from: "absent".to_owned(),
+        from: "Claude account provisioning pending".to_owned(),
         to: "accounts.toml + fleet-accounts.toml synced".to_owned(),
     }
 }

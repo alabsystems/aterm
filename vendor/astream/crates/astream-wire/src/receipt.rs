@@ -134,7 +134,8 @@ pub enum ReceiptVerdict {
 
 impl ReceiptVerdict {
     /// Every verdict, in wire order: the whole vocabulary [`Self::parse_bytes`] and
-    /// [`V1Receipt::decode`] read, so a writer can hold its own list to it both ways.
+    /// [`V1Receipt::decode`] read. A consumer that needs the words spells them from this
+    /// array and [`Self::as_str`], never from a list of its own.
     pub const ALL: [Self; 3] = [Self::Handled, Self::Refused, Self::Deferred];
 
     /// Canonical lowercase wire token (`handled`, `refused`, `deferred`).

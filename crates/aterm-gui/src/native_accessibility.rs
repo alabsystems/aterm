@@ -574,8 +574,175 @@ struct PendingNode {
 
 struct VisibleTextMaterialization {
     target: VirtualTextTarget,
+    /// The viewport's own children, in reading order; each is one of `nodes`.
+    children: Vec<NodeId>,
+    /// Every node under the viewport, its children's children included.
     nodes: Vec<PendingNode>,
     selection: Option<TextSelection>,
+}
+
+/// What a concealed text view ([`TextViewportSpec::concealed`]) publishes in place of its lines.
+pub(crate) const PRIVATE_TEXT_WITHHELD: &str = "Private document: its text is not read out";
+
+/// Claim the node id of `key`, refusing a second key with the same id.
+fn claim_node(
+    key: &UiKey,
+    id_for: &mut impl FnMut(&UiKey) -> NodeId,
+    by_id: &mut FxHashMap<NodeId, UiKey>,
+) -> Result<NodeId, AccessibilityProjectionError> {
+    let id = id_for(key);
+    if let Some(first) = by_id.insert(id, key.clone()) {
+        return Err(AccessibilityProjectionError::IdCollision {
+            first,
+            second: key.clone(),
+        });
+    }
+    Ok(id)
+}
+
+/// A rectangle of logical points as a node's bounds.
+fn node_bounds(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+    Rect {
+        x0: f64::from(x0),
+        y0: f64::from(y0),
+        x1: f64::from(x1.max(x0)),
+        y1: f64::from(y1.max(y0)),
+    }
+}
+
+/// A grid's table as its readers other than the person's eyes get it (one-mesh design §4.8,
+/// "Revealed values stay out of the accessibility tree"): a [`Role::Grid`] named by its shape,
+/// holding a row of the shown columns' headers and a row per shown record, each cell a
+/// [`Role::Label`] whose label is its value. A concealed cell's label is
+/// [`crate::native_editor::HIDDEN_VALUE`] and it carries no value: `reading` never held one.
+/// Returns the grid's id; its nodes join `pending`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's id and collision maps travel with the grid they place"
+)]
+fn materialize_grid(
+    key: &UiKey,
+    rect: LogicalRect,
+    geometry: &crate::native_ui::TextViewportGeometry,
+    grid: &crate::native_editor::GridProjection,
+    reading: &crate::native_editor::GridReading,
+    id_for: &mut impl FnMut(&UiKey) -> NodeId,
+    by_id: &mut FxHashMap<NodeId, UiKey>,
+    pending: &mut Vec<PendingNode>,
+) -> Result<NodeId, AccessibilityProjectionError> {
+    use crate::native_editor::CellReading;
+    let (data_rows, _) = crate::native_ui::editor_grid_slots(geometry, grid);
+    let column_name = |column: usize, header: &CellReading| match header {
+        CellReading::Value(header) if !amacs::table::first_line(header).trim().is_empty() => {
+            amacs::table::first_line(header).trim().to_string()
+        }
+        _ => format!("column {}", column + 1),
+    };
+    let cell_x = |column: usize| {
+        grid.shown
+            .iter()
+            .find(|shown| shown.index == column)
+            .map_or((geometry.text_x, geometry.text_x), |shown| {
+                let x0 = geometry.text_x + shown.x as f32 * geometry.cell_w;
+                (x0, x0 + (shown.width + 2) as f32 * geometry.cell_w)
+            })
+    };
+    let right = rect.right();
+    let bottom = geometry.body_y + geometry.body_h;
+    let row_y = |slot: usize| {
+        let y0 = (geometry.body_y + slot as f32 * geometry.line_h).min(bottom);
+        (y0, (y0 + geometry.line_h).min(bottom))
+    };
+
+    let grid_key = UiKey::new(format!("{}/grid", key.as_str()));
+    let grid_id = claim_node(&grid_key, id_for, by_id)?;
+    let mut table = Node::new(Role::Grid);
+    table.set_label("Table");
+    table.set_description(format!(
+        "{} rows, {} columns",
+        reading.rows, reading.columns
+    ));
+    table.set_read_only();
+    table.set_bounds(node_bounds(geometry.text_x, geometry.body_y, right, bottom));
+    let grid_index = pending.len();
+    pending.push(PendingNode {
+        id: grid_id,
+        node: table,
+        children: Vec::new(),
+    });
+
+    let mut rows = Vec::with_capacity(reading.records.len() + 1);
+    let header_row = std::iter::once((
+        0usize,
+        "Column headers".to_string(),
+        reading
+            .headers
+            .iter()
+            .map(|(column, header)| (*column, header))
+            .collect::<Vec<_>>(),
+    ));
+    let data = reading
+        .records
+        .iter()
+        .take(data_rows)
+        .enumerate()
+        .map(|(slot, (record, cells))| {
+            (
+                slot + 1,
+                format!("Row {}", record + 1),
+                reading
+                    .headers
+                    .iter()
+                    .map(|(column, _)| *column)
+                    .zip(cells)
+                    .collect::<Vec<_>>(),
+            )
+        });
+    for (slot, label, cells) in header_row.chain(data) {
+        let row_key = UiKey::new(format!("{}/{slot}", grid_key.as_str()));
+        let row_id = claim_node(&row_key, id_for, by_id)?;
+        let (y0, y1) = row_y(slot);
+        let mut row = Node::new(Role::Group);
+        row.set_label(label);
+        row.set_bounds(node_bounds(geometry.text_x, y0, right, y1));
+        let mut children = Vec::with_capacity(cells.len());
+        let mut cell_nodes = Vec::with_capacity(cells.len());
+        for (column, cell) in cells {
+            let cell_key = UiKey::new(format!("{}/{column}", row_key.as_str()));
+            let cell_id = claim_node(&cell_key, id_for, by_id)?;
+            let (x0, x1) = cell_x(column);
+            let mut node = Node::new(Role::Label);
+            node.set_label(cell.words().to_string());
+            node.set_description(if slot == 0 {
+                format!("column {}", column + 1)
+            } else {
+                reading
+                    .headers
+                    .iter()
+                    .find(|(shown, _)| *shown == column)
+                    .map_or_else(
+                        || format!("column {}", column + 1),
+                        |(_, header)| column_name(column, header),
+                    )
+            });
+            node.set_bounds(node_bounds(x0, y0, x1.min(right), y1));
+            children.push(cell_id);
+            cell_nodes.push(PendingNode {
+                id: cell_id,
+                node,
+                children: Vec::new(),
+            });
+        }
+        rows.push(row_id);
+        pending.push(PendingNode {
+            id: row_id,
+            node: row,
+            children,
+        });
+        pending.extend(cell_nodes);
+    }
+    pending[grid_index].children = rows;
+    Ok(grid_id)
 }
 
 fn materialize_visible_text(
@@ -588,12 +755,32 @@ fn materialize_visible_text(
 ) -> Result<VisibleTextMaterialization, AccessibilityProjectionError> {
     let geometry = spec.geometry(rect);
     let mut pending = Vec::new();
+    let mut children = Vec::new();
     let mut lines = Vec::new();
     let mut selected_start = None::<u64>;
     let mut selected_end = None::<u64>;
     let mut primary_caret = None::<u64>;
 
-    if geometry.body_h > 0.0
+    // A concealed document's text lines are drawn for the person's eyes only: its readers get
+    // that its text is withheld, never a line of it (one-mesh design §4.8).
+    if spec.concealed && spec.projection.is_some() {
+        let withheld_key = UiKey::new(format!("{}/withheld", key.as_str()));
+        let withheld_id = claim_node(&withheld_key, id_for, by_id)?;
+        let mut withheld = Node::new(Role::Label);
+        withheld.set_label(PRIVATE_TEXT_WITHHELD);
+        withheld.set_bounds(node_bounds(
+            geometry.text_x,
+            geometry.body_y,
+            rect.right(),
+            geometry.body_y + geometry.body_h,
+        ));
+        children.push(withheld_id);
+        pending.push(PendingNode {
+            id: withheld_id,
+            node: withheld,
+            children: Vec::new(),
+        });
+    } else if geometry.body_h > 0.0
         && geometry.text_x < rect.right()
         && let Some(projection) = spec.projection.as_ref()
     {
@@ -703,6 +890,7 @@ fn materialize_visible_text(
                     }
                 })
                 .collect();
+            children.push(line_id);
             lines.push(VirtualTextLine {
                 node: line_id,
                 key: line_key,
@@ -722,31 +910,33 @@ fn materialize_visible_text(
         }
     }
 
-    // A grid draws no text lines; its current cell is what a screen reader hears, announced as
-    // it changes. (The viewport's own value stays its document key: the virtual-text contract
-    // resolves the surface by it.)
-    if let Some(grid) = spec.grid.as_ref() {
+    // A grid draws no text lines: its readers get its table and its current cell, announced as
+    // it changes, from its reading, where a concealed cell is `hidden value` and carries no
+    // value (one-mesh design §4.8). (The viewport's own value stays its document key: the
+    // virtual-text contract resolves the surface by it.)
+    if let (Some(grid), Some(reading)) = (spec.grid.as_ref(), spec.grid_reading.as_deref()) {
+        children.push(materialize_grid(
+            key,
+            rect,
+            &geometry,
+            grid,
+            reading,
+            id_for,
+            by_id,
+            &mut pending,
+        )?);
         let cell_key = UiKey::new(format!("{}/grid-cell", key.as_str()));
-        let cell_id = id_for(&cell_key);
-        if let Some(first) = by_id.insert(cell_id, cell_key.clone()) {
-            return Err(AccessibilityProjectionError::IdCollision {
-                first,
-                second: cell_key,
-            });
-        }
+        let cell_id = claim_node(&cell_key, id_for, by_id)?;
         let mut cell_node = Node::new(Role::Label);
         cell_node.set_description("Current cell");
-        announce_live(
-            &mut cell_node,
-            Live::Polite,
-            &crate::native_ui::editor_grid_cell_words(grid),
-        );
+        announce_live(&mut cell_node, Live::Polite, &reading.cursor_words());
         cell_node.set_bounds(Rect {
             x0: f64::from(geometry.text_x),
             y0: f64::from(geometry.body_y),
             x1: f64::from(rect.right()),
             y1: f64::from(geometry.body_y + geometry.body_h),
         });
+        children.push(cell_id);
         pending.push(PendingNode {
             id: cell_id,
             node: cell_node,
@@ -777,6 +967,7 @@ fn materialize_visible_text(
             x1: f64::from(rect.right()),
             y1: f64::from(rect.bottom()),
         });
+        children.push(status_id);
         pending.push(PendingNode {
             id: status_id,
             node: status_node,
@@ -822,6 +1013,7 @@ fn materialize_visible_text(
             lines,
             primary_selection,
         },
+        children,
         nodes: pending,
         selection,
     })
@@ -1178,9 +1370,7 @@ fn project_with_transform_and_ids(
             children: Vec::new(),
         });
         if let Some(visible) = visible_text {
-            pending[index]
-                .children
-                .extend(visible.nodes.iter().map(|line| line.id));
+            pending[index].children.extend(visible.children);
             pending.extend(visible.nodes);
             virtual_text.push(visible.target);
         }
@@ -2258,6 +2448,8 @@ mod tests {
                     selectable: true,
                     projection: Some(visible),
                     grid: None,
+                    grid_reading: None,
+                    concealed: false,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: Some("1 config error · Save blocked".to_string()),
@@ -2458,6 +2650,8 @@ mod tests {
                         lines,
                     }),
                     grid: None,
+                    grid_reading: None,
+                    concealed: false,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: None,

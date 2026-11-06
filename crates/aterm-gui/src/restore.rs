@@ -1567,9 +1567,9 @@ pub(crate) struct RestoredTab {
     /// an older build ignores it, losing only the grouping.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parked: bool,
-    /// A tab its task opened for itself ([`crate::tab_model::Tab::ephemeral`]), which goes once its
-    /// task concluded. A parked tab is one whatever this says, as a manifest from before the mark
-    /// has it; an older build ignores it, and the tab stays a person's there.
+    /// A tab its task opened for itself ([`crate::tab_model::Tab::ephemeral`]), whose pane remains
+    /// after the task concludes. A parked tab is task-owned even where this bit is absent.
+    /// An older build ignores this bit and leaves the tab as a person's there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
 }

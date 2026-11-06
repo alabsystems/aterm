@@ -487,8 +487,10 @@ impl Ports for Inert {
     }
     fn clone_owed(&self) -> Result<String, String> {
         self.applied("clone");
-        *self.owed.lock().unwrap() =
-            crate::init::OwedClone::Nothing("aterm init owes no clone".into());
+        *self.owed.lock().unwrap() = crate::init::OwedClone::Verified {
+            present: 1,
+            total: 1,
+        };
         Ok("cloned".into())
     }
     fn forget_owed_clone(&self) -> Result<(), String> {
@@ -795,6 +797,40 @@ fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&again.rows, CLONE).outcome, Outcome::Ok);
     assert_eq!(clones(&ports), 1, "once");
+}
+
+/// Fleet registration, the node listener and account setup finish before cloning starts:
+/// a first inventory may contain many large repositories. Event order makes this independent
+/// of clone speed or wall-clock timing.
+#[test]
+fn initial_fleet_and_account_setup_finishes_before_repository_cloning() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.owed.lock().unwrap() = crate::init::OwedClone::Due("53 repositories missing".into());
+    *ports.github.lock().unwrap() = GithubRead::Due {
+        from: "the GitHub helper is missing".into(),
+        revert: "git config --add stand-in".into(),
+    };
+    *ports.node.lock().unwrap() = NodeRead::Due {
+        from: "the node listener is missing".into(),
+        to: "the node listener is running".into(),
+    };
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    for id in [GITHUB, FLEET, NODE, ACCOUNTS, CLONE] {
+        assert_eq!(row(&pass.rows, id).outcome, Outcome::Changed, "{id}");
+    }
+    let applied = ports.applies();
+    let cloned = applied.iter().position(|kind| *kind == "clone").unwrap();
+    for prerequisite in ["github", "fleet", "node", "accounts"] {
+        assert!(
+            applied
+                .iter()
+                .position(|kind| *kind == prerequisite)
+                .unwrap()
+                < cloned,
+            "{prerequisite} was delayed by repository cloning: {applied:?}"
+        );
+    }
 }
 
 #[test]
@@ -2705,9 +2741,9 @@ pub(crate) mod owed_clone {
     }
 
     /// No Sync row acts on the vault while System State holds it (design §8.5, principle 4): a
-    /// person who presses Stop while the subscriber's pass clones what `aterm init` owed (a
-    /// clone may take half an hour) holds every row after it, each reading the hold as it
-    /// starts, so the pass neither joins the fleet nor resyncs the AI accounts from the vault.
+    /// person who presses Stop after fleet registration holds every row after it, each reading
+    /// the hold as it starts, so the pass neither starts the node, resyncs the AI accounts nor
+    /// begins cloning repositories from the vault.
     #[test]
     fn a_stop_pressed_mid_pass_holds_every_row_after_it() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -2718,11 +2754,7 @@ pub(crate) mod owed_clone {
                 .then(|| "a Stop holds it".to_owned())
         };
         let owed = || Ok(OwedClone::Due("the GitHub token is here".to_owned()));
-        let clone = || {
-            // The person presses Stop while this clone runs.
-            stopped.store(true, Ordering::SeqCst);
-            Ok("cloned".to_owned())
-        };
+        let clone = || panic!("a Stop before repository cloning must hold it");
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
@@ -2734,14 +2766,19 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
-            &mut |_| {},
+            &mut |row| {
+                if row.id == FLEET {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+            },
         ));
         assert!(
             stopped.load(Ordering::SeqCst),
-            "the clone ran: {:?}",
+            "fleet registration completed: {:?}",
             pass.rows
         );
-        for id in [IDENTITY, FLEET, ACCOUNTS] {
+        assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Changed);
+        for id in [NODE, ACCOUNTS, CLONE] {
             let held = row(&pass.rows, id);
             assert_eq!(
                 (held.outcome, held.why.as_deref()),
@@ -2753,7 +2790,7 @@ pub(crate) mod owed_clone {
             .inner
             .applies()
             .into_iter()
-            .filter(|kind| !kind.starts_with("fabric"))
+            .filter(|kind| !kind.starts_with("fabric") && *kind != "fleet")
             .collect();
         assert!(
             after_the_stop.is_empty(),
@@ -2855,6 +2892,21 @@ pub(crate) mod owed_clone {
     fn a_clone_only_a_person_can_finish_is_not_rerun_every_pass() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let (sys, alice) = alice();
+        // This independently configured profile still authenticates with GitHub. The vault
+        // default instead reads account and inventory metadata locally.
+        let profile = "/Users//alice/.config/aterm/init.toml";
+        let profile_bytes = b"[github]\naccount='alice'\n";
+        sys.file(profile, profile_bytes).stat_of(
+            profile,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: profile_bytes.len() as u64,
+            },
+        );
         let token = "/Users//alice/.secrets/gh_access_token";
         sys.file(token, b"fixture_token_only").stat_of(
             token,
@@ -3088,8 +3140,30 @@ pub(crate) mod owed_clone {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let state = scratch.path().to_path_buf();
         crate::init::owe_clone(&state, &crate::init::Holds::NONE).unwrap();
-        let (sys, _alice) = alice_with(false);
+        let (sys, alice) = alice_with(false);
         token_landed(&sys);
+        let inventory = "/Users//alice/.secrets/github-repositories.json";
+        let inventory_bytes = br#"{"schema":2,"account":"alice","repositories":[]}"#;
+        sys.file(inventory, inventory_bytes).stat_of(
+            inventory,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: inventory_bytes.len() as u64,
+            },
+        );
+        crate::git_credential::script::launcher(&sys, &alice);
+        crate::git_credential::script::lookups_hold(
+            &sys,
+            &alice,
+            crate::git_credential::GITHUB,
+            "alice",
+            "fixture_token_only",
+        );
+        crate::git_credential::script::alike(&sys, &alice);
         let held = || None;
         let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
         let clone = || crate::init::clone_owed(&sys, &state);
@@ -3120,17 +3194,28 @@ pub(crate) mod owed_clone {
         let asked = || {
             sys.calls()
                 .iter()
-                .filter(|call| call.contains("agh GET /user"))
+                .filter(|call| call.contains("credential fill"))
                 .count()
         };
         assert_eq!(asked(), 0, "no clone runs without git");
         // The tools arrive (their install); the token and init.toml are as they were.
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
-        let _second = converge(&ports, Trigger::Subscriber, Mode::Apply, &mut |_| {});
+        let second = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        assert_eq!(
+            row(&second.rows, CLONE).outcome,
+            Outcome::Changed,
+            "{second:?}"
+        );
         assert!(
             asked() > 0,
             "the tools arrived, yet the owed clone never ran"
         );
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
     /// A token file that is on this Mac but that aterm may not use (here readable by others)

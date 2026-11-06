@@ -14,7 +14,7 @@ pub struct Configuration {
     scope: Scope,
     key: String,
     digest: Digest,
-    values: BTreeMap<(String, String), Value>,
+    values: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Configuration {
@@ -59,7 +59,6 @@ impl Configuration {
         };
 
         let plan = super::super::plans::inspect(&snapshot, key)?;
-        let digest = aterm_codec::hex::encode_lower(&configuration);
         let row = snapshot
             .cells
             .get(&("accounts".into(), key.clone()))
@@ -67,7 +66,9 @@ impl Configuration {
             .ok_or_else(|| Error::new("account proposal is missing"))?;
         if plan["complete"].as_bool() != Some(true)
             || snapshot.scope.digest() != table
-            || plan["configuration_digest"].as_str() != Some(digest.as_str())
+            || !plan["configuration_digest"].as_str().is_some_and(|text| {
+                crate::database::decode_hex::<32>(text).is_ok_and(|d| d == configuration)
+            })
             || row.value["provider"].as_str() != Some(provider.as_str())
             || row.value["method"].as_str() != Some(method.as_str())
         {
@@ -75,7 +76,7 @@ impl Configuration {
                 "account proposal does not match its preparation decision",
             ));
         }
-        let mut values = BTreeMap::new();
+        let mut values: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
         for dependency in plan["dependencies"]
             .as_array()
             .ok_or_else(|| Error::new("account plan has no closure"))?
@@ -86,17 +87,23 @@ impl Configuration {
             let key = dependency["key"]
                 .as_str()
                 .ok_or_else(|| Error::new("account plan has an invalid key"))?;
-            let key = (collection.to_owned(), key.to_owned());
+            let lookup = (collection.to_owned(), key.to_owned());
             let cell = snapshot
                 .cells
-                .get(&key)
+                .get(&lookup)
                 .ok_or_else(|| Error::new("account closure is incomplete"))?;
             if cell.stopped || cell.candidates.len() != 1 {
                 return Err(Error::new("account closure is not unique"));
             }
-            values.insert(key, cell.candidates[0].value.clone());
+            values
+                .entry(lookup.0)
+                .or_default()
+                .insert(lookup.1, cell.candidates[0].value.clone());
         }
-        if !values.contains_key(&("accounts".into(), key.clone())) {
+        if !values
+            .get("accounts")
+            .is_some_and(|rows| rows.contains_key(key.as_str()))
+        {
             return Err(Error::new("account plan omitted its selected account"));
         }
         Ok(Self {
@@ -125,12 +132,12 @@ impl Configuration {
 
     /// The account value whose configuration was checked.
     pub fn account(&self) -> &Value {
-        &self.values[&("accounts".into(), self.key.clone())]
+        &self.values["accounts"][&self.key]
     }
 
     /// Look up only a member of this checked closure. Unrelated records are
     /// deliberately absent, even when the source table also contained them.
     pub fn get(&self, collection: &str, key: &str) -> Option<&Value> {
-        self.values.get(&(collection.to_owned(), key.to_owned()))
+        self.values.get(collection).and_then(|rows| rows.get(key))
     }
 }

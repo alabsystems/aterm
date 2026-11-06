@@ -740,14 +740,9 @@ fn run_at_far_wall(
     (marks, count(&m, "turn"), told, lines)
 }
 
-/// A MANAGED WORKER'S USAGE WALL PAST THE HORIZON ENDS ITS WORK AND TELLS NO PERSON (owner,
-/// 2026-11-04: the claim workers sat a day at a weekly wall, their tabs blocked on screen): the
-/// weekly limit two days off marks the record `failed why=usage-limit`, types nothing, and raises
-/// no `limited:` badge, also where `resume_limits` is off. NEGATIVE CONTROL: the same wall in a
-/// session with no task record marks nothing and types nothing, and with `resume_limits` off,
-/// where its decision types nothing at the wall too, it is told the limit (`limited:`).
+/// Managed workers retain their open task while waiting for quota, just as a person's session does.
 #[test]
-fn a_managed_workers_far_usage_wall_marks_failed_and_tells_no_person() {
+fn a_managed_workers_far_usage_wall_keeps_its_task_open() {
     let limited = |told: &[String]| told.iter().any(|t| t.contains(ATTENTION_PREFIX));
     for resumes in [true, false] {
         let policy = |p: SupervisorConfig| SupervisorConfig {
@@ -756,15 +751,16 @@ fn a_managed_workers_far_usage_wall_marks_failed_and_tells_no_person() {
         };
         let tag = if resumes { "managed" } else { "managed-kept" };
         let (marks, turns, told, lines) = run_at_far_wall(tag, working_task(), policy);
-        let [mark] = marks.as_slice() else {
-            panic!("resume_limits={resumes}: one mark: {marks:?}: {lines:#?}");
-        };
         assert!(
-            mark.starts_with(&format!("task mark failed why={USAGE_LIMIT_WHY}")),
-            "{mark}"
+            marks.is_empty(),
+            "resume_limits={resumes}: {marks:?}: {lines:#?}"
         );
         assert_eq!(turns, 0, "resume_limits={resumes}: {lines:#?}");
-        assert!(!limited(&told), "resume_limits={resumes}: {told:?}");
+        assert_eq!(
+            limited(&told),
+            !resumes,
+            "resume_limits={resumes}: {told:?}"
+        );
 
         let tag = if resumes { "person" } else { "person-kept" };
         let (marks, turns, told, lines) = run_at_far_wall(tag, None, policy);

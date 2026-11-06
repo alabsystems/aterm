@@ -3637,17 +3637,40 @@ pub fn used_here(state: &State, label: &str, now: i64) -> bool {
     if USE_CONDITION_OFF.with(std::cell::Cell::get) {
         return true;
     }
-    let ran = state
+    ran_here(state, label, now) && claim_ours_or_none(state, label, now)
+}
+
+/// Whether a session here ran on `label` within [`USED_WITHIN_S`] ([`Account::ran_at`]): the
+/// first half of [`used_here`].
+#[must_use]
+pub fn ran_here(state: &State, label: &str, now: i64) -> bool {
+    state
         .accounts
         .get(label)
         .and_then(|account| account.ran_at)
-        .is_some_and(|at| recent(at, now, USED_WITHIN_S));
-    let claim_ours_or_none = state
+        .is_some_and(|at| recent(at, now, USED_WITHIN_S))
+}
+
+/// Whether a session on this Mac ever ran on `label` ([`Account::ran_at`], which only a session
+/// noted here sets): the proof that a login whose directory has gone was made here once, however
+/// long ago.
+#[must_use]
+pub fn ran_here_ever(state: &State, label: &str) -> bool {
+    state
+        .accounts
+        .get(label)
+        .is_some_and(|account| account.ran_at.is_some())
+}
+
+/// Whether this Mac holds `label`'s senior live claim or no Mac claims it ([`State::leases`], as
+/// the claims ring settles it): the second half of [`used_here`].
+#[must_use]
+pub fn claim_ours_or_none(state: &State, label: &str, now: i64) -> bool {
+    state
         .leases
         .get(label)
         .filter(|lease| lease.until > now)
-        .is_none_or(|lease| state.owns_swarm_label(&lease.holder));
-    ran && claim_ours_or_none
+        .is_none_or(|lease| state.owns_swarm_label(&lease.holder))
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -3670,12 +3693,122 @@ pub fn without_use_condition<R>(body: impl FnOnce() -> R) -> R {
     body()
 }
 
-/// Returns the labels of accounts with an `email` whose login is expired or due for renewal and
-/// that this Mac uses ([`used_here`]): a login made here that no session here has run on for a
-/// week, or that another Mac holds the senior claim of, is not renewed here by itself. It stays
-/// as it is until a person signs it in, or a session here runs on it and loses its login.
+/// The rows of a roster with no login on this Mac that its upkeep leaves for a person, by what
+/// their source says of them or could not say (`DESIGN-alab-one-mesh-2026-11-05` §4.15 rule 3,
+/// [`super::accounts_sync::rows_of_other_macs`]). A row with a login here is never one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OtherMacs {
+    /// Each row whose account the source gives to other Macs alone, with the first Mac it names.
+    pub named: BTreeMap<String, String>,
+    /// Each row whose source this Mac cannot compare with its own names: one only the network
+    /// could read, one that does not parse or a lab that cannot be read, or a Mac with no name or
+    /// an unreadable pass roster. Its account may be another Mac's, so no door signs it in unasked.
+    pub unread: BTreeSet<String>,
+    /// Why `unread` could not be compared, one cause for the whole read; `None` where none is.
+    pub unread_why: Option<UnreadWhy>,
+}
+
+/// Why this Mac could not compare its source with its own names ([`OtherMacs::unread`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadWhy {
+    /// The source is only on the network, which nothing fetches to judge whose an account is.
+    Network,
+    /// The source takes no name of this Mac's: it has none, or its pool refuses the one it has.
+    NoName,
+    /// The source, the lab or this Mac's swarm roster cannot be read or parsed here.
+    Source,
+}
+
+impl UnreadWhy {
+    /// The cause in a report's words, as [`super::sign_in_ladder::upkeep_waits_because`] gives it.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Network => {
+                "its source is only on the network, which aterm does not fetch to tell whose an \
+                 account is"
+            }
+            Self::NoName => {
+                "its source takes no name of this Mac's (`[fleet] machine` in aterm.toml names \
+                 this Mac)"
+            }
+            Self::Source => {
+                "this Mac cannot read its source, its lab or its swarm roster here, so it cannot \
+                 tell whose the account is"
+            }
+        }
+    }
+}
+
+impl OtherMacs {
+    /// No row is another Mac's: nothing limits who runs an account, or every row has a login here.
+    pub const NONE: Self = Self {
+        named: BTreeMap::new(),
+        unread: BTreeSet::new(),
+        unread_why: None,
+    };
+
+    /// Whether `label` is one of them, named or unread: no door signs it in with nobody asking.
+    #[must_use]
+    pub fn holds(&self, label: &str) -> bool {
+        self.named.contains_key(label) || self.unread.contains(label)
+    }
+}
+
+/// Whether `row`'s login is one this Mac's upkeep renews by itself: the row names an `email`, no
+/// other host holds it, it is not one of `others` (the rows with no login here whose account the
+/// source gives to other Macs alone, or whose source this Mac cannot compare, [`OtherMacs`]:
+/// §4.15 rule 3), this Mac uses it ([`used_here`]), and its login has ended or comes due
+/// ([`LoginState::Expired`], [`LoginState::Due`]). A login whose directory has gone since a
+/// session here ran on it counts: that session's run is the proof the login was made here, and
+/// the sync records a login it finds gone signed out, which is an ended one. A login no session
+/// here has run on for a week, or that another Mac holds the senior claim of, is not: it stays as
+/// it is until a person signs it in, or a session here runs on it and loses its login
+/// (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+#[must_use]
+pub fn renewal_due(
+    row: &Row,
+    logins: &Logins,
+    state: &State,
+    others: &OtherMacs,
+    now: i64,
+) -> bool {
+    row.held_by.is_none()
+        && row.email.is_some()
+        && !others.holds(&row.label)
+        && used_here(state, &row.label, now)
+        && matches!(
+            login_state(row, logins, state, now),
+            LoginState::Expired | LoginState::Due { .. }
+        )
+}
+
+/// The labels of `roster`'s rows whose logins this Mac's upkeep renews by itself, in roster order
+/// ([`renewal_due`], which `others`, the rows whose account may be another Mac's, never pass).
 #[must_use]
 pub fn renew_due(
+    roster: &Roster,
+    logins: &Logins,
+    state: &State,
+    others: &OtherMacs,
+    now: i64,
+) -> Vec<String> {
+    roster
+        .rows
+        .iter()
+        .filter(|row| renewal_due(row, logins, state, others, now))
+        .map(|row| row.label.clone())
+        .collect()
+}
+
+/// The logins still on this Mac that [`renew_due`] lists, in roster order: a due or ended login
+/// this Mac holds (`enrolled`), which the upkeep renews by itself. A row whose login has gone is a
+/// sign-in rather than a renewal, which a report names with its routes once it fails
+/// ([`failing_sign_ins`]). `enrolled` is the set [`super::accounts_sync::rows_of_other_macs`]
+/// reads, [`enrolled_in`] this Mac's home, so no enrolled row is one of [`renewal_due`]'s
+/// `others`, which have no login here, and none is read.
+#[must_use]
+pub fn due_logins_here(
     roster: &Roster,
     logins: &Logins,
     state: &State,
@@ -3685,13 +3818,8 @@ pub fn renew_due(
     roster
         .rows
         .iter()
-        .filter(|row| row.held_by.is_none() && row.email.is_some() && is_enrolled(row, enrolled))
-        .filter(|row| used_here(state, &row.label, now))
         .filter(|row| {
-            matches!(
-                login_state(row, logins, state, now),
-                LoginState::Expired | LoginState::Due { .. }
-            )
+            is_enrolled(row, enrolled) && renewal_due(row, logins, state, &OtherMacs::NONE, now)
         })
         .map(|row| row.label.clone())
         .collect()

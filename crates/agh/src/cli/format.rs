@@ -27,20 +27,32 @@ pub fn render(
             };
             format!("{doc}\n")
         }
-        Format::Ndjson => values.iter().map(|value| format!("{value}\n")).collect(),
+        Format::Ndjson => {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for value in values {
+                let _ = writeln!(out, "{value}");
+            }
+            out
+        }
         Format::Tsv => {
             let mut out = String::new();
             if header {
-                let texts: Vec<String> = columns.iter().map(|c| tsv_escape(&c.text())).collect();
-                out.push_str(&texts.join("\t"));
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\t');
+                    }
+                    tsv_escape_into(&mut out, &c.text());
+                }
                 out.push('\n');
             }
             for value in values {
-                let cells: Vec<String> = columns
-                    .iter()
-                    .map(|c| tsv_escape(&cell(&value_at(value, c))))
-                    .collect();
-                out.push_str(&cells.join("\t"));
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\t');
+                    }
+                    tsv_escape_into(&mut out, &cell(&value_at(value, c)));
+                }
                 out.push('\n');
             }
             out
@@ -63,8 +75,9 @@ pub fn render(
                 }
             }
             let mut out = String::new();
+            let mut line = String::new();
             for row in &rows {
-                let mut line = String::new();
+                line.clear();
                 for (i, (text, width)) in row.iter().zip(&widths).enumerate() {
                     if i > 0 {
                         line.push_str("  ");
@@ -86,14 +99,35 @@ pub(crate) fn cell(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::String(text) => text.clone(),
-        Value::Array(items) => items.iter().map(cell).collect::<Vec<_>>().join(","),
+        Value::Array(items) => {
+            let mut out = String::new();
+            cell_array_into(&mut out, items);
+            out
+        }
         Value::Bool(_) | Value::Number(_) | Value::Object(_) => value.to_string(),
     }
 }
 
+fn cell_array_into(out: &mut String, items: &[Value]) {
+    use std::fmt::Write as _;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            Value::Null => {}
+            Value::String(text) => out.push_str(text),
+            Value::Array(nested) => cell_array_into(out, nested),
+            Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+                let _ = write!(out, "{item}");
+            }
+        }
+    }
+}
+
 /// Escapes `\`, `\t`, `\n`, `\r`, and NUL for `@tsv` output.
-fn tsv_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn tsv_escape_into(out: &mut String, text: &str) {
+    out.reserve(text.len());
     for c in text.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
@@ -104,7 +138,6 @@ fn tsv_escape(text: &str) -> String {
             c => out.push(c),
         }
     }
-    out
 }
 
 /// Escapes tabs, line endings, and control bytes for terminal display.

@@ -105,7 +105,7 @@ pub const CHECKS: [Spec; 18] = [
             "chrome-headless-shell",
         ],
         also: "",
-        runs: "targo test <selection> --tests (no examples), binaries in parallel",
+        runs: "targo test <selection> --tests (no examples; under release, the measuring benches compiled too), binaries in parallel",
     },
     Spec {
         check: Check::Doc,

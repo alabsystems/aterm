@@ -1673,6 +1673,13 @@ impl App {
             crate::app_take_over::note_clipboard_refused("copy");
             return false;
         }
+        // A private document's text reaches the clipboard on the person's own gesture only: an
+        // accessibility client's request or another process's posted input copies none of it,
+        // its text face and an open cell included (one-mesh design §4.8).
+        if self.gesture_unvouched().is_some() && self.front_view_is_private(wid) {
+            crate::app_take_over::note_clipboard_refused("copy");
+            return false;
+        }
         // A pinned or keyboard lens's ⌘C copies its instrument's sentence.
         if self.stats_lens_copy_ready(wid).is_some() {
             return self.copy_stats_sentence(wid);
@@ -1764,6 +1771,16 @@ impl App {
             }
         }
         None
+    }
+
+    /// Whether Edit ▸ Copy and the palette's Copy row are live for window `wid`'s native view: it
+    /// has a selection, and it is no private document's. A private document's Copy is the
+    /// person's keystroke alone (⌘C, M-w), which its window classifies as it arrives; a menu item
+    /// is pressed through the Accessibility API with no event of the person's behind it, so it
+    /// stays greyed there, and ⌘C, no menu's key equivalent then, reaches the view as a key
+    /// (one-mesh design §4.8).
+    pub(crate) fn menu_copies(&self, wid: WindowId) -> bool {
+        self.native_has_selection(wid) && !self.front_view_is_private(wid)
     }
 
     /// Edit ▸ Copy: [`Self::copy_in`] against the frontmost window.

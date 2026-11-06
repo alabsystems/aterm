@@ -546,7 +546,7 @@ fn cold_preparation_keeps_its_directory_origin_from_before_the_first_base_cover(
                 std::time::Instant::now() < deadline,
                 "filesystem clock must advance"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert_eq!(
             directory_origin(parent)?,

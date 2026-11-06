@@ -88,6 +88,8 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
     --sign-out  {sign_out}
     --clone     {clone}
                 (your own, no forks or archived; init.toml [github] scopes or disables it)
+                Initializes only required dependencies selected by the private inventory,
+                at exact recorded gitlink commits; this needs no --develop.
   Preferences need you at the console; sign-outs run last, with you at the screen. A group
   off in System State (all after a Stop) stays as is unless a flag names it; one turned
   off mid-run stays as is. A setting you changed stays yours till Set up now or aterm
@@ -1750,8 +1752,10 @@ const CLONE_OWED: &str = "clone-owed";
 /// What `sync.clone` reads of the clone an `aterm init` owes ([`owed_clone`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwedClone {
-    /// None is owed (never, or the pass ran it): the row reads in place.
+    /// No clone was requested and no vault inventory can be verified here.
     Nothing(String),
+    /// The private vault inventory was read and every repository verified locally.
+    Verified { present: usize, total: usize },
     /// One is owed, but init.toml turned the GitHub step off since: why.
     Off(String),
     /// One is owed, and the token it waits for, or the git every clone runs, is not on this Mac
@@ -1760,8 +1764,8 @@ pub enum OwedClone {
     /// One is owed, and its token is here: what the pass finds.
     Due(String),
     /// One is owed, but its last run stopped at a step only a person can take, and neither
-    /// the token nor init.toml changed since: what they do, in plain words. The pass leaves it
-    /// until one of those changes or they run it themselves.
+    /// the token nor init.toml changed since: what they do, in plain words. The private
+    /// inventory still rechecks preserved checkout work locally, so fixing it resumes setup.
     Person(String),
     /// One is owed, but the person left GitHub repositories as they are in System State since
     /// the run that owes it began: their held line ([`Holds::line`]). A hold already on record
@@ -1866,8 +1870,9 @@ const PERSON_MARK: &str = "mark ";
 /// owes its GitHub step ([`note_owed`]), whether the person's choices in System State (`now`)
 /// came to hold GitHub repositories after the run that owes it began ([`OwedClone::Held`]), and
 /// whether the token that step reads, and Apple's git, are on this Mac now. A step only a person
-/// can finish waits for them until the token, init.toml or git's presence changes
-/// ([`OwedClone::Person`]); a Stop holds the step and keeps it owed ([`OwedClone::Waiting`]).
+/// can finish waits for them until its source changes, or a local read of the private
+/// inventory finds preserved work ready to resume ([`OwedClone::Person`]); a Stop holds the
+/// step and keeps it owed ([`OwedClone::Waiting`]).
 ///
 /// # Errors
 /// The record, this login's context or its init.toml cannot be read.
@@ -1876,7 +1881,7 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
     let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
         Ok(record) => String::from_utf8_lossy(&record).into_owned(),
         Err(aterm_uds::private_file::PrivateFileError::Missing) => {
-            return Ok(OwedClone::Nothing("aterm init owes no clone".into()));
+            return automatic_clone(sys, now);
         }
         Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
     };
@@ -1920,6 +1925,40 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
         .zip(record.lines().skip(1))
         .find(|(_, mark)| mark.strip_prefix(PERSON_MARK) == Some(read.mark.as_str()))
     {
+        if crate::init_github::uses_vault_inventory(sys, &ctx)? {
+            // Old records describe only the source, not what blocked the checkout. Re-probe
+            // the default inventory locally, without applying or enumerating GitHub, so a
+            // corrected worktree can resume even with an untyped pre-upgrade Person mark.
+            // Explicit profiles keep their auth cache and never repeat its network probe.
+            let rows = crate::init_github::run_initial_repositories(sys, &ctx, Mode::Plan)?;
+            for row in rows
+                .iter()
+                .filter(|row| !crate::init_github::keychain_row(row))
+            {
+                let Some(crate::init_observe::Reading::Repositories {
+                    present,
+                    count,
+                    signed_in: true,
+                }) = crate::init_observe::Reading::of(row)
+                else {
+                    continue;
+                };
+                match row.outcome {
+                    Outcome::Ok if present == count => {
+                        return Ok(OwedClone::Verified {
+                            present,
+                            total: count,
+                        });
+                    }
+                    Outcome::Planned if present < count => {
+                        return Ok(OwedClone::Due(format!(
+                            "local checkout work now allows repository setup to finish ({present}/{count} ready)"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
         return Ok(OwedClone::Person(how.to_owned()));
     }
     if let Some(why) = read.unusable {
@@ -1937,6 +1976,65 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
                 .into(),
         )
     })
+}
+
+/// A vault member needs no earlier init debt to acquire its repositories. The subscriber
+/// reads the private inventory on every pass, so newly delivered entries and missing checkouts
+/// are reconciled too. A person's holds still win, and this path never inventories GitHub.
+fn automatic_clone(sys: &dyn System, now: &Holds) -> Result<OwedClone, String> {
+    let nothing = || OwedClone::Nothing("aterm init owes no clone".into());
+    let Ok(identity) = sys.identity() else {
+        return Ok(nothing());
+    };
+    if identity.user.uid != sys.euid() || sys.euid() == 0 {
+        return Ok(nothing());
+    }
+    let token = Path::new(&identity.user.home).join(crate::init_github::TOKEN_FILE);
+    if sys
+        .stat(&token)
+        .is_err_and(|why| why.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(nothing());
+    }
+    if now.holds(Setting::Repositories) {
+        return Ok(OwedClone::Held(now.why(Setting::Repositories)));
+    }
+    let ctx = Ctx {
+        facts: HostFacts::default(),
+        users: vec![identity.user],
+        console: None,
+        host_name: String::new(),
+        cache_dir: PathBuf::new(),
+        disrupt: false,
+    };
+    let Some(read) = crate::init_github::token_read(sys, &ctx)? else {
+        return Ok(OwedClone::Off(
+            "off: init.toml's [github] enabled = false".into(),
+        ));
+    };
+    if let Some(why) = read.unusable {
+        return Ok(OwedClone::Waiting(why));
+    }
+    if !read.landed {
+        return Ok(OwedClone::Waiting(
+            "waiting for the vault's GitHub credential".into(),
+        ));
+    }
+    if crate::items::github::installed_git(sys).is_none() {
+        return Ok(OwedClone::Waiting(
+            "waiting for an installed git to clone the vault's repositories".into(),
+        ));
+    }
+    match crate::init_github::inventory_counts(sys, &ctx) {
+        Ok(Some((present, total))) if present == total => {
+            Ok(OwedClone::Verified { present, total })
+        }
+        Ok(Some((present, total))) => Ok(OwedClone::Due(format!(
+            "{present}/{total} repositories from the private vault are present; fleet setup clones the rest"
+        ))),
+        Ok(None) => Ok(nothing()),
+        Err(why) => Ok(OwedClone::Waiting(why)),
+    }
 }
 
 /// Forget the GitHub step an `aterm init` owes, under the account's state directory `state`:
@@ -1975,6 +2073,38 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
     let mut journal = sys.journal()?;
     let rows = aterm_converge::run(&bound, Mode::Apply, journal.as_mut())
         .map_err(|why| why.to_string())?;
+    settle_owed_clone(sys, state, &ctx, &rows)
+}
+
+/// Clone from inputs captured under the selected vault's complete materialization. The
+/// snapshot is checked again before effects and read-back; its lock never spans network work.
+///
+/// # Errors
+/// As [`clone_owed`], or the captured materialization changed before the operation finished.
+pub fn clone_owed_captured(
+    sys: &dyn System,
+    state: &Path,
+    inputs: crate::init_github::InitialRepositoryInputs,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<String, String> {
+    let (ctx, _) = local_context(sys)?;
+    let rows = crate::init_github::run_initial_repositories_captured(
+        sys,
+        &ctx,
+        Mode::Apply,
+        inputs,
+        current,
+    )?;
+    settle_owed_clone(sys, state, &ctx, &rows)
+}
+
+/// Record one repository attempt after the native or captured runner has returned.
+fn settle_owed_clone(
+    sys: &dyn System,
+    state: &Path,
+    ctx: &Ctx,
+    rows: &[ItemReport],
+) -> Result<String, String> {
     let dir = converge_state(state);
     // The repositories' rows alone: the keychain row's own retry is `sync.github`'s, and its
     // failing must not leave the mark unwritten and rerun this whole step every pass.
@@ -1984,8 +2114,9 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
     };
     if let Some(row) = repository_rows().find(|row| {
         !matches!(
-            row.outcome,
-            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            crate::init_observe::standing(row),
+            aterm_types::macos_setup::Standing::InPlace
+                | aterm_types::macos_setup::Standing::NotNeeded
         )
     }) {
         let why = format!(
@@ -1994,7 +2125,7 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
             row.why.as_deref().unwrap_or(word(row.outcome))
         );
         if row.outcome == Outcome::Person
-            && let Some(read) = crate::init_github::token_read(sys, &ctx)?
+            && let Some(read) = crate::init_github::token_read(sys, ctx)?
         {
             let how = format!(
                 "{why}. Only you can fix this; the vault's sync runs the step again once its \
@@ -4704,19 +4835,23 @@ impl Item for Unchanged<'_> {
 /// A Network-lane item of a group the person's choices can hold after the run began (a GitHub
 /// clone, which may start half an hour in): it reads those choices as it starts
 /// ([`Hooks::held`]), and one they hold by then changes nothing and reads as left, in their
-/// words. Its first reading stands, so the read-back after its own change is the item's.
+/// words. An admitted batch checks that same policy at each effect boundary; a later hold is
+/// retained for the row, while ordinary read-back preserves the item's first admission.
 struct HeldLate<'a> {
     inner: &'a dyn Item,
     held: &'a (dyn Fn(&str) -> Option<String> + Sync),
     decided: std::sync::OnceLock<Option<String>>,
+    late: std::sync::OnceLock<String>,
 }
 
 impl HeldLate<'_> {
     /// Why the person's choices hold this item, read once as it starts.
     fn held(&self) -> Option<&String> {
-        self.decided
-            .get_or_init(|| (self.held)(&self.inner.id()))
-            .as_ref()
+        self.late.get().or_else(|| {
+            self.decided
+                .get_or_init(|| (self.held)(&self.inner.id()))
+                .as_ref()
+        })
     }
 }
 
@@ -4739,7 +4874,26 @@ impl Item for HeldLate<'_> {
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         match self.held() {
             Some(why) => Err(why.clone()),
-            None => self.inner.apply(sys, ctx),
+            None => {
+                let current = || {
+                    if let Some(why) = self.late.get() {
+                        return Err(why.clone());
+                    }
+                    match (self.held)(&self.inner.id()) {
+                        Some(why) => {
+                            let why = self.late.get_or_init(|| why);
+                            Err(why.clone())
+                        }
+                        None => Ok(()),
+                    }
+                };
+                let result = self.inner.apply_guarded(sys, ctx, &current);
+                if self.late.get().is_some() {
+                    Ok(())
+                } else {
+                    result
+                }
+            }
         }
     }
     fn preference_changes(
@@ -4768,7 +4922,10 @@ impl Item for HeldLate<'_> {
         self.inner.detail(sys, ctx)
     }
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
-        self.inner.stood_aside()
+        self.late
+            .get()
+            .map(|why| aterm_converge::StoodAside::Waiting(why.clone()))
+            .or_else(|| self.inner.stood_aside())
     }
     fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {
         self.inner.unfinished()
@@ -4971,6 +5128,7 @@ fn run_layers(
             inner: *inner,
             held: hooks.held,
             decided: std::sync::OnceLock::new(),
+            late: std::sync::OnceLock::new(),
         })
         .collect();
     // Downloaded tools and repository clones need no Apple compiler. Finish them before
@@ -7933,8 +8091,11 @@ mod tests {
         clone_owed(&sys, state.path()).unwrap();
         assert_eq!(
             owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
-            nothing(),
-            "run once"
+            OwedClone::Verified {
+                present: 1,
+                total: 1
+            },
+            "the next pass verifies the inventory instead of cloning again"
         );
     }
 
@@ -7959,8 +8120,75 @@ mod tests {
         clone_owed(&sys, state.path()).unwrap();
         assert_eq!(
             owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
-            OwedClone::Nothing("aterm init owes no clone".into()),
+            OwedClone::Verified {
+                present: 1,
+                total: 1
+            },
         );
+    }
+
+    /// Fleet materialization alone starts repository reconciliation: no earlier init or
+    /// clone-owed file is needed. A complete local inventory settles; a new entry wakes it.
+    #[test]
+    fn fleet_inventory_clones_without_an_earlier_init_and_respects_holds() {
+        let state = aterm_tempfile::tempdir().unwrap();
+        let sys = alice_at(501);
+        let who = user("alice", 501);
+        crate::init_github::scripted::converged(&sys, &who, "notes");
+        assert_eq!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Verified {
+                present: 1,
+                total: 1
+            },
+        );
+        let path = Path::new(&who.home).join(".secrets/github-repositories.json");
+        let bytes = aterm_json::to_vec(&aterm_json::json!({
+            "schema":2,"account":"alice","repositories":[{
+                "id":2,"name":"new-code","owner":{"login":"alice"},
+                "full_name":"alice/new-code","private":true,
+                "clone_url":"https://github.com/alice/new-code.git","default_branch":"main"
+            }]
+        }))
+        .unwrap();
+        sys.file(path.to_str().unwrap(), &bytes).stat_of(
+            path.to_str().unwrap(),
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
+        assert!(matches!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Due(_)
+        ));
+        let mut held = Holds::NONE;
+        held.off.set(Setting::Repositories, true);
+        assert!(matches!(
+            owed_clone(&sys, state.path(), &held).unwrap(),
+            OwedClone::Held(_)
+        ));
+        let path = Path::new(&who.home).join(".config/aterm/init.toml");
+        let profile = b"[github]\nenabled=false\n";
+        sys.file(path.to_str().unwrap(), profile).stat_of(
+            path.to_str().unwrap(),
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: profile.len() as u64,
+            },
+        );
+        assert!(matches!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Off(_)
+        ));
     }
 
     /// GitHub waiting for the vault to let this Mac in is owed, not blocked: its row reads
@@ -11661,6 +11889,89 @@ mod tests {
                         && row.outcome == Outcome::Changed),
                 "{rows:?}"
             );
+        }
+    }
+
+    #[test]
+    fn held_late_forwards_new_choices_to_each_effect_of_one_admitted_batch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Batch {
+            effects: AtomicUsize,
+            stopped: AtomicBool,
+            stop_late: bool,
+        }
+        impl Item for Batch {
+            fn id(&self) -> String {
+                "init.github.batch@alice".into()
+            }
+            fn family(&self) -> &'static str {
+                "github"
+            }
+            fn title(&self) -> String {
+                self.id()
+            }
+            fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+                if self.effects.load(Ordering::SeqCst) == 2 {
+                    ok()
+                } else {
+                    change()
+                }
+            }
+            fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+                panic!("the wrapper must forward current authorization into the batch")
+            }
+            fn apply_guarded(
+                &self,
+                _: &dyn System,
+                _: &Ctx,
+                current: &(dyn Fn() -> Result<(), String> + Sync),
+            ) -> Result<(), String> {
+                for at in 0..2 {
+                    current()?;
+                    self.effects.fetch_add(1, Ordering::SeqCst);
+                    if at == 0 && self.stop_late {
+                        self.stopped.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+        }
+        for stop_late in [false, true] {
+            let batch = Batch {
+                effects: AtomicUsize::new(0),
+                stopped: AtomicBool::new(false),
+                stop_late,
+            };
+            let policy = |_: &str| {
+                batch
+                    .stopped
+                    .load(Ordering::SeqCst)
+                    .then(|| "late Stop".to_owned())
+            };
+            let wrapper = HeldLate {
+                inner: &batch,
+                held: &policy,
+                decided: std::sync::OnceLock::new(),
+                late: std::sync::OnceLock::new(),
+            };
+            let sys = crate::port::Fake::root();
+            let ctx = crate::items::defaults::tests::ctx(&[]);
+            assert!(matches!(wrapper.probe(&sys, &ctx), Probe::Change { .. }));
+            assert!(
+                wrapper.apply(&sys, &ctx).is_ok(),
+                "a held batch is left rather than failed"
+            );
+            assert_eq!(
+                batch.effects.load(Ordering::SeqCst),
+                if stop_late { 1 } else { 2 }
+            );
+            assert_eq!(wrapper.stood_aside().is_some(), stop_late);
+            if stop_late {
+                assert!(matches!(
+                    wrapper.probe(&sys, &ctx),
+                    Probe::NotApplicable { .. }
+                ));
+            }
         }
     }
 

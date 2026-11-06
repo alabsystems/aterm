@@ -65,6 +65,9 @@ fn admitted_observation(
     observed
 }
 
+/// No row's account is another Mac's ([`renew_due`]'s `others`).
+const NONE: OtherMacs = OtherMacs::NONE;
+
 fn every(roster: &Roster) -> BTreeSet<String> {
     roster.rows.iter().map(|r| r.label.clone()).collect()
 }
@@ -570,10 +573,7 @@ fn an_ended_renewable_login_is_due_and_never_signed_out() {
     let enrolled = every(&r);
     let (mut state, mut logins) = renewed(NOW);
     note_login_end(&mut state, &mut logins, "main", NOW + HOUR);
-    assert_eq!(
-        renew_due(&r, &logins, &state, &enrolled, NOW + HOUR),
-        ["main"]
-    );
+    assert_eq!(renew_due(&r, &logins, &state, &NONE, NOW + HOUR), ["main"]);
     assert!(signed_out(&r, &state, &enrolled, NOW + HOUR).is_empty());
     note_auth(&mut state, "work-2", Auth::SignedOut, NOW + HOUR);
     assert_eq!(signed_out(&r, &state, &enrolled, NOW + HOUR), ["work-2"]);
@@ -587,7 +587,7 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
     assert!(note_login_notice(&mut logins, "main", 2, NOW + HOUR));
     note_login_end(&mut state, &mut logins, "main", NOW + 2 * HOUR);
     assert_eq!(
-        renew_due(&r, &logins, &state, &enrolled, NOW + 2 * HOUR),
+        renew_due(&r, &logins, &state, &NONE, NOW + 2 * HOUR),
         ["main"]
     );
     let back = NOW + 3 * HOUR;
@@ -602,7 +602,7 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
         (binding.renewed_at, binding.notice_end, binding.served_at),
         (Some(back), None, Some(back))
     );
-    assert!(renew_due(&r, &logins, &state, &enrolled, back).is_empty());
+    assert!(renew_due(&r, &logins, &state, &NONE, back).is_empty());
     note_auth(&mut state, "work-2", Auth::SignedOut, back);
     assert_eq!(signed_out(&r, &state, &enrolled, back), ["work-2"]);
     assert!(!note_signed_back(&mut state, &mut logins, "work-2", back + 60).is_empty());
@@ -621,7 +621,7 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
     let r = roster();
     let enrolled = every(&r);
     let (mut state, mut logins) = renewed(NOW);
-    assert!(renew_due(&r, &logins, &state, &enrolled, NOW).is_empty());
+    assert!(renew_due(&r, &logins, &state, &NONE, NOW).is_empty());
     assert!(!none_working_within(
         &r,
         &logins,
@@ -631,7 +631,7 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
         NONE_SOON_S
     ));
     note_login_notice(&mut logins, "main", 3, NOW);
-    assert_eq!(renew_due(&r, &logins, &state, &enrolled, NOW), ["main"]);
+    assert_eq!(renew_due(&r, &logins, &state, &NONE, NOW), ["main"]);
     assert!(!none_working_within(
         &r,
         &logins,
@@ -649,10 +649,7 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
         NONE_SOON_S
     ));
     note_login_end(&mut state, &mut logins, "main", NOW + HOUR);
-    assert_eq!(
-        renew_due(&r, &logins, &state, &enrolled, NOW + HOUR),
-        ["main"]
-    );
+    assert_eq!(renew_due(&r, &logins, &state, &NONE, NOW + HOUR), ["main"]);
     assert!(none_working_within(
         &r,
         &logins,
@@ -663,10 +660,7 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
     ));
     let mut ended = state.clone();
     note_auth(&mut ended, "work-2", Auth::SignedOut, NOW);
-    assert_eq!(
-        renew_due(&r, &logins, &ended, &enrolled, NOW + HOUR),
-        ["main"]
-    );
+    assert_eq!(renew_due(&r, &logins, &ended, &NONE, NOW + HOUR), ["main"]);
     let nobody: BTreeSet<String> = ["work-2".to_string()].into();
     let bare = Roster {
         rows: vec![Row {
@@ -674,7 +668,32 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
             ..r.rows[0].clone()
         }],
     };
-    assert!(renew_due(&bare, &logins, &state, &nobody, NOW + HOUR).is_empty());
+    // An ended login a session here ran on is due though nothing of it is enrolled here (the
+    // walled tab's successor whose directory went, `lab claude-rotation-proof` R4); one no
+    // session here ran on is not.
+    assert_eq!(
+        renew_due(&bare, &logins, &state, &NONE, NOW + HOUR),
+        ["main"]
+    );
+    let theirs = OtherMacs {
+        named: BTreeMap::from([("main".to_owned(), "m22".to_owned())]),
+        ..OtherMacs::NONE
+    };
+    assert!(
+        renew_due(&bare, &logins, &state, &theirs, NOW + HOUR).is_empty(),
+        "its source gives its account to another Mac"
+    );
+    let unread = OtherMacs {
+        unread: BTreeSet::from(["main".to_owned()]),
+        ..OtherMacs::NONE
+    };
+    assert!(
+        renew_due(&bare, &logins, &state, &unread, NOW + HOUR).is_empty(),
+        "this Mac cannot read whether its source gives its account to it"
+    );
+    let mut never_ran = state.clone();
+    never_ran.accounts.get_mut("main").expect("main").ran_at = None;
+    assert!(renew_due(&bare, &logins, &never_ran, &NONE, NOW + HOUR).is_empty());
     assert!(!none_working_within(
         &bare,
         &logins,
@@ -1358,10 +1377,9 @@ fn claude_codes_own_warning_is_read_at_any_percent_until_its_window_ends() {
 #[test]
 fn a_due_login_is_renewed_only_while_this_mac_uses_it() {
     let r = roster();
-    let enrolled = every(&r);
     let (mut state, mut logins) = renewed(NOW);
     note_login_end(&mut state, &mut logins, "main", NOW + HOUR);
-    let due = |state: &State, at: i64| renew_due(&r, &logins, state, &enrolled, at);
+    let due = |state: &State, at: i64| renew_due(&r, &logins, state, &NONE, at);
     assert_eq!(due(&state, NOW + HOUR), ["main"]);
     assert_eq!(due(&state, NOW + USED_WITHIN_S - 1), ["main"]);
     assert!(

@@ -263,11 +263,10 @@ impl Link {
                 "the isolated attachment's Local Network permission is withheld",
             ));
         }
-        let wire = match &self.listener {
-            Some(listener) => hints.wire(listener.local_addr()?.port()),
-            None => hints.presence_wire(),
-        };
-        self.hints.send(&wire)
+        match &self.listener {
+            Some(listener) => self.hints.send(&hints.wire(listener.local_addr()?.port())),
+            None => self.hints.send(&hints.presence_wire()),
+        }
     }
 }
 

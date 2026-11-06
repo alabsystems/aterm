@@ -34,12 +34,14 @@
 //!   at the same point, without the drain of the drive's cache, which only a power loss
 //!   shows and no test makes. No application sets the mark, and a release build never
 //!   reads it.
-//! - [`plain_fsync`] (Unix): a plain `fsync(2)`, retried on `EINTR`, in every build:
-//!   the file's writes handed to the drive without the drain of its cache, for a
+//! - [`plain_fsync`] (Unix): a plain `fsync(2)` of any open descriptor (a `&File`, an
+//!   `OwnedFd`, a `BorrowedFd`), retried on `EINTR`, in every build: the file's writes,
+//!   or a directory's entries, handed to the drive without the drain of its cache, for a
 //!   caller that asks for exactly that (aterm-durable's `ordered_or_fsync`, where a
-//!   volume refuses both the barrier and the full flush). On Apple it is the `fsync`
-//!   behind [`full_sync`] in a test's process tree; elsewhere [`File::sync_all`], which
-//!   is `fsync(2)` there.
+//!   volume refuses both the barrier and the full flush, and the plain flushes aterm
+//!   names, through aterm-durable's `primitive::fsync`). On Apple it is the `fsync`
+//!   behind [`full_sync`] in a test's process tree; elsewhere the `owner` module's
+//!   `fsync`, the call [`File::sync_all`] makes there.
 //! - [`flush_tally`]: how many of those four calls this process has made, by kind, so
 //!   a reading around a span of a process's work counts every flush it asked the OS
 //!   for through this crate, whatever the broker's own counts say (astream-broker's
@@ -100,11 +102,11 @@
 //! `socket_hung_up`, `fcntl(F_GETFD)` and `fcntl(F_SETFD)` behind [`close_on_fork`],
 //! `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` behind [`clock_ns`], and `signal(SIGHUP)`
 //! behind [`install_sighup_handler`]. `owner`
-//! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
+//! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], on Apple
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
-//! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
-//! `O_NOFOLLOW` numbers [`open_nonblocking`] and [`open_nonblocking_rw`] pass to safe
-//! `std` live there too.
+//! [`owner_private`] and [`owner_private_dir`], and off Apple `fsync` behind
+//! [`plain_fsync`]; the per-OS `O_NONBLOCK` and `O_NOFOLLOW` numbers
+//! [`open_nonblocking`] and [`open_nonblocking_rw`] pass to safe `std` live there too.
 //! `file_identity` (`cfg(windows)`) reads the kernel's volume and file index for
 //! [`file_matches_path`], so a path replacement is never judged by size or time.
 //! Nothing else here may use `unsafe` — the compiler refuses it — and no errno or raw
@@ -131,8 +133,11 @@
 //! from a failed flush; elsewhere aterm-durable's ordered write is [`full_sync`]. Every
 //! durable write aterm-durable finishes ends with [`full_sync`] or [`full_sync_data`],
 //! and the plain flush its ordered write falls back to where a volume refuses both is
-//! [`plain_fsync`], so [`flush_tally`] counts every flush aterm-durable makes, and
-//! aterm-link's BROKER section quotes the tally its broker's `<log>.health` carries.
+//! [`plain_fsync`], as is every plain flush aterm names (aterm-durable's
+//! `primitive::fsync`: the crash journal's folders, atpkg's stores and the handle-relative
+//! directories of atpkg's build cache and aterm-gui's pinned folders), so [`flush_tally`]
+//! counts every flush aterm-durable makes, and aterm-link's BROKER section quotes the
+//! tally its broker's `<log>.health` carries.
 //! aterm-durable's `Flush::dir_best_effort` and aterm-link's
 //! tolerated state-dir flushes go on without a directory's flush exactly where
 //! [`dir_flush_unavailable`] says so, the broker's own rule, and return any other
@@ -171,7 +176,8 @@ macro_rules! apple_ffi {
         unsafe { fcntl($fd, $cmd) }
     };
     (fsync($fd:expr)) => {
-        // SAFETY: `fd` is a valid open descriptor owned by `file`; `fsync` takes it by value.
+        // SAFETY: `fd` is a valid open descriptor, retained by a BorrowedFd for the call;
+        // `fsync` takes it by value and touches no memory.
         unsafe { fsync($fd) }
     };
     (sysctlbyname($name:expr, $oldp:expr, $oldlenp:expr, $newp:expr, $newlen:expr)) => {
@@ -204,7 +210,7 @@ macro_rules! apple_ffi {
 /// Evaluates `$call` until it answers anything but `EINTR`
 /// ([`io::ErrorKind::Interrupted`]): the retry every flush of the cordon makes, so an
 /// interrupted flush is never reported as a failed one.
-#[cfg(any(test, target_vendor = "apple"))]
+#[cfg(any(test, unix))]
 macro_rules! retried_on_eintr {
     ($call:expr) => {{
         loop {
@@ -217,10 +223,10 @@ macro_rules! retried_on_eintr {
     }};
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(unix)]
 pub(crate) use retried_on_eintr;
 
-#[cfg(any(test, target_vendor = "apple"))]
+#[cfg(any(test, unix))]
 pub(crate) fn is_eintr(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
 }
@@ -469,7 +475,7 @@ pub fn full_sync(file: &File) -> io::Result<()> {
     flush_times::timed(FlushKind::Full, || {
         #[cfg(all(debug_assertions, target_vendor = "apple"))]
         if test_plain_fsync() {
-            return apple::plain_fsync(file);
+            return apple::plain_fsync(std::os::fd::AsFd::as_fd(file));
         }
         file.sync_all()
     })
@@ -485,7 +491,7 @@ pub fn full_sync_data(file: &File) -> io::Result<()> {
     flush_times::timed(FlushKind::Full, || {
         #[cfg(all(debug_assertions, target_vendor = "apple"))]
         if test_plain_fsync() {
-            return apple::plain_fsync(file);
+            return apple::plain_fsync(std::os::fd::AsFd::as_fd(file));
         }
         file.sync_data()
     })
@@ -512,26 +518,29 @@ pub fn barrier_sync(file: &File) -> io::Result<()> {
     })
 }
 
-/// A plain `fsync(2)` of `file`, retried while it is interrupted (`EINTR`), in every
-/// build: its writes handed to the drive, without the drain of the drive's cache that
-/// [`full_sync`] waits for on Apple. For a caller that asks for exactly that flush — a
-/// volume that refuses both [`barrier_sync`] and [`full_sync`] (a network home whose
-/// server takes no `F_FULLFSYNC`) still takes it, as SQLite finds there. Apple: the
-/// cordon's `fsync`. Elsewhere [`File::sync_all`], which is `fsync(2)` there and is
-/// retried on `EINTR` by std.
+/// A plain `fsync(2)` of the open file or directory `fd` (a `&File`, an `OwnedFd`, a
+/// `BorrowedFd`), retried while it is interrupted (`EINTR`), in every build: its writes,
+/// or a directory's entries, handed to the drive, without the drain of the drive's cache
+/// that [`full_sync`] waits for on Apple. For a caller that asks for exactly that flush —
+/// a volume that refuses both [`barrier_sync`] and [`full_sync`] (a network home whose
+/// server takes no `F_FULLFSYNC`) still takes it, as SQLite finds there — and for one
+/// that holds a directory as a bare descriptor (aterm's handle-relative trees), which no
+/// `File` method flushes. The cordon's `fsync`: the `apple` module's on Apple, the
+/// `owner` module's elsewhere on Unix (where it is the call [`File::sync_all`] makes).
 ///
 /// # Errors
 /// The flush's own error.
 #[cfg(unix)]
-pub fn plain_fsync(file: &File) -> io::Result<()> {
+pub fn plain_fsync(fd: impl std::os::fd::AsFd) -> io::Result<()> {
+    let fd = fd.as_fd();
     flush_times::timed(FlushKind::Plain, || {
         #[cfg(target_vendor = "apple")]
         {
-            apple::plain_fsync(file)
+            apple::plain_fsync(fd)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            file.sync_all()
+            owner::plain_fsync(fd)
         }
     })
 }
@@ -1456,24 +1465,36 @@ mod tests {
         }
     }
 
-    /// Each [`plain_fsync`] call raises `plain` by one. No other test of this binary calls
-    /// it, so that count is this test's alone, and a plain flush counted as `full` or
-    /// `barrier` instead falls short here. That it raises NO other count cannot be read in
-    /// this binary, whose other tests flush concurrently: `tests/flush_tally.rs`, a binary
-    /// of one test, checks every kind exactly.
+    /// Each [`plain_fsync`] call raises `plain` by one, whatever descriptor it is handed: a
+    /// regular file's `&File` twice, then a directory held as a bare `OwnedFd` and as a
+    /// `BorrowedFd` of it (the handle-relative trees aterm flushes). No other test of this
+    /// binary calls it, so that count is this test's alone, and a plain flush counted as
+    /// `full` or `barrier` instead falls short here. That it raises NO other count cannot
+    /// be read in this binary, whose other tests flush concurrently: `tests/flush_tally.rs`,
+    /// a binary of one test, checks every kind exactly.
     #[cfg(unix)]
     #[test]
     fn each_plain_fsync_raises_plain_by_one() {
+        use std::os::fd::{AsFd as _, OwnedFd};
         let dir = std::env::temp_dir().join(format!("astream-sys-plain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut f = File::create(dir.join("plain")).unwrap();
         std::io::Write::write_all(&mut f, b"handed to the drive").unwrap();
+        let folder = OwnedFd::from(File::open(&dir).unwrap());
         let before = flush_tally();
         let flushed = plain_fsync(&f).and_then(|()| plain_fsync(&f));
         let after = flush_tally();
+        let entries = plain_fsync(&folder).and_then(|()| plain_fsync(folder.as_fd()));
+        let after_dir = flush_tally();
         let _ = std::fs::remove_dir_all(&dir);
         flushed.expect("a regular file takes a plain fsync");
+        entries.expect("a directory's descriptor takes a plain fsync");
         assert_eq!(after.plain, before.plain + 2, "{before:?} -> {after:?}");
+        assert_eq!(
+            after_dir.plain,
+            after.plain + 2,
+            "{after:?} -> {after_dir:?}"
+        );
     }
 
     /// An interrupted flush is retried and never reported, and the first answer that is

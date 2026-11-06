@@ -1706,12 +1706,15 @@ pub fn clean_mode(m: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || "_.:-".contains(*c))
         .take(64)
         .collect();
-    let m = if kept.is_empty() {
+    let mut m = if kept.is_empty() {
         "ok".to_string()
     } else {
         kept
     };
-    m.strip_prefix("custom:").map_or(m.clone(), str::to_string)
+    if m.starts_with("custom:") {
+        m.drain(..7);
+    }
+    m
 }
 
 const LONG: &str = "This is a long canned reply from the lab stub, not a model. It exists so the transcript \
@@ -1761,11 +1764,16 @@ impl Request {
     }
 
     fn keep_alive(&self) -> bool {
-        let conn = self.header("connection").unwrap_or("").to_ascii_lowercase();
-        if conn.contains("close") {
+        let conn = self.header("connection").unwrap_or("");
+        let has = |needle: &[u8]| {
+            conn.as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+        };
+        if has(b"close") {
             return false;
         }
-        self.version == "HTTP/1.1" || conn.contains("keep-alive")
+        self.version == "HTTP/1.1" || has(b"keep-alive")
     }
 }
 

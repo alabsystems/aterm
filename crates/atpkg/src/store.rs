@@ -3468,6 +3468,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// On Unix each flush is one plain `fsync(2)`, aterm-durable's
+    /// (`platform::sync_file_contents` through `primitive::fsync`), which astream-sys counts
+    /// `plain` in `flush_tally`: the seam counts exactly this thread's seven, and the
+    /// process-wide tally moves by at least them (this binary's other tests flush meanwhile,
+    /// so only a bound reads there; aterm-durable's `tests/flush_tally.rs` holds the two
+    /// counts equal). A store flush that called the OS itself, as this one did through
+    /// `libc::fsync`, moves neither.
     #[test]
     fn sync_tree_flushes_every_file_and_directory_it_walks() {
         let home = temp_home("synctree");
@@ -3480,7 +3487,10 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("../lib/a.rlib", root.join("bin").join("link")).unwrap();
 
+        let recording = aterm_durable::seam::Recording::start();
+        let before = astream_sys::flush_tally();
         let synced = sync_tree(&root).unwrap();
+        let after = astream_sys::flush_tally();
         assert_eq!(
             synced.files, 3,
             "every regular file, and the symlink is not one"
@@ -3490,6 +3500,21 @@ mod tests {
             synced.dirs, dirs_expected,
             "the root, bin, lib and lib/nested — where a directory can be opened"
         );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                recording.take_plain(),
+                7,
+                "each file and directory: one plain fsync(2), aterm-durable's"
+            );
+            assert_eq!(recording.take(), [], "a plain flush is no Flush");
+            assert!(
+                after.plain >= before.plain + 7,
+                "astream-sys counted the store's flushes: {before:?} -> {after:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = (recording, before, after);
 
         assert!(sync_tree(&home.join("absent")).is_err());
         let _ = std::fs::remove_dir_all(&home);

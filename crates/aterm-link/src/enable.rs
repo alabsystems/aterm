@@ -31,6 +31,9 @@ pub const SUN_PATH_MAX: usize = 104;
 pub const MINT_SECRET: &str = "mint.secret";
 /// The log's file name in a fabric root.
 pub(crate) const BUS_LOG: &str = "bus.log";
+/// The log's socket in a fabric root: whoever hosts [`BUS_LOG`] (a broker job, or the node
+/// service) serves it here, beside it.
+pub(crate) const BUS_SOCK: &str = "bus.sock";
 
 /// A mint secret is 32 bytes.
 pub use astream_cap::capfile::SECRET_MIN as SECRET_LEN;
@@ -91,9 +94,27 @@ fn off_recorded(root: &Path, kept: Option<&Path>) -> Option<PathBuf> {
 pub const DEFAULT_RECORD: &str = "fabric-by-default";
 
 /// The record `aterm fabric on --service none` leaves in the fabric root: the person runs the
-/// broker, so the converge pass renews no job an earlier `on` installed there. An `on` that hands
-/// the broker to launchd or systemd takes it out.
+/// broker, so the converge pass renews no job an earlier `on` installed there, and the node
+/// service hosts no `bus.log` there ([`BusHosting::Hand`]). An `on` that hands the broker to
+/// launchd, systemd or the node service takes it out.
 pub const HAND_RECORD: &str = "fabric-service-none";
+
+/// The record in the fabric root that names the tier the node service hosts `bus.log` at (one
+/// word: `strict`, `ordered` or `relaxed`, as `Durability::parse` reads it), written by
+/// `aterm fabric on --durability` under `Service::Node` and by [`retire_broker_job`] from the
+/// retired job's argv; absent, the tier is a guarded root's default
+/// (`durability::resolve(None, true)`).
+pub const DURABILITY_RECORD: &str = "fabric-durability";
+
+/// The node service's launchd label and systemd unit name, which hosts `bus.log` under
+/// [`Service::Node`] (`aterm_agent::node_service::NODE_LABEL`, a crate above this one).
+pub const NODE_JOB: &str = "systems.alab.aterm-node";
+
+/// The words after the program in the node service's argv: [`NODE_JOB`]'s plist and unit run
+/// `<aterm> node serve` (`aterm_agent::node_service`, a crate above this one). `aterm fabric`
+/// reads a process holding `bus.sock` with these words as the node service
+/// ([`fabric::Host::NodeService`]).
+pub const NODE_SERVE: [&str; 2] = ["node", "serve"];
 
 /// The lock in the fabric root that `aterm fabric on`, `aterm fabric off`, the converge pass's
 /// turn-on and its broker renewal hold, one at a time: an off never lands midway through a turn-on
@@ -219,29 +240,37 @@ pub enum Service {
     Systemd,
     /// Nobody here: the broker is expected to be running already.
     None,
+    /// The node service ([`NODE_JOB`]) hosts `bus.log` in its own process ([`bus_hosting`]): no
+    /// broker job is installed, renewed or kept, and one an earlier build installed is retired
+    /// ([`retire_broker_job`]) by the node service at its next pass (design §4.13).
+    Node,
 }
 
 impl Service {
     /// Parse the `--service` word.
     ///
     /// # Errors
-    /// A word that is not one of the three.
+    /// A word that is not one of the four.
     pub fn parse(word: &str) -> Result<Self, String> {
         match word {
             "launchd" => Ok(Service::Launchd),
             "systemd" => Ok(Service::Systemd),
             "none" => Ok(Service::None),
+            "node" => Ok(Service::Node),
             other => Err(format!(
-                "--service {}: launchd, systemd or none",
+                "--service {}: launchd, systemd, none or node",
                 safe(other, 32)
             )),
         }
     }
 
-    /// The platform's supervisor.
+    /// Who keeps the broker by default: the node service where the mesh is on (`mesh`, which a
+    /// caller reads once from `aterm_types::mesh_switch::MESH`), else the platform's supervisor.
     #[must_use]
-    pub const fn default_here() -> Self {
-        if cfg!(target_os = "macos") {
+    pub const fn default_for(mesh: bool) -> Self {
+        if mesh {
+            Service::Node
+        } else if cfg!(target_os = "macos") {
             Service::Launchd
         } else if cfg!(target_os = "linux") {
             Service::Systemd
@@ -250,11 +279,18 @@ impl Service {
         }
     }
 
+    /// [`Service::default_for`] this build's mesh switch (`aterm_types::mesh_switch::MESH`).
+    #[must_use]
+    pub const fn default_here() -> Self {
+        Self::default_for(aterm_types::mesh_switch::MESH)
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Service::Launchd => "launchd",
             Service::Systemd => "systemd",
             Service::None => "none",
+            Service::Node => "node",
         }
     }
 }
@@ -406,7 +442,7 @@ impl Paths {
     }
 
     fn sock(&self) -> String {
-        self.root.join("bus.sock").to_string_lossy().into_owned()
+        self.root.join(BUS_SOCK).to_string_lossy().into_owned()
     }
     fn log(&self) -> String {
         self.root.join(BUS_LOG).to_string_lossy().into_owned()
@@ -809,6 +845,26 @@ fn supervised_argv(argv: Vec<String>) -> Option<Vec<String>> {
 pub struct Role {
     /// The configured fleet.
     pub fleet: Option<String>,
+    /// Who keeps its bus up, which every remedy [`fix_for`] gives is worded for: [`Role::of`]
+    /// leaves [`Keeper::Job`], and `aterm fabric doctor` sets what its report read
+    /// ([`fabric::BrokerView::keeper`]).
+    pub keeper: Keeper,
+}
+
+/// Who keeps a fabric root's bus up: who opens `bus.log`, serves `bus.sock`, and opens them
+/// again. A remedy names only what the person can do to that keeper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Keeper {
+    /// A broker process (`aterm link broker`): the job `on` installed ([`Service::Launchd`],
+    /// [`Service::Systemd`]), whose supervisor starts it again when it exits and whose stderr
+    /// is `<root>/broker.err`, or one a person runs by hand ([`Service::None`]).
+    #[default]
+    Job,
+    /// The node service ([`NODE_JOB`], [`Service::Node`]) hosts `bus.log` in its own process: its
+    /// keeper opens the log within seconds of the fabric being on, reopens it in process when it
+    /// is poisoned or its socket no longer names it, and closes it at `aterm fabric off`; no
+    /// broker job runs, and no `broker.err` is its.
+    Node,
 }
 
 /// Why [`Role::of`] refused a root.
@@ -867,7 +923,10 @@ impl Role {
         }
         let fleet = configured_fleet(p.config.as_deref(), rendezvous.as_ref())?;
         installed_job_is_a_broker(p)?;
-        Ok(Role { fleet })
+        Ok(Role {
+            fleet,
+            keeper: Keeper::Job,
+        })
     }
 
     fn fleet(&self) -> Option<&str> {
@@ -1035,16 +1094,37 @@ fn installed_job(p: &Paths) -> Result<Option<(Service, Vec<String>)>, RoleError>
     })
 }
 
+/// The tier `p`'s root keeps, and what keeps it: [`DURABILITY_RECORD`] where it stands and is
+/// newer than the installed broker job's file ([`record_is_newer`]), else the tier that job's argv
+/// names (`None`: none, so the guarded default), else none.
+///
+/// # Errors
+/// The installed job cannot be read, or its argv is not a broker's whose tier can be told.
 fn kept_durability(
     p: &Paths,
 ) -> Result<(Option<crate::durability::Durability>, Option<String>), String> {
+    let recorded = recorded_durability(&p.root).map(|tier| {
+        (
+            Some(tier),
+            Some(p.root.join(DURABILITY_RECORD).display().to_string()),
+        )
+    });
     let Some((service, argv)) = installed_job(p).map_err(|e| e.to_string())? else {
-        return Ok((None, None));
+        return Ok(recorded.unwrap_or((None, None)));
     };
-    let job = match service {
-        Service::Systemd => format!("the systemd --user unit {}", p.unit().display()),
-        _ => format!("the launchd job {}", p.plist().display()),
+    let (file, job) = match service {
+        Service::Systemd => (
+            p.unit(),
+            format!("the systemd --user unit {}", p.unit().display()),
+        ),
+        _ => (
+            p.plist(),
+            format!("the launchd job {}", p.plist().display()),
+        ),
     };
+    if let Some(recorded) = recorded.filter(|_| record_is_newer(&p.root, Some(&file))) {
+        return Ok(recorded);
+    }
     let named = crate::durability::Durability::named_of_argv(&argv)
         .ok_or_else(|| format!("{job}: cannot determine the broker durability from its argv"))?;
     Ok((named, Some(job)))
@@ -2241,7 +2321,7 @@ fn record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
 }
 
 /// Leave [`HAND_RECORD`] in `p`'s root where `on` runs with `--service none` (`service`), and
-/// take it out where it hands the broker to launchd or systemd.
+/// take it out where it hands the broker to launchd, systemd or the node service.
 fn hand_record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
     let record = p.root.join(HAND_RECORD);
     let there = match record_in_owned_dir(&record) {
@@ -2484,7 +2564,8 @@ pub enum ByDefault {
     TurnedOn(String),
 }
 
-/// Turn the fabric on as `aterm fabric on` does with no flags (the platform's broker job, the
+/// Turn the fabric on as `aterm fabric on` does with no flags (this build's default service: the
+/// platform's broker job, or with the mesh on no job, the node service hosting `bus.log`; the
 /// fleet and durability the root keeps), its step lines kept rather than printed, and no proof
 /// (which would leave a note in a session's inbox nobody asked for): the converge pass's
 /// `sync.fabric` where the fabric was never turned off ([`unset_state`] reads [`Unset::Never`]),
@@ -2495,18 +2576,28 @@ pub enum ByDefault {
 /// The state cannot be read, `on` cannot resolve its paths, or a step failed (what the steps
 /// said).
 pub fn turn_on_by_default() -> Result<ByDefault, String> {
+    turn_on_by_default_with(Service::default_here())
+}
+
+/// [`turn_on_by_default`] with `service` keeping the broker ([`Service::default_for`] the
+/// caller's mesh switch, read once): under [`Service::Node`] the same steps install no job and
+/// wait for the node service to host `bus.log`.
+///
+/// # Errors
+/// As [`turn_on_by_default`].
+pub fn turn_on_by_default_with(service: Service) -> Result<ByDefault, String> {
     match unset_state()? {
         None => return Ok(ByDefault::On),
         Some(Unset::PersonOff(why)) => return Ok(ByDefault::Left(why)),
         Some(Unset::Never(_)) => {}
     }
     let opts = OnOpts::default();
-    let prepared = prepare_on(&opts)?;
+    let prepared = prepare_on(&opts, mesh_keys())?;
     by_default_in(
         &prepared.p.root,
         kept_off_record(&prepared.p).as_deref(),
         &|| configured_command().map(|command| command.is_some()),
-        |out| on_steps(&prepared, &opts, Service::default_here(), out, Proof::Skip).map(|_| ()),
+        |out| on_steps(&prepared, &opts, service, out, Proof::Skip).map(|_| ()),
     )
 }
 
@@ -2688,6 +2779,65 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
         return false;
     }
     true
+}
+
+/// `on`'s node step with the mesh on (§11 C3): the node this Mac's node key in `keys` names,
+/// recorded in the state dir `state`, which held `held`. No key fails the step: the node service
+/// writes it as it starts.
+fn mesh_node_step(
+    keys: &Path,
+    state: &Path,
+    held: Option<String>,
+    dry_run: bool,
+    out: &mut Out,
+) -> Result<String, ExitCode> {
+    let node = match crate::federate::node_of_key(keys) {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            out.fail(
+                "node",
+                &format!(
+                    "{} holds no node key: the node service writes it as it starts (`aterm node \
+                     on`), and this step names this Mac's node by it",
+                    keys.join(crate::federate::NODE_KEY_FILE).display()
+                ),
+            );
+            return Err(ExitCode::from(2));
+        }
+        Err(e) => {
+            out.fail("node", &e.to_string());
+            return Err(ExitCode::from(2));
+        }
+    };
+    if held.as_deref() == Some(node.as_str()) {
+        out.already(
+            "node",
+            &format!(
+                "{node}, named by this Mac's node key ({}/node)",
+                state.display()
+            ),
+        );
+        return Ok(node);
+    }
+    let would = format!(
+        "record {node}, named by this Mac's node key, in {}/node{}",
+        state.display(),
+        held.map_or_else(String::new, |h| format!(" (it held {})", safe(&h, 64)))
+    );
+    if dry_run {
+        out.done("node", &would, "");
+        return Ok(node);
+    }
+    match crate::state::StateDir::open(state).and_then(|s| s.name_node(&node)) {
+        Ok(_) => {
+            out.done("node", &would, &format!("recorded {node}"));
+            Ok(node)
+        }
+        Err(e) => {
+            out.fail("node", &format!("{}/node: {e}", state.display()));
+            Err(ExitCode::from(2))
+        }
+    }
 }
 
 /// Record `node` in the state dir, and say where a node file that held something else was kept.
@@ -3367,15 +3517,24 @@ fn systemd_main_pid(label: &str) -> Option<u32> {
     crate::parse_uint::<u32>(String::from_utf8_lossy(&out.stdout).trim()).filter(|&pid| pid != 0)
 }
 
+/// Why the process serving `p`'s socket is not what `p` asks for, `None` where it is: a replaced
+/// build, no capability checked, or another tier. A broker's tier is the one its argv names
+/// against the one `p` names; the node service's argv names none, so its tier is the one its log
+/// was opened at ([`fabric::BrokerView::tier`]: its health snapshot, else its `Hello`) against the
+/// one it hosts the root at ([`node_tier`]).
 fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
     use crate::durability::Durability;
+    let (running, wanted) = match view.host {
+        Some(fabric::Host::NodeService) => (view.tier(), node_tier(&p.root)),
+        Some(fabric::Host::LinkBroker) | None => (view.durability, p.tier()),
+    };
     if view.replaced.is_some() {
         Some("it runs a replaced build")
     } else if view.guarded == Some(false) {
         Some("it checks no capability")
     } else {
-        match view.durability {
-            Some(running) if running != p.tier() => Some(match running {
+        match running {
+            Some(running) if running != wanted => Some(match running {
                 Durability::Strict => "it runs at durability strict",
                 Durability::Ordered => "it runs at durability ordered",
                 Durability::Relaxed => "it runs at durability relaxed",
@@ -3440,6 +3599,14 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
         }
     }
     match service {
+        Service::Node => node_broker_step(
+            p,
+            named,
+            Service::default_for(false),
+            &LiveLaunchd,
+            || wait_for_broker(p, node),
+            out,
+        ),
         Service::None => {
             let view = probe(p, node);
             let kept;
@@ -3727,6 +3894,423 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
     }
 }
 
+/// Whether, and how, the node service hosts `bus.log` at a fabric root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusHosting {
+    /// No fabric is provisioned here: the root holds no `mint.secret`.
+    Unprovisioned,
+    /// The person turned the fabric off (an off record stands, in the root or beside aterm.toml).
+    Off,
+    /// `aterm fabric on --service none` left [`HAND_RECORD`]: the person runs the broker.
+    Hand,
+    /// The fabric is on: host `bus.log` for `fleet` (the mesh's one fleet,
+    /// [`crate::federate::FLEET`], §11 C3) at `tier` ([`DURABILITY_RECORD`], else the guarded
+    /// default).
+    On {
+        fleet: String,
+        tier: crate::durability::Durability,
+    },
+}
+
+/// How the node service hosts `bus.log` at `p.root` now: read each time (cheap: a few stats).
+/// It hosts it only with the mesh on, so for the mesh's one fleet, whatever fleet an earlier
+/// bridge command named (§11 C3).
+///
+/// A root that is not a directory this user owns, or a mint secret that is a link to nothing,
+/// reads as unprovisioned; a tier record that cannot be read is the guarded default. Call [`retire_broker_job`] first: a job an earlier build
+/// installed holds `bus.log` until it is retired, and its retirement records the tier it ran at.
+#[must_use]
+pub fn bus_hosting(p: &Paths) -> BusHosting {
+    if !record_in_owned_dir(&p.secret()).unwrap_or(false) {
+        return BusHosting::Unprovisioned;
+    }
+    if off_recorded(&p.root, kept_off_record(p).as_deref()).is_some() {
+        return BusHosting::Off;
+    }
+    if record_in_owned_dir(&p.root.join(HAND_RECORD)).unwrap_or(false) {
+        return BusHosting::Hand;
+    }
+    BusHosting::On {
+        fleet: crate::federate::FLEET.to_owned(),
+        tier: recorded_durability(&p.root)
+            .unwrap_or_else(|| crate::durability::resolve(None, true)),
+    }
+}
+
+/// The tier the node service hosts `root`'s `bus.log` at: [`DURABILITY_RECORD`]'s, else a
+/// guarded root's default, as [`bus_hosting`] reads it.
+fn node_tier(root: &Path) -> crate::durability::Durability {
+    recorded_durability(root).unwrap_or_else(|| crate::durability::resolve(None, true))
+}
+
+/// The tier [`DURABILITY_RECORD`] in `root` names; `None` where there is none, or where it is
+/// not a private file holding one tier's word.
+fn recorded_durability(root: &Path) -> Option<crate::durability::Durability> {
+    let bytes = aterm_uds::private_file::read_private(root, DURABILITY_RECORD, 64).ok()?;
+    crate::durability::Durability::parse(std::str::from_utf8(&bytes).ok()?.trim()).ok()
+}
+
+/// Write `tier` to [`DURABILITY_RECORD`] in the private directory `root` (0600, atomically).
+fn write_durability_record(root: &Path, tier: crate::durability::Durability) -> Result<(), String> {
+    aterm_uds::private_file::write_private(
+        root,
+        DURABILITY_RECORD,
+        format!("{}\n", tier.name()).as_bytes(),
+    )
+    .map_err(|e| format!("{}: {e}", root.join(DURABILITY_RECORD).display()))
+}
+
+/// Whether [`DURABILITY_RECORD`] stands in `root` and was written after the broker job's file
+/// `job` (its plist or unit; `None` or missing: no file, so the record is newer). The newer of
+/// the two names the root's tier: a person's `aterm fabric on --durability` under the node
+/// service is newer than any job, and an older build's `on` that rewrote the job after the
+/// record (a build without the mesh, run between two that have it) is newer than the record.
+fn record_is_newer(root: &Path, job: Option<&Path>) -> bool {
+    let modified = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let Some(record) = modified(&root.join(DURABILITY_RECORD)) else {
+        return false;
+    };
+    job.and_then(modified).is_none_or(|job| record > job)
+}
+
+/// Record what a broker job's argv named (`named`: a tier, `Some(None)` none, so the guarded
+/// default; `None` an argv that could not be read, which changes nothing) in `root`'s
+/// [`DURABILITY_RECORD`], unless the record there is newer than the job's file `job`
+/// ([`record_is_newer`]). A job that named no tier takes out an older record.
+fn record_job_tier(
+    root: &Path,
+    named: Option<Option<crate::durability::Durability>>,
+    job: Option<&Path>,
+) -> Result<(), String> {
+    let Some(named) = named else {
+        return Ok(());
+    };
+    if record_is_newer(root, job) {
+        return Ok(());
+    }
+    match named {
+        Some(tier) => write_durability_record(root, tier),
+        None => aterm_uds::private_file::remove_private(root, DURABILITY_RECORD)
+            .map(|_| ())
+            .map_err(|e| format!("{}: {e}", root.join(DURABILITY_RECORD).display())),
+    }
+}
+
+/// What [`retire_broker_job`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetiredJob {
+    /// No broker job was loaded or installed for this root.
+    Absent,
+    /// The job `label` was booted out, its process waited for until gone (it holds bus.log's lock
+    /// until it exits), and its plist or unit removed; `tier` is the tier its argv named, which was
+    /// written to [`DURABILITY_RECORD`] first.
+    Retired {
+        label: String,
+        tier: Option<crate::durability::Durability>,
+    },
+}
+
+/// Retire the separate broker job of `p.root` (launchd on macOS, systemd --user on Linux): the
+/// node service hosts bus.log in its stead (design §4.13). Idempotent: with no job loaded and no
+/// plist or unit on disk it answers `Absent` and runs nothing else.
+///
+/// The tier its argv named is written to [`DURABILITY_RECORD`] before anything is stopped, unless
+/// a record stands that is newer than the job's file ([`record_is_newer`]), which names the tier
+/// already; an argv that named none takes out an older record.
+///
+/// # Errors
+/// A bootout or disable that failed, a job that did not go within the existing `until_gone`
+/// bound, or a plist/unit that could not be removed, each naming what to do.
+pub fn retire_broker_job(p: &Paths) -> Result<RetiredJob, String> {
+    retire_with(
+        p,
+        Service::default_for(false),
+        &LiveLaunchd,
+        &systemctl,
+        &systemd_main_pid,
+    )
+}
+
+/// [`retire_broker_job`] under `supervisor` (the platform's: launchd or systemd), launchd driven
+/// through `lc`, systemd through `systemctl` and `main_pid` (the pid its unit runs: `None` for
+/// none, or no user manager). `lc` also tells whether a process still runs and paces each wait.
+fn retire_with(
+    p: &Paths,
+    supervisor: Service,
+    lc: &dyn Launchd,
+    systemctl: &dyn Fn(&[&str]) -> Result<(), String>,
+    main_pid: &dyn Fn(&str) -> Option<u32>,
+) -> Result<RetiredJob, String> {
+    let label = p.label();
+    match supervisor {
+        Service::Launchd => retire_launchd(p, &label, lc),
+        Service::Systemd => retire_systemd(p, &label, lc, systemctl, main_pid),
+        Service::None | Service::Node => Ok(RetiredJob::Absent),
+    }
+}
+
+/// [`retire_with`]'s launchd job `label`: asked once (`print`); a job launchd holds, or may hold
+/// (a `print` that said nothing), is booted out by domain and waited for until launchd lets it
+/// go ([`let_go`]) and the pid it ran exits ([`until_gone`]); then its plist goes. A bootout that
+/// fails is the error only where launchd still holds the job, or may, after it.
+fn retire_launchd(p: &Paths, label: &str, lc: &dyn Launchd) -> Result<RetiredJob, String> {
+    let plist = p.plist();
+    let (code, printed) = lc.print(label);
+    let job = job_of(code, &printed);
+    let held = matches!(job, LaunchdJob::Loaded(_) | LaunchdJob::Unread);
+    let on_disk = std::fs::symlink_metadata(&plist).is_ok();
+    if !held && !on_disk {
+        return Ok(RetiredJob::Absent);
+    }
+    let named = read_bounded_string(&plist, 1024 * 1024)
+        .ok()
+        .and_then(|text| plist_program_arguments(&collapse_between_tags(&text)))
+        .and_then(supervised_argv)
+        .or_else(|| printed_arguments(&printed))
+        .and_then(|argv| crate::durability::Durability::named_of_argv(&argv));
+    record_job_tier(&p.root, named, on_disk.then_some(plist.as_path()))?;
+    let domain = format!("gui/{}/{label}", uid());
+    let waited = (GONE_POLL * GONE_POLLS).as_secs();
+    if held {
+        // By domain, with no legacy `unload` fallback: that acts on the caller's domain and exits
+        // 0 whatever it did.
+        if let Err(e) = lc.run(&["bootout", &domain]) {
+            if !matches!(lc.job(label), LaunchdJob::Absent | LaunchdJob::NoGuiLogin) {
+                return Err(format!(
+                    "launchd holds {domain} (or did not say), and its bootout failed: {e}; the \
+                     node service tries again at its next pass (`launchctl bootout {domain}` \
+                     retires it by hand)"
+                ));
+            }
+        }
+        if !let_go(lc, label) {
+            return Err(format!(
+                "launchd still held {domain} {waited} s after its bootout, so its broker may \
+                 still hold bus.log: the node service tries again at its next pass"
+            ));
+        }
+        if let LaunchdJob::Loaded(Some(pid)) = job {
+            if !until_gone(lc, || !lc.running(pid)) {
+                return Err(format!(
+                    "pid {pid} of {domain} still ran {waited} s after launchd let it go, holding \
+                     bus.log's lock: `kill {pid}` ends it, and the node service opens the log \
+                     at its next pass"
+                ));
+            }
+        }
+    }
+    match std::fs::remove_file(&plist) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "{}: {e}; launchd loads it again at the next login, so remove it by hand",
+                plist.display()
+            ));
+        }
+    }
+    Ok(RetiredJob::Retired {
+        label: label.to_owned(),
+        tier: named.flatten(),
+    })
+}
+
+/// [`retire_with`]'s systemd user unit `label`: one with a unit file is disabled and stopped
+/// (`disable --now`, which returns once its stop job ends), one whose file is gone stopped alone;
+/// the pid it ran is waited for until it exits, then its unit file goes and systemd reloads.
+fn retire_systemd(
+    p: &Paths,
+    label: &str,
+    lc: &dyn Launchd,
+    systemctl: &dyn Fn(&[&str]) -> Result<(), String>,
+    main_pid: &dyn Fn(&str) -> Option<u32>,
+) -> Result<RetiredJob, String> {
+    let unit = p.unit();
+    let on_disk = std::fs::symlink_metadata(&unit).is_ok();
+    let pid = main_pid(label);
+    if !on_disk && pid.is_none() {
+        return Ok(RetiredJob::Absent);
+    }
+    let named = read_bounded_string(&unit, 1024 * 1024)
+        .ok()
+        .and_then(|text| unit_argv(&text))
+        .and_then(|argv| crate::durability::Durability::named_of_argv(&argv));
+    record_job_tier(&p.root, named, on_disk.then_some(unit.as_path()))?;
+    let stop: &[&str] = if on_disk {
+        &["disable", "--now", label]
+    } else {
+        &["stop", label]
+    };
+    systemctl(stop).map_err(|e| {
+        format!(
+            "{e}; the node service tries again at its next pass (`systemctl --user {}` retires \
+             it by hand)",
+            stop.join(" ")
+        )
+    })?;
+    if let Some(pid) = pid {
+        if !until_gone(lc, || !lc.running(pid)) {
+            return Err(format!(
+                "pid {pid} of systemd --user {label} still ran {} s after it was stopped, \
+                 holding bus.log's lock: `kill {pid}` ends it, and the node service opens the \
+                 log at its next pass",
+                (GONE_POLL * GONE_POLLS).as_secs()
+            ));
+        }
+    }
+    match std::fs::remove_file(&unit) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "{}: {e}; remove it by hand, then `systemctl --user daemon-reload`",
+                unit.display()
+            ));
+        }
+    }
+    // A reload that fails leaves systemd naming a unit with no file, which starts nothing.
+    let _ = systemctl(&["daemon-reload"]);
+    Ok(RetiredJob::Retired {
+        label: label.to_owned(),
+        tier: named.flatten(),
+    })
+}
+
+/// A broker job of `p`'s root that the node service has not retired yet, under `supervisor` (the
+/// platform's), as a line names it; `None` where there is none. launchd is asked once, by `lc`.
+fn legacy_job(p: &Paths, supervisor: Service, lc: &dyn Launchd) -> Option<String> {
+    let label = p.label();
+    match supervisor {
+        Service::Launchd => match lc.job(&label) {
+            LaunchdJob::Loaded(pid) => Some(format!(
+                "launchd {label}{}",
+                pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
+            )),
+            _ => std::fs::symlink_metadata(p.plist()).is_ok().then(|| {
+                format!(
+                    "{} (launchd loads it at the next login)",
+                    p.plist().display()
+                )
+            }),
+        },
+        Service::Systemd => std::fs::symlink_metadata(p.unit())
+            .is_ok()
+            .then(|| format!("systemd --user {label} ({})", p.unit().display())),
+        Service::None | Service::Node => None,
+    }
+}
+
+/// Record the tier `on --durability` named (`p.durability`) in [`DURABILITY_RECORD`], where the
+/// node service reads it ([`bus_hosting`]): `already` where the record names it.
+fn durability_record_step(p: &Paths, out: &mut Out) -> bool {
+    let tier = p.tier();
+    let record = p.root.join(DURABILITY_RECORD);
+    if recorded_durability(&p.root) == Some(tier) {
+        out.already("record", &format!("{} ({})", record.display(), tier.name()));
+        return true;
+    }
+    out.done(
+        "record",
+        &format!(
+            "write {} ({}: the tier the node service hosts bus.log at)",
+            record.display(),
+            tier.name()
+        ),
+        &format!("wrote {} ({})", record.display(), tier.name()),
+    );
+    if out.dry_run {
+        return true;
+    }
+    match write_durability_record(&p.root, tier) {
+        Ok(()) => true,
+        Err(e) => {
+            out.fail("record", &e);
+            false
+        }
+    }
+}
+
+/// `on`'s broker step under [`Service::Node`]: no plist or unit is written and nothing is
+/// bootstrapped. A tier `on --durability` named (`named`) is recorded
+/// ([`durability_record_step`]); a broker job an earlier build installed (`supervisor`'s, launchd
+/// asked by `lc`) is said and left for the node service to retire at its next pass, since
+/// booting it out here would leave the Mac with no bus until the node service opens the log;
+/// then `wait` waits for a broker to answer on `<root>/bus.sock` ([`wait_for_broker`]), which the
+/// node service's keeper opens within seconds of the root's mint secret. A dry run waits for
+/// nothing.
+fn node_broker_step(
+    p: &Paths,
+    named: bool,
+    supervisor: Service,
+    lc: &dyn Launchd,
+    wait: impl FnOnce() -> Result<fabric::BrokerView, Box<fabric::BrokerView>>,
+    out: &mut Out,
+) -> bool {
+    let sock = p.sock();
+    if named && !durability_record_step(p, out) {
+        return false;
+    }
+    if let Some(job) = legacy_job(p, supervisor, lc) {
+        out.note(
+            "broker",
+            &format!(
+                "{job} is the separate broker job an earlier build installed: the node service \
+                 ({NODE_JOB}) retires it at its next pass and hosts bus.log in its stead"
+            ),
+        );
+    }
+    if out.dry_run {
+        out.note(
+            "broker",
+            &format!(
+                "no job: the node service ({NODE_JOB}) hosts bus.log on {sock}; the real run \
+                 waits for it to answer"
+            ),
+        );
+        return true;
+    }
+    match wait() {
+        Ok(view) => {
+            out.ok(
+                "broker",
+                &format!(
+                    "the node service ({NODE_JOB}) hosts bus.log: {sock} answers{} ({} ms)",
+                    view.pid
+                        .map_or_else(String::new, |pid| format!(", pid {pid}")),
+                    view.rtt_ms.unwrap_or(0)
+                ),
+            );
+            if let Some(why) = not_current(p, &view) {
+                out.warn(
+                    "broker",
+                    &format!(
+                        "{why}: the node service ({NODE_JOB}) hosts bus.log at {} once it opens \
+                         the log again (`aterm node status` says what it runs)",
+                        node_tier(&p.root).name()
+                    ),
+                );
+            }
+            true
+        }
+        Err(view) => {
+            let line = unread_broker(&sock, &view).unwrap_or_else(|| {
+                format!(
+                    "the node service ({NODE_JOB}) did not bring {sock} up: {} — `aterm node \
+                     status` says whether it runs, and `aterm node on` (or the converge pass's \
+                     `sync.node`) installs and starts it",
+                    no_answer(&view)
+                )
+            });
+            out.fail("broker", &line);
+            false
+        }
+    }
+}
+
 /// What [`renew_replaced_broker`] found, and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerRenewal {
@@ -3792,7 +4376,42 @@ struct Found {
 /// aterm.toml, the root's role or installed job, or the command cannot be read, or the step
 /// failed (what it said).
 pub fn renew_replaced_broker(renew: Renew) -> Result<BrokerRenewal, String> {
-    renew_with(configured_command()?, renew, look_at, step_on)
+    renew_replaced_broker_with(renew, Service::default_here())
+}
+
+/// [`renew_replaced_broker`] with `service` keeping the broker ([`Service::default_for`] the
+/// caller's mesh switch, read once): under [`Service::Node`] a configured fabric reads
+/// [`BrokerRenewal::Kept`] and nothing is looked at or stepped ([`renew_under`]).
+///
+/// # Errors
+/// As [`renew_replaced_broker`].
+pub fn renew_replaced_broker_with(renew: Renew, service: Service) -> Result<BrokerRenewal, String> {
+    renew_under(service, configured_command()?, renew, look_at, step_on)
+}
+
+/// Why nothing renews a broker under [`Service::Node`].
+const NODE_HOSTS: &str = "the node service (systems.alab.aterm-node) hosts bus.log and renews it \
+     itself, and retires a broker job an earlier build installed: no job to install or renew \
+     (`sync.node` keeps the node service)";
+
+/// [`renew_with`] under `service`: [`Service::Node`] hosts `bus.log` in the node service, so a
+/// configured `command` reads [`BrokerRenewal::Kept`] ([`NODE_HOSTS`]) with no look and no step,
+/// whatever the root holds (a job an earlier build installed included); no command still reads
+/// [`BrokerRenewal::Off`], which the pass's turn-on reads further.
+fn renew_under(
+    service: Service,
+    command: Option<Vec<String>>,
+    renew: Renew,
+    look: impl FnOnce(&[String]) -> Result<Found, String>,
+    step: impl FnOnce(&Found) -> Result<String, String>,
+) -> Result<BrokerRenewal, String> {
+    if service == Service::Node {
+        return Ok(match command {
+            None => BrokerRenewal::Off,
+            Some(_) => BrokerRenewal::Kept(NODE_HOSTS.to_owned()),
+        });
+    }
+    renew_with(command, renew, look, step)
 }
 
 /// The configured fabric command as the app reads it (`[fabric] command` in aterm.toml), `None`
@@ -3899,7 +4518,7 @@ fn unserved(found: &Found, why: &str) -> String {
     let sock = safe(&found.view.endpoint, 256);
     let label = found.p.label();
     let job = match (found.service, &found.loaded, found.job) {
-        (Service::None, ..) | (_, Err(_), _) => String::new(),
+        (Service::None | Service::Node, ..) | (_, Err(_), _) => String::new(),
         (Service::Launchd, Ok(false), _) => {
             format!(", and launchd has not loaded {label}, the job `aterm fabric on` installed")
         }
@@ -4020,7 +4639,7 @@ fn look_at(command: &[String]) -> Result<Found, String> {
             launchd_disabled(&label),
         ),
         Service::Systemd => systemd_state(systemd_unit(&label)),
-        Service::None => (None, Ok(false), false),
+        Service::None | Service::Node => (None, Ok(false), false),
     };
     let mut view = fabric::BrokerView {
         endpoint: cfg.broker,
@@ -4578,11 +5197,41 @@ struct Prepared {
     p: Paths,
     job_durability: Option<crate::durability::Durability>,
     durability_job: Option<String>,
+    /// With the mesh on (§11 C3): aterm's state folder, whose node key names this Mac's node.
+    mesh: Option<PathBuf>,
+}
+
+/// aterm's state folder with the mesh on, whose node key names this Mac's node (§11 C3); `None`
+/// with the mesh off, or where no state folder resolves.
+fn mesh_keys() -> Option<PathBuf> {
+    aterm_types::mesh_switch::MESH
+        .then(aterm_types::dirs::state_dir)
+        .flatten()
 }
 
 /// Resolve `on`'s paths for `opts`: the fleet the root already belongs to (a different
-/// `--fleet` refused) and the durability its installed job names.
-fn prepare_on(opts: &OnOpts) -> Result<Prepared, String> {
+/// `--fleet` refused) and the durability its installed job names. With the mesh on (`mesh`,
+/// aterm's state folder) the fleet is the mesh's one fleet whatever the root served before, and
+/// a `--fleet` naming another is refused.
+fn prepare_on(opts: &OnOpts, mesh: Option<PathBuf>) -> Result<Prepared, String> {
+    if mesh.is_some() {
+        let one = crate::federate::FLEET;
+        if opts.fleet.as_deref().is_some_and(|asked| asked != one) {
+            return Err(format!(
+                "with the mesh on every Mac serves the one fleet {one}: drop --fleet"
+            ));
+        }
+        let mut p = Paths::resolve(Some(one))?;
+        let (job_durability, durability_job) = kept_durability(&p)
+            .map_err(|e| format!("cannot read the installed broker job: {e}"))?;
+        p.durability = opts.durability.or(job_durability);
+        return Ok(Prepared {
+            p,
+            job_durability,
+            durability_job,
+            mesh,
+        });
+    }
     let mut p = Paths::resolve(opts.fleet.as_deref())?;
     let role = Role::of(&p).map_err(|e| format!("cannot determine the existing role: {e}"))?;
     if let Some(fleet) = role.fleet() {
@@ -4601,13 +5250,14 @@ fn prepare_on(opts: &OnOpts) -> Result<Prepared, String> {
         p,
         job_durability,
         durability_job,
+        mesh,
     })
 }
 
 /// `aterm fabric on`.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn on(opts: &OnOpts) -> ExitCode {
-    let prepared = match prepare_on(opts) {
+    let prepared = match prepare_on(opts, mesh_keys()) {
         Ok(prepared) => prepared,
         Err(e) => {
             eprintln!("aterm fabric on: {e}");
@@ -4675,6 +5325,29 @@ struct Proved {
     ran: bool,
 }
 
+/// A node-hosted fabric needs a service that policy permits to run.
+fn node_host_refusal(service: Service, under_ci: bool, node_off: bool) -> Option<&'static str> {
+    if service != Service::Node {
+        return None;
+    }
+    if under_ci {
+        Some("fabric cannot start: under CI the node service does not run")
+    } else if node_off {
+        Some("fabric cannot start: `aterm node off` prevents its host; `aterm node on` enables it")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn node_fabric_requires_a_host_permitted_to_run() {
+    assert!(node_host_refusal(Service::Node, false, false).is_none());
+    assert!(node_host_refusal(Service::Node, true, false).is_some());
+    assert!(node_host_refusal(Service::Node, false, true).is_some());
+    // Negative control: a separately hosted fabric does not require the node job.
+    assert!(node_host_refusal(Service::None, true, true).is_none());
+}
+
 /// Every step of `on` for `prepared` on `out`, from the socket check to the armed instances and,
 /// where `proof` says, the proof: how the proof went, or the exit a step that stopped the run
 /// ends it with (its line already said why).
@@ -4685,10 +5358,22 @@ fn on_steps(
     out: &mut Out,
     proof: Proof,
 ) -> Result<Proved, ExitCode> {
+    let state = aterm_types::dirs::state_dir();
+    if let Some(why) = node_host_refusal(
+        service,
+        std::env::var_os("CI").is_some(),
+        state
+            .as_ref()
+            .is_some_and(|p| std::fs::symlink_metadata(p.join("node-off")).is_ok()),
+    ) {
+        out.note("node service", why);
+        return Err(ExitCode::from(2));
+    }
     let Prepared {
         p,
         job_durability,
         durability_job,
+        mesh,
     } = prepared;
     let job_durability = *job_durability;
     let kept_from = match (opts.durability, durability_job) {
@@ -4771,12 +5456,13 @@ fn on_steps(
         return Err(ExitCode::from(2));
     }
 
-    let node = match read_node(&state) {
-        Some(n) => {
+    let node = match (mesh, read_node(&state)) {
+        (Some(keys), held) => mesh_node_step(keys, &state, held, opts.dry_run, out)?,
+        (None, Some(n)) => {
             out.already("node", &format!("{n} ({}/node)", state.display()));
             n
         }
-        None => {
+        (None, None) => {
             let minted = match aterm_uds::rand::hex_token::<8>() {
                 Ok(hex) => format!("n-{hex}"),
                 Err(e) => {
@@ -5261,6 +5947,52 @@ fn off_launchd(lc: &dyn Launchd, label: &str, plist: &Path, out: &mut Out) {
     }
 }
 
+/// `aterm fabric off`'s broker step under [`Service::Node`]: the off record, written first, has
+/// the node service stop hosting `bus.log` at its next pass ([`bus_hosting`]), and a broker job
+/// an earlier build installed is retired here ([`retire_with`], under the platform's
+/// `supervisor`), which a dry run only names.
+fn off_node(
+    p: &Paths,
+    supervisor: Service,
+    lc: &dyn Launchd,
+    systemctl: &dyn Fn(&[&str]) -> Result<(), String>,
+    main_pid: &dyn Fn(&str) -> Option<u32>,
+    out: &mut Out,
+) {
+    let none = "no broker job of this root: the node service hosts bus.log";
+    if out.dry_run {
+        match legacy_job(p, supervisor, lc) {
+            Some(job) => out.done(
+                "broker",
+                &format!(
+                    "retire {job}, the separate broker job an earlier build installed (stop it, \
+                     wait for it to exit, remove its file)"
+                ),
+                "",
+            ),
+            None => out.already("broker", none),
+        }
+    } else {
+        match retire_with(p, supervisor, lc, systemctl, main_pid) {
+            Ok(RetiredJob::Absent) => out.already("broker", none),
+            Ok(RetiredJob::Retired { label, .. }) => out.done(
+                "broker",
+                "",
+                &format!("retired {label}, the separate broker job an earlier build installed"),
+            ),
+            Err(e) => out.fail("broker", &e),
+        }
+    }
+    out.note(
+        "broker",
+        &format!(
+            "the node service ({NODE_JOB}) stops hosting bus.log on {} at its next pass: the off \
+             record stands",
+            p.sock()
+        ),
+    );
+}
+
 /// `aterm fabric off`.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn off(opts: &OffOpts) -> ExitCode {
@@ -5326,6 +6058,14 @@ pub fn off(opts: &OffOpts) -> ExitCode {
     off_record_step(&p, &mut out);
     let label = p.label();
     match service {
+        Service::Node => off_node(
+            &p,
+            Service::default_for(false),
+            &LiveLaunchd,
+            &systemctl,
+            &systemd_main_pid,
+            &mut out,
+        ),
         Service::Launchd => off_launchd(&LiveLaunchd, &label, &p.plist(), &mut out),
         Service::Systemd => {
             let unit = p.unit();
@@ -5443,11 +6183,19 @@ pub fn off(opts: &OffOpts) -> ExitCode {
     }
 }
 
-fn protocol_remedy(again: &str) -> String {
-    format!(
-        "the broker and this aterm are different releases speaking different astream \
-         protocols: {again} restarts the broker from the aterm on PATH"
-    )
+fn protocol_remedy(again: &str, keeper: Keeper) -> String {
+    match keeper {
+        Keeper::Job => format!(
+            "the broker and this aterm are different releases speaking different astream \
+             protocols: {again} restarts the broker from the aterm on PATH"
+        ),
+        Keeper::Node => format!(
+            "the node service hosting bus.log and this aterm are different releases speaking \
+             different astream protocols: `aterm node status` names the program it runs, and \
+             `aterm node on`, run from the aterm on PATH, restarts it on that build (or read the \
+             fabric with the aterm it runs); {again} then waits for it to answer"
+        ),
+    }
 }
 
 fn renew_remedy(again: &str) -> String {
@@ -5467,6 +6215,35 @@ const POISONED_LOG_REMEDY: &str = "the broker's log is poisoned and refuses ever
      reopened log (one you run by hand, start again yourself); if it poisons again at once, the \
      disk under its log is failing flushes";
 
+/// [`POISONED_LOG_REMEDY`] where the node service hosts the log ([`Keeper::Node`]): its keeper
+/// reopens a poisoned log in process at its next pass, so nothing is stopped by hand.
+const NODE_POISONED_LOG_REMEDY: &str = "bus.log is poisoned and refuses every write until it is \
+     reopened, which the node service does itself at its next pass, within seconds: run `aterm \
+     fabric` again to see it reopened. If it poisons again at once, the disk under the log is \
+     failing flushes (Disk Utility's First Aid, or the system log's I/O errors)";
+
+/// What the person does about the node service itself, in every remedy under [`Keeper::Node`]
+/// that finds nothing serving bus.log.
+const NODE_STARTS: &str = "`aterm node status` says whether the node service runs, and `aterm \
+     node on` starts it";
+
+/// The remedy where nothing answers on bus.log's socket and the node service hosts it
+/// ([`Keeper::Node`]): the node service's own state first, then why it could not open the log,
+/// each cause with what clears it. No `broker.err` is read: the node service writes none, and one
+/// in the root is a retired job's.
+fn node_unanswered(again: &str) -> String {
+    format!(
+        "the node service hosts bus.log here: {NODE_STARTS}. One that runs and serves no \
+         bus.sock could not open the log and journals why; once that is fixed it opens bus.log \
+         at its next pass, within seconds. A log it refuses for a corrupt record: `aterm fabric \
+         off`, then `aterm link broker --repair <root>/bus.log`, which cuts the log at that \
+         record (the records from there on, possibly acked mail, are lost), then {again}. A log \
+         sealed at rest whose key is missing: put its `{}` back beside it. A log a newer aterm \
+         wrote: install that release or a later one",
+        crate::at_rest::REST_KEY
+    )
+}
+
 fn quoted_broker_fix(last_word: &str, again: &str) -> String {
     let s = |t: &str| last_word.contains(t);
     if s(crate::cli::NEWER_LOG_REMEDY) {
@@ -5477,7 +6254,7 @@ fn quoted_broker_fix(last_word: &str, again: &str) -> String {
         )
     } else if s(&format!(": {}", crate::broker_health::POISONED_EXIT_WORDS)) {
         if s(crate::broker_health::UNSUPERVISED_WORDS) {
-            "the broker exited over a poisoned log, and no `aterm fabric on` job runs it: unless \
+            "the broker exited over a poisoned log, and no job `on` installed runs it: unless \
              something else restarts it, start it again with the command its line names (the \
              whole line is the last of broker.err); if it poisons again at once, the disk under \
              its log is failing flushes"
@@ -5525,47 +6302,102 @@ fn quoted_broker_fix(last_word: &str, again: &str) -> String {
     }
 }
 
-/// The fix for one of `aterm fabric`'s warnings, dispatched exhaustively over [`fabric::WarningKind`].
+/// The fix for one of `aterm fabric`'s warnings, dispatched exhaustively over [`fabric::WarningKind`],
+/// worded for who keeps the bus ([`Role::keeper`]): under [`Keeper::Node`] no remedy names a
+/// broker job, its supervisor, launchd or systemd restarting a broker, `broker.err`, a broker's
+/// `--secret-file`, or a `kill` of anything but a bridge, since the process serving bus.log is
+/// the node service (whose kill ends all it hosts) and a `broker.err` in the root is a retired
+/// job's; each says what the person can do to the node service now.
 #[must_use]
 pub fn fix_for(warning: &fabric::WarningKind, role: &Role) -> String {
     let again = role.again();
+    let keeper = role.keeper;
     match warning {
-        fabric::WarningKind::BrokerProtocolSkew => protocol_remedy(&again),
+        fabric::WarningKind::BrokerProtocolSkew => protocol_remedy(&again, keeper),
         fabric::WarningKind::BrokerCapLapsed => renew_remedy(&again),
-        fabric::WarningKind::BrokerUnreachable { last_word } => match last_word.as_deref() {
-            Some(lw) => quoted_broker_fix(lw, &again),
-            None => format!("start the broker: {again}"),
+        fabric::WarningKind::BrokerUnreachable { last_word } => match (keeper, last_word) {
+            (Keeper::Job, Some(lw)) => quoted_broker_fix(lw, &again),
+            (Keeper::Job, None) => format!("start the broker: {again}"),
+            (Keeper::Node, _) => node_unanswered(&again),
         },
-        fabric::WarningKind::ConnectedProbeMismatch => format!("start the broker: {again}"),
-        fabric::WarningKind::BrokerReplacedBuild => format!(
-            "{again} restarts it on the build on disk (a broker of this build or later \
-             restarts itself within a minute of its executable being replaced)"
-        ),
-        fabric::WarningKind::BrokerLogPoisoned => POISONED_LOG_REMEDY.to_string(),
-        fabric::WarningKind::BrokerFlushFailed => {
-            "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
-             I/O errors). A failed flush that put acked records at risk poisons the log, which a \
-             broker of this build then exits to reopen: run `aterm fabric` again to see whether \
-             this one did. The count starts again at zero when the broker next opens its log"
-                .to_string()
-        }
-        fabric::WarningKind::BrokerUnguarded => format!(
-            "{again} rewrites the broker's job and restarts it guarded with the root's mint \
-             secret (a broker run by hand: restart it with `--secret-file <root>/mint.secret`)"
-        ),
+        fabric::WarningKind::ConnectedProbeMismatch => match keeper {
+            Keeper::Job => format!("start the broker: {again}"),
+            Keeper::Node => {
+                format!("{NODE_STARTS}; then {again} waits for bus.log's socket to answer")
+            }
+        },
+        fabric::WarningKind::BrokerReplacedBuild => match keeper {
+            Keeper::Job => format!(
+                "{again} restarts it on the build on disk (a broker of this build or later \
+                 restarts itself within a minute of its executable being replaced)"
+            ),
+            Keeper::Node => "the converge pass's `sync.node` restarts the node service on the \
+                             build on disk; `aterm node on`, run from that build, restarts it \
+                             there now"
+                .to_string(),
+        },
+        fabric::WarningKind::BrokerLogPoisoned => match keeper {
+            Keeper::Job => POISONED_LOG_REMEDY.to_string(),
+            Keeper::Node => NODE_POISONED_LOG_REMEDY.to_string(),
+        },
+        fabric::WarningKind::BrokerFlushFailed => match keeper {
+            Keeper::Job => "check the disk under the broker's log (Disk Utility's First Aid, or \
+                            the system log's I/O errors). A failed flush that put acked records \
+                            at risk poisons the log, which a broker of this build then exits to \
+                            reopen: run `aterm fabric` again to see whether this one did. The \
+                            count starts again at zero when the broker next opens its log"
+                .to_string(),
+            Keeper::Node => "check the disk under bus.log (Disk Utility's First Aid, or the \
+                             system log's I/O errors). A failed flush that put acked records at \
+                             risk poisons the log, which the node service then reopens at its \
+                             next pass: run `aterm fabric` again to see whether it did. The count \
+                             starts again at zero when the log is next opened"
+                .to_string(),
+        },
+        fabric::WarningKind::BrokerUnguarded => match keeper {
+            Keeper::Job => format!(
+                "{again} rewrites the broker's job and restarts it guarded with the root's mint \
+                 secret (a broker run by hand: restart it with `--secret-file \
+                 <root>/mint.secret`)"
+            ),
+            Keeper::Node => format!(
+                "the node service serves bus.log only guarded by the root's mint secret, so \
+                 another process answers on its socket: stop that process (the pid `aterm fabric \
+                 --json` names), then {again} waits for the node service to serve the socket"
+            ),
+        },
         fabric::WarningKind::BridgeStarting => format!(
             "nothing, if its mail moves (`aterm ctl @<sid> post to=@<sid> kind=note --wait=5000 \
-             ping` lands); if it does not, check the broker: {again}"
+             ping` lands); if it does not, {}",
+            match keeper {
+                Keeper::Job => format!("check the broker: {again}"),
+                Keeper::Node => {
+                    format!("{NODE_STARTS}; {again} then waits for bus.log's socket to answer")
+                }
+            }
         ),
         fabric::WarningKind::BridgeLinkDown { reason, last_word } => {
             let cause = match reason.as_str() {
-                "no-socket" | "refused" => match last_word.as_deref() {
-                    Some(lw) => quoted_broker_fix(lw, &again),
-                    None => format!("nothing listens at the broker's socket: {again} starts it"),
+                "no-socket" | "refused" => match (keeper, last_word) {
+                    (Keeper::Job, Some(lw)) => quoted_broker_fix(lw, &again),
+                    (Keeper::Job, None) => {
+                        format!("nothing listens at the broker's socket: {again} starts it")
+                    }
+                    (Keeper::Node, _) => node_unanswered(&again),
                 },
-                "no-ack" => format!("the broker accepts and never answers: {again} restarts it"),
+                "no-ack" => match keeper {
+                    Keeper::Job => {
+                        format!("the broker accepts and never answers: {again} restarts it")
+                    }
+                    Keeper::Node => "bus.log's socket accepts and never answers: `aterm node on` \
+                                     restarts the node service that hosts it"
+                        .to_string(),
+                },
                 "expired" => renew_remedy(&again),
-                "poisoned" => POISONED_LOG_REMEDY.to_string(),
+                "poisoned" => match keeper {
+                    Keeper::Job => POISONED_LOG_REMEDY.to_string(),
+                    Keeper::Node => NODE_POISONED_LOG_REMEDY.to_string(),
+                },
                 "attach" => format!(
                     "the broker refuses this node's cap: move <root>/node.cap aside and run {again}"
                 ),
@@ -5590,13 +6422,18 @@ pub fn fix_for(warning: &fabric::WarningKind, role: &Role) -> String {
                      line in the log names which end it saw — nothing on the broker needs a restart"
                         .to_string()
                 }
-                "protocol" => protocol_remedy(&again),
+                "protocol" => protocol_remedy(&again, keeper),
                 "endpoint-grammar" => "the bridge is a build this aterm cannot serve (it lacks a \
                                        verb the bridge needs): `[fabric] command` names another \
                                        aterm than this instance's; quit and relaunch this aterm, \
                                        or point [fabric] command at its build"
                     .to_string(),
-                _ => format!("check the broker: {again}"),
+                _ => match keeper {
+                    Keeper::Job => format!("check the broker: {again}"),
+                    Keeper::Node => {
+                        format!("check bus.log's host: {NODE_STARTS}; {again} then probes it")
+                    }
+                },
             };
             format!("{cause}; the bridge then reconnects on its own")
         }
@@ -5644,7 +6481,8 @@ pub fn fix_for(warning: &fabric::WarningKind, role: &Role) -> String {
                 .to_string()
         }
         fabric::WarningKind::BridgeDifferentCommand => {
-            "relaunch that aterm instance: its supervisor reads [fabric] command once, at launch"
+            "relaunch that aterm instance: it reads [fabric] command once, at launch, for the \
+             bridge it runs"
                 .to_string()
         }
         fabric::WarningKind::BridgeStateLocked => format!(
@@ -6121,16 +6959,34 @@ fn confirmed() -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Whether `aterm fabric on --service none` left [`HAND_RECORD`] in `root`: the person runs the
+/// broker, and the node service hosts no `bus.log` there ([`BusHosting::Hand`]).
+fn hand_recorded(root: &Path) -> bool {
+    record_in_owned_dir(&root.join(HAND_RECORD)).unwrap_or(false)
+}
+
+/// Who keeps the bus `view` read, for the remedies `doctor` gives ([`Role::keeper`]): the
+/// process serving its socket where one is named ([`fabric::BrokerView::keeper`]), else this
+/// build's default, except that a root whose person runs the broker by hand (`hand`,
+/// [`HAND_RECORD`]) is kept by that broker, whatever the default.
+fn keeper_of(view: &fabric::BrokerView, hand: bool) -> Keeper {
+    match view.keeper() {
+        Keeper::Node if hand && view.host.is_none() => Keeper::Job,
+        keeper => keeper,
+    }
+}
+
 /// `aterm fabric doctor`.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     if retire_ghosts {
         return retire_ghosts_action(yes);
     }
-    let role = match Paths::resolve_for_off()
-        .and_then(|(p, _)| Role::of(&p).map_err(|e| e.to_string()))
-    {
-        Ok(role) => role,
+    let (mut role, hand) = match Paths::resolve_for_off().and_then(|(p, _)| {
+        let role = Role::of(&p).map_err(|e| e.to_string())?;
+        Ok((role, hand_recorded(&p.root)))
+    }) {
+        Ok(read) => read,
         Err(e) => {
             eprintln!(
                 "aterm fabric doctor: cannot determine the existing role: {e}; fix the metadata before reapplying the fabric"
@@ -6148,6 +7004,7 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
             ExitCode::from(2)
         }
         Ok(report) => {
+            role.keeper = keeper_of(&report.broker, hand);
             let mut warnings = report.warning_items.clone();
             match Rendezvous::read() {
                 Ok(Some(_)) => {}
@@ -6170,6 +7027,9 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
                 safe(&report.cfg.fleet, 64),
                 report.node.as_deref().unwrap_or("-")
             );
+            if let Some(row) = fabric::host_row(&report.broker) {
+                println!("  host: {row}");
+            }
             if let Some(d) = report.broker.tier() {
                 println!(
                     "  durability: {} — {}",
@@ -6906,6 +7766,7 @@ mod tests {
             p: scratch_paths(dir.path()),
             job_durability: None,
             durability_job: None,
+            mesh: None,
         };
         let root = prepared.p.root.clone();
 
@@ -7433,6 +8294,8 @@ mod tests {
         write_fails: std::cell::Cell<bool>,
         /// The looks the process a `kickstart -k` killed still runs for.
         exiting: std::cell::Cell<u32>,
+        /// The pid `print` names while launchd holds the job; `None` names none.
+        pid: std::cell::Cell<Option<u32>>,
         calls: std::cell::RefCell<Vec<String>>,
         pauses: std::cell::Cell<u32>,
     }
@@ -7452,6 +8315,7 @@ mod tests {
                 kick_refused: std::cell::Cell::new(false),
                 write_fails: std::cell::Cell::new(false),
                 exiting: std::cell::Cell::new(0),
+                pid: std::cell::Cell::new(None),
                 calls: std::cell::RefCell::new(Vec::new()),
                 pauses: std::cell::Cell::new(0),
             }
@@ -7522,9 +8386,13 @@ mod tests {
                         .collect::<String>()
                 )
             };
+            let pid = self
+                .pid
+                .get()
+                .map_or_else(String::new, |pid| format!("\tpid = {pid}\n"));
             (
                 Some(0),
-                format!("gui/501/{label} = {{\n\tstate = running\n{listed}}}\n"),
+                format!("gui/501/{label} = {{\n\tstate = running\n{pid}{listed}}}\n"),
             )
         }
 
@@ -8560,6 +9428,99 @@ mod tests {
         );
     }
 
+    /// The node service's argv names no tier, so it is not current where the tier its log was
+    /// opened at (its snapshot, else its `Hello`) is not the one it hosts the root at: the
+    /// root's record, else a guarded root's default, whatever tier `p` names. NEGATIVE CONTROL:
+    /// the same view read as a broker's compares its argv, which names none, and is never not
+    /// current for its tier.
+    #[test]
+    fn the_node_service_is_not_current_at_another_tier_than_the_root_records() {
+        use crate::durability::Durability;
+        use astream_broker::{ServedInfo, ServedReason, Tier};
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = Paths {
+            durability: Some(Durability::Strict),
+            ..scratch_paths(dir.path())
+        };
+        aterm_uds::private_file::ensure_private_dir(&p.root).expect("the root");
+        let tier = |d: Durability| match d {
+            Durability::Strict => Tier::Strict,
+            Durability::Ordered => Tier::Ordered,
+            Durability::Relaxed => Tier::Relaxed,
+        };
+        let view = |host, requested: Durability| fabric::BrokerView {
+            host,
+            guarded: Some(true),
+            served: Some(ServedInfo {
+                requested: tier(requested),
+                served: tier(requested),
+                reason: ServedReason::None,
+                horizon_ms: None,
+                rules: 0,
+            }),
+            ..fabric::BrokerView::default()
+        };
+        let node = Some(fabric::Host::NodeService);
+        write_durability_record(&p.root, Durability::Relaxed).expect("the root's record");
+        assert_eq!(
+            not_current(&p, &view(node, Durability::Strict)),
+            Some("it runs at durability strict"),
+            "the record, not `p`, names the tier the node service hosts"
+        );
+        assert_eq!(not_current(&p, &view(node, Durability::Relaxed)), None);
+        aterm_uds::private_file::remove_private(&p.root, DURABILITY_RECORD).expect("no record");
+        let default = crate::durability::resolve(None, true);
+        assert_eq!(
+            not_current(&p, &view(node, default)),
+            None,
+            "a guarded root's default"
+        );
+        let other = if default == Durability::Relaxed {
+            Durability::Strict
+        } else {
+            Durability::Relaxed
+        };
+        assert!(not_current(&p, &view(node, other)).is_some());
+        for host in [Some(fabric::Host::LinkBroker), None] {
+            assert_eq!(
+                not_current(&p, &view(host, other)),
+                None,
+                "NEGATIVE CONTROL: a broker's tier is its argv's ({host:?})"
+            );
+        }
+    }
+
+    /// `doctor` words its remedies for who keeps the bus: the node service where it serves the
+    /// socket, or, with the mesh on, where nothing is named; a broker job wherever a broker
+    /// serves it, the mesh is off, or `on --service none` left the root to its person
+    /// (`hand`). NEGATIVE CONTROL: the hand record changes nothing where a host is named.
+    #[test]
+    fn doctor_words_its_remedies_for_who_keeps_the_bus() {
+        use fabric::Host::{LinkBroker, NodeService};
+        let view = |mesh, host| fabric::BrokerView {
+            mesh,
+            host,
+            ..fabric::BrokerView::default()
+        };
+        for (mesh, host, hand, want) in [
+            (true, Some(NodeService), false, Keeper::Node),
+            (true, Some(NodeService), true, Keeper::Node),
+            (false, Some(NodeService), false, Keeper::Node),
+            (true, Some(LinkBroker), false, Keeper::Job),
+            (true, Some(LinkBroker), true, Keeper::Job),
+            (true, None, false, Keeper::Node),
+            (true, None, true, Keeper::Job),
+            (false, None, false, Keeper::Job),
+            (false, None, true, Keeper::Job),
+        ] {
+            assert_eq!(
+                keeper_of(&view(mesh, host), hand),
+                want,
+                "mesh {mesh}, {host:?}, hand {hand}"
+            );
+        }
+    }
+
     #[test]
     fn the_plist_runs_the_broker_directly_and_reads_as_current_in_any_layout() {
         let p = Paths {
@@ -9478,46 +10439,67 @@ mod tests {
         assert!(set_fabric_command(open, &plain).is_err());
     }
 
-    /// Every [`fabric::WarningKind`] maps to an actionable remedy under every [`Role`], and every
-    /// `aterm fabric on` command in that remedy carries the role's `--fleet`.
-    /// NEGATIVE CONTROL: `SessionQueryFailed` and `RendezvousUnreadable` (which prose substring
-    /// matching previously sent to the generic help fallback or misclassified as `BridgeLaneFaults`)
-    /// receive their own remedies.
-    #[test]
-    fn every_warning_shape_has_a_fix() {
+    /// One of every [`fabric::WarningKind`] shape a remedy branches on: each variant, each
+    /// `BridgeLinkDown` reason, and each broker line (`last_word`) [`quoted_broker_fix`] tells
+    /// apart. Every variant is named once in the exhaustive match below, without a wildcard, so
+    /// a new one does not compile until it gets an index there and a shape here.
+    fn every_warning_shape() -> Vec<fabric::WarningKind> {
         use fabric::WarningKind as W;
-        let roles = [
-            Role { fleet: None },
-            Role {
-                fleet: Some("lab".to_string()),
-            },
-        ];
-        for w in [
-            W::BrokerUnreachable { last_word: None },
-            W::BrokerUnreachable {
-                last_word: Some("written 3m ago: open bus.log: refused".to_string()),
-            },
+        use std::io::ErrorKind as K;
+        let refusal = |kind| crate::cli::log_refusal_remedy(kind, "/r/bus.log").expect("a remedy");
+        let poisoned = |restart| {
+            crate::broker_health::poisoned_line(
+                "/r/bus.log",
+                "a flush failed (EIO) with records no full flush covers",
+                restart,
+            )
+        };
+        let lines: Vec<Option<String>> = [
+            None,
+            Some("open bus.log: refused".to_string()),
+            Some(refusal(K::InvalidData)),
+            Some(refusal(K::Unsupported)),
+            Some(poisoned(None)),
+            Some(poisoned(Some("aterm link broker /r/bus.sock /r/bus.log"))),
+            Some(crate::at_rest::UNFINISHED_RETIRE_REMEDY.to_string()),
+            Some(crate::at_rest::SEALED_LOG_REMEDY.to_string()),
+        ]
+        .into_iter()
+        .map(|line| line.map(|l| format!("written 3m ago: aterm link broker: {l}")))
+        .collect();
+        let mut shapes: Vec<W> = lines
+            .iter()
+            .map(|last_word| W::BrokerUnreachable {
+                last_word: last_word.clone(),
+            })
+            .collect();
+        for reason in [
+            "no-socket",
+            "refused",
+            "no-ack",
+            "expired",
+            "poisoned",
+            "attach",
+            "busy",
+            "record",
+            "denied",
+            "cut-say",
+            "protocol",
+            "endpoint-grammar",
+            "other",
+        ] {
+            let quoted = if matches!(reason, "no-socket" | "refused") {
+                lines.clone()
+            } else {
+                vec![None]
+            };
+            shapes.extend(quoted.into_iter().map(|last_word| W::BridgeLinkDown {
+                reason: reason.to_string(),
+                last_word,
+            }));
+        }
+        shapes.extend([
             W::ConnectedProbeMismatch,
-            W::BridgeLinkDown {
-                reason: "refused".to_string(),
-                last_word: None,
-            },
-            W::BridgeLinkDown {
-                reason: "expired".to_string(),
-                last_word: None,
-            },
-            W::BridgeLinkDown {
-                reason: "no-ack".to_string(),
-                last_word: None,
-            },
-            W::BridgeLinkDown {
-                reason: "attach".to_string(),
-                last_word: None,
-            },
-            W::BridgeLinkDown {
-                reason: "other".to_string(),
-                last_word: None,
-            },
             W::BrokerCapLapsed,
             W::BridgeStarting,
             W::BusUnreadable,
@@ -9546,11 +10528,29 @@ mod tests {
                 pid: 42,
                 sock: None,
             },
+            W::SessionQueryFailed {
+                pid: 42,
+                sock: Some("/run/a b.sock".to_string()),
+            },
             W::SessionHeld {
                 sid: "s-a".to_string(),
                 pid: 1,
                 sock: None,
                 origin: Some("local".to_string()),
+                fabric_lost: false,
+            },
+            W::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 1,
+                sock: None,
+                origin: Some("person,remote,fleet,local".to_string()),
+                fabric_lost: true,
+            },
+            W::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 1,
+                sock: None,
+                origin: None,
                 fabric_lost: false,
             },
             W::SessionInboxEvicted,
@@ -9569,7 +10569,76 @@ mod tests {
             W::RosterTruncated,
             W::BrokerLogPoisoned,
             W::BrokerFlushFailed,
-        ] {
+        ]);
+        let variants = 39;
+        let index = |w: &W| match w {
+            W::NoFabricCommand => 0,
+            W::NoNodeId => 1,
+            W::CapUnreadable { .. } => 2,
+            W::CapWiderRing => 3,
+            W::BrokerProtocolSkew => 4,
+            W::BrokerUnreachable { .. } => 5,
+            W::BrokerCapLapsed => 6,
+            W::BusUnreadable => 7,
+            W::BrokerReplacedBuild => 8,
+            W::BrokerUnguarded => 9,
+            W::BrokerLogPoisoned => 10,
+            W::BrokerFlushFailed => 11,
+            W::InstanceDiscoveryFailed => 12,
+            W::InstanceUnreachable => 13,
+            W::InstanceNoBridge => 14,
+            W::BridgeDown => 15,
+            W::BridgeStateLocked => 16,
+            W::BridgeStarting => 17,
+            W::BridgeLinkDown { .. } => 18,
+            W::BridgeStale => 19,
+            W::ConnectedProbeMismatch => 20,
+            W::BridgeBuildMismatch => 21,
+            W::BridgeLaneFaults => 22,
+            W::RetentionGaveUp => 23,
+            W::BridgeDifferentCommand => 24,
+            W::ConnectedPresenceMismatch => 25,
+            W::SessionQueryFailed { .. } => 26,
+            W::SessionInboxEvicted => 27,
+            W::SessionHeld { .. } => 28,
+            W::SessionUnhandledStaleWork => 29,
+            W::SessionQueuedPostsNoBridge => 30,
+            W::OverdueWork { .. } => 31,
+            W::OverdueUnjudged => 32,
+            W::GhostSessionRow => 33,
+            W::FleetHaltStanding => 34,
+            W::RosterTruncated => 35,
+            W::SubjectBudgetHigh => 36,
+            W::RendezvousMissing => 37,
+            W::RendezvousUnreadable => 38,
+        };
+        let named: BTreeSet<usize> = shapes.iter().map(index).collect();
+        assert_eq!(
+            named,
+            (0..variants).collect::<BTreeSet<_>>(),
+            "every WarningKind variant has a shape"
+        );
+        shapes
+    }
+
+    /// Every [`fabric::WarningKind`] maps to an actionable remedy under every [`Role`] (each
+    /// fleet, each [`Keeper`]), and every `aterm fabric on` command in that remedy carries the
+    /// role's `--fleet`.
+    /// NEGATIVE CONTROL: `SessionQueryFailed` and `RendezvousUnreadable` (which prose substring
+    /// matching previously sent to the generic help fallback or misclassified as `BridgeLaneFaults`)
+    /// receive their own remedies.
+    #[test]
+    fn every_warning_shape_has_a_fix() {
+        use fabric::WarningKind as W;
+        let roles: Vec<Role> = [Keeper::Job, Keeper::Node]
+            .into_iter()
+            .flat_map(|keeper| {
+                [None, Some("lab".to_string())]
+                    .into_iter()
+                    .map(move |fleet| Role { fleet, keeper })
+            })
+            .collect();
+        for w in every_warning_shape() {
             for role in &roles {
                 let fix = fix_for(&w, role);
                 assert!(!fix.is_empty(), "empty fix for {w:?}");
@@ -9603,6 +10672,102 @@ mod tests {
         assert!(
             rv_unreadable.contains("rewrites the rendezvous file"),
             "{rv_unreadable}"
+        );
+    }
+
+    /// Under the node service ([`Keeper::Node`]) no remedy, for any warning shape, any fleet and
+    /// any quoted broker line, names a broker job or its supervisor, launchd or systemd
+    /// restarting a broker, `broker.err`, a broker's `--secret-file`, a rewrite, start or restart
+    /// of a broker, or a `kill` of anything but a bridge: the process serving bus.log is the node
+    /// service, whose kill ends everything it hosts. What it does name is what the person can do
+    /// now. NEGATIVE CONTROL: under [`Keeper::Job`] each of those phrases, and a `kill` of a
+    /// broker, is said by some remedy, so the sweep reads remedies that can say them.
+    #[test]
+    fn no_remedy_names_a_broker_job_where_the_node_service_hosts_bus_log() {
+        use fabric::WarningKind as W;
+        const JOB_ONLY: [&str; 9] = [
+            "job",
+            "supervisor",
+            "launchd",
+            "systemd",
+            "broker.err",
+            "--secret-file",
+            "rewrites the broker",
+            "restarts the broker",
+            "start the broker",
+        ];
+        fn kills_more_than_a_bridge(fix: &str) -> bool {
+            fix.match_indices("kill").any(|(at, _)| {
+                !fix[at..]
+                    .chars()
+                    .take(40)
+                    .collect::<String>()
+                    .contains("bridge")
+            })
+        }
+        let shapes = every_warning_shape();
+        let fixes = |keeper: Keeper| -> Vec<(String, String)> {
+            shapes
+                .iter()
+                .flat_map(|w| {
+                    [None, Some("lab")].map(|fleet| {
+                        let role = Role {
+                            fleet: fleet.map(str::to_string),
+                            keeper,
+                        };
+                        (format!("{w:?}"), fix_for(w, &role))
+                    })
+                })
+                .collect()
+        };
+        for (w, fix) in fixes(Keeper::Node) {
+            for phrase in JOB_ONLY {
+                assert!(
+                    !fix.contains(phrase),
+                    "{w}: the node service's remedy names `{phrase}`: {fix}"
+                );
+            }
+            assert!(!kills_more_than_a_bridge(&fix), "{w}: {fix}");
+        }
+        let job = fixes(Keeper::Job);
+        for phrase in JOB_ONLY {
+            assert!(
+                job.iter().any(|(_, fix)| fix.contains(phrase)),
+                "NEGATIVE CONTROL: no broker's remedy says `{phrase}`"
+            );
+        }
+        assert!(
+            job.iter().any(|(_, fix)| kills_more_than_a_bridge(fix)),
+            "NEGATIVE CONTROL: a broker's remedy kills the broker"
+        );
+
+        let node = Role {
+            fleet: None,
+            keeper: Keeper::Node,
+        };
+        let poisoned = fix_for(&W::BrokerLogPoisoned, &node);
+        assert!(
+            poisoned.contains("which the node service does itself at its next pass"),
+            "{poisoned}"
+        );
+        let down = fix_for(&W::BrokerUnreachable { last_word: None }, &node);
+        assert!(
+            down.contains("`aterm node status`")
+                && down.contains("`aterm node on` starts it")
+                && down.contains("`aterm fabric off`, then `aterm link broker --repair")
+                && down.contains("then `aterm fabric on`"),
+            "{down}"
+        );
+        assert_eq!(
+            fix_for(
+                &W::BridgeLinkDown {
+                    reason: "refused".to_string(),
+                    last_word: Some("written 1s ago: aterm link broker: refused".to_string()),
+                },
+                &node
+            ),
+            format!("{down}; the bridge then reconnects on its own"),
+            "a retired job's line is no reason of the node service's"
         );
     }
 
@@ -9853,7 +11018,7 @@ mod tests {
             "{}",
             fix_for(&fabric::WarningKind::BrokerCapLapsed)
         );
-        let here = protocol_remedy("`aterm fabric on`");
+        let here = protocol_remedy("`aterm fabric on`", Keeper::Job);
         assert!(down("protocol").starts_with(&here), "{}", down("protocol"));
         assert_eq!(fix_for(&fabric::WarningKind::BrokerProtocolSkew), here);
         for reason in ["busy", "record", "protocol"] {
@@ -10601,7 +11766,13 @@ mod tests {
             "rm -f '{r}/bus.sock'; exec '/u/aterm' link broker '{r}/bus.sock' '{r}/bus.log'"
         ));
         install(&legacy);
-        assert_eq!(Role::of(&p), Ok(Role { fleet: None }));
+        assert_eq!(
+            Role::of(&p),
+            Ok(Role {
+                fleet: None,
+                keeper: Keeper::Job
+            })
+        );
         assert!(!p.plist_is_current(&legacy), "`on` still rewrites it");
 
         install(&plist("exec /usr/bin/true"));
@@ -10615,6 +11786,474 @@ mod tests {
                 path: p.plist(),
                 field: "ProgramArguments",
             })
+        );
+    }
+
+    /// A root `p` under `dir` made private (0700), as `on` leaves it.
+    fn private_root(dir: &Path) -> Paths {
+        let p = scratch_paths(dir);
+        std::fs::create_dir_all(dir).expect("its folder");
+        aterm_uds::private_file::ensure_private_dir(&p.root).expect("a private root");
+        p
+    }
+
+    /// Set `path`'s modification time `ago` before now.
+    fn written_ago(path: &Path, ago: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now() - ago))
+            .expect("set its mtime");
+    }
+
+    /// The mesh switch picks who keeps the broker, the word `--service node` names it, and the
+    /// default without the mesh is the platform's supervisor, never the node service.
+    /// NEGATIVE CONTROL: a `default_for` that ignores `mesh` answers the platform's supervisor
+    /// for both.
+    #[test]
+    fn the_mesh_hands_the_broker_to_the_node_service() {
+        assert_eq!(Service::default_for(true), Service::Node);
+        assert_ne!(Service::default_for(false), Service::Node);
+        assert_eq!(
+            Service::default_here(),
+            Service::default_for(aterm_types::mesh_switch::MESH)
+        );
+        assert_eq!(Service::parse("node"), Ok(Service::Node));
+        assert_eq!(Service::Node.name(), "node");
+        let refused = Service::parse("cron").expect_err("not a service");
+        assert!(refused.contains("node"), "{refused}");
+    }
+
+    /// `on`'s broker step under the node service installs no job: with a broker job an earlier
+    /// build left loaded, launchd is only asked about it (no plist written, nothing booted out,
+    /// bootstrapped or kickstarted), the step says the node service retires it, records the tier
+    /// `--durability` named (0600) and waits for the node service to answer; one that does not
+    /// answer fails the step naming the node service, not a broker job. A step with no named tier
+    /// records none, and a dry run waits for nothing and writes nothing.
+    /// NEGATIVE CONTROLS: a Node arm that falls through to the launchd one writes and bootstraps
+    /// the plist (the calls); one that boots the old job out here leaves the Mac with no bus
+    /// until the node service's next pass (a `bootout` call); one that records the tier only
+    /// where it is not named reads `ordered` for a `--durability strict`.
+    #[test]
+    fn under_the_node_service_on_installs_no_job_and_records_a_named_tier() {
+        use crate::durability::Durability;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = Paths {
+            durability: Some(Durability::Strict),
+            ..private_root(dir.path())
+        };
+        let answering = || {
+            Ok(fabric::BrokerView {
+                endpoint: p.sock(),
+                reachable: true,
+                pid: Some(4242),
+                durability: Some(Durability::Strict),
+                ..fabric::BrokerView::default()
+            })
+        };
+        let legacy = FakeLaunchd::new(true, 0);
+        legacy.pid.set(Some(4242));
+        let mut out = Out::kept();
+        assert!(
+            node_broker_step(&p, true, Service::Launchd, &legacy, answering, &mut out),
+            "{}",
+            out.said()
+        );
+        assert_eq!(legacy.calls(), ["print"], "launchd is only asked");
+        assert!(!p.plist().exists(), "no plist is written");
+        assert_eq!(recorded_durability(&p.root), Some(Durability::Strict));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(p.root.join(DURABILITY_RECORD))
+                .expect("the record")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the record is private");
+        }
+        let said = out.said();
+        assert!(
+            said.contains(&format!("launchd {} (pid 4242)", p.label()))
+                && said.contains("retires it at its next pass")
+                && said.contains(NODE_JOB)
+                && !said.contains("WARNING"),
+            "{said}"
+        );
+
+        let mut out = Out::kept();
+        assert!(node_broker_step(
+            &p,
+            true,
+            Service::Launchd,
+            &FakeLaunchd::new(false, 0),
+            answering,
+            &mut out
+        ));
+        assert!(out.said().contains("already"), "{}", out.said());
+
+        let mut out = Out::kept();
+        let silent = || {
+            Err(Box::new(fabric::BrokerView {
+                endpoint: p.sock(),
+                error: Some("connection refused".to_string()),
+                ..fabric::BrokerView::default()
+            }))
+        };
+        assert!(!node_broker_step(
+            &p,
+            true,
+            Service::Launchd,
+            &FakeLaunchd::new(false, 0),
+            silent,
+            &mut out
+        ));
+        let said = out.said();
+        assert!(
+            said.contains("FAILED")
+                && said.contains(NODE_JOB)
+                && said.contains("aterm node status")
+                && !said.contains("launchd"),
+            "{said}"
+        );
+
+        let unnamed = private_root(&dir.path().join("unnamed"));
+        let mut out = Out::kept();
+        let quiet = FakeLaunchd::new(false, 0);
+        assert!(node_broker_step(
+            &unnamed,
+            false,
+            Service::Launchd,
+            &quiet,
+            || {
+                Ok(fabric::BrokerView {
+                    endpoint: unnamed.sock(),
+                    ..fabric::BrokerView::default()
+                })
+            },
+            &mut out
+        ));
+        assert!(
+            !unnamed.root.join(DURABILITY_RECORD).exists(),
+            "no tier named, none recorded: {}",
+            out.said()
+        );
+        assert!(
+            !out.said().contains("earlier build"),
+            "no job, none said: {}",
+            out.said()
+        );
+
+        let dry = Paths {
+            durability: Some(Durability::Relaxed),
+            ..private_root(&dir.path().join("dry"))
+        };
+        let mut out = Out::new(true);
+        out.kept = Some(std::cell::RefCell::new(Vec::new()));
+        assert!(node_broker_step(
+            &dry,
+            true,
+            Service::Launchd,
+            &FakeLaunchd::new(false, 0),
+            || panic!("a dry run waits for nothing"),
+            &mut out
+        ));
+        assert!(
+            !dry.root.join(DURABILITY_RECORD).exists(),
+            "a dry run writes nothing: {}",
+            out.said()
+        );
+    }
+
+    /// Under the node service a configured fabric's renewal is left as it is, nothing looked at
+    /// and nothing stepped, a look and an apply alike, so the converge pass's `sync.fabric`
+    /// installs and restarts no broker job; with no command it still reads off.
+    /// NEGATIVE CONTROL: the same replaced broker under launchd is renewed (the step runs), so
+    /// a `renew_under` that ignores the service renews it under the node service too.
+    #[test]
+    fn under_the_node_service_a_renewal_is_kept_and_steps_nothing() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let command = || Some(words("aterm link serve"));
+        for renew in [Renew::Look, Renew::Apply] {
+            let kept = renew_under(
+                Service::Node,
+                command(),
+                renew,
+                |_: &[String]| panic!("nothing is looked at"),
+                |_: &Found| panic!("nothing is stepped"),
+            );
+            assert_eq!(kept, Ok(BrokerRenewal::Kept(NODE_HOSTS.to_owned())));
+            let off = renew_under(
+                Service::Node,
+                None,
+                renew,
+                |_: &[String]| panic!("nothing is looked at"),
+                |_: &Found| panic!("nothing is stepped"),
+            );
+            assert_eq!(off, Ok(BrokerRenewal::Off));
+        }
+        let renewed = renew_under(
+            Service::Launchd,
+            command(),
+            Renew::Apply,
+            |_: &[String]| Ok(rooted(found(Service::Launchd, Some("/old/aterm")), &root)),
+            |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        );
+        assert!(
+            matches!(renewed, Ok(BrokerRenewal::Renewed(_))),
+            "{renewed:?}"
+        );
+    }
+
+    /// Retiring a broker job records the tier its argv named before anything stops, boots the
+    /// job out by domain, waits for launchd to let it go and for the pid it ran to exit (it holds
+    /// bus.log's lock until then), and removes its plist; a second retire answers absent having
+    /// only asked launchd. A record newer than the job's plist (a person's `on --durability`
+    /// under the node service) stands; an older one is rewritten, and one under a job that named
+    /// no tier taken out. A pid that never exits fails the retire with what to do, its plist kept
+    /// for the next pass.
+    /// NEGATIVE CONTROLS: a retire that returns after the bootout without waiting leaves the
+    /// killed process running (`exiting` above zero) while the node service opens the log; one
+    /// that removes the plist before reading it records no tier; one that writes the record over
+    /// a newer one loses the person's later choice.
+    #[test]
+    fn retiring_a_broker_job_records_its_tier_waits_for_it_and_removes_its_plist() {
+        use crate::durability::Durability;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = private_root(dir.path());
+        let install = |p: &Paths, tier: Option<Durability>| {
+            let job = Paths {
+                durability: tier,
+                ..p.clone()
+            };
+            std::fs::write(p.plist(), job.plist_text()).expect("the job's plist");
+        };
+        let no_systemd = |_: &[&str]| -> Result<(), String> { panic!("no systemctl on launchd") };
+        let no_unit = |_: &str| -> Option<u32> { panic!("no unit on launchd") };
+        install(&p, Some(Durability::Relaxed));
+        let lc = FakeLaunchd::new(true, 3);
+        lc.pid.set(Some(4242));
+        lc.exiting.set(2);
+        let retired = retire_with(&p, Service::Launchd, &lc, &no_systemd, &no_unit);
+        assert_eq!(
+            retired,
+            Ok(RetiredJob::Retired {
+                label: p.label(),
+                tier: Some(Durability::Relaxed),
+            })
+        );
+        assert_eq!(lc.count("bootout"), 1, "{:?}", lc.calls());
+        assert!(
+            ["bootstrap", "kickstart", "write"]
+                .iter()
+                .all(|verb| lc.count(verb) == 0),
+            "{:?}",
+            lc.calls()
+        );
+        assert_eq!(lc.exiting.get(), 0, "the killed broker was waited for");
+        assert!(!lc.held(), "launchd let it go");
+        assert!(!p.plist().exists(), "its plist is gone");
+        assert_eq!(recorded_durability(&p.root), Some(Durability::Relaxed));
+
+        let before = lc.calls().len();
+        assert_eq!(
+            retire_with(&p, Service::Launchd, &lc, &no_systemd, &no_unit),
+            Ok(RetiredJob::Absent)
+        );
+        assert_eq!(lc.calls()[before..], ["print"], "only launchd is asked");
+
+        // A person's `on --durability strict` after the job was written stands.
+        install(&p, Some(Durability::Relaxed));
+        written_ago(&p.plist(), Duration::from_secs(60));
+        write_durability_record(&p.root, Durability::Strict).expect("the person's record");
+        let lc = FakeLaunchd::new(true, 0);
+        assert_eq!(
+            retire_with(&p, Service::Launchd, &lc, &no_systemd, &no_unit),
+            Ok(RetiredJob::Retired {
+                label: p.label(),
+                tier: Some(Durability::Relaxed),
+            })
+        );
+        assert_eq!(recorded_durability(&p.root), Some(Durability::Strict));
+
+        // A job an older build wrote after the record names the tier; one that names none
+        // takes the record out.
+        write_durability_record(&p.root, Durability::Strict).expect("an older record");
+        written_ago(&p.root.join(DURABILITY_RECORD), Duration::from_secs(60));
+        install(&p, Some(Durability::Relaxed));
+        assert_eq!(
+            kept_durability(&p).map(|(tier, _)| tier),
+            Ok(Some(Durability::Relaxed)),
+            "`on` keeps the newer job's tier too"
+        );
+        let lc = FakeLaunchd::new(false, 0);
+        assert!(retire_with(&p, Service::Launchd, &lc, &no_systemd, &no_unit).is_ok());
+        assert_eq!(recorded_durability(&p.root), Some(Durability::Relaxed));
+        assert_eq!(lc.count("bootout"), 0, "a job not loaded is not booted out");
+        written_ago(&p.root.join(DURABILITY_RECORD), Duration::from_secs(60));
+        install(&p, None);
+        assert_eq!(
+            retire_with(&p, Service::Launchd, &lc, &no_systemd, &no_unit),
+            Ok(RetiredJob::Retired {
+                label: p.label(),
+                tier: None,
+            })
+        );
+        assert!(
+            !p.root.join(DURABILITY_RECORD).exists(),
+            "the default: no record"
+        );
+
+        install(&p, None);
+        let stuck = FakeLaunchd::new(true, 0);
+        stuck.pid.set(Some(4242));
+        stuck.exiting.set(GONE_POLLS + 5);
+        let failed = retire_with(&p, Service::Launchd, &stuck, &no_systemd, &no_unit);
+        assert!(
+            matches!(&failed, Err(why) if why.contains("kill 4242")),
+            "{failed:?}"
+        );
+        assert!(p.plist().exists(), "kept for the next pass");
+    }
+
+    /// A systemd unit with no file left is stopped (not disabled, which needs its file), the pid
+    /// it ran waited for, and systemd reloaded; with no file and no pid nothing runs.
+    /// NEGATIVE CONTROL: a retire that disables a unit with no file fails where systemd refuses.
+    #[test]
+    fn retiring_a_systemd_broker_stops_it_and_waits_for_its_pid() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = private_root(dir.path());
+        let lc = FakeLaunchd::new(false, 0);
+        lc.exiting.set(2);
+        let ran = std::cell::RefCell::new(Vec::new());
+        let systemctl = |args: &[&str]| {
+            ran.borrow_mut().push(args.join(" "));
+            Ok(())
+        };
+        let retired = retire_with(&p, Service::Systemd, &lc, &systemctl, &|_| Some(4242));
+        assert_eq!(
+            retired,
+            Ok(RetiredJob::Retired {
+                label: p.label(),
+                tier: None,
+            })
+        );
+        assert_eq!(
+            *ran.borrow(),
+            [format!("stop {}", p.label()), "daemon-reload".to_string()]
+        );
+        assert_eq!(lc.exiting.get(), 0, "its pid was waited for");
+        ran.borrow_mut().clear();
+        assert_eq!(
+            retire_with(&p, Service::Systemd, &lc, &systemctl, &|_| None),
+            Ok(RetiredJob::Absent)
+        );
+        assert!(ran.borrow().is_empty(), "{:?}", ran.borrow());
+    }
+
+    /// `aterm fabric off` under the node service retires the job an earlier build left and says
+    /// the node service stops hosting bus.log; with none it says so and stops nothing.
+    /// NEGATIVE CONTROL: an off that leaves the legacy job loaded keeps a broker on bus.log the
+    /// person turned off (no `bootout` call).
+    #[test]
+    fn an_off_under_the_node_service_retires_a_legacy_job() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = private_root(dir.path());
+        std::fs::write(p.plist(), p.plist_text()).expect("the job's plist");
+        let lc = FakeLaunchd::new(true, 1);
+        let mut out = Out::kept();
+        off_node(
+            &p,
+            Service::Launchd,
+            &lc,
+            &|_| panic!("no systemctl"),
+            &|_| panic!("no unit"),
+            &mut out,
+        );
+        assert!(!out.failed, "{}", out.said());
+        assert_eq!(lc.count("bootout"), 1);
+        assert!(!p.plist().exists());
+        assert!(
+            out.said().contains("retired") && out.said().contains("stops hosting bus.log"),
+            "{}",
+            out.said()
+        );
+        let mut out = Out::kept();
+        off_node(
+            &p,
+            Service::Launchd,
+            &lc,
+            &|_| panic!("no systemctl"),
+            &|_| panic!("no unit"),
+            &mut out,
+        );
+        assert!(
+            out.said().contains("already") && !out.failed,
+            "{}",
+            out.said()
+        );
+    }
+
+    /// What the node service hosts at a root: nothing where no mint secret is; off where an off
+    /// record stands (in the root or only beside aterm.toml), ahead of the person's hand record;
+    /// the person's broker where `on --service none` left its record, until an `on` under the
+    /// node service takes it out; else on, for the mesh's one fleet whatever fleet a bridge
+    /// command names, at the recorded tier (else ordered).
+    /// NEGATIVE CONTROL: a `bus_hosting` that skips the kept off record hosts the log of a
+    /// fabric whose root the person tidied after an off.
+    #[test]
+    fn the_node_service_hosts_bus_log_only_for_a_provisioned_fabric_that_is_on() {
+        use crate::durability::Durability;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let config_dir = dir.path().join("cfg/aterm");
+        std::fs::create_dir_all(&config_dir).expect("aterm.toml's folder");
+        let p = Paths {
+            config: Some(config_dir.join("aterm.toml")),
+            rendezvous: Some(dir.path().join("run/fabric.toml")),
+            ..scratch_paths(dir.path())
+        };
+        assert_eq!(bus_hosting(&p), BusHosting::Unprovisioned);
+        aterm_uds::private_file::ensure_private_dir(&p.root).expect("the root");
+        assert_eq!(bus_hosting(&p), BusHosting::Unprovisioned);
+        aterm_uds::private_file::write_private(&p.root, MINT_SECRET, &[7; SECRET_LEN])
+            .expect("the secret");
+        let on = |fleet: &str, tier| BusHosting::On {
+            fleet: fleet.to_owned(),
+            tier,
+        };
+        let fleet = crate::federate::FLEET;
+        assert_eq!(bus_hosting(&p), on(fleet, Durability::Ordered));
+        write_durability_record(&p.root, Durability::Strict).expect("a tier");
+        assert_eq!(bus_hosting(&p), on(fleet, Durability::Strict));
+
+        let lab = Paths {
+            fleet: "lab".to_owned(),
+            ..p.clone()
+        };
+        let (toml, _) =
+            set_fabric_command("", &lab.bridge_command("n-0123456789abcdef")).expect("a command");
+        std::fs::write(config_dir.join("aterm.toml"), toml).expect("aterm.toml");
+        assert_eq!(
+            bus_hosting(&p),
+            on(fleet, Durability::Strict),
+            "a bridge command's fleet is not the mesh's"
+        );
+
+        aterm_uds::private_file::write_private(&p.root, HAND_RECORD, b"").expect("by hand");
+        assert_eq!(bus_hosting(&p), BusHosting::Hand);
+        let mut out = Out::kept();
+        assert!(record_step(&p, Service::Node, &mut out), "{}", out.said());
+        assert_eq!(bus_hosting(&p), on(fleet, Durability::Strict));
+
+        aterm_uds::private_file::write_private(&p.root, HAND_RECORD, b"").expect("by hand");
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(!out.failed, "{}", out.said());
+        assert_eq!(bus_hosting(&p), BusHosting::Off, "off ahead of by hand");
+        std::fs::remove_file(p.root.join(OFF_RECORD)).expect("the root's off record");
+        assert_eq!(
+            bus_hosting(&p),
+            BusHosting::Off,
+            "the off record beside aterm.toml"
         );
     }
 }

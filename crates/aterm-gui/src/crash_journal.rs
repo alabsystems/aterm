@@ -715,7 +715,7 @@ mod unix {
         Note, QuitLayout, Reopened, decode, encode, unix_nanos,
     };
     use crate::crash_signal::markers::{self, Owner};
-    use crate::durable::{Flush, fsync};
+    use crate::durable::Flush;
     use crate::restore::RestoreManifest;
 
     /// The writer's half: this process's journal, its lifetime lock held.
@@ -919,11 +919,12 @@ mod unix {
             .open(dir)?;
         match flush {
             Some(flush) => crate::durable::finish(&handle, flush),
-            None => fsync(&handle),
+            None => aterm_durable::primitive::fsync(&handle),
         }
     }
 
-    /// [`sync_dir`]'s plain `fsync(2)` after `step` has taken effect: a folder the volume
+    /// [`sync_dir`]'s plain `fsync(2)` (aterm-durable's, which astream-sys counts `plain`)
+    /// after `step` has taken effect: a folder the volume
     /// cannot flush, or open, is accepted
     /// (`aterm_durable::DirFlushed::classify`, astream-sys's `dir_flush_unavailable`), and a
     /// failed flush is logged.
@@ -3589,6 +3590,13 @@ pub(crate) mod tests {
         );
     }
 
+    /// The image and its entry are only ordered, and the boot claim's folder takes one plain
+    /// `fsync(2)`, aterm-durable's (`primitive::fsync`), which astream-sys counts `plain` in
+    /// `flush_tally`: the seam counts exactly this thread's one, and the process-wide tally
+    /// moves by at least it (this binary's other tests flush meanwhile, so only a bound reads
+    /// there; aterm-durable's `tests/flush_tally.rs` holds the seam's count to the tally's
+    /// exactly). A folder flush that called the OS itself, as this one did through
+    /// `libc::fsync`, moves neither.
     #[test]
     fn a_journal_image_is_only_ordered_and_the_boot_claim_untouched() {
         use aterm_durable::{Flush, seam::Recording};
@@ -3608,13 +3616,29 @@ pub(crate) mod tests {
             [Flush::Ordered, Flush::Ordered],
             "the image and its entry"
         );
+        assert_eq!(
+            recording.take_plain(),
+            0,
+            "a published image takes no plain flush"
+        );
         die(owner);
+        let before = astream_sys::flush_tally();
         let claim = claim_here(dir.path(), logs.path());
+        let after = astream_sys::flush_tally();
         assert!(claim.reopened.is_some(), "the dead run's desk reopens");
         assert_eq!(
             recording.take(),
             [],
             "the claim's entries take the plain fsync(2), not an aterm-durable arm"
+        );
+        assert_eq!(
+            recording.take_plain(),
+            1,
+            "the claim's folder: one plain fsync(2), aterm-durable's"
+        );
+        assert!(
+            after.plain > before.plain,
+            "astream-sys counted the claim's folder flush: {before:?} -> {after:?}"
         );
     }
 
@@ -4113,7 +4137,7 @@ pub(crate) mod tests {
                 std::time::Instant::now() < deadline,
                 "the file clock did not reach the wall clock in a minute"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         std::fs::remove_file(&probe).unwrap();
     }

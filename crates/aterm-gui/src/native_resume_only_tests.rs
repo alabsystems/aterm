@@ -1070,6 +1070,7 @@ fn cancellation_waits_for_reserved_but_unpublished_preparation() {
         &request.id,
         world.facts.clock.load(Ordering::SeqCst),
         false,
+        AccountSlot::Plain,
     )
     .unwrap();
     world.seal.cancel(recovery::CancellationKind::OwnerStop);

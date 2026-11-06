@@ -16,14 +16,15 @@ use crate::decide::{self, Face, Handoff};
 pub const EXIT_REPLACED: u8 = aterm_ctl::EXIT_REPLACED;
 
 /// The usage line printed after a usage error.
-pub const SYNOPSIS: &str = "usage: amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...";
+pub const SYNOPSIS: &str =
+    "usage: amacs [--wait | --no-wait] [-nw | --tty] [--secret=HEADER,...] [+LINE[:COL]] FILE...";
 
 /// Help text for `amacs --help`, `aterm edit --help` and `aterm amacs --help`.
 pub const HELP: &str = "\
 amacs - aterm's editor (`aterm edit` is the same command)
 
 USAGE:
-    amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...
+    amacs [--wait | --no-wait] [-nw | --tty] [--secret=HEADER,...] [+LINE[:COL]] FILE...
 
 In an aterm tab, each FILE opens in a new Editor tab to the right of this one,
 and amacs waits, printing nothing, until that tab closes; then the next FILE
@@ -43,6 +44,11 @@ OPTIONS:
     --no-wait     in an aterm tab, hand each FILE to an Editor tab and return
                   at once (in the terminal neither flag changes anything)
     -nw, --tty    edit in this terminal instead of an Editor tab
+    --secret=HEADER,...
+                  for a private grid (`aterm db`'s revealed secrets): the
+                  columns, by header, whose cells the Editor tab's
+                  accessibility tree and status never read out (`--secret=`
+                  names none; without it such a grid hides every cell)
     -h, --help    print this help
     --            every later argument is a FILE
 
@@ -97,6 +103,9 @@ pub struct Args {
     pub tty: bool,
     pub wait: bool,
     pub no_wait: bool,
+    /// `--secret=HEADER,...`: the private grid's columns no reader of the window gets
+    /// ([`EditRequest::secret`]).
+    pub secret: Option<Vec<String>>,
     pub targets: Vec<Target>,
 }
 
@@ -137,6 +146,31 @@ pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
                     continue;
                 }
                 _ => {}
+            }
+            if let Some(headers) = text.strip_prefix("--secret=") {
+                if parsed.secret.is_some() {
+                    return Err("--secret is given twice".to_string());
+                }
+                let headers: Vec<String> = if headers.is_empty() {
+                    Vec::new()
+                } else {
+                    headers.split(',').map(str::to_string).collect()
+                };
+                // The wire's own reading decides which lists it carries.
+                let probe = EditRequest {
+                    uri: "file:///".to_string(),
+                    line: None,
+                    create: false,
+                    for_word: None,
+                    wait: true,
+                    read_only: false,
+                    secret: Some(headers.clone()),
+                };
+                if probe.format().is_err() {
+                    return Err(format!("bad {text}"));
+                }
+                parsed.secret = Some(headers);
+                continue;
             }
             if let Some(spec) = text.strip_prefix('+') {
                 position =
@@ -321,6 +355,7 @@ pub fn edit_files(
             for_word: for_word.map(str::to_string),
             wait: !args.no_wait,
             read_only: false,
+            secret: args.secret.clone(),
         };
         let opened = match window.edit(&request) {
             Ok(opened) => opened,
@@ -629,6 +664,23 @@ mod tests {
             panic!("an edit");
         };
         assert!(args.wait && args.tty && !args.no_wait);
+        assert_eq!(args.secret, None);
+        let Ok(Command::Edit(args)) = parse_args(&os(&["--secret=password,=totp", "a.tsv"])) else {
+            panic!("an edit");
+        };
+        assert_eq!(
+            args.secret,
+            Some(vec!["password".to_string(), "=totp".to_string()])
+        );
+        let Ok(Command::Edit(args)) = parse_args(&os(&["--secret=", "a.tsv"])) else {
+            panic!("an edit");
+        };
+        assert_eq!(args.secret, Some(Vec::new()), "`--secret=` names none");
+        let Ok(Command::Edit(args)) = parse_args(&os(&[
+            "--wait", "+12:4", "a b", "c", "-nw", "--", "-x", "+3",
+        ])) else {
+            panic!("an edit");
+        };
         assert_eq!(
             args.targets,
             [
@@ -658,6 +710,9 @@ mod tests {
             &["+x", "a"],
             &["a", "+3"],
             &["--wait", "--no-wait", "a"],
+            &["--secret=a,a", "a"],
+            &["--secret=a", "--secret=b", "a"],
+            &["--secret=a b", "a"],
             &[],
             &["--tty"],
         ] {
@@ -700,6 +755,7 @@ mod tests {
             for_word: Some(word),
             wait: true,
             read_only: false,
+            secret: None,
         };
         for byte in 0..=u8::MAX {
             let sent = request(char::from(byte).to_string()).format().is_ok();

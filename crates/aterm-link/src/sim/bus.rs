@@ -129,6 +129,14 @@
 //! are refused as a batch astream rolled back. A request is processed inside
 //! the client's `write`, on the bridge's thread; a subscription's deliveries
 //! are produced only when the scheduler pumps it.
+//!
+//! ## The log's device (critic item F07)
+//!
+//! `Hello` names the device the log is on ([`OnDevice`]), its full flush draining it. In a
+//! world whose log is on the state dir's device, every full flush of the log (Strict's, an
+//! escalation's, the horizon's, an open's, a `Settle`'s) drains that device too
+//! (`device::Drain`), putting every write the bridge ordered there before it on the media; a
+//! `Settle`'s drains as its answer goes, so a held one is the writer still flushing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
@@ -333,11 +341,37 @@ impl ConnState {
         }
     }
 
-    /// Every held answer, sent ([`ConnState::held`]).
-    fn send_held(&mut self) {
+    /// Every held answer, sent ([`ConnState::held`]): whether one was a `Settle`'s, whose
+    /// full flush ends as it goes ([`Held::settles`]).
+    #[must_use]
+    fn send_held(&mut self) -> bool {
+        let mut settled = false;
         while let Some(h) = self.held.pop_front() {
             self.out.extend(h.frame);
             self.mark_rate(h.rate);
+            settled |= h.settles;
+        }
+        settled
+    }
+}
+
+/// WHERE THE LOG IS (critic item F07, [`State::device`]): the device number its `Hello` names
+/// (astream's `LogDevice`, its full flush draining that device, as `F_FULLFSYNC` does on
+/// Apple), and, where that is the state dir's own device, the hold that drains it with each of
+/// the broker's full flushes ([`State::flushed_in_full`]). Every world but one whose log is on
+/// the state dir's device names another, whose flush settles nothing of the bridge's.
+#[derive(Clone, Debug)]
+pub(crate) struct OnDevice {
+    pub(crate) dev: u64,
+    pub(crate) drain: Option<super::device::Drain>,
+}
+
+impl Default for OnDevice {
+    /// A device no state dir is on.
+    fn default() -> Self {
+        Self {
+            dev: u64::MAX,
+            drain: None,
         }
     }
 }
@@ -360,6 +394,9 @@ struct Held {
     frame: Vec<u8>,
     /// A refusal for the rate's ([`RateMark`]).
     rate: Option<RateMark>,
+    /// A `Settle`'s answer: its full flush ends as it is sent (critic item F07), the latest a
+    /// writer that took the request may issue it.
+    settles: bool,
 }
 
 /// What one tail was TOLD of the records retention gave up below it, as astream's
@@ -446,6 +483,14 @@ pub(crate) struct State {
     pub(crate) log: Vec<Rec>,
     /// Every record below it is on stable media.
     pub(crate) durable: u64,
+    /// WHERE THE LOG IS (critic item F07): the device its `Hello` names, a full flush that
+    /// drains it, and the state dir's device itself where the log is on it.
+    pub(crate) device: OnDevice,
+    /// A `Settle` was just handled, so the answer [`State::answer`] makes next is its own:
+    /// the device is drained as it goes, a held one being the writer still flushing.
+    settle_owed: bool,
+    /// The `Settle`s this broker answered ([`Broker::settles`]).
+    pub(crate) settles: u64,
     dedup: BTreeMap<(u64, u64), u64>,
     groups: BTreeMap<String, u64>,
     /// subject -> (offset of its newest record, the producer charged for it).
@@ -836,6 +881,9 @@ impl Broker {
                 lineage: Vec::new(),
                 log: Vec::new(),
                 durable: 0,
+                device: OnDevice::default(),
+                settle_owed: false,
+                settles: 0,
                 dedup: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 index: BTreeMap::new(),
@@ -1072,9 +1120,13 @@ impl Broker {
             s.holds = None;
         }
         let mut sent = 0;
+        let mut settled = false;
         for c in s.conns.values_mut().filter(|c| c.open) {
             sent += c.held.len();
-            c.send_held();
+            settled |= c.send_held();
+        }
+        if settled {
+            s.drain_device();
         }
         if sent > 0 {
             s.notes.push(format!("broker answers {sent} held"));
@@ -1086,6 +1138,16 @@ impl Broker {
     pub(crate) fn held_counts(&self) -> (u64, u64, u64) {
         let s = lock(&self.state);
         (s.held_total, s.tries_not_yet, s.seen_before_ack)
+    }
+
+    /// The `Settle`s this broker answered ([`State::settles`]).
+    pub(crate) fn settles(&self) -> u64 {
+        lock(&self.state).settles
+    }
+
+    /// The log is on `device` from now on ([`State::device`]).
+    pub(crate) fn on_device(&self, device: OnDevice) {
+        lock(&self.state).device = device;
     }
 
     /// `(commits that rode a publish in one write, commits written alone)` ([`State::commits_corked`]).
@@ -1118,7 +1180,7 @@ impl Broker {
     pub(crate) fn horizon(&self) {
         let mut s = lock(&self.state);
         if s.up && s.tier == Tier::Ordered {
-            s.durable = s.log.len() as u64;
+            s.flushed_in_full();
             let line = format!("horizon durable={}", s.durable);
             s.notes.push(line);
         }
@@ -1247,7 +1309,7 @@ impl Broker {
             (None, false) => Event::Start,
         });
         s.rebuild();
-        s.durable = s.log.len() as u64;
+        s.flushed_in_full();
         s.up = true;
         let mut latest: Vec<usize> = s.latest_wills().into_values().collect();
         latest.sort_by_key(|&i| s.wills[i].reg_off);
@@ -1882,10 +1944,9 @@ impl State {
         }
         let escalated = rec.escalated;
         self.log.push(rec);
-        let head = self.log.len() as u64;
         match self.tier {
-            Tier::Strict => self.durable = head,
-            Tier::Ordered | Tier::Relaxed if escalated => self.durable = head,
+            Tier::Strict => self.flushed_in_full(),
+            Tier::Ordered | Tier::Relaxed if escalated => self.flushed_in_full(),
             _ => {}
         }
         off
@@ -2010,6 +2071,8 @@ impl State {
     }
 
     fn answer(&mut self, conn: u64, responses: &[Response]) {
+        let settles = std::mem::take(&mut self.settle_owed);
+        let mut settled = false;
         let State {
             conns,
             holds,
@@ -2021,8 +2084,10 @@ impl State {
             return;
         };
         for r in responses {
+            // A settle's ack names the durable head, no record: the reorder count reads none.
+            let settle = settles && matches!(r, Response::PublishAck { .. });
             let ack_of = match r {
-                Response::PublishAck { offset, .. } => Some(*offset),
+                Response::PublishAck { offset, .. } if !settle => Some(*offset),
                 _ => None,
             };
             let rate = match r {
@@ -2034,7 +2099,8 @@ impl State {
                 _ => None,
             };
             let hold = !c.held.is_empty()
-                || (ack_of.is_some() && holds.as_mut().is_some_and(|rng| rng.chance(1, 3)));
+                || ((ack_of.is_some() || settle)
+                    && holds.as_mut().is_some_and(|rng| rng.chance(1, 3)));
             if hold {
                 let mut frame = VecDeque::new();
                 put(&mut frame, r);
@@ -2042,12 +2108,32 @@ impl State {
                     ack_of,
                     frame: Vec::from(frame),
                     rate,
+                    settles: settle,
                 });
                 *held_total += 1;
             } else {
                 put(&mut c.out, r);
                 c.mark_rate(rate);
+                settled |= settle;
             }
+        }
+        if settled {
+            self.drain_device();
+        }
+    }
+
+    /// THE LOG'S FULL FLUSH (critic item F07): its every record on the media, and every write the
+    /// bridge ordered on the state dir's device before it, where the log is on that device
+    /// ([`OnDevice::drain`]).
+    fn flushed_in_full(&mut self) {
+        self.durable = self.log.len() as u64;
+        self.drain_device();
+    }
+
+    /// The state dir's device drained by a full flush of the log's, where the log is on it.
+    fn drain_device(&self) {
+        if let Some(drain) = &self.device.drain {
+            drain.full_flush();
         }
     }
 
@@ -2458,6 +2544,7 @@ impl State {
                         | astream_broker::REQUEST_STATS
                         | astream_broker::REQUEST_BURST_MARKS
                         | astream_broker::REQUEST_RELAY
+                        | astream_broker::REQUEST_SETTLE
                         | if self.gap_fences {
                             astream_broker::REQUEST_GAP_FENCES
                         } else {
@@ -2465,6 +2552,12 @@ impl State {
                         },
                 ),
                 health: None,
+                // The device the log is on ([`OnDevice`]), its full flush draining it as Apple's
+                // `F_FULLFSYNC` does: the simulated device is Apple's, barriers and all.
+                device: Some(astream_broker::LogDevice {
+                    dev: self.device.dev,
+                    flush_drains_device: true,
+                }),
                 // The rules this open set, and none read back from an earlier one's.
                 retention: self
                     .ret
@@ -2656,6 +2749,22 @@ impl State {
                 }
                 self.notes.push(format!("clear gap fences c{conn}"));
                 vec![self.mark(head, String::new())]
+            }
+            // ASTREAM'S SETTLE (critic item F07): a full flush the writer issues once it took the
+            // request, whatever already covers the head, answered with the durable head after
+            // it. The log is on the media at once; the state dir's device, where the log is on
+            // it, is drained as the answer goes ([`State::answer`]), so a held answer is the
+            // writer still flushing, the latest it may.
+            Request::Settle => {
+                self.settles += 1;
+                self.durable = head;
+                self.settle_owed = true;
+                self.notes
+                    .push(format!("settle c{conn} durable={}", self.durable));
+                vec![Response::PublishAck {
+                    offset: self.durable,
+                    deduped: false,
+                }]
             }
             Request::Retire {
                 producer_id,
@@ -3175,15 +3284,19 @@ impl Read for SimStream {
                 tries_not_yet,
                 ..
             } = &mut *s;
+            let mut settled = false;
             if let Some(c) = conns.get_mut(&self.conn) {
                 if !c.held.is_empty() {
                     if trying {
                         *tries_not_yet += 1;
                     } else {
-                        c.send_held();
+                        settled = c.send_held();
                         out_empty = false;
                     }
                 }
+            }
+            if settled {
+                s.drain_device();
             }
         }
         if out_empty {

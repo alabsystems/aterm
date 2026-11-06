@@ -14,8 +14,9 @@
 //!   The `[everyone]` reseal carries the revoke cascade (the Mac's roster row and pool slots, a new
 //!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could read, for rotation
 //!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25). It refuses up front,
-//!   signing nothing, where its batch and the re-keys it makes due would pass the log's keyed
-//!   budget ([`RemovalFill`]).
+//!   signing nothing, where its batch and every re-key owed after it (its own, and those earlier
+//!   removals made due that some Mac can still sign) would pass the log's keyed budget or its
+//!   byte bound ([`RemovalFill`]).
 //! - [`tend_epochs`] is the coverage rule on every vault pass, and the only automatic re-key:
 //!   where removals on two sides of a split left two newest epochs, or a newest epoch is still
 //!   wrapped to a Mac the log removed (a quorum `Remove` voided the remover's rotation, or the
@@ -23,7 +24,8 @@
 //!   ([`log_entries::coalesce_concurrent_commons_epochs`]), in the turn
 //!   [`Log::rekey_dues`] gives it: the remover first, everyone else after a grace. A Commons
 //!   exchange signs nothing. A re-key no removal made due waits, unsigned, where it would take
-//!   the log's keyed records past [`crate::membership_log::AUTOMATIC_KEYED_STOP`]
+//!   the log's keyed records past [`crate::membership_log::AUTOMATIC_KEYED_STOP`], or into the
+//!   room, in records or bytes, that the re-keys a held `Remove` made due still owe
 //!   ([`within_automatic_stop`]).
 //! - [`removed_notes`] names each Mac the log removed, by whom and when, so a removed Mac that asks
 //!   again shows as removed, not new, and a person's "Allow again" restores a plain removal
@@ -1014,17 +1016,22 @@ pub(super) enum Mints {
     No,
 }
 
-/// What a removal would add to the membership log's keyed records, beside what the log holds
-/// (one-mesh §8, "The 8,500 stop"): the 8,500 stop never holds a re-key a removal made due,
-/// since writers wait on it ([`log_entries::Waiting`]), so a removal reserves that room up front
-/// and refuses, signing nothing, where the log could not take it all ([`RemovalFill::passes`]).
-/// Every way a person removes a Mac weighs it before its `Remove` is signed: `aterm members
-/// remove` ([`draft_removal`]), `aterm secrets revoke` (`log_entries::draft_retire_in_log_with`)
-/// and a publish that puts a Mac's key on a `code-only` line (`log_entries`' writer). A seat move
-/// (`super::readmit`'s `Replace`) is signed only below its proof-admission stop
-/// (`super::readmit::PROVEN_FILL` of the keyed budget, 9,216 records), a quarter of the budget
-/// below the hard bound. Every count is a bound of [`log_entries::rekey_keyed_bound`] over the
-/// log as this Mac holds it when the removal is drafted, never below what is signed.
+/// What a removal would add to the membership log's keyed records and their bytes, beside what
+/// the log holds (one-mesh §8, "The 8,500 stop"): the 8,500 stop never holds a re-key a removal
+/// made due, since writers wait on it ([`log_entries::Waiting`]), so a removal reserves that room
+/// up front and refuses, signing nothing, where the log could not take it all
+/// ([`RemovalFill::passes`]). Every way a person removes a Mac weighs it before its `Remove` is
+/// signed: `aterm members remove` ([`draft_removal`]), `aterm secrets revoke`
+/// (`log_entries::draft_retire_in_log_with`) and a publish that puts a Mac's key on a `code-only`
+/// line (`log_entries`' writer). A seat move (`super::readmit`'s `Replace`) is signed only below
+/// its proof-admission stop (`super::readmit::PROVEN_FILL` of the keyed budget, 9,216 records), a
+/// quarter of the budget below the hard bound. Every count is a bound of
+/// [`log_entries::rekey_bound`] over the log as this Mac holds it when the removal is drafted,
+/// never below what is signed.
+///
+/// One-mesh proofs P6 (`docs/design/one-mesh-proofs/P6-log-capacity.md`): the room reserved is
+/// what every held `Remove` still owes, not only this one's (F1), in wire bytes as well as
+/// records (F6), and a heal keeps the same room free ([`log_entries::owed_rekeys`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RemovalFill {
     /// The keyed records the log holds.
@@ -1033,12 +1040,65 @@ pub(super) struct RemovalFill {
     /// mints or may mint ([`Mints`]), its `Wrap`s and re-`Put`s with the cascade. Its `Remove`s
     /// are weighed records, not keyed ones.
     batch: usize,
-    /// The keyed records of the re-keys it makes due at worst, for each audience whose newest
-    /// epoch wraps a Mac it removes: a ranked holder's rotation where the batch does not surely
-    /// mint there, and one coalesce of the heads a concurrent removal leaves.
+    /// The keyed records of the re-keys owed after it at worst, for each audience whose newest
+    /// epoch wraps a Mac it removes, or that an earlier removal left owing a re-key some Mac can
+    /// sign and nobody has yet (`log_entries::owed_audiences`): a ranked holder's rotation where
+    /// the batch does not surely mint there, and one coalesce of the heads a concurrent removal
+    /// leaves.
     worst: usize,
     /// The log's keyed budget ([`crate::membership_log::RecordBudgets::keyed`]).
     limit: usize,
+    /// The wire bytes of the records the log holds.
+    bytes: usize,
+    /// The most wire bytes of `batch`'s records.
+    batch_bytes: usize,
+    /// The most wire bytes of `worst`'s records.
+    worst_bytes: usize,
+    /// The log's byte bound ([`crate::membership_log::budgets::held_bytes_bound`]).
+    byte_limit: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`RemovalFill::of`], on for one test thread: the worst case counts only the
+    /// audiences whose newest epoch wraps a Mac this removal removes, as before one-mesh proofs
+    /// P6 F1, so a re-key an earlier removal made due loses its room.
+    pub(super) static FILL_OWN_TARGET_ONLY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`RemovalFill::passes`], on for one test thread: the fill weighs records alone,
+    /// as before one-mesh proofs P6 F6, so a re-key's re-`Put`s can pass the byte bound.
+    pub(super) static FILL_IGNORES_BYTES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fill_mutants() -> (bool, bool) {
+    (
+        FILL_OWN_TARGET_ONLY.with(std::cell::Cell::get),
+        FILL_IGNORES_BYTES.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(not(test))]
+const fn fill_mutants() -> (bool, bool) {
+    (false, false)
+}
+
+/// Whether a log that holds `held` of `limit` (records or bytes) takes `cost` more and still keeps
+/// `need` free: `held + cost + need <= limit`, without overflow at any size. The room check of a
+/// removal's fill ([`RemovalFill::passes`]), a heal (`log_entries`' `heal_room`) and the tender's
+/// re-keys no removal made due ([`within_automatic_stop`], and its 8,500 stop with no `need`);
+/// one-mesh proofs P6's `keeps_room`. `Log::insert`'s hard bound and a proof admission's line keep
+/// their own checks.
+#[must_use]
+pub(super) const fn keeps_room(held: u64, cost: u64, need: u64, limit: u64) -> bool {
+    held <= limit && cost <= limit - held && need <= limit - held - cost
+}
+
+/// `count` as a [`keeps_room`] operand.
+#[must_use]
+pub(super) fn wide(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 impl RemovalFill {
@@ -1057,11 +1117,18 @@ impl RemovalFill {
         let flight = log_entries::Flight::of_batch(log, opened, me);
         let mut gone = log.removed_recipients();
         gone.extend(removed.iter().copied());
+        // The re-keys earlier removals made due that some Mac can still sign (P6 F1), beside
+        // the ones this batch makes due.
+        let owed = if fill_mutants().0 {
+            BTreeSet::new()
+        } else {
+            log_entries::owed_audiences(log)
+        };
         let mut seats = log.current_recipients(&EpochAudience::Everyone);
         seats.retain(|seat| !removed.contains(seat));
         let no_seats = BTreeSet::new();
-        let mut batch = 0usize;
-        let mut worst = 0usize;
+        let mut batch = log_entries::RekeyCost::default();
+        let mut worst = log_entries::RekeyCost::default();
         for (audience, newest) in &opened.maximal_epochs {
             let mints = mints(audience, newest, &gone);
             let seats = if matches!(audience, EpochAudience::Hosts(_)) {
@@ -1070,56 +1137,89 @@ impl RemovalFill {
                 &seats
             };
             let next = everyone.filter(|_| *audience == EpochAudience::Everyone);
-            let cost =
-                log_entries::rekey_keyed_bound(log, opened, &flight, audience, seats, &gone, next);
+            let cost = log_entries::rekey_bound(log, opened, &flight, audience, seats, &gone, next);
             if mints != Mints::No {
-                batch = batch.saturating_add(cost);
+                batch = batch.plus(cost);
             }
-            let wraps_it = newest.iter().any(|epoch| {
-                opened
-                    .wrapped_recipients
-                    .get(epoch)
-                    .is_some_and(|wrapped| !wrapped.is_disjoint(removed))
-            });
-            if wraps_it {
+            if log_entries::wraps_removed(opened, newest, removed) || owed.contains(audience) {
                 let rekeys = if mints == Mints::Surely { 1 } else { 2 };
-                worst = worst.saturating_add(cost.saturating_mul(rekeys));
+                worst = worst.plus(cost.times(rekeys));
             }
         }
         Self {
             keyed: log.counts().keyed,
-            batch,
-            worst,
+            batch: batch.keyed,
+            worst: worst.keyed,
             limit: log.budgets().keyed,
+            bytes: log.held_bytes(),
+            batch_bytes: batch.bytes,
+            worst_bytes: worst.bytes,
+            byte_limit: crate::membership_log::budgets::held_bytes_bound(),
         }
     }
 
-    /// This fill with `keyed` more records in its batch: what a batch signs beside the removal
+    /// This fill with `wraps` more `Wrap`s in its batch: what a batch signs beside the removal
     /// (a seat move's `Admit` `Wrap`s and the moved seat's `Wrap` in each epoch it mints,
     /// `super::readmit::seat_move_refusal`).
-    pub(super) const fn with_more(self, keyed: usize) -> Self {
+    pub(super) fn with_more(self, wraps: usize) -> Self {
+        let wrap = crate::membership_log::Kind::Wrap.most_bytes();
         Self {
-            batch: self.batch.saturating_add(keyed),
+            batch: self.batch.saturating_add(wraps),
+            batch_bytes: self.batch_bytes.saturating_add(wraps.saturating_mul(wrap)),
             ..self
         }
     }
 
-    /// Whether the log's keyed records, the batch and the worst case together would pass the
-    /// keyed budget.
-    pub(super) const fn passes(self) -> bool {
-        self.keyed
-            .saturating_add(self.batch)
-            .saturating_add(self.worst)
-            > self.limit
+    /// Whether the log's records, the batch and the worst case together would pass its keyed
+    /// budget.
+    fn passes_records(self) -> bool {
+        !keeps_room(
+            wide(self.keyed),
+            wide(self.batch),
+            wide(self.worst),
+            wide(self.limit),
+        )
     }
 
-    /// The refusal a person reads: the fill, with no value of any entry.
+    /// Whether the log's records, the batch and the worst case together would pass its keyed
+    /// budget or its byte bound.
+    pub(super) fn passes(self) -> bool {
+        self.passes_records()
+            || (!fill_mutants().1
+                && !keeps_room(
+                    wide(self.bytes),
+                    wide(self.batch_bytes),
+                    wide(self.worst_bytes),
+                    wide(self.byte_limit),
+                ))
+    }
+
+    /// The refusal a person reads: the fill of the bound it passes, records first, with no value
+    /// of any entry. The worst case is every re-key owed after it, its own and those earlier
+    /// removals made due that are not signed yet.
     pub(super) fn refusal(self) -> String {
+        let (counts, held, batch, worst, limit) = if self.passes_records() {
+            (
+                "keyed records",
+                self.keyed,
+                self.batch,
+                self.worst,
+                self.limit,
+            )
+        } else {
+            (
+                "record bytes",
+                self.bytes,
+                self.batch_bytes,
+                self.worst_bytes,
+                self.byte_limit,
+            )
+        };
         format!(
-            "the membership log is full: it holds {} keyed records, and this removal's {} with \
-             the at most {} of the re-keys it makes due would pass its limit of {}, so none of \
-             them is signed",
-            self.keyed, self.batch, self.worst, self.limit
+            "the membership log is full: it holds {held} {counts}, and this removal's {batch} with \
+             the at most {worst} of the re-keys owed after it (its own, and those earlier removals \
+             made due that are not signed yet) would pass its limit of {limit}, so none of them \
+             is signed"
         )
     }
 }
@@ -1590,6 +1690,466 @@ pub(super) fn vault_pass(paths: &Paths, posts_by: Option<Instant>) {
     }
 }
 
+/// What the node service's vault pass keeps to (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13,
+/// §11 B10). [`NodePassPace::LIVE`] is the node service's.
+#[derive(Clone, Copy, Debug)]
+pub struct NodePassPace {
+    /// A pass runs at least this often, a new record or not.
+    pub every: Duration,
+    /// A pass that was busy or failed runs again after this.
+    pub again: Duration,
+    /// How often the loop looks at the records file (one `stat`) and at its stop.
+    pub look: Duration,
+    /// How long one pass waits out a writer of the vault's state before it says busy.
+    pub lock_wait: Duration,
+}
+
+impl NodePassPace {
+    /// The node service's pace: every 60 seconds, a new record seen within a second.
+    pub const LIVE: Self = Self {
+        every: Duration::from_secs(60),
+        again: Duration::from_secs(5),
+        look: Duration::from_secs(1),
+        lock_wait: Duration::from_secs(10),
+    };
+}
+
+/// How one node pass ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodePassSaid {
+    /// It looked at everything; what it signed and applied is beside this.
+    Done,
+    /// A writer still held the vault's state when its wait ended: it read nothing, which says
+    /// nothing about gaps or files.
+    Busy,
+    /// A step failed; another pass tries again.
+    Failed,
+}
+
+impl NodePassSaid {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn of_word(word: &str) -> Option<Self> {
+        match word {
+            "done" => Some(Self::Done),
+            "busy" => Some(Self::Busy),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// What one node pass did, kept for `aterm secrets status` ([`node_pass_receipt`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodePassReceipt {
+    /// When it ran, by the pass's clock.
+    pub ran_ms: u64,
+    /// How it ended.
+    pub said: NodePassSaid,
+    /// How many records it signed.
+    pub signed: usize,
+    /// The version it wrote to this Mac's files, where it wrote one.
+    pub applied: Option<u64>,
+}
+
+impl NodePassReceipt {
+    fn encode(&self) -> String {
+        let applied = self
+            .applied
+            .map_or_else(|| "-".to_owned(), |seq| seq.to_string());
+        format!(
+            "1 {} {} {} {applied}\n",
+            self.ran_ms,
+            self.said.word(),
+            self.signed
+        )
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut words = text.split_ascii_whitespace();
+        if words.next()? != "1" {
+            return None;
+        }
+        let ran_ms = words.next()?.parse().ok()?;
+        let said = NodePassSaid::of_word(words.next()?)?;
+        let signed = words.next()?.parse().ok()?;
+        let applied = match words.next()? {
+            "-" => None,
+            seq => Some(seq.parse().ok()?),
+        };
+        words.next().is_none().then_some(Self {
+            ran_ms,
+            said,
+            signed,
+            applied,
+        })
+    }
+}
+
+/// The node service's newest pass on this Mac: `None` where none ran, or its file is unreadable.
+#[must_use]
+pub fn node_pass_receipt(paths: &Paths) -> Option<NodePassReceipt> {
+    let bytes = fsx::read_private(&node_pass_file(paths), MAX_NODE_PASS_FILE)
+        .ok()
+        .flatten()?;
+    NodePassReceipt::parse(std::str::from_utf8(bytes.as_slice()).ok()?)
+}
+
+const MAX_NODE_PASS_FILE: usize = 256;
+
+fn node_pass_file(paths: &Paths) -> PathBuf {
+    paths.dir.join("node-pass")
+}
+
+/// One Mac's node passes: what its repairs held across them ([`repair_due`]), so a file a program
+/// keeps rewriting is put back once, as the subscriber's pass does.
+#[derive(Default)]
+pub struct NodePass {
+    repaired: Repaired,
+    /// Something it signed has reached no server yet.
+    unposted: bool,
+}
+
+impl NodePass {
+    /// One pass at `now_ms`: the heal, the re-key tender and the waiting writes
+    /// ([`vault_pass_at`]'s steps), what they signed posted once `may_post` lets this Mac use the
+    /// network (a post it could not make is owed to a later pass), then the materializer from what
+    /// this Mac holds, with no network.
+    ///
+    /// Each wait for the vault's locks ends within `lock_wait`, and a writer still there then makes
+    /// the pass [`NodePassSaid::Busy`], never a pass that found nothing. `None` where this Mac has
+    /// no vault: nothing is created for one.
+    pub fn once(
+        &mut self,
+        paths: &Paths,
+        now_ms: u64,
+        lock_wait: Duration,
+        may_post: &dyn Fn() -> bool,
+    ) -> Option<(NodePassReceipt, Option<Error>)> {
+        match config(paths) {
+            Ok(None) => return None,
+            Ok(Some(_)) => {}
+            Err(error) => {
+                let receipt = node_receipt(now_ms, NodePassSaid::Failed, 0, None);
+                return Some((receipt, Some(error)));
+            }
+        }
+        let (signed, healing) = vault_pass_until(paths, now_ms, Instant::now() + lock_wait);
+        self.unposted |= !signed.is_empty();
+        if self.unposted && may_post() {
+            let by = super::fan_out::one_exchange();
+            self.unposted = super::admit::post_records_to_servers_by(paths, by).is_err();
+        }
+        // A writer that outlasted the wait holds the files too: their turn comes with the next pass.
+        let busy = healing.as_ref().map(said_of) == Some(NodePassSaid::Busy);
+        let (applied, applying) = if busy {
+            (None, None)
+        } else {
+            match self.materialize(paths, Instant::now() + lock_wait) {
+                Ok(applied) => (applied, None),
+                Err(error) => (None, Some(error)),
+            }
+        };
+        let first = healing.or(applying);
+        let said = first.as_ref().map_or(NodePassSaid::Done, said_of);
+        Some((node_receipt(now_ms, said, signed.len(), applied), first))
+    }
+
+    /// Write this Mac's files from the records and the envelope it holds, where its log moved, a
+    /// repair is due ([`repair_due`]), or an apply failed or was cut short: the local half of the
+    /// subscriber's sync.
+    fn materialize(&mut self, paths: &Paths, deadline: Instant) -> crate::Result<Option<u64>> {
+        let config = configured(paths)?;
+        let before = load_state(paths)?;
+        let kept = self.repaired.clone();
+        let unfinished =
+            before.membership == Stored::In && (before.failed || !before.pending.is_empty());
+        let repair = !unfinished && self.repair_due(paths, &before);
+        let moved = log_entries::current_records_digest(paths, &config, &before)
+            .is_some_and(|digest| Some(digest) != before.records_digest);
+        if !unfinished && !repair && !moved {
+            return Ok(None);
+        }
+        let outcome = apply_until(
+            paths,
+            config,
+            before,
+            ApplyInput::Cached,
+            None,
+            Some(deadline),
+            repair,
+        );
+        match outcome {
+            Ok(SyncOutcome::Applied { seq, report }) => {
+                if apply_failed(&report) {
+                    self.repaired = kept;
+                    return Err(Error::new("a file of this version could not be written"));
+                }
+                Ok(Some(seq))
+            }
+            Ok(_) => Ok(None),
+            Err(error) => {
+                self.repaired = kept;
+                Err(error)
+            }
+        }
+    }
+
+    /// [`repair_due`]. A Mac that holds its vault as a log alone keeps no envelope for that rule's
+    /// cache check to read, which would call every pass a repair, so its rule is the rest of it:
+    /// once per version and set of files not as written.
+    fn repair_due(&mut self, paths: &Paths, state: &State) -> bool {
+        if state.digest.is_some() {
+            return repair_due(paths, &mut self.repaired);
+        }
+        let Some(source) = state.source_identity else {
+            return false;
+        };
+        if state.membership != Stored::In {
+            return false;
+        }
+        let version = (source, state.seq);
+        let changed = unsettled(paths, state);
+        let due = (!changed.is_empty() || state.own.is_none())
+            && self
+                .repaired
+                .as_ref()
+                .is_none_or(|(last, files)| *last != version || *files != changed);
+        if due {
+            self.repaired = Some((version, changed));
+        }
+        due
+    }
+}
+
+/// [`vault_pass_at`]'s three steps at `now_ms`, each whether or not one before it fails, every wait
+/// for the vault's locks ending at `deadline`: what they signed, and the first thing that kept one
+/// from finishing ([`crate::ErrorKind::VaultBusy`] for a writer still there at `deadline`).
+fn vault_pass_until(paths: &Paths, now_ms: u64, deadline: Instant) -> (Vec<Record>, Option<Error>) {
+    let mut signed = Vec::new();
+    let mut first = None;
+    for step in [
+        log_entries::close_wrap_gaps_until(paths, now_ms, deadline),
+        tend_epochs_until(paths, now_ms, deadline),
+        log_entries::sign_waiting_writes_by(paths, now_ms, Some(deadline)),
+    ] {
+        match step {
+            Ok(Some(records)) => signed.extend(records),
+            Ok(None) => {
+                first.get_or_insert_with(|| {
+                    Error::of_kind(
+                        crate::ErrorKind::VaultBusy,
+                        "a vault writer still holds this Mac's state",
+                    )
+                });
+            }
+            Err(error) => {
+                first.get_or_insert(error);
+            }
+        }
+    }
+    (signed, first)
+}
+
+const fn node_receipt(
+    ran_ms: u64,
+    said: NodePassSaid,
+    signed: usize,
+    applied: Option<u64>,
+) -> NodePassReceipt {
+    NodePassReceipt {
+        ran_ms,
+        said,
+        signed,
+        applied,
+    }
+}
+
+fn said_of(error: &Error) -> NodePassSaid {
+    match error.kind() {
+        crate::ErrorKind::VaultBusy | crate::ErrorKind::TimedOut => NodePassSaid::Busy,
+        _ => NodePassSaid::Failed,
+    }
+}
+
+/// What tells one records file's contents from another's: every writer renames a new file over it
+/// ([`fsx::FileStamp`]). `None` with no readable file.
+fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(paths.records_data_file().ok()?).ok()?;
+    let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+    Some(fsx::FileStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime_ns: ns(meta.mtime(), meta.mtime_nsec()),
+        ctime_ns: ns(meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+/// When the next node pass is due: at once for a records file not seen before (a record arrived,
+/// by whichever path), otherwise when its time comes, or at once where the clock was set back.
+#[derive(Debug, Default)]
+struct NodePassDue {
+    stamp: Option<fsx::FileStamp>,
+    ran_ms: Option<u64>,
+    wait_ms: u64,
+}
+
+impl NodePassDue {
+    fn due(&self, stamp: Option<fsx::FileStamp>, now_ms: u64) -> bool {
+        let Some(ran_ms) = self.ran_ms else {
+            return true;
+        };
+        stamp != self.stamp || now_ms < ran_ms || now_ms - ran_ms >= self.wait_ms
+    }
+
+    /// A pass that began with the file at `stamp` ran at `now_ms`, and the next waits `wait`. A
+    /// record that came during the pass differs from `stamp`, so it is due at the next look.
+    fn ran(&mut self, stamp: Option<fsx::FileStamp>, now_ms: u64, wait: Duration) {
+        self.stamp = stamp;
+        self.ran_ms = Some(now_ms);
+        self.wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+    }
+}
+
+/// What a node service gives [`run_node_pass`].
+pub struct NodePassHost<'a> {
+    /// This Mac's vault.
+    pub paths: &'a Paths,
+    /// Ends the loop.
+    pub stop: &'a std::sync::atomic::AtomicBool,
+    /// Whether the node's switches hold sharing off now (`[swarm] enabled = false`, this Mac left
+    /// the fleet): no pass runs while one does.
+    pub held: &'a dyn Fn() -> bool,
+    /// Whether this Mac may use the local network now.
+    pub may_post: &'a dyn Fn() -> bool,
+    /// Start the converge pass's runner (`crate::converge::start`), without waiting for it.
+    pub start_converge: &'a dyn Fn() -> Option<aterm_uds::spawnfd::Child>,
+    /// The clock the pass and its timer read.
+    pub now_ms: &'a dyn Fn() -> u64,
+    /// Where each change in how passes end is noted.
+    pub log: &'a dyn Fn(&str),
+    /// Its pace.
+    pub pace: NodePassPace,
+}
+
+/// The vault pass of a node service (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13): one pass on
+/// every new log record, by whichever path it came (the relay's ingest, a pull, another process's
+/// write, this pass's own), seen by one `stat` of the records file each [`NodePassPace::look`], and
+/// one every [`NodePassPace::every`]. It runs until `stop`, each pass's end kept where `aterm
+/// secrets status` reads it. A person's `aterm secrets agent off` holds it too
+/// ([`crate::service::subscriber_turned_off`]), as it holds all automatic vault work.
+pub fn run_node_pass(host: &NodePassHost<'_>) {
+    let mut pass = NodePass::default();
+    let mut due = NodePassDue::default();
+    let mut last_said = None;
+    let mut unfinished = 0_u32;
+    let mut converge = NodeConverge::default();
+    while !host.stop.load(std::sync::atomic::Ordering::Acquire) {
+        if !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home) {
+            let stamp = records_stamp(host.paths);
+            let now_ms = (host.now_ms)();
+            if due.due(stamp, now_ms) {
+                let ended = pass.once(host.paths, now_ms, host.pace.lock_wait, host.may_post);
+                let done = !matches!(&ended, Some((r, _)) if r.said != NodePassSaid::Done);
+                unfinished = if done {
+                    0
+                } else {
+                    unfinished.saturating_add(1)
+                };
+                // The next pass counts from when this one looked, not from when it ended: a clock
+                // that moved during a pass would otherwise skip the time that pass never saw.
+                due.ran(stamp, now_ms, node_pass_wait(&host.pace, unfinished));
+                if let Some((receipt, error)) = ended {
+                    converge.owed |= receipt.applied.is_some();
+                    keep_node_pass_end(host, &receipt, error.as_ref(), &mut last_said);
+                }
+            }
+            converge.tend(host);
+        }
+        std::thread::sleep(host.pace.look);
+    }
+}
+
+/// The wait after a pass, `unfinished` of them in a row busy or failed: [`NodePassPace::every`]
+/// after one that finished, otherwise [`NodePassPace::again`], doubling up to `every`.
+fn node_pass_wait(pace: &NodePassPace, unfinished: u32) -> Duration {
+    if unfinished == 0 {
+        return pace.every;
+    }
+    pace.again
+        .saturating_mul(1_u32 << (unfinished - 1).min(16))
+        .min(pace.every)
+}
+
+/// The converge pass's runner a node pass starts: a version it applied is one the subscriber's
+/// pass beside it then finds unchanged, so its own trigger never fires for that version
+/// ([`crate::converge::Due`]). One runner at a time, and only once this Mac may use the local
+/// network, which a runner does; a start that cannot come yet is owed. Failed runners use the
+/// subscriber's bounded retry policy on a monotonic clock, independent of the vault's wall clock.
+#[derive(Default)]
+struct NodeConverge {
+    owed: bool,
+    runner: Option<aterm_uds::spawnfd::Child>,
+    retry: crate::converge::RunnerRetry,
+    clock: Option<Instant>,
+}
+
+impl NodeConverge {
+    fn tend(&mut self, host: &NodePassHost<'_>) {
+        let clock = self.clock.get_or_insert_with(Instant::now);
+        let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.tend_at(now_ms, host.may_post, host.start_converge);
+    }
+
+    fn tend_at(
+        &mut self,
+        now_ms: u64,
+        may_post: &dyn Fn() -> bool,
+        start: &dyn Fn() -> Option<aterm_uds::spawnfd::Child>,
+    ) {
+        use crate::converge::Last;
+        // Each look reaps a runner that ended.
+        let last = Last::of(&mut self.runner);
+        self.retry.reaped(last, now_ms);
+        self.owed |= last == Last::Held;
+        if (self.owed || self.retry.due(now_ms)) && last != Last::Running && may_post() {
+            self.retry.started();
+            self.runner = start();
+            self.owed = false;
+            if self.runner.is_none() {
+                self.retry.reaped(Last::Failed, now_ms);
+            }
+        }
+    }
+}
+
+fn keep_node_pass_end(
+    host: &NodePassHost<'_>,
+    receipt: &NodePassReceipt,
+    error: Option<&Error>,
+    last_said: &mut Option<NodePassSaid>,
+) {
+    if last_said.replace(receipt.said) != Some(receipt.said) {
+        (host.log)(&match error {
+            Some(error) => format!("vault pass {}: {error}", receipt.said.word()),
+            None => format!("vault pass {}", receipt.said.word()),
+        });
+    }
+    let _ = fsx::write_atomic(
+        &node_pass_file(host.paths),
+        receipt.encode().as_bytes(),
+        0o600,
+    );
+}
+
 #[cfg(test)]
 thread_local! {
     /// The negative control of the ranks: while set, every member's turn is the first, at once,
@@ -1658,9 +2218,12 @@ fn stop_holds_removals() -> bool {
 ///   room ([`RemovalFill`]; a seat move, below the proof-admission stop);
 /// - of the rest (a coalesce of heads no removal left, an F21 reseal's re-`Put`s), each in turn
 ///   where the log's keyed records and the bound of what it and the re-keys kept before it sign
-///   ([`log_entries::rekey_keyed_bound`], over the seats `active` they carry) stay within
-///   [`crate::membership_log::RecordBudgets::automatic_keyed_stop`]. One that would pass it stays
-///   due and waits for checkpoints, nothing signed.
+///   ([`log_entries::rekey_bound`], over the seats `active` they carry) stay within
+///   [`crate::membership_log::RecordBudgets::automatic_keyed_stop`], and leave free, in keyed
+///   records and in wire bytes, what the re-keys a held `Remove` made due still owe
+///   ([`log_entries::owed_rekeys`]; one-mesh proofs P6, F2 and F6: the stop alone left a large
+///   lab's reserve to an automatic batch, and bytes no room at all). One that would pass either
+///   stays due and waits for checkpoints or for the owed re-keys, nothing signed.
 fn within_automatic_stop(
     log: &Log,
     opened: &OpenedAudienceEntries,
@@ -1682,23 +2245,74 @@ fn within_automatic_stop(
         } else {
             active
         };
-        log_entries::rekey_keyed_bound(log, opened, flight, audience, seats, &removed, None)
+        log_entries::rekey_bound(log, opened, flight, audience, seats, &removed, None)
     };
     let (mut kept, rest): (Vec<EpochAudience>, Vec<EpochAudience>) = ready
         .into_iter()
         .partition(|audience| made_by_removal.contains(audience));
-    let mut planned = kept.iter().fold(log.counts().keyed, |sum, audience| {
-        sum.saturating_add(cost(audience))
-    });
+    let mut planned = kept.iter().fold(
+        log_entries::RekeyCost {
+            keyed: log.counts().keyed,
+            bytes: log.held_bytes(),
+        },
+        |sum, audience| sum.plus(cost(audience)),
+    );
+    if rest.is_empty() {
+        return kept;
+    }
+    // What the owed re-keys need beside the plan: those kept above are counted in both, which
+    // only holds a re-key no removal made due a little earlier near the bound.
+    let owed = if automatic_ignores_owed() {
+        log_entries::RekeyCost::default()
+    } else {
+        log_entries::owed_rekeys(log, opened, flight)
+    };
     let stop = log.budgets().automatic_keyed_stop();
+    let (limit, byte_limit) = (
+        log.budgets().keyed,
+        crate::membership_log::budgets::held_bytes_bound(),
+    );
     for audience in rest {
-        let after = planned.saturating_add(cost(&audience));
-        if after <= stop {
-            planned = after;
+        let more = cost(&audience);
+        if keeps_room(wide(planned.keyed), wide(more.keyed), 0, wide(stop))
+            && keeps_room(
+                wide(planned.keyed),
+                wide(more.keyed),
+                wide(owed.keyed),
+                wide(limit),
+            )
+            && keeps_room(
+                wide(planned.bytes),
+                wide(more.bytes),
+                wide(owed.bytes),
+                wide(byte_limit),
+            )
+        {
+            planned = planned.plus(more);
             kept.push(audience);
         }
     }
     kept
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`within_automatic_stop`], on for one test thread: a re-key no removal made due
+    /// keeps no owed room free (the 8,500 stop and the log's hard bounds alone), as before
+    /// one-mesh proofs P6's F2 and F6 fixes, so its records and bytes can take the room an owed
+    /// re-key needs.
+    pub(super) static AUTOMATIC_IGNORES_OWED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn automatic_ignores_owed() -> bool {
+    AUTOMATIC_IGNORES_OWED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn automatic_ignores_owed() -> bool {
+    false
 }
 
 /// Whether [`UNDECIDED_HOLDS`] holds `audience` past the settle grace: it is set and
@@ -1845,6 +2459,30 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
         return Ok(Vec::new());
     }
     tend_ready_epochs(paths, now_ms, &identity, &mark)
+}
+
+/// [`tend_epochs_at`], its waits for the vault's locks ending at `deadline`: `None` where a writer
+/// still held one then, which says nothing of what is due.
+///
+/// # Errors
+/// As [`tend_epochs_at`].
+fn tend_epochs_until(
+    paths: &Paths,
+    now_ms: u64,
+    deadline: Instant,
+) -> crate::Result<Option<Vec<Record>>> {
+    let Some(look) = log_entries::look_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    let dues = look_at_dues(paths, now_ms)?;
+    drop(look);
+    let Some((identity, mark, ready)) = dues else {
+        return Ok(Some(Vec::new()));
+    };
+    if ready.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    tend_ready_epochs_by(paths, now_ms, &identity, &mark, Some(deadline))
 }
 
 /// The tender's scheduling look of a vault pass at `now_ms` ([`ready_rekeys`]), its clocks kept
@@ -2055,6 +2693,18 @@ fn tend_ready_epochs(
     identity: &Identity,
     mark: &TendMark,
 ) -> crate::Result<Vec<Record>> {
+    Ok(tend_ready_epochs_by(paths, now_ms, identity, mark, None)?.unwrap_or_default())
+}
+
+/// [`tend_ready_epochs`], its waits for the vault's locks ending at `deadline` where one is given:
+/// `None` where a writer still held one then.
+fn tend_ready_epochs_by(
+    paths: &Paths,
+    now_ms: u64,
+    identity: &Identity,
+    mark: &TendMark,
+    deadline: Option<Instant>,
+) -> crate::Result<Option<Vec<Record>>> {
     let me_recipient = identity.recipient();
     // The re-key's carry is the current seats (one-mesh M1, M4): a seat a newest epoch omitted
     // is a gap the heal closes, never a Mac to drop from the next epoch.
@@ -2066,7 +2716,7 @@ fn tend_ready_epochs(
                 .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
         }))
     };
-    let (minted, _, resealed) = log_entries::author_and_commit_records(paths, |store| {
+    let draft = |store: &Store| -> crate::Result<(Vec<Record>, bool)> {
         let Some(mut log) = store.log().cloned() else {
             return Ok((Vec::new(), false));
         };
@@ -2135,7 +2785,14 @@ fn tend_ready_epochs(
             .map(|_| ())
         })?;
         Ok((minted, resealing))
-    })?;
+    };
+    let authored = match deadline {
+        Some(deadline) => log_entries::author_and_commit_records_until(paths, deadline, draft)?,
+        None => Some(log_entries::author_and_commit_records(paths, draft)?),
+    };
+    let Some((minted, _, resealed)) = authored else {
+        return Ok(None);
+    };
     if !minted.is_empty() {
         // F21 rule 8: a reseal of an uncovered keyed epoch records what each removed Mac could
         // read while it was out, for a person to rotate at its provider.
@@ -2146,7 +2803,7 @@ fn tend_ready_epochs(
             record_read_after_cutoff(paths, log, identity)?;
         }
     }
-    Ok(minted)
+    Ok(Some(minted))
 }
 
 /// A held record is an epoch, which can name one due audience, one seen clock and one wait
@@ -2617,6 +3274,10 @@ pub fn epoch_convergence_environment() {}
 )]
 #[doc(hidden)]
 pub fn gap_heal_environment() {}
+
+#[cfg(test)]
+#[path = "node_pass_tests.rs"]
+mod node_pass_tests;
 
 #[cfg(test)]
 #[path = "remove_tests.rs"]

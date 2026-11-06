@@ -600,7 +600,7 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
     off.accounts = Some(ClaudeAccounts {
         pool_picks: false,
         unattended: true,
-        off: Some("`[harness] logins = \"off\"`"),
+        off: Some("`[harness] logins = \"off\"`".into()),
         ..accounts(Some("expired"))
     });
     let row = assess(&off, true, NOW);

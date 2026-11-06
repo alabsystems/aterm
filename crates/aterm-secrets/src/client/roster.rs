@@ -5,6 +5,7 @@
 //! (`docs/DESIGN-alab-swarm-2026-10-27.md` §3.2, §4.1, §4.6, §12.3 C11).
 
 use super::*;
+use crate::membership_log::Log;
 use crate::swarm_roster::{
     Newcomer, POLICY_ENTRY, ROSTER_ENTRY, SeedAdmission, SheetHints, SwarmPolicy, SwarmRoster,
     assign_newcomer, leading_m_label, seed_roster,
@@ -19,23 +20,10 @@ fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
     let Some(lock) = StateLock::observe(paths)? else {
         return Ok(None);
     };
-    base_swarm_roster_for(paths, &lock, RosterUse::Current)
+    base_swarm_roster_for(paths, &lock)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RosterUse {
-    Current,
-    Denial,
-}
-
-fn base_swarm_roster_for(
-    paths: &Paths,
-    lock: &StateLock,
-    purpose: RosterUse,
-) -> crate::Result<Option<SwarmRoster>> {
-    if purpose == RosterUse::Denial {
-        return base_swarm_roster_for_denial_held(paths, lock);
-    }
+fn base_swarm_roster_for(paths: &Paths, _lock: &StateLock) -> crate::Result<Option<SwarmRoster>> {
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };
@@ -62,9 +50,10 @@ fn base_swarm_roster_for(
         if let Some(cached_bytes) = &cached {
             let env = envelope::parse(cached_bytes)?;
             let seeded = log_entries::trusted_seeded_log(paths, &expected, &env)?;
-            if purpose == RosterUse::Current
-                && !log_entries::applied_log_available(&state, seeded.as_ref())
-            {
+            if !log_entries::applied_log_available(
+                &state,
+                seeded.as_ref().map(|(_, digest)| *digest),
+            ) {
                 return Ok(None);
             }
             if let Ok((read, log_digest)) = log_entries::roster_with_log(
@@ -99,28 +88,16 @@ fn base_swarm_roster_for(
 
 /// Read authenticated roster evidence without granting a current membership view.
 /// The caller overlays its authenticated log before using these historical rows.
-pub(super) fn base_swarm_roster_for_denial_held(
-    paths: &Paths,
-    _lock: &StateLock,
-) -> crate::Result<Option<SwarmRoster>> {
-    base_swarm_roster_for_denial_snapshot(paths)
-}
-
-fn base_swarm_roster_for_denial_snapshot(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
-    let Some(expected) = config(paths)? else {
+fn base_denial_roster(reads: &Reads<'_>) -> crate::Result<Option<SwarmRoster>> {
+    reads.state()?;
+    let Some(identity) = reads.identity()? else {
         return Ok(None);
     };
-    let state = load_state(paths)?;
-    let Some(identity) = read_identity(paths)? else {
-        return Ok(None);
-    };
-    let custody = log_entries::authenticated_custody(paths, &expected, &state)?;
-    let cached = read_verified_cached_envelope(paths, &expected, &state)?;
-    let envelope = cached.as_deref().map(envelope::parse).transpose()?;
+    let custody = reads.custody()?;
     log_entries::denial_roster(
-        custody.as_ref().map(|(log, _)| log),
-        envelope.as_ref(),
-        &identity,
+        custody.as_ref().map(HeldLog::log),
+        reads.verified()?,
+        identity,
     )
 }
 
@@ -178,7 +155,7 @@ fn swarm_roster_with(
 ) -> crate::Result<Option<SwarmRoster>> {
     with_roster_observation(paths, |observation| match observation {
         RosterObservation::Held(lock) => {
-            swarm_roster_held_with(paths, lock, RosterUse::Current, after_config, after_base)
+            swarm_roster_held_with(paths, lock, after_config, after_base)
         }
         RosterObservation::Standalone => Ok(None),
     })
@@ -190,15 +167,15 @@ pub(super) fn swarm_roster_held(
     paths: &Paths,
     lock: &StateLock,
 ) -> crate::Result<Option<SwarmRoster>> {
-    swarm_roster_held_with(paths, lock, RosterUse::Current, || {}, || {})
+    swarm_roster_held_with(paths, lock, || {}, || {})
 }
 
 /// Authenticated denial evidence remains readable when a positive snapshot is unavailable.
 pub(super) fn swarm_roster_for_denial_held(
     paths: &Paths,
-    lock: &StateLock,
+    _lock: &StateLock,
 ) -> crate::Result<Option<SwarmRoster>> {
-    swarm_roster_held_with(paths, lock, RosterUse::Denial, || {}, || {})
+    denial_swarm_roster(&Reads::new(paths))
 }
 
 pub(super) fn swarm_roster_for_denial(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
@@ -214,7 +191,6 @@ pub(super) fn swarm_roster_for_denial(paths: &Paths) -> crate::Result<Option<Swa
 fn swarm_roster_held_with(
     paths: &Paths,
     lock: &StateLock,
-    purpose: RosterUse,
     after_config: impl FnOnce(),
     after_base: impl FnOnce(),
 ) -> crate::Result<Option<SwarmRoster>> {
@@ -222,86 +198,82 @@ fn swarm_roster_held_with(
         return Ok(None);
     };
     after_config();
-    let base = base_swarm_roster_for(paths, lock, purpose)?;
+    let base = base_swarm_roster_for(paths, lock)?;
     after_base();
-    swarm_roster_with_base(paths, &expected, base, purpose)
+    swarm_roster_with_base(paths, &expected, base)
 }
 
 /// An authenticated negative-only snapshot, including membership removals and
 /// restorations. Absence or an error must never be used as positive authority.
-pub(super) fn swarm_roster_for_denial_snapshot(
-    paths: &Paths,
-) -> crate::Result<Option<SwarmRoster>> {
-    let Some(expected) = config(paths)? else {
+pub(super) fn denial_swarm_roster(reads: &Reads<'_>) -> crate::Result<Option<SwarmRoster>> {
+    if reads.config()?.is_none() {
+        return Ok(None);
+    }
+    let base = base_denial_roster(reads)?;
+    let custody = reads.custody()?;
+    let mut evidence = custody.as_ref().map(HeldLog::log);
+    if let Some(log) = evidence
+        && let Some(identity) = reads.identity()?
+        && let Some(envelope) = reads.verified()?
+        && log_entries::log_base(Some(log), envelope, identity)? == log_entries::LogBase::Behind
+    {
+        // An older log cannot turn omission from its epoch into denial of a newer
+        // envelope's admitted reader. Explicit removals are checked separately.
+        evidence = None;
+    }
+    if let Some(roster) = base {
+        return Ok(Some(roster_under_evidence(roster, evidence)));
+    }
+    let Some(log) = evidence else {
         return Ok(None);
     };
-    let base = base_swarm_roster_for_denial_snapshot(paths)?;
-    swarm_roster_with_base(paths, &expected, base, RosterUse::Denial)
+    let mut roster = SwarmRoster::default();
+    overlay_log_membership(log, None, &mut roster);
+    Ok((!roster.members.is_empty()
+        || !roster.deny_labels.is_empty()
+        || !roster.deny_nodes.is_empty())
+    .then_some(roster))
+}
+
+/// `roster` with `evidence`'s membership over it or, with no log, its denied members' nodes denied.
+fn roster_under_evidence(mut roster: SwarmRoster, evidence: Option<&Log>) -> SwarmRoster {
+    if let Some(log) = evidence {
+        overlay_log_membership(log, None, &mut roster);
+    } else {
+        let active_nodes: BTreeSet<String> = roster
+            .members
+            .iter()
+            .filter(|m| !steward::member_is_denied_in_roster(&roster, m))
+            .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
+            .map(|n| n.trim().to_ascii_lowercase())
+            .collect();
+        for m in &roster.members {
+            if steward::member_is_denied_in_roster(&roster, m) {
+                if let Some(node_id) = &m.node_id
+                    && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+                {
+                    roster.deny_nodes.push(node_id.clone());
+                }
+                if let Some(node_key) = &m.node_key
+                    && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
+                {
+                    roster.deny_nodes.push(node_key.clone());
+                }
+            }
+        }
+        roster.canonicalize();
+    }
+    roster
 }
 
 fn swarm_roster_with_base(
     paths: &Paths,
     expected: &Config,
     base: Option<SwarmRoster>,
-    purpose: RosterUse,
 ) -> crate::Result<Option<SwarmRoster>> {
-    let mut evidence = match purpose {
-        RosterUse::Current => log_entries::trusted_local_log(paths, expected)?,
-        RosterUse::Denial => {
-            log_entries::authenticated_custody(paths, expected, &load_state(paths)?)?
-                .map(|(log, _)| log)
-        }
-    };
-    if purpose == RosterUse::Denial
-        && let Some(log) = &evidence
-        && let Some(identity) = read_identity(paths)?
-        && let Some(bytes) = read_verified_cached_envelope(paths, expected, &load_state(paths)?)?
-        && log_entries::log_base(Some(log), &envelope::parse(&bytes)?, &identity)?
-            == log_entries::LogBase::Behind
-    {
-        // An older log cannot turn omission from its epoch into denial of a newer
-        // envelope's admitted reader. Explicit removals are checked separately.
-        evidence = None;
-    }
-    if let Some(mut roster) = base {
-        if let Some(log) = &evidence {
-            overlay_log_membership(log, None, &mut roster);
-        } else {
-            let active_nodes: BTreeSet<String> = roster
-                .members
-                .iter()
-                .filter(|m| !steward::member_is_denied_in_roster(&roster, m))
-                .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
-                .map(|n| n.trim().to_ascii_lowercase())
-                .collect();
-            for m in &roster.members {
-                if steward::member_is_denied_in_roster(&roster, m) {
-                    if let Some(node_id) = &m.node_id
-                        && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
-                    {
-                        roster.deny_nodes.push(node_id.clone());
-                    }
-                    if let Some(node_key) = &m.node_key
-                        && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
-                    {
-                        roster.deny_nodes.push(node_key.clone());
-                    }
-                }
-            }
-            roster.canonicalize();
-        }
-        return Ok(Some(roster));
-    }
-    if purpose == RosterUse::Denial {
-        let Some(log) = evidence else {
-            return Ok(None);
-        };
-        let mut roster = SwarmRoster::default();
-        overlay_log_membership(&log, None, &mut roster);
-        return Ok((!roster.members.is_empty()
-            || !roster.deny_labels.is_empty()
-            || !roster.deny_nodes.is_empty())
-        .then_some(roster));
+    let evidence = log_entries::trusted_local_log(paths, expected)?;
+    if let Some(roster) = base {
+        return Ok(Some(roster_under_evidence(roster, evidence.as_ref())));
     }
     let state = load_state(paths)?;
     let log_only_bound = state.digest.is_none()
@@ -1416,7 +1388,7 @@ pub(super) fn log_labels(paths: &Paths) -> crate::Result<(BTreeMap<String, Strin
     let Some(config) = config(paths)? else {
         return Ok((BTreeMap::new(), Vec::new()));
     };
-    let store = super::load_records_for(paths, &config)?;
+    let store = super::load_records_for(&Reads::new(paths), &config)?;
     let store = log_entries::checked_author_projection_for(paths, &config, &store)?;
     let Some(log) = store.log() else {
         return Ok((BTreeMap::new(), Vec::new()));

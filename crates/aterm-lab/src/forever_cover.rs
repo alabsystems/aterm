@@ -1552,7 +1552,16 @@ fn hidden_facts(
     (said, Ok(()))
 }
 
-/// Judges F18 live: a person's prompt answered immediately mid-chain.
+/// Judges F18 live: a person's prompt answered at once mid-chain, under Cruise. Cruise never
+/// parks (the owner's ruling of 2026-10-26; the want this replaced, `LEFT` to the person and
+/// nothing typed, predates it): the reply is a turn end like any other, judged at a point of its
+/// own on the short back-off ladder. The person's turn adds no short answer of the agent's (v6
+/// §14.17.5.7: the streak counts only the agent's own), so that back-off names the streak the
+/// one standing at the person's Enter named; nothing reaches their exchange before its due (no
+/// act, and no harness text at the stub: [`Cover::window_stub`], read to the due); no `LEFT`,
+/// no `task=theirs`, no end and no need; and the work goes on at the due. P4C's chain is its
+/// negative control: the same prompt typed by the control socket is the conversation's own turn,
+/// which lengthens the streak.
 pub(super) fn judge_person_instant(seen: &Seen, t0: i64) -> Verdict {
     let Some(asked) = seen.asked_ms else {
         return Verdict::Unobserved(match seen.ask_refused_ms {
@@ -1576,140 +1585,140 @@ pub(super) fn judge_person_instant(seen: &Seen, t0: i64) -> Verdict {
     let read = seen.journal.iter().find(|(t, l)| {
         *t > asked && event_words(l).is_some_and(|(_, w)| w.contains(head.as_str()))
     });
-    let left_rule = format!("rule={}", turn_end::RULE_LEFT);
     let left = seen
         .journal
         .iter()
-        .find(|(t, l)| *t > asked && l.starts_with("LEFT ") && l.contains(&left_rule));
-    let left_row = seen
-        .ledger
-        .iter()
-        .find(|r| r.ts > asked && r.rule == turn_end::RULE_LEFT && r.decision == "skipped");
-    let judged_by = left.map_or(seen.end_ms, |(t, _)| *t);
+        .find(|(t, l)| *t > asked && l.starts_with("LEFT "));
+    let decided = own_backoff_after(seen, asked);
+    let due = decided.and_then(|(_, l)| backoff_due(l));
+    let judged_by = decided.map_or(seen.end_ms, |(t, _)| *t);
     let ran = seen.ledger.iter().find(|r| {
         r.rule == aterm_agent::supervise::approvals::RULE_TURN_RAN
             && r.ts > asked
             && r.ts <= judged_by
     });
-    let theirs = seen
-        .status
-        .iter()
-        .find(|(t, s)| *t >= asked && word(s, "task").as_deref() == Some("theirs"));
-    let typed: Vec<&(i64, String)> = seen
-        .all_acts()
-        .into_iter()
-        .filter(|(t, _)| *t > asked)
-        .collect();
-    let rows_in = seen
-        .ledger
-        .iter()
-        .filter(|r| r.ts > asked && r.acted())
-        .count();
-    let decided = own_backoff_after(seen, asked);
-    let done_in = seen.first_after("DONE ", asked);
-    let stub = seen.cover.window_stub.as_ref();
-    let said = format!(
-        "the person's Enter at +{} (status human_ms={stamp}); {}; {}{}; {}; {}; the stub {}",
-        at(t0, asked),
-        read.map_or_else(
-            || "its reply's words never read".to_string(),
-            |(t, l)| format!(
-                "its reply read at +{} ({})",
-                at(t0, *t),
-                crate::util::one_line(l, 80)
-            )
-        ),
-        left.map_or_else(
-            || "NO LEFT".to_string(),
-            |(t, l)| format!("+{} {}", at(t0, *t), crate::util::one_line(l, 90))
-        ),
-        left_row.map_or_else(String::new, |r| format!(
-            " (its ledger row +{} {} {})",
-            at(t0, r.ts),
-            r.rule,
-            r.decision
-        )),
-        theirs.map_or_else(
-            || "never task=theirs".to_string(),
-            |(t, _)| format!("+{} status task=theirs", at(t0, *t))
-        ),
-        if typed.is_empty() && rows_in == 0 {
-            format!("nothing typed for {} after it", at(0, seen.end_ms - asked))
-        } else {
-            "TYPED".to_string()
-        },
-        stub.map_or_else(
-            || "UNREAD".to_string(),
-            |s| format!(
-                "read {} request(s) after it, {} with a harness text",
-                s.read, s.new_turns
-            )
-        ),
-    );
     if let Some(r) = ran {
         return Verdict::Unobserved(format!(
-            "{said}: a read saw the turn run (+{} {}), so it was no instant turn",
+            "the person's Enter at +{}: a read saw the turn run (+{} {}), so it was no instant turn",
+            at(t0, asked),
             at(t0, r.ts),
             r.rule
         ));
     }
+    let standing = seen
+        .journal
+        .iter()
+        .rfind(|(t, l)| *t <= asked && backoff_named(l))
+        .and_then(|(_, l)| backoff_streak(l));
+    let theirs = seen
+        .status
+        .iter()
+        .find(|(t, s)| *t >= asked && word(s, "task").as_deref() == Some("theirs"));
+    let next = seen
+        .all_acts()
+        .into_iter()
+        .find(|(t, _)| *t > asked)
+        .map(|(t, l)| (*t, l.as_str()));
+    let stub = seen.cover.window_stub.as_ref();
+    let mut said = vec![
+        format!(
+            "the person's Enter at +{} (status human_ms={stamp})",
+            at(t0, asked)
+        ),
+        read.map_or_else(
+            || "its reply's words never read".to_string(),
+            |(t, l)| {
+                format!(
+                    "its reply read at +{} ({})",
+                    at(t0, *t),
+                    crate::util::one_line(l, 80)
+                )
+            },
+        ),
+    ];
     let mut bad = Vec::new();
-    if let Some((tw, wl)) = decided {
+    if let Some((tl, ll)) = left {
         bad.push(format!(
-            "JUDGED AS A TURN OF THE CONVERSATION, though a person's hand typed it: a back-off decided at a point of its own at +{} ({})",
-            at(t0, *tw),
-            crate::util::one_line(wl, 110)
+            "LEFT to the person at +{} ({}): Cruise parks no exchange (the owner's ruling of \
+             2026-10-26)",
+            at(t0, *tl),
+            crate::util::one_line(ll, 90)
         ));
     }
-    if !typed.is_empty() || rows_in > 0 {
-        bad.push(format!(
-            "TYPED into the person's exchange: {} journal act(s){}, {rows_in} ledger act(s)",
-            typed.len(),
-            typed.first().map_or_else(String::new, |(t, l)| format!(
-                " (the first {} at +{})",
-                act_rule(l).unwrap_or("?"),
-                at(t0, *t)
-            ))
-        ));
+    if let Some((t, _)) = theirs {
+        bad.push(format!("status said task=theirs at +{}", at(t0, *t)));
     }
-    if let Some((d, _)) = done_in {
+    if let Some((d, _)) = seen.first_after("DONE ", asked) {
         bad.push(format!(
             "a DONE at +{} after the person's prompt",
             at(t0, *d)
         ));
     }
-    if let Some(s) = stub.filter(|s| s.new_turns > 0) {
-        bad.push(format!(
-            "the stub saw {} request(s) holding a harness text after the person's prompt",
-            s.new_turns
-        ));
-    }
     if let Some(n) = seen.needs_seen() {
         bad.push(format!("a need was raised, though no reply named one: {n}"));
     }
-    match left {
-        Some((tl, _)) => {
-            if tl - asked >= take_window_ms() {
+    match (decided, due) {
+        (Some((tw, wl)), Some(due)) => {
+            said.push(format!(
+                "its back-off decided at +{} ({}), due +{}",
+                at(t0, *tw),
+                crate::util::one_line(wl, 110),
+                at(t0, due)
+            ));
+            let streak = backoff_streak(wl);
+            if streak != standing {
                 bad.push(format!(
-                    "LEFT {} after the Enter: not as the reply showed",
-                    at(0, tl - asked)
+                    "ITS BACK-OFF NAMES {} SHORT TURN(S), the one standing at the Enter {}: the \
+                     person's turn counted as the agent's short answer",
+                    streak.map_or_else(|| "?".to_string(), |n| n.to_string()),
+                    standing.map_or_else(|| "none".to_string(), |n| n.to_string())
                 ));
             }
-            if theirs.is_none() {
-                bad.push("status never said task=theirs".to_string());
+            match next {
+                Some((ta, la)) if ta < due - STEP_SLACK_MS => bad.push(format!(
+                    "TYPED into the person's exchange at +{} ({}), before its back-off's due at +{}",
+                    at(t0, ta),
+                    act_rule(la).unwrap_or("?"),
+                    at(t0, due)
+                )),
+                Some((ta, la)) if ta > due + PERSISTENCE_GRACE_MS => bad.push(format!(
+                    "{} typed at +{}, {} past its back-off's due",
+                    act_rule(la).unwrap_or("?"),
+                    at(t0, ta),
+                    at(0, ta - due)
+                )),
+                Some((ta, la)) => said.push(format!(
+                    "{} typed at +{}, at its due",
+                    act_rule(la).unwrap_or("?"),
+                    at(t0, ta)
+                )),
+                None => {
+                    if let Some(lost) = lost_after(seen, asked, t0) {
+                        bad.push(lost);
+                    }
+                }
             }
         }
-        None if bad.is_empty() => {
-            return match lost_after(seen, asked, t0) {
-                Some(lost) => Verdict::Fail(format!("{said}: NO LEFT; {lost}")),
-                None => Verdict::Unobserved(format!(
-                    "{said}: neither left to the person nor judged within {}",
-                    at(t0, seen.end_ms)
-                )),
-            };
+        _ => {
+            if let Some((ta, la)) = next {
+                bad.push(format!(
+                    "TYPED into the person's exchange at +{} ({}) with no back-off decided at its \
+                     reply",
+                    at(t0, ta),
+                    act_rule(la).unwrap_or("?")
+                ));
+            } else if let Some(lost) = lost_after(seen, asked, t0) {
+                bad.push(lost);
+            }
         }
-        None => bad.push(format!("NO LEFT … {left_rule} line")),
     }
+    if let Some(s) = stub.filter(|s| s.new_turns > 0) {
+        bad.push(format!(
+            "the stub saw {} request(s) holding a harness text before the back-off's due",
+            s.new_turns
+        ));
+    }
+    let said = said.join("; ");
     if !bad.is_empty() {
         return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
     }
@@ -1718,23 +1727,28 @@ pub(super) fn judge_person_instant(seen: &Seen, t0: i64) -> Verdict {
             "{said}: no read saw the person's reply after the Enter"
         ));
     }
-    if stub.is_none() {
+    if decided.is_none() {
         return Verdict::Unobserved(format!(
-            "{said}: the stub's dumps after the prompt were not read"
+            "{said}: no back-off decided at its reply within {}",
+            at(t0, seen.end_ms)
         ));
     }
-    let quiet = seen.end_ms - judged_by;
-    if quiet < QUIET_UNDER_OFF_MS {
+    if next.is_none() {
         return Verdict::Unobserved(format!(
-            "{said}: watched {} after the LEFT, under {} s",
-            at(0, quiet),
-            QUIET_UNDER_OFF_MS / 1000
+            "{said}: watched to +{}, the act at its due not observed",
+            at(t0, seen.end_ms)
         ));
     }
-    Verdict::Pass(format!(
-        "{said}: the instant turn no read saw run left to its person, quiet {} after it",
-        at(0, quiet)
-    ))
+    match stub {
+        None => Verdict::Unobserved(format!(
+            "{said}: the stub's dumps before the due were not read"
+        )),
+        Some(s) => Verdict::Pass(format!(
+            "{said}; the stub read {} request(s) before the due, none with a harness text: judged \
+             on the ladder, the person's turn no short answer, the work went on",
+            s.read
+        )),
+    }
 }
 
 /// Whether the lab's resize took ([`Cover::resized`]): `dims` after it
@@ -2160,7 +2174,8 @@ pub(super) fn judge_dialog(seen: &Seen, land: bool, t0: i64) -> Verdict {
     )
 }
 
-/// Judges F3 live: a first reply ending on a read-only tool box.
+/// Judges F3 live: a first reply ending on a read-only tool box, judged at that point: a back-off
+/// naming one short turn, or Land's instruction typed there at once (v6 §14.10), then landed.
 pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     let results = seen.cover.tool_results.unwrap_or(0);
     let screen = seen.cover.first_screen.as_ref().map_or_else(
@@ -2193,6 +2208,19 @@ pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64)
         .journal
         .iter()
         .find(|(t, l)| *t > t0 && first_act.is_none_or(|a| *t < a) && backoff_named(l));
+    // The decision at the tool-ended point: its back-off, else Land's instruction typed at that
+    // point at once (v6 §14.10, as L1 reads it): the land act of the first point's seq, its first
+    // act, within [`switch::AT_ONCE_MS`] of the point.
+    let idle = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > t0 && l.starts_with("EVENT idle "));
+    let at_point = land.filter(|(ta, l)| {
+        first_act == Some(*ta)
+            && point.is_some_and(|r| *ta - r.ts <= switch::AT_ONCE_MS)
+            && idle.is_some_and(|(te, el)| te <= ta && word(el, "seq") == word(l, "seq"))
+    });
+    let decided = backoff.or(at_point);
     let said = format!(
         "the tool's result carried back in {results} request(s); {}; {}; {screen}",
         point.map_or_else(
@@ -2203,16 +2231,17 @@ pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64)
                 crate::util::one_line(&r.reason, 70)
             )
         ),
-        backoff.map_or_else(
+        decided.map_or_else(
             || "no back-off".to_string(),
             |(t, l)| format!("+{} {}", at(t0, *t), crate::util::one_line(l, 100))
         ),
     );
-    let Some((tw, wl)) = backoff else {
+    let Some((tw, wl)) = decided else {
         return match (first_act, lost_after(seen, t0, t0)) {
             (Some(a), _) => Verdict::Fail(format!(
-                "{said}: an act typed at +{} with no back-off decided before it",
-                at(t0, a)
+                "{said}: an act typed at +{} with no back-off decided before it, nor land@v1 typed at the first point within {} s",
+                at(t0, a),
+                switch::AT_ONCE_MS / 1000
             )),
             (None, Some(lost)) => {
                 Verdict::Fail(format!("{said}: THE TOOL-ENDED TURN NEVER JUDGED; {lost}"))
@@ -2223,7 +2252,7 @@ pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64)
             )),
         };
     };
-    if backoff_streak(wl) != Some(1) {
+    if backoff.is_some() && backoff_streak(wl) != Some(1) {
         return Verdict::Fail(format!(
             "{said}: the first back-off +{} names {} short turn(s), not 1",
             at(t0, *tw),

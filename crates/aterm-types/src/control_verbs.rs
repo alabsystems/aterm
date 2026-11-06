@@ -2788,7 +2788,10 @@ pub const VERBS: &[VerbSpec] = &[
              into it or its queue) by the screen, as `seq` does: content that moves, or the \
              cursor leaving the row the text was typed on; a press that shows neither is \
              pressed again, and a turn none of whose presses showed is `submitted=0 … \
-             pressed=<n>`, the Enters it pressed. A verified submit says what showed it: \
+             pressed=<n>`, the Enters it pressed. Any turn that pressed Enter and verified no \
+             submit names its Enters so, a composer that still holds the text when the turn's \
+             time runs out included, since its program may yet take a late Enter. A verified \
+             submit says what showed it: \
              `submit_by=claim|composer|block|screen`. A block-verified submit also says \
              `block=<id>` when the exact input block was retained and exactly one command \
              started since Enter was armed; it is absent when that association is unavailable \
@@ -2804,13 +2807,27 @@ pub const VERBS: &[VerbSpec] = &[
             "`, the text typed and not submitted, and a re-press it takes none of stops the \
              re-presses as a miss does). `typed=1` presses key by key at \
              `cadence=<ms>` (default 70) up to `cap=<n>` graphemes (default 240, max 4096) and \
-             pastes the rest (`typed=<keys> pasted=<graphemes>`), stopping with `OK 0 turn \
-             skipped reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> \
-             id=<n>` when the timeout, a person's key, or a screen or input-frame change \
-             overtakes it. Fenced on a composer box, a key waits for an open DEC 2026 frame to \
-             close, a digit also for the program to read and draw the key before it, and a \
-             guarded submit for the last key; a wait gives its time back to `timeout=` once \
-             it ends, so `timeout=` bounds each wait, not their sum. \
+             pastes the rest (`typed=<keys> pasted=<graphemes>`). The timeout never leaves part \
+             of the text typed: a key goes only while it, one paste of the rest and the \
+             submit's window (at most half of `timeout=`, with the echo's 150 ms settle) still \
+             fit before `timeout=` at the pace the keys have gone, with room for the longest \
+             wait a fenced key has needed so far, and once they would not the rest goes as that \
+             one paste (bracketed where the program asked for bracketed paste), so the submit \
+             takes the whole text; the echo's settle then waits only while that share of the \
+             submit still fits (a Claude Code composer's echo is waited for as ever, since an \
+             Enter before it shows proves nothing; an echo that spends the submit's share sends \
+             the Enter late, `pressed=<n>` when unverified). A turn \
+             whose first key does not fit writes nothing (`OK 0 turn skipped \
+             reason=deadline typed=0 pasted=0 submitted=0 seq=<n> id=<n>`, the composer as it \
+             was). A person's \
+             key or a screen or input-frame change stops it with `OK 0 turn skipped \
+             reason=<person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> id=<n>`, the part \
+             typed left standing. Fenced on a composer box, a key waits for an open DEC 2026 \
+             frame to close, a digit also for the program to read and draw the key before it, \
+             and a guarded submit for the last key; a wait gives its time back to `timeout=` \
+             once it ends, so the time the turn has left bounds each wait, not their sum, a hang \
+             detector: one that outlasts it, as one the program never ends does, is cut there \
+             (`reason=deadline typed=<k>`). \
              `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
              `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout momentum=<v>`). \
              `if-gen=<epoch>.<seq>` (`status gen=`) and `if-rows=<first>-<last>:<hex16>` \
@@ -4267,6 +4284,24 @@ pub const VERBS: &[VerbSpec] = &[
          15 minutes and 64 KiB per output. \
          After a lost reply, poll the same ID: an unknown ID never establishes completion. \
          Accepts no command, account, path, environment, selector or input body.",
+    )
+    .lane(Lane::Wait)
+    .input(Input::NONE),
+    va(
+        "claude-challenge",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "claude-challenge: interactive OAuth handoff (start|poll)",
+        "— Local owner or admitted native fleet Drive only, on a serving window. Starts the \
+         exact pinned Claude OAuth URL in this machine's visible browser and returns only its \
+         state-checked loopback callback to the caller. No mailbox or Claude credential file is \
+         accepted. Software performs no CAPTCHA or consent action. Replies `OK 1` and a schema-1 \
+         JSON object with request, state (working|done|failed), and callback when done. IDs are \
+         32 lowercase hex digits and caller-bound. One challenge runs at a time, bounded to 180 \
+         seconds. Repeat start observes only the identical retained request; a lost reply is \
+         recovered by polling the same ID.",
     )
     .lane(Lane::Wait)
     .input(Input::NONE),

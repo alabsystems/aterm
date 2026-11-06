@@ -68,6 +68,13 @@ impl Fake {
         self.procs.lock().unwrap().remove(&pid);
     }
 
+    /// Gives `pid` the parent `parent`: an orphan's adoption once its parent exits.
+    fn reparent(&self, pid: i32, parent: u32) {
+        if let Some(p) = self.procs.lock().unwrap().get_mut(&pid) {
+            p.lin.parent = parent;
+        }
+    }
+
     /// The sweep a reading would list.
     fn sweep(&self) -> Vec<ProcessReading> {
         self.procs
@@ -188,10 +195,15 @@ fn pass(fake: &Arc<Fake>, records: Option<PathBuf>) -> LeftPass {
 
 /// This instance (pid 100 under pid 90) and tab 7's shell (pid 200, unique id 1000).
 fn world() -> Arc<Fake> {
+    world_as("s-7")
+}
+
+/// [`world`], tab 7's session `sid`.
+fn world_as(sid: &str) -> Arc<Fake> {
     let fake = Arc::new(Fake::default());
     fake.add(90, 1, 10, None);
     fake.add(i32::try_from(SELF).unwrap(), 90, 20, None);
-    fake.add(200, SELF, 1000, Some("s-7"));
+    fake.add(200, SELF, 1000, Some(sid));
     fake
 }
 
@@ -202,6 +214,11 @@ fn req(tab: bool) -> Request {
 
 /// [`req`], tab 7 naming `leader` as its agent's group leader.
 fn led(tab: bool, leader: Option<u32>) -> Request {
+    led_as("s-7", tab, leader)
+}
+
+/// [`led`], tab 7's session `sid`.
+fn led_as(sid: &str, tab: bool, leader: Option<u32>) -> Request {
     Request {
         self_pid: SELF,
         tabs: tab
@@ -224,7 +241,7 @@ fn led(tab: bool, leader: Option<u32>) -> Request {
             })
             .into_iter()
             .collect(),
-        session_ids: tab.then(|| (7, "s-7".to_owned())).into_iter().collect(),
+        session_ids: tab.then(|| (7, sid.to_owned())).into_iter().collect(),
         ..Request::default()
     }
 }
@@ -964,5 +981,464 @@ fn the_facts_left_part_is_as_of_the_ask() {
     assert_eq!(
         crate::vitals_jobs::leftover_reading(&view, "s-7", now, gone),
         None
+    );
+}
+
+/// Tab 7's session id in the closed-tab tests, of the shape aterm mints: the record keeps no
+/// other.
+const SID: &str = "s-0000000000000000a007";
+
+/// When the closed-tab tests first read, unix ms.
+const T0: u64 = 1_792_000_060_000;
+
+/// A pass over `fake` in boot `b` whose closed-tab record is `file`: one aterm's run on a state
+/// home.
+fn kept_pass(fake: &Arc<Fake>, file: &std::path::Path) -> LeftPass {
+    LeftPass::with(LeftReaders {
+        kernel: Arc::clone(fake) as Arc<dyn LeftKernel + Send + Sync>,
+        boot: || Some("b".to_owned()),
+        closed: Some(file.to_path_buf()),
+        ..LeftReaders::inert()
+    })
+}
+
+/// A scratch state home and its closed-tab record's path.
+fn state_home() -> (aterm_tempfile::TempDir, PathBuf) {
+    let dir = aterm_tempfile::tempdir().expect("a scratch state home");
+    let file = dir.path().join(crate::vitals_left_closed::FILE);
+    (dir, file)
+}
+
+/// A reading of `fake` with tab 7 (session [`SID`]) open where `tab`.
+fn tick_as(pass: &mut LeftPass, fake: &Fake, at_ms: u64, tab: bool) -> Arc<LeftView> {
+    let sweep = fake.sweep();
+    pass.tick(at_ms, Some(&sweep), true, &led_as(SID, tab, None), None, 0)
+        .expect("a view")
+}
+
+/// `pid`'s row as `sys left` judges it, its source aside: its state, why, tier, proof words and
+/// token.
+fn judged(view: &LeftView, pid: u32) -> (State, Why, Tier, Vec<left::Proof>, Option<String>) {
+    let row = view.rows.iter().find(|r| r.pid == pid).expect("listed");
+    (
+        row.state,
+        row.why,
+        row.tier,
+        row.proof.clone(),
+        row.token.clone(),
+    )
+}
+
+/// `pid`'s row's tier, source and token.
+fn offered(view: &LeftView, pid: u32) -> (Tier, Source, Option<String>) {
+    let row = view.rows.iter().find(|r| r.pid == pid).expect("listed");
+    (row.tier, row.from.clone(), row.token.clone())
+}
+
+/// A CLOSED TAB'S ROW READS ALIKE AFTER A RESTART: tab 7 closes and leaves a pipeline's member
+/// (born at 1500, its leader gone); the aterm that hosted it quits, and one that starts again in
+/// the same boot on the same state home gives the row the same state, why, tier, proof words and
+/// token, from the same close (its session, label, number, window and time), and `end`'s re-read
+/// judges it alike. NEGATIVE CONTROL: read no record at the start, and the row is named with no
+/// token.
+#[test]
+fn a_closed_tabs_row_reads_alike_after_a_restart() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    fake.remove(200);
+    let before = tick_as(&mut first, &fake, T0 + 1_000, false);
+    assert_eq!(offered(&before, 2606).0, Tier::Offer, "{:?}", before.rows);
+    first.at_stop(&[], T0 + 2_000);
+    drop(first);
+
+    let mut again = kept_pass(&fake, &file);
+    let after = tick_as(&mut again, &fake, T0 + 5_000, false);
+    assert_eq!(judged(&after, 2606), judged(&before, 2606));
+    assert_eq!(
+        offered(&after, 2606).1,
+        Source::Closed(RESTORED_KEYS),
+        "a key no session of this process has"
+    );
+    let (was, now) = (&before.closed[0], &after.closed[0]);
+    assert_eq!(
+        (
+            now.sid.as_str(),
+            now.label.as_str(),
+            now.number,
+            now.shell_uniqueid,
+            now.horizon,
+            now.closed_ms,
+            now.left
+        ),
+        (
+            was.sid.as_str(),
+            was.label.as_str(),
+            was.number,
+            was.shell_uniqueid,
+            was.horizon,
+            was.closed_ms,
+            was.left
+        )
+    );
+    assert!(now.restored && !was.restored);
+    let readers = LeftReaders {
+        kernel: Arc::clone(&fake) as Arc<dyn LeftKernel + Send + Sync>,
+        boot: || Some("b".to_owned()),
+        ..LeftReaders::inert()
+    };
+    let fresh = reread(&readers, &after.live, &after.closed, SELF, 2606, T0 + 6_000)
+        .view()
+        .expect("read again");
+    assert_eq!(offered(&fresh, 2606), offered(&after, 2606));
+}
+
+/// A TAB OPEN AT THE QUIT IS CLOSED AT THE QUIT: tab 7 holds an orphan its session started (born
+/// at 1500, offered from the live tab) when the probe thread stops; the stop records the tab
+/// closed then, at the high-water unique id of the table it reads then (1700, past the last
+/// reading's 1500), and the shell goes with the aterm. The aterm that starts again reads the
+/// orphan as that tab's leftover, owner gone, with the same token; a process the session's marker
+/// names that was born after the quit's horizon is not the tab's. NEGATIVE CONTROL: close no live
+/// tab at the stop, and the orphan is named with no token.
+#[test]
+fn a_tab_open_at_the_quit_is_closed_at_the_quit() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    let open = tick_as(&mut first, &fake, T0, true);
+    let (state, why, tier, proof, token) = judged(&open, 2606);
+    assert_eq!(
+        (state, why, tier, offered(&open, 2606).1),
+        (State::Orphaned, Why::Orphaned, Tier::Offer, Source::Tab(7))
+    );
+    fake.add(2700, 90, 1700, None);
+    first.at_stop(&[], T0 + 1_000);
+    drop(first);
+    fake.remove(200);
+    fake.add(2800, 1, 1800, Some(SID));
+    fake.group(2800, 2600);
+
+    let mut again = kept_pass(&fake, &file);
+    let after = tick_as(&mut again, &fake, T0 + 2_000, false);
+    assert_eq!(
+        judged(&after, 2606),
+        (State::Left, Why::OwnerGone, Tier::Offer, proof, token)
+    );
+    assert_eq!(offered(&after, 2606).1, Source::Closed(RESTORED_KEYS));
+    let tab = &after.closed[0];
+    assert_eq!(
+        (
+            tab.sid.as_str(),
+            tab.closed_ms,
+            tab.shell_uniqueid,
+            tab.horizon
+        ),
+        (SID, T0 + 1_000, 1000, 1700)
+    );
+    assert_eq!(
+        offered(&after, 2800),
+        (Tier::Name, Source::Unknown, None),
+        "born after the quit"
+    );
+}
+
+/// A QUIT'S RECORD WAITS WHILE ITS SHELL RUNS: tab 7's shell outlives the aterm that recorded the
+/// tab closed at its quit (it survived the quit's hangup), so the session it names is not gone. An
+/// aterm that starts while that shell runs does not take the record, and keeps it in the file when
+/// it writes a close of its own; one that starts once the shell is gone takes it. NEGATIVE
+/// CONTROL: take a quit's record whatever its shell reads, and the running tab's orphan reads as a
+/// closed tab's leftover.
+#[test]
+fn a_quits_record_waits_while_its_shell_runs() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    first.at_stop(&[], T0 + 1_000);
+    drop(first);
+
+    let other = "s-0000000000000000a00c";
+    fake.add(201, SELF, 1700, Some(other));
+    let mut during = kept_pass(&fake, &file);
+    let sweep = fake.sweep();
+    let view = during
+        .tick(T0 + 2_000, Some(&sweep), true, &tab_8(other), None, 0)
+        .expect("a view");
+    assert!(view.closed.is_empty(), "{:?}", view.closed);
+    assert_eq!(offered(&view, 2606), (Tier::Name, Source::Unknown, None));
+    during.at_stop(&[], T0 + 2_500);
+    drop(during);
+
+    fake.remove(200);
+    fake.remove(201);
+    let mut later = kept_pass(&fake, &file);
+    let view = tick_as(&mut later, &fake, T0 + 3_000, false);
+    let sids: Vec<&str> = view.closed.iter().map(|t| t.sid.as_str()).collect();
+    assert_eq!(sids, [SID, other], "both quits, oldest first");
+    assert_eq!(
+        offered(&view, 2606).1,
+        Source::Closed(RESTORED_KEYS),
+        "{:?}",
+        view.rows
+    );
+}
+
+/// A MARKER NAMING A SESSION NO RECORDED ATERM OF THIS USER HOSTED STAYS NAMED: an orphan whose
+/// marker names a session no record holds, and one naming a session recorded only in another
+/// boot's file (whose unique ids say nothing of this boot's), each born inside that record's
+/// window, read `name` with no token, tied to nothing. NEGATIVE CONTROL: read a record of another
+/// boot, and the second offers a token.
+#[test]
+fn a_marker_naming_no_recorded_session_stays_named() {
+    let (_home, file) = state_home();
+    let other = "s-0000000000000000a008";
+    let elsewhere = Kept {
+        tab: ClosedTab {
+            sid: other.to_owned(),
+            label: "Tab 3".into(),
+            number: Some(3),
+            shell_uniqueid: 1000,
+            horizon: 2000,
+            closed_ms: T0 - 1_000,
+            ..ClosedTab::default()
+        },
+        shell_pid: 300,
+        ..Kept::default()
+    };
+    crate::vitals_left_closed::write(&file, "a", [&elsewhere], T0).expect("another boot's");
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(other));
+    fake.group(2606, 2600);
+    fake.add(2607, 1, 1600, Some("s-0000000000000000a009"));
+    fake.group(2607, 2600);
+    let mut pass = kept_pass(&fake, &file);
+    let view = tick_as(&mut pass, &fake, T0, false);
+    assert!(view.closed.is_empty(), "{:?}", view.closed);
+    for pid in [2606, 2607] {
+        assert_eq!(
+            offered(&view, pid),
+            (Tier::Name, Source::Unknown, None),
+            "pid {pid}"
+        );
+    }
+}
+
+/// A CLOSE PAST THE BOUND IS DROPPED, in memory as on disk: 30 days and a millisecond after tab 7
+/// closed, the reading drops its close, so its survivor is named with no token, and an aterm that
+/// starts again then reads no close either. NEGATIVE CONTROL: keep closes in memory whatever their
+/// age, and the survivor still offers a token.
+#[test]
+fn a_close_past_the_bound_is_dropped() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut pass = kept_pass(&fake, &file);
+    tick_as(&mut pass, &fake, T0, true);
+    fake.remove(200);
+    let closed = tick_as(&mut pass, &fake, T0 + 1_000, false);
+    assert_eq!(offered(&closed, 2606).0, Tier::Offer);
+    let past = T0 + 1_000 + crate::vitals_left_closed::CLOSED_KEPT_MS + 1;
+    let late = tick_as(&mut pass, &fake, past, false);
+    assert!(late.closed.is_empty(), "{:?}", late.closed);
+    assert_eq!(offered(&late, 2606), (Tier::Name, Source::Unknown, None));
+    let mut again = kept_pass(&fake, &file);
+    let view = tick_as(&mut again, &fake, past, false);
+    assert!(view.closed.is_empty(), "{:?}", view.closed);
+}
+
+/// A CLOSE TOLD BEFORE A RESTART IS NOT TOLD AGAIN: the reading that records tab 7's close counts
+/// the process it left, its host tells of it, and the stop takes that telling, so the record says
+/// the close was told and the aterm that starts again makes no second `proc.left` record of it; a
+/// tab that closed at the quit was never told, and is. NEGATIVE CONTROL: tell every close a view
+/// holds with processes left, and the first close is told again.
+#[test]
+fn a_close_told_before_a_restart_is_not_told_again() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    fake.remove(200);
+    let closed = tick_as(&mut first, &fake, T0 + 1_000, false);
+    assert_eq!(
+        told_now(&closed),
+        [SID],
+        "told by the aterm that saw the close"
+    );
+    first.at_stop(&[closed.closed[0].key], T0 + 1_500);
+    drop(first);
+    let other = "s-0000000000000000a00b";
+    fake.add(201, SELF, 1700, Some(other));
+    fake.add(2607, 1, 1800, Some(other));
+    fake.group(2607, 2601);
+    let mut second = kept_pass(&fake, &file);
+    let sweep = fake.sweep();
+    second
+        .tick(T0 + 2_000, Some(&sweep), true, &tab_8(other), None, 0)
+        .expect("a view");
+    second.at_stop(&[], T0 + 3_000);
+    drop(second);
+    fake.remove(201);
+
+    let mut third = kept_pass(&fake, &file);
+    let view = tick_as(&mut third, &fake, T0 + 4_000, false);
+    assert_eq!(told_now(&view), [other], "{:?}", view.closed);
+}
+
+/// A reading's request with tab 8 open, session `sid`, its shell pid 201, and no tab 7.
+fn tab_8(sid: &str) -> Request {
+    Request {
+        tabs: vec![TabRoot {
+            key: 8,
+            tab: 8,
+            tab_id: Some(8),
+            shell_pid: 201,
+            label: "Tab 4".into(),
+            program: "zsh".into(),
+            agent_leader: None,
+        }],
+        session_ids: vec![(8, sid.to_owned())],
+        ..led_as(SID, false, None)
+    }
+}
+
+/// The sessions of the closes `view` holds that the host tells of now, as a host that never told
+/// one would ([`crate::message_reporters::newly_left`]).
+fn told_now(view: &LeftView) -> Vec<String> {
+    let mut told = std::collections::BTreeSet::new();
+    crate::message_reporters::newly_left(&mut told, view)
+        .iter()
+        .map(|t| t.sid.clone())
+        .collect()
+}
+
+/// A CLOSE WITH AN EMPTY WINDOW SPOILS NO RECORD: tab 7 closes and leaves an orphan (born at
+/// 1500); tab 8 (its shell's unique id 3000) then closes with no process newer than 1500 alive, so
+/// the reading that misses it reads a horizon below its shell and its window holds nothing. The
+/// aterm that starts again still offers tab 7's survivor from its close. NEGATIVE CONTROL: write
+/// every close the table holds, and the record reads as none, so the survivor is named with no
+/// token.
+#[test]
+fn a_close_with_an_empty_window_spoils_no_record() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    fake.remove(200);
+    let closed = tick_as(&mut first, &fake, T0 + 1_000, false);
+    assert_eq!(offered(&closed, 2606).0, Tier::Offer, "{:?}", closed.rows);
+    let other = "s-0000000000000000a00d";
+    fake.add(201, SELF, 3000, Some(other));
+    let sweep = fake.sweep();
+    first
+        .tick(T0 + 2_000, Some(&sweep), true, &tab_8(other), None, 0)
+        .expect("a view");
+    fake.remove(201);
+    let view = tick_as(&mut first, &fake, T0 + 3_000, false);
+    let empty = view.closed.iter().find(|t| t.sid == other).expect("kept");
+    assert!(empty.horizon < empty.shell_uniqueid, "{empty:?}");
+    first.at_stop(&[], T0 + 4_000);
+    drop(first);
+
+    let mut again = kept_pass(&fake, &file);
+    let after = tick_as(&mut again, &fake, T0 + 5_000, false);
+    assert_eq!(
+        offered(&after, 2606).1,
+        Source::Closed(RESTORED_KEYS),
+        "{:?}",
+        after.rows
+    );
+}
+
+/// A CLOSE ITS HOST NEVER TOLD IS TOLD BY THE NEXT ATERM: the reading that records tab 7's close
+/// counts the process it left, but the aterm quits before its host adopts that reading, so no
+/// `proc.left` record told of it; the aterm that starts again tells of it. NEGATIVE CONTROL: write
+/// a close told once a reading counted what it left, and the next aterm tells none.
+#[test]
+fn a_close_its_host_never_told_is_told_by_the_next_aterm() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    fake.remove(200);
+    let closed = tick_as(&mut first, &fake, T0 + 1_000, false);
+    assert_eq!(closed.closed[0].left, 1, "counted at the close");
+    first.at_stop(&[], T0 + 1_500);
+    drop(first);
+
+    let mut again = kept_pass(&fake, &file);
+    let view = tick_as(&mut again, &fake, T0 + 2_000, false);
+    assert_eq!(told_now(&view), [SID], "{:?}", view.closed);
+}
+
+/// A CLOSE ITS HOST TOLD IS NOT TOLD AGAIN AFTER AN EXIT WITH NO STOP: tab 7's survivor (born at
+/// 1500) is still its pipeline's child when the close is recorded, so that reading counts nothing
+/// left; the next finds it orphaned and counts it, its host tells of it and says so to the pass,
+/// and the aterm exits as an update's predecessor does at its Commit, with no stop. The aterm that
+/// starts again tells none. NEGATIVE CONTROL: say nothing to the pass of the host's telling, and
+/// the close is told again.
+#[test]
+fn a_close_its_host_told_is_not_told_again_after_an_exit() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2605, 200, 1400, Some(SID));
+    fake.group(2605, 2600);
+    fake.add(2606, 2605, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    fake.remove(200);
+    let closed = tick_as(&mut first, &fake, T0 + 1_000, false);
+    assert_eq!(closed.closed[0].left, 0, "{:?}", closed.rows);
+    fake.remove(2605);
+    fake.reparent(2606, 1);
+    let left = tick_as(&mut first, &fake, T0 + 2_000, false);
+    assert_eq!(told_now(&left), [SID], "{:?}", left.rows);
+    first.keep_told(&[left.closed[0].key], T0 + 2_500);
+    drop(first);
+
+    let mut again = kept_pass(&fake, &file);
+    let view = tick_as(&mut again, &fake, T0 + 3_000, false);
+    assert_eq!(offered(&view, 2606).1, Source::Closed(RESTORED_KEYS));
+    assert!(told_now(&view).is_empty(), "{:?}", view.closed);
+}
+
+/// A QUIT'S RECORD IS TAKEN ONCE ITS SHELL'S PID NAMES ANOTHER PROCESS: tab 7 is open at the
+/// quit, its shell goes, and its pid is taken again by a process born later (unique id 1900); the
+/// aterm that starts then takes the quit's record. NEGATIVE CONTROL: read a pid that names any
+/// process as the shell, whatever its unique id, and the record is held back.
+#[test]
+fn a_quits_record_is_taken_once_its_shells_pid_is_reused() {
+    let (_home, file) = state_home();
+    let fake = world_as(SID);
+    fake.add(2606, 1, 1500, Some(SID));
+    fake.group(2606, 2600);
+    let mut first = kept_pass(&fake, &file);
+    tick_as(&mut first, &fake, T0, true);
+    first.at_stop(&[], T0 + 1_000);
+    drop(first);
+    fake.remove(200);
+    fake.add(200, SELF, 1900, None);
+
+    let mut again = kept_pass(&fake, &file);
+    let view = tick_as(&mut again, &fake, T0 + 2_000, false);
+    assert_eq!(
+        offered(&view, 2606).1,
+        Source::Closed(RESTORED_KEYS),
+        "{:?}",
+        view.closed
     );
 }

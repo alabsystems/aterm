@@ -306,8 +306,10 @@ fn serve(client: &mut CtlStream, source: &ObservationHandle) -> io::Result<()> {
         return Err(refused());
     }
     let wire = live_encode_publication(&publication, age_ms)?;
-    write_all(client, &(wire.len() as u32).to_be_bytes(), deadline)?;
-    write_all(client, &wire, deadline)?;
+    let mut frame = Vec::with_capacity(4 + wire.len());
+    frame.extend_from_slice(&(wire.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&wire);
+    write_all(client, &frame, deadline)?;
     // Keep the endpoint alive through the reader's kernel identity checks.
     // Darwin refuses timeout updates once the peer has closed its socket.
     let mut ack = [0; ACK.len()];
@@ -439,8 +441,7 @@ fn live_encode(state: &NetworkObservation, age_ms: u64) -> io::Result<Vec<u8>> {
 
 fn live_encode_publication(publication: &Publication, age_ms: u64) -> io::Result<Vec<u8>> {
     let state = &publication.observation;
-    let history = encode(state, None).map_err(|_| refused())?;
-    let history: Value = aterm_json::from_slice(&history).map_err(|_| refused())?;
+    let history = encode_value(state, None);
     let live = state.peers.iter().map(|peer| {
         let age = if peer.reachability == Reachability::Reachable {
             publication.contact_ages.get(&peer.slot).copied().map(age_millis).transpose()?
@@ -523,15 +524,12 @@ fn live_decode_parts(
     if age_ms > 15_000 {
         return Err(refused_at("source-stale"));
     }
-    let history = aterm_json::to_vec(
-        value
-            .get("history")
-            .ok_or_else(|| refused_at("snapshot-history"))?,
-    )
-    .map_err(|_| refused_at("snapshot-history"))?;
+    let history = value
+        .get("history")
+        .ok_or_else(|| refused_at("snapshot-history"))?;
     // History decoding validates bounded identities and samples but deliberately
     // resets current evidence. Only this live exchange can supply it again.
-    let mut observation = decode(&history).map_err(|_| refused_at("snapshot-history"))?;
+    let mut observation = decode_value(history).map_err(|_| refused_at("snapshot-history"))?;
     if observation.observed_at_ms == 0 || observation.observed_at_ms > now {
         return Err(refused_at("sample-clock"));
     }

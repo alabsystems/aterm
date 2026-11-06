@@ -488,14 +488,19 @@ fn a_draft_typed_and_cleared_is_no_new_point_under_any_program() {
 }
 
 /// The key and submit mark Claude Code's rule gave every program's point before ATERM-KI-1101-2:
-/// the turn's rows end under the last said row, and nothing drawn under them joins the key.
+/// the turn's rows end under the last said row, and nothing drawn under them joins the key. Their
+/// letters are the screen's transcript's (`ScreenReader::transcript`: beside Claude Code's side
+/// panel each row's words up to the panel's rule, ATERM-KI-1101-3's; every other program's rows
+/// whole), as they are in the rule itself.
 fn claude_rule(reader: &dyn ScreenReader, turn: &Turn) -> (String, Option<(u64, u64)>) {
     let rows = &turn.screen.rows;
     let upto = last_said_index(rows).map_or(0, |k| k + 1).min(rows.len());
+    let transcript = reader.transcript(rows);
+    let words = transcript.rows();
     let mark = turn.screen.submits.map(|n| {
         (
             n,
-            crate::supervise::policy::turn_end::screen_mark(&rows[..upto]),
+            crate::supervise::policy::turn_end::screen_mark(&words[..upto]),
         )
     });
     if turn.phase == Phase::Prompt
@@ -512,7 +517,7 @@ fn claude_rule(reader: &dyn ScreenReader, turn: &Turn) -> (String, Option<(u64, 
     let span = (turn.phase == Phase::Prompt)
         .then(|| prompt_box_span(rows))
         .flatten();
-    push_words_above(&mut key, &rows[..span.map_or(upto, |(a, _)| a)]);
+    push_words_above(&mut key, &words[..span.map_or(upto, |(a, _)| a)]);
     if let Some((a, b)) = span {
         for r in &rows[a..=b] {
             key.push_str(r.trim_end());

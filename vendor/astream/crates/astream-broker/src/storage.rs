@@ -165,6 +165,28 @@ impl Backing {
         }
     }
 
+    /// The device this file is on and whether its full flush ([`FlushHandle::full`],
+    /// `F_FULLFSYNC` on Apple) drains it ([`LogDevice`](crate::LogDevice)), read by `fstat`
+    /// on the file's own descriptor; `None` where that fails, off Unix, and for the
+    /// simulated device, which shares no device with any other file.
+    pub(crate) fn device(&self) -> Option<crate::LogDevice> {
+        match self {
+            #[cfg(unix)]
+            Backing::Os(f) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let meta = f.metadata().ok()?;
+                Some(crate::LogDevice {
+                    dev: meta.dev(),
+                    flush_drains_device: cfg!(target_vendor = "apple"),
+                })
+            }
+            #[cfg(not(unix))]
+            Backing::Os(_) => None,
+            #[cfg(test)]
+            Backing::Sim(_) => None,
+        }
+    }
+
     /// A handle that flushes this file IN FULL from another place than the log's own
     /// lock: the file's own descriptor, shared, or the simulated device. `fail` stands in
     /// the fault-injection seam's failed fsync.

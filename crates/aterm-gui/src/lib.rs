@@ -954,6 +954,9 @@ mod harness_policy_verb;
 mod harness_recovery_verb;
 mod kitty_animation;
 mod login_notice_verb;
+/// The menu bar's machine title, `m8 Heron` (`docs/DESIGN-machine-names-2026-11-04.md` §5.1).
+#[cfg(target_os = "macos")]
+mod machine_title;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
 mod needs;
@@ -1091,6 +1094,7 @@ mod vitals_gpu;
 mod vitals_host;
 mod vitals_jobs;
 mod vitals_left;
+mod vitals_left_closed;
 mod vitals_startup;
 mod wallpaper_present;
 mod watchdog;
@@ -2326,12 +2330,13 @@ pub(crate) mod handover_pauses_for_test {
     }
 }
 
-/// The releaser's half of [`term_lock_ui`]'s handoff, called by the PTY reader and the compress worker between batches.
+/// The releaser's half of [`term_lock_ui`]'s handoff, called by the PTY reader and the compress
+/// worker between batches: while a waiter is registered it spins until the waiter has the lock or
+/// [`UI_HANDOFF_SPIN`] has passed. The waiter wakes by the unlock or its own sleep slice
+/// ([`pause_for_handover`]), so the releaser never yields the processor for it: on macOS a yield
+/// while other work is runnable sets the thread aside for a whole 10 ms scheduling quantum, so a
+/// yield here could hold the PTY reader, and the output behind it, that long after a hand-over.
 pub(crate) fn yield_to_ui_waiter(ui_waiting: &std::sync::atomic::AtomicU32) {
-    if ui_waiting.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    std::thread::yield_now();
     yield_to_ui_waiter_until(ui_waiting, UI_HANDOFF_SPIN, Instant::now);
 }
 
@@ -2477,7 +2482,7 @@ mod ui_handoff_tests {
                 t0.elapsed() < Duration::from_secs(60),
                 "acquirer never registered"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         drop(held);
         assert_eq!(
@@ -4071,6 +4076,10 @@ enum Wake {
         painted: Option<Box<status_item::Glance>>,
     },
     SiblingScan(Vec<status_item::SiblingInstance>),
+    /// This machine's name as `machine-name.toml` holds it, from [`machine_title::spawn`]'s
+    /// reader: the menu bar's machine title follows it.
+    #[cfg(target_os = "macos")]
+    MachineName(machine_title::MachineView),
     #[cfg(target_os = "macos")]
     SiblingRaised {
         pid: u32,
@@ -10568,6 +10577,9 @@ struct App {
     guest_search_last_query: String,
     guest_search_last_anchor: Option<FindAnchor>,
     _menu: Option<menu::MenuHandle>,
+    /// The machine title's view, from [`Wake::MachineName`]; `None` until its reader's first read.
+    #[cfg(target_os = "macos")]
+    machine_view: Option<machine_title::MachineView>,
     _status_item: Option<status_item::StatusItemHandle>,
     status_fingerprint: Option<u64>,
     status_drawn: Vec<status_item::Glance>,
@@ -11056,8 +11068,16 @@ impl App {
         let activates_commit = matches!(ev, Wake::ActivateCommittedHandoff { .. });
         #[cfg(not(unix))]
         let activates_commit = false;
+        // The machine title's reader posts a view once and again only at a change, so a candidate
+        // that dropped it would show no title after Commit; it only titles a bar item already
+        // installed, which mutates no session.
+        #[cfg(target_os = "macos")]
+        let titles_the_bar = matches!(ev, Wake::MachineName(_));
+        #[cfg(not(target_os = "macos"))]
+        let titles_the_bar = false;
         if self.incoming_handoff_pending
             && !activates_commit
+            && !titles_the_bar
             && !matches!(
                 ev,
                 Wake::GpuSurfaceReady { .. } | Wake::ControlPrepared | Wake::ProgramResolved { .. }
@@ -15671,6 +15691,8 @@ impl App {
             guest_search_last_query: String::new(),
             guest_search_last_anchor: None,
             _menu: None,
+            #[cfg(target_os = "macos")]
+            machine_view: None,
             _status_item: None,
             status_fingerprint: None,
             status_drawn: Vec::new(),
@@ -19103,6 +19125,13 @@ impl ApplicationHandler<Wake> for App {
         if !self.headless {
             self.publish_menu_live();
             self.publish_agents_live(status_rebuilt, Instant::now());
+            // What the person types where a private document is in front reaches no other
+            // process's event tap (one-mesh design §4.8).
+            crate::secure_input::set_private_front(
+                self.windows
+                    .iter()
+                    .any(|(wid, ws)| ws.focused && self.front_view_is_private(*wid)),
+            );
         }
         #[cfg(windows)]
         if !self.headless
@@ -21078,6 +21107,11 @@ impl App {
                     self.siblings = rows;
                     self.mark_status_dirty();
                 }
+            }
+            #[cfg(target_os = "macos")]
+            Wake::MachineName(view) => {
+                self.machine_view = Some(view);
+                self.refresh_machine_menu();
             }
             #[cfg(target_os = "macos")]
             Wake::NativeTerminateRequested { generation } => {
@@ -27597,6 +27631,7 @@ pub fn main_entry_with_network(
                 active_handle.clone(),
                 store.clone(),
                 event_loop.create_proxy(),
+                !headless,
                 plan.clone(),
                 config.clone(),
                 Some((session0.ctx.self_id.clone(), session0.ctx.nonce)),
@@ -28339,6 +28374,8 @@ pub fn main_entry_with_network(
         guest_search_last_query: String::new(),
         guest_search_last_anchor: None,
         _menu: None,
+        #[cfg(target_os = "macos")]
+        machine_view: None,
         _status_item: None,
         status_fingerprint: None,
         status_drawn: Vec::new(),

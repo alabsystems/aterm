@@ -710,6 +710,60 @@ fn book(dir: &std::path::Path, file: &str, peers: &[crate::fleet_member::Peer]) 
 }
 
 #[test]
+fn the_nicknames_in_view_are_other_nodes_records_their_own_keys_sign() {
+    use crate::fleet_member::{ISSUER_BOOK_FILE, PEERS_FILE};
+    let dir = private_state("nicks");
+    let (me, other, third) = (identity(1), identity(2), identity(3));
+    let nick = |word: &str| Nickname::parse(word).expect("a nickname");
+    let named = |who: &NodeIdentity, word: &str| {
+        let mut record = plain(who);
+        record.nick = Some(nick(word));
+        record
+    };
+    assert!(
+        nicknames_in_books(&dir, Some(me.node()), ZERO_DIGEST).is_empty(),
+        "no books"
+    );
+
+    let fleet = [7; 8];
+    let mut seeded = entry(&third, "m10.local", None);
+    seeded.signed = seeded
+        .signed
+        .map(|signed| signed.with_record(named(&third, "otter").sign(&third, fleet)));
+    // Another key's signature on `other`'s entry: no record of `other`'s.
+    let mut forged = entry(&other, "m9.local", None);
+    forged.signed = forged
+        .signed
+        .map(|signed| signed.with_record(named(&other, "puffin").sign(&third, ZERO_DIGEST)));
+    book(
+        &dir,
+        PEERS_FILE,
+        &[
+            entry(&me, "m8.local", Some(&named(&me, "kestrel"))),
+            entry(&other, "m9.local", Some(&named(&other, "heron"))),
+            forged,
+        ],
+    );
+    book(&dir, ISSUER_BOOK_FILE, &[seeded]);
+    assert_eq!(
+        nicknames_in_books(&dir, Some(me.node()), ZERO_DIGEST),
+        [nick("heron")],
+        "never this node's own, another fleet's or a record another key signed"
+    );
+    assert_eq!(
+        nicknames_in_books(&dir, Some(me.node()), fleet),
+        [nick("heron"), nick("otter")],
+        "the held seed's records, and the zero digest's beside them"
+    );
+    assert_eq!(
+        nicknames_in_books(&dir, None, ZERO_DIGEST),
+        [nick("kestrel"), nick("heron")],
+        "a node with no identity yet reads every one"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleans up");
+}
+
+#[test]
 fn floor_finds_this_nodes_newest_record_in_either_book() {
     use crate::fleet_member::{ISSUER_BOOK_FILE, PEERS_FILE};
     let dir = private_state("floor");

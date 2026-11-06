@@ -30,7 +30,9 @@ fn moved(before: astream_sys::FlushTally, after: astream_sys::FlushTally) -> (u6
 /// flushes the seam records and nothing else (two on Windows, which notes the entry's flush
 /// and makes none); an ordered write moves `barrier` by the one
 /// ordered flush the seam records on Apple targets, where the barrier is its own call, and
-/// `full` elsewhere, where it is a full flush. NEGATIVE CONTROL: a flush that calls the OS
+/// `full` elsewhere, where it is a full flush; on Unix, a plain flush of a file and of a
+/// directory's bare descriptor (`primitive::fsync`, the handle-relative trees' flush) moves
+/// `plain` by exactly the two plain flushes the seam counts. NEGATIVE CONTROL: a flush that calls the OS
 /// directly (`File::sync_all`, `File::sync_data`), as `primitive::full` and
 /// `primitive::full_data` did before they were astream-sys's, leaves the tally unmoved. On
 /// Apple, the plain-flush fallback on a descriptor that refuses both of `ordered`'s flushes
@@ -97,6 +99,24 @@ fn the_tally_moves_by_exactly_the_flushes_the_seam_records() {
         "the ordered flush the seam recorded is one call counted: {before:?} -> {after:?}"
     );
 
+    // A plain flush of a file and of a directory held as a bare descriptor (the
+    // handle-relative trees' folders): one `plain` each, and two the seam counts.
+    #[cfg(unix)]
+    {
+        let folder = std::os::fd::OwnedFd::from(std::fs::File::open(dir.path()).unwrap());
+        let before = astream_sys::flush_tally();
+        aterm_durable::primitive::fsync(&file).expect("the file's plain flush");
+        aterm_durable::primitive::fsync(&folder).expect("the folder's plain flush");
+        let after = astream_sys::flush_tally();
+        assert_eq!(recording.take_plain(), 2, "the plain flushes, as asked");
+        assert_eq!(recording.take(), [], "a plain flush is no Flush");
+        assert_eq!(
+            moved(before, after),
+            (0, 0, 2),
+            "each plain flush the seam counted is one plain call: {before:?} -> {after:?}"
+        );
+    }
+
     let before = astream_sys::flush_tally();
     #[expect(
         clippy::disallowed_methods,
@@ -135,5 +155,10 @@ fn the_tally_moves_by_exactly_the_flushes_the_seam_records() {
             "one call of each kind answered one ordered flush"
         );
         assert_eq!(recording.take(), [Flush::Ordered]);
+        assert_eq!(
+            recording.take_plain(),
+            1,
+            "and the plain one the seam counts"
+        );
     }
 }

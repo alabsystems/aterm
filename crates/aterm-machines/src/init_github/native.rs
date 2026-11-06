@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native GitHub transport using `agh` and [`crate::git_credential`].
+//! Private vault repository inventory and native cloning through [`crate::git_credential`].
+//! An explicit init.toml profile can instead ask `agh` for that account's live inventory.
 
 use super::{
     Asked, Github, INPUT_MAX, TokenUnread, asked, decode, get, identity, keychain, read_token,
@@ -17,7 +18,7 @@ use aterm_converge::{Class, Layer, Remedy, Requires};
 use aterm_types::macos_setup::FailureKind;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// The repositories the signed-in account owns, private ones included. Its forks and archived
 /// repositories are left out of the default set ([`NativeRepositories::plan`]); an init.toml
@@ -28,6 +29,8 @@ const ACCESSIBLE: &str =
 /// The step a person takes for the GitHub sign-in or settings a repository needs, as the
 /// engine names it beside their remedy.
 const GITHUB_STEP: &str = "github.sign-in";
+/// Preserved checkout work is separate from the credential's sign-in remedy.
+const REPOSITORIES_STEP: &str = "github.repositories";
 
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
     run_with(sys, ctx, mode, None)
@@ -74,7 +77,7 @@ fn run_with(
     let place = || Place {
         layer: Layer::Workstation,
         class: Class::Install,
-        requires: Requires::Console,
+        requires: Requires::Account,
         remedy: Remedy::Command("aterm init".into()),
     };
     let bound = crate::engine::bind(
@@ -100,6 +103,9 @@ struct NativeRepositories {
     /// System State.
     reading: LastReading,
     captured: Option<Captured>,
+    /// Ordinary init captures only after its Secrets dependency has run. A successful
+    /// generation stays fixed; an unready observation is retried rather than cached.
+    prepared: OnceLock<InitialRepositoryInputs>,
     /// The secrets item it waits for in `aterm init` ([`item`]).
     after: Option<String>,
     /// `aterm init`'s default, which nobody configured: no token on this Mac is no stage here,
@@ -108,6 +114,9 @@ struct NativeRepositories {
     /// What the last probe or apply read, for the step after it: the apply reuses the probe's
     /// inventory and verdicts, and the read-back reads again only what the apply cloned.
     carried: Mutex<Option<Carried>>,
+    /// What the last apply's clones made of their hook installers ([`repos::Cloned::hooks`]),
+    /// which the read-back's row says.
+    hooks: Mutex<Vec<String>>,
 }
 
 /// What one step read for the next ([`NativeRepositories::carried`]).
@@ -125,12 +134,27 @@ enum Carried {
 pub struct InitialRepositoryInputs {
     user: User,
     local: Result<LocalInputs, Block>,
+    source: Option<super::source::Stamp>,
+    authority: InputAuthority,
+}
+
+#[derive(Clone)]
+enum InputAuthority {
+    /// An external caller holds and rechecks its own ready source snapshot.
+    Caller,
+    /// This default source was deliberately local: a newly configured vault is a new source.
+    Local(aterm_secrets::client::Paths),
+    Vault(
+        aterm_secrets::client::Paths,
+        Box<aterm_secrets::client::MaterializationSnapshot>,
+    ),
 }
 
 #[derive(Clone)]
 struct LocalInputs {
     configured: Option<Github>,
     token: Arc<Secret>,
+    inventory: Option<super::inventory::Inventory>,
 }
 
 struct Captured {
@@ -148,10 +172,150 @@ impl InitialRepositoryInputs {
         let [user] = ctx.users.as_slice() else {
             return Err("initial repository setup requires exactly one local user".into());
         };
-        Ok(Self {
+        Ok(Self::local(sys, user))
+    }
+
+    /// Capture an ordinary account's inputs through its configured local vault when the
+    /// default repository source is used. This runs lazily after the Secrets dependency;
+    /// explicitly configured personal profiles continue to use their own local source.
+    ///
+    /// # Errors
+    /// The context does not name exactly one local account. Unready inputs stay typed blockers.
+    pub fn capture_ready(sys: &dyn System, ctx: &Ctx) -> Result<Self, String> {
+        let [user] = ctx.users.as_slice() else {
+            return Err("initial repository setup requires exactly one local user".into());
+        };
+        Ok(Self::ready(sys, user))
+    }
+
+    fn local(sys: &dyn System, user: &User) -> Self {
+        let before = super::source::Stamp::read(sys, user);
+        let local = Self::read(sys, user);
+        let read = local.and_then(|local| {
+            let before = before.map_err(Block::from)?;
+            let after = super::source::Stamp::read(sys, user).map_err(Block::from)?;
+            if before != after {
+                return Err("repository inputs changed while they were read; waiting for a coherent version".to_owned().into());
+            }
+            Ok((local, after))
+        });
+        let (local, source) = match read {
+            Ok((local, source)) => (Ok(local), Some(source)),
+            Err(why) => (Err(why), None),
+        };
+        Self {
             user: user.clone(),
-            local: Self::read(sys, user),
-        })
+            local,
+            source,
+            authority: InputAuthority::Caller,
+        }
+    }
+
+    fn ready(sys: &dyn System, user: &User) -> Self {
+        let failed = |why: String| Self {
+            user: user.clone(),
+            local: Err(why.into()),
+            source: None,
+            authority: InputAuthority::Caller,
+        };
+        let table = match super::profile(sys, user) {
+            Ok(profile) => profile.and_then(|profile| profile.github),
+            Err(why) => {
+                let mut inputs = failed(why.clone());
+                inputs.local = Err(Block::of(Wait::Settings)(why));
+                return inputs;
+            }
+        };
+        let default = match super::asked(table, user) {
+            Ok(Asked::Default) => true,
+            Ok(_) => false,
+            Err(why) => {
+                let mut inputs = failed(why.clone());
+                inputs.local = Err(Block::of(Wait::Settings)(why));
+                return inputs;
+            }
+        };
+        if !default {
+            let inputs = Self::local(sys, user);
+            if inputs
+                .local
+                .as_ref()
+                .is_ok_and(|local| local.configured.is_none())
+            {
+                return failed("the repository source changed while it was admitted".into());
+            }
+            return inputs;
+        }
+        let paths = aterm_secrets::client::Paths::for_home(Path::new(&user.home));
+        let configured = match aterm_secrets::client::config(&paths) {
+            Ok(Some(configured)) => configured,
+            Ok(None) => {
+                let mut inputs = Self::local(sys, user);
+                if inputs
+                    .local
+                    .as_ref()
+                    .is_ok_and(|local| local.configured.is_some())
+                {
+                    return failed("the repository source changed while it was admitted".into());
+                }
+                inputs.authority = InputAuthority::Local(paths);
+                return inputs;
+            }
+            Err(why) => return failed(why.to_string()),
+        };
+        match aterm_secrets::client::with_materialization_ready_for_entries(
+            &paths,
+            &configured,
+            &super::VAULT_INPUT_ENTRIES,
+            || Ok(Self::local(sys, user)),
+        ) {
+            Ok(Some(captured)) => {
+                let mut inputs = captured.inputs;
+                if inputs
+                    .local
+                    .as_ref()
+                    .is_ok_and(|local| local.configured.is_some())
+                {
+                    return failed("the repository source changed while it was admitted".into());
+                }
+                inputs.authority = InputAuthority::Vault(paths, Box::new(captured.snapshot));
+                inputs
+            }
+            Ok(None) => {
+                failed("the configured secrets vault is not ready for repository inputs".into())
+            }
+            Err(why) => failed(why.to_string()),
+        }
+    }
+
+    /// Whether the selected source and its captured inputs still hold. This observes only
+    /// local files and ready-vault evidence, and grants no lease over later effects.
+    ///
+    /// # Errors
+    /// The current local source or vault state cannot be safely read.
+    pub fn is_current(&self, sys: &dyn System) -> Result<bool, String> {
+        if self.local.is_err() {
+            return Ok(false);
+        }
+        match &self.authority {
+            InputAuthority::Caller => {}
+            InputAuthority::Local(paths) => {
+                if aterm_secrets::client::config(paths)
+                    .map_err(|why| why.to_string())?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            InputAuthority::Vault(paths, snapshot) => {
+                if !snapshot.is_current(paths).map_err(|why| why.to_string())? {
+                    return Ok(false);
+                }
+            }
+        }
+        self.source
+            .as_ref()
+            .map_or(Ok(false), |source| source.is_current(sys, &self.user))
     }
 
     fn read(sys: &dyn System, user: &User) -> Result<LocalInputs, Block> {
@@ -171,7 +335,19 @@ impl InitialRepositoryInputs {
             token_key: None,
         });
         let token = Arc::new(read_token(sys, user, &source).map_err(Block::token)?);
-        Ok(LocalInputs { configured, token })
+        let inventory = if configured.is_none() {
+            Some(
+                super::inventory::Inventory::read(sys, user)
+                    .map_err(Block::of(Wait::RepositoryInventory))?,
+            )
+        } else {
+            None
+        };
+        Ok(LocalInputs {
+            configured,
+            token,
+            inventory,
+        })
     }
 }
 
@@ -181,9 +357,11 @@ impl NativeRepositories {
             user,
             reading: LastReading::default(),
             captured,
+            prepared: OnceLock::new(),
             after: None,
             unasked: false,
             carried: Mutex::new(None),
+            hooks: Mutex::new(Vec::new()),
         }
     }
 
@@ -210,7 +388,7 @@ impl NativeRepositories {
     fn read(&self, sys: &dyn System) -> Result<(Plan, repos::Partition), Block> {
         match self.take() {
             Some(Carried::Applied(plan, mut standing, touched)) => {
-                self.ensure_current().map_err(Block::from)?;
+                self.ensure_current(sys).map_err(Block::from)?;
                 standing.read_back(sys, &self.user, &touched);
                 Ok((plan, standing))
             }
@@ -239,76 +417,114 @@ impl Item for NativeRepositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        self.reading.set(None);
-        let check = (|| {
-            let (plan, standing) = self.read(sys)?;
-            let lookups = self.lookups(sys, &plan)?;
-            self.ensure_current().map_err(Block::from)?;
-            // Signed in, with no repository left that fits: the row waits for room instead of
-            // a pass that would clone nothing.
-            let volume = sys.volume(Path::new(&self.user.home));
-            let left: Vec<String> = standing
-                .missing
-                .iter()
-                .filter_map(|repo| repos::no_room(volume.as_ref(), repo))
-                .collect();
-            if lookups.ready()
-                && !standing.missing.is_empty()
-                && left.len() == standing.missing.len()
-            {
-                let why =
-                    repos::short_of_room(volume.as_ref(), &left, CHECK_AGAIN).unwrap_or_default();
-                return Err(Block::of(Wait::DiskSpace)(why));
+        // What the last apply's clones made of their hook installers: whatever this read says,
+        // the switch turned off since included, its row says that too.
+        let hooks = std::mem::take(&mut *self.hooks.lock().unwrap_or_else(PoisonError::into_inner));
+        let read = (|| -> Probe {
+            self.reading.set(None);
+            if matches!(super::settings_managed(sys, &self.user), Ok(false)) {
+                return Probe::NotApplicable {
+                    why: "repository setup is disabled in init.toml's [github] table".into(),
+                };
             }
-            Ok::<_, Block>((plan, standing, lookups))
-        })();
-        let (plan, standing, lookups) = match check {
-            Ok(read) => read,
-            Err(block) => {
-                // Why it cannot go on, where this probe decided it: System State's note.
-                self.reading.set(block.wait.map(Reading::Waits));
-                return block.probe(self.unasked, sys.macos());
-            }
-        };
-        let ready = lookups.ready();
-        let (count, missing) = (standing.admissible(), standing.missing.len());
-        self.reading.set(Some(Reading::Repositories {
-            present: count.saturating_sub(missing),
-            count,
-            signed_in: ready,
-        }));
-        let mut notes = plan.notes.clone();
-        notes.extend(standing.notes.iter().cloned());
-        let probe = if let Lookups::Not(why) = &lookups {
-            Probe::Blocked {
-                why: format!(
-                    "{missing} of {count} repositories missing, and aterm's GitHub route does \
+            let check = (|| {
+                let (plan, standing) = self.read(sys)?;
+                let lookups = self.lookups(sys, &plan)?;
+                self.ensure_current(sys).map_err(Block::from)?;
+                // Signed in, with no repository left that fits: the row waits for room instead of
+                // a pass that would clone nothing.
+                let volume = sys.volume(Path::new(&self.user.home));
+                let left: Vec<String> = standing
+                    .missing
+                    .iter()
+                    .filter_map(|repo| repos::no_room(volume.as_ref(), repo))
+                    .collect();
+                if lookups.ready()
+                    && !standing.missing.is_empty()
+                    && standing.dependencies.is_empty()
+                    && left.len() == standing.missing.len()
+                {
+                    let why = repos::short_of_room(volume.as_ref(), &left, CHECK_AGAIN)
+                        .unwrap_or_default();
+                    return Err(Block::of(Wait::DiskSpace)(why));
+                }
+                Ok::<_, Block>((plan, standing, lookups))
+            })();
+            let (plan, standing, lookups) = match check {
+                Ok(read) => read,
+                Err(block) => {
+                    // Why it cannot go on, where this probe decided it: System State's note.
+                    self.reading.set(block.wait.map(Reading::Waits));
+                    return block.probe(self.unasked, sys.macos());
+                }
+            };
+            let ready = lookups.ready();
+            let count = plan.repositories.len();
+            let present = standing.present.len();
+            let missing = count.saturating_sub(present);
+            self.reading.set(Some(Reading::Repositories {
+                present,
+                count,
+                signed_in: ready,
+            }));
+            let mut notes = plan.notes.clone();
+            notes.extend(standing.notes.iter().cloned());
+            let probe = if let Lookups::Not(why) = &lookups {
+                Probe::Blocked {
+                    why: format!(
+                        "{missing} of {count} repositories missing, and aterm's GitHub route does \
                      not hand back the synced token: {why}; aterm never keeps the token in the \
                      login keychain"
-                ),
-            }
-        } else if missing == 0 {
-            let mut now = format!(
-                "{count} matching worktrees present; aterm's GitHub route hands back the synced \
+                    ),
+                }
+            } else if standing.missing.is_empty()
+                && standing.dependencies.is_empty()
+                && !standing.notes.is_empty()
+            {
+                Probe::Person {
+                    step: REPOSITORIES_STEP.into(),
+                    how: format!(
+                        "{present} of {count} repositories ready; preserved work or dependency metadata blocks completion: {}",
+                        repos::named(&standing.notes).unwrap_or_default()
+                    ),
+                }
+            } else if missing == 0 {
+                let mut now = format!(
+                    "{count} matching worktrees present; aterm's GitHub route hands back the synced \
                  token"
-            );
-            if let Some(left) = repos::named(&notes) {
-                now.push_str(&format!("; left as they are: {left}"));
-            }
-            Probe::Ok { now }
-        } else {
-            Probe::Change {
-                from: format!("{missing} of {count} repositories missing"),
-                to: "clone missing repositories through aterm's GitHub route; preserve existing \
-                     worktrees"
+                );
+                if let Some(left) = repos::named(&notes) {
+                    now.push_str(&format!("; left as they are: {left}"));
+                }
+                Probe::Ok { now }
+            } else {
+                Probe::Change {
+                from: format!("{missing} of {count} repositories missing or needing required dependencies"),
+                to: "clone missing repositories and their required dependencies through aterm's GitHub route; preserve existing work"
                     .into(),
             }
-        };
-        self.carry(Carried::Probed(plan, standing));
-        probe
+            };
+            self.carry(Carried::Probed(plan, standing));
+            probe
+        })();
+        repos::with_hooks(read, &hooks)
     }
 
-    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        authorized()?;
+        self.ensure_current(sys)?;
+        if !super::settings_managed(sys, &self.user)? {
+            return Ok(());
+        }
         let (plan, standing) = match self.take() {
             Some(Carried::Probed(plan, standing)) => (plan, standing),
             _ => {
@@ -325,9 +541,15 @@ impl Item for NativeRepositories {
                 (plan, standing)
             }
         };
-        let current = || self.ensure_current();
+        let current = || {
+            authorized()?;
+            if !super::settings_managed(sys, &self.user)? {
+                return Err("repository setup was disabled in init.toml while cloning".into());
+            }
+            self.ensure_current(sys)
+        };
         current()?;
-        if standing.missing.is_empty() {
+        if standing.missing.is_empty() && standing.dependencies.is_empty() {
             self.carry(Carried::Applied(plan, standing, Vec::new()));
             return Ok(());
         }
@@ -337,12 +559,23 @@ impl Item for NativeRepositories {
                  was cloned"
             ));
         }
-        let guard = self
-            .captured
-            .is_some()
-            .then(|| repos::CloneGuard::new(&current));
-        let cloned = repos::clone_all(sys, &self.user, &standing.missing, guard.as_ref());
-        current()?;
+        let guard = repos::CloneGuard::new(&current);
+        let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        for (repo, path) in &standing.dependencies {
+            current()?;
+            match super::dependencies::repair(sys, &self.user, path, repo, &current) {
+                Ok(()) => cloned.cloned.push(repo.clone()),
+                Err(why) => cloned.failed.push(format!("~/{}: {why}", repo.name)),
+            }
+        }
+        // A failed row is read back by nothing: it says what the clones that went made of their
+        // hook installers, after why it failed; a done one leaves that to the read-back's row.
+        if let Err(why) = current() {
+            return Err(std::iter::once(why)
+                .chain(cloned.hooks)
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
         let home = Path::new(&self.user.home);
         let room = repos::short_of_room(sys.volume(home).as_ref(), &cloned.left, CHECK_AGAIN);
         let mut failed = cloned.failed;
@@ -354,8 +587,10 @@ impl Item for NativeRepositories {
             failed.push(why);
         }
         if failed.is_empty() {
+            *self.hooks.lock().unwrap_or_else(PoisonError::into_inner) = cloned.hooks;
             Ok(())
         } else {
+            failed.extend(cloned.hooks);
             Err(failed.join("; "))
         }
     }
@@ -398,7 +633,12 @@ impl Block {
                 ),
             },
             Some(wait) if wait.kind() == FailureKind::NeedsPerson => Probe::Person {
-                step: GITHUB_STEP.into(),
+                step: if wait == Wait::InTheWay {
+                    REPOSITORIES_STEP
+                } else {
+                    GITHUB_STEP
+                }
+                .into(),
                 how: self.why,
             },
             _ => Probe::Blocked { why: self.why },
@@ -446,34 +686,77 @@ impl From<String> for Block {
 const CHECK_AGAIN: &str = "press Check again in System State, or launch aterm again";
 
 impl NativeRepositories {
-    fn ensure_current(&self) -> Result<(), String> {
+    fn ensure_current(&self, sys: &dyn System) -> Result<(), String> {
         if let Some(captured) = &self.captured
             && !(captured.current)()?
         {
             return Err("the selected secrets vault changed or is still syncing; repository setup waits for a new ready snapshot".into());
         }
+        let inputs = self
+            .captured
+            .as_ref()
+            .map(|captured| &captured.inputs)
+            .or_else(|| self.prepared.get());
+        if let Some(inputs) = inputs.filter(|inputs| inputs.local.is_ok())
+            && !inputs.is_current(sys)?
+        {
+            return Err(
+                "repository input source changed; waiting for a new coherent version".into(),
+            );
+        }
         Ok(())
     }
 
-    /// The token, the account it signs in as (one `GET /user`) and the repositories to have in
-    /// `~`: the init.toml `[github]` owner's when one is configured, else the account's own
-    /// that are neither forks nor archived.
+    /// The token and private vault inventory, captured together. An explicitly configured
+    /// profile instead reads its own live GitHub account and repository scope.
     fn plan(&self, sys: &dyn System) -> Result<Plan, Block> {
-        self.ensure_current().map_err(Block::from)?;
+        self.ensure_current(sys).map_err(Block::from)?;
         let inputs = match &self.captured {
             Some(captured) if captured.inputs.user == self.user => captured.inputs.local.clone()?,
             Some(_) => return Err("the captured repository account changed".to_owned().into()),
             None if self.unasked
                 && sys
                     .stat(&Path::new(&self.user.home).join(super::TOKEN_FILE))
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                && configuration(sys, &self.user)
+                    .map_err(Block::of(Wait::Settings))?
+                    .is_none()
+                && aterm_secrets::client::config(&aterm_secrets::client::Paths::for_home(
+                    Path::new(&self.user.home),
+                ))
+                .map_err(|why| Block::from(why.to_string()))?
+                .is_none() =>
             {
-                // Nothing to sign in with, so nothing else (git, the home) is read.
+                // No token and no configured source yet: git and the home need not be read.
                 return Err(Block::of(Wait::Token)(String::new()));
             }
-            None => InitialRepositoryInputs::read(sys, &self.user)?,
+            None => {
+                let inputs = self.prepared.get().cloned().unwrap_or_else(|| {
+                    let inputs = InitialRepositoryInputs::ready(sys, &self.user);
+                    if inputs.local.is_ok() {
+                        let _ = self.prepared.set(inputs.clone());
+                    }
+                    inputs
+                });
+                inputs.local?
+            }
         };
-        let LocalInputs { configured, token } = inputs;
+        let LocalInputs {
+            configured,
+            token,
+            inventory,
+        } = inputs;
+        if let Some(inventory) = inventory {
+            let listed = inventory
+                .repositories()
+                .map_err(Block::of(Wait::RepositoryInventory))?;
+            self.ensure_current(sys).map_err(Block::from)?;
+            return Ok(Plan {
+                token,
+                repositories: listed.repositories,
+                notes: listed.notes,
+            });
+        }
         let account = identity(sys, &self.user, &token).map_err(Block::github)?;
         if configured
             .as_ref()
@@ -530,7 +813,7 @@ impl NativeRepositories {
                 .repositories
                 .retain(|repo| !repo.fork && !repo.archived);
         }
-        self.ensure_current().map_err(Block::from)?;
+        self.ensure_current(sys).map_err(Block::from)?;
         Ok(Plan {
             token,
             repositories: listed.repositories,
@@ -592,6 +875,7 @@ pub(super) mod tests {
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
         script::launcher(&sys, &item.user);
         source(&sys, "/Users//alice/.secrets/gh_access_token");
+        metadata(&sys, &item.user, aterm_json::json!([]));
         answer(
             &sys,
             &item.user,
@@ -675,6 +959,11 @@ pub(super) mod tests {
     }
 
     fn answer(sys: &Fake, user: &User, endpoint: &str, body: aterm_json::Value) {
+        // Default fixtures represent the same complete inventory delivered privately by the
+        // vault. Explicitly scoped profiles below still exercise GitHub's transport.
+        if endpoint == format!("{ACCESSIBLE}&page=1") {
+            metadata(sys, user, body.clone());
+        }
         sys.on_github_api(
             user,
             endpoint,
@@ -686,12 +975,357 @@ pub(super) mod tests {
         );
     }
 
+    fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
+        let path = Path::new(&user.home).join(super::super::inventory::FILE);
+        let bytes = aterm_json::to_vec(&aterm_json::json!({
+            "schema":2,"account":user.name,"repositories":repositories
+        }))
+        .unwrap();
+        sys.file(path.to_str().unwrap(), &bytes).stat_of(
+            path.to_str().unwrap(),
+            Stat {
+                len: bytes.len() as u64,
+                ..stat(false, 0o600)
+            },
+        );
+    }
+
+    fn scope(sys: &Fake, user: &User) {
+        let path = Path::new(&user.home).join(".config/aterm/init.toml");
+        let bytes = format!("[github]\naccount='{}'\n", user.name);
+        sys.file(path.to_str().unwrap(), bytes.as_bytes()).stat_of(
+            path.to_str().unwrap(),
+            Stat {
+                len: bytes.len() as u64,
+                ..stat(false, 0o600)
+            },
+        );
+    }
+
+    fn scoped_fixture() -> (Fake, NativeRepositories) {
+        let (sys, item) = fixture();
+        scope(&sys, &item.user);
+        (sys, item)
+    }
+
     fn repository(owner: &str, name: &str, id: u64) -> aterm_json::Value {
         aterm_json::json!({"id":id,"name":name,"owner":{"login":owner},"full_name":format!("{owner}/{name}"),"private":true,"clone_url":format!("https://github.com/{owner}/{name}.git"),"default_branch":"main"})
     }
 
+    fn required_repository(sys: &Fake, who: &User, name: &str, paths: &[&str]) {
+        let mut value = repository("alice", name, 1);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("required_submodules".into(), aterm_json::json!(paths));
+        metadata(sys, who, aterm_json::json!([value]));
+        super::super::dependencies::tests::declarations(
+            sys,
+            who,
+            &Path::new(&who.home).join(name),
+            paths,
+        );
+    }
+
     #[test]
-    fn default_credential_infers_identity_and_inventories_all_accessible_owners_without_gh() {
+    fn native_bootstrap_counts_and_repairs_required_gitlinks_on_new_and_existing_parents() {
+        for already_present in [false, true] {
+            let names = ["parent".to_owned()];
+            let (sys, item) = listing(&names, if already_present { &names } else { &[] });
+            required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+            let parent = Path::new(&item.user.home).join("parent");
+            super::super::dependencies::tests::download(
+                &sys,
+                &item.user,
+                &parent,
+                "vendor/library",
+                u64::from(!already_present),
+            );
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            assert_eq!(
+                super::super::inventory_counts(&sys, &ctx).unwrap(),
+                Some((0, 1))
+            );
+            let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{already_present}: {rows:?}"
+            );
+            assert_eq!(
+                Reading::of(stage(&rows)),
+                Some(Reading::Repositories {
+                    present: 1,
+                    count: 1,
+                    signed_in: true
+                })
+            );
+            assert_eq!(
+                super::super::inventory_counts(&sys, &ctx).unwrap(),
+                Some((1, 1))
+            );
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| call.contains(" clone "))
+                    .count(),
+                if already_present { 1 } else { 2 }
+            );
+            assert!(sys.stat(&parent.join("vendor/library")).is_ok());
+            assert!(sys.stat(&parent.join("optional/huge")).is_err());
+        }
+    }
+
+    #[test]
+    fn native_dependency_failure_stays_unfinished_and_the_next_pass_repairs_only_the_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let names = ["parent".to_owned()];
+        let (sys, item) = listing(&names, &names);
+        required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+        let parent = Path::new(&item.user.home).join("parent");
+        for sequence in 0..2 {
+            super::super::dependencies::tests::download(
+                &sys,
+                &item.user,
+                &parent,
+                "vendor/library",
+                sequence,
+            );
+        }
+        let once = AtomicBool::new(false);
+        sys.simulate(move |_, command| {
+            (command.display().contains(" clone ") && !once.swap(true, Ordering::SeqCst))
+                .then(|| Ran::exit(128, "synthetic transport unavailable"))
+        });
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Failed,
+            "{rows:?}"
+        );
+        assert_eq!(
+            super::super::inventory_counts(&sys, &ctx).unwrap(),
+            Some((0, 1))
+        );
+        assert!(sys.stat(&parent).is_ok());
+        assert!(sys.stat(&parent.join("vendor/library")).is_err());
+        let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Changed,
+            "{rows:?}"
+        );
+        assert_eq!(
+            super::super::inventory_counts(&sys, &ctx).unwrap(),
+            Some((1, 1))
+        );
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.contains(" clone "))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn blocked_required_dependency_keeps_its_counts_and_names_preserved_work_not_sign_in() {
+        let names = ["parent".to_owned()];
+        let (sys, item) = listing(&names, &names);
+        required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+        let vendor = Path::new(&item.user.home).join("parent/vendor");
+        let path = vendor.join("library");
+        sys.stat_of(vendor.to_str().unwrap(), stat(true, 0o700));
+        sys.file(path.to_str().unwrap(), b"preserved owner work")
+            .stat_of(path.to_str().unwrap(), stat(false, 0o600));
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        match item.probe(&sys, &ctx) {
+            Probe::Person { step, how } => {
+                assert_eq!(step, REPOSITORIES_STEP);
+                assert!(
+                    how.contains("0 of 1 repositories ready") && how.contains("preserved work"),
+                    "{how}"
+                );
+                assert!(!how.contains("sign-in"));
+                assert!(how.contains("vendor/library"), "{how}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let reading = Reading::Repositories {
+            present: 0,
+            count: 1,
+            signed_in: true,
+        };
+        assert_eq!(item.detail(&sys, &ctx), Some(reading.token()));
+        assert_eq!(reading.word().as_deref(), Some("0 of 1"));
+        assert_eq!(sys.read_file(&path).unwrap(), b"preserved owner work");
+        assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
+    }
+
+    #[test]
+    fn cached_preserved_dependency_work_is_rechecked_without_a_source_change_or_manual_init() {
+        use crate::init::{Holds, OwedClone};
+        let names = ["parent".to_owned()];
+        let (sys, item) = listing(&names, &names);
+        sys.logged_in(&item.user);
+        required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+        let vendor = Path::new(&item.user.home).join("parent/vendor");
+        let path = vendor.join("library");
+        sys.stat_of(vendor.to_str().unwrap(), stat(true, 0o700));
+        sys.file(path.to_str().unwrap(), b"owner's occupied path")
+            .stat_of(path.to_str().unwrap(), stat(false, 0o600));
+        super::super::dependencies::tests::download(
+            &sys,
+            &item.user,
+            vendor.parent().unwrap(),
+            "vendor/library",
+            0,
+        );
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let source = super::super::token_read(&sys, &ctx).unwrap().unwrap().mark;
+        let state = aterm_tempfile::tempdir().unwrap();
+        crate::init::owe_clone(state.path(), &Holds::NONE).unwrap();
+        assert!(crate::init::clone_owed(&sys, state.path()).is_err());
+        // The persisted marker is the old untyped format, and must not be treated as an
+        // eternal prohibition after the owner corrects only the local dependency path.
+        let record = state
+            .path()
+            .join(aterm_converge::FileJournal::DIR)
+            .join("clone-owed");
+        let cached = std::fs::read(&record).unwrap();
+        assert!(String::from_utf8_lossy(&cached).contains("\nmark "));
+        for _ in 0..2 {
+            assert!(matches!(
+                crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+                OwedClone::Person(_)
+            ));
+        }
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.contains(" clone ") || call.contains("agh GET"))
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            cached,
+            "re-probing is read-only"
+        );
+        sys.remove(&path).unwrap();
+        assert_eq!(
+            super::super::token_read(&sys, &ctx).unwrap().unwrap().mark,
+            source
+        );
+        assert!(matches!(
+            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Due(_)
+        ));
+        assert!(
+            sys.stat(&path).is_err(),
+            "a due read still changes no worktree"
+        );
+        crate::init::clone_owed(&sys, state.path()).unwrap();
+        assert_eq!(
+            super::super::token_read(&sys, &ctx).unwrap().unwrap().mark,
+            source
+        );
+        assert_eq!(
+            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Verified {
+                present: 1,
+                total: 1
+            }
+        );
+        assert!(!record.exists());
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.contains(" clone "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_dependency_batch_checks_stop_and_real_input_changes_after_each_download() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for change in ["none", "stop", "token", "inventory"] {
+            let names = ["parent".to_owned()];
+            let (sys, item) = listing(&names, &names);
+            required_repository(
+                &sys,
+                &item.user,
+                "parent",
+                &["vendor/first", "vendor/second"],
+            );
+            let parent = Path::new(&item.user.home).join("parent");
+            super::super::dependencies::tests::download(
+                &sys,
+                &item.user,
+                &parent,
+                "vendor/first",
+                0,
+            );
+            super::super::dependencies::tests::download(
+                &sys,
+                &item.user,
+                &parent,
+                "vendor/second",
+                1,
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let pressed = Arc::clone(&stop);
+            let who = item.user.clone();
+            sys.simulate(move |sys, command| {
+                if command.display().contains(" clone ") {
+                    match change {
+                        "stop" => pressed.store(true, Ordering::SeqCst),
+                        "token" => {
+                            sys.file(
+                                &format!("{}/{}", who.home, super::super::TOKEN_FILE),
+                                b"fixture_rotated_token",
+                            );
+                        }
+                        "inventory" => metadata(sys, &who, aterm_json::json!([])),
+                        _ => {}
+                    }
+                }
+                None
+            });
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
+            let applied = item.apply_guarded(&sys, &ctx, &|| {
+                if stop.load(Ordering::SeqCst) {
+                    Err("late Stop".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(applied.is_ok(), change == "none", "{change}: {applied:?}");
+            assert_eq!(
+                sys.stat(&parent.join("vendor/first")).is_ok(),
+                change == "none",
+                "{change}"
+            );
+            assert_eq!(
+                sys.stat(&parent.join("vendor/second")).is_ok(),
+                change == "none",
+                "{change}"
+            );
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| call.contains(" clone "))
+                    .count(),
+                if change == "none" { 2 } else { 1 },
+                "{change}"
+            );
+            assert!(sys.stat(&parent).is_ok());
+        }
+    }
+
+    #[test]
+    fn default_credential_reads_private_vault_inventory_without_github_discovery() {
         let (sys, item) = fixture();
         answer(
             &sys,
@@ -711,6 +1345,7 @@ pub(super) mod tests {
             [("alice", "personal"), ("team", "work")]
         );
         assert!(sys.calls().iter().all(|call| !call.contains("/gh ")
+            && !call.contains(" agh GET ")
             && !call.contains("auth login")
             && !call.contains(TOKEN)
             && !call.contains("alabsystems")
@@ -721,10 +1356,393 @@ pub(super) mod tests {
         );
     }
 
-    /// Two listed repositories that want the same folder in `~`: the signed-in account's own
-    /// keeps it, the other is one note, and the stage is done once the kept one is present.
     #[test]
-    fn a_repository_whose_folder_another_takes_is_one_note_and_the_stage_is_done() {
+    fn missing_or_invalid_private_inventory_never_falls_back_to_public_discovery() {
+        let (sys, item) = bare();
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        source(&sys, "/Users//alice/.secrets/gh_access_token");
+        answer(
+            &sys,
+            &item.user,
+            "/user",
+            aterm_json::json!({"login":"alice"}),
+        );
+        let blocked = item.plan(&sys).err().unwrap();
+        assert_eq!(blocked.wait, Some(Wait::RepositoryInventory));
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+
+        let path = Path::new(&item.user.home).join(super::super::inventory::FILE);
+        sys.file(path.to_str().unwrap(), b"not JSON")
+            .stat_of(path.to_str().unwrap(), stat(false, 0o600));
+        assert_eq!(
+            item.plan(&sys).err().unwrap().wait,
+            Some(Wait::RepositoryInventory)
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+    }
+
+    #[test]
+    fn a_captured_private_inventory_stays_with_its_token_snapshot() {
+        let (sys, mut item) = fixture();
+        metadata(
+            &sys,
+            &item.user,
+            aterm_json::json!([repository("alice", "first", 1)]),
+        );
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        metadata(
+            &sys,
+            &item.user,
+            aterm_json::json!([repository("alice", "later", 2)]),
+        );
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(|| Ok(true)),
+        });
+        let inputs = &item.captured.as_ref().unwrap().inputs;
+        assert_eq!(
+            inputs
+                .local
+                .as_ref()
+                .unwrap()
+                .inventory
+                .as_ref()
+                .unwrap()
+                .repositories()
+                .unwrap()
+                .repositories[0]
+                .name,
+            "first"
+        );
+        assert!(!inputs.is_current(&sys).unwrap());
+        assert!(
+            item.plan(&sys)
+                .err()
+                .unwrap()
+                .why
+                .contains("source changed")
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+    }
+
+    #[test]
+    fn captured_private_inventory_clones_in_the_accounts_background_session() {
+        let names = ["background-code".to_owned()];
+        let (sys, item) = listing(&names, &[]);
+        let mut context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        context.console = None;
+        let captured = InitialRepositoryInputs::capture(&sys, &context).unwrap();
+        let rows =
+            run_captured(&sys, &context, Mode::Apply, captured, Box::new(|| Ok(true))).unwrap();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Changed,
+            "{rows:?}"
+        );
+        assert_eq!(
+            Reading::of(stage(&rows)),
+            Some(Reading::Repositories {
+                present: 1,
+                count: 1,
+                signed_in: true
+            })
+        );
+        assert!(sys.calls().iter().any(|call| call.contains(" clone ")));
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+    }
+
+    #[test]
+    fn a_native_repository_batch_respects_late_stop_but_not_an_explicit_older_hold() {
+        use crate::init::Holds;
+        use aterm_types::macos_setup::{Selection, Setting};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for late_stop in [false, true] {
+            let repositories = names("batch", 6);
+            let (sys, item) = listing(&repositories, &[]);
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let stop = Arc::new(AtomicBool::new(false));
+            let pressed = Arc::clone(&stop);
+            sys.simulate(move |_, command| {
+                if late_stop && command.display().contains(" clone ") {
+                    pressed.store(true, Ordering::SeqCst);
+                }
+                None
+            });
+            let mut off = Selection::none();
+            off.set(Setting::Repositories, true);
+            let start = Holds { off, ..Holds::NONE };
+            let current = || {
+                let now = Holds {
+                    stopped: stop.load(Ordering::SeqCst).then(|| "late Stop".to_owned()),
+                    stopped_revision: Some(2),
+                    ..start.clone()
+                };
+                if now.later(&start, Setting::Repositories) {
+                    Err(now.why(Setting::Repositories))
+                } else {
+                    Ok(())
+                }
+            };
+            assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
+            let applied = item.apply_guarded(&sys, &ctx, &current);
+            assert_eq!(applied.is_err(), late_stop, "{applied:?}");
+            let published = repositories
+                .iter()
+                .filter(|name| sys.stat(&Path::new(&item.user.home).join(name)).is_ok())
+                .count();
+            assert_eq!(published, if late_stop { 0 } else { 6 });
+            let clones = sys
+                .calls()
+                .iter()
+                .filter(|call| call.contains(" clone "))
+                .count();
+            if late_stop {
+                assert!(
+                    (1..=LANES_SEEN).contains(&clones),
+                    "{clones} clones started after Stop"
+                );
+            } else {
+                assert_eq!(clones, 6);
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs() {
+        use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
+        for ordinary in [false, true] {
+            for changed in ["unrelated", "token", "inventory", "missing", "incomplete"] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let home = root.path().join("home");
+                let source = root.path().join("team.secrets");
+                let paths = Paths::for_home(&home);
+                let inventory = aterm_json::to_string(&aterm_json::json!({
+                    "schema":2,"account":"alice","repositories":[repository("alice", "new", 1)]
+                }))
+                .unwrap();
+                let source_text = format!(
+                    "gh_access_token={TOKEN}\ngithub-repositories.json={inventory}\nunrelated=before\n"
+                );
+                aterm_uds::atomic_file::write(&source, source_text.as_bytes(), 0o600).unwrap();
+                client::join(
+                    &paths,
+                    &JoinOptions {
+                        source: source.to_string_lossy().into_owned(),
+                        host: Some("fixture".into()),
+                        interactive: false,
+                        wait: std::time::Duration::ZERO,
+                        confirm: &|_| false,
+                        password: JoinPassword::Given(None),
+                        fetched: None,
+                        requested: &|| {},
+                        say: &|_| {},
+                    },
+                )
+                .unwrap();
+                let who = User {
+                    home: home.to_string_lossy().into_owned(),
+                    ..user("alice", 501)
+                };
+                let mut sys = Fake::root();
+                sys.euid = who.uid;
+                sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
+                sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                let token_path = home.join(super::super::TOKEN_FILE);
+                sys.file(token_path.to_str().unwrap(), TOKEN.as_bytes())
+                    .stat_of(token_path.to_str().unwrap(), stat(false, 0o600));
+                metadata(
+                    &sys,
+                    &who,
+                    aterm_json::json!([repository("alice", "new", 1)]),
+                );
+                script::launcher(&sys, &who);
+                script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
+                script::alike(&sys, &who);
+                repos::tests::script_clone_named(&sys, &who, "new", 0, false);
+                repos::tests::script_existing(&sys, &who, &home.join("new"), "new");
+                let mut ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+                ctx.console = None;
+                let configured = client::config(&paths).unwrap().unwrap();
+                let captured = client::with_materialization_ready_for_entries(
+                    &paths,
+                    &configured,
+                    &super::super::VAULT_INPUT_ENTRIES,
+                    || {
+                        InitialRepositoryInputs::capture(&sys, &ctx)
+                            .map_err(aterm_secrets::Error::new)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                let syncing = paths.clone();
+                let once = std::sync::atomic::AtomicBool::new(false);
+                sys.simulate(move |_, command| {
+                    if command.display().contains(" clone ")
+                        && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let next = match changed {
+                            "unrelated" => {
+                                source_text.replace("unrelated=before", "unrelated=after")
+                            }
+                            "token" => source_text.replace(TOKEN, "fixture-rotated-token"),
+                            "inventory" => source_text.replace(&inventory, "{}"),
+                            "missing" => source_text
+                                .lines()
+                                .filter(|line| !line.starts_with("github-repositories.json="))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            "incomplete" => {
+                                std::fs::create_dir_all(syncing.home.join(".tool/blocked"))
+                                    .unwrap();
+                                format!("{source_text}~/.tool/blocked=cannot-materialize\n")
+                            }
+                            _ => unreachable!(),
+                        };
+                        aterm_uds::atomic_file::write(&source, next.as_bytes(), 0o600).unwrap();
+                        client::sync(&syncing, None).unwrap();
+                    }
+                    None
+                });
+                let rows = if ordinary {
+                    run(&sys, &ctx, Mode::Apply).unwrap()
+                } else {
+                    run_captured(
+                        &sys,
+                        &ctx,
+                        Mode::Apply,
+                        captured.inputs,
+                        Box::new(move || {
+                            captured
+                                .snapshot
+                                .is_current(&paths)
+                                .map_err(|why| why.to_string())
+                        }),
+                    )
+                    .unwrap()
+                };
+                let published = changed == "unrelated";
+                assert_eq!(
+                    stage(&rows).outcome == crate::model::Outcome::Changed,
+                    published,
+                    "{changed}: {rows:?}"
+                );
+                assert_eq!(sys.stat(&home.join("new")).is_ok(), published, "{changed}");
+                assert_eq!(
+                    sys.calls()
+                        .iter()
+                        .filter(|call| call.contains(" clone "))
+                        .count(),
+                    1,
+                    "{changed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_settings() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for change in ["none", "inventory", "token", "profile", "unrelated"] {
+            let names = names("local", 6);
+            let (sys, item) = listing(&names, &[]);
+            let who = item.user.clone();
+            let profile = format!("{}/.config/aterm/init.toml", who.home);
+            sys.file(&profile, b"").stat_of(
+                &profile,
+                Stat {
+                    len: 0,
+                    ..stat(false, 0o600)
+                },
+            );
+            let once = AtomicBool::new(false);
+            let boundary = Mutex::new(());
+            sys.simulate(move |sys, command| {
+                if command.display().contains(" clone ") {
+                    let _mutation = boundary.lock().unwrap();
+                    if once.swap(true, Ordering::SeqCst) {
+                        return None;
+                    }
+                    match change {
+                        "inventory" => metadata(sys, &who, aterm_json::json!([])),
+                        "token" => {
+                            sys.file(
+                                &format!("{}/{}", who.home, super::super::TOKEN_FILE),
+                                b"fixture_rotated_local_token",
+                            );
+                        }
+                        "profile" | "unrelated" => {
+                            let path = format!("{}/.config/aterm/init.toml", who.home);
+                            let bytes = if change == "profile" {
+                                b"[github]\naccount='alice'\nowner='team'\n".as_slice()
+                            } else {
+                                b"[develop]\ncheckouts=[]\n".as_slice()
+                            };
+                            sys.file(&path, bytes).stat_of(
+                                &path,
+                                Stat {
+                                    len: bytes.len() as u64,
+                                    ..stat(false, 0o600)
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            });
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+            let complete = matches!(change, "none" | "unrelated");
+            assert_eq!(
+                stage(&rows).outcome == crate::model::Outcome::Changed,
+                complete,
+                "{change}: {rows:?}"
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| sys.stat(&Path::new(&item.user.home).join(name)).is_ok())
+                    .count(),
+                if complete { 6 } else { 0 },
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unready_lazy_capture_can_retry_but_a_successful_generation_cannot_rebase() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (sys, item) = fixture();
+        let path = Path::new(&item.user.home).join(super::super::TOKEN_FILE);
+        let path_for_hook = path.clone();
+        let changed = AtomicBool::new(false);
+        sys.on_owned_read(move |sys, path| {
+            if path == path_for_hook && !changed.swap(true, Ordering::SeqCst) {
+                sys.file(path.to_str().unwrap(), b"fixture_changed_while_capturing");
+            }
+        });
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        assert!(
+            matches!(item.probe(&sys, &ctx), Probe::Blocked { .. }),
+            "a mixed capture must remain unfinished"
+        );
+        assert!(
+            item.prepared.get().is_none(),
+            "an unready capture must not be cached"
+        );
+        assert!(item.plan(&sys).is_ok(), "a coherent retry may be admitted");
+        sys.file(path.to_str().unwrap(), TOKEN.as_bytes());
+        assert!(
+            item.plan(&sys).is_err(),
+            "a successful capture never silently adopts a new generation"
+        );
+    }
+
+    /// A private inventory that cannot place every intended repository in home never declares
+    /// the retained subset complete, even when one matching checkout is already present.
+    #[test]
+    fn colliding_private_inventory_leaves_every_checkout_untouched_and_unfinished() {
         use super::repos::tests::script_existing;
         let (sys, item) = fixture();
         answer(
@@ -743,14 +1761,14 @@ pub(super) mod tests {
         script::alike(&sys, &item.user);
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
         assert_eq!(
-            stage(&rows).to.as_deref(),
-            Some(
-                "1 matching worktrees present; aterm's GitHub route hands back the synced \
-                 token; left as they are: github.com/team/Shared: ~/shared is \
-                 github.com/alice/shared's; not cloned"
-            )
+            stage(&rows).outcome,
+            crate::model::Outcome::Blocked,
+            "{rows:?}"
+        );
+        assert_eq!(
+            Reading::of(stage(&rows)),
+            Some(Reading::Waits(Wait::RepositoryInventory))
         );
         assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
             && !call.contains("--replace-all")
@@ -759,7 +1777,7 @@ pub(super) mod tests {
 
     #[test]
     fn native_inventory_follows_agh_pagination_before_any_mutation() {
-        let (sys, item) = fixture();
+        let (sys, item) = scoped_fixture();
         let page = (0..30)
             .map(|index| repository("alice", &format!("repo-{index}"), index + 1))
             .collect::<Vec<_>>();
@@ -780,11 +1798,11 @@ pub(super) mod tests {
             &sys,
             &item.user,
             &format!("{ACCESSIBLE}&page=2"),
-            aterm_json::json!([repository("team", "work", 31)]),
+            aterm_json::json!([repository("alice", "work", 31)]),
         );
         let plan = item.plan(&sys).unwrap();
         assert_eq!(plan.repositories.len(), 31);
-        assert_eq!(plan.repositories.last().unwrap().owner, "team");
+        assert_eq!(plan.repositories.last().unwrap().owner, "alice");
         assert!(
             sys.calls()
                 .iter()
@@ -794,7 +1812,7 @@ pub(super) mod tests {
 
     #[test]
     fn failed_native_inventory_never_persists_credentials_or_clones() {
-        let (sys, item) = fixture();
+        let (sys, item) = scoped_fixture();
         sys.on_github_api(
             &item.user,
             &format!("{ACCESSIBLE}&page=1"),
@@ -886,6 +1904,7 @@ pub(super) mod tests {
             let (sys, item) = bare();
             sys.file(crate::items::github::CLT_GIT, b"synthetic git");
             source(&sys, "/Users//alice/.secrets/gh_access_token");
+            scope(&sys, &item.user);
             (sys, item)
         };
         let cases: Vec<(&str, (Fake, NativeRepositories), Option<Wait>)> = vec![
@@ -959,7 +1978,7 @@ pub(super) mod tests {
             (
                 "the inventory unreached",
                 {
-                    let (sys, item) = fixture();
+                    let (sys, item) = scoped_fixture();
                     sys.fail_github_api(
                         &item.user,
                         &format!("{ACCESSIBLE}&page=1"),
@@ -1028,6 +2047,7 @@ pub(super) mod tests {
         let (sys, item) = bare();
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
         source(&sys, "/Users//alice/.secrets/gh_access_token");
+        scope(&sys, &item.user);
         sys.fail_github_api(&item.user, "/user", GithubFailure::Unreached);
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         assert!(item.apply(&sys, &context).is_err(), "GitHub did not answer");
@@ -1092,6 +2112,12 @@ pub(super) mod tests {
                     crate::model::Outcome::NotApplicable,
                     "{rows:?}"
                 );
+                assert_eq!(stage(&rows).outcome, crate::model::Outcome::NotApplicable);
+                assert!(
+                    !sys.calls()
+                        .iter()
+                        .any(|call| call.contains(" clone ") || call.contains(" agh GET "))
+                );
             }
         }
     }
@@ -1111,7 +2137,7 @@ pub(super) mod tests {
                 (sys, item)
             }),
             ("GitHub out of reach", || {
-                let (sys, item) = fixture();
+                let (sys, item) = scoped_fixture();
                 sys.fail_github_api(
                     &item.user,
                     &format!("{ACCESSIBLE}&page=1"),
@@ -1373,8 +2399,8 @@ pub(super) mod tests {
         // whose repositories and token may differ, instead of for disk space.
         let (mut sys, mut item) = fixture();
         sys.volume = Some(volume(12 * GIB));
-        let inputs = InitialRepositoryInputs::capture(&sys, &context).unwrap();
         answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
+        let inputs = InitialRepositoryInputs::capture(&sys, &context).unwrap();
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         script::alike(&sys, &item.user);
         let sys = Arc::new(sys);
@@ -1438,8 +2464,19 @@ pub(super) mod tests {
             inputs,
             current: Box::new(|| Ok(true)),
         });
-        let plan = item.plan(&sys).unwrap();
-        assert_eq!(plan.token.bytes(), TOKEN.as_bytes());
+        let inputs = &item.captured.as_ref().unwrap().inputs;
+        assert_eq!(
+            inputs.local.as_ref().unwrap().token.bytes(),
+            TOKEN.as_bytes()
+        );
+        assert!(!inputs.is_current(&sys).unwrap());
+        assert!(
+            item.plan(&sys)
+                .err()
+                .unwrap()
+                .why
+                .contains("source changed")
+        );
         assert!(
             sys.calls()
                 .iter()
@@ -1458,20 +2495,16 @@ pub(super) mod tests {
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([]),
         );
-        let sys = Arc::new(sys);
-        let observed = Arc::clone(&sys);
+        let checked = std::sync::atomic::AtomicUsize::new(0);
         item.captured = Some(Captured {
             inputs,
             current: Box::new(move || {
-                Ok(!observed
-                    .calls()
-                    .iter()
-                    .any(|call| call.contains("/user/repos?")))
+                Ok(checked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0)
             }),
         });
-        let why = item.apply(&*sys, &ctx).unwrap_err();
+        let why = item.apply(&sys, &ctx).unwrap_err();
         assert!(why.contains("changed"), "{why}");
-        assert!(sys.calls().iter().any(|call| call.contains("/user/repos?")));
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
         assert!(
             sys.calls()
                 .iter()
@@ -1511,13 +2544,13 @@ pub(super) mod tests {
     fn captured_clones_never_write_the_login_keychain() {
         let (sys, mut item) = fixture();
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
-        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
         answer(
             &sys,
             &item.user,
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([repository("alice", "new", 1)]),
         );
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         item.captured = Some(Captured {
             inputs,
@@ -1558,32 +2591,7 @@ pub(super) mod tests {
             .zip(1..)
             .map(|(name, id)| repository("alice", name, id))
             .collect();
-        for (index, chunk) in values.chunks(30).enumerate() {
-            let page = index + 1;
-            let mut headers = Vec::new();
-            if page * 30 < values.len() {
-                let next = format!("https://api.github.com{ACCESSIBLE}&page={}", page + 1);
-                headers.push(("Link".to_owned(), format!("<{next}>; rel=\"next\"")));
-            }
-            sys.on_github_api(
-                &item.user,
-                &format!("{ACCESSIBLE}&page={page}"),
-                Ok(GithubResponse {
-                    status: 200,
-                    headers,
-                    body: aterm_json::to_vec(&chunk.to_vec()).unwrap(),
-                }),
-            );
-        }
-        // A last page that is full asks for the one after it, which is empty.
-        if values.len().is_multiple_of(30) {
-            answer(
-                &sys,
-                &item.user,
-                &format!("{ACCESSIBLE}&page={}", values.len() / 30 + 1),
-                aterm_json::json!([]),
-            );
-        }
+        metadata(&sys, &item.user, aterm_json::Value::Array(values));
         let mut sequence = 0;
         for name in listed {
             let path = home.join(name);
@@ -1625,12 +2633,13 @@ pub(super) mod tests {
 
     const TOP_LEVEL: &str = "rev-parse --is-inside-work-tree --show-prefix --show-toplevel";
 
-    /// One whole pass over 50 repositories already in `~` and 10 to clone: GitHub's account and
-    /// listing are read once, each present worktree is read once (one rev-parse, one origin), and
+    /// One whole pass over 50 repositories already in `~` and 10 to clone: private metadata is
+    /// read once, each present worktree is read once (one rev-parse, one origin), and
     /// the read-back reads only the 10 clones. Each missing repository has one remote inventory
     /// and one clone; local route admission is repeated before network operations.
     #[test]
-    fn a_whole_pass_reads_github_and_each_worktree_once_and_reads_back_only_its_clones() {
+    fn a_whole_pass_reads_private_inventory_and_each_worktree_once_and_reads_back_only_its_clones()
+    {
         let (present, missing) = (names("repo", 50), names("new", 10));
         let listed: Vec<String> = present.iter().chain(&missing).cloned().collect();
         let (sys, item) = listing(&listed, &present);
@@ -1647,14 +2656,14 @@ pub(super) mod tests {
         );
         let calls = sys.calls();
         let count = |what: &str| calls.iter().filter(|call| call.ends_with(what)).count();
-        assert_eq!(count(" agh GET /user"), 1, "{calls:?}");
+        assert_eq!(count(" agh GET /user"), 0, "{calls:?}");
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.contains(" agh GET /user/repos"))
                 .count(),
-            3,
-            "two pages and the empty one after the full last page"
+            0,
+            "repository inventory is internal vault metadata"
         );
         let home = Path::new(&item.user.home);
         for name in &present {
@@ -1682,6 +2691,129 @@ pub(super) mod tests {
             missing.len(),
             "{calls:#?}"
         );
+    }
+
+    /// The native stage's guards meet the installers: a guard that stops the rest once its clone
+    /// ran its installer fails the row with that outcome after why, and a switch turned off
+    /// before the read-back answers not applicable with it. NEGATIVE CONTROL: the switch read
+    /// before the outcomes are taken drops the line from that answer.
+    #[test]
+    fn a_guard_or_switch_after_the_clone_still_says_what_its_installer_did() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const INSTALLED: &str = "Trust git hooks: installed (core.hooksPath = scripts/hooks)";
+        let says = format!("$HOME/trust: ran its {}: {INSTALLED}", repos::HOOK_INSTALLER);
+        for stop in [true, false] {
+            let (sys, item) = listing(&["trust".to_owned()], &[]);
+            let home = Path::new(&item.user.home);
+            let (staged, clone) = repos::tests::clone_key(&sys, &item.user, "trust", 0);
+            sys.on_stat(&clone, &staged.join("scripts"), stat(true, 0o755));
+            sys.on_write(
+                &clone,
+                &staged.join(repos::HOOK_INSTALLER),
+                b"#!/usr/bin/env bash\n",
+            );
+            let installer =
+                repos::installer_command(&sys, &item.user, &home.join("trust")).display();
+            sys.on(&installer, Ran::ok(&format!("{INSTALLED}\n")));
+            let ran = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&ran);
+            sys.simulate(move |_, command| {
+                if command.display() == installer {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                None
+            });
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+            let authorized = || {
+                if stop && ran.load(Ordering::SeqCst) {
+                    Err("late Stop".to_owned())
+                } else {
+                    Ok(())
+                }
+            };
+            let applied = item.apply_guarded(&sys, &context, &authorized);
+            assert!(ran.load(Ordering::SeqCst), "the installer ran");
+            if stop {
+                let why = applied.unwrap_err();
+                assert_eq!(why, format!("late Stop; {says}"));
+                continue;
+            }
+            applied.unwrap();
+            sys.write_user_file(
+                &item.user,
+                &home.join(".config/aterm/init.toml"),
+                b"[github]\nenabled = false\n",
+                0o600,
+            )
+            .unwrap();
+            match item.probe(&sys, &context) {
+                Probe::NotApplicable { why } => assert_eq!(
+                    why,
+                    format!("repository setup is disabled in init.toml's [github] table; {says}")
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// The stage's row says what a clone it made did with the hook installer it carries: the
+    /// read-back's line ends with the installer's own first line, and a failing installer leaves
+    /// the stage changed, its clone in place. CONTROL: a clone with no installer adds nothing.
+    #[test]
+    fn the_stage_row_says_what_a_new_clones_hook_installer_did() {
+        const INSTALLED: &str = "Trust git hooks: installed (core.hooksPath = scripts/hooks)";
+        let present = "1 matching worktrees present; aterm's GitHub route hands back the synced \
+                       token";
+        for (carries, reply, says) in [
+            (
+                true,
+                Ran::ok(&format!("{INSTALLED}\n")),
+                format!(
+                    "{present}; $HOME/trust: ran its {}: {INSTALLED}",
+                    repos::HOOK_INSTALLER
+                ),
+            ),
+            (
+                true,
+                Ran::exit(1, "ERROR: refused\n"),
+                format!(
+                    "{present}; $HOME/trust: its {} failed (exit 1: ERROR: refused); the clone \
+                     stands",
+                    repos::HOOK_INSTALLER
+                ),
+            ),
+            (false, Ran::ok(INSTALLED), present.to_owned()),
+        ] {
+            let (sys, item) = listing(&["trust".to_owned()], &[]);
+            let home = Path::new(&item.user.home);
+            if carries {
+                let (staged, clone) = repos::tests::clone_key(&sys, &item.user, "trust", 0);
+                let scripts = staged.join("scripts");
+                sys.on_stat(&clone, &scripts, stat(true, 0o755));
+                sys.on_write(
+                    &clone,
+                    &staged.join(repos::HOOK_INSTALLER),
+                    b"#!/usr/bin/env bash\n",
+                );
+            }
+            let installer = repos::installer_command(&sys, &item.user, &home.join("trust"));
+            sys.on(&installer.display(), reply);
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, Mode::Apply).unwrap();
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{rows:?}"
+            );
+            assert_eq!(stage(&rows).to.as_deref(), Some(says.as_str()), "{rows:?}");
+            assert_eq!(
+                sys.calls().contains(&installer.display()),
+                carries,
+                "{:?}",
+                sys.calls()
+            );
+        }
     }
 
     /// Up to four clones run at once: each of the first four waits, inside its clone, for the
@@ -1762,11 +2894,10 @@ pub(super) mod tests {
         );
     }
 
-    /// A worktree of another origin where a repository goes, and a repository named like a
-    /// standard home folder, are each a note: the others clone, git never runs in the home
-    /// folder, and the stage is done.
+    /// Existing destinations stay untouched while the others clone. They remain part of the
+    /// expected count and keep the stage unfinished; preserving a folder never completes it.
     #[test]
-    fn a_folder_in_the_way_or_a_home_folder_is_a_note_and_the_others_clone() {
+    fn blocked_destinations_remain_unfinished_while_the_other_repositories_clone() {
         let listed: Vec<String> = ["Documents", "infra", "new"].map(str::to_owned).to_vec();
         let (sys, item) = listing_with(&listed, &[], &["infra"]);
         let home = Path::new(&item.user.home);
@@ -1774,14 +2905,17 @@ pub(super) mod tests {
         let rows = run(&sys, &context, Mode::Apply).unwrap();
         assert_eq!(
             stage(&rows).outcome,
-            crate::model::Outcome::Changed,
+            crate::model::Outcome::Failed,
             "{rows:?}"
         );
         assert_eq!(
-            stage(&rows).to.as_deref(),
+            stage(&rows)
+                .explain
+                .as_ref()
+                .map(|explain| explain.why.as_str()),
             Some(
-                "1 matching worktrees present; aterm's GitHub route hands back the synced \
-                 token; left as they are: ~/Documents is a standard home folder; left untouched; \
+                "1 of 3 repositories ready; preserved work or dependency metadata blocks completion: \
+                 ~/Documents is a standard home folder; left untouched; \
                  ~/infra has a different or credential-bearing GitHub origin; left untouched"
             )
         );
@@ -1800,6 +2934,27 @@ pub(super) mod tests {
                 .all(|call| !call.contains("rename-noreplace") || call.ends_with("/new")),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn an_entirely_blocked_inventory_never_claims_zero_repositories_are_complete() {
+        let listed = names("occupied", 53);
+        let theirs: Vec<&str> = listed.iter().map(String::as_str).collect();
+        let (sys, item) = listing_with(&listed, &[], &theirs);
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        assert!(matches!(item.probe(&sys, &context), Probe::Person { .. }));
+        assert_eq!(
+            item.detail(&sys, &context),
+            Some(
+                Reading::Repositories {
+                    present: 0,
+                    count: 53,
+                    signed_in: true
+                }
+                .token()
+            )
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
     }
 
     /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody

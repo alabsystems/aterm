@@ -283,6 +283,12 @@ impl From<std::io::Error> for ProtoError {
 struct Put(Vec<u8>);
 
 impl Put {
+    fn new(cap: usize) -> Self {
+        let mut buf = Vec::with_capacity(HEADER + cap);
+        buf.extend_from_slice(&[0; HEADER]);
+        Self(buf)
+    }
+
     fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
@@ -380,18 +386,23 @@ impl Take<'_> {
         }
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, ProtoError> {
+    fn slice(&mut self) -> Result<&[u8], ProtoError> {
         let len = self.u32()? as usize;
-        if len > self.0.len() {
-            return Err(ProtoError::Malformed("a byte string runs past the payload"));
-        }
-        let (b, rest) = self.0.split_at(len);
+        let (b, rest) = self
+            .0
+            .split_at_checked(len)
+            .ok_or(ProtoError::Malformed("a byte string runs past the payload"))?;
         self.0 = rest;
-        Ok(b.to_vec())
+        Ok(b)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, ProtoError> {
+        Ok(self.slice()?.to_vec())
     }
 
     fn text(&mut self) -> Result<String, ProtoError> {
-        String::from_utf8(self.bytes()?)
+        std::str::from_utf8(self.slice()?)
+            .map(str::to_owned)
             .map_err(|_| ProtoError::Malformed("text that is not UTF-8"))
     }
 
@@ -503,15 +514,15 @@ fn take_hello(t: &mut Take<'_>) -> Result<Hello, ProtoError> {
     })
 }
 
-/// `payload` under `kind`, header first, refused past [`MAX_MESSAGE`].
-fn frame(kind: u8, payload: Vec<u8>) -> Result<Vec<u8>, ProtoError> {
-    if payload.len() > MAX_MESSAGE {
-        return Err(ProtoError::TooLarge(payload.len() as u64));
+/// `out` (`HEADER` placeholder bytes followed by the payload) under `kind`, header first,
+/// refused past [`MAX_MESSAGE`].
+fn frame(kind: u8, mut out: Vec<u8>) -> Result<Vec<u8>, ProtoError> {
+    let payload_len = out.len() - HEADER;
+    if payload_len > MAX_MESSAGE {
+        return Err(ProtoError::TooLarge(payload_len as u64));
     }
-    let mut out = Vec::with_capacity(HEADER + payload.len());
-    out.push(kind);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&payload);
+    out[0] = kind;
+    out[1..HEADER].copy_from_slice(&(payload_len as u32).to_le_bytes());
     Ok(out)
 }
 
@@ -521,7 +532,7 @@ impl Request {
     /// # Errors
     /// Its payload is over [`MAX_MESSAGE`].
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        let mut p = Put(Vec::new());
+        let mut p = Put::new(64);
         let kind = match self {
             Self::Attach(a) => {
                 p.u32(a.proto);
@@ -617,7 +628,7 @@ impl Reply {
     /// # Errors
     /// Its payload is over [`MAX_MESSAGE`].
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        let mut p = Put(Vec::new());
+        let mut p = Put::new(64);
         let kind = match self {
             Self::Attached {
                 phase,

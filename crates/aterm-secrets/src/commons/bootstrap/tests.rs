@@ -116,6 +116,7 @@ fn existing_binding_observation_never_takes_or_repairs_device_custody() {
     let (_home, paths) = fixture();
     let device = Device::open(&paths).unwrap().unwrap();
     let expected = device.request([1; 16], [2; 32]).unwrap().binding().clone();
+    let identity = client::read_identity(&paths).unwrap().unwrap();
     let _held = aterm_uds::private_file::PrivateLock::take(
         &paths.dir,
         "commons-device.lock",
@@ -124,28 +125,28 @@ fn existing_binding_observation_never_takes_or_repairs_device_custody() {
     )
     .unwrap();
     assert_eq!(
-        Device::existing_binding_for_observation(&paths).unwrap(),
-        expected
+        Device::existing_binding_for_observation(&paths, &identity).unwrap(),
+        Some(expected.clone())
     );
     let claim = paths.dir.join("commons/device.claim");
     std::fs::remove_file(&claim).unwrap();
     assert_eq!(
-        Device::existing_binding_for_observation(&paths).unwrap(),
-        expected,
+        Device::existing_binding_for_observation(&paths, &identity).unwrap(),
+        Some(expected.clone()),
         "authenticated device bytes still identify a denial without repairing custody"
     );
     assert!(!claim.exists(), "a query must not recreate a claim");
     let matching = device.claim();
     assert_eq!(
-        Device::existing_binding_before_claim(&paths, || {
+        Device::observe_binding(&paths, &identity, || {
             fsx::write_new(&claim, &matching, 0o600).unwrap();
         })
         .unwrap(),
-        expected,
+        Some(expected),
         "matching claim publication does not change the observed binding"
     );
     fsx::write_atomic(&claim, b"invalid claim", 0o600).unwrap();
-    assert!(Device::existing_binding_for_observation(&paths).is_err());
+    assert!(Device::existing_binding_for_observation(&paths, &identity).is_err());
 }
 
 fn switch_source(paths: &Paths, target: &Path) {

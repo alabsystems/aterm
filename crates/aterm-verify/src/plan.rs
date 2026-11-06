@@ -236,11 +236,11 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
         || (needs_app && ctx.measure_artifact.is_none())
 }
 
-/// Planned stages for `ctx.checks` ([`crate::checks::stages_of`]) in declared order, each with
-/// the memory it claims by the run's book ([`StageSpec::mem`]): none for a named skip
-/// ([`named_skip`]), which starts nothing.
-#[must_use]
-pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
+/// The stages `ctx` runs, unordered: its checks' ([`crate::checks::stages_of`]), only the
+/// compiles under `--compile-only`, only the burst under `--cursor-pacing`, no test compile over
+/// an empty selection, and no measuring rows' compile where the test compile builds them or no
+/// matrix will run ([`folds_measuring`], [`named_skip`]).
+fn wanted(ctx: &Ctx) -> Vec<StageId> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
     if ctx.compile_only {
         wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::CheckersCompile));
@@ -251,6 +251,39 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     if ctx.scope.selects_nothing() {
         wanted.retain(|id| *id != StageId::TestCompile);
     }
+    if folds(ctx, &wanted) || named_skip(ctx, StageId::MeasuringTests) {
+        wanted.retain(|id| *id != StageId::MeasurePrebuild);
+    }
+    wanted
+}
+
+/// Whether the test compile also builds the measuring matrices' benches
+/// ([`crate::stages::measuring_bench_args`]): it is the workspace's and the release's own
+/// (`release`, `--as-release`: [`Ctx::checkers_in_tests`]). `ship release` runs that compile
+/// first (`verify test --all --compile-only --as-release`), so the release's `verify` finds the
+/// benches built, and a red row of it reruns as `--as-release`, which builds them again. Their
+/// units are the test compile's: `test --bench` and `bench --profile test` build a bench under the
+/// same profile in the same compile mode, the workspace's features unify alike for both, and the
+/// `aterm-spec/checkers` feature the release's compile carries reaches none of them. So no
+/// prebuild row is planned, and the measuring stage, alone on the quiet machine, finds its benches
+/// built or does not run ([`crate::stages`]' `measuring_tests`). Any other plan that measures
+/// leaves them to the prebuild row ([`StageId::MeasurePrebuild`]): a dev run's red test compile
+/// reruns as `verify test`, which builds no bench.
+#[must_use]
+pub fn folds_measuring(ctx: &Ctx) -> bool {
+    folds(ctx, &wanted(ctx))
+}
+
+fn folds(ctx: &Ctx, wanted: &[StageId]) -> bool {
+    ctx.checkers_in_tests && ctx.scope.is_workspace() && wanted.contains(&StageId::TestCompile)
+}
+
+/// Planned stages for `ctx.checks` ([`wanted`]) in declared order, each with the memory it claims
+/// by the run's book ([`StageSpec::mem`]): none for a named skip ([`named_skip`]), which starts
+/// nothing.
+#[must_use]
+pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
+    let wanted = wanted(ctx);
     let v: Vec<StageSpec> = declared(&ctx.scope)
         .into_iter()
         .filter(|s| wanted.contains(&s.id))
@@ -455,7 +488,8 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::MeasurePrebuild,
-            "measuring rows' compile (paint, spin, aos and rewind, --no-run)",
+            "measuring rows' compile (paint, spin, aos and rewind, --no-run, where the release's \
+             test compile does not build them)",
             Lane::MainTarget,
         ),
         // Report live UI defects before the longer performance matrices. The
@@ -1014,14 +1048,24 @@ mod tests {
         let mut selections: Vec<Vec<Check>> = every_check().into_iter().map(|c| vec![c]).collect();
         selections.extend([DEV.to_vec(), RELEASE.to_vec(), every_check()]);
         for checks in selections {
-            let p = plan(&ctx(&checks, Scope::workspace()));
-            crate::sched::check_waits(&p)
-                .unwrap_or_else(|e| panic!("{checks:?} could deadlock: {e}"));
-            let mut want = crate::checks::stages_of(&checks);
-            want.sort_by_key(|id| *id as u8);
-            let mut got: Vec<StageId> = p.iter().map(|s| s.id).collect();
-            got.sort_by_key(|id| *id as u8);
-            assert_eq!(got, want, "{checks:?}");
+            for app in [false, true] {
+                let c = if app {
+                    with_app(&checks, Scope::workspace())
+                } else {
+                    ctx(&checks, Scope::workspace())
+                };
+                let p = plan(&c);
+                crate::sched::check_waits(&p)
+                    .unwrap_or_else(|e| panic!("{checks:?} could deadlock: {e}"));
+                let mut want = crate::checks::stages_of(&checks);
+                // The measuring rows' compile is planned only where their matrices run and the
+                // release's test compile does not build them ([`folds_measuring`]).
+                want.retain(|id| *id != StageId::MeasurePrebuild || app);
+                want.sort_by_key(|id| *id as u8);
+                let mut got: Vec<StageId> = p.iter().map(|s| s.id).collect();
+                got.sort_by_key(|id| *id as u8);
+                assert_eq!(got, want, "{checks:?}, app {app}");
+            }
         }
     }
 
@@ -1061,30 +1105,92 @@ mod tests {
         assert!(ready(&p, &started, &done, 1, doc, u64::MAX));
     }
 
+    fn with_app(checks: &[Check], scope: Scope) -> Ctx {
+        ctx(checks, scope)
+            .with_measure_artifact(Some(crate::MeasureArtifact::unnamed("/release/aterm.app")))
+    }
+
     #[test]
     fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target() {
-        let p = plan(&ctx(&RELEASE, Scope::workspace()));
+        let p = plan(&with_app(&RELEASE, Scope::workspace()).with_release(true));
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
-        let prebuild = at(StageId::MeasurePrebuild);
         let barrier = p.iter().position(|s| s.exclusive).expect("a barrier");
         assert_eq!(p[barrier].id, StageId::RedrawConformance);
-        assert!(prebuild < barrier && !p[prebuild].exclusive);
-        assert_eq!(p[prebuild].lane, Lane::MainTarget);
         assert_eq!(p[barrier].lane, Lane::MainTarget);
+        assert!(
+            !p.iter().any(|s| s.id == StageId::MeasurePrebuild),
+            "the release's test compile builds the measuring benches"
+        );
+        assert!(at(StageId::TestCompile) < barrier && !p[at(StageId::TestCompile)].exclusive);
         for id in [StageId::RedrawConformance, StageId::ObjcDrives] {
             assert!(barrier <= at(id), "{id:?} runs at or behind the barrier");
             assert!(at(id) < at(StageId::MeasuringTests));
             assert!(p[at(id)].exclusive);
             assert_eq!(p[at(id)].lane, Lane::MainTarget, "{id:?}");
         }
+        let alone = plan(&with_app(&[Check::Measure], Scope::workspace()));
+        let alone_ids: Vec<StageId> = alone.iter().map(|s| s.id).collect();
         assert_eq!(
-            ids(&ctx(&[Check::Measure], Scope::workspace())),
+            alone_ids,
             [
                 StageId::MeasurePrebuild,
                 StageId::MeasuringTests,
                 StageId::GuiSmoke
             ]
         );
+        let barrier = alone.iter().position(|s| s.exclusive).expect("a barrier");
+        assert_eq!(alone[barrier].id, StageId::MeasuringTests);
+        assert!(!alone[0].exclusive && alone[0].lane == Lane::MainTarget);
+        assert_eq!(
+            ids(&ctx(&[Check::Measure], Scope::workspace())),
+            [StageId::MeasuringTests, StageId::GuiSmoke],
+            "with no bundle no matrix runs, so nothing compiles them"
+        );
+    }
+
+    #[test]
+    fn only_the_releases_test_compile_builds_the_measuring_benches() {
+        let prebuilds = |c: &Ctx| ids(c).contains(&StageId::MeasurePrebuild);
+        let folding = [
+            // A prebuild would be planned here without the fold.
+            with_app(&RELEASE, Scope::workspace()).with_release(true),
+            // `verify release` with no bundle builds what the release's does.
+            ctx(&RELEASE, Scope::workspace()).with_release(true),
+            // The compile `ship release` runs first, so its `verify` finds them built, and the
+            // command a release's red test row prints.
+            ctx(&[Check::Test], Scope::workspace())
+                .with_checkers_in_tests(true)
+                .with_compile_only(true),
+            ctx(&[Check::Test], Scope::workspace()).with_checkers_in_tests(true),
+        ];
+        for c in &folding {
+            assert!(folds_measuring(c), "{:?}", c.checks);
+            assert!(!prebuilds(c), "{:?}", c.checks);
+        }
+        let narrowed = Scope::packages(&["aterm-verify".to_string()]);
+        let elsewhere = [
+            // A dev run that tests and measures: its red compile reruns as `verify test`.
+            (
+                with_app(&[Check::Test, Check::Measure], Scope::workspace()),
+                true,
+            ),
+            (with_app(&[Check::Test, Check::Measure], narrowed), true),
+            (with_app(&[Check::Measure], Scope::workspace()), true),
+            // No bundle, so no matrix runs: nothing compiles them.
+            (
+                ctx(&[Check::Test, Check::Measure], Scope::workspace()),
+                false,
+            ),
+            (ctx(&[Check::Test], Scope::workspace()), false),
+            (
+                with_app(&[Check::Measure], Scope::workspace()).with_cursor_pacing(true),
+                false,
+            ),
+        ];
+        for (c, prebuild) in &elsewhere {
+            assert!(!folds_measuring(c), "{:?}", c.checks);
+            assert_eq!(prebuilds(c), *prebuild, "{:?}", c.checks);
+        }
     }
 
     #[test]

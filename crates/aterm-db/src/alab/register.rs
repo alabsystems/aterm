@@ -206,18 +206,18 @@ fn text<'a>(row: &'a Value, column: &str) -> Option<&'a str> {
 
 /// One name, with or without the `.local` a stored `hostname` reading carries.
 fn same_host(a: &str, b: &str) -> bool {
-    let bare = |name: &'_ str| {
+    fn bare(name: &str) -> &str {
         let name = name.trim();
         match name.len().checked_sub(".local".len()) {
             Some(cut)
                 if name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(".local") =>
             {
-                name[..cut].to_owned()
+                &name[..cut]
             }
-            _ => name.to_owned(),
+            _ => name,
         }
-    };
-    bare(a).eq_ignore_ascii_case(&bare(b))
+    }
+    bare(a).eq_ignore_ascii_case(bare(b))
 }
 
 /// This Mac's host names as a facts cell: spelled once each, in a stable order so a changed
@@ -427,12 +427,12 @@ fn goes_by(row: &Row, label: &str) -> bool {
 }
 
 /// The machines live enrollments other than this one are bound to.
-fn bound_elsewhere(input: &Input<'_>, facts: &OwnedRead) -> BTreeSet<String> {
+fn bound_elsewhere<'a>(input: &Input<'_>, facts: &'a OwnedRead) -> BTreeSet<&'a str> {
     facts
         .rows
         .iter()
         .filter(|(uuid, _)| **uuid != input.me.uuid && input.live.contains(uuid.as_str()))
-        .filter_map(|(_, row)| text(&row.value, "mac").map(str::to_owned))
+        .filter_map(|(_, row)| text(&row.value, "mac"))
         .collect()
 }
 
@@ -452,7 +452,7 @@ fn reinstall(
     input: &Input<'_>,
     machines: &Projection,
     facts: &OwnedRead,
-    bound: &BTreeSet<String>,
+    bound: &BTreeSet<&str>,
     found: &mut Vec<Finding>,
 ) -> std::result::Result<Option<(String, String)>, ()> {
     let me = input.me;
@@ -564,18 +564,15 @@ fn pick(
         Ok(None) => {}
     }
     let live_rows = || machines.rows.iter().filter(|(_, row)| row.live());
-    let node_of = |row: &Row| {
-        row.get("fleet_node")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
+    fn node_of(row: &Row) -> Option<&str> {
+        row.get("fleet_node").and_then(Value::as_str)
+    }
     // A row stating another fleet node is another Mac, whatever else it shares with this one.
-    let no_other_node =
-        |row: &Row| node_of(row).is_none_or(|n| probe.node.as_deref() == Some(n.as_str()));
+    let no_other_node = |row: &Row| node_of(row).is_none_or(|n| probe.node.as_deref() == Some(n));
     // Two rows naming this node adopt neither, and a birth beside them would make it three.
     if let Some(node) = probe.node.as_deref() {
         let named: Vec<&String> = live_rows()
-            .filter(|(_, row)| node_of(row).as_deref() == Some(node))
+            .filter(|(_, row)| node_of(row) == Some(node))
             .map(|(pk, _)| pk)
             .collect();
         if named.len() > 1 {
@@ -587,7 +584,7 @@ fn pick(
             return Pick::Held;
         }
         for pk in named {
-            if bound.contains(pk) {
+            if bound.contains(pk.as_str()) {
                 // Another live enrollment holds this node's row: a disk clone keeps its fleet
                 // files. This Mac goes on, and `check` shows the owner.
                 found.push(finding(
@@ -606,7 +603,7 @@ fn pick(
     }
     let by_host: Vec<&String> = live_rows()
         .filter(|(pk, row)| {
-            !bound.contains(*pk)
+            !bound.contains(pk.as_str())
                 && no_other_node(row)
                 && row
                     .get("hosts")
@@ -634,7 +631,7 @@ fn pick(
     if let Some(label) = me.label.as_deref() {
         let planned: Vec<&String> = live_rows()
             .filter(|(pk, row)| {
-                !bound.contains(*pk)
+                !bound.contains(pk.as_str())
                     && no_other_node(row)
                     && row.get("status").and_then(Value::as_str) == Some("planned")
                     && goes_by(row, label)

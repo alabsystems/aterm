@@ -1263,7 +1263,7 @@ mod tests {
             .is_some_and(|worker| worker.is_finished())
         {
             assert!(Instant::now() < deadline, "worker did not exit after panic");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         timeline.lock().unwrap().note_foreground_group(20);
         resolver.request(1, &timeline, 20, 0, None);

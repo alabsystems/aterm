@@ -191,8 +191,10 @@ impl<'a> ReceiptWriter<'a> {
         else {
             return Err("rollback-recipe");
         };
-        let state = super::super::upgrade_drive::load(opts, &format!("renewal-{}", prepare.id))
-            .ok_or("rollback-completion-missing")?;
+        let state =
+            super::super::upgrade_drive::load_record(opts, &format!("renewal-{}", prepare.id))
+                .map_err(|_| "rollback-completion-unreadable")?
+                .ok_or("rollback-completion-missing")?;
         let terminal = state.native_coordination
             && state.native_rollback
             && state.native_completed_prepare.as_deref() == Some(&prepare)

@@ -86,7 +86,7 @@ fn poll_to_finish(host: &mut Host, call: &thread::JoinHandle<io::Result<transpor
     while !call.is_finished() {
         assert!(Instant::now() < until, "Google fixture hang detector");
         host.poll().unwrap();
-        thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
 }
 

@@ -455,6 +455,7 @@ aterm-digest = { workspace = true }
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
+aterm-link = { path = "../aterm-link" }
 # `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
 # dependencies of its own).
 aterm-bench = { path = "../aterm-bench" }
@@ -496,6 +497,12 @@ aterm-keeper = { workspace = true }
 # Run the Linux notification queue's Unix wire/client seam against a private
 # Rust socket-pair endpoint; this adds no D-Bus edge to shipped macOS builds.
 aterm-dbus = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The node service's bus.log tests (`node_serve_tests/bus_log.rs`, one-mesh C2) post, read and
+# stream as a local client and a peer would, with astream's own client; aterm-mesh links it
+# already, so this adds no package to the graph.
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "stream"] }
 
 [target.'cfg(windows)'.dependencies]
 # aterm's Win32 declarations (WB.2 of docs/AUDIT-third-party-2026-10-15.md; no

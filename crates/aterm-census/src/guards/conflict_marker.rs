@@ -101,6 +101,12 @@ fn conflict_marker(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let Some(body) = text(tree, rel) else {
             continue;
         };
+        if !["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+            .iter()
+            .any(|m| body.contains(m))
+        {
+            continue;
+        }
         let markdown = rel.ends_with(".md");
         let is_changelog = rel == "CHANGELOG.md" || rel.ends_with("/CHANGELOG.md");
 

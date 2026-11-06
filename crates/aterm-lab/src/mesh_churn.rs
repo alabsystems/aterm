@@ -46,7 +46,7 @@
 //! the path that let it in.
 //!
 //! **The script** ([`run`]), §10's membership steps (tables, presence and the relay join with
-//! A6, B8 and B9), in §10's order but for the rebuild:
+//! A6, B8 and B9), in §10's order but for the rebuild and the newcomer:
 //!
 //! 1. m00 founds the lab; every other Mac is let in.
 //! 2. Two Macs are stopped (`SIGSTOP`, server and subscriber) for `--minutes`, and two others
@@ -54,17 +54,21 @@
 //! 3. Two members remove two others at once (`aterm members remove`, the CLI).
 //! 4. The two killed Macs start again and read up.
 //! 5. The sleepers wake once their minutes are up, and read up.
-//! 6. One Mac is rebuilt with its node key kept and let back in. §10 rebuilds after the split's
-//!    kill, but the way back rotates `[everyone]`, and that epoch would coalesce with the killed
-//!    remover's partial one after the heal and cover its gap: the heal would hold without the
-//!    gap rule ever running ([`rebuild`]).
+//! 6. One Mac is rebuilt with its node key kept and let back in. §10 rebuilds once the heal
+//!    converged; here it is before the split, for the same reason: the way back rotates
+//!    `[everyone]`, and that epoch would coalesce with the killed remover's partial one and cover
+//!    its gap, so the heal would hold without the gap rule ever running ([`rebuild`]).
 //! 7. The Macs split into two islands (the `ATERM_DEBUG_PARTITION` cut). On island A a member
 //!    removes another, and is killed in the middle of its batch: it signed the whole batch, and
-//!    only a causal prefix of it (the `Remove`, the new `[everyone]` epoch and half of its `Wrap`s)
-//!    reached half of A's servers. The Mac it removed writes an `[everyone]` entry after its
-//!    cutoff. On island B a member writes an entry and lets a new Mac in. Nothing either island
-//!    signs reaches the other until the heal ([`SPLIT_HELD`]).
-//! 8. The islands heal with the remover down: the gap its kill left is the heal's to close.
+//!    only a causal prefix of it (through the new `[everyone]` epoch and half of its `Wrap`s,
+//!    short of the vault's admin's, [`partial`]) reached half of A's servers. The Mac it removed
+//!    writes an `[everyone]` entry after its cutoff. On island B a member writes an entry and
+//!    lets a new Mac in, where §10 adds it after the heal: a seat the remover's batch never knew
+//!    is one more gap the heal must close.
+//!    Nothing either island signs reaches the other until the heal ([`SPLIT_HELD`]).
+//! 8. The islands heal with the remover down: the gap its kill left is the heal's to close, by
+//!    `Wrap`s of the partial epoch ([`GAP_HEALED`]) once the settle grace held it
+//!    ([`PREFIX_HELD`]).
 //! 9. The remover returns.
 //!
 //! **Waits and timings.** A wait fails only once nothing it watches moved for one minute (the
@@ -152,18 +156,19 @@ const DEFAULT_N: usize = 30;
 /// §10's sleep.
 const DEFAULT_MINUTES: u64 = 5;
 
-// The product's own timers a wait gives the product before its hang detector runs. They mirror
-// `crates/aterm-secrets/src/client/log_entries.rs` (`GAP_STEP_MS` :5479, `REMOVER_GRACE_MS`
-// :5485, `SETTLE_GRACE_MS` :5494, `pub(super)` there) and the subscriber's longest error nap
-// (`client.rs` `LONGEST_ERROR_RETRY`) with the vault server's long-poll hold (`server.rs`
-// `DEFAULT_HOLD`).
+// The product's own timers a wait gives the product before its hang detector runs: its heal
+// periods, read from the product, and one subscriber round, which mirrors the subscriber's
+// longest error nap (`client.rs` `LONGEST_ERROR_RETRY`) with the vault server's long-poll hold
+// (`server.rs` `DEFAULT_HOLD`).
 
-/// One heal rank's step.
-const GAP_STEP: Duration = Duration::from_secs(60);
-/// How long a Mac that removed nobody waits before it coalesces a remover's rotation.
-const REMOVER_GRACE: Duration = Duration::from_secs(600);
-/// How long a Mac waits for a minter's batch to settle before it heals over it.
-const SETTLE_GRACE: Duration = Duration::from_secs(600);
+/// One heal rank's step ([`client::GAP_STEP_MS`]).
+const GAP_STEP: Duration = Duration::from_millis(client::GAP_STEP_MS);
+/// How long a Mac that removed nobody waits before it coalesces a remover's rotation
+/// ([`client::REMOVER_GRACE_MS`]).
+const REMOVER_GRACE: Duration = Duration::from_millis(client::REMOVER_GRACE_MS);
+/// How long a Mac waits for a minter's batch to settle before it heals over it
+/// ([`client::SETTLE_GRACE_MS`]).
+const SETTLE_GRACE: Duration = Duration::from_millis(client::SETTLE_GRACE_MS);
 /// One subscriber round at its slowest: its longest error nap after a long-poll's hold.
 const ROUND: Duration = Duration::from_secs(60 + 25);
 /// The longest one exchange with a vault server may take (`transport.rs` `EXCHANGE`,
@@ -205,6 +210,11 @@ pub struct Control {
 /// The controls of §10 whose scenario this lab runs. `no-inventory-on-gap` and
 /// `reused-incarnation` need the relay's cut-below-cursor and incarnation scenarios, which join
 /// with B8 ([`refused_control`]).
+///
+/// `unsettled-ok` breaks [`PREFIX_HELD`], where §10 first named the `Wrap` bound: the remover's
+/// own `Wrap`s land once it returns, so a heal from its prefix leaves at most two `Wrap`s to one
+/// recipient (the heal's and the remover's), as a heal after the settle grace does. Only when
+/// the heal signed tells the two apart.
 pub const CONTROLS: &[Control] = &[
     Control {
         name: "old-gap-rule",
@@ -214,7 +224,7 @@ pub const CONTROLS: &[Control] = &[
     Control {
         name: "unsettled-ok",
         switch: "UNSETTLED_OK",
-        breaks: WRAP_BOUND,
+        breaks: PREFIX_HELD,
     },
 ];
 
@@ -597,6 +607,29 @@ pub struct Split {
     pub crossed: Vec<String>,
 }
 
+/// The killed remover's partial `[everyone]` epoch, and the heal's `Wrap`s of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Partial {
+    /// The `[everyone]` epoch the prefix carried; `None` where the remover's batch minted none,
+    /// or the split stopped before it cut the prefix.
+    pub epoch: Option<RecordId>,
+    /// The recipients the prefix's `Wrap`s of the epoch name: the gap is every other current
+    /// member.
+    pub delivered: BTreeSet<Recipient>,
+    /// When the lab began posting the prefix to island A's servers (Unix milliseconds).
+    pub reached_ms: u64,
+    /// The `Wrap`s of the epoch that seats other than its minter's signed, read once the heal's
+    /// wait ended: each by the Mac whose seat signed it, to its recipient, with its authored
+    /// time (Unix milliseconds).
+    pub heal_wraps: Vec<(String, Recipient, u64)>,
+    /// The newest `[everyone]` epochs the up current members held once the heal's wait ended,
+    /// other than the partial one: each named with the Mac that minted it, and its authored time
+    /// (Unix milliseconds; 0 where no log held it).
+    pub newer: Vec<(String, u64)>,
+    /// The heal's `Wrap`s were read.
+    pub read: bool,
+}
+
 /// A write the split made, and who holds it at the end.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Wrote {
@@ -639,6 +672,8 @@ pub struct Evidence {
     pub newcomer: Option<String>,
     /// The split's ledger.
     pub split: Split,
+    /// The killed remover's partial epoch and the heal's `Wrap`s of it.
+    pub partial: Partial,
     /// The negative control the run set.
     pub control: Option<Control>,
 }
@@ -670,11 +705,23 @@ pub const FRONTIER: &str = "frontier";
 /// return would hand every member its missing `Wrap`s and cover a heal that never ran, so the end
 /// read is no evidence of this.
 pub const NEWEST_KEY: &str = "newest-key";
+/// Once the heal's wait ended, the remover down, seats other than the remover's had signed
+/// `Wrap`s of its partial `[everyone]` epoch (the gap rule ran), no newer `[everyone]` epoch came
+/// before the first of them (none covered the gap first), and every up current member the prefix
+/// left out held one, unless an epoch minted after the heal began superseded the partial one
+/// (the admin's envelope mirror reseals once its own heal `Wrap` opens it): the rest of the gap
+/// then matters no more, and [`NEWEST_KEY`] holds them to the newer key.
+pub const GAP_HEALED: &str = "gap-healed";
 /// Every current member's own vault reads it in: the key assertion as the Mac's secrets see it,
 /// for a subscriber that marks itself revoked stops writing them.
 pub const VAULT_IN: &str = "vault-in";
 /// No epoch has more than two `Wrap`s to one recipient.
 pub const WRAP_BOUND: &str = "wrap-bound";
+/// No Mac healed the partial epoch from its prefix: every `Wrap` of it that a Mac but its minter
+/// signed before the remover returned came at least the product's settle grace
+/// ([`client::SETTLE_GRACE_MS`]) after the lab began posting the prefix to island A, before
+/// which no Mac could have seen the epoch.
+pub const PREFIX_HELD: &str = "prefix-held";
 /// No removed Mac is wrapped by a current member's newest epoch or seated by its log, and none
 /// reads itself a current member.
 pub const REMOVED_NO_KEY: &str = "removed-no-key";
@@ -860,6 +907,95 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
         },
     );
 
+    let partial = &ev.partial;
+    let healed_to: BTreeSet<&Recipient> = partial.heal_wraps.iter().map(|(_, to, _)| to).collect();
+    let left_out: Vec<&Seen> = at_heal
+        .iter()
+        .copied()
+        .filter(|s| {
+            s.recipient
+                .as_ref()
+                .is_none_or(|r| !partial.delivered.contains(r))
+        })
+        .collect();
+    let unhealed: Vec<&str> = left_out
+        .iter()
+        .filter(|s| s.recipient.as_ref().is_none_or(|r| !healed_to.contains(r)))
+        .map(|s| s.name.as_str())
+        .collect();
+    let healers: BTreeSet<&str> = partial
+        .heal_wraps
+        .iter()
+        .map(|(by, _, _)| by.as_str())
+        .collect();
+    let first_heal = partial.heal_wraps.iter().map(|(_, _, at)| *at).min();
+    let before_heal: Vec<&str> = partial
+        .newer
+        .iter()
+        .filter(|(_, at)| first_heal.is_none_or(|first| *at < first))
+        .map(|(epoch, _)| epoch.as_str())
+        .collect();
+    let newer: Vec<&str> = partial.newer.iter().map(|(e, _)| e.as_str()).collect();
+    let gap = |e: &RecordId| {
+        format!(
+            "the remover's prefix left {} of {} up current members out of its partial [everyone] \
+             epoch {}",
+            left_out.len(),
+            at_heal.len(),
+            short(e)
+        )
+    };
+    push(
+        GAP_HEALED,
+        partial.read && partial.epoch.is_some() && !left_out.is_empty(),
+        first_heal.is_some()
+            && before_heal.is_empty()
+            && (unhealed.is_empty() || !newer.is_empty()),
+        match partial.epoch {
+            _ if !partial.read || at_heal.is_empty() => {
+                "nothing was read once the heal's wait ended".to_owned()
+            }
+            None => "no partial [everyone] epoch was cut: the remover's batch minted none, or the \
+                     split stopped first"
+                .to_owned(),
+            Some(e) if left_out.is_empty() => format!("{}: no gap to heal", gap(&e)),
+            Some(e) if first_heal.is_none() => format!(
+                "{}; no Mac but the remover signed a Wrap of it ({})",
+                gap(&e),
+                if newer.is_empty() {
+                    "nothing healed the gap".to_owned()
+                } else {
+                    format!("covered by {}", newer.join(", "))
+                }
+            ),
+            Some(e) if !before_heal.is_empty() => format!(
+                "{}; {} came before the heal's first Wrap of it and covered the gap",
+                gap(&e),
+                before_heal.join(", ")
+            ),
+            Some(e) if unhealed.is_empty() => format!(
+                "{}; heal Wraps by {} reached every one",
+                gap(&e),
+                healers.into_iter().collect::<Vec<_>>().join(" ")
+            ),
+            Some(e) if !newer.is_empty() => format!(
+                "{}; heal Wraps by {} reached {} of them before {}, minted after the heal's first \
+                 Wrap, superseded it for the rest ({})",
+                gap(&e),
+                healers.into_iter().collect::<Vec<_>>().join(" "),
+                left_out.len() - unhealed.len(),
+                newer.join(", "),
+                unhealed.join(" ")
+            ),
+            Some(e) => format!(
+                "{}; no heal Wrap of it reached {}, and no newer epoch superseded it: the heal \
+                 skipped them",
+                gap(&e),
+                unhealed.join(" ")
+            ),
+        },
+    );
+
     let not_in: Vec<String> = current
         .iter()
         .filter(|s| s.vault_state != "in")
@@ -902,6 +1038,48 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
+    );
+
+    let grace = client::SETTLE_GRACE_MS;
+    let after = |at: u64| at.saturating_sub(partial.reached_ms);
+    let early: Vec<String> = partial
+        .heal_wraps
+        .iter()
+        .filter(|(_, _, at)| after(*at) < grace)
+        .map(|(by, _, at)| format!("{by} {:.1}s", after(*at) as f64 / 1000.0))
+        .collect();
+    let judged = partial.read && partial.epoch.is_some() && !partial.heal_wraps.is_empty();
+    push(
+        PREFIX_HELD,
+        judged,
+        early.is_empty(),
+        if !judged {
+            "no heal Wrap of a partial [everyone] epoch was read, so none says when the heal signed"
+                .to_owned()
+        } else if early.is_empty() {
+            format!(
+                "every one of {} heal Wraps of the partial epoch came {:.1}s or more after its \
+                 prefix reached island A (the settle grace is {}s)",
+                partial.heal_wraps.len(),
+                partial
+                    .heal_wraps
+                    .iter()
+                    .map(|(_, _, at)| after(*at))
+                    .min()
+                    .unwrap_or(0) as f64
+                    / 1000.0,
+                grace / 1000
+            )
+        } else {
+            format!(
+                "{} of {} heal Wraps of the partial epoch came inside the {}s settle grace after \
+                 its prefix reached island A, signed from the prefix: {}",
+                early.len(),
+                partial.heal_wraps.len(),
+                grace / 1000,
+                early.join(", ")
+            )
+        },
     );
 
     let mut kept_in = Vec::new();
@@ -2246,6 +2424,18 @@ fn synthetic() -> Result<String, Fail> {
     aterm_uds::rand::hex_token::<16>().map_err(|e| Fail::die(format!("random bytes: {e}")))
 }
 
+/// The least first byte of m00's key. The remover's batch wraps its `[everyone]` epoch to each
+/// recipient in key order (`rotate_after_removal` walks a set of them), and [`partial`] cuts the
+/// prefix short of the `Wrap` to the vault's admin, m00, so that admin's envelope mirror cannot
+/// reseal over the gap before the heal. Drawn at random, m00's key sorts first, or second behind
+/// the remover's, in about one run in ten at 14 Macs, which leaves the prefix no `Wrap` to a
+/// member that could heal the gap and the split unbuilt ([`split`]); a key at this floor sorts
+/// behind two other members' in all but a vanishing share of runs.
+const ADMIN_KEY_FLOOR: u8 = 0xF0;
+
+/// Draws of m00's key before the lab gives up: one draw in sixteen makes [`ADMIN_KEY_FLOOR`].
+const ADMIN_KEY_DRAWS: usize = 1024;
+
 /// Found the lab on m00 ([`Lab::found`]'s doc says why this way), then let every other Mac in.
 fn bring_up(lab: &mut Lab, ev: &mut Evidence) -> Result<(), Fail> {
     let t = Timed::now();
@@ -2316,8 +2506,10 @@ impl Lab {
     /// the envelope approver every admin's does; the lab lets no Mac in through it. m00's
     /// `[everyone]` holds one synthetic entry, so its founding epoch seals something, and the
     /// servers policy every Mac's subscriber reads its peers from
-    /// ([`aterm_secrets::SWARM_POLICY_ENTRY`], a member's write through the log).
+    /// ([`aterm_secrets::SWARM_POLICY_ENTRY`], a member's write through the log). m00's key is
+    /// drawn first, to sort late ([`ADMIN_KEY_FLOOR`] says why).
     fn found(&mut self) -> Result<(), Fail> {
+        self.draw_admin_key()?;
         self.start_server(0)?;
         let seed_dir = self.macs[0].root.join("tmp/seed");
         std::fs::create_dir_all(&seed_dir).map_err(|e| Fail::die(e.to_string()))?;
@@ -2364,6 +2556,37 @@ impl Lab {
         let policy = format!("servers = [{}]\n", servers.join(", "));
         self.act_ok(0, Act::Put, &[aterm_secrets::SWARM_POLICY_ENTRY, &policy])?;
         self.start_member(0)
+    }
+
+    /// Make m00's key, the vault's admin's, one that sorts late ([`ADMIN_KEY_FLOOR`]): each draw is
+    /// the product's own ([`client::machine_identity`]) in a scratch vault folder, and the one
+    /// kept becomes m00's whole.
+    fn draw_admin_key(&self) -> Result<(), Fail> {
+        let to = self.macs[0].paths();
+        let draws = Paths::locate_for_home(&self.macs[0].root.join("tmp/admin-key"));
+        let at = |what: &str, path: &Path, e: &dyn std::fmt::Display| {
+            Fail::die(format!("m00's key: {what} {}: {e}", path.display()))
+        };
+        if to.dir.exists() {
+            return Err(Fail::die(format!(
+                "m00's key: its vault folder {} exists before the lab founded it",
+                to.dir.display()
+            )));
+        }
+        for _ in 0..ADMIN_KEY_DRAWS {
+            let key = client::machine_identity(&draws).map_err(|e| at("draw", &draws.dir, &e))?;
+            if key.recipient().0[0] >= ADMIN_KEY_FLOOR {
+                if let Some(parent) = to.dir.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| at("make", parent, &e))?;
+                }
+                return std::fs::rename(&draws.dir, &to.dir).map_err(|e| at("move", &to.dir, &e));
+            }
+            std::fs::remove_dir_all(&draws.dir).map_err(|e| at("clear", &draws.dir, &e))?;
+        }
+        Err(Fail::die(format!(
+            "m00's key: no draw of {ADMIN_KEY_DRAWS} began with a byte of {ADMIN_KEY_FLOOR:#04x} \
+             or more"
+        )))
     }
 
     /// `by` lets Mac `who` in by a person's Allow and the phrase on its desk, then `who` points
@@ -2605,7 +2828,7 @@ fn run(lab: &mut Lab) -> Result<Evidence, Fail> {
 
     // 7. The split. The remover stays down through the heal whatever the split did.
     let t = Timed::now();
-    let went = split(lab, &mut ev, &plan);
+    let went = split(lab, &mut ev, &plan)?;
     lab.down(plan.split_remover);
     record(
         &mut ev,
@@ -2625,6 +2848,18 @@ fn run(lab: &mut Lab) -> Result<Evidence, Fail> {
     let watch = lab.current_up(&ev.current);
     let healed = waited(lab.await_settled("heal", &watch, Need::Key(&ev.removed), Schedule::HEAL));
     ev.healed = lab.read_all();
+    if let Some(epoch) = ev.partial.epoch {
+        ev.partial.heal_wraps = heal_wraps(lab, &epoch);
+        let newest: BTreeSet<RecordId> = ev
+            .healed
+            .iter()
+            .filter(|s| s.up && ev.current.contains_key(&s.name))
+            .flat_map(|s| s.newest.iter().copied())
+            .filter(|id| *id != epoch)
+            .collect();
+        ev.partial.newer = minted_by(lab, &newest);
+    }
+    ev.partial.read = true;
     record(
         &mut ev,
         t.went(
@@ -2855,7 +3090,24 @@ fn write(lab: &mut Lab, i: usize, entry: &str) -> Result<Wrote, String> {
 /// of the batch reaches half of A's servers, and the remover goes down. Island B writes and
 /// admits the newcomer. Each island's records spread over it, and the ledger is read.
 #[allow(clippy::too_many_lines)]
-fn split(lab: &mut Lab, ev: &mut Evidence, plan: &Plan) -> Went {
+/// Step 7, the split: what the step went to ([`Went`]), or a [`Fail`] where the cut short of the
+/// vault's admin's `Wrap` left the scenario unbuilt ([`split_steps`]), which ends the run
+/// unjudged. A batch whose first half of `Wrap`s reaches no healer, the admin's cut aside, is
+/// the product's, and fails the step.
+fn split(lab: &mut Lab, ev: &mut Evidence, plan: &Plan) -> Result<Went, Fail> {
+    let mut unbuilt = None;
+    let went = split_steps(lab, ev, plan, &mut unbuilt);
+    unbuilt.map_or(Ok(went), |why| Err(Fail::die(format!("mesh churn: {why}"))))
+}
+
+/// [`split`]'s steps; `unbuilt` says why where the cut short of the vault's admin's `Wrap` is what
+/// left the prefix no `Wrap` to a member that could heal it, the uncut half reaching one.
+fn split_steps(
+    lab: &mut Lab,
+    ev: &mut Evidence,
+    plan: &Plan,
+    unbuilt: &mut Option<String>,
+) -> Went {
     let fail = |e: Fail| e.msg.unwrap_or_default();
     lab.cut(true).map_err(fail)?;
     let all: Vec<usize> = (0..lab.macs.len()).collect();
@@ -2887,7 +3139,56 @@ fn split(lab: &mut Lab, ev: &mut Evidence, plan: &Plan) -> Went {
         .filter(|rec| !before.contains(rec.id()))
         .collect();
     batch.sort_by_key(|rec| rec.sequence());
-    let prefix = partial(&batch);
+    let admin = see(&name(0), &lab.macs[0].paths(), true).recipient;
+    let prefix = partial(&batch, admin.as_ref());
+    let epoch = prefix
+        .iter()
+        .find(|rec| everyone_epoch(rec))
+        .map(|rec| *rec.id());
+    let delivered_by = |cut: &[&Record]| -> BTreeSet<Recipient> {
+        cut.iter()
+            .filter_map(|rec| match rec.body() {
+                Body::Wrap {
+                    epoch: of,
+                    recipient,
+                    ..
+                } if Some(*of) == epoch => Some(*recipient),
+                _ => None,
+            })
+            .collect()
+    };
+    let delivered = delivered_by(&prefix);
+    // A member other than the remover must open the partial epoch, or nobody can heal it.
+    let healers: BTreeSet<Recipient> = ev
+        .current
+        .keys()
+        .filter(|m| **m != name(r) && **m != name(c))
+        .filter_map(|m| {
+            let i = lab.macs.iter().position(|mac| mac.name == *m)?;
+            see(m, &lab.macs[i].paths(), true).recipient
+        })
+        .collect();
+    if let Some(e) = epoch.filter(|_| delivered.is_disjoint(&healers)) {
+        let uncut = partial(&batch, None);
+        if prefix.len() < uncut.len() && !delivered_by(&uncut).is_disjoint(&healers) {
+            let why = format!(
+                "the remover's batch wraps its [everyone] epoch {} to the vault's admin ahead of \
+                 every member that could heal it, the remover aside, so no causal prefix both \
+                 leaves the admin out and reaches a healer: this run could not build the split",
+                short(&e)
+            );
+            *unbuilt = Some(why.clone());
+            return Err(why);
+        }
+        return Err(format!(
+            "no Wrap of the remover's [everyone] epoch {} among the first half of its Wraps goes \
+             to a current member but the remover: no prefix of the batch reaches a member that \
+             could heal its gap",
+            short(&e)
+        ));
+    }
+    ev.partial.epoch = epoch;
+    ev.partial.delivered = delivered;
     let a_servers: Vec<usize> = plan
         .on(Island::A)
         .into_iter()
@@ -2895,6 +3196,7 @@ fn split(lab: &mut Lab, ev: &mut Evidence, plan: &Plan) -> Went {
         .collect();
     let reached: Vec<usize> = a_servers.iter().copied().step_by(2).collect();
     let wire = aterm_secrets::membership_log::encode_records(prefix.iter().copied());
+    ev.partial.reached_ms = aterm_time::unix_millis().ok_or("the clock reads before 1970")?;
     for &i in &reached {
         aterm_secrets::transport::post_records(&lab.macs[i].url(), &wire)
             .map_err(|e| format!("the prefix to {}: {e}", name(i)))?;
@@ -2902,15 +3204,20 @@ fn split(lab: &mut Lab, ev: &mut Evidence, plan: &Plan) -> Went {
     let reached_at = Instant::now();
     lab.down(r);
     lab.say(&format!(
-        "{} removed {} ({c_label}): signed {} records ({}), {} reached {} of island A's {} servers; \
-         then it was killed",
+        "{} removed {} ({c_label}): signed {} records ({}), {} reached {} of island A's {} \
+         servers, through its [everyone] epoch {} and short of its Wrap to m00, the vault's \
+         admin; then it was killed",
         name(r),
         name(c),
         batch.len(),
         signed.trim(),
         prefix.len(),
         reached.len(),
-        a_servers.len()
+        a_servers.len(),
+        ev.partial
+            .epoch
+            .as_ref()
+            .map_or_else(|| "(none)".to_owned(), short)
     ));
     ev.current.remove(&name(c));
     if let Some(recipient) = see(&name(c), &lab.macs[c].paths(), true).recipient {
@@ -3001,6 +3308,74 @@ fn held_by(
     held
 }
 
+/// The `Wrap`s of `epoch` that any Mac's log holds, each once, signed by a seat other than the
+/// epoch's minter's: by the Mac whose seat signed it, to its recipient, with its authored time.
+fn heal_wraps(lab: &Lab, epoch: &RecordId) -> Vec<(String, Recipient, u64)> {
+    let signers = signers(lab);
+    let mut wraps: BTreeMap<RecordId, (String, Recipient, u64)> = BTreeMap::new();
+    for mac in &lab.macs {
+        let Ok(store) = client::load_records(&mac.paths()) else {
+            continue;
+        };
+        let Some(log) = store.log() else {
+            continue;
+        };
+        let Some(minter) = log.get(epoch).map(|rec| *rec.actor()) else {
+            continue;
+        };
+        for rec in log.records() {
+            if let Body::Wrap {
+                epoch: of,
+                recipient,
+                ..
+            } = rec.body()
+                && of == epoch
+                && *rec.actor() != minter
+            {
+                wraps.entry(*rec.id()).or_insert_with(|| {
+                    let by = signers
+                        .get(rec.actor())
+                        .map_or_else(|| "a seat no Mac here holds".to_owned(), |&i| name(i));
+                    (by, *recipient, rec.authored_ms())
+                });
+            }
+        }
+    }
+    wraps.into_values().collect()
+}
+
+/// Each of `epochs`, named with the Mac whose seat minted it, and its authored time, as any Mac's
+/// log holds it (0 where none does).
+fn minted_by(lab: &Lab, epochs: &BTreeSet<RecordId>) -> Vec<(String, u64)> {
+    let signers = signers(lab);
+    let mut by: BTreeMap<RecordId, (String, u64)> = BTreeMap::new();
+    for mac in &lab.macs {
+        if let Ok(store) = client::load_records(&mac.paths())
+            && let Some(log) = store.log()
+        {
+            for id in epochs {
+                if let Some(rec) = log.get(id) {
+                    by.entry(*id).or_insert_with(|| {
+                        let who = signers
+                            .get(rec.actor())
+                            .map_or_else(|| "a seat no Mac here holds".to_owned(), |&i| name(i));
+                        (who, rec.authored_ms())
+                    });
+                }
+            }
+        }
+    }
+    epochs
+        .iter()
+        .map(|id| {
+            let (who, at) = by
+                .get(id)
+                .map_or(("an unread seat", 0), |(who, at)| (who.as_str(), *at));
+            (format!("{} by {who}", short(id)), at)
+        })
+        .collect()
+}
+
 /// Each seat any Mac's log has bound, removed ones included (a genesis founder's binding, an
 /// `Admit`'s entrant), by the Mac whose identity it binds: whose a signed record is.
 fn signers(lab: &Lab) -> BTreeMap<aterm_secrets::membership_log::MemberId, usize> {
@@ -3042,25 +3417,61 @@ fn signers(lab: &Lab) -> BTreeMap<aterm_secrets::membership_log::MemberId, usize
 }
 
 /// The causal prefix of a removal batch (by its signer's sequence) that a kill in the middle of
-/// it leaves delivered: through the `[everyone]` epoch and half of the `Wrap`s that follow it.
+/// it leaves delivered: through its `[everyone]` epoch and half of the `Wrap`s that follow it,
+/// whatever audiences it rotates before that one, and never as far as the epoch's `Wrap` to
+/// `admin`, the vault's admin. An admin that opens the partial epoch takes the heal as a change
+/// to its envelope document and reseals `[everyone]` under a fresh epoch at once (a writer's
+/// epoch cannot wait), which covers the gap before the gap rule runs ([`GAP_HEALED`]); left
+/// out, it waits for the heal's `Wrap` like any member.
 #[must_use]
-pub fn partial<'a>(batch: &[&'a Record]) -> Vec<&'a Record> {
-    let kinds: Vec<Kind> = batch.iter().map(|r| r.kind()).collect();
-    batch[..prefix_len(&kinds)].to_vec()
+pub fn partial<'a>(batch: &[&'a Record], admin: Option<&Recipient>) -> Vec<&'a Record> {
+    let parts: Vec<(Kind, bool)> = batch
+        .iter()
+        .map(|r| (r.kind(), everyone_epoch(r)))
+        .collect();
+    let epoch = batch.iter().find(|r| everyone_epoch(r)).map(|r| *r.id());
+    let to_admin = batch.iter().position(|r| match r.body() {
+        Body::Wrap {
+            epoch: of,
+            recipient,
+            ..
+        } => Some(*of) == epoch && Some(recipient) == admin,
+        _ => false,
+    });
+    batch[..prefix_len(&parts, to_admin)].to_vec()
 }
 
-/// How many of a batch's records, by kind in signing order, [`partial`] delivers: through its
-/// first `Epoch` and half the `Wrap`s right after it; half the batch where it holds no epoch.
+/// `record` mints an `[everyone]` epoch.
+fn everyone_epoch(record: &Record) -> bool {
+    matches!(
+        record.body(),
+        Body::Epoch {
+            audience: EpochAudience::Everyone,
+            ..
+        }
+    )
+}
+
+/// How many of a batch's records [`partial`] delivers, by each one's kind in signing order and
+/// whether it mints the `[everyone]` epoch: through that `Epoch` and half the `Wrap`s right after
+/// it, stopping short of the record at `left_out` where that comes after the epoch; half the
+/// batch where none mints it.
 #[must_use]
-pub fn prefix_len(kinds: &[Kind]) -> usize {
-    let Some(epoch) = kinds.iter().position(|k| *k == Kind::Epoch) else {
-        return kinds.len() / 2;
-    };
-    let wraps = kinds[epoch + 1..]
+pub fn prefix_len(parts: &[(Kind, bool)], left_out: Option<usize>) -> usize {
+    let Some(epoch) = parts
         .iter()
-        .take_while(|k| **k == Kind::Wrap)
+        .position(|(kind, everyone)| *everyone && *kind == Kind::Epoch)
+    else {
+        return parts.len() / 2;
+    };
+    let wraps = parts[epoch + 1..]
+        .iter()
+        .take_while(|(kind, _)| *kind == Kind::Wrap)
         .count();
-    epoch + 1 + wraps / 2
+    let half = epoch + 1 + wraps / 2;
+    left_out
+        .filter(|&at| at > epoch)
+        .map_or(half, |at| half.min(at))
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -496,7 +496,10 @@ fn unresolved_prepare_replay_preserves_debt_and_cannot_reconcile_another_id() {
             binding().capability
         )),
     ] {
-        let mut st = original.clone();
+        // Each reply case starts from the current durable generation. A replay
+        // saves before sending, so the preceding case made `original` stale.
+        let mut st = upgrade_drive::load(&opts, "conversation").unwrap();
+        assert_eq!(st, original, "reloading preserves the unresolved debt");
         let expected = expected.clone();
         let (mut client, worker) = endpoint(move |line| {
             assert_eq!(request(line), expected, "only the exact Prepare may leave");
@@ -949,7 +952,7 @@ fn private_token_constructor_retains_both_plans_and_original_budget_through_roll
 }
 
 #[test]
-fn queued_prepare_safe_receipt_restores_unsent_but_unknown_keeps_original_dispatch() {
+fn queued_prepare_safe_receipt_restores_unsent() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let opts = opts(dir.path());
     let command = planned();
@@ -991,9 +994,16 @@ fn queued_prepare_safe_receipt_restores_unsent_but_unknown_keeps_original_dispat
     st.unsent(back);
     assert_eq!(st.phase, Phase::Announced { at_s: 1, asks: 1 });
     assert!(st.native.is_none() && st.native_prepare.is_empty());
+    upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
     drop(client);
     worker.join().unwrap();
+}
 
+#[test]
+fn unknown_prepare_replay_keeps_original_dispatch() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let command = planned();
     let (mut st, _) = state(&command);
     let (mut client, worker) =
         endpoint(|line| common(line).or_else(|| Some("OK native-act state=unknown\n".into())));

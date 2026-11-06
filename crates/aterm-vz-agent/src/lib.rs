@@ -145,7 +145,7 @@ pub(crate) fn read_bounded_regular(path: &Path, max_bytes: usize) -> io::Result<
 pub fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
     let mut f = open_regular_nonblock(path)?;
     let mut h = aterm_digest::Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = [0u8; 64 * 1024];
     loop {
         match f.read(&mut buf) {
             Ok(0) => return Ok(h.finalize()),

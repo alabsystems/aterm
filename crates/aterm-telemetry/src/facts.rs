@@ -51,7 +51,7 @@ impl HostFacts {
 
     /// The facts as the log spells them: each text a word ([`word_of`]).
     fn fields(&self) -> String {
-        let mut s = String::new();
+        let mut s = String::with_capacity(128);
         let _ = write!(
             s,
             "host={} model={} cpu={} cores={} mem_mib={} os={} aterm={}",

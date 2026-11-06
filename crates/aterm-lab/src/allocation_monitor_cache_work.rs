@@ -459,14 +459,14 @@ fn run_checked(original: &Original<'_>, engine: &mut Engine) -> Result<()> {
         counters.read()? == [1, 1, 1],
         "cold scripts did not each execute once",
     )?;
-    let stdout = fs::read(built.logs.join("build.stdout"))?;
+    let stdout = crate::util::read_regular_file(&built.logs.join("build.stdout"))?;
     let dependency = dependency_artifact(&stdout, &target)?;
     let original_dependency = artifact(&dependency)?;
     let compiler_binary = executable_artifact(&stdout, &target)?;
     let original_compiler_binary = artifact(&compiler_binary)?;
     let binary = built.dest.join("bin").join(BIN);
     let original_binary = artifact(&binary)?;
-    let receipt = fs::read(built.dest.join("local-build.json"))?;
+    let receipt = crate::util::read_regular_file(&built.dest.join("local-build.json"))?;
     execute(&binary, &version)?;
     execute(&compiler_binary, &version)?;
     require(
@@ -507,7 +507,7 @@ fn run_checked(original: &Original<'_>, engine: &mut Engine) -> Result<()> {
             && artifact(&dependency)? == original_dependency
             && artifact(&compiler_binary)? == original_compiler_binary
             && artifact(&binary)? == original_binary
-            && fs::read(built.dest.join("local-build.json"))? == receipt,
+            && crate::util::read_regular_file(&built.dest.join("local-build.json"))? == receipt,
         "warm build reran a script or changed dependency/publication bytes",
     )?;
     let current_target = fs::symlink_metadata(&target)?;

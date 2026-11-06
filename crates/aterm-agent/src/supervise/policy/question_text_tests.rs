@@ -2020,8 +2020,10 @@ fn the_land_text_fits_wherever_the_long_term_text_does() {
 /// capture (Claude Code's single, multi, preview and review; Muse Code's; agy's), at 80, 120 and
 /// 200 columns, with no text of the loop's in it and with its text remembered there, each text
 /// priority escalates in no cell where the recommended decision approves. Negative controls:
-/// a person's input and a changed priority latch keep the text path's refusal. MUTANT: the
-/// text refusal escalates instead of using the recommendation (`text_instead` returns `why`).
+/// a person's input and a changed priority latch keep the text path's refusal in some cell; each
+/// fail-closed row is held alone by
+/// [`a_text_prioritys_fail_closed_rows_each_keep_the_dialog_a_persons`]. MUTANT: the text refusal
+/// escalates instead of using the recommendation (`text_instead` returns `why`).
 #[test]
 fn a_text_priority_escalates_nowhere_the_recommended_answer_is_taken() {
     let decide = |prompt: &aterm_phase::PromptV2,
@@ -2094,4 +2096,162 @@ fn a_text_priority_escalates_nowhere_the_recommended_answer_is_taken() {
         "T10: text priorities answer {answered} of {cells} cells; changed latches hold {latch_held}; a \
          person's input keeps {person_held}"
     );
+}
+
+/// A TEXT PRIORITY'S FAIL-CLOSED ROWS, ONE AT A TIME (judge 2's, [`text_instead`]): under each
+/// text priority, where its stand-in would press the recommended answer, a person's input since
+/// the loop's text keeps the dialog theirs, row by row: Claude Code's free-text row with the
+/// loop's text gone (`text_instead`), Muse Code's shut notes field with the loop's note gone
+/// (`note_answer`), and a tab the text already fell back on, on either program (`POLICY_PERSON`).
+/// Two more stay a person's with no person's input at all: a free-text row whose loop text was
+/// another word's (the latch moved mid-dialog), and a note in Muse Code's open notes field that
+/// the loop did not write, where an Enter would send it. CONTROL: each row with no person's input
+/// is answered under the priority's own rule, the latch's with the priority's own text gone.
+/// MUTANTS: each row's person test dropped, the latch test dropped, and the open-notes test
+/// dropped.
+#[test]
+fn a_text_prioritys_fail_closed_rows_each_keep_the_dialog_a_persons() {
+    for p in [LONG, SHORT, LAND] {
+        fail_closed_rows_keep_the_dialog_a_persons(p);
+    }
+}
+
+fn fail_closed_rows_keep_the_dialog_a_persons(p: QuestionPriority) {
+    use aterm_phase::muse::fixtures as u;
+    let claude = |capture: &str| {
+        let rows = screen(capture);
+        (parse_prompt_v2(&rows).expect("the dialog"), rows)
+    };
+    let muse = |capture: &str| {
+        let rows = screen(capture);
+        let prompt = aterm_phase::read(Some("muse"), &rows, None)
+            .prompt
+            .expect("the question");
+        (prompt, rows)
+    };
+    let decide = |(prompt, rows): &(aterm_phase::PromptV2, Vec<String>),
+                  own: Option<QuestionPriority>,
+                  fell_back: bool,
+                  person: bool| {
+        answer_question(prompt, rows, p, own, (fell_back, person), Pane::of(rows))
+    };
+    for (what, read, own, fell_back) in [
+        (
+            "Claude Code's single-select, the text gone",
+            claude(f::QUESTION_283_FREE_TEXT_FOCUSED),
+            Some(p),
+            false,
+        ),
+        (
+            "Claude Code's multi-select, the text gone",
+            claude(f::QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED),
+            Some(p),
+            false,
+        ),
+        (
+            "Muse Code's question, the note gone",
+            muse(u::QUESTION_NOTE_ESC),
+            Some(p),
+            false,
+        ),
+        (
+            "Claude Code's tab the text fell back on",
+            claude(f::QUESTION_283_FREE_TEXT_FOCUSED),
+            None,
+            true,
+        ),
+        (
+            "Muse Code's tab the note fell back on",
+            muse(u::QUESTION),
+            None,
+            true,
+        ),
+    ] {
+        let d = decide(&read, own, fell_back, false);
+        assert!(
+            matches!(&d, Decision::Approve { rule_id, .. } if *rule_id == p.rule_id()),
+            "{p:?}, {what}: the control, no person's input: {d:?}"
+        );
+        let d = decide(&read, own, fell_back, true);
+        assert!(
+            matches!(d, Decision::Escalate { .. }),
+            "{p:?}, {what}: a person's input since the text: {d:?}"
+        );
+    }
+    let single = claude(f::QUESTION_283_FREE_TEXT_FOCUSED);
+    let other = if p == LONG { SHORT } else { LONG };
+    let why = reason(&decide(&single, Some(other), false, false)).to_string();
+    assert!(
+        why.contains(&format!(
+            "the supervisor wrote the {} policy text into this question",
+            other.word()
+        )),
+        "{p:?}, the latch moved: {why}"
+    );
+    let open = muse(u::QUESTION_NOTE_LONG);
+    let why = reason(&decide(&open, None, false, false)).to_string();
+    assert!(
+        why.contains("text in its notes field the supervisor did not write"),
+        "{p:?}, Muse Code's open notes field: {why}"
+    );
+}
+
+/// `rows` with its options grown to `n`, each new one numbered after the last, the free-text and
+/// chat rows renumbered after them.
+fn with_options(rows: &[String], n: u8) -> Vec<String> {
+    let at = rows
+        .iter()
+        .position(|r| r.contains("4. Type something."))
+        .expect("the free-text row");
+    let mut out = rows[..at].to_vec();
+    for k in 4..=n {
+        out.push(format!("  {k}. Shade {k}"));
+        out.push(format!("     Another scheme, number {k}."));
+    }
+    let (free, chat) = (format!("{}. Type", n + 1), format!("{}. Chat", n + 2));
+    for r in &rows[at..] {
+        out.push(
+            r.replacen("4. Type", &free, 1)
+                .replacen("5. Chat", &chat, 1),
+        );
+    }
+    out
+}
+
+/// A TEXT PRIORITY'S STAND-IN WHERE ITS TEXT CANNOT BE REACHED: a single-select whose free-text row
+/// is more rows from the focus than the loop moves ([`MAX_QUESTION_FOCUS_STEPS`]) gets its
+/// recommended option, under the focus, pressed under each text priority's rule, nothing typed.
+/// CONTROLS: the same dialog with its three options is typed into, so the distance alone makes the
+/// stand-in, and a person's input since the loop's text keeps it theirs. MUTANT:
+/// `answer_question`'s placement refusal of the text escalated, not stood in for.
+#[test]
+fn a_text_too_far_from_the_focus_takes_the_recommended_option() {
+    let rows = with_options(&screen(f::QUESTION_ONE), 7);
+    let prompt = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("no box: {rows:#?}"));
+    let dialog = prompt.question_dialog.as_ref().expect("a dialog");
+    let free = focus_position(dialog, QuestionFocus::FreeText).expect("the free-text row");
+    let from = focus_position(dialog, dialog.focus()).expect("the focus");
+    assert!(
+        (free - from).unsigned_abs() > MAX_QUESTION_FOCUS_STEPS,
+        "PRECONDITION: the free-text row is {} rows from the focus",
+        free - from
+    );
+    let decide = |p: QuestionPriority, person: bool| {
+        answer_question(&prompt, &rows, p, None, (false, person), Pane::of(&rows))
+    };
+    for p in [LONG, SHORT, LAND] {
+        let (what, rule, subject, _) = did(&decide(p, false));
+        assert_eq!(
+            what,
+            Did::Enter(0, AnswerTarget::Option(1)),
+            "{p:?}: {subject}"
+        );
+        assert_eq!(rule, p.rule_id());
+        assert!(subject.contains("(recommended: "), "{subject}");
+        reason(&decide(p, true));
+        let near = screen(f::QUESTION_ONE);
+        let prompt = parse_prompt_v2(&near).expect("the dialog");
+        let d = answer_question(&prompt, &near, p, None, (false, false), Pane::of(&near));
+        assert!(matches!(did(&d).0, Did::Type(_, _)), "{p:?}: {d:?}");
+    }
 }

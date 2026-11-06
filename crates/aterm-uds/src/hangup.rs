@@ -303,7 +303,7 @@ mod tests {
                 std::time::Instant::now() < blocked,
                 "the writer never filled the sockets"
             );
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         #[cfg(target_os = "macos")]
         {

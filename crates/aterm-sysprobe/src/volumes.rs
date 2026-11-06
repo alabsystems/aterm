@@ -996,8 +996,8 @@ pub fn read_path(path: &Path, t: &Table) -> Result<Reading, Unread> {
 }
 
 /// At most `cap` bytes of `path`, and whether the read stopped at the cap.
-#[cfg(target_os = "linux")]
-fn read_capped(path: &Path, cap: usize) -> Option<(String, bool)> {
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) fn read_capped(path: &Path, cap: usize) -> Option<(String, bool)> {
     use std::io::Read as _;
     let f = crate::open_nonblock(path).ok()?;
     let mut buf = Vec::with_capacity(cap.min(16 * 1024));

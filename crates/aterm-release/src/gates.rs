@@ -1945,9 +1945,56 @@ pub fn gitlinks(listing: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Why [`submodules_on_declared_branch`] refused.
+#[derive(Debug)]
+pub enum PinRefusal {
+    /// What a pin's branch carries is unknown: its fetch failed every attempt, or git could not
+    /// answer. The network or the forge, not the pin.
+    Unread(String),
+    /// A pin its declared branch does not carry, or a gitlink with no declared branch.
+    Off(String),
+}
+
+impl std::fmt::Display for PinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unread(why) | Self::Off(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A fetch that receives nothing for two minutes ends, rather than at the forge's own gateway
+/// timeout (one HTTP 504 took ten).
+const FETCH_STALL: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=120"];
+
+/// The waits before a failed fetch's second and third attempts: a forge's 5xx or a dropped
+/// connection clears in seconds, and a fetch repeats safely.
+pub const FETCH_RETRIES: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+];
+
 /// Every submodule pin is on its declared branch.
-pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> Result<()> {
-    let listing = git_ok(git, &["ls-tree", "-r", "HEAD"])?.stdout_utf8();
+///
+/// # Errors
+///
+/// [`PinRefusal::Off`] for a pin its branch does not carry or a gitlink `.gitmodules` does not
+/// declare; [`PinRefusal::Unread`] when git cannot list the tree, every fetch attempt fails, or
+/// git cannot decide ancestry.
+pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> std::result::Result<(), PinRefusal> {
+    on_declared_branch_waiting(git, &FETCH_RETRIES, &mut std::thread::sleep)
+}
+
+/// [`submodules_on_declared_branch`], waiting `retries` between fetch attempts through `wait`.
+fn on_declared_branch_waiting(
+    git: &dyn GitRunner,
+    retries: &[std::time::Duration],
+    wait: &mut dyn FnMut(std::time::Duration),
+) -> std::result::Result<(), PinRefusal> {
+    let unread = |e: Error| PinRefusal::Unread(e.to_string());
+    let listing = git_ok(git, &["ls-tree", "-r", "HEAD"])
+        .map_err(unread)?
+        .stdout_utf8();
     let links = gitlinks(&listing);
     if links.is_empty() {
         return Ok(());
@@ -1959,7 +2006,8 @@ pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> Result<()> {
             ".gitmodules",
             "--get-regexp",
             r"^submodule\..*\.path$",
-        ])?
+        ])
+        .map_err(unread)?
         .stdout_utf8();
     let mut off = Vec::new();
     for (pin, path) in &links {
@@ -1969,18 +2017,20 @@ pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> Result<()> {
                 .then(|| key.strip_prefix("submodule.")?.strip_suffix(".path"))
                 .flatten()
         }) else {
-            return Err(Error::new(format!(
+            return Err(PinRefusal::Off(format!(
                 "the gitlink {path} has no .gitmodules entry, so the branch it must be on is \
                  unknown"
             )));
         };
-        let branch = git.git(&[
-            "config",
-            "-f",
-            ".gitmodules",
-            "--get",
-            &format!("submodule.{name}.branch"),
-        ])?;
+        let branch = git
+            .git(&[
+                "config",
+                "-f",
+                ".gitmodules",
+                "--get",
+                &format!("submodule.{name}.branch"),
+            ])
+            .map_err(unread)?;
         let (branch, source) = if branch.success() {
             let branch = branch.stdout_utf8().trim().to_string();
             let source = format!("refs/heads/{branch}");
@@ -1988,29 +2038,35 @@ pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> Result<()> {
         } else {
             ("HEAD".to_string(), "HEAD".to_string())
         };
-        let fetched = git.git(&[
-            "-C",
-            path,
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "origin",
-            &source,
-        ])?;
+        let mut fetch = vec!["-C", path.as_str()];
+        fetch.extend(FETCH_STALL);
+        fetch.extend(["fetch", "--quiet", "--no-tags", "origin", &source]);
+        let mut fetched = git.git(&fetch).map_err(unread)?;
+        let mut attempts = 1;
+        for pause in retries {
+            if fetched.success() {
+                break;
+            }
+            wait(*pause);
+            fetched = git.git(&fetch).map_err(unread)?;
+            attempts += 1;
+        }
         if !fetched.success() {
-            return Err(Error::new(format!(
-                "cannot fetch {path}'s declared branch {branch} from its origin (exit {}): {}, \
-                 so whether its pin {pin} is on it is unknown",
+            return Err(PinRefusal::Unread(format!(
+                "cannot fetch {path}'s declared branch {branch} from its origin in {attempts} \
+                 attempts (last exit {}): {}, so whether its pin {pin} is on it is unknown",
                 fetched.status,
                 fetched.stderr_utf8().trim()
             )));
         }
-        let on = git.git(&["-C", path, "merge-base", "--is-ancestor", pin, "FETCH_HEAD"])?;
+        let on = git
+            .git(&["-C", path, "merge-base", "--is-ancestor", pin, "FETCH_HEAD"])
+            .map_err(unread)?;
         match on.status {
             0 => {}
             1 => off.push(format!("{path} at {pin} is not on {branch}")),
             n => {
-                return Err(Error::new(format!(
+                return Err(PinRefusal::Unread(format!(
                     "git cannot tell whether {path}'s pin {pin} is on {branch} (exit {n}): {}",
                     on.stderr_utf8().trim()
                 )));
@@ -2020,7 +2076,7 @@ pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> Result<()> {
     if off.is_empty() {
         return Ok(());
     }
-    Err(Error::new(format!(
+    Err(PinRefusal::Off(format!(
         "submodule pin(s) on no commit their declared branch carries — a release ships only \
          what each repository's own branch carries:\n  {}",
         off.join("\n  ")
@@ -3217,13 +3273,15 @@ mod submodule_tests {
 
         git(&top.join("vendor/bus"), &["checkout", "-q", &side]);
         git(&top, &["commit", "-q", "-am", "pin the side branch"]);
-        submodules_on_declared_branch(&runner).expect_err("a side-branch pin is refused");
+        let off = submodules_on_declared_branch(&runner).expect_err("a side-branch pin is refused");
+        assert!(matches!(off, PinRefusal::Off(_)), "{off}");
 
         git(&bus, &["tag", "main", &side]);
         git(&bus, &["checkout", "-q", "side"]);
         git(&bus, &["branch", "-D", "main"]);
-        submodules_on_declared_branch(&runner)
+        let unread = on_declared_branch_waiting(&runner, &FETCH_RETRIES, &mut drop)
             .expect_err("a same-named tag cannot stand in for a missing branch");
+        assert!(matches!(unread, PinRefusal::Unread(_)), "{unread}");
     }
 
     #[test]
@@ -3250,7 +3308,11 @@ mod submodule_tests {
         submodules_on_declared_branch(&git).expect("on the remote's HEAD");
         let calls = git.calls.lock().expect("calls").clone();
         assert!(
-            calls.contains(&"-C vendor/astream fetch --quiet --no-tags origin HEAD".to_string()),
+            calls.contains(
+                &"-C vendor/astream -c http.lowSpeedLimit=1 -c http.lowSpeedTime=120 fetch \
+                  --quiet --no-tags origin HEAD"
+                    .to_string()
+            ),
             "{calls:?}"
         );
         assert!(
@@ -3260,18 +3322,45 @@ mod submodule_tests {
             "{calls:?}"
         );
 
-        let unfetched = fake(vec![(
-            " fetch ",
-            RunOut {
-                status: 128,
-                stdout: vec![],
-                stderr: b"fatal: unable to access the remote".to_vec(),
-            },
-        )]);
-        submodules_on_declared_branch(&unfetched).expect_err("no fetch, no verdict");
+        let failed = || {
+            (
+                " fetch ",
+                RunOut {
+                    status: 128,
+                    stdout: vec![],
+                    stderr: b"error: RPC failed; HTTP 504 curl 22".to_vec(),
+                },
+            )
+        };
+        let mut waited = Vec::new();
+        let unfetched = fake(vec![failed(), failed(), failed()]);
+        let refused = on_declared_branch_waiting(&unfetched, &FETCH_RETRIES, &mut |d| {
+            waited.push(d);
+        })
+        .expect_err("no fetch, no verdict");
+        assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
+        assert!(refused.to_string().contains("in 3 attempts"), "{refused}");
+        assert_eq!(waited, FETCH_RETRIES);
+
+        // A forge's passing 5xx is retried: the second attempt fetches and the gate decides.
+        let mut waited = Vec::new();
+        let recovered = fake(vec![failed()]);
+        on_declared_branch_waiting(&recovered, &FETCH_RETRIES, &mut |d| waited.push(d))
+            .expect("the retried fetch decides");
+        assert_eq!(waited, FETCH_RETRIES[..1]);
+        let fetches = recovered
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|c| c.contains(" fetch "))
+            .count();
+        assert_eq!(fetches, 2);
 
         let undecided = fake(vec![("merge-base", out(128, ""))]);
-        submodules_on_declared_branch(&undecided).expect_err("no ancestry, no verdict");
+        let refused =
+            submodules_on_declared_branch(&undecided).expect_err("no ancestry, no verdict");
+        assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
     }
 }
 

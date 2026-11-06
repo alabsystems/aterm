@@ -16,13 +16,20 @@ fn message(
     recipient: aterm_secrets::age::Recipient,
     record: &Record,
 ) -> Result<Vec<u8>> {
-    let mut body = record.body.clone();
-    body.remove("origin_att");
-    let mut bytes = scope.to_vec();
+    let canonical_body = if record.body.contains_key("origin_att") {
+        let mut body = record.body.clone();
+        body.remove("origin_att");
+        canonical(&body)?
+    } else {
+        canonical(&record.body)?
+    };
+    let key = ids(&record.key)?;
+    let mut bytes = Vec::with_capacity(32 + 48 + 32 + 16 + canonical_body.len());
+    bytes.extend_from_slice(&scope);
     bytes.extend_from_slice(&requester);
     bytes.extend_from_slice(&recipient.0);
-    bytes.extend_from_slice(&ids(&record.key)?);
-    bytes.extend_from_slice(&canonical(&body)?);
+    bytes.extend_from_slice(&key);
+    bytes.extend_from_slice(&canonical_body);
     Ok(bytes)
 }
 

@@ -1191,6 +1191,15 @@ impl App {
         self.request_redraw_all_windows();
     }
 
+    /// Title the menu bar's machine item from [`Self::machine_view`] (§5.1 of
+    /// `docs/DESIGN-machine-names-2026-11-04.md`); nothing until its reader's first read.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn refresh_machine_menu(&self) {
+        if let (Some(handle), Some(view)) = (self._menu.as_ref(), self.machine_view.as_ref()) {
+            crate::menu::update_machine_menu(handle, view);
+        }
+    }
+
     /// Sync the macOS Version menu title and items with the current staged/realized update state.
     pub(crate) fn refresh_version_menu(&self) {
         if let Some(handle) = self._menu.as_ref() {

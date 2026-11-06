@@ -409,7 +409,7 @@ pub fn run(words: &[String]) -> Result<Value> {
         "history" => {
             empty(&options)?;
             let db = Database::open(dir)?;
-            json!({"operations":db.history.index.inventory().filter_map(|id|db.provenance(id)).collect::<Vec<_>>()})
+            json!({"operations":db.all_provenance()})
         }
         "provenance" => {
             let id = decode_hex(take(&mut options, "--operation")?)?;
@@ -541,7 +541,32 @@ pub fn run(words: &[String]) -> Result<Value> {
             empty(&options)?;
             let db = Database::open(dir)?;
             let view = db.view();
-            let records:Vec<_>=view.cells.iter().filter(|((c,k),_)|c==collection&&key.is_none_or(|key|key==k)).map(|((_,key),cell)|json!({"key":key,"stopped":cell.stopped,"conflicted":cell.candidates.len()>1,"values":cell.candidates.iter().map(|v|json!({"operation":hex::encode_lower(&v.operation),"value":v.value})).collect::<Vec<_>>()})).collect();
+            let row_json = |key: &str, cell: &crate::database::Cell| {
+                json!({
+                    "key": key,
+                    "stopped": cell.stopped,
+                    "conflicted": cell.candidates.len() > 1,
+                    "values": cell
+                        .candidates
+                        .iter()
+                        .map(|v| json!({"operation": hex::encode_lower(&v.operation), "value": v.value}))
+                        .collect::<Vec<_>>(),
+                })
+            };
+            let records: Vec<_> = match key {
+                Some(key) => view
+                    .cells
+                    .get(&(collection.to_owned(), key.to_owned()))
+                    .map(|cell| row_json(key, cell))
+                    .into_iter()
+                    .collect(),
+                None => view
+                    .cells
+                    .range((collection.to_owned(), String::new())..)
+                    .take_while(|((c, _), _)| c == collection)
+                    .map(|((_, key), cell)| row_json(key, cell))
+                    .collect(),
+            };
             json!({"records":records,"pending":view.causal.pending.len(),"quarantined":view.causal.quarantined.len()})
         }
         "put" | "stop" => {

@@ -464,10 +464,10 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
             Starter {
                 exe: PathBuf::from(cli.word),
                 env: Vec::new(),
-                args: Ok(Vec::new()),
+                args: cli.unnamed_posture(),
                 unset: Vec::new(),
             },
-            "a starter that runs no {}: its plain word",
+            "a starter that runs no {}: its plain word, at its CLI's floor",
             cli.agent.product()
         );
     }

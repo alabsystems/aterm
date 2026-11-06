@@ -238,7 +238,7 @@ pub struct ClaudeAccounts {
     pub unattended: bool,
     /// The switch that keeps aterm's own sign-ins off here, where one does
     /// ([`crate::harness::accounts_sync::sign_ins_off_for`]).
-    pub off: Option<&'static str>,
+    pub off: Option<String>,
 }
 
 /// An automatic sign-in of a row that failed and stands on record (`logins.json`'s
@@ -527,7 +527,7 @@ pub struct CliAccounts {
     pub bot_check_at: Option<i64>,
     /// The switch that keeps aterm's own sign-ins off here, where one does
     /// ([`crate::harness::accounts_sync::sign_ins_off_for`]).
-    pub off: Option<&'static str>,
+    pub off: Option<String>,
 }
 
 impl CliAccounts {
@@ -845,6 +845,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
                 (&raw_roster, &logins),
                 m.now,
             )
+            .named
         }
         _ => std::collections::BTreeMap::new(),
     };
@@ -1345,6 +1346,7 @@ fn pool_for_with(
                     (&raw_roster, &logins),
                     m.now,
                 )
+                .named
             });
     let executable =
         |row: &accounts::Row| row.held_by.is_none() && state.execution_verdict(&row.label).is_ok();

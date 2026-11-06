@@ -14,6 +14,13 @@ mod convergence;
 #[path = "gap_heal_conformance_tests.rs"]
 mod gap_heal;
 
+#[path = "capacity_tests.rs"]
+mod capacity;
+
+/// One-mesh W3's tests of `log_entries/waiting.rs`, beside it, declared here for this lab.
+#[path = "log_entries/waiting_tests.rs"]
+mod waiting;
+
 /// Every clock in the log-derived envelope survives persistence, including maximum
 /// timestamps: every held record an epoch (a due, a seen and a wait clock each), and half of
 /// them `Remove`s instead (a removal clock each). The former 64 KiB reader refuses either file
@@ -1705,7 +1712,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
     assert!(restored_labels.contains(&label));
     assert!(restored_nodes.contains(&aterm_codec::hex::encode_lower(&node_key)));
 
-    let snapshot = roster::swarm_roster_for_denial_snapshot(m7)
+    let snapshot = roster::denial_swarm_roster(&Reads::new(m7))
         .unwrap()
         .unwrap();
     assert!(!snapshot.is_label_denied(&label));
@@ -3268,7 +3275,7 @@ fn passes(all: &[Paths], t0: u64, steps: u64) -> Vec<Record> {
 /// `[everyone]` is due a coalesce no writer waits on, and the heal owes m44 one `Wrap` of m22's
 /// head (m44's `Admit` is not in its past), after which S still sets the heads apart. Returns
 /// the lab, its seven Macs (m44 last), m44's recipient, the log's keyed records and the tender's
-/// bound on what the coalesce signs ([`log_entries::rekey_keyed_bound`]), the same before the
+/// bound on what the coalesce signs ([`log_entries::rekey_bound`]), the same before the
 /// heal and after.
 fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
     let lab = convergence::six();
@@ -3302,7 +3309,7 @@ fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
     let opened = log.open_audience_entries(&identity).unwrap().unwrap();
     let (_, me, _) = member_key(&lab.all[0]);
     let flight = log_entries::Flight::of_batch(&log, &opened, &me);
-    let bound = log_entries::rekey_keyed_bound(
+    let bound = log_entries::rekey_bound(
         &log,
         &opened,
         &flight,
@@ -3310,7 +3317,8 @@ fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
         &log.current_recipients(&EpochAudience::Everyone),
         &log.removed_recipients(),
         None,
-    );
+    )
+    .keyed;
     let keyed = log.counts().keyed;
     (lab, all, rec44, keyed, bound)
 }
@@ -4207,7 +4215,7 @@ fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
     let flight = log_entries::Flight::of_batch(&log, &opened, &me);
     let mut gone = log.removed_recipients();
     gone.insert(rec40);
-    let ring_bound = log_entries::rekey_keyed_bound(
+    let ring_bound = log_entries::rekey_bound(
         &log,
         &opened,
         &flight,
@@ -4215,7 +4223,8 @@ fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
         &BTreeSet::new(),
         &gone,
         None,
-    );
+    )
+    .keyed;
     assert!(ring_bound > 0);
 
     let keyed = log.counts().keyed;
@@ -4234,7 +4243,7 @@ fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
     macs.server.stop();
 }
 
-/// F21 and the planned cost ([`log_entries::rekey_keyed_bound`]): for an audience a Mac does not
+/// F21 and the planned cost ([`log_entries::rekey_bound`]): for an audience a Mac does not
 /// open whole, the bound counts the names it reads, its keyed tombstones, and each `Put` and
 /// `Delete` sealed under an epoch whose key it lacks, not every write the log ever held there. On
 /// m41 of the keyed split ([`keyed_split`]), which lacks the key of the uncovered keyed epoch E,
@@ -4267,7 +4276,7 @@ fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write()
     let flight = log_entries::Flight::of_batch(&log, &opened, &a41);
     let seats = log.current_recipients(&EpochAudience::Everyone);
     let removed = log.removed_recipients();
-    let bound = log_entries::rekey_keyed_bound(
+    let bound = log_entries::rekey_bound(
         &log,
         &opened,
         &flight,
@@ -4275,7 +4284,8 @@ fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write()
         &seats,
         &removed,
         None,
-    );
+    )
+    .keyed;
     let writes = log
         .records()
         .filter(|record| {

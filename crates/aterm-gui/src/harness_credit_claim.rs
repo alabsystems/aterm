@@ -37,8 +37,8 @@
 //! what it acts with in any mode; that rule judges any box Claude Code still raises. Its tab is
 //! named for its offer ([`worker_role`]) and its task ends in one of the two replies a managed
 //! Autopilot Land worker concludes on: claimed, which lands, or `Could not finish: NOT CLAIMED:`,
-//! which fails. Its tab is ephemeral, as every worker's is, so the reaper closes it once its task
-//! concluded ([`crate::worker_reaper`]); one whose task never concludes is ended once it has run
+//! which fails. Its tab remains after either conclusion. An unfinished claim worker, unless
+//! waiting at a quota wall, is ended once it has run
 //! [`WORKER_FOR`] since it started or a person last typed in its tab ([`ran_out`]): its program,
 //! where the program in front names itself the agent its record names, then its task, marked
 //! `exited`, which concludes it. A seamless update carries the task record that clock reads; any

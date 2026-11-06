@@ -106,6 +106,7 @@ pub fn read_owned(
         return read;
     }
     for op in ops {
+        let mut signer = None;
         for change in op
             .changes
             .iter()
@@ -116,7 +117,7 @@ pub fn read_owned(
                 continue;
             };
             let named = owner_of(collection, &change.key);
-            let signer = resolve(&op.roster, &op.actor);
+            let signer = *signer.get_or_insert_with(|| resolve(&op.roster, &op.actor));
             let n = value.get("n").and_then(Value::as_u64);
             let (Some(machine), Some(n)) = (named.filter(|m| Some(*m) == signer), n) else {
                 read.inert += 1;
@@ -182,6 +183,7 @@ pub fn read_log(
     }
     let mut seen = BTreeMap::<([u8; 16], u64), usize>::new();
     for op in ops {
+        let mut signer = None;
         for change in op
             .changes
             .iter()
@@ -197,7 +199,7 @@ pub fn read_log(
                 let n = text.parse::<u64>().ok()?;
                 Some((keys::parse_uuid32(uuid)?, n))
             });
-            let signer = resolve(&op.roster, &op.actor);
+            let signer = *signer.get_or_insert_with(|| resolve(&op.roster, &op.actor));
             let (Some((machine, n)), Some(value)) = (
                 parsed.filter(|(machine, _)| Some(*machine) == signer),
                 change.value.as_ref().filter(|v| bounded(collection, v)),
@@ -379,7 +381,7 @@ pub fn quota(table: &Table, ops: &[Op], merges: &[(Actor, u64)]) -> Quota {
     }
     let mut quota = Quota::default();
     for (actor, mut records) in by_writer {
-        records.sort();
+        records.sort_unstable();
         let mut spent = 0;
         for (sequence, id) in records {
             // The merges between this writer's previous business record and this one.

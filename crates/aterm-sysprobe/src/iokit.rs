@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IOKit and CoreFoundation declarations for reading macOS GPU and CPU IORegistry entries, and the GPU's user clients.
+//! IOKit and CoreFoundation declarations for reading macOS GPU, Neural Engine, CPU and block-storage IORegistry entries, and the GPU's user clients.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -85,6 +85,27 @@ unsafe extern "C" {
         mainPort: mach_port_t,
         matching: CFDictionaryRef,
     ) -> io_service_t;
+    /// Consumes `matching`; on success `existing` is a +1 iterator over every match.
+    pub fn IOServiceGetMatchingServices(
+        mainPort: mach_port_t,
+        matching: CFDictionaryRef,
+        existing: *mut io_iterator_t,
+    ) -> kern_return_t;
+    /// A +1 matching dictionary for the BSD device `bsdName` (`disk3s5`), consumed by
+    /// `IOServiceGetMatchingServices`.
+    pub fn IOBSDNameMatching(
+        mainPort: mach_port_t,
+        options: u32,
+        bsdName: *const c_char,
+    ) -> CFMutableDictionaryRef;
+    /// On success `iterator` is a +1 iterator over `entry`'s parents in `plane`.
+    pub fn IORegistryEntryGetParentIterator(
+        entry: io_registry_entry_t,
+        plane: *const c_char,
+        iterator: *mut io_iterator_t,
+    ) -> kern_return_t;
+    /// Whether `object` is an instance of `className` or of a subclass of it.
+    pub fn IOObjectConformsTo(object: io_object_t, className: *const c_char) -> boolean_t;
     pub fn IORegistryEntryFromPath(
         mainPort: mach_port_t,
         path: *const c_char,
@@ -153,6 +174,35 @@ unsafe extern "C" {
     ) -> Boolean;
     pub fn CFDataGetLength(theData: CFDataRef) -> CFIndex;
     pub fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+}
+
+// The calls a test makes to read a recorded registry entry (`ioreg -a`'s XML) back as the
+// CoreFoundation objects a live read gives.
+#[cfg(test)]
+opaque! { __CFError }
+
+/// `CFBase.h`: `unsigned long`.
+#[cfg(test)]
+pub type CFOptionFlags = usize;
+/// `CFPropertyList.h`: a `CFIndex` enum.
+#[cfg(test)]
+pub type CFPropertyListFormat = CFIndex;
+#[cfg(test)]
+pub type CFErrorRef = *mut __CFError;
+
+#[cfg(test)]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    /// A +1 `CFDataRef` holding a copy of `length` bytes, or NULL.
+    pub fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+    /// A +1 property list read from `data`, or NULL (`error`, where not NULL, is then +1).
+    pub fn CFPropertyListCreateWithData(
+        allocator: CFAllocatorRef,
+        data: CFDataRef,
+        options: CFOptionFlags,
+        format: *mut CFPropertyListFormat,
+        error: *mut CFErrorRef,
+    ) -> CFTypeRef;
 }
 
 // The calls a test makes to hold a power assertion of its own, which

@@ -1241,7 +1241,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(60);
             while sys.boundary.waiting() == 0 {
                 assert!(Instant::now() < deadline, "the sign-out never waited");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 count(sys, &clicking(item)),

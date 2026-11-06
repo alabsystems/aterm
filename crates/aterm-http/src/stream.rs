@@ -805,7 +805,7 @@ mod tests {
         let waited = Instant::now();
         while client.set_read_timeout(Some(HANG_DETECTOR)).is_ok() {
             assert!(waited.elapsed() < HANG_DETECTOR, "the reset never landed");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
 
         let mut stream = Stream::plain(

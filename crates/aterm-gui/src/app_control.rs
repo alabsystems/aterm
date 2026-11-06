@@ -1573,6 +1573,8 @@ mod tests {
                         }],
                     }),
                     grid: None,
+                    grid_reading: None,
+                    concealed: false,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: Some("Unknown config key…".to_string()),

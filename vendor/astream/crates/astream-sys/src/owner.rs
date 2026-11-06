@@ -4,8 +4,10 @@
 //! The cordoned Unix module: hand-declared FFI for the owner-only file rule (no libc
 //! dependency). `geteuid` on every Unix, and on Apple the four `<sys/acl.h>` calls that
 //! read a descriptor's extended access list. The `open` flags the rule opens with are
-//! plain per-OS numbers, kept here beside the calls they serve. Raw pointers stay inside
-//! this module: every function returns an owned value or `io::Result`.
+//! plain per-OS numbers, kept here beside the calls they serve. Off Apple it also holds
+//! the cordon's plain flush, `fsync` behind [`crate::plain_fsync`] (Apple's is the
+//! `apple` module's). Raw pointers stay inside this module: every function returns an
+//! owned value or `io::Result`.
 
 use std::ffi::c_int;
 #[cfg(target_vendor = "apple")]
@@ -15,6 +17,30 @@ use std::io;
 
 unsafe extern "C" {
     fn geteuid() -> u32;
+}
+
+#[cfg(not(target_vendor = "apple"))]
+unsafe extern "C" {
+    fn fsync(fd: c_int) -> c_int;
+}
+
+/// `fsync(fd)`, retried while it is interrupted (`EINTR`, [`crate::retried_on_eintr`]):
+/// the open file's writes, or a directory's entries, handed to the drive.
+/// [`crate::plain_fsync`] off Apple, the call `File::sync_all` makes there, on any
+/// descriptor rather than only a `File`'s.
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn plain_fsync(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let fd = fd.as_raw_fd();
+    crate::retried_on_eintr!({
+        // SAFETY: `fd` is a valid open descriptor, retained by a BorrowedFd for the call;
+        // `fsync` takes it by value and touches no memory.
+        if unsafe { fsync(fd) } == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 #[cfg(target_vendor = "apple")]

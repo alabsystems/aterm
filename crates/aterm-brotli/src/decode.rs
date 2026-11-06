@@ -315,6 +315,7 @@ impl<R: Read> Decoder<R> {
             State::Uncompressed { left } => {
                 let n = left.min(STEP_OUTPUT);
                 let Self { bits, out, .. } = self;
+                out.reserve(n);
                 bits.take_bytes(n, &mut |piece| out.extend_from_slice(piece))?;
                 self.total += n as u64;
                 self.track_context();
@@ -440,6 +441,7 @@ impl<R: Read> Decoder<R> {
         if insert > mb.left {
             return corrupt("an insert runs past its meta-block");
         }
+        self.out.reserve(insert);
         let (mut p1, mut p2) = (self.p1, self.p2);
         let mut mode = mb.modes[mb.literal.current as usize];
         let mut map = 64 * mb.literal.current as usize;

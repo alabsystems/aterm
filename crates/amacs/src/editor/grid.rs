@@ -29,7 +29,7 @@ use super::view::{
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, snapshot_for_view};
 use crate::input::{EditorInput, Reduction};
 use crate::language::Language;
-use crate::store::{DocumentSnapshot, DocumentStore, EditDelta, rebase_position};
+use crate::store::{Concealed, DocumentSnapshot, DocumentStore, EditDelta, rebase_position};
 use crate::table::{self, Delimiter, Table, TooLarge, Unwritable};
 
 /// What a key the open cell editor does not take says.
@@ -59,6 +59,19 @@ pub const ROW_JOINS_BREAKS: &str = "deleting this row would join the line break 
 
 /// What a copy or a cut of a cell with no value says.
 pub const EMPTY_CELL: &str = "The cell is empty: nothing to copy or cut";
+
+/// What a copy of a concealed cell says ([`Concealed`]): a status is read out to the window's
+/// readers, so it names no value.
+pub const COPIED_HIDDEN: &str = "Copied the hidden value";
+
+/// What the window's readers other than the person's eyes get in place of a concealed cell's
+/// value ([`Concealed`]; one-mesh design §4.8).
+pub const HIDDEN_VALUE: &str = "hidden value";
+
+/// Why a kill or copy of a concealed document's text was refused to input without clipboard
+/// authority ([`Concealed`]).
+pub const CONCEALED_STAYS: &str =
+    "A hidden value is copied or cut only on the person's own keystroke";
 
 /// The words for why `edit_cell` wrote nothing.
 const fn unwritable(why: Unwritable) -> &'static str {
@@ -614,6 +627,140 @@ pub fn project_grid(
         panel,
         problem_line: table.first_problem_line(text),
         draft: draft.cloned(),
+    }
+}
+
+/// What a grid's readers other than the person's eyes (the window's accessibility tree) get of
+/// one cell.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CellReading {
+    /// Its whole value.
+    Value(String),
+    /// The record has no cell there.
+    Missing,
+    /// Concealed ([`Concealed`]): read out as [`HIDDEN_VALUE`], never its value.
+    Hidden,
+}
+
+impl CellReading {
+    /// What a reader is told of the cell: its value, `empty`, `no cell`, or [`HIDDEN_VALUE`].
+    #[must_use]
+    pub fn words(&self) -> &str {
+        match self {
+            Self::Value(value) if value.is_empty() => "empty",
+            Self::Value(value) => value,
+            Self::Missing => "no cell",
+            Self::Hidden => HIDDEN_VALUE,
+        }
+    }
+}
+
+/// What a grid's readers other than the person's eyes get (one-mesh design §4.8): the table's
+/// shape, the shown columns' headers and the shown records' cells, each whole (the face clips
+/// them to its columns), and the current cell, every concealed one [`CellReading::Hidden`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GridReading {
+    /// The data records (the header row is not one) and the columns.
+    pub rows: usize,
+    pub columns: usize,
+    /// Each shown column: its index and its header (record 0).
+    pub headers: Vec<(usize, CellReading)>,
+    /// Each shown data record: its record number and a cell per shown column.
+    pub records: Vec<(usize, Vec<CellReading>)>,
+    /// The current cell: its record and column, its column's header, and the cell.
+    pub cursor_at: (usize, usize),
+    pub cursor_header: CellReading,
+    pub cursor: CellReading,
+}
+
+impl GridReading {
+    /// What a reader is told of the current cell: `Row 2, addr: ada@example.test`, the column
+    /// named by its number where its header is the cell itself, empty or hidden.
+    #[must_use]
+    pub fn cursor_words(&self) -> String {
+        let (record, column) = self.cursor_at;
+        let header = match &self.cursor_header {
+            CellReading::Value(header) if record > 0 => table::first_line(header).trim(),
+            _ => "",
+        };
+        let column = if header.is_empty() {
+            format!("column {}", column + 1)
+        } else {
+            header.to_string()
+        };
+        format!("Row {}, {column}: {}", record + 1, self.cursor.words())
+    }
+}
+
+/// Whether the cell at `record`, `column` of `table` (the scan of `text`) is concealed by
+/// `concealed`: every cell under [`Concealed::All`]; a data cell of a named column under
+/// [`Concealed::Columns`], a header never.
+#[must_use]
+pub fn cell_concealed(
+    concealed: Option<&Concealed>,
+    text: &str,
+    table: &Table,
+    record: usize,
+    column: usize,
+) -> bool {
+    let Some(concealed) = concealed else {
+        return false;
+    };
+    if record == 0 {
+        return concealed.headers();
+    }
+    let header = table
+        .cell(0, column)
+        .map_or(std::borrow::Cow::Borrowed(""), |cell| cell.value(text));
+    concealed.column(&header)
+}
+
+/// What a grid's readers get of `projection`, the grid laid out from `table` (the scan of
+/// `text`), under `concealed` ([`GridReading`]). The current cell reads its stored value, never
+/// an open editor's text.
+#[must_use]
+pub fn read_grid(
+    text: &str,
+    table: &Table,
+    projection: &GridProjection,
+    concealed: Option<&Concealed>,
+) -> GridReading {
+    let read = |record: usize, column: usize| {
+        if cell_concealed(concealed, text, table, record, column) {
+            CellReading::Hidden
+        } else {
+            table
+                .cell(record, column)
+                .map_or(CellReading::Missing, |cell| {
+                    CellReading::Value(cell.value(text).into_owned())
+                })
+        }
+    };
+    let shown = |record: usize| {
+        projection
+            .shown
+            .iter()
+            .map(|column| read(record, column.index))
+            .collect::<Vec<_>>()
+    };
+    let cursor_at = (projection.cursor.record, projection.cursor.column);
+    GridReading {
+        rows: projection.records.saturating_sub(1),
+        columns: projection.columns,
+        headers: projection
+            .shown
+            .iter()
+            .map(|column| column.index)
+            .zip(shown(0))
+            .collect(),
+        records: projection
+            .rows
+            .iter()
+            .map(|row| (row.record, shown(row.record)))
+            .collect(),
+        cursor_at,
+        cursor_header: read(0, cursor_at.1),
+        cursor: read(cursor_at.0, cursor_at.1),
     }
 }
 
@@ -1611,12 +1758,23 @@ impl EditorWorkspace {
         if value.is_empty() {
             return Ok(vec![EditorEffect::Status(EMPTY_CELL.to_string())]);
         }
-        let shown = table::clip(&value, 32);
+        // A status is read out to the window's readers: a concealed value is never quoted there.
+        let said = if cell_concealed(
+            store.concealed(view.document),
+            &snapshot.text,
+            &table,
+            record,
+            column,
+        ) {
+            COPIED_HIDDEN.to_string()
+        } else {
+            format!("Copied “{}”", table::clip(&value, 32))
+        };
         // A cell is a whole value: a copy never joins the kill before it.
         self.record_kill(value.clone(), None, false);
         *self.kills_mut().1 = Some(value);
         self.last_yank = None;
-        Ok(vec![EditorEffect::Status(format!("Copied “{shown}”"))])
+        Ok(vec![EditorEffect::Status(said)])
     }
 
     /// `kill-region` and `kill-line` (C-w, C-k, ⌘X): the current cell's value onto the kill ring,
@@ -1961,7 +2119,9 @@ fn draft_drop(view: &mut EditorBufferView) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{CloseWhy, Invocation, Keymap, Platform, READ_ONLY_DOCUMENT};
+    use crate::editor::{
+        CloseWhy, CommandAuthority, Invocation, Keymap, Platform, READ_ONLY_DOCUMENT,
+    };
     use crate::store::{DocumentId, DocumentViewId};
 
     /// Whether `effects` asks the host to close the view for `why`.
@@ -2875,6 +3035,201 @@ mod tests {
             Err(CELL_CHANGED.to_string())
         );
         assert_eq!(view.grid_draft().unwrap().text, "done!");
+    }
+
+    /// A revealed secret's grid, concealed by its `password` column: what its readers get holds
+    /// every address, every header and the table's shape, and no password, the current cell's
+    /// included; copying a password still copies it (the person's clipboard), and says so without
+    /// quoting it, while the kill ring every document yanks from keeps none of it and a macro's
+    /// replay copies nothing; copying an address quotes it, and the ring keeps that no more than a
+    /// password, since a private document's kills all stay off it. A document that conceals
+    /// everything hides the headers too, and a plain grid (nothing concealed) reads its passwords
+    /// out, so the search finds a value where one is.
+    /// NEGATIVE CONTROL: with `cell_concealed` answering `false` for a data cell, the reading
+    /// holds the passwords: `` a password reached the reading ``.
+    #[test]
+    fn a_concealed_grid_reads_out_no_secret_and_every_other_cell() {
+        const SECRETS: [&str; 2] = ["hunter2-Zq9", "s3cr3t-Wv7"];
+        let text = format!(
+            "addr,password,note\nada@example.test,{},first\nbob@example.test,{},second\n",
+            SECRETS[0], SECRETS[1]
+        );
+        let (mut store, mut workspace, mut view, document) = grid_editor(&text);
+        let password = Concealed::Columns(vec!["password".into()]);
+        store.set_concealed(document, password.clone()).unwrap();
+        goto(&mut store, &mut workspace, &mut view, 1, 1);
+        let snapshot = store.snapshot(document).unwrap();
+        let table = Table::scan(&snapshot.text, Delimiter::Comma).unwrap();
+        let projection = project_grid(&snapshot.text, &table, &view, 20, 80);
+        let holds = |reading: &GridReading, wanted: &str| format!("{reading:?}").contains(wanted);
+
+        let reading = read_grid(&snapshot.text, &table, &projection, Some(&password));
+        for secret in SECRETS {
+            assert!(!holds(&reading, secret), "a password reached the reading");
+        }
+        assert_eq!(reading.cursor, CellReading::Hidden);
+        assert_eq!(reading.cursor.words(), HIDDEN_VALUE);
+        assert_eq!((reading.rows, reading.columns), (2, 3));
+        for wanted in [
+            "addr",
+            "password",
+            "note",
+            "ada@example.test",
+            "bob@example.test",
+        ] {
+            assert!(holds(&reading, wanted), "{wanted} is read out: {reading:?}");
+        }
+        assert_eq!(
+            reading.records[0].1,
+            vec![
+                CellReading::Value("ada@example.test".into()),
+                CellReading::Hidden,
+                CellReading::Value("first".into()),
+            ]
+        );
+
+        let copied = press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('c', Modifiers::SUPER)],
+        );
+        assert!(
+            copied.iter().any(|effect| matches!(
+                effect,
+                EditorEffect::KillToClipboard { text } if text == SECRETS[0]
+            )),
+            "the person's copy holds the value: {copied:?}"
+        );
+        assert!(copied.contains(&EditorEffect::Status(COPIED_HIDDEN.to_string())));
+        assert!(!format!("{copied:?}").contains("Copied “"), "{copied:?}");
+        assert!(
+            !workspace.kill_ring.iter().any(|kill| kill == SECRETS[0]),
+            "the ring every document yanks from keeps no hidden value"
+        );
+        assert_eq!(workspace.grid_kill, None);
+        // A macro's replay is no keystroke of the person's: it copies no hidden value.
+        workspace.playing_macro = true;
+        let replayed = press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('c', Modifiers::SUPER)],
+        );
+        workspace.playing_macro = false;
+        assert!(
+            replayed.contains(&EditorEffect::Status(CONCEALED_STAYS.to_string())),
+            "{replayed:?}"
+        );
+        goto(&mut store, &mut workspace, &mut view, 1, 0);
+        let copied = press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('c', Modifiers::SUPER)],
+        );
+        assert!(
+            copied.contains(&EditorEffect::Status(
+                "Copied “ada@example.test”".to_string()
+            )),
+            "{copied:?}"
+        );
+        assert!(
+            copied.iter().any(|effect| matches!(
+                effect,
+                EditorEffect::KillToClipboard { text } if text == "ada@example.test"
+            )),
+            "{copied:?}"
+        );
+        assert!(
+            !workspace
+                .kill_ring
+                .iter()
+                .any(|kill| kill == "ada@example.test"),
+            "a private document's copies stay off the ring, its plain cells' included"
+        );
+
+        assert_eq!(
+            reading.cursor_words(),
+            format!("Row 2, password: {HIDDEN_VALUE}")
+        );
+
+        let all = read_grid(&snapshot.text, &table, &projection, Some(&Concealed::All));
+        assert!(
+            all.headers
+                .iter()
+                .map(|(_, header)| header)
+                .chain(all.records.iter().flat_map(|(_, cells)| cells))
+                .chain([&all.cursor, &all.cursor_header])
+                .all(|cell| *cell == CellReading::Hidden),
+            "{all:?}"
+        );
+        assert_eq!(
+            all.cursor_words(),
+            format!("Row 2, column 2: {HIDDEN_VALUE}")
+        );
+
+        let plain = read_grid(&snapshot.text, &table, &projection, None);
+        assert!(
+            SECRETS.iter().all(|secret| holds(&plain, secret)),
+            "a plain grid reads its passwords out"
+        );
+    }
+
+    /// Input without clipboard authority (in aterm, a control client's, an accessibility
+    /// client's or another process's posted keys) neither copies nor cuts a concealed
+    /// document's value, not even to a kill ring of its own, from which it could yank the value
+    /// where the window's readers read it; the cut it makes in a plain grid lands on that ring.
+    /// NEGATIVE CONTROL: with `execute_with` skipping its concealed check, C-k cuts the password
+    /// onto the guest's ring and the document loses it: `` the guest's cut ``.
+    #[test]
+    fn input_without_clipboard_authority_takes_no_concealed_value() {
+        const SECRET: &str = "hunter2-Zq9";
+        let text = format!("addr,password\nada@example.test,{SECRET}\n");
+        for concealed in [true, false] {
+            let (mut store, mut workspace, mut view, document) = grid_editor(&text);
+            if concealed {
+                store
+                    .set_concealed(document, Concealed::Columns(vec!["password".into()]))
+                    .unwrap();
+            }
+            goto(&mut store, &mut workspace, &mut view, 1, 1);
+            workspace.granted = vec![
+                CommandAuthority::Read,
+                CommandAuthority::Edit,
+                CommandAuthority::Save,
+            ];
+            let copied = press(
+                &mut store,
+                &mut workspace,
+                &mut view,
+                &[ch('c', Modifiers::SUPER)],
+            );
+            assert!(
+                !format!("{copied:?}").contains(SECRET),
+                "no copy without clipboard authority: {copied:?}"
+            );
+            let cut = press(
+                &mut store,
+                &mut workspace,
+                &mut view,
+                &[ch('k', Modifiers::CTRL)],
+            );
+            let guest_holds = workspace.guest_grid_kill.as_deref() == Some(SECRET)
+                || workspace.guest_kill_ring.iter().any(|kill| kill == SECRET);
+            assert_eq!(guest_holds, !concealed, "the guest's cut: {cut:?}");
+            assert_eq!(
+                store.snapshot(document).unwrap().text.contains(SECRET),
+                concealed,
+                "the guest's cut"
+            );
+            assert_eq!(
+                cut.contains(&EditorEffect::Status(CONCEALED_STAYS.to_string())),
+                concealed,
+                "{cut:?}"
+            );
+            assert!(workspace.kill_ring.is_empty(), "the person's ring");
+        }
     }
 
     #[test]

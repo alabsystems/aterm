@@ -2,8 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! Local GitHub bootstrap: git's HTTPS credential route (aterm's own helper, never the login
-//! keychain) and repositories. By default the first launch's own repository stage ([`native`]),
-//! which init.toml's `[github]` table scopes, turns off, or replaces with its own token source.
+//! keychain) and repositories. By default the first launch's own repository stage ([`native`])
+//! reads the private account and complete repository inventory from the vault's
+//! `github-repositories.json`, beside its development token. init.toml's `[github]` table
+//! scopes, turns off, or replaces the source with its own token source.
 //! Beside it, in every mode but off, [`keychain`] replaces the keychain block an earlier `aterm
 //! init` wrote, read from git's settings before any GitHub answer.
 
@@ -16,11 +18,18 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 mod credentials;
+mod dependencies;
+mod inventory;
 mod keychain;
 mod native;
 mod repos;
+mod source;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
+
+/// The private vault entries that determine default repository acquisition. Other vault
+/// entries must not invalidate a clone whose source and credential remain unchanged.
+pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", "github-repositories.json"];
 
 /// Whether the git every clone runs ([`crate::items::github::installed_git`]: the Command Line
 /// Tools', else Xcode's) is installed: the initial repositories wait on it
@@ -28,6 +37,41 @@ pub use native::InitialRepositoryInputs;
 #[must_use]
 pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
+}
+
+/// Whether repository setup uses the private vault inventory rather than an explicit profile.
+/// This reads only the local init profile, without credentials or GitHub requests.
+///
+/// # Errors
+/// The context or init profile cannot be admitted.
+pub fn uses_vault_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("repository inventory requires exactly one local user".into());
+    };
+    let table = profile(sys, user)?.and_then(|profile| profile.github);
+    Ok(matches!(asked(table, user)?, Asked::Default))
+}
+
+/// Count matching local checkouts against the private vault's complete inventory. No
+/// GitHub inventory, token, credential helper, or filesystem mutation is involved.
+/// An explicit GitHub profile leaves this default inventory out of its setup.
+///
+/// # Errors
+/// The local account, private inventory, or home cannot be admitted.
+pub(crate) fn inventory_counts(
+    sys: &dyn System,
+    ctx: &Ctx,
+) -> Result<Option<(usize, usize)>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("repository inventory requires exactly one local user".into());
+    };
+    let table = profile(sys, user)?.and_then(|profile| profile.github);
+    if !matches!(asked(table, user)?, Asked::Default) {
+        return Ok(None);
+    }
+    let listed = inventory::Inventory::read(sys, user)?.repositories()?;
+    let standing = repos::partition(sys, user, &listed.repositories)?;
+    Ok(Some((standing.present.len(), listed.repositories.len())))
 }
 
 /// Reconcile using locally captured inputs, checking their materialization
@@ -108,7 +152,7 @@ enum Asked {
     Profile(Github),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Github {
     pub account: String,
     pub owner: String,
@@ -235,7 +279,7 @@ pub(crate) struct TokenRead {
     /// Why a token file that is there cannot be used (not a regular file of the user's, a
     /// link, readable by others, or too long): what is wrong with it, in plain words.
     pub(crate) unusable: Option<String>,
-    /// A digest of init.toml, the token and whether git is installed, which moves when any of
+    /// A digest of init.toml, private repository metadata, the token and whether git is installed, which moves when any of
     /// them changes: a clone only a person could finish waits until it does. The token itself is
     /// not kept.
     pub(crate) mark: String,
@@ -270,6 +314,14 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
         _ => None,
     };
     let token = read.ok().map(zeroize::Zeroizing::new);
+    let inventory = sys
+        .read_owned_file(
+            &Path::new(&user.home).join(inventory::FILE),
+            user.uid,
+            inventory::MAX_BYTES,
+            true,
+        )
+        .unwrap_or_default();
     // Whether git is there is part of the mark: a step that stopped without it runs again once
     // the Command Line Tools bring it.
     let git = [u8::from(crate::items::github::installed_git(sys).is_some())];
@@ -277,6 +329,7 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
     for part in [
         config.as_slice(),
         token.as_ref().map_or(&[][..], |token| token.as_slice()),
+        inventory.as_slice(),
         &git[..],
     ] {
         digest.update((part.len() as u64).to_le_bytes());

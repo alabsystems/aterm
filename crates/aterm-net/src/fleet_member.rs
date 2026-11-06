@@ -74,6 +74,38 @@ pub const OFF_FILE: &str = "fleet-off";
 /// copy of the issuer's book is written whole at each read. An older aterm never reads it.
 pub const ANSWERED_FILE: &str = "fleet-answered";
 
+/// The vault this machine's fleet state — its key, its book and `[fleet] drive_from`'s grants —
+/// was taken under, in the state directory (`docs/DESIGN-fluid-swarm-2026-10-28.md` F17,
+/// `docs/KNOWN_ISSUES.md` ATERM-KI-1105-10): written in an init's take of its key, a join's take
+/// of aterm.toml, and an issuer's sync's take of the vault's default fleet again, and where none
+/// is there yet by the first writer that reads a vault configured ([`HeldBook::keep_vault`]),
+/// removed by a leave. What its lines mean is
+/// `aterm_agent::fleet_vault`'s: this crate stores and reads its text alone ([`read_vault`]). A
+/// file of its own, never a field of a book entry: the book refills from every member under the
+/// shared secret, and no entry another Mac sent names the vault this one took its fleet under.
+pub const VAULT_FILE: &str = "fleet-vault";
+
+/// The most bytes [`VAULT_FILE`] holds: a vault's name and the keys of its line.
+const VAULT_FILE_MAX: usize = 16 * 1024;
+
+/// The text of [`VAULT_FILE`] in `dir`, `None` where there is none.
+///
+/// # Errors
+/// It is there and cannot be read privately (another user's, open to others, a link, past
+/// [`VAULT_FILE_MAX`]), or it is not UTF-8.
+pub fn read_vault(dir: &Path) -> io::Result<Option<String>> {
+    match read_private(dir, VAULT_FILE, VAULT_FILE_MAX) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{VAULT_FILE} is not UTF-8"),
+            )
+        }),
+        Err(PrivateFileError::Missing) => Ok(None),
+        Err(e) => Err(io::Error::other(format!("{VAULT_FILE}: {e}"))),
+    }
+}
+
 /// How far past this machine's clock a time in [`ANSWERED_FILE`] may be and still read as an
 /// answer: each is written from that clock moments after it was taken, so one later than this
 /// was written before the clock stepped back (set by hand, a bad clock chip, a time-server
@@ -566,10 +598,12 @@ const NODE_SEED_LEN: usize = 32;
 /// With the mesh switch on every call takes the lock, since it rewrites the book's legacy node
 /// ids to key-derived principals.
 /// While the mesh switch is on, the node dials [`crate::fleet::ALPN_MESH`] first under the
-/// verdict this process provided ([`judge_mesh_by`]).
+/// verdict this process provided ([`judge_mesh_by`]), and notes each listener it proves there
+/// into the network place under `dir` ([`noting_in`]).
 pub fn node_identity(dir: &Path) -> io::Result<NodeIdentity> {
     let mesh = aterm_types::mesh_switch::MESH;
-    node_identity_with_mesh(dir, mesh).map(|me| dialing_by(me, mesh, MESH_VERDICT.get()))
+    node_identity_with_mesh(dir, mesh)
+        .map(|me| noting_in(dialing_by(me, mesh, MESH_VERDICT.get()), dir))
 }
 
 /// The verdict this process's dialers judge an [`crate::fleet::ALPN_MESH`] listener by: the
@@ -599,6 +633,20 @@ static UNKNOWN_TO: std::sync::OnceLock<fn(SocketAddr)> = std::sync::OnceLock::ne
 /// stands: `false` where one already did.
 pub fn on_unknown_to(offer: fn(SocketAddr)) -> bool {
     UNKNOWN_TO.set(offer).is_ok()
+}
+
+/// `me` noting each [`crate::fleet::ALPN_MESH`] listener it proves into the heard ledger of the
+/// network place under the state root `dir` ([`crate::fleet::heard::Heard::live`]) where it
+/// dials the mesh ([`dialing_by`]): every mesh handshake this process dials is a node-proven
+/// answer (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 B6). Elsewhere it notes nothing.
+fn noting_in(me: NodeIdentity, dir: &Path) -> NodeIdentity {
+    #[cfg(unix)]
+    if me.dials_mesh() {
+        return me.noting(Some(crate::fleet::heard::Heard::live(dir)));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    me
 }
 
 /// `me` dialing the mesh where the switch `mesh` is on and a verdict was provided.
@@ -640,7 +688,7 @@ fn node_identity_with_mesh(dir: &Path, mesh: bool) -> io::Result<NodeIdentity> {
 }
 
 /// This machine's node as [`NODE_FILE`] and [`NODE_KEY_FILE`] in `dir` hold it, never
-/// minted: `None` while either is missing. It dials as [`node_identity`]'s does.
+/// minted: `None` while either is missing. It dials, and notes, as [`node_identity`]'s does.
 pub fn read_node_identity(dir: &Path) -> io::Result<Option<NodeIdentity>> {
     let Some(node) = read_node_id(dir)? else {
         return Ok(None);
@@ -649,7 +697,7 @@ pub fn read_node_identity(dir: &Path) -> io::Result<Option<NodeIdentity>> {
     Ok(read_node_seed(dir)?
         .map(|seed| identity_of(&node, &seed))
         .transpose()?
-        .map(|me| dialing_by(me, mesh, MESH_VERDICT.get())))
+        .map(|me| noting_in(dialing_by(me, mesh, MESH_VERDICT.get()), dir)))
 }
 
 fn read_node_seed(dir: &Path) -> io::Result<Option<[u8; NODE_SEED_LEN]>> {
@@ -1717,11 +1765,14 @@ pub fn automatic_host(routes: [Option<IpAddr>; 3]) -> Option<String> {
 /// The private state file holding this node's chosen primary name.
 pub const NAME_FILE: &str = "fleet-name";
 
+/// The most [`NAME_FILE`] holds; a longer one holds no name.
+pub const NAME_FILE_MAX: usize = 64;
+
 /// Read this node's optional primary name from private local state.
 /// # Errors
 /// The file cannot be read privately, is not UTF-8, or contains an invalid name.
 pub fn read_primary_name(state: &Path) -> Result<Option<String>, String> {
-    let bytes = match read_private(state, NAME_FILE, 64) {
+    let bytes = match read_private(state, NAME_FILE, NAME_FILE_MAX) {
         Ok(bytes) => bytes,
         Err(PrivateFileError::Missing) => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -2292,7 +2343,7 @@ impl fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`OFF_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for at most two seconds ([`LOCK_WAIT`]; a debug build's test seams aside); aterm.toml's write lock, where `write` takes it, comes after it.
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`OFF_FILE`], [`VAULT_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for at most two seconds ([`LOCK_WAIT`]; a debug build's test seams aside); aterm.toml's write lock, where `write` takes it, comes after it.
 /// # Errors
 /// [`Unwritten::Lock`]: another writer holds the lock past its wait, the lock cannot be
 /// taken, or a leave's directory open to others cannot be narrowed; [`Unwritten::Moved`]:
@@ -2376,7 +2427,7 @@ fn unnamed_held(dir: &Path) -> Result<(Option<u32>, Option<BookLock>), Unwritten
     Ok((narrowed, lock))
 }
 
-/// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
+/// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`VAULT_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
 pub struct HeldBook<'a> {
     dir: &'a Path,
     held: Held,
@@ -2660,6 +2711,21 @@ impl HeldBook<'_> {
         }
     }
 
+    /// Keep `text` as the record of the vault this machine's fleet state was taken under
+    /// ([`VAULT_FILE`]), whole, or none for `None`.
+    /// # Errors
+    /// It is past [`VAULT_FILE_MAX`], or it cannot be written or removed.
+    pub fn keep_vault(&self, text: Option<&str>) -> io::Result<()> {
+        match text {
+            Some(text) if text.len() > VAULT_FILE_MAX => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{VAULT_FILE} would hold more than {VAULT_FILE_MAX} bytes"),
+            )),
+            Some(text) => write_private(self.dir, VAULT_FILE, text.as_bytes()),
+            None => self.remove(VAULT_FILE).map(|_| ()),
+        }
+    }
+
     /// Adopt, of `offered`, the fleet seeds members' book replies relayed in their trailers
     /// (`docs/DESIGN-machine-names-2026-11-04.md` §3.3), each one [`fleet_seed::judge`] takes
     /// over the seed held then, once it verifies under `mark`, the mark of the secret held here,
@@ -2669,7 +2735,10 @@ impl HeldBook<'_> {
     /// book names no issuer) adopts only a seed it minted, which another member can hold only
     /// when this root lost its file: another minter's is a conflict to it, held seed or none.
     /// Another minter's seed is refused, the last one recorded in [`fleet_seed::CONFLICT_FILE`]
-    /// at `now_ms`, once. A seed file that cannot be read stands; one that holds no seed is replaced.
+    /// at `now_ms`, once. A seed file that cannot be read stands; one that holds no seed is replaced,
+    /// and so is a held seed that no longer verifies under `mark` and the key bound to its minter
+    /// (a rekey whose root could not sign it again): it is no seed of this fleet's, so a member
+    /// takes the one its root holds now rather than keeping one nobody can sign for this secret.
     /// Returns the seed it adopted, if any.
     /// # Errors
     /// The seed or the record cannot be written.
@@ -2691,17 +2760,23 @@ impl HeldBook<'_> {
             Err(_) => return Ok(None),
         };
         let own = name_record::node_of(me.node());
-        let root = read_join_code(self.dir).is_ok() && !names_an_issuer(self.dir, Some(me.node()));
+        let root = self.is_root(me);
         let keys = Keyring::read(self.dir);
-        let (mut adopted, mut refused) = (None, None);
-        for seed in offered {
-            let mine = Some(seed.minter()) == own;
-            let key = if mine {
+        let key_of = |seed: &fleet_seed::FleetSeed| {
+            if Some(seed.minter()) == own {
                 Some(me.key())
             } else {
                 keys.bound(&name_record::node_word(seed.minter()))
-            };
-            if !key.is_some_and(|key| seed.verifies(&key, mark)) {
+            }
+        };
+        // A minter whose key is unbound here leaves its seed held: nothing shows it stale.
+        if held.is_some_and(|held| key_of(&held).is_some_and(|key| !held.verifies(&key, mark))) {
+            held = None;
+        }
+        let (mut adopted, mut refused) = (None, None);
+        for seed in offered {
+            let mine = Some(seed.minter()) == own;
+            if !key_of(&seed).is_some_and(|key| seed.verifies(&key, mark)) {
                 continue;
             }
             let judged = if root && !mine {
@@ -2731,6 +2806,65 @@ impl HeldBook<'_> {
             )?;
         }
         Ok(adopted)
+    }
+
+    /// On a root holding no fleet seed (`docs/DESIGN-machine-names-2026-11-04.md` §3.3: a fleet
+    /// founded before seeds, or a root whose file was lost), mint one for the fleet whose
+    /// secret's mark is `mark` once [`fleet_seed::UNHELD_WAIT_MS`] has passed since it first
+    /// found it held none, as [`fleet_seed::UNHELD_FILE`] records at `now_ms`. The wait runs only
+    /// in rounds that `read` a member's book, each of which relays the seed it minted before if
+    /// that member holds it ([`HeldBook::adopt_relayed_seed`]), so a root off its network, whose
+    /// dials all miss, neither starts the wait nor ends it; a second mint settles on the first by
+    /// [`fleet_seed::judge`]'s earlier rule. A held seed that no longer verifies under its own key
+    /// and `mark` is none. A member mints nothing, and a held seed drops the record. A seed file
+    /// it cannot read stands. Returns the seed it minted.
+    /// # Errors
+    /// The record or the seed cannot be written, or the CSPRNG cannot be read.
+    pub fn mint_unheld_seed(
+        &self,
+        me: &NodeIdentity,
+        mark: FleetMark,
+        (now_ms, read): (u64, bool),
+    ) -> io::Result<Option<fleet_seed::FleetSeed>> {
+        if !self.is_root(me) {
+            return Ok(None);
+        }
+        match fleet_seed::read(self.dir) {
+            Ok(Some(held)) if held.verifies(&me.key(), mark) => {
+                let _ = self.remove(fleet_seed::UNHELD_FILE);
+                return Ok(None);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(_) => return Ok(None),
+        }
+        if !read {
+            return Ok(None);
+        }
+        // A record from a later clock than this one's restarts the wait, so a clock set back
+        // never holds the mint off past one wait.
+        match fleet_seed::read_unheld(self.dir).filter(|since| *since <= now_ms) {
+            Some(since) if now_ms - since >= fleet_seed::UNHELD_WAIT_MS => {}
+            Some(_) => return Ok(None),
+            None => {
+                write_private(
+                    self.dir,
+                    fleet_seed::UNHELD_FILE,
+                    format!("{now_ms}\n").as_bytes(),
+                )?;
+                return Ok(None);
+            }
+        }
+        let seed = fleet_seed::FleetSeed::mint(me, mark, now_ms)?;
+        self.keep_seed(Some(&seed))?;
+        let _ = self.remove(fleet_seed::UNHELD_FILE);
+        Ok(Some(seed))
+    }
+
+    /// Whether `me` is the fleet's root here: it holds the join code, which only `init` and its
+    /// own rekey write, and its book names no issuer (§3.3).
+    fn is_root(&self, me: &NodeIdentity) -> bool {
+        read_join_code(self.dir).is_ok() && !names_an_issuer(self.dir, Some(me.node()))
     }
 
     /// Remove the state directory's file `name`: whether it was there.
@@ -4969,6 +5103,17 @@ pub fn heartbeat_members_while(
                     .iter()
                     .filter_map(|(_, fetched, _)| fetched.as_ref()?.seed),
                 now,
+            );
+            // A root holding none mints once its wait over rounds that read its members' books,
+            // none of which relayed its seed, is over (machine names §3.3); the next round's
+            // readers adopt it.
+            let _ = book.mint_unheld_seed(
+                me,
+                secret.mark(),
+                (
+                    now,
+                    answered.iter().any(|(_, fetched, _)| fetched.is_some()),
+                ),
             );
             Ok(true)
         },

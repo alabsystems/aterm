@@ -477,10 +477,21 @@ const INTERNAL_TOKENS: &[&str] = &[
 /// Whether the name-token fallback drops `name` as an internal bin.
 #[must_use]
 pub fn looks_internal(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let tokens: Vec<&str> = lower.split(['-', '_']).collect();
-    tokens.iter().any(|t| INTERNAL_TOKENS.contains(t))
-        || (tokens.len() > 1 && (tokens[0] == "gen" || tokens[tokens.len() - 1] == "gen"))
+    let mut first_gen = false;
+    let mut last_gen = false;
+    let mut count = 0usize;
+    for t in name.split(['-', '_']) {
+        if INTERNAL_TOKENS.iter().any(|w| t.eq_ignore_ascii_case(w)) {
+            return true;
+        }
+        let is_gen = t.eq_ignore_ascii_case("gen");
+        if count == 0 {
+            first_gen = is_gen;
+        }
+        last_gen = is_gen;
+        count += 1;
+    }
+    count > 1 && (first_gen || last_gen)
 }
 
 /// Choose what ships and what is shimmed: the declared `expose` ∪ `bundle` (every name of which must have built), else every bin the name-token fallback keeps.

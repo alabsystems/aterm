@@ -41,9 +41,15 @@ pub(super) fn rewrite(stage: &Path, version: &str) -> Result<()> {
             )));
         }
         let rendered = literals(text, &prefix, perl)?;
-        let levels = rel.parent().map_or(0, |parent| parent.components().count());
-        let parent = (0..levels).map(|_| "..").collect::<Vec<_>>().join("/");
         let setup = if perl {
+            let levels = rel.parent().map_or(0, |parent| parent.components().count());
+            let mut parent = String::with_capacity(levels.saturating_mul(3));
+            for i in 0..levels {
+                if i > 0 {
+                    parent.push('/');
+                }
+                parent.push_str("..");
+            }
             format!(
                 "BEGIN {{ require Cwd; require File::Basename; $ENV{{ATERM_GIT_ROOT}} = Cwd::abs_path(File::Basename::dirname(__FILE__) . '/{parent}'); }}\n"
             )

@@ -3973,8 +3973,11 @@ pub(super) struct St {
     pub(super) native_prepare: String,
     /// Persisted before any native dispatch; terminal receipts never restore raw fallback.
     pub(super) native_coordination: bool,
-    /// A positive NotGranted retirement preserves the owed recipe, never a launch grant.
+    pub(super) native_record: super::native_record::Baseline,
+    /// A NotGranted retirement, never a launch grant.
     pub(super) native_retired_unissued: bool,
+    /// Unconfirmed account successor; the original binding and recipe remain above.
+    pub(super) native_account_candidate: Option<super::native_account_handoff::Pending>,
     /// Completed data is never an active grant; later crash entry mints a new operation.
     pub(super) native_completed_prepare: Option<Box<super::native_act::Prepare>>,
     pub(super) native_observation: Option<super::native_observe::SavedObservation>,
@@ -4496,7 +4499,10 @@ impl St {
         now: u64,
     ) -> (St, Retarget) {
         if let Some(old) = prior.as_ref().filter(|old| {
-            old.native_retired_unissued || old.native.is_some() || !old.native_prepare.is_empty()
+            old.native_retired_unissued
+                || old.native_account_candidate.is_some()
+                || old.native.is_some()
+                || !old.native_prepare.is_empty()
         }) {
             let mut kept = old.clone();
             kept.native_coordination = true;
@@ -4505,6 +4511,7 @@ impl St {
         let native_coordination = prior
             .as_ref()
             .is_some_and(super::native_restart::coordinated);
+        let native_record = prior.as_ref().map(|st| st.native_record.clone());
         let left = prior
             .as_ref()
             .map(|p| p.left_typed.clone())
@@ -4686,6 +4693,9 @@ impl St {
             None => (St::fresh(from, to, who, now), Retarget::Anew),
         };
         st.native_coordination |= native_coordination;
+        if let Some(native_record) = native_record {
+            st.native_record = native_record;
+        }
         if st.left_typed.is_empty() {
             st.left_typed = left;
         }
@@ -4796,6 +4806,7 @@ impl St {
             return;
         }
         st.native_coordination |= super::native_restart::coordinated(self);
+        st.native_record = self.native_record.clone();
         if self.agent == st.agent
             && let Some(failed) = self
                 .carried_failed_start()
@@ -4811,6 +4822,7 @@ impl St {
             return;
         }
         st.native_coordination |= super::native_restart::coordinated(self);
+        st.native_record = self.native_record.clone();
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
             st.request_tab.clone_from(&self.request_tab);
@@ -4848,7 +4860,10 @@ impl St {
         )
     )]
     fn preserve_unresolved_native(&self, st: &mut St) -> bool {
-        if !self.native_retired_unissued && self.native.is_none() && self.native_prepare.is_empty()
+        if !self.native_retired_unissued
+            && self.native_account_candidate.is_none()
+            && self.native.is_none()
+            && self.native_prepare.is_empty()
         {
             return false;
         }
@@ -4860,6 +4875,9 @@ impl St {
     }
 
     fn new_round(&mut self, now: u64) {
+        if self.native_retired_unissued || self.native_account_candidate.is_some() {
+            return;
+        }
         self.account_intent = None;
         self.back_account_intent = None;
         if self.pending_since == 0 {
@@ -5112,11 +5130,21 @@ impl St {
         if self.native_rollback {
             o.insert("native_rollback".into(), Value::Bool(true));
         }
-        if self.native_coordination || self.native_retired_unissued {
+        if super::native_restart::coordinated(self) {
             o.insert("native_coordination".into(), Value::Bool(true));
+            o.insert(
+                "native_generation".into(),
+                Value::from(super::native_record::generation(self)),
+            );
+            if let Some(id) = super::native_record::write_id(self) {
+                o.insert("native_write_id".into(), Value::from(id));
+            }
         }
-        if self.native_retired_unissued {
+        if self.native_retired_unissued || self.native_account_candidate.is_some() {
             o.insert("native_retired_unissued".into(), Value::Bool(true));
+        }
+        if let Some(candidate) = &self.native_account_candidate {
+            candidate.write_into(&mut o);
         }
         if let Some(encoded) = self
             .native_completed_prepare
@@ -5304,6 +5332,14 @@ impl St {
             project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeAccountClientSlot",
+            action = "Reload",
+            project = "aterm_agent::harness::native_account_handoff::tests::transition"
+        )
+    )]
     pub(super) fn from_json(text: &str) -> Option<St> {
         let v: Value = aterm_json::from_str(text).ok()?;
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -5344,6 +5380,7 @@ impl St {
             _ => n("relaunched_at"),
         };
         let mut st = St {
+            native_record: super::native_record::Baseline::default(),
             phase,
             from: s("from"),
             to: s("to"),
@@ -5369,10 +5406,18 @@ impl St {
                 || v.get("native_id").is_some()
                 || v.get("native_completed_prepare").is_some()
                 || v.get("native_observation").is_some()
+                || v.get("native_account_candidate").is_some()
+                || v.get("native_generation").is_some()
+                || v.get("native_write_id").is_some()
+                || v.get("native_rollback").and_then(Value::as_bool) == Some(true)
                 || v.get("native_retired_unissued").and_then(Value::as_bool) == Some(true),
             native_retired_unissued: v
                 .get("native_retired_unissued")
-                .map_or(Some(false), Value::as_bool)?,
+                .map_or(Some(false), Value::as_bool)?
+                || v.get("native_account_candidate").is_some(),
+            native_account_candidate: v
+                .get("native_account_candidate")
+                .map(super::native_account_handoff::Pending::read),
             native_completed_prepare: match v.get("native_completed_prepare") {
                 None => None,
                 Some(value) => {
@@ -5572,6 +5617,18 @@ impl St {
         if v.get("notices").is_none() {
             st.notices = upgrade_status::round_notices(&st.phase, &st.streak_why, st.stop_streak);
         }
+        let generation = v.get("native_generation").map_or(Some(0), Value::as_u64)?;
+        let write_id = match v.get("native_write_id") {
+            None => None,
+            Some(value) => {
+                let id = value.as_str()?;
+                if generation == 0 || !aterm_codec::hex::is_lower(id, 32) {
+                    return None;
+                }
+                Some(id.to_owned())
+            }
+        };
+        super::native_record::loaded(&st, generation, write_id);
         Some(st)
     }
 
@@ -6127,7 +6184,20 @@ fn forget_settled_pending(
     if opts.dry_run {
         return None;
     }
-    remove(opts, session);
+    if super::native_restart::coordinated(st) {
+        if st.native.is_some()
+            || !st.native_prepare.is_empty()
+            || st.native_account_candidate.is_some()
+        {
+            return None;
+        }
+        let mut closed = st.clone();
+        closed.phase = Phase::Done;
+        closed.done_at = now;
+        save_checked(opts, session, &closed).ok()?;
+    } else {
+        remove(opts, session);
+    }
     (!model_only(st)).then(|| st.clone())
 }
 
@@ -6207,9 +6277,8 @@ pub(super) fn registry_graph() -> Option<PathBuf> {
     .map(|dir| dir.join("graph"))
 }
 
-pub(super) fn sat_a_week(entry: &std::fs::DirEntry, now: u64) -> bool {
-    entry
-        .metadata()
+pub(super) fn sat_a_week(path: &Path, now: u64) -> bool {
+    std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file)
         .and_then(|m| m.modified().ok())
@@ -6245,7 +6314,7 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
         let Some(id) = name.and_then(|name| name.strip_suffix(".json")) else {
             continue;
         };
-        if live.contains(id) || !sat_a_week(&entry, now) {
+        if live.contains(id) || !sat_a_week(&path, now) {
             continue;
         }
         let Some(st) = read_record_text(&path)
@@ -6260,8 +6329,12 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
                 .agent_records(&opts.home)
                 .session_files()
                 .is_none_or(|files| conversation_live(&files, id));
-        if driven_here(st.agent) && settled(&st) && !held_elsewhere {
-            remove(opts, id);
+        if driven_here(st.agent)
+            && settled(&st)
+            && !super::native_restart::coordinated(&st)
+            && !held_elsewhere
+        {
+            prune_if_unchanged(opts, id, &st, now);
         }
     }
 }
@@ -6321,7 +6394,25 @@ pub(super) fn save(opts: &Opts, session: &str, st: &St) {
 /// the directory must be private and success includes its durability barrier.
 /// An error may follow rename, so retain the transition and retry it.
 pub(super) fn save_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+    if opts.dry_run {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dry-run cannot acknowledge a native record save",
+        ));
+    }
     record::save_at_checked(opts, session, st, now_s())
+}
+
+/// Restore request metadata without reporting new progress. Native records
+/// still require a successful durability barrier before this returns.
+pub(super) fn restore_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+    if opts.dry_run {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dry-run cannot acknowledge a native record restore",
+        ));
+    }
+    record::restore_checked(opts, session, st)
 }
 
 pub(super) fn build_starts(
@@ -6347,6 +6438,54 @@ pub(super) fn build_proved(
 mod record {
     use super::{Opts, St};
     use std::path::Path;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum WriteKind {
+        Save,
+        CheckedSave,
+        Restore,
+        CheckedRestore,
+    }
+
+    #[derive(Debug)]
+    struct OtherAgentRecord;
+
+    impl std::fmt::Display for OtherAgentRecord {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("record belongs to an unsupported non-native agent")
+        }
+    }
+
+    impl std::error::Error for OtherAgentRecord {}
+
+    fn lock(opts: &Opts, session: &str) -> std::io::Result<aterm_uds::file_lock::LockFile> {
+        let dir = super::ensure_upgrade_tree(&opts.state, None)?;
+        aterm_uds::file_lock::LockFile::take(
+            &dir.join(format!("{session}.lock")),
+            std::time::Instant::now(),
+            "native session record is held",
+        )
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeAccountClientSlot",
+            action = "StaleSave",
+            project = "aterm_agent::harness::native_account_handoff::tests::transition"
+        )
+    )]
+    fn check_pending(previous: Option<&St>, next: &St) -> std::io::Result<()> {
+        if previous.is_some_and(|previous| {
+            !super::super::native_account_handoff::preserves_pending(previous, next)
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "native account candidate requires exact recovery",
+            ));
+        }
+        Ok(())
+    }
 
     fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -6411,25 +6550,64 @@ mod record {
         false
     }
 
-    pub(in super::super) fn load(opts: &Opts, session: &str) -> Option<St> {
-        load_checked(opts, session).ok().flatten()
-    }
-
-    fn load_checked(opts: &Opts, session: &str) -> std::io::Result<Option<St>> {
+    pub(in super::super) fn load_record(opts: &Opts, session: &str) -> std::io::Result<Option<St>> {
         let Some(dir) = super::check_upgrade_tree(&opts.state, None)? else {
             return Ok(None);
         };
-        Ok(
-            super::read_record_text(&dir.join(format!("{session}.json")))?
-                .and_then(|text| St::from_json(&text)),
-        )
+        match super::read_record_text(&dir.join(format!("{session}.json")))? {
+            None => Ok(None),
+            Some(text) => St::from_json(&text).map(Some).ok_or_else(|| {
+                if other_non_native_agent(&text) {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, OtherAgentRecord)
+                } else {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "existing session record is unreadable",
+                    )
+                }
+            }),
+        }
+    }
+
+    fn other_non_native_agent(text: &str) -> bool {
+        let Ok(value) = aterm_json::from_str::<aterm_json::Value>(text) else {
+            return false;
+        };
+        let Some(agent) = value.get("agent").and_then(aterm_json::Value::as_str) else {
+            return false;
+        };
+        if super::upgrade::Agent::parse(agent).is_some_and(|agent| {
+            super::super::lanes::lanes(agent.program()) != super::super::lanes::Lanes::NONE
+        }) {
+            return false;
+        }
+        // Unknown agents still quarantine if any native authority or debt may
+        // be present. Empty strings/false flags carry no native operation.
+        ![
+            "native_id",
+            "native_cap",
+            "native_completed_prepare",
+            "native_observation",
+            "native_account_candidate",
+            "native_generation",
+            "native_write_id",
+        ]
+        .iter()
+        .any(|key| value.get(key).is_some())
+            && [
+                "native_coordination",
+                "native_retired_unissued",
+                "native_rollback",
+            ]
+            .iter()
+            .all(|key| value.get(key).is_none_or(|v| v.as_bool() == Some(false)))
+            && value
+                .get("native_prepare")
+                .is_none_or(|v| v.as_str() == Some(""))
     }
 
     pub(in super::super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
-        let _ = save_at_with(opts, session, st, now, |opts, session, out| {
-            write_verbatim(opts, session, out);
-            Ok(())
-        });
+        let _ = save_at_with(opts, session, st, now, WriteKind::Save);
     }
 
     pub(in super::super) fn save_at_checked(
@@ -6438,27 +6616,90 @@ mod record {
         st: &St,
         now: u64,
     ) -> std::io::Result<()> {
-        save_at_with(opts, session, st, now, write_verbatim_checked)
+        save_at_with(opts, session, st, now, WriteKind::CheckedSave)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "AttemptBefore",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "AttemptAfter",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "Rival",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "Retry",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "LateRetry",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeWriteIdentity",
+            action = "Fresh",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::identity::transition"
+        )
+    )]
     fn save_at_with(
         opts: &Opts,
         session: &str,
         st: &St,
         now: u64,
-        writer: impl FnOnce(&Opts, &str, &St) -> std::io::Result<()>,
+        kind: WriteKind,
     ) -> std::io::Result<()> {
         if opts.dry_run {
             return Ok(());
         }
+        // Atomic rename protects readers, but not two read/modify/write callers.
+        // A separate stable inode serializes every producer of this record.
+        let _held = lock(opts, session)?;
         let key = st.progress_key();
-        let on_disk = load_checked(opts, session)?;
+        let on_disk = load_record(opts, session)?;
         let mut out = st.clone();
-        match &on_disk {
-            Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
-            _ => out.progress_at = now,
+        // Match the serializer's conservative interpretation before capturing
+        // the acknowledged baseline.
+        out.native_retired_unissued |= out.native_account_candidate.is_some();
+        out.native_coordination |= super::super::native_restart::coordinated(st)
+            || on_disk
+                .as_ref()
+                .is_some_and(super::super::native_restart::coordinated);
+        check_pending(on_disk.as_ref(), &out)?;
+        super::super::native_record::check(on_disk.as_ref(), st, &out)?;
+        let restoring = matches!(kind, WriteKind::Restore | WriteKind::CheckedRestore);
+        if !restoring {
+            match &on_disk {
+                Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
+                _ => out.progress_at = now,
+            }
+            out.progress_key = key;
         }
-        out.progress_key = key;
         let kept = on_disk
             .is_none()
             .then(|| kept_move(opts, session))
@@ -6489,19 +6730,53 @@ mod record {
             until.retain(|(tab, _)| out.tabs.contains(tab));
             out.tabs_until = until;
         }
-        writer(opts, session, &out)?;
-        super::build_start::note(opts, session, on_disk.as_ref(), st, now);
+        // A status rewrite must not weaken a previously acknowledged native
+        // record, including a transition that clears its last native field.
+        write_record(
+            opts,
+            session,
+            &out,
+            on_disk.as_ref(),
+            matches!(kind, WriteKind::CheckedSave | WriteKind::CheckedRestore),
+        )?;
+        super::super::native_record::acknowledge(st, &out);
+        if !restoring {
+            super::build_start::note(opts, session, on_disk.as_ref(), st, now);
+        }
         Ok(())
     }
 
-    fn write_verbatim(opts: &Opts, session: &str, st: &St) {
-        if opts.dry_run {
-            return;
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeAccountClientSlot",
+            action = "Rewrite",
+            project = "aterm_agent::harness::native_account_handoff::tests::transition"
+        )
+    )]
+    fn write_record(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+        previous: Option<&St>,
+        checked: bool,
+    ) -> std::io::Result<()> {
+        if checked
+            || super::super::native_restart::coordinated(st)
+            || previous.is_some_and(super::super::native_restart::coordinated)
+        {
+            write_verbatim_checked(opts, session, st)
+        } else {
+            write_verbatim(opts, session, st)
         }
-        let Ok(dir) = super::ensure_upgrade_tree(&opts.state, None) else {
-            return;
-        };
-        let _ = replace_text(&dir.join(format!("{session}.json")), &st.to_json());
+    }
+
+    fn write_verbatim(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+        if opts.dry_run {
+            return Ok(());
+        }
+        let dir = super::ensure_upgrade_tree(&opts.state, None)?;
+        replace_text(&dir.join(format!("{session}.json")), &st.to_json())
     }
 
     fn write_verbatim_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
@@ -6510,15 +6785,19 @@ mod record {
         }
         let dir = super::ensure_upgrade_tree(&opts.state, None)?;
         let name = format!("{session}.json");
+        let text = st.to_json();
+        if super::super::native_restart::coordinated(st) {
+            super::super::native_record::validate_encoding(st, &text)?;
+        }
         #[cfg(unix)]
         {
-            aterm_journal::write_private_durable(&dir, &name, st.to_json().as_bytes())
+            aterm_journal::write_private_durable(&dir, &name, text.as_bytes())
         }
         #[cfg(not(unix))]
         {
             // Keep the existing portable replacement route, returning its
             // failure to the checked caller instead of hiding it.
-            crate::harness::upgrade_models::write_atomic(&dir.join(name), &st.to_json())
+            crate::harness::upgrade_models::write_atomic(&dir.join(name), &text)
         }
     }
 
@@ -6527,32 +6806,126 @@ mod record {
             return;
         }
         match prior {
-            Some(st) => write_verbatim(opts, session, st),
+            Some(st) => {
+                let _ = restore_record(opts, session, st);
+            }
             None => remove(opts, session),
         }
     }
 
+    fn restore_record(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
+        save_at_with(opts, session, st, super::now_s(), WriteKind::Restore)
+    }
+
+    pub(in super::super) fn restore_checked(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+    ) -> std::io::Result<()> {
+        save_at_with(opts, session, st, super::now_s(), WriteKind::CheckedRestore)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeRecord",
+            action = "Remove",
+            project = "aterm_agent::harness::native_account_handoff::tests::record_tests::transition"
+        )
+    )]
     pub(in super::super) fn remove(opts: &Opts, session: &str) {
+        remove_when(opts, session, |_, _| true);
+    }
+
+    pub(in super::super) fn prune_if_unchanged(
+        opts: &Opts,
+        session: &str,
+        expected: &St,
+        now: u64,
+    ) {
+        let expected = expected.to_json();
+        remove_when(opts, session, |disk, path| {
+            disk.to_json() == expected && super::sat_a_week(path, now)
+        });
+    }
+
+    fn remove_when(opts: &Opts, session: &str, eligible: impl FnOnce(&St, &Path) -> bool) {
         if opts.dry_run {
             return;
         }
-        if let Some(disk) = load(opts, session) {
+        let Ok(_held) = lock(opts, session) else {
+            return;
+        };
+        let Ok(previous) = load_record(opts, session) else {
+            return;
+        };
+        let Ok(Some(dir)) = super::check_upgrade_tree(&opts.state, None) else {
+            return;
+        };
+        let path = dir.join(format!("{session}.json"));
+        if let Some(disk) = previous {
+            if super::super::native_restart::coordinated(&disk) || !eligible(&disk, &path) {
+                return;
+            }
             keep_move(opts, session, &disk);
         }
-        if let Ok(Some(dir)) = super::check_upgrade_tree(&opts.state, None) {
-            let _ = std::fs::remove_file(dir.join(format!("{session}.json")));
-        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(all(test, unix))]
     pub(in super::super) fn write_verbatim_for_test(opts: &Opts, session: &str, st: &St) {
-        write_verbatim(opts, session, st);
+        let _ = write_verbatim(opts, session, st);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(in super::super) fn ordinary_write_for_test(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+        restore: bool,
+    ) -> std::io::Result<()> {
+        if restore {
+            restore_record(opts, session, st)
+        } else {
+            save_at_with(opts, session, st, super::now_s(), WriteKind::Save)
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(in super::super) fn native_writer_for_test(
+        opts: &Opts,
+        session: &str,
+        st: &St,
+        previous: Option<&St>,
+        best_effort: bool,
+    ) -> std::io::Result<()> {
+        if best_effort {
+            let dir = super::ensure_upgrade_tree(&opts.state, None)?;
+            aterm_uds::private_file::write_private(
+                &dir,
+                &format!("{session}.json"),
+                st.to_json().as_bytes(),
+            )
+        } else {
+            write_record(opts, session, st, previous, false)
+        }
     }
 }
 
 #[cfg(all(test, unix))]
 use record::write_verbatim_for_test as write_verbatim;
-pub(super) use record::{kept_move, load, remove, restore, save_at};
+pub(super) use record::{kept_move, load_record, prune_if_unchanged, remove, restore, save_at};
+
+/// Read an expected-readable unit-test fixture through the production decoder.
+///
+/// # Panics
+/// The fixture exists but cannot be read as a valid record.
+#[cfg(test)]
+pub(super) fn load(opts: &Opts, session: &str) -> Option<St> {
+    load_record(opts, session).expect("read the fixture record")
+}
+#[cfg(all(test, unix))]
+pub(super) use record::{native_writer_for_test, ordinary_write_for_test};
 
 pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
     if opts.dry_run {
@@ -7211,7 +7584,7 @@ pub fn conversation_typed(
     session: Option<&str>,
     extra: &[String],
 ) -> std::io::Result<Vec<approvals::Typed>> {
-    let record = session.and_then(|s| load(opts, s));
+    let record = session.map(|s| load_record(opts, s)).transpose()?.flatten();
     typed_through(opts, tab, session, record.as_ref(), extra, &[])
 }
 
@@ -7221,7 +7594,7 @@ pub(super) fn conversation_typed_by(
     session: &str,
     st: &St,
 ) -> std::io::Result<Vec<approvals::Typed>> {
-    let record = load(opts, session);
+    let record = load_record(opts, session)?;
     typed_through(
         opts,
         tab,
@@ -7399,7 +7772,7 @@ pub(super) fn lefts_through(
     let Some(root) = opts.aterm_state.as_deref() else {
         return Ok(Vec::new());
     };
-    let record = load(opts, session);
+    let record = load_record(opts, session)?;
     let mut lefts = Vec::new();
     for t in tabs_through(root, tab, record.as_ref(), &st.tabs)? {
         if let Some(key) =
@@ -8694,7 +9067,9 @@ impl Homes {
     pub(super) fn of_records(opts: &Opts, sessions: &std::collections::BTreeSet<String>) -> Self {
         let mut homes = Homes::default();
         for session in sessions {
-            if let Some(st) = load(opts, session).filter(|st| st.home.is_some()) {
+            if let Ok(Some(st)) = load_record(opts, session)
+                && st.home.is_some()
+            {
                 homes.add(&opts.home, st.agent_records(&opts.home));
             }
         }
@@ -8790,8 +9165,15 @@ fn due_among(
     let targets = std::cell::OnceCell::new();
     let mctx = std::cell::OnceCell::new();
     let unanswered = std::cell::Cell::new(false);
+    let unread_record = std::cell::Cell::new(false);
     let wants = |sf: &SessionFile| {
-        let prior = load(opts, &sf.session_id);
+        let prior = match load_record(opts, &sf.session_id) {
+            Ok(prior) => prior,
+            Err(_) => {
+                unread_record.set(true);
+                return false;
+            }
+        };
         if prior.as_ref().is_some_and(|st| st.native_retired_unissued) {
             return false;
         }
@@ -8801,7 +9183,11 @@ fn due_among(
         unanswered.set(!wanted && tg.unanswered);
         wanted
     };
-    match tab_agent(tab, files, tabs, wants, read_args, read_group, read_ids) {
+    let found = tab_agent(tab, files, tabs, wants, read_args, read_group, read_ids);
+    if unread_record.get() {
+        return Due::Unread(UNREAD_SAVED_RECORD);
+    }
+    match found {
         TabAgent::Claimed(_) => Due::Yes,
         TabAgent::Nothing if unanswered.get() => Due::Unread(UNREAD_VERSION),
         TabAgent::Nothing => Due::No,
@@ -8894,6 +9280,9 @@ pub enum Due {
 pub const UNREAD_SOCKET: &str = "no-socket";
 /// [`Due::Unread`]'s word for a look that found no record of the tab's agent among Claude Code's session records while it may still be written.
 pub const UNREAD_RECORD: &str = "no-record";
+
+/// An existing record is unreadable and cannot authorize a restart.
+pub const UNREAD_SAVED_RECORD: &str = "record-unreadable";
 /// [`Due::Unread`]'s word for a look that could not read the tab agent's process whole, for Claude Code and Codex alike.
 pub const UNREAD_PROCESS: &str = "no-process";
 /// [`Due::Unread`]'s word for a look that could not read Claude Code's session records whole.
@@ -9012,7 +9401,9 @@ fn mint_behind(
     let Some(target) = upgrade::choose_target(&running, &targets.for_session(native)) else {
         return false;
     };
-    let prior = load(opts, &sf.session_id);
+    let Ok(prior) = load_record(opts, &sf.session_id) else {
+        return false;
+    };
     if let Some(st) = prior
         .as_ref()
         .filter(|st| !behind_anew(st, &target.version))
@@ -9325,6 +9716,7 @@ pub fn hold_clock(opts: &Opts, until: u64) -> bool {
     let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return true;
     };
+    let mut complete = true;
     for e in dir.flatten() {
         let path = e.path();
         if path.extension().is_none_or(|x| x != "json") {
@@ -9333,13 +9725,17 @@ pub fn hold_clock(opts: &Opts, until: u64) -> bool {
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        if let Some(mut st) = load(opts, &session).filter(|st| st.tab == tab)
+        let Ok(record) = load_record(opts, &session) else {
+            complete = false;
+            continue;
+        };
+        if let Some(mut st) = record.filter(|st| st.tab == tab)
             && st.hold_clock(until)
         {
             save(opts, &session, &st);
         }
     }
-    true
+    complete
 }
 
 /// Maximum consecutive looks the upgrade waits for background work under its own gate.
@@ -9717,13 +10113,20 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
             tabs,
             |sf, tab| {
                 let tg = targets.get_or_init(|| Targets::read(opts));
-                opts.only_sid.as_deref().is_none_or(|only| only == tab)
-                    && (needs_upgrade_inspection(sf, tg, load(opts, &sf.session_id).as_ref())
-                        || model_wants_a_look(
-                            opts,
-                            sf,
-                            mctx.get_or_init(|| ModelCtx::read(opts, tg)),
-                        ))
+                if opts.only_sid.as_deref().is_some_and(|only| only != tab) {
+                    return false;
+                }
+                match load_record(opts, &sf.session_id) {
+                    Err(_) => true,
+                    Ok(prior) => {
+                        needs_upgrade_inspection(sf, tg, prior.as_ref())
+                            || model_wants_a_look(
+                                opts,
+                                sf,
+                                mctx.get_or_init(|| ModelCtx::read(opts, tg)),
+                            )
+                    }
+                }
             },
             atpkg::caller_shell::process_args,
             process_group,
@@ -9851,7 +10254,9 @@ pub fn retarget_pending_for_test(
     proc_start: &str,
 ) -> Result<(), &'static str> {
     let _held = sweep_lock(opts)?;
-    let prior = load(opts, session).ok_or("no-record")?;
+    let prior = load_record(opts, session)
+        .map_err(|_| UNREAD_SAVED_RECORD)?
+        .ok_or("no-record")?;
     if prior.phase != Phase::Pending || prior.source != "managed" {
         return Err("not-pending-managed");
     }
@@ -9908,8 +10313,10 @@ pub fn in_flight(opts: &Opts) -> Vec<String> {
                 return None;
             }
             let session = path.file_stem()?.to_string_lossy().into_owned();
-            let st =
-                load(opts, &session).filter(|st| st.in_flight() && !st.native_retired_unissued)?;
+            let st = load_record(opts, &session)
+                .ok()
+                .flatten()
+                .filter(|st| st.in_flight() && !st.native_retired_unissued)?;
             let ours =
                 opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) && lane_on(opts, st.agent);
             ours.then_some(session)
@@ -9924,7 +10331,7 @@ pub fn in_flight(opts: &Opts) -> Vec<String> {
 pub fn in_flight_agent(opts: &Opts) -> Option<upgrade::Agent> {
     in_flight(opts)
         .first()
-        .and_then(|session| load(opts, session))
+        .and_then(|session| load_record(opts, session).ok().flatten())
         .map(|st| st.agent)
 }
 
@@ -10100,7 +10507,10 @@ fn visit_models(
     if let Err(why) = preliminary_unique_owner(initial_files, sf) {
         return said(r, format!("wait:{why}"));
     }
-    let mut prior = load(opts, &sf.session_id);
+    let mut prior = match load_record(opts, &sf.session_id) {
+        Ok(prior) => prior,
+        Err(_) => return said(r, format!("wait:{UNREAD_SAVED_RECORD}")),
+    };
     if prior.as_ref().is_some_and(|st| st.native_retired_unissued) {
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
@@ -11488,7 +11898,11 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        let Some(mut st) = load(opts, &session).filter(St::in_flight) else {
+        let Some(mut st) = load_record(opts, &session)
+            .ok()
+            .flatten()
+            .filter(St::in_flight)
+        else {
             continue;
         };
         if !driven_here(st.agent) {
@@ -12655,7 +13069,11 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        let Some(mut st) = load(opts, &session).filter(St::confirming) else {
+        let Some(mut st) = load_record(opts, &session)
+            .ok()
+            .flatten()
+            .filter(St::confirming)
+        else {
             continue;
         };
         if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {

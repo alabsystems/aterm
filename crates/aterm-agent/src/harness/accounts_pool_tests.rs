@@ -2205,7 +2205,7 @@ fn a_default_row_a_sign_in_moved_is_named_as_moved_on_a_program_that_ignores_cod
     assert!(crate::harness::accounts_sync::accounts_sync_off(Some(
         &config
     )));
-    assert!(crate::harness::accounts_sync::sign_ins_off(&config).is_some());
+    assert!(!crate::harness::accounts_sync::harness_sign_ins_on(&config));
 
     let world = World::new("unlisted-default");
     let work = world.work_dir(Cli::Codex);

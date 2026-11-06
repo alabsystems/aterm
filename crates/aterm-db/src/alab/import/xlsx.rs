@@ -198,15 +198,17 @@ fn shared(strings: &str) -> Result<Vec<String>> {
 
 /// The 0-based column of a cell reference (`C7` is 2), where it names one within [`MAX_COLS`].
 fn column_of(reference: &str) -> Option<usize> {
-    let letters = reference
-        .bytes()
-        .take_while(u8::is_ascii_alphabetic)
-        .collect::<Vec<u8>>();
+    let bytes = reference.as_bytes();
+    let len = bytes
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(bytes.len());
+    let letters = &bytes[..len];
     if letters.is_empty() || letters.len() > 3 {
         return None;
     }
     let mut col = 0usize;
-    for letter in letters {
+    for &letter in letters {
         col = col
             .checked_mul(26)?
             .checked_add(usize::from(letter.to_ascii_uppercase() - b'A') + 1)?;
@@ -215,11 +217,33 @@ fn column_of(reference: &str) -> Option<usize> {
     (col < MAX_COLS).then_some(col)
 }
 
+#[derive(Clone, Copy, Default)]
+enum CellKind {
+    Shared,
+    Inline,
+    Bool,
+    Error,
+    #[default]
+    Other,
+}
+
+impl CellKind {
+    fn from_attr(attr: Option<&str>) -> Self {
+        match attr.unwrap_or("n") {
+            "s" => Self::Shared,
+            "inlineStr" => Self::Inline,
+            "b" => Self::Bool,
+            "e" => Self::Error,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// One cell being read.
 #[derive(Default)]
 struct CellRead {
     col: usize,
-    kind: String,
+    kind: CellKind,
     value: String,
     inline: String,
 }
@@ -276,7 +300,7 @@ fn cells(sheet: &str, strings: &[String], name: &str) -> Result<Vec<(usize, usiz
                     }
                     let read = CellRead {
                         col,
-                        kind: tag.attr("t").unwrap_or("n").to_owned(),
+                        kind: CellKind::from_attr(tag.attr("t")),
                         ..CellRead::default()
                     };
                     if !tag.empty {
@@ -325,8 +349,8 @@ fn cells(sheet: &str, strings: &[String], name: &str) -> Result<Vec<(usize, usiz
 
 /// A read cell's text.
 fn text_of(mut read: CellRead, strings: &[String]) -> Result<String> {
-    let text = match read.kind.as_str() {
-        "s" => {
+    let text = match read.kind {
+        CellKind::Shared => {
             let index = read
                 .value
                 .trim()
@@ -338,15 +362,15 @@ fn text_of(mut read: CellRead, strings: &[String]) -> Result<String> {
                 .cloned()
                 .ok_or_else(|| bad("points a cell past its shared strings"))?
         }
-        "inlineStr" => std::mem::take(&mut read.inline),
-        "b" => match read.value.trim() {
+        CellKind::Inline => std::mem::take(&mut read.inline),
+        CellKind::Bool => match read.value.trim() {
             "1" => "1".to_owned(),
             _ => "0".to_owned(),
         },
         // An error cell (`#N/A`) says nothing the import reads.
-        "e" => String::new(),
+        CellKind::Error => String::new(),
         // A number, a date serial or a formula's cached string, as stored.
-        _ => std::mem::take(&mut read.value),
+        CellKind::Other => std::mem::take(&mut read.value),
     };
     read.value.zeroize();
     read.inline.zeroize();

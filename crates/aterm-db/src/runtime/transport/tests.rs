@@ -114,7 +114,7 @@ fn accept_ready(listener: &Listener) -> Connection {
         match listener.accept() {
             Ok(connection) => return connection,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {
-                thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             Err(error) => panic!("{error}"),
         }
@@ -1611,7 +1611,7 @@ fn a_peer_that_refuses_its_connections_is_dialed_later_each_time() {
                 .all(|worker| worker.task.is_finished())
             {
                 assert!(Instant::now() < until, "a refused dial did not finish");
-                thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             // Reaped at the same virtual instant: the next dial is due only after its wait.
             transport.tick(at).unwrap();
@@ -1650,7 +1650,7 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
     while !transport.workers.is_empty() {
         transport.tick(Instant::now()).unwrap();
         assert!(Instant::now() < until, "failed worker did not finish");
-        thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(
         transport

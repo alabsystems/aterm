@@ -463,6 +463,8 @@ pub struct VmCounters {
     pub compressions: u64,
     /// Pages read in from files (`pageins`).
     pub pageins: u64,
+    /// The VM page size the page counts are in, bytes.
+    pub page_bytes: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -519,6 +521,7 @@ pub(crate) fn memory_detail_of(
             decompressions: p.decompressions,
             compressions: p.compressions,
             pageins: p.pageins,
+            page_bytes,
         }),
         kernel_available_pct: None,
     }

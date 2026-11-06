@@ -127,10 +127,15 @@ impl StandIn {
     /// # Panics
     /// When the test binary cannot be spawned.
     pub(crate) fn spawn(mut self) -> Running {
+        // std's spawn copies every descriptor not yet marked close-on-exec. Holding the spawn lock
+        // across it, a socket another test's thread makes through `aterm_uds::kept_out` is marked
+        // before the stand-in can copy it, so a listener that test closes stops answering then.
+        let spawning = aterm_uds::spawn_lock::spawning();
         let child = self
             .command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn `{}` {}: {e}", self.test, self.how));
+        drop(spawning);
         Running {
             test: self.test,
             how: self.how,
@@ -482,6 +487,57 @@ mod tests {
 
     /// The stand-in role of [`a_stand_in_that_readied_then_ended_between_two_looks_readied`].
     const ROLE: &str = "ATERM_TEST_ALONE_READIED_THEN_ENDED";
+
+    /// The stand-in role of [`a_stand_in_s_spawn_waits_for_a_kept_out_socket_s_mark`].
+    #[cfg(target_vendor = "apple")]
+    const SPAWN_ROLE: &str = "ATERM_TEST_ALONE_SPAWN_WAITS";
+
+    /// A stand-in's spawn takes the spawn lock (`aterm_uds::spawn_lock`): started while a socket
+    /// made through `aterm_uds::kept_out` is between its creation and its mark, it waits for the
+    /// mark, so the stand-in never holds a copy of that socket.
+    ///
+    /// NEGATIVE CONTROL: without the hold in [`StandIn::spawn`], the stand-in starts while the
+    /// socket is unmarked, and the first assertion in the wait fails.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_stand_in_s_spawn_waits_for_a_kept_out_socket_s_mark() {
+        use std::sync::mpsc;
+        if std::env::var_os(SPAWN_ROLE).is_some() {
+            return;
+        }
+        let hang = aterm_spec::wait::MUST_HAPPEN;
+        let (created_tx, created) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let creator = std::thread::spawn(move || {
+            aterm_uds::kept_out(|| {
+                let pair = std::os::unix::net::UnixStream::pair()?;
+                created_tx.send(()).expect("the test listens");
+                go_rx
+                    .recv_timeout(hang)
+                    .expect("the test lets the mark happen");
+                Ok::<_, std::io::Error>(pair)
+            })
+            .expect("a kept-out pair")
+        });
+        created.recv_timeout(hang).expect("the pair is created");
+        let mut stand_in = StandIn::this_test();
+        stand_in.command().env(SPAWN_ROLE, "1");
+        let spawner = std::thread::spawn(move || stand_in.spawn());
+        let waits = aterm_spec::wait::within(hang, std::time::Duration::from_millis(1), || {
+            assert!(
+                !spawner.is_finished(),
+                "the stand-in started while a kept-out socket was unmarked"
+            );
+            aterm_uds::spawn_lock::seam::spawn_waits(spawner.thread().id()).then_some(())
+        });
+        assert!(
+            waits.is_some(),
+            "the stand-in's spawn never reached the lock"
+        );
+        go.send(()).expect("the creator waits");
+        drop(creator.join().expect("the creator"));
+        Running::passed(spawner.join().expect("the spawner"));
+    }
 
     /// A stand-in that readied the caller and then ended, both between the
     /// wait's first look at `ready` and its look at the stand-ins, readied it:

@@ -20,13 +20,15 @@
 //!     its typing to that act, the turn above the composer unchanged ([`judge_draft`]);
 //!   - `switch-flip`: Land then Off within [`FLIP_WITHIN_MS`]: nothing typed, past the
 //!     back-off's due ([`judge_flip`]);
-//!   - `switch-over-held`: held at the same reply under Cruise, past its looks in front switched
-//!     to Land by `meta set`, no person's (limit 1: nothing typed), back to Cruise, then by the
-//!     person's press of Land on Settings ▸ Harness's SESSIONS row ([`press`], meta
-//!     `autopilot_by=human:settings`), their turn (v6 §14.17 item 3): land@v1 once, opened by the
-//!     why quoting the held reply, `status land_asked=switch` and the state line's
-//!     [`acts::SWITCH_ASKED`] while its answer is out, held again at the same answer and nothing
-//!     typed past it ([`judge_over_held`], [`asked_line`]);
+//!   - `switch-over-held`: its replies repeated under Cruise ([`repeat_of`]: Cruise's wait before
+//!     its request for a different approach since the continuous-forward design of 2026-11-01,
+//!     or an older build's hold), switched to Land by `meta set`, no person's (limit 1: nothing
+//!     typed; Land holds there), back to Cruise, then by the person's press of Land on Settings ▸
+//!     Harness's SESSIONS row ([`press`], meta `autopilot_by=human:settings`), their turn (v6
+//!     §14.17 item 3), all before Cruise's request falls due: land@v1 once, opened by the why
+//!     quoting the repeated reply, `status land_asked=switch` and the state line's
+//!     [`acts::SWITCH_ASKED`] while its answer is out, held by Land at the same answer and
+//!     nothing typed past it ([`judge_over_held`], [`asked_line`]);
 //!   - `switch-busy`: switched [`BUSY_SWITCH_MS`] into a long busy turn: nothing typed mid-turn,
 //!     land@v1 within [`BUSY_LAND_MS`] of the turn's point ([`judge_busy`]);
 //!   - `command-draft` (no switch, v6 §14.17.5.8): a person's command ([`command_draft`]: a typed
@@ -51,11 +53,11 @@ use aterm_agent::supervise::policy::turn_end;
 use aterm_agent::supervise::tape::show::Typed;
 use aterm_agent::supervise::tape::{show, store, text};
 
-use super::surfaces::held::{arm_of, is_stall, stall_of};
+use super::surfaces::held::{arm_of, is_stall};
 use super::surfaces::{Ctx, compose, observed, page_field};
 use super::{
     AT_DONE_MS, Chain, Harness, Line, Scenario, Seen, Tab, Verdict, act_rule, at, at_composer,
-    backoff_due, backoff_named, backoff_streak, idle_words, on, word,
+    backoff_due, backoff_named, backoff_streak, idle_words, on, recovery_wait, word,
 };
 use crate::Fail;
 use crate::door::{Door, Reply};
@@ -150,8 +152,9 @@ pub const BUSY_SWITCH_MS: i64 = 5_000;
 /// How soon after the busy turn's point land@v1 comes.
 pub const BUSY_LAND_MS: i64 = 3_000;
 
-/// How long past its hold `switch-over-held` is switched: past both of its looks in front
-/// ([`super::surfaces::held::HELD_LOOKS_MS`]), which read the hold's words under Cruise.
+/// How long past its repeat ([`repeat_of`]) `switch-over-held` is switched: well inside Cruise's
+/// wait before its request (the ladder's step for three short turns, 8 min), with time for the
+/// state line to say the repeat.
 pub const HELD_SWITCH_MS: i64 = 50_000;
 
 /// How long past the switch a read may still show the words from before it: the loop's one-second
@@ -1107,6 +1110,27 @@ pub fn judge_flip(seen: &Seen, t0: i64) -> Verdict {
     verdict(&said, &bad)
 }
 
+/// THE REPEAT `switch-over-held` SWITCHES OVER: the first point from `t0` its replies repeated at
+/// under Cruise, the loop's wait before its request for a different approach
+/// ([`recovery_wait`]), or on a build that held Cruise there (ruling F, before the
+/// continuous-forward design of 2026-11-01) its hold. The replies hold the same reply at it
+/// (`TurnEndState::held_by`), so the person's switch to Land there is their switch over a held
+/// tab (v6 §14.17 item 3), though Cruise goes on.
+#[must_use]
+pub fn repeat_of(seen: &Seen, t0: i64) -> Option<&Line> {
+    seen.journal
+        .iter()
+        .find(|(t, l)| *t >= t0 && (recovery_wait(l) || is_stall(l)))
+}
+
+/// Whether `journal`, a session's `drive/<sid>.journal.jsonl` text, holds `switch-over-held`'s
+/// repeat point ([`repeat_of`]: Cruise's recovery wait, or an older build's hold): what
+/// `autopilot-captures`' switch-asked scene waits for before the person's switch to Land.
+#[must_use]
+pub fn repeat_journaled(journal: &str) -> bool {
+    super::parse_journal_lines(journal).any(|(_, l)| recovery_wait(&l) || is_stall(&l))
+}
+
 /// The person's switch to Land after the hold at `ts`: the first of the lab's presses from it on.
 fn press_after(seen: &Seen, ts: i64) -> Option<&Switched> {
     seen.cover.words.iter().find(|w| w.at > ts && w.person)
@@ -1127,20 +1151,19 @@ fn held_reply(seen: &Seen, ts: i64) -> Option<&str> {
         .next_back()
 }
 
-/// SWO: a tab held under Cruise (ruling F's same reply), switched to Land past its looks in front
-/// by `meta set` and back to Cruise, then by the person's press, its stand-in giving Land's one ask
-/// the same reply (v6 §14.17 item 3): nothing typed between the hold and the person's press, the
-/// switch no person made included (limit 1); its wake journaled within [`WAKE_WITHIN_MS`]; one
-/// land@v1 within
-/// [`LAND_WITHIN_MS`] of it, opened by the switch's why (`You stopped at: “…”`) quoting the held
-/// reply; `status land_asked=switch` read while its answer was out; held again at that answer
-/// (`kind=stalled`); and nothing typed past it, watched [`WATCH_MS`] past the second hold, every
-/// `status` from [`SWITCH_SETTLE_MS`] past it saying the hold's arm (`held=`) and no ask
+/// SWO: a tab whose replies repeated under Cruise ([`repeat_of`]), switched to Land by `meta set`
+/// and back to Cruise, then by the person's press, its stand-in giving Land's one ask the same
+/// reply (v6 §14.17 item 3): nothing typed between the repeat and the person's press, the switch
+/// no person made included (limit 1); its wake journaled within [`WAKE_WITHIN_MS`]; one land@v1
+/// within [`LAND_WITHIN_MS`] of it, opened by the switch's why (`You stopped at: “…”`) quoting
+/// the repeated reply; `status land_asked=switch` read while its answer was out; held by Land at
+/// that answer (`kind=stalled`); and nothing typed past it, watched [`WATCH_MS`] past that hold,
+/// every `status` from [`SWITCH_SETTLE_MS`] past it saying the hold's arm (`held=`) and no ask
 /// (`land_asked=-`).
 #[must_use]
 pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
-    let Some((ts, sl)) = stall_of(seen, t0) else {
-        return Verdict::Unobserved(format!("no hold within {}", at(t0, seen.end_ms)));
+    let Some((ts, sl)) = repeat_of(seen, t0) else {
+        return Verdict::Unobserved(format!("no repeated reply within {}", at(t0, seen.end_ms)));
     };
     if let Some(v) = untaken(seen, t0) {
         return v;
@@ -1153,21 +1176,20 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
         .collect();
     let Some(cl) = ctl.iter().find(|w| w.word == "land") else {
         return Verdict::Unobserved(format!(
-            "held at +{}, but no switch to Land by `meta set` was made",
+            "repeated at +{}, but no switch to Land by `meta set` was made",
             at(t0, *ts)
         ));
     };
     let Some(sw) = press_after(seen, cl.at) else {
         return Verdict::Unobserved(format!(
-            "held at +{}, switched to Land by `meta set` at +{}, but the person's switch was \
+            "repeated at +{}, switched to Land by `meta set` at +{}, but the person's switch was \
              never made",
             at(t0, *ts),
             at(t0, cl.at)
         ));
     };
-    let arm = arm_of(sl);
     let mut said = vec![
-        format!("held at +{} ({})", at(t0, *ts), one_line(sl, 110)),
+        format!("repeated at +{} ({})", at(t0, *ts), one_line(sl, 110)),
         format!(
             "`meta set` {} (no person's)",
             ctl.iter()
@@ -1190,7 +1212,7 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
     }
     let before = acts_between(seen, *ts, cl.at);
     if !before.is_empty() {
-        bad.push(format!("typed after the hold: {}", named(&before, t0)));
+        bad.push(format!("typed after the repeat: {}", named(&before, t0)));
     }
     let after = acts_between(seen, sw.at, i64::MAX);
     let Some(&ask) = after.first() else {
@@ -1252,6 +1274,7 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
         at(t0, *th),
         one_line(hl, 110)
     ));
+    let arm = arm_of(hl);
     let asking = observed(&seen.status, &seen.status_reads, ta, *th);
     if asking.is_empty() {
         bad.push("no `status` read while the ask stood".into());
@@ -1325,8 +1348,8 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
 /// past the second hold on leads with the hold's stop again ([`stop_words`]' line).
 #[must_use]
 pub fn asked_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let Some((ts, sl)) = stall_of(seen, cx.t0) else {
-        return Verdict::Unobserved("no hold before the switch".into());
+    let Some((ts, _)) = repeat_of(seen, cx.t0) else {
+        return Verdict::Unobserved("no repeated reply before the switch".into());
     };
     let Some(sw) = press_after(seen, *ts) else {
         return Verdict::Unobserved("the person's switch was never made".into());
@@ -1337,7 +1360,7 @@ pub fn asked_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some(ta) = acts_between(seen, sw.at, i64::MAX).first().map(|(t, _)| *t) else {
         return Verdict::Fail("NO ASK: nothing typed after the switch".into());
     };
-    let Some((th, _)) = held_again(seen, ta) else {
+    let Some((th, hl)) = held_again(seen, ta) else {
         return Verdict::Unobserved("not held again after the ask".into());
     };
     let w = &seen.window;
@@ -1366,7 +1389,7 @@ pub fn asked_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         };
     };
     // Held again under Land: no switch to make, so the stop names none.
-    let lead = stop_words(arm_of(sl), StopForm::Line, false);
+    let lead = stop_words(arm_of(hl), StopForm::Line, false);
     let again = lines(th + SWITCH_SETTLE_MS, seen.end_ms + 1);
     if let Some((t, l)) = again.iter().find(|(_, l)| !l.starts_with(&lead)) {
         return Verdict::Fail(format!(
@@ -1605,9 +1628,9 @@ pub(in crate::forever) fn word_step(
             set(door, tab, &["land", "off"]);
         }
         Chain::SwitchOverHeld => {
-            // `meta set`'s Land HELD_SWITCH_MS past the hold, its Cruise CTL_WATCH_MS later, then
-            // the person's press of Land.
-            let held = stall_of(s, tab.t0).map(|(t, _)| *t);
+            // `meta set`'s Land HELD_SWITCH_MS past the repeat, its Cruise CTL_WATCH_MS later,
+            // then the person's press of Land.
+            let held = repeat_of(s, tab.t0).map(|(t, _)| *t);
             match s.cover.words.as_slice() {
                 [] if held.is_some_and(|t| now >= t + HELD_SWITCH_MS) => {
                     set(door, tab, &["land"]);

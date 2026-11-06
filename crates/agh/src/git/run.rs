@@ -744,39 +744,59 @@ mod unix {
     /// and a config-based hook (`hook.<name>.command`), which git 2.54 runs from the clone's
     /// config whatever `core.hooksPath` says.
     pub(super) fn rewrites(key: &str) -> bool {
-        let key = key.to_ascii_lowercase();
-        let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+        let (section, rest) = key.split_once('.').unwrap_or((key, ""));
         let (sub, var) = match rest.rsplit_once('.') {
             Some((sub, var)) => (Some(sub), var),
             None => (None, rest),
         };
-        match section {
-            "url" => sub.is_some() && matches!(var, "insteadof" | "pushinsteadof"),
-            "http" | "credential" | "include" | "includeif" | "protocol" | "bundle" | "hook" => {
-                true
-            }
-            "fetch" => var == "bundleuri" && sub.is_none(),
-            "remote" => {
-                sub.is_some_and(|name| name.contains([':', '/']))
-                    || (sub.is_some()
-                        && matches!(
-                            var,
-                            "proxy"
-                                | "pushurl"
-                                | "uploadpack"
-                                | "receivepack"
-                                | "promisor"
-                                | "partialclonefilter"
-                        ))
-            }
-            "core" => {
-                matches!(
+        let is = |s: &str, list: &[&str]| list.iter().any(|w| s.eq_ignore_ascii_case(w));
+        if section.eq_ignore_ascii_case("url") {
+            sub.is_some() && is(var, &["insteadof", "pushinsteadof"])
+        } else if is(
+            section,
+            &[
+                "http",
+                "credential",
+                "include",
+                "includeif",
+                "protocol",
+                "bundle",
+                "hook",
+            ],
+        ) {
+            true
+        } else if section.eq_ignore_ascii_case("fetch") {
+            sub.is_none() && var.eq_ignore_ascii_case("bundleuri")
+        } else if section.eq_ignore_ascii_case("remote") {
+            sub.is_some_and(|name| name.contains([':', '/']))
+                || (sub.is_some()
+                    && is(
+                        var,
+                        &[
+                            "proxy",
+                            "pushurl",
+                            "uploadpack",
+                            "receivepack",
+                            "promisor",
+                            "partialclonefilter",
+                        ],
+                    ))
+        } else if section.eq_ignore_ascii_case("core") {
+            sub.is_none()
+                && is(
                     var,
-                    "sshcommand" | "gitproxy" | "fsmonitor" | "hookspath" | "alternaterefscommand"
-                ) && sub.is_none()
-            }
-            "extensions" => matches!(var, "worktreeconfig" | "partialclone") && sub.is_none(),
-            _ => false,
+                    &[
+                        "sshcommand",
+                        "gitproxy",
+                        "fsmonitor",
+                        "hookspath",
+                        "alternaterefscommand",
+                    ],
+                )
+        } else if section.eq_ignore_ascii_case("extensions") {
+            sub.is_none() && is(var, &["worktreeconfig", "partialclone"])
+        } else {
+            false
         }
     }
 

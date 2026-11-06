@@ -164,9 +164,11 @@ impl SheetKind {
     pub fn detect(headers: &[String]) -> Option<Self> {
         let has = |name: &str| headers.iter().any(|h| h.trim().eq_ignore_ascii_case(name));
         let starts = |name: &str| {
-            headers
-                .iter()
-                .any(|h| h.trim().to_ascii_lowercase().starts_with(name))
+            headers.iter().any(|h| {
+                let t = h.trim();
+                t.get(..name.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(name))
+            })
         };
         if has("email address") {
             Some(Self::Emails)
@@ -219,7 +221,7 @@ pub struct Sheet {
 
 /// Whether a sheet header names a credential: its column's cells are flags at most.
 fn secret_header(header: &str) -> bool {
-    let lower = header.trim().to_ascii_lowercase();
+    let bytes = header.trim().as_bytes();
     [
         "password",
         "passwd",
@@ -229,7 +231,11 @@ fn secret_header(header: &str) -> bool {
         "totp",
     ]
     .iter()
-    .any(|word| lower.contains(word))
+    .any(|word| {
+        bytes
+            .windows(word.len())
+            .any(|w| w.eq_ignore_ascii_case(word.as_bytes()))
+    })
 }
 
 impl Sheet {
@@ -253,7 +259,29 @@ impl Sheet {
     /// The bytes are not a CSV within the caps, or it has no header.
     pub fn parse(kind: SheetKind, name: &str, bytes: &[u8]) -> Result<Self> {
         let records = crate::import::parse(bytes)?;
-        Self::from_records(kind, name, records, |_| bytes.to_vec())
+        Self::from_records_with_bytes(kind, name, records, bytes)
+    }
+
+    /// Parse `bytes` (at most the importer's CSV caps) as a sheet named `name`, detecting its
+    /// [`SheetKind`] from the header row in a single CSV pass.
+    ///
+    /// # Errors
+    /// The bytes are not a CSV within the caps, it has no header, or its header row names no
+    /// sheet this build reads.
+    pub fn parse_detected(name: &str, bytes: &[u8]) -> Result<Self> {
+        let mut records = crate::import::parse(bytes)?;
+        let Some(headers) = records.first() else {
+            return Err(Error::new("the sheet has no header row"));
+        };
+        let Some(kind) = SheetKind::detect(headers) else {
+            for record in &mut records {
+                record.iter_mut().for_each(zeroize::Zeroize::zeroize);
+            }
+            return Err(Error::new(
+                "the sheet's header row names no sheet this build reads",
+            ));
+        };
+        Self::from_records_with_bytes(kind, name, records, bytes)
     }
 
     /// The tab `tab` of the xlsx workbook `bytes`, file `name`, as a sheet read as a CSV is
@@ -276,14 +304,34 @@ impl Sheet {
         })
     }
 
+    fn from_records_with_bytes(
+        kind: SheetKind,
+        name: &str,
+        records: Vec<Vec<String>>,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let mut sheet = Self::build_records(kind, name, records)?;
+        sheet.source = keys::source_pk(bytes);
+        sheet.sha256 = hex::encode_lower(&Sha256::digest(bytes));
+        Ok(sheet)
+    }
+
     /// `records` (header first) as a sheet named `name`, its source named by the bytes `named`
     /// gives for it once its credential columns are flags.
     fn from_records(
         kind: SheetKind,
         name: &str,
-        mut records: Vec<Vec<String>>,
+        records: Vec<Vec<String>>,
         named: impl FnOnce(&Self) -> Vec<u8>,
     ) -> Result<Self> {
+        let mut sheet = Self::build_records(kind, name, records)?;
+        let bytes = zeroize::Zeroizing::new(named(&sheet));
+        sheet.source = keys::source_pk(&bytes);
+        sheet.sha256 = hex::encode_lower(&Sha256::digest(&bytes));
+        Ok(sheet)
+    }
+
+    fn build_records(kind: SheetKind, name: &str, mut records: Vec<Vec<String>>) -> Result<Self> {
         if records.is_empty() {
             return Err(Error::new("the sheet has no header row"));
         }
@@ -306,7 +354,7 @@ impl Sheet {
                 }
             }
         }
-        let mut sheet = Self {
+        Ok(Self {
             kind,
             name: name.to_owned(),
             source: String::new(),
@@ -316,11 +364,7 @@ impl Sheet {
             mode: Mode::FillOnly,
             secrets: BTreeMap::new(),
             conflicted: BTreeSet::new(),
-        };
-        let bytes = zeroize::Zeroizing::new(named(&sheet));
-        sheet.source = keys::source_pk(&bytes);
-        sheet.sha256 = hex::encode_lower(&Sha256::digest(&bytes));
-        Ok(sheet)
+        })
     }
 
     /// A harness file as a sheet: one row per [`Stated`] row, so its coordinates, source row and
@@ -735,18 +779,31 @@ fn column_service(provider: &str) -> &'static str {
 
 /// The provider word and service a logins sheet `services` word names.
 fn service_word(word: &str) -> Option<(&'static str, &'static str)> {
-    Some(match word {
-        "claude" | "claude code" | "claude-code" => (keys::ANTHROPIC, "claude-code"),
-        "chatgpt" | "chat gpt" => (keys::OPENAI, "chatgpt"),
-        "codex" | "openai" | "open ai" => (keys::OPENAI, "codex"),
-        "google" | "gemini" => (keys::GOOGLE, "gemini-web"),
-        "agy" | "antigravity" => (keys::GOOGLE, "agy"),
-        "meta" | "meta ai" => (keys::META, "meta-web"),
-        "muse" => (keys::META, "muse-code"),
-        "kimi" | "kimi code" => (keys::KIMI, "kimi-code"),
-        "grok" | "x" | "xai" => (keys::XAI, "grok"),
-        _ => return None,
-    })
+    const TABLE: &[(&str, &str, &str)] = &[
+        ("claude", keys::ANTHROPIC, "claude-code"),
+        ("claude code", keys::ANTHROPIC, "claude-code"),
+        ("claude-code", keys::ANTHROPIC, "claude-code"),
+        ("chatgpt", keys::OPENAI, "chatgpt"),
+        ("chat gpt", keys::OPENAI, "chatgpt"),
+        ("codex", keys::OPENAI, "codex"),
+        ("openai", keys::OPENAI, "codex"),
+        ("open ai", keys::OPENAI, "codex"),
+        ("google", keys::GOOGLE, "gemini-web"),
+        ("gemini", keys::GOOGLE, "gemini-web"),
+        ("agy", keys::GOOGLE, "agy"),
+        ("antigravity", keys::GOOGLE, "agy"),
+        ("meta", keys::META, "meta-web"),
+        ("meta ai", keys::META, "meta-web"),
+        ("muse", keys::META, "muse-code"),
+        ("kimi", keys::KIMI, "kimi-code"),
+        ("kimi code", keys::KIMI, "kimi-code"),
+        ("grok", keys::XAI, "grok"),
+        ("x", keys::XAI, "grok"),
+        ("xai", keys::XAI, "grok"),
+    ];
+    TABLE
+        .iter()
+        .find_map(|&(name, prov, svc)| word.eq_ignore_ascii_case(name).then_some((prov, svc)))
 }
 
 /// A mailbox's service and code path from its address's domain.
@@ -918,12 +975,10 @@ struct Planner<'a> {
 /// The digits of a phone number as the registry keeps them: ASCII digits only, a US number's
 /// leading country `1` dropped, as fleet_db normalized it. `None` below four digits.
 fn phone_digits(raw: &str) -> Option<String> {
-    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
-    let digits = if digits.len() == 11 && digits.starts_with('1') {
-        digits[1..].to_owned()
-    } else {
-        digits
-    };
+    let mut digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() == 11 && digits.starts_with('1') {
+        digits.remove(0);
+    }
     (digits.len() >= 4).then_some(digits)
 }
 
@@ -1474,7 +1529,13 @@ impl Planner<'_> {
     ) -> Option<(String, Coord)> {
         let mut kept: Vec<(Coord, String)> = Vec::new();
         for (at, text) in pieces {
-            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut flat = String::with_capacity(text.len());
+            for word in text.split_whitespace() {
+                if !flat.is_empty() {
+                    flat.push(' ');
+                }
+                flat.push_str(word);
+            }
             match guard::note_cell(&flat, NOTE_BYTES) {
                 Ok(()) if !flat.is_empty() => kept.push((at.clone(), flat)),
                 _ => self.withhold(collection, pk, at),
@@ -2007,11 +2068,11 @@ impl Planner<'_> {
         address_pk: &str,
     ) -> Vec<String> {
         let mut accounts = Vec::new();
-        let text = cells.get(col).map_or("", |c| c.trim()).to_ascii_lowercase();
+        let text = cells.get(col).map_or("", |c| c.trim());
         if text.is_empty() {
             return accounts;
         }
-        if guard::credential_shaped(&text) {
+        if guard::credential_shaped(text) {
             self.unsettled_logins.insert(address_pk.to_owned());
             return accounts;
         }
@@ -2321,8 +2382,11 @@ impl Planner<'_> {
                     && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
                 {
                     let at = coord(sheet, n, row, col);
-                    let digits: String = val.chars().take_while(char::is_ascii_digit).collect();
-                    if let Ok(num) = digits.parse::<u64>() {
+                    let digits_end = val
+                        .bytes()
+                        .position(|b| !b.is_ascii_digit())
+                        .unwrap_or(val.len());
+                    if let Ok(num) = val[..digits_end].parse::<u64>() {
                         self.want(&MACHINE, &pk, column, json!(num), &at);
                     } else {
                         self.note(&MACHINE, &pk, &at);
@@ -2340,10 +2404,14 @@ impl Planner<'_> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    let normalized = part.replace('.', "-");
-                    if let Ok(alias_label) =
-                        Label::parse(part).or_else(|_| Label::parse(&normalized))
-                    {
+                    let parsed = Label::parse(part).or_else(|e| {
+                        if part.contains('.') {
+                            Label::parse(&part.replace('.', "-"))
+                        } else {
+                            Err(e)
+                        }
+                    });
+                    if let Ok(alias_label) = parsed {
                         let canon = alias_label.canonical();
                         if canon != label.canonical() {
                             self.element(&MACHINE, &pk, "aliases", &canon, &at);
@@ -2457,11 +2525,14 @@ impl Planner<'_> {
                     .filter(|c| !c.is_empty())
             {
                 let at = coord(sheet, n, row, col);
-                let word = match val.to_ascii_lowercase().as_str() {
-                    "active" => "active",
-                    "suspended" => "suspended",
-                    "disabled" => "disabled",
-                    _ => "unknown",
+                let word = if val.eq_ignore_ascii_case("active") {
+                    "active"
+                } else if val.eq_ignore_ascii_case("suspended") {
+                    "suspended"
+                } else if val.eq_ignore_ascii_case("disabled") {
+                    "disabled"
+                } else {
+                    "unknown"
                 };
                 self.want(&ADDRESS, &address_pk, "status", json!(word), &at);
             }
@@ -2472,13 +2543,21 @@ impl Planner<'_> {
                     .filter(|c| !c.is_empty())
             {
                 let at = coord(sheet, n, row, col);
-                let word = match val.to_ascii_lowercase().as_str() {
-                    "proton" | "protonmail" => "proton",
-                    "gmail" => "gmail",
-                    "google" => "google",
-                    "outlook" | "hotmail" => "outlook",
-                    "privateemail" => "privateemail",
-                    _ => "other",
+                let word = if val.eq_ignore_ascii_case("proton")
+                    || val.eq_ignore_ascii_case("protonmail")
+                {
+                    "proton"
+                } else if val.eq_ignore_ascii_case("gmail") {
+                    "gmail"
+                } else if val.eq_ignore_ascii_case("google") {
+                    "google"
+                } else if val.eq_ignore_ascii_case("outlook") || val.eq_ignore_ascii_case("hotmail")
+                {
+                    "outlook"
+                } else if val.eq_ignore_ascii_case("privateemail") {
+                    "privateemail"
+                } else {
+                    "other"
                 };
                 self.want(&ADDRESS, &address_pk, "provider", json!(word), &at);
             }
@@ -2793,7 +2872,7 @@ impl Planner<'_> {
         let Self {
             input,
             current,
-            rows,
+            mut rows,
             findings,
             protected,
             roster,
@@ -2867,8 +2946,7 @@ impl Planner<'_> {
         // What each source found another import holding otherwise, by key and column.
         let mut differs: BTreeMap<usize, BTreeSet<(&'static str, String, String)>> =
             BTreeMap::new();
-        let stated: BTreeSet<(&'static str, String)> = rows.keys().cloned().collect();
-        for ((name, pk), want) in rows {
+        for (&(name, ref pk), want) in &mut rows {
             let Some(collection) = collections.iter().copied().find(|c| c.name == name) else {
                 continue;
             };
@@ -2879,7 +2957,7 @@ impl Planner<'_> {
             if let Some(at) = &want.src {
                 touched_rows.insert((at.sheet, name, pk.clone()));
             }
-            let current_row = current[name].rows.get(&pk);
+            let current_row = current[name].rows.get(pk);
             let count = plan.counts.entry(name).or_default();
             count.rows += 1;
             if current_row.is_none() {
@@ -2967,7 +3045,7 @@ impl Planner<'_> {
                         changes.push(cell::change(
                             collection,
                             CellKey {
-                                pk: &pk,
+                                pk,
                                 col: column,
                                 elem,
                             },
@@ -3043,7 +3121,7 @@ impl Planner<'_> {
                 )?;
             }
             // Secret cells: sealed to this cell's coordinates, compared by opening, never shown.
-            let guarded = (name == ADDRESS.name && protected.contains(&pk))
+            let guarded = (name == ADDRESS.name && protected.contains(pk))
                 || current_row.is_some_and(check::protected);
             // Merged once `step` is done with them.
             let mut secret_touched = Vec::new();
@@ -3064,7 +3142,7 @@ impl Planner<'_> {
                 }
                 let holds = |held: &Value| {
                     held.as_str().is_some_and(|token| {
-                        input.sealer.holds(name, &pk, column, token, &wanted.value)
+                        input.sealer.holds(name, pk, column, token, &wanted.value)
                     })
                 };
                 let decided = decide(
@@ -3075,7 +3153,7 @@ impl Planner<'_> {
                 );
                 let outcome = match decided {
                     Decided::Write => {
-                        let token = input.sealer.seal(name, &pk, column, &wanted.value)?;
+                        let token = input.sealer.seal(name, pk, column, &wanted.value)?;
                         count.cells += 1;
                         secret_touched.push(wanted.at.sheet);
                         let value = CellValue::imported(
@@ -3086,7 +3164,7 @@ impl Planner<'_> {
                         changes.push(cell::change(
                             collection,
                             CellKey {
-                                pk: &pk,
+                                pk,
                                 col: column,
                                 elem: None,
                             },
@@ -3219,7 +3297,7 @@ impl Planner<'_> {
                     )?;
                 }
                 if !want.notes.is_empty() {
-                    let mut notes = want.notes.clone();
+                    let mut notes = std::mem::take(&mut want.notes);
                     notes.sort();
                     notes.dedup();
                     if notes.len() > MAX_NOTES {
@@ -3276,7 +3354,7 @@ impl Planner<'_> {
             let Some(field) = row.fields.get(crate::typed::LIFECYCLE) else {
                 continue;
             };
-            if stated.contains(&(PREFERENCE.name, pk.clone()))
+            if rows.contains_key(&(PREFERENCE.name, pk.clone()))
                 || !row.live()
                 || !retractable(field, sources, &read)
                 || login_unsettled(row)
@@ -3344,7 +3422,7 @@ impl Planner<'_> {
         }
         for collection in [&ACCOUNT, &ADDRESS] {
             for (pk, row) in &current[collection.name].rows {
-                if !stated.contains(&(collection.name, pk.clone()))
+                if !rows.contains_key(&(collection.name, pk.clone()))
                     && row.live()
                     && row
                         .fields
@@ -3419,7 +3497,7 @@ impl Planner<'_> {
                 ("rows", json!(count)),
                 ("at", json!(input.now_ms)),
                 ("counts", Value::Object(counts)),
-                ("differs", found.clone().unwrap_or(Value::Null)),
+                ("differs", found.unwrap_or(Value::Null)),
                 (crate::typed::LIFECYCLE, json!("live")),
             ]
             .into_iter()
@@ -3442,7 +3520,12 @@ impl Planner<'_> {
             count.cells += changes.len();
             source_rows.push(changes);
         }
-        plan.rows = source_rows.into_iter().chain(written_rows).collect();
+        plan.rows = if source_rows.is_empty() {
+            written_rows
+        } else {
+            source_rows.extend(written_rows);
+            source_rows
+        };
         plan.findings.sort();
         plan.findings.dedup();
         Ok(plan)

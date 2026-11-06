@@ -2138,11 +2138,15 @@ fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
-    let said = |needle: &str| lower.iter().position(|l| l.contains(needle));
+    let has = |line: &str, needle: &str| {
+        line.as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    let said = |needle: &str| lines.iter().position(|l| has(l, needle));
     let first = lines.first().copied().unwrap_or("(no error line)");
     if let Some(at) = said("status code: 403").or_else(|| said("http 403"))
-        && lower.iter().any(|l| l.contains("agreement"))
+        && lines.iter().any(|l| has(l, "agreement"))
     {
         return NotaryProbe {
             check: Check::Owner {
@@ -2170,11 +2174,7 @@ fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str
         "nsurlerrordomain",
         "could not be found",
     ];
-    if said("status code").is_none()
-        && lower
-            .iter()
-            .any(|l| transport.iter().any(|t| l.contains(t)))
-    {
+    if said("status code").is_none() && lines.iter().any(|l| transport.iter().any(|t| has(l, t))) {
         return NotaryProbe {
             check: Check::CouldNotRun(format!(
                 "Apple's notary service did not answer notarytool profile '{profile}': {first}"

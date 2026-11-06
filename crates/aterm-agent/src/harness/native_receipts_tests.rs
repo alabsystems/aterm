@@ -10,6 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 #[path = "native_successor_tests.rs"]
 mod successor;
 
+#[path = "native_receipts_phase_tests.rs"]
+mod phase;
+
 fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());

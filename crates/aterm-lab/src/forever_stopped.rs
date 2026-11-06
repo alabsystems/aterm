@@ -2,18 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! STOPPED WORK FIRST (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7, slice 7a): what `lab
-//! forever` wants of the menu bar's Needs you and of the window's pressing session once a need
-//! that stops an agent stands beside a `NEEDS YOU:` report its agent carries on past.
+//! forever` wants of the menu bar's Needs you once a need that stops an agent stands beside a
+//! `NEEDS YOU:` report its agent carries on past, and that no window presses either tab (the
+//! continuous-forward design of 2026-11-01 removed the window's pressing session with every other
+//! automatic attention mark: `docs/DESIGN-continuous-forward-2026-11-01.md`).
 //!
 //! Where the window is read and `cruise-n` runs, a plain shell tab stands beside the chains
 //! ([`ASK_TAB`]), no agent in it. Once N4's report (two needs) is read, and [`ASK_AFTER_MS`] past
 //! it, the lab writes that tab a stand-in direct ask (`meta set attention owner=lab kind=ask …`,
 //! [`ask_step`]): newer than the report, and like it `◇` decide. It reads `chrome` until Needs
 //! you lists both, keeps what it read in [`Window::stopped`](super::Window::stopped), and takes
-//! the ask down again. N4 then wants ([`first`]): the ask's row above the report's, `presence
-//! pressing=` naming the ask's tab, and the report row's tip in its program's own name
-//! ([`report_words`]). Main before 7a lists the older report first, presses the front tab's
-//! report, and gives its row no tip.
+//! the ask down again. N4 then wants ([`first`]): the ask's row above the report's, no tab
+//! pressed (no `presence pressing=` naming one), and the report row's tip in its program's own
+//! name ([`report_words`]). Main before 7a lists the older report first, presses the front tab's
+//! report, and gives its row no tip; 7a pressed the ask's tab, which continuous forward undid.
 
 use std::time::Duration;
 
@@ -42,7 +44,7 @@ pub const ASK_AFTER_MS: i64 = 2_000;
 const STEP_WAIT: Duration = Duration::from_secs(60);
 
 /// The want [`first`] composes under.
-pub const WANT: &str = "stopped first (§14.7): a direct ask newer than its report lists first under Needs you, `presence pressing=` names the ask's tab, and the report row's tip says its program carries on meanwhile";
+pub const WANT: &str = "stopped first (§14.7): a direct ask newer than its report lists first under Needs you, no tab pressed for attention (`presence pressing=` names none), and the report row's tip says its program carries on meanwhile";
 
 /// When N4's report was read: the `EVENT idle` quoting its last need after the chain's third act.
 fn n4_read(seen: &Seen) -> Option<i64> {
@@ -192,9 +194,10 @@ fn product(program: &str) -> Option<&'static str> {
         .map(aterm_phase::Program::product)
 }
 
-/// N4's stopped-first want: the ask's row above the report's under Needs you, `presence
-/// pressing=` the ask's tab, the report row's tip [`report_words`] in its program's name, and the
-/// ask's row gone once it was taken down.
+/// N4's stopped-first want: the ask's row above the report's under Needs you, no tab pressed
+/// (`presence pressing=` names none, or no presence line at all: continuous forward), the report
+/// row's tip [`report_words`] in its program's name, and the ask's row gone once it was taken
+/// down.
 #[must_use]
 pub fn first(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t, l)) = &seen.window.stopped else {
@@ -223,9 +226,10 @@ pub fn first(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         _ => {}
     }
     match word(l, "pressing").as_deref() {
-        Some("ask") => {}
+        Some("-") => {}
         other => bad.push(format!(
-            "presence pressing={}, not the ask's tab",
+            "PRESSED: presence pressing={}, an automatic attention mark on a tab, which the \
+             continuous-forward design of 2026-11-01 removed",
             other.unwrap_or("?")
         )),
     }

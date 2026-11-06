@@ -547,14 +547,19 @@ impl Directory {
         now: u64,
     ) -> Result<RingState> {
         let claims = claim_dir(session)?;
-        // Every name this Mac holds storage or a claim under, read once: matching each period's
-        // names against them needs no look at the disk per period.
-        let mut names = BTreeSet::new();
-        for dir in [&self.root, &claims] {
+        // Every table digest this Mac holds storage or a claim under, decoded once: matching each
+        // period's digest against them needs neither disk I/O nor string allocation per period.
+        let mut digests = BTreeSet::new();
+        for (dir, prefix) in [(&self.root, ""), (&claims, "table-")] {
             match std::fs::read_dir(dir) {
                 Ok(entries) => {
                     for entry in entries {
-                        names.insert(entry?.file_name());
+                        let name = entry?.file_name();
+                        if let Some(hex) = name.to_str().and_then(|s| s.strip_prefix(prefix))
+                            && let Ok(digest) = crate::database::decode_hex::<32>(hex)
+                        {
+                            digests.insert(digest);
+                        }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -562,16 +567,13 @@ impl Directory {
             }
         }
         let mut held = BTreeSet::new();
-        if !names.is_empty() {
+        if !digests.is_empty() {
             for epoch in 0..=ring.epoch_of(now).saturating_add(REBUILD_SPAN) {
                 if held.len() >= MAX_HELD {
                     break;
                 }
                 let scope = ring.scope(self.trust, epoch)?;
-                let table = aterm_codec::hex::encode_lower(&scope.digest());
-                if names.contains(std::ffi::OsStr::new(&table))
-                    || names.contains(std::ffi::OsStr::new(&claim_name(scope)))
-                {
+                if digests.contains(&scope.digest()) {
                     held.insert(epoch);
                 }
             }
@@ -598,8 +600,9 @@ impl Directory {
         aterm_journal::write_private_durable(&dir, &name, &state.encode())?;
         // The floor's second copy, which a rebuild reads when the state is lost
         // (`rebuilt_floor`): a bound only, so one that cannot be written fails nothing.
-        let mut floor = FLOOR_MAGIC.to_vec();
-        floor.extend_from_slice(&state.floor.to_le_bytes());
+        let mut floor = [0u8; FLOOR_LEN];
+        floor[..FLOOR_MAGIC.len()].copy_from_slice(FLOOR_MAGIC);
+        floor[FLOOR_MAGIC.len()..].copy_from_slice(&state.floor.to_le_bytes());
         let _ = aterm_journal::write_private_durable(&dir, &ring.floor_name(), &floor);
         Ok(())
     }
@@ -673,7 +676,9 @@ impl Directory {
                 "injected failure after a ring retirement deleted",
             ));
         }
-        state.held.retain(|epoch| !doomed.contains(epoch));
+        for epoch in &doomed {
+            state.held.remove(epoch);
+        }
         self.save_ring_state(session, ring, &state)?;
         Ok(state)
     }

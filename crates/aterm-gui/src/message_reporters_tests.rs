@@ -4076,6 +4076,8 @@ fn left_fixture() -> aterm_vitals::left::LeftView {
         closed_ms: LEFT_NOW - 7_200_000,
         agent_spans: Vec::new(),
         left,
+        restored: false,
+        told: false,
     };
     let daemon = LeftRow {
         tier: Tier::Name,

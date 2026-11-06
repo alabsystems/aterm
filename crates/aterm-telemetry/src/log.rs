@@ -15,7 +15,7 @@
 //! say what this account ran, and no other account reads them.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -255,10 +255,18 @@ fn gone_ok(r: io::Result<()>) -> io::Result<()> {
 }
 
 fn ends_in_line_feed(file: &mut File, len: u64) -> io::Result<bool> {
-    use std::io::{Seek as _, SeekFrom};
-    file.seek(SeekFrom::Start(len - 1))?;
     let mut last = [0u8; 1];
-    file.read_exact(&mut last)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt as _;
+        file.read_exact_at(&mut last, len - 1)?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        file.seek(SeekFrom::Start(len - 1))?;
+        file.read_exact(&mut last)?;
+    }
     Ok(last[0] == b'\n')
 }
 

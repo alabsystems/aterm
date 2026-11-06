@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 12, "0.12");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 13, "0.13");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1504,14 +1504,31 @@ fn status_words(rows: &[String], first: usize, end: usize) -> Cow<'_, str> {
 /// [`panel_rule`] finds the panel's text is none of the agent's words and a row blank up to the
 /// rule is a blank row. A block no row beside draws the rule at is read whole, the panel's text
 /// with it: the one row of a live zone at the screen's top, over the composer's top rule, which
-/// the panel is not drawn across (no capture draws the panel beside such a row).
-pub(crate) fn panel_cut(row: &str, rule: Option<usize>) -> &str {
+/// the panel is not drawn across (no capture draws the panel beside such a row). A row no longer
+/// on the screen is read through it, to match words already held, at each rule it may have been
+/// drawn beside ([`rule_columns`]).
+#[must_use]
+pub fn panel_cut(row: &str, rule: Option<usize>) -> &str {
     let Some(rule) = rule else {
         return row;
     };
     rule_cells(row)
         .find(|&(cell, _)| cell == rule)
         .map_or(row, |(_, at)| crate::text::trim_end(&row[..at]))
+}
+
+/// EACH SIDE PANEL'S RULE A ROW NO LONGER ON THE SCREEN MAY HAVE BEEN DRAWN BESIDE: the cell
+/// column of each `│` `row` draws ([`rule_cells`]), each a rule [`panel_cut`] cuts it at. A row
+/// the screen shows is read by the screen's [`Transcript`], whose rule [`panel_rule`] finds beside
+/// the row over the composer's top rule; a row the screen no longer shows (one aterm-core's
+/// archive kept: the row's text whole as it scrolled off, beside the panel the padding, the rule
+/// and the panel's text with it, and no column or panel of its own) says by nothing which of its
+/// `│`, if any, was a panel's rule, and the screen does not say either: by the time it is read the
+/// panel may be closed or its rule at another column. So a reader that only matches such a row
+/// against words it already holds reads it whole and cut at each of these, and keeps the row
+/// itself whole (aterm-agent's `supervise::report::begins_with`, a turn's text).
+pub fn rule_columns(row: &str) -> impl Iterator<Item = usize> + '_ {
+    rule_cells(row).map(|(cell, _)| cell)
 }
 
 /// Row `i` cut at the side panel's rule beside it ([`panel_cut`], the rule [`panel_rule`] reads
@@ -1577,8 +1594,11 @@ fn rule_cells(row: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
 /// and of the cards parked over the composer ([`crate::survey::parked_span`], which the status
 /// walk, [`transcript_end`] and the last-said walk step over, and [`crate::survey::survey_block`],
 /// which [`survey_open`] reads, each against the rule's room) reads the transcript's rows here;
-/// with no composer frame, or no rule beside that row, the screen is read whole.
-pub(crate) struct Transcript<'a> {
+/// with no composer frame, or no rule beside that row, the screen is read whole. Outside this
+/// crate it is Claude Code's reader's [`crate::reader::ScreenReader::transcript`]: the worker's
+/// report and the harness's point key read their rows through it (aterm-agent's
+/// `supervise::report` and `supervise::run`).
+pub struct Transcript<'a> {
     /// The screen's rows, each above the composer's top rule cut at the rule, the rest whole.
     pub(crate) rows: Cow<'a, [String]>,
     /// The rule's cell column, `None` with no panel drawn.
@@ -1593,10 +1613,7 @@ impl<'a> Transcript<'a> {
             panel_rule(rows, last, last).map(|rule| (frame.top, rule))
         });
         let Some((top, rule)) = rule else {
-            return Self {
-                rows: Cow::Borrowed(rows),
-                rule: None,
-            };
+            return Self::whole(rows);
         };
         let rows = rows
             .iter()
@@ -1613,6 +1630,24 @@ impl<'a> Transcript<'a> {
             rows: Cow::Owned(rows),
             rule: Some(rule),
         }
+    }
+
+    /// `rows` whole, no panel's rule beside them: the transcript of a screen whose reader reads
+    /// no side panel ([`crate::reader::ScreenReader::transcript`]'s default).
+    #[must_use]
+    pub const fn whole(rows: &'a [String]) -> Self {
+        Self {
+            rows: Cow::Borrowed(rows),
+            rule: None,
+        }
+    }
+
+    /// The screen's rows as the transcript's readers read them: each row above the composer's
+    /// top rule cut at the panel's rule, the rest whole; with no rule, the screen whole. As many
+    /// rows as the screen.
+    #[must_use]
+    pub fn rows(&self) -> &[String] {
+        &self.rows
     }
 
     /// The cells the rows above the composer are laid out in: beside the panel, the rule's

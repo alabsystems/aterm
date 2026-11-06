@@ -115,11 +115,10 @@ fn label_number(label: Option<&str>) -> u64 {
     label
         .and_then(|label| label.strip_prefix('m'))
         .map(|rest| {
-            rest.bytes()
-                .take_while(u8::is_ascii_digit)
-                .collect::<Vec<_>>()
+            let len = rest.bytes().take_while(u8::is_ascii_digit).count();
+            &rest[..len]
         })
-        .and_then(|digits| std::str::from_utf8(&digits).ok()?.parse().ok())
+        .and_then(|digits| digits.parse().ok())
         .unwrap_or(u64::MAX)
 }
 
@@ -149,8 +148,8 @@ impl LabView {
             })
             .collect();
         let addresses = cell::project(&ADDRESS, cells);
-        let address = |pk: Option<String>| {
-            let row = addresses.rows.get(&pk?)?;
+        let address = |pk: Option<&str>| {
+            let row = addresses.rows.get(pk?)?;
             text(row, "addr")
         };
         let accounts = cell::project(&ACCOUNT, cells)
@@ -161,8 +160,8 @@ impl LabView {
                     label: registry::account_label(&pk, &row),
                     realm: text(&row, "realm"),
                     legacy_label: text(&row, "legacy_label"),
-                    login: address(text(&row, "login")),
-                    identity: address(text(&row, "identity")),
+                    login: address(row.get("login").and_then(Value::as_str)),
+                    identity: address(row.get("identity").and_then(Value::as_str)),
                     status: text(&row, "status"),
                     region: text(&row, "region"),
                     flow: text(&row, "flow"),
@@ -236,9 +235,12 @@ impl LabView {
 
     /// The accounts `machine` prefers, smaller rank first and an unranked one last.
     pub fn preferred_by(&self, machine: &str) -> impl Iterator<Item = &Preference> {
-        self.preferences
+        let start = self
+            .preferences
+            .partition_point(|p| p.machine.as_str() < machine);
+        self.preferences[start..]
             .iter()
-            .filter(move |p| p.machine == machine)
+            .take_while(move |p| p.machine == machine)
     }
 
     /// The machines that prefer `account`, by rank, then by the smaller label number: the
@@ -249,13 +251,19 @@ impl LabView {
             .iter()
             .filter(|p| p.account == account)
             .collect();
-        rows.sort_by_key(|p| {
+        rows.sort_by(|a, b| {
             (
-                p.rank.is_none(),
-                p.rank,
-                label_number(self.machine_label(&p.machine)),
-                p.machine.clone(),
+                a.rank.is_none(),
+                a.rank,
+                label_number(self.machine_label(&a.machine)),
+                &a.machine,
             )
+                .cmp(&(
+                    b.rank.is_none(),
+                    b.rank,
+                    label_number(self.machine_label(&b.machine)),
+                    &b.machine,
+                ))
         });
         rows
     }
@@ -271,10 +279,7 @@ impl LabView {
             .filter_map(|row| {
                 let machine = self.bound.get(&row.uuid)?;
                 self.accounts.contains_key(&row.account).then_some(())?;
-                let prefers = self
-                    .preferences
-                    .iter()
-                    .any(|p| p.machine == *machine && p.account == row.account);
+                let prefers = self.preferred_by(machine).any(|p| p.account == row.account);
                 (!prefers).then(|| Placement {
                     machine: machine.clone(),
                     account: row.account.clone(),
@@ -283,12 +288,17 @@ impl LabView {
                 })
             })
             .collect();
-        out.sort_by_key(|p| {
+        out.sort_by(|a, b| {
             (
-                p.account.clone(),
-                label_number(self.machine_label(&p.machine)),
-                p.machine.clone(),
+                &a.account,
+                label_number(self.machine_label(&a.machine)),
+                &a.machine,
             )
+                .cmp(&(
+                    &b.account,
+                    label_number(self.machine_label(&b.machine)),
+                    &b.machine,
+                ))
         });
         out.dedup_by(|a, b| a.account == b.account && a.machine == b.machine);
         out

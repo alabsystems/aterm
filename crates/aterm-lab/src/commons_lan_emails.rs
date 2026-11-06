@@ -255,10 +255,11 @@ pub(super) fn set(
 }
 
 /// `emails-wait`: read the digest until it equals `want` (until it differs from what follows a
-/// leading `!`), or `seconds` pass; the report and its exit code (1 when it never did).
+/// leading `!`), or `seconds` pass; the report and its exit code (1 when it never did). A read
+/// the CLI refused counts as a poll that saw nothing (`failed_reads`, and the first refusal).
 ///
 /// # Errors
-/// The wait is out of range, or a digest could not be read.
+/// The wait is out of range, or an interrupt stopped it.
 pub(super) fn wait(
     aterm: &Path,
     world: &World,
@@ -273,9 +274,32 @@ pub(super) fn wait(
     let started = Instant::now();
     let until = started + Duration::from_secs(seconds);
     let mut polls = 0_u64;
+    // A read the CLI refused (a pass past its deadline on a loaded Mac, a table a sync advanced
+    // mid-read) observed nothing: the poll goes on, and the report counts them.
+    let mut failed = 0_u64;
+    let mut first_failure: Option<String> = None;
     loop {
         stop::check()?;
-        let read = digest(aterm, world)?;
+        let read = match digest(aterm, world) {
+            Ok(read) => read,
+            Err(failure) => {
+                polls += 1;
+                failed += 1;
+                first_failure.get_or_insert_with(|| {
+                    failure.msg.unwrap_or_default().chars().take(200).collect()
+                });
+                if Instant::now() >= until {
+                    return Ok((
+                        json!({"seen": false, "waited_ms": started.elapsed().as_millis(),
+                            "polls": polls, "failed_reads": failed,
+                            "first_failure": first_failure}),
+                        1,
+                    ));
+                }
+                stop::sleep(POLL)?;
+                continue;
+            }
+        };
         polls += 1;
         let held = read["digest"].as_str();
         let reached = match want.strip_prefix('!') {
@@ -286,6 +310,7 @@ pub(super) fn wait(
             return Ok((
                 json!({"seen": true, "at_ms": crate::util::now_ms(),
                     "waited_ms": started.elapsed().as_millis(), "polls": polls,
+                    "failed_reads": failed, "first_failure": first_failure,
                     "digest": read}),
                 0,
             ));
@@ -293,12 +318,118 @@ pub(super) fn wait(
         if Instant::now() >= until {
             return Ok((
                 json!({"seen": false, "waited_ms": started.elapsed().as_millis(),
-                    "polls": polls, "last": read}),
+                    "polls": polls, "failed_reads": failed, "first_failure": first_failure,
+                    "last": read}),
                 1,
             ));
         }
         stop::sleep(POLL)?;
     }
+}
+
+/// Every value the fixture of `seed` and its edits `tags` (`emails-set … password <tag>`) can
+/// have put in the table: what a reveal's Editor file holds and nothing else may.
+#[cfg(debug_assertions)]
+fn needles(seed: &str, tags: &[String]) -> Vec<String> {
+    let mut needles: Vec<String> = rows(seed)
+        .into_iter()
+        .filter_map(|row| row.password)
+        .collect();
+    for tag in tags {
+        needles.extend((1..=ROWS).map(|index| password(seed, &format!("edit:{tag}"), index)));
+    }
+    needles
+}
+
+/// The addresses the reveal's grid shows when it opens, at its top: what its accessibility tree
+/// must still carry once the passwords are concealed (A17b).
+#[cfg(debug_assertions)]
+fn first_screen(seed: &str) -> Vec<String> {
+    rows(seed)
+        .into_iter()
+        .take(3)
+        .map(|row| row.email)
+        .collect()
+}
+
+/// `emails-reveal <aterm> <world> <seed> [<tag>...]`: one-mesh A17 on a lab Mac's own emails
+/// table, its passwords sealed by the lab's import and edits. A windowed instance in the world's
+/// environment, whose boot tab's zsh accepts `aterm db emails --show-passwords` once (nobody
+/// typing over the control socket), then [`crate::reveal_tab::observe`]: the protected Editor tab opens
+/// and holds the values, `text`, `screen`, `image`, `window`, `video`, `key`, `pointer`,
+/// `invoke` and `doc read` of it refuse, and the caller's tab text, blocks and session log hold
+/// none of them, before and after the Editor tab closes; the window's accessibility tree carries
+/// the grid and its first addresses and no password (a named skip without an Accessibility
+/// grant). The caller stops the world's node first: the instance is the world's one aterm while
+/// it runs. The report names checks only.
+///
+/// # Errors
+/// The world is no prepared profile, its home already holds a `.zshrc`, or the instance or its
+/// Editor tab did not come up.
+#[cfg(debug_assertions)]
+pub(super) fn reveal(
+    aterm: &Path,
+    world: &World,
+    seed: &str,
+    tags: &[String],
+) -> Result<(Value, i32), Fail> {
+    let aterm = std::fs::canonicalize(aterm).map_err(fail)?;
+    let command = aterm.to_string_lossy();
+    if command.contains('\'') {
+        return Err(Fail::die("the aterm path holds a single quote"));
+    }
+    let rc = world.home.join(".zshrc");
+    crate::util::write_fresh(
+        &rc,
+        crate::reveal_tab::zshrc(&format!("{command} db emails --show-passwords")),
+    )
+    .map_err(fail)?;
+    let mut env = crate::reveal_tab::zsh_env(world);
+    env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
+    let started = crate::instance::Instance::start(
+        world,
+        crate::instance::Launch {
+            aterm: aterm.clone(),
+            headless: false,
+            args: Vec::new(),
+            env,
+            cwd: world.home.clone(),
+            sandbox: None,
+            reroute: false,
+        },
+    )
+    .map_err(fail);
+    let mut evidence = crate::reveal_tab::Evidence::default();
+    let observed = started.and_then(|mut inst| {
+        let observed = crate::reveal_tab::observe(
+            &mut inst,
+            world,
+            &needles(seed, tags),
+            &first_screen(seed),
+            &mut evidence,
+        );
+        crate::instance::after_stop(observed, inst.stop())
+    });
+    let removed = std::fs::remove_file(&rc);
+    observed?;
+    removed.map_err(fail)?;
+    let checks = crate::reveal_tab::judge_tab(&evidence);
+    let pass = checks.iter().all(|(_, held)| *held);
+    let refusals: Vec<Value> = evidence
+        .refusals
+        .iter()
+        .map(|(verb, first)| json!({"verb": verb, "first": first.chars().take(120).collect::<String>()}))
+        .collect();
+    Ok((
+        json!({
+            "pass": pass,
+            "checks": checks.iter().map(|(name, held)| json!({"check": name, "pass": held})).collect::<Vec<_>>(),
+            "refusals": refusals,
+            "doc_read": evidence.doc_read.chars().take(120).collect::<String>(),
+            "skipped": crate::reveal_tab::skipped(&evidence).into_iter().map(|why| json!(why)).collect::<Vec<_>>(),
+        }),
+        i32::from(!pass),
+    ))
 }
 
 #[cfg(test)]

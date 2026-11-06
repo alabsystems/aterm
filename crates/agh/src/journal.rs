@@ -1311,8 +1311,8 @@ fn mint(step: u64, slug: &Slug, op: WriteOp, key: &str) -> IntentId {
     hasher.update(op.slug().as_bytes());
     hasher.update([0u8]);
     hasher.update(key.as_bytes());
-    let hex = aterm_codec::hex::encode_lower(&hasher.finalize());
-    let short = hex.get(..12).unwrap_or(&hex);
+    let digest = hasher.finalize();
+    let short = aterm_codec::hex::encode_lower(&digest[..6]);
     IntentId(format!("{step}-{short}"))
 }
 

@@ -88,12 +88,14 @@ pub struct Planned {
 /// # Errors
 /// The live cask has no such line to keep.
 pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
-    let quoted = |line: &str, key: &str, ok: fn(char) -> bool| -> Option<String> {
+    fn quoted<'a>(line: &'a str, key: &str, ok: fn(char) -> bool) -> Option<&'a str> {
         let v = line
-            .strip_prefix(&format!("  {key} \""))?
+            .strip_prefix("  ")?
+            .strip_prefix(key)?
+            .strip_prefix(" \"")?
             .strip_suffix('"')?;
-        (!v.is_empty() && v.chars().all(ok)).then(|| v.to_string())
-    };
+        (!v.is_empty() && v.chars().all(ok)).then_some(v)
+    }
     let version = live
         .lines()
         .find_map(|l| quoted(l, "version", |c| c.is_ascii_digit() || c == '.'));
@@ -109,9 +111,15 @@ pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
     for line in source.split_inclusive('\n') {
         let (body, end) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
         if quoted(body, "version", |c| c != '"').is_some() {
-            out.push_str(&format!("  version \"{version}\"{end}"));
+            out.push_str("  version \"");
+            out.push_str(version);
+            out.push('"');
+            out.push_str(end);
         } else if quoted(body, "sha256", |c| c.is_ascii_hexdigit()).is_some() {
-            out.push_str(&format!("  sha256 \"{sha}\"{end}"));
+            out.push_str("  sha256 \"");
+            out.push_str(sha);
+            out.push('"');
+            out.push_str(end);
         } else {
             out.push_str(line);
         }
@@ -187,8 +195,10 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
     };
     for path in &all {
         let raw = read(path)?;
-        let text = String::from_utf8_lossy(&raw).to_lowercase();
-        if let Some(w) = INTERNAL_WORDING.iter().find(|w| text.contains(*w)) {
+        if let Some(w) = INTERNAL_WORDING.iter().find(|w| {
+            raw.windows(w.len())
+                .any(|win| win.eq_ignore_ascii_case(w.as_bytes()))
+        }) {
             return Err(format!(
                 "{} carries internal-only wording ({w:?}) — scrub it before deploying",
                 path.display()
@@ -218,9 +228,11 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
         std::fs::read_dir(&casks_dir).map_err(|e| format!("{}: {e}", casks_dir.display()))?
     {
         let entry = entry.map_err(|e| format!("{}: {e}", casks_dir.display()))?;
-        let path = entry.path();
-        if path.extension().is_some_and(|x| x == "rb") {
-            casks.push(path);
+        if Path::new(&entry.file_name())
+            .extension()
+            .is_some_and(|x| x == "rb")
+        {
+            casks.push(entry.path());
         }
     }
     casks.sort();

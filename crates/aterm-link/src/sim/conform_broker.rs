@@ -14,14 +14,20 @@
 //!
 //! * REAL: `Broker::open_opts` on a scratch directory, opened as aterm opens
 //!   its own: [`crate::durability::Durability::options`] (the tier, the
-//!   100 ms Ordered horizon, the escalation table on the weak tiers), a fixed
+//!   100 ms Ordered horizon, the escalation table on the weak tiers, aterm's
+//!   16 MiB residency budget), a fixed
 //!   `Boot::Known` and `Volume::Boot` (so a same-boot unclean stop keeps the
 //!   generation), unguarded, and aterm's rules set at every open (the
 //!   world's, `Opts::rules`), or for the journal of a world whose broker was
 //!   unretained, never: what `aterm link broker` serves when setting the rules
 //!   fails. Its retention tick's interval is a year, and the tick setting the
 //!   rules asks for at once is waited for before anything is served. Served on
-//!   a scratch Unix socket and read with astream's codec.
+//!   a scratch Unix socket and read with astream's codec. The SEALED arm seals
+//!   its log under a key, as `aterm link broker` seals one beside its
+//!   `rest.key`; the COLD arm (critic item F06) keeps a residency budget of 0
+//!   in place of aterm's, so every record a read takes below the head comes
+//!   back from the file through astream's paged cold tier, as most of the
+//!   history the shipped broker serves does.
 //! * MODEL: `bus::Broker::new` with the same table, retained as the real arm
 //!   is, each connection a raw [`bus::SimStream`]. No held acks, refused
 //!   batches, race or mutant; its tails write what they match before a
@@ -51,8 +57,8 @@
 //! words; a `Mark`'s `next`, `head`, `resume` and `oldest`, and its `durable`
 //! exactly on Strict and by [`Law`] on Ordered and Relaxed (monotone, at most
 //! the head, at least one past every escalated ack); a `Hello`'s generation,
-//! lineage, served tier, request set and retention rules, never its nonce,
-//! log id or health. A tail's `Mark`s are skipped: the model sends none.
+//! lineage, served tier, request set, retention rules and whether it names its log's
+//! device (critic item F07), never its nonce, log id, health or device number. A tail's `Mark`s are skipped: the model sends none.
 //! Since the log ids differ, a conditional `Retire` naming the model's log is
 //! sent to the real arm naming the real log at the same generation
 //! (`Real::on_this_log`); one naming any other log goes as it is.
@@ -249,6 +255,23 @@ struct Real {
     /// The key the log is sealed under, opened keyed and bound as `aterm link broker` opens a log
     /// with its `rest.key` (`None`: plaintext).
     at_rest: Option<[u8; 32]>,
+    /// The bytes of decoded records every open keeps resident in place of aterm's own
+    /// [`crate::durability::RESIDENT_BUDGET`], which [`Durability::options`] sets (`None`:
+    /// aterm's). The cold arm's 0 keeps the newest record alone, so every read below the head
+    /// comes from the log file through astream's paged cold tier.
+    resident_budget: Option<usize>,
+    /// The records earlier opens read back cold (`Broker::cold_reads`, which counts from each
+    /// open): with the open that serves now's, [`Real::cold_reads`].
+    cold_before: u64,
+    /// The records the broker read back cold while one of [`run_keeping`]'s requests,
+    /// deliveries, ticks or cuts ran: the compared steps but [`Step::RateLimited`], whose
+    /// comparison reads `Broker::stats`, as the harness's own waits do ([`Real::settle`] and an
+    /// open's wait for its first tick poll it), and `Broker::stats` reads every retained
+    /// `/a/will` record, cold ones from the file. Attributed by time, not by cause: astream's
+    /// counter is the broker's, and its own threads (a tail catching up after a subscribe) read
+    /// at their own pace, so a read is counted in whichever window it falls in and the count
+    /// moves between runs of one script; the cold test holds it only to not being 0.
+    answered_cold: u64,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
     /// one firing each.
@@ -341,6 +364,7 @@ impl Real {
         tier: Tier,
         retain: Option<astream_broker::Retention>,
         at_rest: Option<[u8; 32]>,
+        resident_budget: Option<usize>,
     ) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
@@ -355,6 +379,9 @@ impl Real {
             retain,
             boot: Boot::Known(BOOT),
             at_rest,
+            resident_budget,
+            cold_before: 0,
+            answered_cold: 0,
             up: None,
             conns: BTreeMap::new(),
             will_producers: BTreeSet::new(),
@@ -397,6 +424,9 @@ impl Real {
     /// Open again setting `rules`, or none.
     fn open_setting(&mut self, rules: Option<astream_broker::Retention>) {
         let mut opts = self.durability.options();
+        if let Some(budget) = self.resident_budget {
+            opts.resident_budget = Some(budget);
+        }
         opts.boot = self.boot;
         opts.volume = Volume::Boot;
         opts.require_bound_at_rest = self.at_rest.is_some();
@@ -428,7 +458,7 @@ impl Real {
                     Instant::now() < deadline,
                     "the real broker never took its first retention tick"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
         }
         // And its rate limit, as `aterm link broker` sets it at every open (critic item E06).
@@ -443,6 +473,16 @@ impl Real {
         &self.up.as_ref().expect("the real broker is up").0
     }
 
+    /// The records this arm read back from its log file because its budget left them cold,
+    /// over every open so far (`Broker::cold_reads`): 0 for a broker that holds them all.
+    fn cold_reads(&self) -> u64 {
+        self.cold_before
+            + self
+                .up
+                .as_ref()
+                .map_or(0, |(broker, _)| broker.cold_reads())
+    }
+
     /// Wait until the writer has settled every will queued to it.
     fn settle(&self) {
         let deadline = Instant::now() + HANG;
@@ -452,7 +492,7 @@ impl Real {
                 "the real broker never settled {} wills",
                 self.queued
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -592,6 +632,7 @@ impl Real {
             broker.arm_unclean_stop();
         }
         handle.shutdown();
+        self.cold_before += broker.cold_reads();
         drop(broker);
     }
 
@@ -830,11 +871,15 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
         }
         Response::Nonce { log, ext, .. } => (
             format!(
-                "hello generation={:?} served={:?} lineage={:?} requests={:?} retention={:?}",
+                "hello generation={:?} served={:?} lineage={:?} requests={:?} device={} \
+                 retention={:?}",
                 log.as_ref().map(|l| l.generation),
                 ext.durability,
                 ext.lineage,
                 ext.requests,
+                // That it names one: the real arm's number is its scratch log's device, the model's
+                // none's, and the drain is the platform's on the real arm and Apple's on the model.
+                ext.device.is_some(),
                 ext.retention
                     .as_deref()
                     .map(|rules| astream_broker::Retention::decode(rules).ok_or(rules))
@@ -888,25 +933,40 @@ fn run_keyed(
     mutant: ArmMutant,
     steps: &[Step],
 ) -> Verdict {
-    run_keeping(tier, retain, at_rest, mutant, steps).map(drop)
+    run_keeping(tier, retain, at_rest, None, mutant, steps).map(drop)
 }
 
-/// [`run_keyed`], handing back the real broker's files to look at.
+/// [`run_keyed`], the real broker keeping `resident_budget` bytes of decoded records resident
+/// in place of aterm's budget (`None`: aterm's), handing back the real broker's files and its
+/// cold reads to look at.
 fn run_keeping(
     tier: Tier,
     retain: Option<astream_broker::Retention>,
     at_rest: Option<[u8; 32]>,
+    resident_budget: Option<usize>,
     mutant: ArmMutant,
     steps: &[Step],
 ) -> Result<Real, String> {
     let table = table(tier);
     let clock = Clock::new();
-    let mut real = Real::new(tier, retain.clone(), at_rest);
+    let mut real = Real::new(tier, retain.clone(), at_rest, resident_budget);
     let mut model = Model::new(tier, retain, mutant);
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
     for (i, step) in steps.iter().enumerate() {
         let at = |what: &str| format!("{tier} step {i} {step:?}: {what}");
+        // The cold reads while a compared step runs ([`Real::answered_cold`]), `RateLimited`
+        // aside, as it reads `Broker::stats`; none of these opens or stops the broker.
+        let compared = matches!(
+            step,
+            Step::Send(..)
+                | Step::Pipeline(..)
+                | Step::Deliver(_)
+                | Step::DeliverAny(_)
+                | Step::Tick(_)
+                | Step::Cut(_)
+        )
+        .then(|| real.cold_reads());
         match step {
             Step::Dial(c) => {
                 real.dial(*c);
@@ -1010,6 +1070,9 @@ fn run_keeping(
                 }
                 answers += 1;
             }
+        }
+        if let Some(cold) = compared {
+            real.answered_cold += real.cold_reads() - cold;
         }
     }
     assert!(answers > 0, "a script that compared nothing");
@@ -1350,6 +1413,14 @@ pub(crate) mod scripts {
             Step::Send(2, publish(P, seq(1, 8), LANE, "fenced")),
             Step::Send(2, Request::ClearGapFences),
             Step::Send(2, publish(P, seq(1, 8), LANE, "lifted")),
+            // The settle (critic item F07): answered in send order with the durable head after
+            // its full flush, on a clean log too, and pipelined behind a publish.
+            Step::Send(2, Request::Settle),
+            Step::Send(2, Request::Settle),
+            Step::Pipeline(
+                2,
+                vec![publish(P, seq(1, 9), LANE, "settled"), Request::Settle],
+            ),
         ];
         s.extend(look(2));
         s
@@ -2114,6 +2185,9 @@ fn every_script() -> [(&'static str, Vec<Step>); 10] {
     ]
 }
 
+/// The key the sealed arms' logs are sealed under.
+const KEY: [u8; 32] = *b"conform-broker-at-rest-key-32-by";
+
 /// **A SEALED LOG ANSWERS AS A PLAINTEXT ONE**: every hand-written script, each where its
 /// plaintext run plays it ([`every_script`] on every tier the host serves, [`long_scripts`] on
 /// Relaxed), the real broker's log sealed at rest as `aterm link broker` opens one with its
@@ -2124,12 +2198,12 @@ fn every_script() -> [(&'static str, Vec<Step>); 10] {
 /// the keyed arm, so the arm compares, at the budget too.
 #[test]
 fn a_sealed_log_answers_every_script_as_the_model_does() {
-    const KEY: [u8; 32] = *b"conform-broker-at-rest-key-32-by";
     let arm = |tier, key, mutant, script: &[Step]| {
         run_keeping(
             tier,
             Some(crate::broker_rules::default_rules()),
             key,
+            None,
             mutant,
             script,
         )
@@ -2186,6 +2260,167 @@ fn a_sealed_log_answers_every_script_as_the_model_does() {
         )
         .is_err(),
         "CONTROL: the keyed arm answered a model with no subject budget as astream answers it"
+    );
+}
+
+/// THE COLD ARM'S resident budget: the newest record alone stays decoded, so every record a
+/// read takes below a log's head comes back from the file through astream's paged cold tier.
+const COLD: Option<usize> = Some(0);
+
+/// The hand-written scripts that read no record below their log's head, the one record a
+/// budget of 0 keeps resident: the scripts the cold arm reads nothing back for.
+const HEAD_ONLY: &[&str] = &["binary payload"];
+
+/// **A COLD LOG ANSWERS AS A RESIDENT ONE** (critic item F06). The shipped broker keeps 16 MiB of
+/// decoded records resident ([`crate::durability::RESIDENT_BUDGET`]) of up to 352 MiB its rules
+/// retain, so most of the history it serves it reads back from its log file through astream's
+/// paged cold tier, which no run above reaches: the longest script, [`long::scan_bound`], stays
+/// under aterm's budget. Here the real broker keeps none resident ([`COLD`]) and plays what the
+/// resident arms play, retained as they are: every hand-written script, plaintext and sealed
+/// under [`KEY`] (each sealed run's log has its `.seal`), on the tiers its resident runs play
+/// (every tier the host serves for [`every_script`], Relaxed for [`long_scripts`]), the door's
+/// journal of each of the [`WORLDS`] at its world's rules, and the reclaim scenario's on every
+/// tier the host serves. Residency is on no answer, so the model answers each as it answers a
+/// resident log.
+///
+/// The arm provably reached the cold tier: in every run of a script that reads below its head
+/// (each but [`HEAD_ONLY`]: a `Fetch` or a `Last` page, a group's resume, a tail's catch-up, the
+/// records retention's tick weighs under aterm's hold rules), and of every journal, records
+/// were read back cold while the requests, deliveries, ticks and cuts whose answers were
+/// compared ran (`Broker::cold_reads` over those steps, `Real::answered_cold`: never over the
+/// harness's own waits or `RateLimited`'s, which poll `Broker::stats`), and no [`HEAD_ONLY`]
+/// run read any.
+/// NEGATIVE CONTROLS: a model that forgets its dedup (`FreshDedup`), or its subject budget
+/// (`PublishPastTheBudget`, on the subject budget's long script), is still caught on the cold
+/// arm, and at aterm's own budget a script the cold arm reads back records for reads none, so
+/// the cold reads are the budget's doing.
+#[test]
+fn a_cold_log_answers_every_script_as_the_model_does() {
+    let rules = || Some(crate::broker_rules::default_rules());
+    let served: Vec<Tier> = [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+        .collect();
+    let scripts: Vec<_> = [None, Some(KEY)]
+        .into_iter()
+        .flat_map(|key| {
+            served
+                .iter()
+                .flat_map(move |&tier| {
+                    every_script().map(move |(name, script)| (tier, key, name, script))
+                })
+                .chain(long_scripts().map(move |(name, script)| (Tier::Relaxed, key, name, script)))
+        })
+        .collect();
+    let mut runs = aterm_spec::check::each(&scripts, |(tier, key, name, script)| {
+        let what = format!(
+            "{name} at {tier}{}",
+            if key.is_some() { ", sealed" } else { "" }
+        );
+        let verdict =
+            run_keeping(*tier, rules(), *key, COLD, ArmMutant::None, script).and_then(|real| {
+                if key.is_some() && !real.bound_at_rest() {
+                    Err("no `.seal`: nothing sealed it".to_string())
+                } else {
+                    Ok((real.answered_cold, real.cold_reads()))
+                }
+            });
+        (what, !HEAD_ONLY.contains(name), verdict)
+    });
+    let worlds: Vec<(u64, super::world::Opts)> = WORLDS
+        .iter()
+        .filter(|&&(_, tier)| served_here(tier))
+        .map(|&(seed, tier)| (seed, journalled_opts(seed, tier)))
+        .collect();
+    runs.extend(aterm_spec::check::each(&worlds, |(seed, opts)| {
+        let tier = opts.tier.expect("a journalled world names its tier");
+        let steps = replay(&super::world::run(opts).journal);
+        let verdict = run_keeping(tier, opts.rules(), None, COLD, ArmMutant::None, &steps)
+            .map(|real| (real.answered_cold, real.cold_reads()));
+        (format!("seed {seed}'s journal at {tier}"), true, verdict)
+    }));
+    runs.extend(served.iter().map(|&tier| {
+        let opts = super::world::Opts {
+            journal: true,
+            ..super::world::Opts::reclaiming(5, tier)
+        };
+        let steps = replay(&super::world::run_reclaim(&opts, 3, true).journal);
+        let verdict = run_keeping(tier, opts.rules(), None, COLD, ArmMutant::None, &steps)
+            .map(|real| (real.answered_cold, real.cold_reads()));
+        (format!("the reclaim journal at {tier}"), true, verdict)
+    }));
+    let (mut answered, mut cold) = (0, 0);
+    let mut failed = Vec::new();
+    let mut fewest: Option<(u64, &str)> = None;
+    for (what, below_the_head, verdict) in &runs {
+        match *verdict {
+            Err(ref e) => failed.push(format!("{what}: {e}")),
+            Ok((0, _)) if *below_the_head => failed.push(format!(
+                "{what}: no answer read a record back cold, so none came from the cold tier"
+            )),
+            Ok((_, all)) if !*below_the_head && all > 0 => failed.push(format!(
+                "{what}: read {all} records back cold, so it reads below its head"
+            )),
+            Ok((reads, all)) => {
+                answered += reads;
+                cold += all;
+                if *below_the_head && fewest.is_none_or(|(least, _)| reads < least) {
+                    fewest = Some((reads, what));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "the cold arm's answers read {answered} records back cold over {} runs (the fewest \
+         {fewest:?}), and with the harness's waits {cold}",
+        runs.len()
+    );
+    assert!(
+        failed.is_empty(),
+        "the model diverged from a cold log:\n{}",
+        failed.join("\n")
+    );
+    assert!(
+        answered > 0,
+        "the cold arm's answers read nothing back cold"
+    );
+    let resident = run_keeping(
+        Tier::Relaxed,
+        rules(),
+        None,
+        None,
+        ArmMutant::None,
+        &scripts::publishing(),
+    )
+    .expect("the resident arm");
+    assert_eq!(
+        resident.cold_reads(),
+        0,
+        "CONTROL: at aterm's budget the publishing script reads records back cold"
+    );
+    assert!(
+        run_keeping(
+            Tier::Relaxed,
+            rules(),
+            None,
+            COLD,
+            ArmMutant::FreshDedup,
+            &scripts::publishing()
+        )
+        .is_err(),
+        "CONTROL: the cold arm answered a forgetful model's resend as astream answers it"
+    );
+    assert!(
+        run_keeping(
+            Tier::Relaxed,
+            rules(),
+            None,
+            COLD,
+            ArmMutant::PublishPastTheBudget,
+            &long::budgets()
+        )
+        .is_err(),
+        "CONTROL: the cold arm answered a model with no subject budget as astream answers it"
     );
 }
 

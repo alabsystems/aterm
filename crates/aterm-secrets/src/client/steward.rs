@@ -351,48 +351,43 @@ pub(super) fn local_recipient_denied_in_roster_held(paths: &Paths, lock: &StateL
     local_recipient_denial_held(paths, lock).unwrap_or(true)
 }
 
-pub(crate) fn local_recipient_denial_held(paths: &Paths, lock: &StateLock) -> crate::Result<bool> {
-    local_recipient_denied_with(paths, || roster::swarm_roster_for_denial_held(paths, lock))
+pub(crate) fn local_recipient_denial_held(paths: &Paths, _lock: &StateLock) -> crate::Result<bool> {
+    local_recipient_denied(&Reads::new(paths))
 }
 
-fn local_recipient_denied_with(
-    paths: &Paths,
-    read_roster: impl FnOnce() -> crate::Result<Option<crate::swarm_roster::SwarmRoster>>,
-) -> crate::Result<bool> {
-    let Some(identity) = read_identity(paths)? else {
+pub(super) fn local_recipient_denied(reads: &Reads<'_>) -> crate::Result<bool> {
+    let Some(identity) = reads.identity()? else {
         return Ok(false);
     };
     let my_rec = identity.recipient();
     let recipient = my_rec.to_bech32();
-    let cfg = super::config(paths)?;
-    let state = load_state(paths)?;
-    let custody = cfg
-        .as_ref()
-        .map(|c| super::log_entries::authenticated_custody(paths, c, &state))
-        .transpose();
+    let cfg = reads.config()?;
+    // With no configuration custody never reads state, and an unreadable state still fails here.
+    reads.state()?;
+    let custody = reads.custody();
     if custody.is_err() {
         // Missing retained records cannot erase a denial authenticated by the cached
         // envelope. This fallback grants nothing; a complete log still resolves restores.
-        if let Some(config) = &cfg
-            && let Some(bytes) = super::read_verified_cached_envelope(paths, config, &state)?
-            && let Some(roster) =
-                log_entries::denial_roster(None, Some(&envelope::parse(&bytes)?), &identity)?
-            && roster_denies_local(paths, &roster, Some(config), &recipient)
+        if let Some(envelope) = reads.verified()?
+            && let Some(roster) = log_entries::denial_roster(None, Some(envelope), identity)?
+            && matches!(
+                roster_denies_local(reads.paths(), identity, &roster, cfg, &recipient),
+                Ok(true)
+            )
         {
             return Ok(true);
         }
     }
-    let local_log = custody?.flatten().map(|(log, _)| log);
-    if let (Some(c), Some(log)) = (&cfg, &local_log) {
+    let custody = custody?;
+    let local_log = custody.as_ref().map(HeldLog::log);
+    if let Some(log) = local_log {
         if log.removes(&my_rec) {
             return Ok(true);
         }
-        let behind = super::read_verified_cached_envelope(paths, c, &state)?
-            .and_then(|bytes| envelope::parse(&bytes).ok())
-            .is_some_and(|env| {
-                super::log_entries::log_base(Some(log), &env, &identity).ok()
-                    == Some(super::log_entries::LogBase::Behind)
-            });
+        let behind = reads.verified()?.is_some_and(|envelope| {
+            log_entries::log_base(Some(log), envelope, identity).ok()
+                == Some(log_entries::LogBase::Behind)
+        });
         if !behind
             && log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
@@ -402,8 +397,8 @@ fn local_recipient_denied_with(
             return Ok(true);
         }
     }
-    let r = read_roster()?;
-    if let Some(log) = &local_log
+    let r = roster::denial_swarm_roster(reads)?;
+    if let Some(log) = local_log
         && log_entries::recipient_denied_by_roster_or_log(r.as_ref(), log, &my_rec)
     {
         return Ok(true);
@@ -411,33 +406,39 @@ fn local_recipient_denied_with(
     let Some(r) = r else {
         return Ok(false);
     };
-    Ok(roster_denies_local(paths, &r, cfg.as_ref(), &recipient))
+    roster_denies_local(reads.paths(), identity, &r, cfg, &recipient)
 }
 
+/// Whether `r` denies this Mac. Where it denies nodes and nothing else denies this Mac, the device
+/// says which node this is, so a device that cannot be read is an error, not `false`: a Mac with no
+/// log has no seat to carry its node, and here alone would read as still in.
 fn roster_denies_local(
     paths: &Paths,
+    identity: &Identity,
     r: &crate::swarm_roster::SwarmRoster,
     config: Option<&Config>,
     recipient: &str,
-) -> bool {
-    if !r.deny_nodes.is_empty()
-        && let Ok(binding) =
-            crate::commons::bootstrap::Device::existing_binding_for_observation(paths)
+) -> crate::Result<bool> {
+    let device = if r.deny_nodes.is_empty() {
+        Ok(None)
+    } else {
+        crate::commons::bootstrap::Device::existing_binding_for_observation(paths, identity)
+    };
+    if let Ok(Some(binding)) = &device
         && (r.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
             || r.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
             || r.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine())))
     {
-        return true;
+        return Ok(true);
     }
-    if let Some(m) = r.member_by_recipient(recipient) {
-        return member_is_denied_in_roster(r, m);
+    let denied = match r.member_by_recipient(recipient) {
+        Some(member) => member_is_denied_in_roster(r, member),
+        None => config.is_some_and(|cfg| r.is_label_denied(&cfg.host)),
+    };
+    if denied {
+        return Ok(true);
     }
-    if let Some(cfg) = config
-        && r.is_label_denied(&cfg.host)
-    {
-        return true;
-    }
-    false
+    device.map(|_| false)
 }
 
 fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Option<String>> {
@@ -654,6 +655,10 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
     };
     let unavailable = || Unavailable(Some(context.clone()));
     let denial_or_unavailable = |denial: crate::Result<bool>| {
+        // An error refuses every other reader and here keeps a held role. One read of the vault
+        // file failing answers its whole observation, hiding the cached envelope's denial, so a
+        // failed observation gets one more, from the files as they are now.
+        let denial = denial.or_else(|_| local_recipient_denied(&Reads::new(paths)));
         // Even corrupt state cannot hide an explicit configured-lineage removal.
         let denied = denial.unwrap_or_else(|_| {
             log_entries::trusted_configured_log(paths, &config)
@@ -677,9 +682,7 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
         Ok(StateObservation::Absent | StateObservation::Busy) | Err(_) => {
             // Negative evidence remains useful during contention. Its absence or an
             // unreadable snapshot grants no new authority and preserves only a held role.
-            return denial_or_unavailable(local_recipient_denied_with(paths, || {
-                roster::swarm_roster_for_denial_snapshot(paths)
-            }));
+            return denial_or_unavailable(local_recipient_denied(&Reads::new(paths)));
         }
     };
     let state = load_state(paths);
@@ -712,7 +715,7 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
     let Ok(custody) = log_entries::authenticated_custody(paths, &config, &state) else {
         return unavailable();
     };
-    if !log_entries::applied_log_available(&state, custody.as_ref()) {
+    if !log_entries::applied_log_available(&state, custody.as_ref().map(|(_, digest)| *digest)) {
         // Missing applied records cannot establish a new role from an older envelope.
         // ServeRole may retain its existing role only under this unchanged context.
         return unavailable();

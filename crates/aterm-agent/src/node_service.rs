@@ -415,6 +415,10 @@ impl NodeJobLock {
                         Ok(()) => {
                             let _ = file.unlock();
                             if attempt < 4 {
+                                #[expect(
+                                    clippy::disallowed_methods,
+                                    reason = "a counted retry past another process's momentary shared probe, which no wake crosses: no deadline waits on the node job's take, and a longer pause only gives the probe longer to let go"
+                                )]
                                 std::thread::yield_now();
                             } else {
                                 std::thread::sleep(Duration::from_millis(1));
@@ -1931,7 +1935,22 @@ fn sync_gate(
     aterm_config: Option<&Path>,
     under_ci: bool,
 ) -> Result<Option<String>, String> {
-    if let Some(cfg) = aterm_config
+    sync_gate_with_mesh(
+        state_dir,
+        aterm_config,
+        under_ci,
+        aterm_types::mesh_switch::MESH,
+    )
+}
+
+fn sync_gate_with_mesh(
+    state_dir: &Path,
+    aterm_config: Option<&Path>,
+    under_ci: bool,
+    mesh: bool,
+) -> Result<Option<String>, String> {
+    if !mesh
+        && let Some(cfg) = aterm_config
         && !aterm_secrets::swarm::enabled_at(cfg).map_err(|e| e.to_string())?
     {
         return Ok(Some(aterm_secrets::swarm::SWARM_OFF.to_owned()));
@@ -1944,10 +1963,12 @@ fn sync_gate(
             "off on this Mac by your choice: `aterm node on` turns it on".to_owned(),
         ));
     }
-    // Membership is the fleet's key. A leave removes it (and writes `fleet-off`, which keeps the
+    // With the mesh on this job also hosts the local fabric, independently of swarm and fleet
+    // membership. CI and an explicit node off still stand aside. On the old path membership is
+    // the fleet's key. A leave removes it (and writes `fleet-off`, which keeps the
     // default fleet's sync from joining again); a fleet a person forms or joins here after that is
     // served by the window all the same, so the job stands for it too.
-    if aterm_net::fleet::read_key_file(state_dir).is_err() {
+    if !mesh && aterm_net::fleet::read_key_file(state_dir).is_err() {
         return Ok(Some(
             if left_the_fleet(state_dir) {
                 "this Mac left its fleet (`aterm fleet leave`)"

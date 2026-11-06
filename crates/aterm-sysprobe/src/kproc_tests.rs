@@ -76,7 +76,7 @@ mod live {
                 return r;
             }
             assert!(start.elapsed() < HANG, "{what}: not within {HANG:?}");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -120,7 +120,7 @@ mod live {
                 start.elapsed() < HANG,
                 "script's sleep: not within {HANG:?}"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         (script, sleep)
     }

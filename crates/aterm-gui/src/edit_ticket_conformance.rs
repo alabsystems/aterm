@@ -305,6 +305,7 @@ impl Rig {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         }
     }
 

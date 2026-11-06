@@ -381,6 +381,49 @@ impl Real {
         out
     }
 
+    /// [`Real::output_forwarded`] for a child of `step` that does a step's work, with the
+    /// `step-child-finished` record of what `wait4` booked for it ([`step_child_event`]).
+    fn output_accounted(
+        &self,
+        step: Step,
+        cmd: &mut Command,
+    ) -> std::io::Result<(std::process::Output, String)> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started_at_unix_ms = now_ms();
+        let (mut child, forwarded) = self.spawn_forwarded(cmd)?;
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+        let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+        let waited = wait_accounted(&mut child);
+        let ended_at_unix_ms = now_ms();
+        drop(forwarded);
+        let (status, usage) = waited?;
+        let output = std::process::Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        };
+        let record = step_child_event(
+            step,
+            cmd,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            status.code().unwrap_or(-1),
+            usage,
+        );
+        Ok((output, record))
+    }
+
     fn slug(&self) -> String {
         crate::publish::workspace_channel_slug(&self.repo)
             .unwrap_or_else(|_| "alabsystems/aterm".to_string())
@@ -496,7 +539,12 @@ impl Real {
             return not_started();
         }
         cmd.stdin(Stdio::null());
-        let pipe = if stream {
+        // The publish step's lines are always read as they arrive: when each came is the only
+        // split of the engine's time (`publish-line` records, A1), whether or not they echo.
+        let arrivals = (step == Step::Publish && !self.scratch_logs)
+            .then(|| crate::durable::open_append(&self.side_log(step, "arrivals"), true).ok())
+            .flatten();
+        let pipe = if stream || arrivals.is_some() {
             let made = std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w)));
             match made {
                 Ok((reader, out, err)) => {
@@ -521,6 +569,7 @@ impl Real {
             cmd.stdout(out).stderr(err);
             None
         };
+        let started_at_unix_ms = now_ms();
         let spawned = self.spawn_forwarded(cmd);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let (mut child, forwarded) = match spawned {
@@ -537,6 +586,7 @@ impl Real {
         let pumped = pipe.and_then(|reader| {
             let mut log = file.try_clone().ok()?;
             let (done, finished) = std::sync::mpsc::channel::<()>();
+            let mut arrivals = arrivals.map(Arrivals::new);
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -545,17 +595,32 @@ impl Real {
                         break;
                     }
                     let _ = log.write_all(&buf[..n]);
-                    let _ = std::io::stdout().write_all(&buf[..n]);
+                    if stream {
+                        let _ = std::io::stdout().write_all(&buf[..n]);
+                    }
+                    if let Some(arrivals) = &mut arrivals {
+                        arrivals.read(&buf[..n]);
+                    }
                 }
                 let _ = done.send(());
             });
             Some(finished)
         });
-        let code = child.wait().map_or(-1, |s| s.code().unwrap_or(-1));
+        let waited = wait_accounted(&mut child);
+        let ended_at_unix_ms = now_ms();
+        let code = waited
+            .as_ref()
+            .map_or(-1, |(status, _)| status.code().unwrap_or(-1));
         if let Some(finished) = pumped {
             let _ = finished.recv_timeout(std::time::Duration::from_secs(5));
         }
         drop(forwarded);
+        let usage = waited.ok().and_then(|(_, usage)| usage);
+        let _ = writeln!(
+            file,
+            "{}",
+            step_child_event(step, cmd, started_at_unix_ms, ended_at_unix_ms, code, usage)
+        );
         Ran {
             code,
             detail: tail(&log, 8),
@@ -672,12 +737,17 @@ impl Real {
             )
             .detail(ran.detail));
         }
-        crate::gates::submodules_on_declared_branch(&self.git()).map_err(|e| {
-            Refusal::new(
-                e.to_string(),
+        crate::gates::submodules_on_declared_branch(&self.git()).map_err(|e| match e {
+            crate::gates::PinRefusal::Unread(why) => Refusal::new(
+                why,
+                "the fetch was retried and the pin is not in question: re-run once the network \
+                 and the forge answer",
+            ),
+            crate::gates::PinRefusal::Off(why) => Refusal::new(
+                why,
                 "land the astream change on astream's main and bump vendor/astream to that \
                  commit (vendor/README-astream.md), then re-run",
-            )
+            ),
         })
     }
 
@@ -922,15 +992,20 @@ impl Real {
             Err(why) => return not_run(scanner_refusal(why)),
         };
         scanners.apply(&mut stage);
-        let (code, text) = match self.output_forwarded(&mut stage) {
-            Ok(o) => (
-                o.status.code().unwrap_or(-1),
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-            ),
+        let (code, text) = match self.output_accounted(self.step, &mut stage) {
+            Ok((o, record)) => {
+                if let Ok(mut file) = crate::durable::open_append(&self.step_log(self.step), true) {
+                    let _ = writeln!(file, "{record}");
+                }
+                (
+                    o.status.code().unwrap_or(-1),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
+                )
+            }
             Err(e) => (-1, format!("cannot run {}: {e}", pubbin.display())),
         };
         let _ = crate::durable::write_fresh(&log, format!("{handed}\n{text}"));
@@ -1403,8 +1478,10 @@ impl Real {
             "--test",
             "spec_xref_closure",
         ]);
-        // The pinned driver bypasses atpkg's shim. Match the verifier's cache
-        // after `child` has removed the caller's Cargo layout overrides.
+        // The pinned driver bypasses atpkg's shim. Match the verifier's cache, and the
+        // physical target every verify child is handed, after `child` has removed the
+        // caller's Cargo layout overrides: a test compiled here through the clone's
+        // `target -> target.noindex` link would spell its `CARGO_BIN_EXE_*` unlike verify's.
         let env = aterm_verify::EnvSnapshot {
             home: std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1412,9 +1489,13 @@ impl Real {
             path: publication_path(),
             ..Default::default()
         };
-        let target = self.repo.join("target");
-        if let Some(layout) = aterm_verify::main_build_dir(&env, &self.repo)
-            .or_else(|| aterm_verify::fallback_build_dir(&env, &self.repo, &target))
+        // The clone by its physical path, as verify reads its root, so the cache and its
+        // layout are the ones verify chose.
+        let repo = aterm_verify::physical(&self.repo);
+        let target = aterm_verify::physical_target(&env, &repo);
+        cmd.env("CARGO_TARGET_DIR", &target);
+        if let Some(layout) = aterm_verify::main_build_dir(&env, &repo)
+            .or_else(|| aterm_verify::fallback_build_dir(&env, &repo, &target))
         {
             cmd.arg("--config").arg(layout);
         }
@@ -1514,27 +1595,43 @@ impl Real {
 
     fn captured(
         &self,
+        step: Step,
         prover: &Prover,
         log: &Path,
         cmd: &mut Command,
     ) -> std::io::Result<std::process::Output> {
         scrub(cmd);
         cmd.env("TRUST_STAGE2_BIN", &prover.bin);
-        let out = self.output_forwarded(cmd)?;
+        let (out, record) = self.output_accounted(step, cmd)?;
         append_output(log, &out);
+        if let Ok(mut file) = crate::durable::open_append(log, true) {
+            let _ = writeln!(file, "{record}");
+        }
         Ok(out)
     }
 
     fn stage_fixtures_run(
         &self,
+        step: Step,
         c: &Candidate,
         reserved: &Reservation,
         prover: &Prover,
         log: &Path,
     ) -> Result<String, Refusal> {
+        // The generator compiles the clone's working tree, so that tree must be R's.
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(Refusal::new(
+                format!(
+                    "the clone is not at {}'s tree and clean, so the handoff fixtures would not be its",
+                    short(&c.commit)
+                ),
+                format!("restore the clean candidate tree, then {RELEASE_COMMAND}"),
+            )
+            .detail(off));
+        }
         let pins = fixture_pins(c, reserved);
         let root = fixture_root(&self.repo)?;
-        let mut run = |cmd: &mut Command| self.captured(prover, log, cmd);
+        let mut run = |cmd: &mut Command| self.captured(step, prover, log, cmd);
         crate::fixtures::stage(
             &prover.bin.join("targo"),
             &self.repo,
@@ -1859,6 +1956,107 @@ fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+/// When each line of a step's output arrived, as `publish-line` records in a side log: the
+/// engine stamps none of its own, and promote's sections reach the log only once it ends.
+struct Arrivals {
+    file: std::fs::File,
+    line: Vec<u8>,
+}
+
+impl Arrivals {
+    /// The head of a line kept: enough to name the engine's section, never its whole output.
+    const HEAD: usize = 200;
+
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            line: Vec::new(),
+        }
+    }
+
+    fn read(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte != b'\n' {
+                if self.line.len() < Self::HEAD {
+                    self.line.push(byte);
+                }
+                continue;
+            }
+            let text = String::from_utf8_lossy(&self.line).into_owned();
+            let _ = writeln!(
+                self.file,
+                "release-event: {}",
+                aterm_json::json!({
+                    "schema": 1, "event": "publish-line", "at_unix_ms": now_ms(), "line": text,
+                })
+            );
+            self.line.clear();
+        }
+    }
+}
+
+/// Wait for a step's child and keep what `wait4` books for it: CPU of the child and of every
+/// descendant reaped down its tree (verify's stages and the engine's children run in groups and
+/// sessions of their own, which a group read of the child would miss), and the largest process's
+/// resident peak. `None` usage where the host keeps no accounting; the status either way.
+fn wait_accounted(
+    child: &mut aterm_uds::spawnfd::Child,
+) -> std::io::Result<(std::process::ExitStatus, Option<aterm_uds::spawnfd::Rusage>)> {
+    match child.wait_with_rusage() {
+        Ok(usage) => Ok((usage.status, Some(usage))),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok((child.wait()?, None)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `step-child-finished` record a step's child leaves in its step log: when it ran, how it
+/// exited and what `wait4` booked for it. Planning data for `release status`, never a verdict,
+/// so it carries no `outcome` (a retried child's exit is not the run's first red).
+fn step_child_event(
+    step: Step,
+    cmd: &Command,
+    started_at_unix_ms: Option<u64>,
+    ended_at_unix_ms: Option<u64>,
+    exit_code: i32,
+    usage: Option<aterm_uds::spawnfd::Rusage>,
+) -> String {
+    let program = std::iter::once(
+        Path::new(cmd.get_program())
+            .file_name()
+            .unwrap_or(cmd.get_program())
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .chain(
+        cmd.get_args()
+            .take(3)
+            .map(|a| a.to_string_lossy().into_owned()),
+    )
+    .collect::<Vec<_>>()
+    .join(" ");
+    format!(
+        "release-event: {}",
+        aterm_json::json!({
+            "schema": 1, "event": "step-child-finished", "step": step.name(),
+            "program": program,
+            "started_at_unix_ms": started_at_unix_ms, "ended_at_unix_ms": ended_at_unix_ms,
+            "exit_code": exit_code,
+            "child_cpu": usage.map(|u| aterm_json::json!({
+                "scope": "reaped-child-and-waited-descendants",
+                "observed_s": u.cpu.as_secs_f64(),
+            })),
+            "peak_bytes": usage.map(|u| u.maxrss).filter(|b| *b > 0),
+        })
+    )
 }
 
 fn short(sha: &str) -> &str {
@@ -2832,8 +3030,9 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
         );
     }
     bad.extend(source_attestation_findings(release));
-    let retired: Vec<&String> = assets
+    let retired: Vec<&str> = assets
         .keys()
+        .map(String::as_str)
         .filter(|n| {
             n.ends_with("-x86_64.dmg") || n.ends_with("-lite.dmg") || *n == "aterm-offline.dmg"
         })
@@ -2841,18 +3040,13 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
     if !retired.is_empty() {
         bad.push(format!(
             "retired macOS asset(s) present: {} — there is exactly ONE macOS DMG",
-            retired
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            retired.join(", ")
         ));
     }
     let body = release
         .get("body")
         .and_then(aterm_json::Value::as_str)
-        .unwrap_or("")
-        .to_lowercase();
+        .unwrap_or("");
     let said: Vec<&str> = [
         "batteries-included",
         "batteries included",
@@ -2861,7 +3055,11 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
         "air-gapped",
     ]
     .into_iter()
-    .filter(|w| body.contains(w))
+    .filter(|w| {
+        body.as_bytes()
+            .windows(w.len())
+            .any(|win| win.eq_ignore_ascii_case(w.as_bytes()))
+    })
     .collect();
     if !said.is_empty() {
         bad.push(format!(
@@ -3970,7 +4168,7 @@ impl Backend for Real {
         prover: &Prover,
     ) -> Result<String, Refusal> {
         let log = self.step_log(self.step);
-        self.stage_fixtures_run(c, reserved, prover, &log)
+        self.stage_fixtures_run(self.step, c, reserved, prover, &log)
     }
 
     fn land_fixtures(
@@ -4086,20 +4284,14 @@ impl Backend for Real {
         prover: &Prover,
         fixtures: bool,
     ) -> Built {
-        // A resumed journal may have staged with an older cutter. Recheck the
-        // warm test graph before starting either the product or its fixtures.
-        if let Err(refusal) = self.compile_tests(c, prover) {
-            return Built {
-                artifact: Err(refusal),
-                fixtures: None,
-            };
-        }
         let fixtures_log = self.side_log(Step::Build, "fixtures");
         let this = &*self;
         std::thread::scope(|s| {
             let staged = if fixtures {
                 let log = &fixtures_log;
-                Some(s.spawn(move || this.stage_fixtures_run(c, reserved, prover, log)))
+                Some(
+                    s.spawn(move || this.stage_fixtures_run(Step::Build, c, reserved, prover, log)),
+                )
             } else {
                 None
             };
@@ -6073,17 +6265,7 @@ mod tests {
                 .contains("required workspace test compilation failed"),
             "{failure:?}"
         );
-        real.entered(Step::Build);
-        let failed_build = real.build(&candidate, &Reservation::default(), &prover, true);
-        assert!(
-            failed_build
-                .artifact
-                .unwrap_err()
-                .why
-                .contains("required workspace test compilation failed")
-        );
-        assert!(failed_build.fixtures.is_none());
-        let compiled = std::fs::read_to_string(real.step_log(Step::Build)).unwrap();
+        let compiled = std::fs::read_to_string(real.step_log(real.step)).unwrap();
         assert!(
             compiled.contains("--compile-only") && compiled.contains("--as-release"),
             "{compiled}"
@@ -6146,9 +6328,81 @@ mod tests {
         );
     }
 
+    /// The fixture generator compiles the clone's working tree, so a clone off the candidate's
+    /// tree is refused before it runs, in the build step as in the stage step.
+    #[cfg(unix)]
+    #[test]
+    fn the_fixture_generator_refuses_a_clone_off_the_candidates_tree() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        crate::ledger::testing::init(
+            &repo,
+            &[
+                ("user.name", "Test"),
+                ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+        let git = GitCli::new(&repo);
+        git.git(&["commit", "--allow-empty", "-qm", "candidate"])
+            .unwrap();
+        let candidate = Candidate {
+            commit: git
+                .git(&["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .into(),
+            version: "1.0.0".into(),
+            why: "test".into(),
+            bump_from: None,
+        };
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
+        let prover = Prover {
+            bin,
+            commit: "test".into(),
+            source: "test".into(),
+        };
+        let real = Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
+        let log = dir.path().join("fixtures.log");
+        let off_tree = |refusal: &Refusal| refusal.why.contains("tree and clean");
+        let clean = real.stage_fixtures_run(
+            Step::Build,
+            &candidate,
+            &Reservation::default(),
+            &prover,
+            &log,
+        );
+        assert!(!clean.as_ref().is_err_and(off_tree), "{clean:?}");
+        std::fs::write(repo.join("untracked"), "changed").unwrap();
+        let dirty = real
+            .stage_fixtures_run(
+                Step::Build,
+                &candidate,
+                &Reservation::default(),
+                &prover,
+                &log,
+            )
+            .unwrap_err();
+        assert!(off_tree(&dirty), "{dirty:?}");
+        assert!(
+            dirty.detail.iter().any(|line| line.contains("untracked")),
+            "{dirty:?}"
+        );
+    }
+
     #[test]
     fn source_closure_uses_the_workspace_graph_and_refuses_a_failed_check() {
         let dir = aterm_tempfile::tempdir().unwrap();
+        // A release clone's layout: its target is a link, and the closure builds through
+        // the physical directory verify's children are handed.
+        std::fs::create_dir(dir.path().join("target.noindex")).unwrap();
+        std::os::unix::fs::symlink("target.noindex", dir.path().join("target")).unwrap();
+        let physical = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("target.noindex");
         let real = Real::new(dir.path(), Some(Path::new("/unused/engine")), true, false).unwrap();
         let prover = Prover {
             bin: dir.path().join("toolchain"),
@@ -6174,7 +6428,18 @@ mod tests {
                 );
                 assert_eq!(args.len(), 9);
                 assert_eq!(args[7], "--config");
-                assert!(args[8].to_string_lossy().contains(".noindex"));
+                assert_eq!(
+                    args[8].to_string_lossy(),
+                    format!(
+                        "build.build-dir='{}'",
+                        physical.join("build.noindex").display()
+                    )
+                );
+                let target = cmd
+                    .get_envs()
+                    .find(|(k, _)| *k == "CARGO_TARGET_DIR")
+                    .and_then(|(_, v)| v);
+                assert_eq!(target, Some(physical.as_os_str()));
                 Ran {
                     code,
                     detail: vec!["unbound model action".into()],
@@ -6667,6 +6932,118 @@ mod tests {
         assert!(
             at("one\n") < at("two\n") && at("two\n") < at("three\n"),
             "{log}"
+        );
+    }
+
+    /// Each step child leaves one `step-child-finished` record after its output: its exit, when
+    /// it ran, and the CPU `wait4` booked for it and the descendants it reaped (here a
+    /// grandchild that did all the work), with no `outcome`, so a child's exit is never a red.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_child_books_the_cpu_of_what_it_reaped_and_is_no_red() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(dir.path(), None, true, false).expect("a backend");
+        let mut cmd = real.child("/bin/sh", None);
+        cmd.args([
+            "-c",
+            "/bin/sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' & wait; echo done; exit 3",
+        ]);
+        let ran = real.logged(Step::Build, &mut cmd);
+        assert_eq!(ran.code, 3, "{ran:?}");
+        let log = std::fs::read_to_string(real.step_log(Step::Build)).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"step-child-finished\""))
+            .unwrap_or_else(|| panic!("no record: {log}"));
+        assert!(
+            log.find("done\n").unwrap() < log.find(line).unwrap(),
+            "the record follows the output: {log}"
+        );
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(event["step"].as_str(), Some("build"), "{event}");
+        assert_eq!(event["exit_code"].as_u64(), Some(3), "{event}");
+        assert!(event.get("outcome").is_none(), "{event}");
+        assert!(
+            event["started_at_unix_ms"].as_u64() <= event["ended_at_unix_ms"].as_u64(),
+            "{event}"
+        );
+        let cpu = event["child_cpu"]["observed_s"]
+            .as_f64()
+            .expect("wait4 CPU");
+        assert!(cpu > 0.0, "{event}");
+        assert!(
+            event["program"].as_str().unwrap().starts_with("sh -c"),
+            "{event}"
+        );
+    }
+
+    /// A step child whose output the step reads (the fixture generator, the export dry run)
+    /// is booked as a logged one is, and its output still comes back whole and apart.
+    #[test]
+    fn a_captured_step_child_is_booked_and_keeps_its_output() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(dir.path(), None, true, false).expect("a backend");
+        let mut cmd = real.child("/bin/sh", None);
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo out; echo err >&2; exit 4",
+        ]);
+        let (out, record) = real.output_accounted(Step::Stage, &mut cmd).unwrap();
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(
+            (out.stdout.as_slice(), out.stderr.as_slice()),
+            (&b"out\n"[..], &b"err\n"[..])
+        );
+        let event: aterm_json::Value =
+            aterm_json::from_str(record.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(event["step"].as_str(), Some("stage"), "{event}");
+        assert_eq!(event["exit_code"].as_u64(), Some(4), "{event}");
+        assert!(event.get("outcome").is_none(), "{event}");
+        let cpu = event["child_cpu"]["observed_s"]
+            .as_f64()
+            .expect("wait4 CPU");
+        assert!(cpu > 0.0, "{event}");
+    }
+
+    /// The publish step's lines are stamped as they arrive, in a side log, even when they are
+    /// not echoed: the split of the engine's time comes from nowhere else.
+    #[cfg(unix)]
+    #[test]
+    fn the_publish_steps_lines_are_stamped_as_they_arrive() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut real = Real::new(dir.path(), None, true, false).expect("a backend");
+        real.scratch_logs = false;
+        let mut cmd = real.child("/bin/sh", None);
+        cmd.args([
+            "-c",
+            "echo '== first section'; echo body >&2; echo '== second'",
+        ]);
+        let ran = real.logged(Step::Publish, &mut cmd);
+        real.scratch_logs = true;
+        assert_eq!(ran.code, 0, "{ran:?}");
+        let log = std::fs::read_to_string(real.step_log(Step::Publish)).unwrap();
+        assert!(
+            log.contains("== first section\n") && log.contains("body\n"),
+            "{log}"
+        );
+        let arrivals = std::fs::read_to_string(real.side_log(Step::Publish, "arrivals")).unwrap();
+        let lines: Vec<aterm_json::Value> = arrivals
+            .lines()
+            .map(|l| aterm_json::from_str(l.strip_prefix("release-event: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3, "{arrivals}");
+        assert!(
+            lines
+                .iter()
+                .all(|e| e["event"].as_str() == Some("publish-line")
+                    && e["at_unix_ms"].as_u64().is_some())
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|e| e["line"].as_str() == Some("== second")),
+            "{arrivals}"
         );
     }
 

@@ -26,6 +26,39 @@ impl DocumentId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentViewId(pub u64);
 
+/// What no reader of a document gets but the person's own eyes on its window (one-mesh design
+/// §4.8, "Revealed values stay out of the accessibility tree"): a revealed secret's grid's
+/// accessibility tree, the status its editor writes, and every other surface the window hands
+/// to another process, carry its concealed cells as "hidden value". Set once, for the document's
+/// life ([`DocumentStore::set_concealed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Concealed {
+    /// Every cell, headers included, and every line of its text: what a private document whose
+    /// opener named no secret columns gets.
+    All,
+    /// The cells of the grid columns headed by one of these (each header's whole text). The
+    /// headers themselves, and the text of every other column, are not concealed; a line of the
+    /// document's text still is, since a line holds every column's cell.
+    Columns(Vec<String>),
+}
+
+impl Concealed {
+    /// Whether the cells of the grid column headed `header` are concealed.
+    #[must_use]
+    pub fn column(&self, header: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Columns(headers) => headers.iter().any(|named| named == header),
+        }
+    }
+
+    /// Whether a header row's cell is concealed: only where every cell is.
+    #[must_use]
+    pub const fn headers(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 /// Immutable read projection.
 #[derive(Clone, Debug)]
 pub struct DocumentSnapshot {
@@ -130,6 +163,8 @@ struct Document {
     /// Opened to be read and never changed ([`DocumentStore::set_read_only`]): every transaction
     /// is refused, as a directory listing's is.
     read_only: bool,
+    /// What no reader but the person's eyes gets of it ([`DocumentStore::set_concealed`]).
+    concealed: Option<Concealed>,
     id: DocumentId,
     canonical_uri: String,
     surface: Surface,
@@ -223,6 +258,7 @@ impl DocumentStore {
         let document = Document {
             directory: None,
             read_only: false,
+            concealed: None,
             id,
             canonical_uri: canonical_uri.clone(),
             surface,
@@ -263,6 +299,32 @@ impl DocumentStore {
             .ok_or(DocumentError::UnknownDocument)?
             .read_only = true;
         Ok(())
+    }
+
+    /// Conceal `concealed` of document `id` from every reader but the person's eyes, for the rest
+    /// of its life ([`Concealed`]). A later call keeps the first: what a reader may be told never
+    /// widens under it.
+    ///
+    /// # Errors
+    /// No such document.
+    pub fn set_concealed(
+        &mut self,
+        id: DocumentId,
+        concealed: Concealed,
+    ) -> Result<(), DocumentError> {
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        document.concealed.get_or_insert(concealed);
+        Ok(())
+    }
+
+    /// What of document `id` no reader but the person's eyes gets ([`Self::set_concealed`]);
+    /// `None` for a document that conceals nothing.
+    #[must_use]
+    pub fn concealed(&self, id: DocumentId) -> Option<&Concealed> {
+        self.documents.get(&id)?.concealed.as_ref()
     }
 
     /// Whether document `id` refuses every change: a directory listing, or a document made
@@ -800,6 +862,29 @@ mod tests {
     /// sequence, and stays read-only when its URI is opened again.
     /// NEGATIVE CONTROL: with `transact` checking only `directory`, the edit commits:
     /// `` read-only: Committed { .. } ``.
+    /// A concealed document keeps what it first concealed for its life: a second call cannot
+    /// narrow it, and reopening its URI keeps it. A header is concealed only where every cell is.
+    #[test]
+    fn a_document_s_concealment_is_set_once_and_never_narrows() {
+        let (mut store, id) = open();
+        assert_eq!(store.concealed(id), None);
+        store.set_concealed(id, Concealed::All).unwrap();
+        store
+            .set_concealed(id, Concealed::Columns(vec!["password".into()]))
+            .unwrap();
+        assert_eq!(store.concealed(id), Some(&Concealed::All));
+        assert_eq!(store.open("mem://readme".into(), "again".into()), id);
+        assert_eq!(store.concealed(id), Some(&Concealed::All));
+        let columns = Concealed::Columns(vec!["password".into(), "number".into()]);
+        assert!(columns.column("password") && columns.column("number"));
+        assert!(!columns.column("addr") && !columns.column("=password"));
+        assert!(!columns.headers() && Concealed::All.headers() && Concealed::All.column("addr"));
+        assert_eq!(
+            store.set_concealed(DocumentId(NonZeroU64::new(99).unwrap()), Concealed::All),
+            Err(DocumentError::UnknownDocument)
+        );
+    }
+
     #[test]
     fn a_read_only_document_refuses_every_change() {
         let (mut store, id) = open();

@@ -95,6 +95,38 @@ impl Supervised {
         broker
     }
 
+    /// [`Supervised::start`] once the bridge holds its mirror pin's fence. Where the bridge
+    /// fences the pin by the broker's settle (critic item F07), its first take costs the broker
+    /// a full flush, which the armed fault would fail ahead of the post's. So a broker with no
+    /// fault serves the log until that take and stops cleanly, and this run's broker reopens
+    /// it, its generation unmoved; its banner is broker.err's second ([`Supervised::identity`]).
+    fn start_fenced(&self, w: &World) -> BrokerProcess {
+        let clean = Self {
+            secret: self.secret.clone(),
+            err: self.err.clone(),
+            fault: String::new(),
+        };
+        let mut first = clean.start(w);
+        w.wait_ready();
+        w.mirror_fenced();
+        drop(first.lifeline.take());
+        let ended = until("the fault-free broker to end with its lifeline", || {
+            first.child.try_wait().ok().flatten()
+        });
+        assert!(
+            ended.success(),
+            "a clean stop exits 0: {ended}\n{}",
+            read(&self.err)
+        );
+        let broker = self.start(w);
+        assert_eq!(
+            self.identity(1),
+            self.identity(0),
+            "a clean stop's reopen keeps the log and its generation"
+        );
+        broker
+    }
+
     fn identity(&self, n: usize) -> (String, u64) {
         let banner = until("the broker's banner on broker.err", || {
             read(&self.err)
@@ -155,8 +187,8 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, ""));
-    let mut broker = sup.start(&w);
-    let (id, generation) = sup.identity(0);
+    let mut broker = sup.start_fenced(&w);
+    let (id, generation) = sup.identity(1);
     w.wait_ready();
 
     w.post_landed(&a, &b, "note", "", "before the poison");
@@ -184,7 +216,7 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
 
     drop(broker);
     let _restarted = sup.start(&w);
-    let (id_after, generation_after) = sup.identity(1);
+    let (id_after, generation_after) = sup.identity(2);
     assert_eq!(id_after, id, "the same log");
     assert_eq!(
         generation_after,
@@ -243,7 +275,7 @@ fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, "stay"));
-    let mut broker = sup.start(&w);
+    let mut broker = sup.start_fenced(&w);
     w.wait_ready();
     w.post_landed(&a, &b, "note", "", "before the poison");
 
@@ -302,8 +334,8 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, ""));
-    let mut broker = sup.start(&w);
-    let (id, generation) = sup.identity(0);
+    let mut broker = sup.start_fenced(&w);
+    let (id, generation) = sup.identity(1);
     w.wait_ready();
 
     let (_, asked) = w.post_landed(&b, &a, "ask", "", "which branch?");
@@ -338,7 +370,7 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
 
     drop(broker);
     let _restarted = sup.start(&w);
-    let (id_after, generation_after) = sup.identity(1);
+    let (id_after, generation_after) = sup.identity(2);
     assert_eq!(id_after, id, "the same log");
     assert_eq!(generation_after, generation + 1, "the next generation");
 

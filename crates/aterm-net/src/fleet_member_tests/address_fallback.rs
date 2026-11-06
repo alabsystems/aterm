@@ -513,7 +513,7 @@ fn shared_refusals_are_judged_by_each_targets_key() {
             let started = Instant::now();
             while Arc::strong_count(&opened.exchange) < 5 {
                 assert!(started.elapsed() < HANG, "every reader joins the exchange");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             opened.exchange.tell(Exchanged::Refused(ProvedRefusal {
                 ended: matches!(error, FleetError::UnknownOp(_)),
@@ -593,7 +593,7 @@ fn a_partly_admitted_lookup_keeps_its_result_and_its_limit() {
                 started.elapsed() < HANG,
                 "the admitted lookup returns its permit"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
     let _held: Vec<_> = (0..RESOLVER_THREADS_MAX)

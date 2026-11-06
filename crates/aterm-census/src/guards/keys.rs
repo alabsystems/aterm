@@ -44,9 +44,17 @@ fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
     surface.extend(tool);
     for rel in &surface {
-        match crate::tree::read_bytes(&tree.root.join(rel)) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
+        let loaded = tree
+            .corpus
+            .get(rel)
+            .map(|f| Ok(std::borrow::Cow::Borrowed(f.raw.as_str())))
+            .unwrap_or_else(|| {
+                crate::tree::read_bytes(&tree.root.join(rel)).map(|bytes| {
+                    std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+                })
+            });
+        match loaded {
+            Ok(text) => {
                 for (i, line) in text.lines().enumerate() {
                     if phrases(line).iter().any(|p| !synthetic(p)) {
                         out.push(Finding {

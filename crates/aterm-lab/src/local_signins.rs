@@ -331,7 +331,7 @@ impl Ran {
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::util::read_regular_file(path).ok()?;
     Some(aterm_codec::hex::encode_lower(
         &aterm_digest::Sha256::digest(&bytes),
     ))
@@ -347,7 +347,8 @@ fn put(path: &Path, text: &str) -> Result<(), String> {
 fn b64url(bytes: &[u8]) -> String {
     let mut out = String::new();
     let _ = aterm_codec::base64::encode_url_into(&mut out, bytes);
-    out.trim_end_matches('=').to_string()
+    out.truncate(out.trim_end_matches('=').len());
+    out
 }
 
 /// An unsigned JWT (`alg: none`) whose claims a Codex login file carries.
@@ -562,7 +563,7 @@ pub fn standin_main(argv0: &str, args: &[String]) -> i32 {
         .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned());
     let Some(ran) = path
         .parent()
-        .and_then(|dir| std::fs::read_to_string(dir.join(STANDIN_MARK)).ok())
+        .and_then(|dir| crate::util::read_regular_text(&dir.join(STANDIN_MARK)).ok())
         .map(PathBuf::from)
     else {
         return 1;
@@ -818,19 +819,22 @@ impl Mac {
         let mut stack = vec![self.world.state()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let path = entry.path();
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
                 if kind.is_dir() {
-                    stack.push(path);
-                } else if kind.is_file()
-                    && let Ok(bytes) = std::fs::read(&path)
-                {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for l in &labels {
-                        if text.contains(&format!("\"{l}\"")) {
-                            found.insert(format!("{l} in {}", path.display()));
+                    stack.push(entry.path());
+                } else if kind.is_file() {
+                    let path = entry.path();
+                    if let Ok(bytes) = crate::util::read_regular_file(&path) {
+                        for l in &labels {
+                            if bytes.windows(l.len() + 2).any(|w| {
+                                w[0] == b'"'
+                                    && w[l.len() + 1] == b'"'
+                                    && &w[1..=l.len()] == l.as_bytes()
+                            }) {
+                                found.insert(format!("{l} in {}", path.display()));
+                            }
                         }
                     }
                 }

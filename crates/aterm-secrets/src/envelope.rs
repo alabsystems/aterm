@@ -8,7 +8,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 
 mod digest_cache;
 
-pub(crate) use digest_cache::digest as digest_bytes;
+use digest_cache::digest as digest_bytes;
 
 /// The first line.
 pub const MAGIC: &str = "alab-vault/1";
@@ -62,6 +62,7 @@ pub struct Envelope {
     pub signature: [u8; 64],
     raw: Vec<u8>,
     signed_len: usize,
+    digest: [u8; 32],
 }
 
 /// What signing needs.
@@ -511,6 +512,7 @@ pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
         signature,
         raw: bytes.to_vec(),
         signed_len,
+        digest: digest_bytes(bytes),
     })
 }
 
@@ -697,12 +699,12 @@ impl Envelope {
 
     /// SHA-256 of [`Envelope::raw`].
     pub fn digest(&self) -> [u8; 32] {
-        digest_bytes(&self.raw)
+        self.digest
     }
 
     /// Check the signature over the signed bytes with `signer`.
     pub fn verify_signature(&self) -> crate::Result<()> {
-        if astream_aead::signature::verify(
+        if crate::ed25519::verifies_cached(
             &self.signer,
             &self.raw[..self.signed_len],
             &self.signature,
@@ -899,6 +901,24 @@ pub(crate) fn verify_for_reader_with(
     retired: &Retired,
 ) -> crate::Result<(Envelope, Pin, Verdict)> {
     let envelope = parse(bytes)?;
+    let (pin, verdict) =
+        judge_for_reader(&envelope, expect_name, pin, followed, held, retired, || {
+            envelope.verify_signature()
+        })?;
+    Ok((envelope, pin, verdict))
+}
+
+/// [`verify_for_reader_with`]'s checks after [`parse`], in its order, of an envelope already
+/// parsed; `signature` answers [`Envelope::verify_signature`] when that check is reached.
+pub(crate) fn judge_for_reader(
+    envelope: &Envelope,
+    expect_name: &str,
+    pin: &[u8; 32],
+    followed: &[[u8; 32]],
+    held: Option<&Floor>,
+    retired: &Retired,
+    signature: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<(Pin, Verdict)> {
     if envelope.name != expect_name {
         return Err(Error::new(format!(
             "envelope: names the vault `{}`, not `{expect_name}`",
@@ -906,7 +926,7 @@ pub(crate) fn verify_for_reader_with(
         )));
     }
     let pin = envelope.check_pin_with(pin, followed, retired)?;
-    envelope.verify_signature()?;
+    signature()?;
     let held = held.filter(|_| !matches!(pin, Pin::Replaced(_)));
     let verdict = match held {
         None => Verdict::New,
@@ -936,7 +956,7 @@ pub(crate) fn verify_for_reader_with(
             )));
         }
     };
-    Ok((envelope, pin, verdict))
+    Ok((pin, verdict))
 }
 
 /// A syntactically valid armored block around `bytes` (not an age file: the envelope never looks inside).

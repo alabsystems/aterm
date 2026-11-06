@@ -206,6 +206,17 @@ impl Recent {
         (n > 0).then(|| sum / f64::from(n))
     }
 
+    /// Largest of the readings [`Self::mean`] averages.
+    #[must_use]
+    pub fn max(&self, now_ms: i64, window_ms: i64) -> Option<f64> {
+        let cutoff = i128::from(now_ms) - i128::from(window_ms);
+        self.v
+            .iter()
+            .filter(|r| i128::from(r.at_ms) > cutoff && r.at_ms <= now_ms)
+            .map(|r| r.v)
+            .reduce(f64::max)
+    }
+
     /// Every reading kept, oldest first.
     #[must_use]
     pub fn readings(&self) -> Vec<Reading> {
@@ -385,6 +396,8 @@ pub struct BucketRing {
     recent: Recent,
     /// The ten-minute buckets the deck's 1 h boxes read.
     long: Long,
+    /// Whether a push feeds `long`: not for a ring [`Self::without_long`] made.
+    long_kept: bool,
 }
 
 impl Default for BucketRing {
@@ -404,13 +417,27 @@ impl BucketRing {
             b: VecDeque::with_capacity(cap),
             recent: Recent::default(),
             long: Long::default(),
+            long_kept: true,
+        }
+    }
+
+    /// [`Self::with_capacity`] with no ten-minute buckets: a ring that reads only its last
+    /// minute and its ten-second buckets (a deck unit's, whose six hours its row's ring carries;
+    /// A1 §9 keeps no per-core 6 h rings). Its [`Self::long_cells`] stay empty.
+    #[must_use]
+    pub fn without_long(cap: usize) -> Self {
+        Self {
+            long_kept: false,
+            ..Self::with_capacity(cap)
         }
     }
 
     /// Record a reading taken at `at_unix_ms`.
     pub fn push(&mut self, at_unix_ms: i64, v: Option<f64>, over: bool) -> Option<i64> {
         let v = v.filter(|x| x.is_finite());
-        self.long.push(at_unix_ms, v, over);
+        if self.long_kept {
+            self.long.push(at_unix_ms, v, over);
+        }
         let k = at_unix_ms.div_euclid(BUCKET_MS);
         let closed = match self.open_k() {
             None => {
@@ -530,6 +557,7 @@ impl BucketRing {
     }
 
     /// Every ten-minute bucket as a cell, oldest first; the last is the open one ([`Self::long_k`]).
+    /// Empty for a ring [`Self::without_long`] made.
     #[must_use]
     pub fn long_cells(&self) -> Vec<Cell> {
         self.long.b.iter().map(Bucket::cell).collect()
@@ -553,6 +581,12 @@ impl BucketRing {
     #[must_use]
     pub fn now_mean(&self, now_unix_ms: i64, window_ms: i64) -> Option<f64> {
         self.recent.mean(now_unix_ms, window_ms)
+    }
+
+    /// Largest of the readings [`Self::now_mean`] averages.
+    #[must_use]
+    pub fn now_max(&self, now_unix_ms: i64, window_ms: i64) -> Option<f64> {
+        self.recent.max(now_unix_ms, window_ms)
     }
 
     /// Whether the open bucket is over.

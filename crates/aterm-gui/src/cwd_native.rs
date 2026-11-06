@@ -11,19 +11,25 @@ use aterm_core::terminal::Terminal;
 pub(crate) trait ReportedCwd {
     /// The shell-reported cwd as a native path, or `None` if never reported.
     fn native_working_directory(&self) -> Option<Cow<'_, str>>;
+
+    /// Whether this machine made the report behind [`Self::native_working_directory`]
+    /// ([`reported_here`]): a shell over ssh reports its own host's directory, which this
+    /// machine's files do not hold.
+    fn reported_cwd_here(&self) -> bool;
 }
 
 impl ReportedCwd for Terminal {
     fn native_working_directory(&self) -> Option<Cow<'_, str>> {
         let path = self.current_working_directory()?;
-        let here = || {
-            reported_here(
-                self.reported_cwd_host(),
-                crate::tab_label::names_this_machine,
-                netbios_name(),
-            )
-        };
-        Some(native_path_reported(path, here))
+        Some(native_path_reported(path, || self.reported_cwd_here()))
+    }
+
+    fn reported_cwd_here(&self) -> bool {
+        reported_here(
+            self.reported_cwd_host(),
+            crate::tab_label::names_this_machine,
+            netbios_name(),
+        )
     }
 }
 

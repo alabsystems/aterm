@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Read the home ALab LAN evidence a member's desk admits a proving Mac by, without changing
-//! membership or exposing keys: the network place's proof under this process's state root
-//! (`aterm_netplace::proof::read`), as the desk's `home_lan::home_net` reads it.
+//! membership or exposing keys: the network place's proof and home-day ledger under this
+//! process's state root, judged under this build's rule (`home_lan::Rule::live`), as the desk's
+//! `home_lan::home_net` reads them, writing nothing (no seed).
 
 #[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,7 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = aterm_types::dirs::state_dir().ok_or("no state root")?;
     let now = aterm_netplace::proof::read(&state);
-    let home = home_lan::home_net_at(&now);
+    let home = home_lan::home_net_with(
+        &state,
+        aterm_netplace::facts::here_now(),
+        now.at_ms,
+        home_lan::Rule::live(),
+    );
     let route = now.facts.route.as_ref();
     println!(
         "home={} evidence_rows={} primary_ipv4={} gateway_known={} expensive_or_unknown={}",

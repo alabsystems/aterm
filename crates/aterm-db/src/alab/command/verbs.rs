@@ -45,11 +45,12 @@ const LOG_DAYS_MAX: u64 = 120;
 /// The registry as LabView reads it on this Mac, as an observer.
 fn lab(paths: &Paths) -> Result<(att::View, LabView)> {
     let view = Handle::at(paths.clone(), &att::REGISTRY).view()?;
-    let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
+    let empty = crate::typed::owned::OwnedRead::default();
+    let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
     let lab = LabView::read(
         &view.cells,
-        &owned(registry::MACHINE_FACTS.name),
-        &owned(registry::MAILBOX_OBS.name),
+        owned(registry::MACHINE_FACTS.name),
+        owned(registry::MAILBOX_OBS.name),
         None,
     );
     Ok((view, lab))
@@ -82,10 +83,14 @@ fn at(t: u64, now: u64) -> Value {
     }
 }
 
-fn label_of(lab: &LabView, pk: &str) -> Option<String> {
+fn label_str<'a>(lab: &'a LabView, pk: &str) -> Option<&'a str> {
     lab.accounts
         .get(pk)
-        .and_then(|account| account.label.clone())
+        .and_then(|account| account.label.as_deref())
+}
+
+fn label_of(lab: &LabView, pk: &str) -> Option<String> {
+    label_str(lab, pk).map(str::to_owned)
 }
 
 /// The account `name` names: its key, its label or its legacy label, live or not. Never an
@@ -197,13 +202,19 @@ pub(super) fn runs_on(
         .collect();
     let (preferred, placed) = lab.runs_on(mc, &seen.places);
     let mut preferred: Vec<&crate::alab::view::Preference> = preferred;
-    preferred.sort_by_key(|p| {
+    preferred.sort_by(|a, b| {
         (
-            p.rank.is_none(),
-            p.rank,
-            label_of(lab, &p.account),
-            p.account.clone(),
+            a.rank.is_none(),
+            a.rank,
+            label_str(lab, &a.account),
+            a.account.as_str(),
         )
+            .cmp(&(
+                b.rank.is_none(),
+                b.rank,
+                label_str(lab, &b.account),
+                b.account.as_str(),
+            ))
     });
     let account = |pk: &str| {
         let found = lab.accounts.get(pk);

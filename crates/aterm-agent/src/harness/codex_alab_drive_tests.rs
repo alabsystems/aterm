@@ -12,6 +12,7 @@ use crate::harness::self_claimed::{
     FirstFrame, Live as ClaimedLive, Record, Resume, Witnesses, validate,
 };
 use crate::harness::upgrade::Request;
+use crate::harness::upgrade_drive::load;
 use crate::supervise::ScratchDir;
 
 const TAB: &str = "s-c0dec0dec0dec0dec0de";

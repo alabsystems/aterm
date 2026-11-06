@@ -1149,7 +1149,7 @@ pub(crate) mod tests {
                 std::time::Instant::now() < deadline,
                 "the filesystem's clock did not move past a ctime in a minute"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let _ = std::fs::remove_file(&probe);
     }

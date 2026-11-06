@@ -137,6 +137,10 @@ pub struct OpenedAudienceEntries {
     /// `(Audience, name)`: its winning `Put`, or for a carry the op whose value it carries. F21
     /// rule 8 reads who signed it, when, and under which epoch ([`Log::read_after_cutoff`]).
     pub winning_ops: BTreeMap<(Audience, String), RecordId>,
+    /// The winning `Delete` of each register whose winner is one, by `(Audience, name)`: the op
+    /// that took the entry away. One-mesh W3's journal of overtaken writes names it
+    /// (`client::log_entries`' `Overtaken`).
+    pub winning_deletes: BTreeMap<(Audience, String), RecordId>,
     /// Audiences that have at least one effective [`Body::Epoch`] and whose maximal epochs were all
     /// unwrapped by this [`Identity`], less each audience with an uncovered keyed epoch it did not
     /// open (F21 rule 7), whose writes this Mac cannot read yet.
@@ -223,6 +227,52 @@ pub(super) fn check_audience(audience: &EpochAudience) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// The most wire bytes the records a re-key signs take, by kind: each record's header with
+/// [`super::MAX_PARENTS`] parents around its body, as [`super::Kind::most_bytes`] counts a kind
+/// whose fields bound it, here for the kinds whose body depends on their audience and value. A
+/// re-key's room is reserved in bytes as well as records with them (one-mesh proofs P6, F6:
+/// `client/remove.rs`' `RemovalFill`).
+#[cfg(any(unix, test))]
+pub(crate) mod most_bytes {
+    use super::{DELETE_MAGIC, EpochAudience, PUT_MAGIC, encode_audience_wire};
+
+    /// The AEAD tag a `Put` or `Delete` ciphertext carries past its plaintext.
+    const TAG: usize = 16;
+
+    fn audience(audience: &EpochAudience) -> usize {
+        let mut out = Vec::new();
+        encode_audience_wire(&mut out, audience);
+        out.len()
+    }
+
+    /// An `Epoch` of `of`: its audience, generation and commitment.
+    #[must_use]
+    pub(crate) fn epoch(of: &EpochAudience) -> usize {
+        super::super::MOST_FRAME + audience(of) + 8 + 32
+    }
+
+    /// A `Put` under an epoch of `of` sealing an entry whose name is `name` bytes long, with an
+    /// anchor of `anchor` bytes or none, and a value of `value` bytes (the Commons control
+    /// descriptor is the value of an entry named `commons::ENTRY` with no anchor).
+    #[must_use]
+    pub(crate) fn put(
+        of: &EpochAudience,
+        name: usize,
+        anchor: Option<usize>,
+        value: usize,
+    ) -> usize {
+        let plaintext = PUT_MAGIC.len() + 1 + 2 + name + anchor.map_or(0, |a| 2 + a) + 4 + value;
+        super::super::MOST_FRAME + audience(of) + 32 + 32 + 4 + plaintext + TAG
+    }
+
+    /// A `Delete` under an epoch of `of` of an entry whose name is `name` bytes long.
+    #[must_use]
+    pub(crate) fn delete(of: &EpochAudience, name: usize) -> usize {
+        let plaintext = DELETE_MAGIC.len() + 2 + name;
+        super::super::MOST_FRAME + audience(of) + 32 + 32 + 2 + plaintext + TAG
     }
 }
 
@@ -2093,6 +2143,7 @@ impl Log {
         let mut keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
         let mut keyed_deletes: BTreeMap<Audience, BTreeSet<String>> = BTreeMap::new();
         let mut winning_ops: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
+        let mut winning_deletes: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
         let mut host_winners: BTreeMap<String, Vec<(Audience, usize, RecordId)>> = BTreeMap::new();
 
         let registers: Vec<((Audience, String), Vec<CandidateOp>)> =
@@ -2145,11 +2196,14 @@ impl Log {
                     .entry(EpochAudience::from(audience))
                     .or_default()
                     .insert(winner.epoch);
-            } else if keyed_keys.contains_key(&winner.epoch) {
-                keyed_deletes
-                    .entry(audience.clone())
-                    .or_default()
-                    .insert(name.clone());
+            } else {
+                winning_deletes.insert((audience.clone(), name.clone()), winner.record_id);
+                if keyed_keys.contains_key(&winner.epoch) {
+                    keyed_deletes
+                        .entry(audience.clone())
+                        .or_default()
+                        .insert(name.clone());
+                }
             }
         }
 
@@ -2207,6 +2261,7 @@ impl Log {
                 uncovered_keyed,
                 keyed_deletes,
                 winning_ops,
+                winning_deletes,
                 fully_unwrapped_audiences,
                 hidden_epochs,
                 keyless_keyed,

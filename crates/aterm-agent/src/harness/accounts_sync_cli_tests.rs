@@ -258,7 +258,7 @@ fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
         let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW + 60);
         let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_accounts_sync(&env, sheet.to_str(), None, false, &mut out, &mut err);
+        let code = run_accounts_sync(&env, None, sheet.to_str(), None, false, &mut out, &mut err);
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, ExitCode::SUCCESS, "{later}: {err}");
         assert_eq!(alt(&bed), None, "{later}: the row drops");
@@ -384,7 +384,7 @@ fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
                 let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
                 let (mut out, mut err) = (Vec::new(), Vec::new());
                 let code = if cli == Cli::Claude {
-                    run_accounts_sync(&env, sheet.to_str(), None, false, &mut out, &mut err)
+                    run_accounts_sync(&env, None, sheet.to_str(), None, false, &mut out, &mut err)
                 } else {
                     let source = named.then(|| sheet.to_str()).flatten();
                     run_cli_accounts_sync(
@@ -447,7 +447,7 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
             let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = if cli == Cli::Claude {
-                run_accounts_sync(&env, sheet.to_str(), None, json, &mut out, &mut err)
+                run_accounts_sync(&env, None, sheet.to_str(), None, json, &mut out, &mut err)
             } else {
                 run_cli_accounts_sync(cli, (&env, None), (None, None, json), &mut out, &mut err)
             };
@@ -1779,16 +1779,24 @@ fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
 /// EACH POOL'S SIGN-INS READ THE HARNESS AND ITS OWN SWITCH: the automatic sign-in of a CLI's
 /// rows is off where `[harness] accounts = "off"`, `[harness] logins = "off"` or
 /// `[harness] enabled = false`, and where that CLI's own `[harness.<cli>] enabled = false`
-/// (Claude Code's and Codex's; Grok Build and Kimi Code have no table of their own), never for
-/// another CLI's. The switch `aterm ai` names for a CLI's rows ([`sign_ins_off_for`]) is the one
-/// that keeps them off, its own table's included; the harness-wide words the gates every pool
-/// shares read ([`sign_ins_off`]) name no CLI's table. NEGATIVE CONTROL: the rule that read the
+/// (Claude Code's, Codex's and agy's; Grok Build and Kimi Code have no table of their own), never
+/// for another CLI's, exactly as the window reads it (`SupervisorConfig::logins_for` and
+/// `accounts_for`). The setting `aterm ai` names for a CLI's rows ([`sign_ins_off_for`]) is the one
+/// in aterm.toml that keeps them off, as it is written there: its own table's, the swarm switch,
+/// the harness written off itself, a `harness` key below another table's header, and a value
+/// other than `"off"` that reads as off included; the gates every pool shares
+/// ([`harness_sign_ins_on`]) read no CLI's table. NEGATIVE CONTROLS: the rule that read the
 /// harness-wide switches alone kept Codex's sign-ins on under `[harness.codex] enabled = false`,
-/// and Claude Code's under `[harness.claude] enabled = false`, and named no switch for either.
+/// and Claude Code's under `[harness.claude] enabled = false`, and named no switch for either; the
+/// rule that read only those two CLIs' tables kept agy's on under `[harness.agy] enabled = false`,
+/// which the window reads as agy's logins off; the
+/// rule that named a switch by how it was read named `[harness] accounts = "off"` for the swarm
+/// switch and a misplaced `harness.accounts`, `[harness] enabled = false` for `harness = false`,
+/// and `[harness] logins = "off"` for `logins = false`, none of which aterm.toml says.
 #[test]
 fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
     let bed = Bed::new("sign-ins-switches");
-    let all = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi];
+    let all = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi, Cli::Agy];
     for (config, off, said) in [
         ("", &[][..], None),
         (
@@ -1816,8 +1824,53 @@ fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
             &[Cli::Claude][..],
             Some("`[harness.claude] enabled = false`"),
         ),
+        (
+            "[harness.agy]\nenabled = false\n",
+            &[Cli::Agy][..],
+            Some("`[harness.agy] enabled = false`"),
+        ),
+        (
+            "[swarm]\nenabled = false\n",
+            &all[..],
+            Some("`[swarm] enabled = false`"),
+        ),
+        ("swarm = false\n", &all[..], Some("`swarm = false`")),
+        ("harness = false\n", &all[..], Some("`harness = false`")),
+        (
+            "[harness]\nlogins = false\n",
+            &all[..],
+            Some("`[harness] logins = false`"),
+        ),
+        (
+            "[theme]\nharness.accounts = \"off\"\n",
+            &all[..],
+            Some(
+                "`theme.harness.accounts = \"off\"` (a `harness.accounts` below another table's \
+                 header)",
+            ),
+        ),
+        (
+            "[theme]\nharness.codex.enabled = false\n",
+            &[Cli::Codex][..],
+            Some(
+                "`theme.harness.codex.enabled = false` (a `harness.codex.enabled` below another \
+                 table's header)",
+            ),
+        ),
+        // The master switch outranks rotation's, which outranks the CLI's own.
+        (
+            "[harness]\nenabled = false\naccounts = \"off\"\n[harness.codex]\nenabled = false\n",
+            &all[..],
+            Some("`[harness] enabled = false`"),
+        ),
+        (
+            "[harness]\naccounts = \"off\"\n[harness.codex]\nenabled = false\n",
+            &all[..],
+            Some("`[harness] accounts = \"off\"`"),
+        ),
     ] {
         fs::write(bed.aterm_toml(), config).unwrap();
+        let (read, _) = crate::supervise::config::SupervisorConfig::from_aterm_toml(config);
         for cli in all {
             let held = off.contains(&cli);
             assert_eq!(
@@ -1825,17 +1878,62 @@ fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
                 !held,
                 "{config}{cli:?}"
             );
+            // The window's reading of the same switches agrees.
+            assert_eq!(
+                read.logins_for(cli.program())
+                    && read.accounts_for(cli.program()) != accounts::Mode::Off,
+                !held,
+                "{config}{cli:?}: the window's reading"
+            );
             assert_eq!(
                 sign_ins_off_for(&bed.aterm_toml(), cli),
-                said.filter(|_| held),
+                said.filter(|_| held).map(str::to_string),
                 "{config}{cli:?}: the switch named"
             );
         }
         assert_eq!(
-            sign_ins_off(&bed.aterm_toml()),
-            said.filter(|_| off.len() == all.len()),
-            "{config}: the harness-wide switch"
+            harness_sign_ins_on(&bed.aterm_toml()),
+            off.len() != all.len(),
+            "{config}: the harness-wide switches"
         );
+    }
+    // An aterm.toml that is not valid TOML, whose lines are read one by one, says so, and where
+    // the parser stopped.
+    fs::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n[broken\n").unwrap();
+    for cli in all {
+        assert!(!sign_ins_on(&bed.aterm_toml(), cli), "{cli:?}");
+        let said = sign_ins_off_for(&bed.aterm_toml(), cli).expect("named");
+        assert!(
+            said.starts_with("an aterm.toml that is not valid TOML (TOML error at line 3, column ")
+                && said.ends_with(") and is read line by line"),
+            "{cli:?}: {said}"
+        );
+    }
+    // CONTROL: the same lines read as valid TOML name the setting.
+    fs::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n").unwrap();
+    assert_eq!(
+        sign_ins_off_for(&bed.aterm_toml(), Cli::Claude).as_deref(),
+        Some("`[harness] accounts = \"off\"`")
+    );
+    // An aterm.toml that cannot be read turns the harness off, and says so, not a switch it
+    // does not hold (NEGATIVE CONTROL: the rule that named the reading said
+    // `[harness] enabled = false`).
+    fs::remove_file(bed.aterm_toml()).unwrap();
+    fs::create_dir(bed.aterm_toml()).unwrap();
+    assert!(!harness_sign_ins_on(&bed.aterm_toml()));
+    for cli in all {
+        assert!(!sign_ins_on(&bed.aterm_toml(), cli), "{cli:?}");
+        let said = sign_ins_off_for(&bed.aterm_toml(), cli).expect("named");
+        assert!(
+            said.starts_with("an aterm.toml that cannot be read (") && said.ends_with(')'),
+            "{cli:?}: {said}"
+        );
+    }
+    fs::remove_dir(bed.aterm_toml()).unwrap();
+    // No aterm.toml is the defaults: nothing keeps sign-ins off.
+    for cli in all {
+        assert!(sign_ins_on(&bed.aterm_toml(), cli), "{cli:?}");
+        assert_eq!(sign_ins_off_for(&bed.aterm_toml(), cli), None, "{cli:?}");
     }
 }
 
@@ -2947,8 +3045,14 @@ fn kimi_renewal_ending(
 ) -> super::super::cli::Renewal {
     let roster_path = bed.roster(Cli::Kimi);
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
-    let candidates =
-        read_renewal_candidates(Cli::Kimi, &store, &roster_path, now).expect("the records");
+    let candidates = read_renewal_candidates(
+        Cli::Kimi,
+        &store,
+        (&bed.home, &bed.state),
+        &roster_path,
+        now,
+    )
+    .expect("the records");
     let (_, row) = candidates
         .tiered
         .into_iter()
@@ -4165,7 +4269,7 @@ fn keep_a_row_with_no_login(bed: &Bed, cli: Cli) {
 }
 
 /// What [`rows_of_other_macs_at`] reads of `cli`'s roster in `bed`.
-fn other_macs_of(bed: &Bed, cli: Cli) -> BTreeMap<String, String> {
+fn other_macs_of(bed: &Bed, cli: Cli) -> accounts::OtherMacs {
     let roster = bed.roster(cli);
     let records = accounts::Store::at_for(&bed.state, cli, &bed.home)
         .read_account_records(Some(&roster), NOW)
@@ -4180,8 +4284,20 @@ fn other_macs_of(bed: &Bed, cli: Cli) -> BTreeMap<String, String> {
 }
 
 /// The row `other`, held by `machine`.
-fn other_held_by(machine: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([("other".to_owned(), machine.to_owned())])
+fn other_held_by(machine: &str) -> accounts::OtherMacs {
+    accounts::OtherMacs {
+        named: BTreeMap::from([("other".to_owned(), machine.to_owned())]),
+        ..accounts::OtherMacs::NONE
+    }
+}
+
+/// The row `other`, whose source this Mac cannot compare with its own names, for `why`.
+fn other_unread(why: accounts::UnreadWhy) -> accounts::OtherMacs {
+    accounts::OtherMacs {
+        unread: BTreeSet::from(["other".to_owned()]),
+        unread_why: Some(why),
+        ..accounts::OtherMacs::NONE
+    }
 }
 
 /// ANOTHER MAC'S ACCOUNT (`ATERM-KI-1105-9`): a row with no login here whose account the source
@@ -4193,8 +4309,9 @@ fn a_row_its_source_gives_other_macs_alone_reads_as_theirs() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
         let bed = Bed::new("other-macs");
         keep_a_row_with_no_login(&bed, cli);
-        assert!(
-            other_macs_of(&bed, cli).is_empty(),
+        assert_eq!(
+            other_macs_of(&bed, cli),
+            accounts::OtherMacs::NONE,
             "{cli:?}: CONTROL: no source says nothing"
         );
         bed.secret(
@@ -4214,17 +4331,142 @@ fn a_row_its_source_gives_other_macs_alone_reads_as_theirs() {
             ACCOUNTS_CSV_FILE,
             &sheet_giving(cli, "someone@example.test", "m22"),
         );
-        assert!(
-            other_macs_of(&bed, cli).is_empty(),
+        assert_eq!(
+            other_macs_of(&bed, cli),
+            accounts::OtherMacs::NONE,
             "{cli:?}: CONTROL: an account it does not know"
         );
         bed.secret(
             ACCOUNTS_CSV_FILE,
             &sheet_giving(cli, "other@example.test", "m16"),
         );
-        assert!(
-            other_macs_of(&bed, cli).is_empty(),
+        assert_eq!(
+            other_macs_of(&bed, cli),
+            accounts::OtherMacs::NONE,
             "{cli:?}: CONTROL: the source names this Mac"
+        );
+    }
+}
+
+/// `bed`'s Claude Code row `other`, which a session here ran on an hour ago and whose login has
+/// gone since (recorded signed out), as the upkeep reads it: whether the renewal's ranking, the
+/// due list and the renewal door each take it, what the read said of other Macs, and why a
+/// report says the row waits ([`super::super::sign_in_ladder::upkeep_waits_because`]).
+fn renewal_of_a_used_gone_row(
+    bed: &Bed,
+) -> ((bool, bool, bool), accounts::OtherMacs, &'static str) {
+    let cli = Cli::Claude;
+    let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+    store
+        .transact(NOW, &mut None, |state| {
+            let mut events = accounts::note_session(state, "s-1", "other", None, NOW - 3600);
+            state.sessions.clear();
+            events.extend(accounts::note_auth(
+                state,
+                "other",
+                accounts::Auth::SignedOut,
+                NOW - 60,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    let candidates =
+        read_renewal_candidates(cli, &store, (&bed.home, &bed.state), &bed.roster(cli), NOW)
+            .unwrap();
+    let records = &candidates.records;
+    let ranked = candidates
+        .tiered
+        .iter()
+        .any(|(_, row)| row.label == "other");
+    let due = accounts::renew_due(
+        &records.roster,
+        &records.logins,
+        &records.state,
+        &candidates.others,
+        NOW,
+    )
+    .contains(&"other".to_owned());
+    let row = records.roster.row("other").unwrap().clone();
+    let admitted = upkeep_sign_in(cli, (records, &candidates.others), &row, NOW).is_some();
+    let waits = super::super::sign_in_ladder::upkeep_waits_because(
+        &row,
+        &records.state,
+        &candidates.others,
+        NOW,
+    );
+    ((ranked, due, admitted), candidates.others, waits)
+}
+
+/// ANOTHER MAC'S ACCOUNT IS NOT RENEWED HERE (§4.15 rule 3): a row a session here ran on within
+/// the week whose login has gone since (recorded signed out) is the upkeep's renewal while the
+/// sheet gives its account to this Mac, and neither ranked, due nor admitted by the renewal door
+/// once the sheet gives it to m22 alone. CONTROL: the sheet naming this Mac.
+#[test]
+fn a_used_row_whose_login_went_is_not_renewed_where_its_source_gives_it_to_another_mac() {
+    for (computer, ours) in [("m16", true), ("m22", false)] {
+        let bed = Bed::new("other-macs-renewal");
+        keep_a_row_with_no_login(&bed, Cli::Claude);
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &sheet_giving(Cli::Claude, "other@example.test", computer),
+        );
+        let (taken, others, _) = renewal_of_a_used_gone_row(&bed);
+        assert_eq!(
+            others.named.contains_key("other"),
+            !ours,
+            "the sheet gives it to {computer}"
+        );
+        assert_eq!(
+            taken,
+            (ours, ours, ours),
+            "the sheet gives it to {computer}"
+        );
+    }
+}
+
+/// A SOURCE THIS MAC CANNOT COMPARE KEEPS THE DOOR SHUT (§4.15 rule 3): where `[fleet]
+/// accounts_source` is a sheet only the network could read, no read here says whether the used
+/// row whose login went is this Mac's, so it is unread, and neither ranked, due nor admitted.
+/// CONTROL: the same sheet at a local path, naming this Mac, admits it.
+#[test]
+fn a_used_row_whose_login_went_is_not_renewed_where_its_source_cannot_be_read_here() {
+    for (source, readable) in [
+        ("sheet.csv", true),
+        ("https://example.test/sheet.csv", false),
+    ] {
+        let bed = Bed::new("other-macs-unread");
+        keep_a_row_with_no_login(&bed, Cli::Claude);
+        fs::write(
+            bed.aterm_toml(),
+            format!("[fleet]\nmachine = \"m16\"\naccounts_source = \"{source}\"\n"),
+        )
+        .unwrap();
+        fs::write(
+            bed.config.join("sheet.csv"),
+            sheet_giving(Cli::Claude, "other@example.test", "m16"),
+        )
+        .unwrap();
+        let (taken, others, waits) = renewal_of_a_used_gone_row(&bed);
+        if !readable {
+            assert_eq!(
+                waits,
+                accounts::UnreadWhy::Network.words(),
+                "a report names the network as the cause"
+            );
+        }
+        assert_eq!(
+            others,
+            if readable {
+                accounts::OtherMacs::NONE
+            } else {
+                other_unread(accounts::UnreadWhy::Network)
+            },
+            "{source}"
+        );
+        assert_eq!(
+            taken,
+            (readable, readable, readable),
+            "{source}: the door renews it only where it can read whose it is"
         );
     }
 }
@@ -4274,7 +4516,7 @@ fn a_login_already_here_is_this_macs_whoever_the_source_gives_it_to() {
         "CONTROL"
     );
     signed_out_kimi_login(&bed, "other", NOW);
-    assert!(other_macs_of(&bed, Cli::Kimi).is_empty());
+    assert_eq!(other_macs_of(&bed, Cli::Kimi), accounts::OtherMacs::NONE);
 }
 
 /// A ROW ON THIS MAC'S DEFAULT LOGIN IS THIS MAC'S WHILE A LOGIN STANDS THERE, whoever the sheet
@@ -4295,7 +4537,10 @@ fn the_row_on_the_default_login_is_this_macs_while_its_login_stands() {
     );
     assert_eq!(
         other_macs_of(&bed, Cli::Kimi),
-        BTreeMap::from([("own".to_owned(), "m22".to_owned())])
+        accounts::OtherMacs {
+            named: BTreeMap::from([("own".to_owned(), "m22".to_owned())]),
+            ..accounts::OtherMacs::NONE
+        }
     );
     let login = bed
         .home
@@ -4303,7 +4548,40 @@ fn the_row_on_the_default_login_is_this_macs_while_its_login_stands() {
         .join("credentials/kimi-code.json");
     fs::create_dir_all(login.parent().unwrap()).unwrap();
     fs::write(&login, "{}").unwrap();
-    assert!(other_macs_of(&bed, Cli::Kimi).is_empty());
+    assert_eq!(other_macs_of(&bed, Cli::Kimi), accounts::OtherMacs::NONE);
+}
+
+/// A POOL'S DEFAULT ROW IS ENROLLED ONLY WHILE ITS LOGIN STANDS ([`CliPool::enrolled`], the set
+/// [`rows_of_other_macs`] reads), so the window's due line never names a login no longer on this
+/// Mac, nor one whose account the sheet gives another Mac. CONTROL: with its login file there,
+/// it is enrolled.
+#[test]
+fn a_pools_default_row_is_enrolled_only_while_its_login_stands() {
+    let bed = Bed::new("pool-default-enrolled");
+    fs::write(
+        bed.roster(Cli::Kimi),
+        "[[account]]\nlabel = \"own\"\nclass = \"dedicated\"\n\
+         email = \"other@example.test\"\nregion = \"global\"\n",
+    )
+    .unwrap();
+    let enrolled = || {
+        cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW)
+            .into_iter()
+            .find(|pool| pool.cli == Cli::Kimi)
+            .expect("the kept roster's pool")
+            .enrolled
+    };
+    assert!(
+        !enrolled().contains("own"),
+        "no login stands on the default home"
+    );
+    let login = bed
+        .home
+        .join(Cli::Kimi.accounts().default_home)
+        .join("credentials/kimi-code.json");
+    fs::create_dir_all(login.parent().unwrap()).unwrap();
+    fs::write(&login, "{}").unwrap();
+    assert!(enrolled().contains("own"), "CONTROL: its login stands");
 }
 
 /// CLAUDE CODE READS WHOSE AN ACCOUNT IS FROM THE SOURCE ITS SYNC READS, a fleet file beside its
@@ -4324,7 +4602,11 @@ fn a_fleet_file_beside_claude_codes_roster_says_whose_an_account_is() {
         other_macs_of(&bed, Cli::Claude)
     };
     assert_eq!(other_macs("m22"), other_held_by("m22"));
-    assert!(other_macs("m16").is_empty(), "CONTROL: this Mac's");
+    assert_eq!(
+        other_macs("m16"),
+        accounts::OtherMacs::NONE,
+        "CONTROL: this Mac's"
+    );
 }
 
 /// UNDER A POOL FILE THIS MAC GOES BY THE NAME THE POOL RESOLVES: `m100`, its roster's label, though
@@ -4349,14 +4631,19 @@ fn under_a_pool_file_this_mac_goes_by_the_name_the_pool_resolves() {
             );
             other_macs_of(&bed, cli)
         };
-        assert!(other_macs("m100").is_empty(), "{cli:?}: this Mac's");
+        assert_eq!(
+            other_macs("m100"),
+            accounts::OtherMacs::NONE,
+            "{cli:?}: this Mac's"
+        );
         assert_eq!(other_macs("m9"), other_held_by("m9"), "{cli:?}");
     }
 }
 
 /// A SOURCE `[fleet] accounts_source` NAMES says whose an account is, a relative path read from
-/// the config's folder as a sync reads it. One only a network could read says nothing: no report
-/// fetches. `CONTROL`: the same sheet naming this Mac.
+/// the config's folder as a sync reads it. One only a network could read cannot say, since no
+/// report fetches, so its row with no login here is unread. `CONTROL`: the same sheet naming
+/// this Mac.
 #[test]
 fn a_configured_source_says_whose_an_account_is() {
     let bed = Bed::new("other-macs-key");
@@ -4378,13 +4665,75 @@ fn a_configured_source_says_whose_an_account_is() {
         sheet_giving(Cli::Claude, "other@example.test", "m16"),
     )
     .unwrap();
-    assert!(other_macs_of(&bed, Cli::Claude).is_empty(), "CONTROL");
+    assert_eq!(
+        other_macs_of(&bed, Cli::Claude),
+        accounts::OtherMacs::NONE,
+        "CONTROL"
+    );
     fs::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\naccounts_source = \"https://example.test/sheet.csv\"\n",
     )
     .unwrap();
-    assert!(other_macs_of(&bed, Cli::Claude).is_empty(), "a network's");
+    assert_eq!(
+        other_macs_of(&bed, Cli::Claude),
+        other_unread(accounts::UnreadWhy::Network),
+        "a network's"
+    );
+}
+
+/// A POOL THAT REFUSES THIS MAC'S NAME LEAVES ITS ROWS UNREAD: where the swarm roster denies
+/// `m100`, the name `aterm.toml` gives this Mac, the pool gives this Mac no identity, and no other
+/// name stands in for it, so a row the pool keeps warm on `m100` is not read as this Mac's
+/// ([`accounts::UnreadWhy::NoName`]). CONTROL: with nothing denied, the pool names this Mac and
+/// the row is its own.
+#[cfg(unix)]
+#[test]
+fn a_pool_that_refuses_this_macs_name_leaves_its_rows_unread() {
+    let cli = Cli::Codex;
+    for denied in [false, true] {
+        let bed = Bed::new("other-macs-pool-denied");
+        keep_a_row_with_no_login(&bed, cli);
+        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
+        let deny: &[&str] = if denied { &["m100"] } else { &[] };
+        super::super::ai_pool::tests::seed_local_swarm_roster_denying(&bed.home, "m100", &[], deny);
+        bed.secret(
+            super::super::ai_pool::AI_POOL_FILE,
+            &format!(
+                "version = 1\n\n[last_heard]\nm100 = \"2026-10-27\"\n\n[[account]]\n\
+                 provider = \"{}\"\nemail = \"other@example.test\"\nwarm = [\"m100\"]\n",
+                cli.id()
+            ),
+        );
+        let others = other_macs_of(&bed, cli);
+        if denied {
+            assert!(others.unread.contains("other"), "{others:?}");
+            assert_eq!(others.unread_why, Some(accounts::UnreadWhy::NoName));
+        } else {
+            assert_eq!(others, accounts::OtherMacs::NONE, "CONTROL");
+        }
+    }
+}
+
+/// WITH NO HOME THE VAULT'S SOURCES CANNOT BE READ, and they outrank a roster of its own, so a
+/// Claude Code row with no login here is unread ([`accounts::UnreadWhy::Source`]). CONTROL: the
+/// same roster read with its home, which holds no source, is nobody else's.
+#[test]
+fn with_no_home_a_claude_row_with_no_login_is_unread() {
+    let bed = Bed::new("other-macs-no-home");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    let roster = bed.roster(Cli::Claude);
+    let records = accounts::Store::at_for(&bed.state, Cli::Claude, &bed.home)
+        .read_account_records(Some(&roster), NOW)
+        .unwrap();
+    let mut env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+    let read =
+        |env: &Env| rows_of_other_macs(Cli::Claude, env, &records.raw_roster, &records.logins);
+    assert_eq!(read(&env), accounts::OtherMacs::NONE, "CONTROL");
+    env.home = None;
+    let others = read(&env);
+    assert!(others.unread.contains("other"), "{others:?}");
+    assert_eq!(others.unread_why, Some(accounts::UnreadWhy::Source));
 }
 
 /// Sheet rows that conflict over an address say whose it is as one row would. Each names another
@@ -4408,7 +4757,11 @@ fn sheet_rows_that_conflict_over_an_account_say_whose_it_is() {
         other_macs_of(&bed, Cli::Claude)
     };
     assert_eq!(conflict("m20", "m22"), other_held_by("m20"));
-    assert!(conflict("m16", "m22").is_empty(), "CONTROL: names this Mac");
+    assert_eq!(
+        conflict("m16", "m22"),
+        accounts::OtherMacs::NONE,
+        "CONTROL: names this Mac"
+    );
 }
 
 /// A NAME THIS MAC HAD IS STILL THIS MAC'S: its swarm roster row is `m100` with the alias `m32`,
@@ -4429,13 +4782,14 @@ fn a_sheet_naming_a_name_this_mac_had_gives_it_to_this_mac() {
         other_macs_of(&bed, Cli::Claude)
     };
     assert_eq!(named("m22"), other_held_by("m22"), "CONTROL");
-    assert!(named("m32").is_empty(), "its own old name");
+    assert_eq!(named("m32"), accounts::OtherMacs::NONE, "its own old name");
 }
 
-/// A LAB THAT COULD NOT BE READ MAY NAME THIS MAC, so what a sync would refuse to read meanwhile
-/// says nothing. `CONTROL`: the same fleet file says whose it is once the lab is not pending.
+/// A LAB THAT COULD NOT BE READ MAY NAME THIS MAC OR NOT, so what a sync would refuse to read
+/// meanwhile leaves the row with no login here unread. `CONTROL`: the same fleet file says whose
+/// it is once the lab is not pending.
 #[test]
-fn a_pending_lab_says_nothing_of_whose_an_account_is() {
+fn a_pending_lab_leaves_whose_an_account_is_unread() {
     let bed = Bed::new("other-macs-pending");
     keep_a_row_with_no_login(&bed, Cli::Claude);
     fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
@@ -4451,7 +4805,11 @@ fn a_pending_lab_says_nothing_of_whose_an_account_is() {
         "CONTROL"
     );
     let pending = crate::harness::alab_roster::while_pending(|| other_macs_of(&bed, Cli::Claude));
-    assert!(pending.is_empty(), "{pending:?}");
+    assert_eq!(
+        pending,
+        other_unread(accounts::UnreadWhy::Source),
+        "{pending:?}"
+    );
 }
 
 /// A SYNC'S RECEIPT LISTS NO SIGN-IN OF ANOTHER MAC'S ACCOUNT: under a fleet discovery made, whose
@@ -4473,7 +4831,7 @@ fn a_syncs_receipt_lists_no_sign_in_of_another_macs_account() {
         .unwrap();
         let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_accounts_sync(&env, None, None, true, &mut out, &mut err);
+        let code = run_accounts_sync(&env, None, None, None, true, &mut out, &mut err);
         assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
         let doc: Value = aterm_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
         doc["needs_renew"].as_array().unwrap().len()

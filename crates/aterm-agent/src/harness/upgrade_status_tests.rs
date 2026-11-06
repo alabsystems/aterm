@@ -2985,7 +2985,7 @@ fn special_and_oversized_records_keep_the_tab_without_blocking_the_reader() {
                 },
             );
             assert_eq!(view.unreadable(), [state_dir(&read_opts).join("aaa.json")]);
-            assert!(load(&read_opts, "aaa").is_none());
+            assert!(super::super::load_record(&read_opts, "aaa").is_err());
             assert!(super::super::kept_move(&read_opts, "aaa").is_none());
             assert!(super::super::recorded_homes(&read_opts).is_empty());
             assert!(!super::super::confirming(&read_opts));

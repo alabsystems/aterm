@@ -112,8 +112,7 @@ pub fn build(
             path.display()
         ));
     }
-    let hash =
-        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&wasm))[..12].to_string();
+    let hash = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&wasm)[..6]);
     let js = rename_module(&js, &format!("{STEM}.{hash}.wasm"))?;
     install(term, &hash, &js, &wasm)?;
     Ok(hash)

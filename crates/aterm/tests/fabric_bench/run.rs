@@ -41,6 +41,9 @@ mod tallies;
 #[path = "run/outside.rs"]
 mod outside;
 
+#[path = "run/seeded.rs"]
+mod seeded;
+
 /// What a run hands back.
 pub struct Report {
     pub json: Value,
@@ -2598,7 +2601,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         served.clone(),
         format!(
             "The bridge is SIGKILLed after a run past the supervisor's healthy mark, and the \
-             supervisor relaunches it at once, once the killed bridge's lanes have ended; the \
+             supervisor relaunches it at once, the killed bridge's lanes left to end; the \
              clock starts when the new bridge writes its pid (its aterm connection is up; a \
              thread of its own watches for it from the kill on, past any post in the kill window) \
              and stops when its node \

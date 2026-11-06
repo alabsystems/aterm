@@ -21,21 +21,23 @@ pub(super) struct Debit {
     pub cumulative: u64,
 }
 impl Debit {
-    pub fn encode(&self) -> Vec<u8> {
-        self.body(b"ARDB1")
-    }
-    pub fn encode_attempt(&self, operation: Digest) -> Vec<u8> {
-        let mut bytes = self.body(b"ARDA1");
-        bytes.extend_from_slice(&operation);
+    pub fn encode(&self) -> [u8; 69] {
+        let mut bytes = [0u8; 69];
+        self.write_prefix(b"ARDB1", &mut bytes[..69]);
         bytes
     }
-    fn body(&self, tag: &[u8]) -> Vec<u8> {
-        let mut bytes = tag.to_vec();
-        bytes.extend_from_slice(&self.allocation);
-        bytes.extend_from_slice(&self.request);
-        bytes.extend_from_slice(&self.cost.to_le_bytes());
-        bytes.extend_from_slice(&self.cumulative.to_le_bytes());
+    pub fn encode_attempt(&self, operation: Digest) -> [u8; 101] {
+        let mut bytes = [0u8; 101];
+        self.write_prefix(b"ARDA1", &mut bytes[..69]);
+        bytes[69..101].copy_from_slice(&operation);
         bytes
+    }
+    fn write_prefix(&self, tag: &[u8; 5], out: &mut [u8]) {
+        out[..5].copy_from_slice(tag);
+        out[5..37].copy_from_slice(&self.allocation);
+        out[37..53].copy_from_slice(&self.request);
+        out[53..61].copy_from_slice(&self.cost.to_le_bytes());
+        out[61..69].copy_from_slice(&self.cumulative.to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> Result<(Self, Option<Digest>)> {
         let mut read = crate::crypto::Reader::new(bytes);
@@ -71,16 +73,17 @@ pub(super) struct Completion {
     pub observation: Observation,
 }
 impl Completion {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = b"ARDO1".to_vec();
-        bytes.extend_from_slice(&self.allocation);
-        bytes.extend_from_slice(&self.request);
-        bytes.extend_from_slice(&self.claim);
-        bytes.push(match self.observation.outcome() {
+    pub fn encode(&self) -> [u8; 118] {
+        let mut bytes = [0u8; 118];
+        bytes[..5].copy_from_slice(b"ARDO1");
+        bytes[5..37].copy_from_slice(&self.allocation);
+        bytes[37..53].copy_from_slice(&self.request);
+        bytes[53..85].copy_from_slice(&self.claim);
+        bytes[85] = match self.observation.outcome() {
             Outcome::Completed => 0,
             Outcome::Rejected => 1,
-        });
-        bytes.extend_from_slice(&self.observation.evidence());
+        };
+        bytes[86..118].copy_from_slice(&self.observation.evidence());
         bytes
     }
     fn decode(bytes: &[u8]) -> Result<Self> {

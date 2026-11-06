@@ -68,7 +68,12 @@ pub fn main_entry(words: &[String]) -> ExitCode {
     let mut report = |line: &str| {
         let _ = writeln!(std::io::stderr(), "aterm db table: {line}");
     };
-    match run(&paths, words, &mut super::amacs, &mut report) {
+    match run(
+        &paths,
+        words,
+        &mut |file: &Path, line: usize, secret: &[String]| super::amacs(file, line, Some(secret)),
+        &mut report,
+    ) {
         Ok(Output::Json(value)) => match aterm_json::to_string(&value) {
             Ok(text) => aterm_uds::stdout::answer_exit("aterm db table", &format!("{text}\n"), 0),
             Err(_) => ExitCode::from(1),

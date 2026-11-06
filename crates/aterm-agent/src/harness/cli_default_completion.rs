@@ -24,9 +24,10 @@ pub(in crate::harness) fn complete(
         return Ok(None);
     };
     if asked.is_none()
-        && env.config.as_deref().is_some_and(|config| {
-            super::super::accounts_sync::sign_ins_off_for(config, Cli::Codex).is_some()
-        })
+        && env
+            .config
+            .as_deref()
+            .is_some_and(|config| !super::super::accounts_sync::sign_ins_on(config, Cli::Codex))
     {
         return Ok(None);
     }
@@ -161,7 +162,7 @@ pub(in crate::harness) fn complete(
         || !crate::ai::facts::codex_file_store(&home)
         || (asked.is_none()
             && env.config.as_deref().is_some_and(|config| {
-                super::super::accounts_sync::sign_ins_off_for(config, Cli::Codex).is_some()
+                !super::super::accounts_sync::sign_ins_on(config, Cli::Codex)
             }))
     {
         return Err(

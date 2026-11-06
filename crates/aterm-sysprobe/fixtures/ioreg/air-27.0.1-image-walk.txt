@@ -1,0 +1,27 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 39>
+  +-o J815AP  <class IOPlatformExpertDevice, id 0x1000002bc, registered, matched, active, busy 0 (39456 ms), retain 40>
+    +-o IOResources  <class IOResources, id 0x1000002c4, registered, matched, active, busy 0 (10175 ms), retain 65>
+      +-o IOHDIXController  <class IOHDIXController, id 0x10000035f, registered, matched, active, busy 0 (356 ms), retain 6>
+        +-o IOHDIXHDDriveOutKernel@28  <class IOHDIXHDDriveOutKernel, id 0x100015408, registered, matched, active, busy 0 (22 ms), retain 13>
+          +-o IODiskImageBlockStorageDeviceOutKernel  <class IODiskImageBlockStorageDeviceOutKernel, id 0x10001540b, registered, matched, active, busy 0 (20 ms), retain 6>
+            |   "Protocol Characteristics" = {"Physical Interconnect"="Virtual Interface","Physical Interconnect Location"="File","Virtual Interface Location Path"=<"/tmp/r4img.dmg">}
+            |   "Device Characteristics" = {"Product Revision Level"="704","Product Name"="Disk Image","Vendor Name"="Apple"}
+            +-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x10001540c, registered, matched, active, busy 0 (19 ms), retain 8>
+              |   "Statistics" = {"Operations (Write)"=0,"Latency Time (Write)"=0,"Bytes (Read)"=367616,"Errors (Write)"=0,"Total Time (Read)"=9872887,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=0,"Bytes (Write)"=0,"Operations (Read)"=92,"Retries (Write)"=0}
+              +-o Apple read/write Media  <class IOMedia, id 0x10001540d, registered, matched, active, busy 0 (19 ms), retain 11>
+                |   "BSD Name" = "disk4"
+                +-o IOGUIDPartitionScheme  <class IOGUIDPartitionScheme, id 0x100015411, !registered, !matched, active, busy 0 (15 ms), retain 6>
+                  |   "UUID" = "00000000-0000-0000-0000-00000000D140"
+                  +-o disk image@1  <class IOMedia, id 0x100015415, registered, matched, active, busy 0 (15 ms), retain 11>
+                    |   "UUID" = "00000000-0000-0000-0000-0000000000B1"
+                    |   "BSD Name" = "disk4s1"
+                    +-o AppleAPFSContainerScheme  <class AppleAPFSContainerScheme, id 0x100015417, !registered, !matched, active, busy 0 (10 ms), retain 7>
+                      |   "Statistics" = {"Operations (Read)"=80,"Bytes (Write)"=0,"Operations (Write)"=0,"Bytes (Read)"=327680}
+                      +-o AppleAPFSMedia  <class AppleAPFSMedia, id 0x100015418, registered, matched, active, busy 0 (10 ms), retain 11>
+                        |   "UUID" = "00000000-0000-0000-0000-0000000000A5"
+                        |   "BSD Name" = "disk5"
+                        +-o AppleAPFSContainer  <class AppleAPFSContainer, id 0x100015420, registered, matched, active, busy 0 (3 ms), retain 16>
+                          |   "UUID" = "00000000-0000-0000-0000-0000000000A5"
+                          +-o R4PROBE@1  <class AppleAPFSVolume, id 0x100015421, registered, matched, active, busy 0 (3 ms), retain 11>
+                                "UUID" = "00000000-0000-0000-0000-0000000000E1"
+                                "BSD Name" = "disk5s1"

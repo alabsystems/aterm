@@ -265,7 +265,7 @@ fn read_exactly(reader: &mut std::fs::File, want: usize) -> Vec<u8> {
                     Instant::now() < deadline,
                     "hang: private pipe prefix did not arrive"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             other => panic!("read private pipe: {other:?}"),
         }

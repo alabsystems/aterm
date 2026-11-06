@@ -7311,10 +7311,11 @@ pub(super) fn finish_deadline<T>(
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
 /// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
-/// [`BotCheckClock`]) not counted against the drive's steps, and ends the drive
-/// [`BOT_CHECK_UNCLEARED`] once it has stood for [`VENDOR_STALL`] or the deadline comes during
-/// it; its block page ends it [`BLOCK_PAGE_MET`] at once. Either end, and a drive that reached
-/// no callback in time, is noted for [`take_met`].
+/// [`BotCheckClock`]) not counted against the drive's steps. Once it has stood for
+/// [`VENDOR_STALL`], or its block page is read, a Claude flow asks the fleet issuer's visible
+/// challenge service for the exact callback; software never operates that challenge. An
+/// unavailable or unsuccessful service retains [`BOT_CHECK_UNCLEARED`] or [`BLOCK_PAGE_MET`].
+/// Either end, and a drive that reached no callback in time, is noted for [`take_met`].
 pub fn drive_cdp_oauth_with_webmail(
     cdp: &mut CdpClient,
     authorize_url: &str,
@@ -7412,6 +7413,19 @@ fn drive_cdp_oauth_until(
         mailbox_credential,
         deliver_callback,
     )
+}
+
+fn central_callback(
+    flow: &MailboxFlow,
+    authorize_url: &str,
+    email: Option<&str>,
+) -> Result<String, &'static str> {
+    let callback = super::challenge_relay::request_central(authorize_url, email)
+        .map_err(|_| "the fleet challenge service could not complete sign-in")?;
+    if !flow.is_callback(&callback) {
+        return Err("the fleet challenge service returned another OAuth flow's callback");
+    }
+    Ok(callback)
 }
 
 fn drive_cdp_oauth_flow_until(
@@ -7613,11 +7627,23 @@ fn drive_cdp_oauth_flow_until(
             }
             match state {
                 "block_page" => {
+                    if google_config.is_none()
+                        && let Ok(callback) =
+                            central_callback(&flow, authorize_url, email.as_deref())
+                    {
+                        return callback_delivery_result(deliver_callback(&callback));
+                    }
                     note_met(MetWord::BlockPage, last_host.as_deref());
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
                     if bot.check(url, deadline.now()) >= bot_stall {
+                        if google_config.is_none()
+                            && let Ok(callback) =
+                                central_callback(&flow, authorize_url, email.as_deref())
+                        {
+                            return callback_delivery_result(deliver_callback(&callback));
+                        }
                         note_met(MetWord::BotCheck, last_host.as_deref());
                         return Err(BOT_CHECK_UNCLEARED);
                     }

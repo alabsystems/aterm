@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-mesh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure decision kernels of the one mesh, with the Clean islands that prove its safety laws"
+
+# No dependencies, no proc macros and no anchors: every island here is checked by every Trust
+# build, and the Trust lane takes the crate (PM-1).
+
+[lints]
+workspace = true

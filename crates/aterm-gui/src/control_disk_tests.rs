@@ -380,7 +380,7 @@ fn a_demand_is_registered_poked_and_met_by_a_pass() {
             let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             while shelf.board_lock().demands.is_empty() {
                 assert!(Instant::now() < deadline, "the demand never landed");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(shelf.board_lock().demands[0].need, 30 * GIB);
             shelf.publish(|b| {
@@ -446,7 +446,7 @@ fn a_spent_pass_answers_unmet_with_counts_not_paths() {
             let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             while shelf.board_lock().demands.is_empty() {
                 assert!(Instant::now() < deadline, "the demand never landed");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             shelf.publish(|b| {
                 b.volumes[0] = home_row(25 * GIB);

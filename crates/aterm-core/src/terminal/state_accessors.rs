@@ -105,7 +105,7 @@ impl Terminal {
 
     /// The embedder is about to make its console host leave the alternate screen a dead app left up (the `mainscreen` verb under the host policy, [`set_host_resyncs_alt_screen`](Self::set_host_resyncs_alt_screen)): the `?1049l` the host forwards then leaves it as a dead app's screen, releasing the modes the app left on as a prompt's request does, and a prompt on that screen asks the host nothing more.
     #[inline]
-    pub const fn expect_host_alt_screen_leave(&mut self) -> bool {
+    pub fn expect_host_alt_screen_leave(&mut self) -> bool {
         if !self.modes.alternate_screen {
             return false;
         }
@@ -359,14 +359,14 @@ impl Terminal {
 
     /// Authorize OSC 133 / OSC 633 shell integration with a 32-byte capability nonce.
     #[inline]
-    pub const fn authorize_shell_integration(&mut self, nonce: [u8; 32]) {
+    pub fn authorize_shell_integration(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize(nonce);
         self.host_journal.push(super::HostOp::AuthorizeShell(nonce));
     }
 
     /// [`authorize_shell_integration`][Self::authorize_shell_integration] for a nonce the shell has not taken yet: the re-key of an adopted shell whose nonce did not survive an update, delivered through a file the shell reads at its next prompt (aterm-gui `shell_rekey`).
     #[inline]
-    pub const fn authorize_shell_integration_on_first_mark(&mut self, nonce: [u8; 32]) {
+    pub fn authorize_shell_integration_on_first_mark(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_on_first_mark(nonce);
         self.host_journal
             .push(super::HostOp::AuthorizeShellOnFirstMark(nonce));
@@ -374,7 +374,7 @@ impl Terminal {
 
     /// [`authorize_shell_integration_on_first_mark`][Self::authorize_shell_integration_on_first_mark] for a typed re-key (aterm-gui `shell_rekey::typed`): a nonce left in a one-use file for a line typed at the prompt.
     #[inline]
-    pub const fn authorize_shell_integration_rekey(&mut self, nonce: [u8; 32]) {
+    pub fn authorize_shell_integration_rekey(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_rekey(nonce);
         self.host_journal
             .push(super::HostOp::AuthorizeShellRekey(nonce));

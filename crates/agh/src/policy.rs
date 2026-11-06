@@ -626,16 +626,22 @@ impl Router {
         self.validated.is_some()
     }
 
+    fn owner_row(&self, owner: &str) -> Option<&crate::config::OwnerRule> {
+        let owners = &self.validated.as_ref()?.owners;
+        if owner.bytes().all(|b| !b.is_ascii_uppercase()) {
+            owners.get(owner)
+        } else {
+            owners.get(&owner.to_ascii_lowercase())
+        }
+    }
+
     /// Resolves the effective tier for an owner (`Release`, configured row tier, or `External`).
     #[must_use]
     pub fn tier_of(&self, owner: &str) -> Tier {
         if on_floor(owner) {
             return Tier::Release;
         }
-        self.validated
-            .as_ref()
-            .and_then(|v| v.owners.get(&owner.to_ascii_lowercase()))
-            .map_or(Tier::External, |row| row.tier)
+        self.owner_row(owner).map_or(Tier::External, |row| row.tier)
     }
 
     /// The owner's chain (`None`: the default chain).
@@ -645,19 +651,14 @@ impl Router {
             return vec![ChainStep::Anonymous];
         };
         owner
-            .and_then(|o| validated.owners.get(&o.to_ascii_lowercase()))
+            .and_then(|o| self.owner_row(o))
             .map_or_else(|| validated.default_read.clone(), |row| row.read.clone())
     }
 
     /// The owner's writer, when its row names one.
     #[must_use]
     pub fn writer_of(&self, owner: &str) -> Option<&str> {
-        self.validated
-            .as_ref()?
-            .owners
-            .get(&owner.to_ascii_lowercase())?
-            .write
-            .as_deref()
+        self.owner_row(owner)?.write.as_deref()
     }
 
     /// The profile so named.
@@ -941,10 +942,7 @@ impl Router {
             );
         };
         let Some(writer) = self.writer_of(owner) else {
-            let has_row = self
-                .validated
-                .as_ref()
-                .is_some_and(|v| v.owners.contains_key(&owner.to_ascii_lowercase()));
+            let has_row = self.owner_row(owner).is_some();
             let why = if has_row {
                 format!("{owner} has no write profile")
             } else {

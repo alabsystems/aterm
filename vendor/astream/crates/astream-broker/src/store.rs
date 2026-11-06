@@ -5619,6 +5619,12 @@ impl BrokerLog {
         self.file.flush_handle(self.faults.sync)
     }
 
+    /// The device the log file is on and whether its full flush drains it, as `Hello`
+    /// names them ([`LogDevice`](crate::LogDevice), [`Backing::device`]).
+    pub(crate) fn device(&self) -> Option<crate::LogDevice> {
+        self.file.device()
+    }
+
     /// Whether a full flush is owed for everything below `target`: `false` (counted as
     /// skipped) when one already covers it — and `false`, uncounted, on a poisoned log,
     /// where no flush can make anything durable for this open

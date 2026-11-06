@@ -89,8 +89,11 @@ impl Sink {
 fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
     let mut told = 0u64;
     let mut flushes = Vec::new();
+    let mut batch = Vec::with_capacity(BATCH);
+    let mut lines = Vec::with_capacity(BATCH + 1);
     while let Ok(first) = rx.recv() {
-        let mut batch = Vec::new();
+        batch.clear();
+        lines.clear();
         let mut take = |msg: Msg, batch: &mut Vec<Row>| match msg {
             Msg::Row(row) => batch.push(*row),
             Msg::Flush(done) => flushes.push(done),
@@ -102,7 +105,6 @@ fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
-        let mut lines = Vec::with_capacity(batch.len() + 1);
         let lost = counts.dropped.load(Ordering::Relaxed);
         if lost > told {
             lines.push(gap_line(crate::now_ms(), lost - told));

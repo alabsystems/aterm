@@ -183,8 +183,8 @@ pub(crate) const WAKE_SETTLE: Duration = Duration::from_secs(30);
 /// Each session's own share of the wake's settle, added past [`WAKE_SETTLE`], is below this.
 pub(super) const WAKE_SPREAD: Duration = Duration::from_secs(60);
 
-/// How long the session repository's last answer stands for the same done words
-/// ([`Session::repo_read`]).
+/// How long the session repository's last answer stands for the same done words, no turn seen and
+/// no act typed since ([`Session::repo_read`]).
 pub(super) const REPO_REPROBE: Duration = Duration::from_secs(20);
 
 /// The reason of the due the wake's settle places.
@@ -1971,11 +1971,17 @@ impl<C: Ctl> Session<'_, C> {
             login_shared,
             login_pin,
             login_moved,
+            // A WORKER'S TASK IS ITS LAUNCH'S OWN PROMPT, typed by aterm for its manager: where its
+            // task record stands (`TurnEndState::managed`, read before the first point's reading)
+            // the conversation's record is not asked whether anyone asked it anything, as that
+            // record can only lag the task. Claude Code 2.1.318 had written its transcript's mode
+            // rows and file-history snapshots, and not the task's row, when the lab stub's
+            // instant reply ended the worker's first turn on screen.
             taskless: (r.taskless
                 && !self
                     .turn_end
                     .redrawn_fresh(screen.submits, screen.inputs_after))
-                || host.is_some_and(|h| h.taskless())
+                || (!self.turn_end.managed() && host.is_some_and(|h| h.taskless()))
                 || self.unasked_launch(&r, host)
                 || self.launch_unmet(&screen.rows, host.is_some()),
             finished_record: self
@@ -2511,8 +2517,8 @@ impl<C: Ctl> Session<'_, C> {
     /// THE AGENT'S LEFT ROWS AT THIS YIELD ([`IdleHost::leftover`]), read where the repository is
     /// ([`Self::repo_reads`]: a done claim, a finished record, an awaited land check, a Land
     /// go-ahead's park), and kept for the same done words as the repository's answer is, so a turn
-    /// that ran since reads them again; not asked at a landing's own words read again, nor where a
-    /// tape recorded without the door replays.
+    /// that ran since, or the answer to an act typed since, reads them again; not asked at a
+    /// landing's own words read again, nor where a tape recorded without the door replays.
     fn left_read(
         &mut self,
         reading: &TurnEndReading,
@@ -3301,6 +3307,9 @@ impl<C: Ctl> Session<'_, C> {
             self.autopilot.begin();
             self.autopilot_read(opts)?;
         }
+        // The record ahead of the reading: whether a manager waits on the session is part of
+        // what the first point reads (its `taskless`).
+        let record = self.task_ahead(opts)?;
         let mut r = self.turn_end_reading(&point.screen, worked, opts);
         if !self.fx.replay_lacks_host_door("host.answered")
             && let Some(ago) = self.answered_ago(&r, point.screen.seq, opts)
@@ -3310,7 +3319,6 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
-        let record = self.task_ahead(opts)?;
         self.fold_point(&mut r, now, point.screen.seq, opts);
         self.task_seed(record, opts);
         self.decide_to_act(r, opts, (now, true), &point.screen)
@@ -3646,9 +3654,6 @@ impl<C: Ctl> Session<'_, C> {
         if matches!(action, TurnEndAction::Nothing) {
             self.turn_end.conclude_repeated(&r, now);
         }
-        if !withheld {
-            self.turn_end.conclude_at_wall(&r, &cfg, &action);
-        }
         let limit_draft_holds = (r.autopilot != Autopilot::Off)
             && crate::supervise::policy::exception::draft_holds_limit_switch(
                 &self.turn_end,
@@ -3787,11 +3792,11 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.account_round();
         self.probe_seed_claims(&turn.screen, review);
+        let record = self.task_ahead(opts)?;
         let mut r = self.turn_end_reading(&turn.screen, None, opts);
         self.point_as_decided(&mut turn);
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
-        let record = self.task_ahead(opts)?;
         self.fold_point(&mut r, now, turn.screen.seq, opts);
         self.task_seed(record, opts);
         self.probe_shut(&turn, ProbeGate::NotNew, None, review)?;
@@ -4507,6 +4512,11 @@ impl<C: Ctl> Session<'_, C> {
         // write reads the reach afresh (`Session::write_guards`).
         self.reach_seen = None;
         self.witness_seen = None;
+        // So are the host's repository and left reads: the act's answer is a new yield, read
+        // again whatever its words, though no turn of it is seen (`Session::repo_read`,
+        // `Session::left_read`), so what the agent ended or pushed in that turn holds nothing.
+        self.repo_seen = None;
+        self.left_seen = None;
         if let Some(fact) = &fact {
             self.fact_rode(fact, None, seq, review);
         }

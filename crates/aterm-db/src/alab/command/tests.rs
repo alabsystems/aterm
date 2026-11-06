@@ -464,7 +464,7 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
 /// and a repair round carried the declaration, the other Mac's catalog holds another Mac's
 /// declaration, and an import there into a registry it held nothing of is refused before any
 /// round is read, while the importer's own declaration is not another Mac's.
-/// NEGATIVE CONTROL: with `peek_declared_elsewhere` counting this Mac's own declaration too, the
+/// NEGATIVE CONTROL: with `peek_declaration` counting this Mac's own declaration too, the
 /// importer reads its own declaration as another's: `` left: Some((…, true)) right: Some((…,
 /// false)) ``.
 #[test]
@@ -1122,12 +1122,7 @@ fn the_export_publishes_once_and_check_reports_its_drift() {
 
 /// The verbs' scripted [`Io`]: an opener that runs `edit`, stdin that answers `stdin`, no review
 /// and no heard archive (the window alone, never this Mac's real spool).
-fn verb_io<'a>(
-    paths: &Paths,
-    list: &[&str],
-    open: &'a mut dyn FnMut(&Path, usize) -> Result<()>,
-    stdin: &str,
-) -> Result<Value> {
+fn verb_io<'a>(paths: &Paths, list: &[&str], open: att::Opener<'a>, stdin: &str) -> Result<Value> {
     let mut review = |_: &Path| Ok(());
     let line = stdin.to_owned();
     let mut read = move || Ok(line.clone());
@@ -1141,7 +1136,7 @@ fn verb_io<'a>(
 }
 
 fn verb(paths: &Paths, list: &[&str]) -> Result<Value> {
-    verb_io(paths, list, &mut |_: &Path, _| Ok(()), "")
+    verb_io(paths, list, &mut |_: &Path, _, _: &[String]| Ok(()), "")
 }
 
 /// The readers print the registry by key and label: `accounts` gives each account's label and
@@ -1312,7 +1307,7 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let (vault, logins) = sheets(scratch.path());
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
-    let mut open = |_: &Path, _| Ok(());
+    let mut open = |_: &Path, _, _: &[String]| Ok(());
     let added = verb_io(
         paths,
         &["add", "account", "claude"],
@@ -1377,7 +1372,7 @@ fn edit_saves_the_owners_cell_through_the_grid() {
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
     let m3 = keys::machine_pk("m3");
     let mut opened = Vec::new();
-    let mut open = |path: &Path, _: usize| -> Result<()> {
+    let mut open = |path: &Path, _: usize, _: &[String]| -> Result<()> {
         opened.push(path.file_name().unwrap().to_string_lossy().into_owned());
         let held = std::fs::read_to_string(path).unwrap();
         if opened.len() == 1 {

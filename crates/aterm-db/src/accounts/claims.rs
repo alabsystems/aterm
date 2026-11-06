@@ -150,16 +150,11 @@ pub struct Read {
 /// `clock.state` (F22).
 fn clock_of(
     bootstrap: &Bootstrap,
-    session: &Session<'_>,
+    bindings: &[aterm_secrets::commons::binding::Binding],
     me: &[u8; 16],
     now: u64,
-) -> Result<crate::clock::Judgement> {
-    Ok(crate::clock::judge(
-        bootstrap,
-        &session.members()?,
-        me,
-        now.saturating_mul(1000),
-    ))
+) -> crate::clock::Judgement {
+    crate::clock::judge(bootstrap, bindings, me, now.saturating_mul(1000))
 }
 
 fn request_for(key: &str, bytes: &[u8]) -> [u8; 16] {
@@ -200,8 +195,8 @@ fn canonical(body: &Value) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The row a command carries: its key (the machine it claims to be) and its body.
-fn row_of(command: &Command) -> Result<([u8; 16], &Value)> {
+/// The row fields a decoded command carries (`machine`, `body`, `key`, `request`).
+fn row_fields(command: &Command) -> Result<([u8; 16], &Value, &str, &[u8; 16])> {
     let Command::Write { request, changes } = command else {
         return Err(Error::new("claim command is not a write"));
     };
@@ -216,7 +211,13 @@ fn row_of(command: &Command) -> Result<([u8; 16], &Value)> {
         return Err(Error::new("claim command is not a row"));
     };
     let machine = crate::database::decode_hex::<16>(&change.key)?;
-    if request_for(&change.key, &canonical(body)?) != *request {
+    Ok((machine, body, &change.key, request))
+}
+
+/// The row a command carries: its key (the machine it claims to be) and its body.
+fn row_of(command: &Command) -> Result<([u8; 16], &Value)> {
+    let (machine, body, key, request) = row_fields(command)?;
+    if request_for(key, &canonical(body)?) != *request {
         return Err(Error::new(
             "claim command's retry identity is not its row's",
         ));
@@ -242,12 +243,16 @@ fn decode(payload: &[u8]) -> Result<Command> {
 }
 
 /// Each current member's machine, by its writer actor.
-fn machines(session: &Session<'_>) -> Result<BTreeMap<Actor, [u8; 16]>> {
-    Ok(session
-        .members()?
+fn machines_of(bindings: &[aterm_secrets::commons::binding::Binding]) -> BTreeMap<Actor, [u8; 16]> {
+    bindings
         .iter()
         .map(|binding| (binding.actor(), *binding.machine()))
-        .collect())
+        .collect()
+}
+
+#[cfg(test)]
+fn machines(session: &Session<'_>) -> Result<BTreeMap<Actor, [u8; 16]>> {
+    Ok(machines_of(&session.members()?))
 }
 
 use crate::table::binding_denied_in_roster;
@@ -268,7 +273,7 @@ fn latest(logs: &[(Source, Log)], machines: &BTreeMap<Actor, [u8; 16]>) -> BTree
         let (tier, generation) = source.tier();
         for (operation, command) in log.eligible() {
             let actor = operation.header.actor;
-            let Ok((machine, body)) = row_of(&command) else {
+            let Ok((machine, body, _, _)) = row_fields(&command) else {
                 continue;
             };
             if machines.get(&actor) != Some(&machine) {
@@ -459,13 +464,13 @@ pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
     let mut logs = ring_logs(&session, &directory, &state, now)?;
     let ring = logs.len();
     logs.extend(legacy_logs(&session, &directory, &bootstrap, now));
-    let machines = machines(&session)?;
+    let bindings = session.members()?;
+    let machines = machines_of(&bindings);
     let latest = latest(&logs, &machines);
     let me = me(&session, &machines)?;
-    let clock = clock_of(&bootstrap, &session, &me, now)?;
+    let clock = clock_of(&bootstrap, &bindings, &me, now);
     let roster = aterm_secrets::client::swarm_roster_until(paths, deadline)
         .map_err(crate::table::failure)?;
-    let bindings = session.members()?;
     let local_denied = aterm_secrets::client::local_recipient_denied_in_roster(paths)
         || roster.as_ref().is_some_and(|r| {
             bindings
@@ -496,8 +501,7 @@ pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
             .map_err(|why| why.to_string())
     };
     let denied_actors: std::collections::BTreeSet<Actor> = match &roster {
-        Some(r) => session
-            .members()?
+        Some(r) => bindings
             .iter()
             .filter(|b| b.actor() != session.actor() && binding_denied_in_roster(r, b))
             .map(aterm_secrets::commons::binding::Binding::actor)
@@ -542,8 +546,9 @@ fn own_table(paths: &Paths, now: u64, deadline: Instant) -> Result<astream_wire:
     let bootstrap = Bootstrap::required_until(paths, admission).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
-    let machines = machines(&session)?;
-    if let Some(why) = clock_of(&bootstrap, &session, &me(&session, &machines)?, now)?.refusal() {
+    let bindings = session.members()?;
+    let machines = machines_of(&bindings);
+    if let Some(why) = clock_of(&bootstrap, &bindings, &me(&session, &machines)?, now).refusal() {
         return Err(Error::new(&why));
     }
     let state = directory.ring_view(&session, &CLAIMS);
@@ -651,11 +656,11 @@ pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Res
     {
         return Err(Error::new("this Mac is denied in the swarm roster"));
     }
-    let machines = machines(&session)?;
+    let machines = machines_of(&bindings);
     let machine = me(&session, &machines)?;
     // A Mac its peers read as off writes no row (F22): a row it wrote would land in a table its
     // peers never read, or outrank its later rows once its clock is set right.
-    if let Some(why) = clock_of(&bootstrap, &session, &machine, now)?.refusal() {
+    if let Some(why) = clock_of(&bootstrap, &bindings, &machine, now).refusal() {
         return Err(Error::new(&why));
     }
     let command = command(&machine, body)?;

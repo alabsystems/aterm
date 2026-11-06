@@ -14,6 +14,8 @@ use crate::tables::{CODE_LENGTH_CODE, CODE_LENGTH_ORDER};
 const ROOT: u32 = 8;
 /// The longest code (§3.5).
 const MAX_LEN: u8 = 15;
+/// The largest alphabet any Brotli prefix code uses (command alphabet = 704).
+const MAX_ALPHABET: usize = 704;
 /// A table entry linking to a second-level table.
 const LINK: u32 = 1 << 31;
 
@@ -70,7 +72,8 @@ impl Code {
             next[len] = code;
         }
         // Each symbol's code, bit-reversed: the order the stream sends it in.
-        let mut codes = vec![(0u32, 0u32); lengths.len()];
+        let mut codes_buf = [(0u32, 0u32); MAX_ALPHABET];
+        let codes = &mut codes_buf[..lengths.len()];
         for (s, &l) in lengths.iter().enumerate() {
             if l > 0 {
                 let l = u32::from(l);
@@ -80,7 +83,7 @@ impl Code {
         }
         let root = 1usize << ROOT;
         let mut sub_bits = [0u32; 1 << ROOT];
-        for &(r, l) in &codes {
+        for &(r, l) in &*codes {
             if l > ROOT {
                 let p = (r as usize) & (root - 1);
                 sub_bits[p] = sub_bits[p].max(l - ROOT);
@@ -170,7 +173,8 @@ pub(crate) fn read_code<R: Read>(b: &mut Bits<R>, alphabet: u32) -> Step<Code> {
         return corrupt("the code length code is not complete");
     }
     let lengths_code = Code::canonical(&lengths_code)?;
-    let mut lengths = vec![0u8; alphabet as usize];
+    let mut lengths_buf = [0u8; MAX_ALPHABET];
+    let lengths = &mut lengths_buf[..alphabet as usize];
     let mut symbol = 0usize;
     let mut previous: u8 = 8;
     let mut repeat: u32 = 0;
@@ -211,7 +215,7 @@ pub(crate) fn read_code<R: Read>(b: &mut Bits<R>, alphabet: u32) -> Step<Code> {
     if space != 0 {
         return corrupt("a prefix code's lengths are not complete");
     }
-    Code::canonical(&lengths)
+    Code::canonical(lengths)
 }
 
 fn read_simple<R: Read>(b: &mut Bits<R>, alphabet: u32) -> Step<Code> {
@@ -235,11 +239,12 @@ fn read_simple<R: Read>(b: &mut Bits<R>, alphabet: u32) -> Step<Code> {
         _ if b.read(1)? == 0 => &[2, 2, 2, 2],
         _ => &[1, 2, 3, 3],
     };
-    let mut lengths = vec![0u8; alphabet as usize];
+    let mut lengths_buf = [0u8; MAX_ALPHABET];
+    let lengths = &mut lengths_buf[..alphabet as usize];
     for (&s, &l) in symbols[..n].iter().zip(shape) {
         lengths[s as usize] = l;
     }
-    Code::canonical(&lengths)
+    Code::canonical(lengths)
 }
 
 #[cfg(test)]

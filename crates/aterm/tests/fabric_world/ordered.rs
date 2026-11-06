@@ -66,6 +66,11 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
     let broker = w.broker.as_ref().expect("the world serves its broker");
     let (a, b) = w.two_sessions();
     let full = || broker.flush_counts().full;
+    // Where the log is on the state dir's device, the bridge's first take asks the broker for
+    // one full flush to settle its mirror pin (critic item F07): a flush of the bridge's own
+    // state, not of a record, and made before the note so the note rides the horizon.
+    w.mirror_fenced();
+    let settle = u64::from(w.bridge_settles_the_pin());
 
     let note = agent_note(&w, &a, &b, "before");
     assert!(
@@ -73,7 +78,11 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
         "an agent's note is not escalated: durable {} at @{note}",
         broker.durable_head()
     );
-    assert_eq!(full(), 0, "no full flush was spent on machine records");
+    assert_eq!(
+        full(),
+        settle,
+        "no full flush was spent on machine records, the pin's settle aside"
+    );
 
     let cap = w.person_cap("h-x");
     let cap = cap.to_string_lossy();
@@ -88,12 +97,12 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
         halt > note && broker.durable_head() > note,
         "the whole file"
     );
-    assert_eq!(full(), 1, "one full flush, the halt's");
+    assert_eq!(full(), settle + 1, "one full flush, the halt's");
     let (out, _) = w.fabric_as_person(&["halt", "--cap-file", &cap, "off"]);
     let lift = at_off(&out, "halt is OFF at ");
     assert!(broker.durable_head() > lift, "a lift is escalated too");
     let after_lift = full();
-    assert_eq!(after_lift, 2);
+    assert_eq!(after_lift, settle + 2);
 
     let note = agent_note(&w, &a, &b, "after");
     assert!(broker.durable_head() <= note, "@{note} rides the horizon");

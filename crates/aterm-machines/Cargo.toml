@@ -72,13 +72,15 @@ aterm-log = { workspace = true }
 # Not aterm-phase, which holds the screen reader deny.toml keeps to aterm-gui and aterm-agent.
 aterm-agent-names = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Portable debugger-authorization classification for the root setup steps, and on macOS the
+# app held responsible for a sign-out's Accessibility grant (`System::responsible_app`).
+aterm-containment = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Command Line Tools' Low Data Mode look (port/low_data.rs): the first update of
 # Network.framework's path monitor (`aterm_objc::PathMonitor`).
 aterm-objc = { workspace = true }
-# The app macOS holds responsible for this process (`System::responsible_app`), which the
-# sign-out's Accessibility grant goes to.
-aterm-containment = { workspace = true }
 
 [dev-dependencies]
 # The loopback GitHub the key calls are tested against.

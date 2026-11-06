@@ -2288,7 +2288,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the shell never led its pty"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 

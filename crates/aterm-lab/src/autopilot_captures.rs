@@ -172,9 +172,7 @@ impl Scene {
             Scene::Landed => "Land landed",
             Scene::Off => "Autopilot Off: its reply read, nothing typed",
             Scene::SameLand => "Land held by the same reply, the stop said",
-            Scene::SwitchAsked => {
-                "Cruise held by the same reply, switched to Land: Land asked once more"
-            }
+            Scene::SwitchAsked => "Cruise's repeated reply switched to Land: Land asked once more",
             Scene::Cruise => "Cruise at rest after a turn",
             Scene::Land => "Land landing: Land's instruction typed (land@v1)",
             Scene::Need => "its report naming a NEEDS YOU need",
@@ -720,7 +718,7 @@ chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b'
 land-repo (land-c's repository hold), landed (land-e's landing, its Done for you row standing),
 off, and same-land (the same-reply hold, the stop said); beside same-land's, land-open's and
 land-repo's shots the Overview, Settings ▸ Harness turned to its row (the state line) and the
-Messages rows it raised; Claude Code also switch-asked (switch-over-held's hold under Cruise,
+Messages rows it raised; Claude Code also switch-asked (switch-over-held's repeat under Cruise,
 switched to Land by the person's press on Settings ▸ Harness, shot while Land's one ask stands,
 its shots beside it as same-land's), which agy and Muse Code name a skip. codex-alab runs
 codex-alab-proof's legs against its fake model: cruise, land, landed, off and need; its holds are
@@ -738,9 +736,9 @@ the instance's (default 1); --columns and --lines its grid (400 x 40, so the rul
 whole title). --out defaults to $LAB_STATE/autopilot-captures.
 
 --baseline ATERM also takes one paired agy typing take after the captures, or alone without
---harness (200 keys, then 200 backspaces, under one `video`, harness `continue = false`): on ATERM
-first, then on this lab's aterm, back to back, the same lab binary, agy, stub, keys and pace
-(typing-agy.txt). --typing codex-alab takes it on codex-alab instead, in codex-alab-proof's `off`
+--harness (200 keys, then 200 backspaces, under one `video`, harness `continue = false`, its Cruise
+chip drawn, then idle 20 s): on ATERM first, then on this lab's aterm, back to back, the same lab
+binary, agy, stub, keys and pace (typing-agy.txt). --typing codex-alab takes it on codex-alab instead, in codex-alab-proof's `off`
 leg under Autopilot Off at rest, each take then idle 20 s, four takes in the order baseline, this
 tree, this tree, baseline, so neither arm always runs second; each line names its slot
 (typing-codex-alab.txt). Take it on a quiet machine.
@@ -1288,9 +1286,10 @@ fn agent_lab(
         out,
         a,
     };
+    let drive = run.state().join("drive");
     while tabs.iter().any(|(_, t)| !t.done) {
         for (chain, tab) in tabs.iter_mut().filter(|(_, t)| !t.done) {
-            let settled = agent_settled(&door, tab.scene, &tab.sid, *chain);
+            let settled = agent_settled(&door, &drive, tab.scene, &tab.sid, *chain);
             if let Some(why) = settle(tab, settled) {
                 let why = format!(
                     "{why}; it read {}",
@@ -1320,7 +1319,7 @@ fn agent_lab(
 }
 
 /// Whether `scene`'s tab `sid` stands where its capture wants it, read off its `status` and screen.
-fn agent_settled(door: &Door<'_>, scene: Scene, sid: &str, chain: Chain) -> bool {
+fn agent_settled(door: &Door<'_>, drive: &Path, scene: Scene, sid: &str, chain: Chain) -> bool {
     let st = forever::on(door, sid, &["status"]);
     let w = |k: &str| forever::word(&st, k).unwrap_or_default();
     let idle = w("agent") == "idle";
@@ -1331,11 +1330,19 @@ fn agent_settled(door: &Door<'_>, scene: Scene, sid: &str, chain: Chain) -> bool
         Scene::LandRepo => idle && held(HoldLeg::Repo),
         // Stopped: the same-reply hold standing (3a's `status held=`).
         Scene::SameLand => idle && w("held") == HeldBy::SameReply.word(),
-        // Held under Cruise, the person's switch to Land is made here, their press on Settings ▸
-        // Harness's row (no `meta set`, which is no person's and asks nothing); shot while Land's
-        // one ask stands (`status land_asked=switch`), its answer slow.
+        // Its replies repeated under Cruise (Cruise's recovery wait since the continuous-forward
+        // design of 2026-11-01, or an older build's hold: the session's journal,
+        // [`forever::switch::repeat_journaled`]), the person's switch to Land is made here, their
+        // press on Settings ▸ Harness's row (no `meta set`, which is no person's and asks
+        // nothing); shot while Land's one ask stands (`status land_asked=switch`), its answer
+        // slow.
         Scene::SwitchAsked => {
-            if idle && w("autopilot") == "cruise" && w("held") == HeldBy::SameReply.word() {
+            if idle
+                && w("autopilot") == "cruise"
+                && forever::switch::repeat_journaled(&crate::util::scratch_text(
+                    &drive.join(format!("{sid}.journal.jsonl")),
+                ))
+            {
                 let _ = forever::surfaces::press_word(door, None, sid, "land");
             }
             w("land_asked") == "switch"
@@ -2611,8 +2618,8 @@ const NOT_TAKEN: &str = "typing NOT TAKEN:";
 const TYPING_SAYS: &str = "the agy typing take: 200 keys (one `send` or `key \
     space` each, 50 ms apart) then 200 backspaces into the composer of an agy under \
     Autopilot Cruise (harness continue = false, so nothing is typed into it), after the stub's \
-    first reply, under one `video 60 keys` that must outlast the burst, on a private headless \
-    lab 144x50 at 1x of its own; the baseline's arm first, then this tree's, back to back, the \
+    first reply, under one `video 60 keys` that must outlast the burst, then an idle window of \
+    20 s, on a private headless lab 144x50 at 1x of its own; the baseline's arm first, then this tree's, back to back, the \
     same lab binary, agy, stub, keys and pace, only the aterm differing; headless, so \
     frames are n_render with render_p*";
 
@@ -2691,8 +2698,9 @@ fn typing_in(tag: &str) -> Result<String, Fail> {
     }
     stop::sleep(Duration::from_secs(3))?;
     let (picked, said) = burst_taken(&door, &sid)?;
+    let idle = idle_taken(&door)?;
     Ok(format!(
-        "{TAKEN}{ver} aterm {}: {picked}; video: {said}",
+        "{TAKEN}{ver} aterm {}: {picked}; {idle}; video: {said}",
         run.aterm
     ))
 }

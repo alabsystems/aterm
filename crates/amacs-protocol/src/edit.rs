@@ -51,14 +51,14 @@ impl std::fmt::Display for EditError {
 impl std::error::Error for EditError {}
 
 /// The `edit` request's usage line.
-pub const EDIT_USAGE: &str =
-    "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0] [ro=1]";
+pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0] [ro=1] \
+     [secret=<header>[,<header>…]]";
 
 /// The `await edit` request's usage line.
 pub const AWAIT_EDIT_USAGE: &str = "await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]";
 
 /// Parsed `edit` request (`edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]
-/// [ro=1]`).
+/// [ro=1] [secret=<header>[,<header>…]]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
     /// The file, as a `file://` URI ([`super::uri::path_to_file_uri`]).
@@ -75,6 +75,41 @@ pub struct EditRequest {
     /// writes it; the person reads it and closes the tab (a revealed secret's grid, one-mesh
     /// design §4.8).
     pub read_only: bool,
+    /// `secret=<header>[,<header>…]`: the grid columns of a private document (a revealed
+    /// secret's grid) whose cells no reader of the window but the person's eyes gets, by each
+    /// header's whole text; `secret=` names none. `None` when it is not given, and then a private
+    /// document conceals every cell (one-mesh design §4.8, "Revealed values stay out of the
+    /// accessibility tree"). Only a private document takes it.
+    pub secret: Option<Vec<String>>,
+}
+
+/// The most headers a `secret=` names.
+pub const MAX_SECRET_HEADERS: usize = 64;
+
+/// Whether `header` may be named by `secret=`: 1 to 128 bytes with no whitespace, control
+/// character or `,`, so the list stays one `key=value` wire field.
+fn is_secret_header(header: &str) -> bool {
+    (1..=128).contains(&header.len())
+        && !header
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+}
+
+/// The headers a `secret=` value names; an empty value names none.
+fn parse_secret(value: &str) -> Result<Vec<String>, EditError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let headers: Vec<String> = value.split(',').map(str::to_string).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    if headers.len() > MAX_SECRET_HEADERS
+        || headers
+            .iter()
+            .any(|header| !is_secret_header(header) || !seen.insert(header.as_str()))
+    {
+        return Err(EditError::BadField("secret", value.to_string()));
+    }
+    Ok(headers)
 }
 
 impl EditRequest {
@@ -92,19 +127,27 @@ impl EditRequest {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         };
-        let mut seen = Vec::new();
+        let mut seen = 0u8;
+        let mut mark = |bit: u8, word: &str| -> Result<(), EditError> {
+            if seen & bit != 0 {
+                return Err(EditError::UnknownOption(word.to_string()));
+            }
+            seen |= bit;
+            Ok(())
+        };
         for word in words {
             let (key, value) = word
                 .split_once('=')
                 .ok_or_else(|| EditError::UnknownOption(word.to_string()))?;
-            if seen.contains(&key) {
-                return Err(EditError::UnknownOption(word.to_string()));
-            }
-            seen.push(key);
             match key {
-                "line" => request.line = Some(parse_line(value)?),
+                "line" => {
+                    mark(1 << 0, word)?;
+                    request.line = Some(parse_line(value)?);
+                }
                 "create" => {
+                    mark(1 << 1, word)?;
                     request.create = match value {
                         "1" => true,
                         "0" => false,
@@ -112,12 +155,14 @@ impl EditRequest {
                     };
                 }
                 "for" => {
+                    mark(1 << 2, word)?;
                     if !is_for_word(value) {
                         return Err(EditError::BadField("for", value.to_string()));
                     }
                     request.for_word = Some(value.to_string());
                 }
                 "wait" => {
+                    mark(1 << 3, word)?;
                     request.wait = match value {
                         "1" => true,
                         "0" => false,
@@ -125,11 +170,16 @@ impl EditRequest {
                     };
                 }
                 "ro" => {
+                    mark(1 << 4, word)?;
                     request.read_only = match value {
                         "1" => true,
                         "0" => false,
                         _ => return Err(EditError::BadField("ro", value.to_string())),
                     };
+                }
+                "secret" => {
+                    mark(1 << 5, word)?;
+                    request.secret = Some(parse_secret(value)?);
                 }
                 _ => return Err(EditError::UnknownOption(word.to_string())),
             }
@@ -143,7 +193,8 @@ impl EditRequest {
         if !self.uri.starts_with("file://") {
             return Err(EditError::BadField("uri", self.uri.clone()));
         }
-        let mut args = self.uri.clone();
+        let mut args = String::with_capacity(self.uri.len() + 64);
+        args.push_str(&self.uri);
         if let Some((line, col)) = self.line {
             if line == 0 || col == Some(0) {
                 return Err(EditError::BadLine(format_line(line, col)));
@@ -174,6 +225,14 @@ impl EditRequest {
         }
         if self.read_only {
             args.push_str(" ro=1");
+        }
+        if let Some(headers) = &self.secret {
+            let value = headers.join(",");
+            if parse_secret(&value).as_deref() != Ok(headers.as_slice()) {
+                return Err(EditError::BadField("secret", value));
+            }
+            args.push_str(" secret=");
+            args.push_str(&value);
         }
         Ok(args)
     }
@@ -352,18 +411,25 @@ impl AwaitEdit {
 
     /// The `await` verb's arguments, as [`Self::parse`] reads them.
     pub fn format(&self) -> Result<String, EditError> {
+        use std::fmt::Write as _;
         let mut args = match &self.key {
-            AwaitKey::Ticket(ticket) => format!("edit ticket={ticket}"),
+            AwaitKey::Ticket(ticket) => {
+                let mut s = String::with_capacity(48);
+                let _ = write!(s, "edit ticket={ticket}");
+                s
+            }
             AwaitKey::Uri(uri) => {
                 token("uri", uri)?;
                 if !uri.starts_with("file://") {
                     return Err(EditError::BadField("uri", uri.clone()));
                 }
-                format!("edit uri={uri}")
+                let mut s = String::with_capacity(uri.len() + 32);
+                s.push_str("edit uri=");
+                s.push_str(uri);
+                s
             }
         };
         if let Some(ms) = self.timeout_ms {
-            use std::fmt::Write as _;
             let _ = write!(args, " timeout={ms}");
         }
         Ok(args)
@@ -505,6 +571,7 @@ mod tests {
                 for_word: None,
                 wait: true,
                 read_only: false,
+                secret: None,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -513,6 +580,7 @@ mod tests {
                 for_word: Some("git".to_string()),
                 wait: true,
                 read_only: false,
+                secret: None,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -521,6 +589,7 @@ mod tests {
                 for_word: Some("claude-code_2.1".to_string()),
                 wait: true,
                 read_only: false,
+                secret: None,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -529,6 +598,7 @@ mod tests {
                 for_word: Some("git".to_string()),
                 wait: false,
                 read_only: false,
+                secret: None,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -537,6 +607,25 @@ mod tests {
                 for_word: Some("aterm".to_string()),
                 wait: true,
                 read_only: true,
+                secret: None,
+            },
+            EditRequest {
+                uri: URI.to_string(),
+                line: Some((1, None)),
+                create: false,
+                for_word: Some("aterm-db".to_string()),
+                wait: true,
+                read_only: true,
+                secret: Some(vec!["password".to_string(), "=totp".to_string()]),
+            },
+            EditRequest {
+                uri: URI.to_string(),
+                line: None,
+                create: false,
+                for_word: Some("aterm-db".to_string()),
+                wait: true,
+                read_only: false,
+                secret: Some(Vec::new()),
             },
         ] {
             let args = request.format().unwrap();
@@ -551,7 +640,19 @@ mod tests {
                 request.read_only,
                 "only `ro=1` is written: {args}"
             );
+            assert_eq!(
+                args.contains("secret="),
+                request.secret.is_some(),
+                "`secret=` is written only when given: {args}"
+            );
         }
+        assert_eq!(
+            EditRequest::parse(&format!("{URI} secret="))
+                .unwrap()
+                .secret,
+            Some(Vec::new()),
+            "`secret=` names no column"
+        );
         assert!(
             !EditRequest::parse(&format!("{URI} ro=0"))
                 .unwrap()
@@ -571,6 +672,7 @@ mod tests {
                 for_word: Some("git".to_string()),
                 wait: true,
                 read_only: false,
+                secret: None,
             },
             "options in any order, any spacing"
         );
@@ -603,6 +705,7 @@ mod tests {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         };
         assert!(matches!(zero.format(), Err(EditError::BadLine(_))));
     }
@@ -622,6 +725,10 @@ mod tests {
             "wait=0 wait=0",
             "ro=yes",
             "ro=1 ro=1",
+            "secret=a,a",
+            "secret=a,,b",
+            "secret=,",
+            "secret=a secret=b",
             "for=a/b",
             "bare",
         ] {
@@ -643,6 +750,7 @@ mod tests {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         };
         assert_eq!(spaced.format(), Err(EditError::Whitespace("uri")));
         let word = EditRequest {
@@ -652,6 +760,7 @@ mod tests {
             for_word: Some("git commit".to_string()),
             wait: true,
             read_only: false,
+            secret: None,
         };
         assert_eq!(word.format(), Err(EditError::Whitespace("for")));
         let ok = EditOk {

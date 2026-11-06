@@ -1109,7 +1109,7 @@ fn a_flag_raised_at_any_moment_replays_exactly() {
             let flag = Arc::clone(&flag);
             std::thread::spawn(move || {
                 for _ in 0..spins {
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 flag.store(true, Ordering::SeqCst);
             })
@@ -1211,7 +1211,7 @@ fn a_host_racing_the_loop_replays_exactly() {
                     if spin == stop_at {
                         flag.store(true, Ordering::SeqCst);
                     }
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
             })
         };

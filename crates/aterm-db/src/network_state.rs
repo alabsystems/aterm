@@ -428,20 +428,26 @@ fn state(v: &Value) -> Result<Reachability> {
     }
 }
 
-fn encode(
+fn encode_value(
     observation: &NetworkObservation,
     trust: Option<aterm_secrets::commons::journal::Trust>,
-) -> Result<Vec<u8>> {
+) -> Value {
     let peers: Vec<_> = observation.peers.iter().map(|p| json!({
         "slot":p.slot,"identity":identity_value(&p.identity),"first":p.first_seen_ms,"last":p.last_seen_ms,
         "last_authenticated_endpoint":p.last_authenticated_endpoint.as_ref().map(endpoint_value),
         "last_repair":p.last_repair.as_ref().map(repair::value),
         "samples":p.samples.iter().map(|s| json!({"at":s.at_ms,"state":state_value(s.state)})).collect::<Vec<_>>()
     })).collect();
-    let value = json!({"version":1,"revision":observation.revision,"observed":observation.observed_at_ms,
+    json!({"version":1,"revision":observation.revision,"observed":observation.observed_at_ms,
         "observer":observation.observer.as_ref().map(identity_value),"limited":observation.retention_limited,"peers":peers,
         "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),
-        "trust":trust.map(|t|json!({"network":aterm_codec::hex::encode_lower(&t.network),"authority":aterm_codec::hex::encode_lower(&t.authority),"genesis":aterm_codec::hex::encode_lower(&t.genesis)}))});
+        "trust":trust.map(|t|json!({"network":aterm_codec::hex::encode_lower(&t.network),"authority":aterm_codec::hex::encode_lower(&t.authority),"genesis":aterm_codec::hex::encode_lower(&t.genesis)}))})
+}
+fn encode(
+    observation: &NetworkObservation,
+    trust: Option<aterm_secrets::commons::journal::Trust>,
+) -> Result<Vec<u8>> {
+    let value = encode_value(observation, trust);
     let wire = aterm_json::to_vec(&value).map_err(|_| bad())?;
     if wire.len() > MAX_BYTES {
         return Err(bad());
@@ -461,7 +467,10 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
         return Err(bad());
     }
     let value: Value = aterm_json::from_slice(wire).map_err(|_| bad())?;
-    if number(&value, "version")? != 1 {
+    decode_value(&value)
+}
+fn decode_value(value: &Value) -> Result<NetworkObservation> {
+    if number(value, "version")? != 1 {
         return Err(bad());
     }
     let rows = value
@@ -473,7 +482,7 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut slots = std::collections::BTreeSet::new();
-    let mut peers = Vec::new();
+    let mut peers = Vec::with_capacity(rows.len());
     for row in rows {
         let identity = identity(row.get("identity").ok_or_else(bad)?)?;
         let slot = number(row, "slot")?;
@@ -508,17 +517,17 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
                 .collect::<Result<_>>()?,
         });
     }
-    peers.sort_by_key(|p| p.slot);
+    peers.sort_unstable_by_key(|p| p.slot);
     let observer = value
         .get("observer")
         .filter(|v| !v.is_null())
         .map(identity)
         .transpose()?;
     Ok(NetworkObservation {
-        revision: number(&value, "revision")?,
-        observed_at_ms: number(&value, "observed")?,
+        revision: number(value, "revision")?,
+        observed_at_ms: number(value, "observed")?,
         observer,
-        accounts_exchange: accounts_exchange(&value)?,
+        accounts_exchange: accounts_exchange(value)?,
         history: HistoryState::Ready,
         detail: "Retained history; current reachability has not been checked".into(),
         peers,
@@ -529,8 +538,7 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
         ..NetworkObservation::default()
     })
 }
-fn decode_trust(wire: &[u8]) -> Result<Option<aterm_secrets::commons::journal::Trust>> {
-    let value: Value = aterm_json::from_slice(wire).map_err(|_| bad())?;
+fn decode_trust_value(value: &Value) -> Result<Option<aterm_secrets::commons::journal::Trust>> {
     value
         .get("trust")
         .filter(|v| !v.is_null())
@@ -542,6 +550,18 @@ fn decode_trust(wire: &[u8]) -> Result<Option<aterm_secrets::commons::journal::T
             })
         })
         .transpose()
+}
+fn decode_record(
+    wire: &[u8],
+) -> Result<(
+    NetworkObservation,
+    Option<aterm_secrets::commons::journal::Trust>,
+)> {
+    if wire.len() > MAX_BYTES {
+        return Err(bad());
+    }
+    let value: Value = aterm_json::from_slice(wire).map_err(|_| bad())?;
+    Ok((decode_value(&value)?, decode_trust_value(&value)?))
 }
 
 /// The live observation another local process (a window, or the node job) publishes of
@@ -646,8 +666,7 @@ impl Observer {
                 if record.seq != offset || record.subject != SUBJECT {
                     return Err(OpenFailure::Unavailable);
                 }
-                state = decode(&record.body)?;
-                trust = decode_trust(&record.body)?;
+                (state, trust) = decode_record(&record.body)?;
                 offset = Offset(record.seq.0.checked_add(1).ok_or_else(bad)?);
             }
         }

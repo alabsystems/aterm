@@ -38,6 +38,9 @@ mod auth_deadline;
 #[cfg(test)]
 mod auth_deadline_tests;
 pub mod browser_window;
+pub mod challenge_relay;
+#[cfg(unix)]
+mod challenge_window;
 pub mod claims;
 pub mod cli;
 pub mod codex_alab;
@@ -89,6 +92,7 @@ pub mod mailbox_needs;
 pub mod mailbox_routes;
 pub mod mailbox_seen;
 pub mod muse_usage;
+mod native_account_handoff;
 mod native_account_recipe;
 pub mod native_act;
 pub mod native_keys;
@@ -105,6 +109,7 @@ pub use native_launch::{
 #[cfg(all(test, target_os = "macos"))]
 mod native_launch_tests;
 pub mod native_observe;
+mod native_record;
 mod native_restart;
 pub mod netwatch;
 pub mod open_url;

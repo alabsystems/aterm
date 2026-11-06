@@ -28,7 +28,7 @@ use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
 use std::path::{Path, PathBuf};
 
-fn never_open(_: &Path, _: usize) -> Result<()> {
+fn never_open(_: &Path, _: usize, _: &[String]) -> Result<()> {
     panic!("this verb opens no editor")
 }
 
@@ -191,7 +191,7 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
     let mut opened: Vec<(PathBuf, usize)> = Vec::new();
     let mut reports = Vec::new();
     let edited = {
-        let mut open = |path: &Path, line: usize| -> Result<()> {
+        let mut open = |path: &Path, line: usize, _: &[String]| -> Result<()> {
             opened.push((path.to_owned(), line));
             let held = std::fs::read_to_string(path).unwrap();
             let row = record(&held, MC);
@@ -242,7 +242,7 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
         &[],
         false,
         None,
-        &mut |path: &Path, _| {
+        &mut |path: &Path, _, _: &[String]| {
             rounds += 1;
             if rounds == 1 {
                 let held = std::fs::read_to_string(path).unwrap();
@@ -817,7 +817,7 @@ fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
         &filters,
         false,
         None,
-        &mut |path: &Path, line: usize| {
+        &mut |path: &Path, line: usize, _: &[String]| {
             rounds += 1;
             let held = std::fs::read_to_string(path).unwrap();
             if rounds == 1 {
@@ -1088,4 +1088,41 @@ fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retiremen
     assert_eq!(stale_retire["written"], json!(0));
     assert_eq!(stale_retire["retired"], json!([]));
     assert_eq!(stale_retire["stale"], json!([{"pk": MC, "column": "row"}]));
+}
+
+/// E1 (`docs/measured/e2e-emails-table-2026-11-05.md`): on three real Macs a digest read that a
+/// repair round raced failed with "table witness advanced during observation; reopen and verify".
+/// A read now reopens while the observation answers busy, until its deadline; any other answer,
+/// and a busy one past the deadline, comes back at once.
+/// NEGATIVE CONTROL: with `reopened` calling `observe` once, the first assertion fails (left a
+/// busy error, right `Ok(3)`); observed.
+#[test]
+fn a_read_that_a_writer_kept_busy_reopens_until_it_reads() {
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut attempts = 0;
+    let read = reopened(later, || {
+        attempts += 1;
+        if attempts < 3 {
+            Err(Error::snapshot_changed())
+        } else {
+            Ok(attempts)
+        }
+    });
+    assert_eq!(read.map_err(|e| e.to_string()), Ok(3));
+
+    let mut attempts = 0;
+    let read: Result<()> = reopened(later, || {
+        attempts += 1;
+        Err(Error::new("application table is not initialized"))
+    });
+    assert!(read.is_err_and(|e| !e.is_busy()));
+    assert_eq!(attempts, 1, "a refusal that is not busy is not read again");
+
+    let mut attempts = 0;
+    let read: Result<()> = reopened(std::time::Instant::now(), || {
+        attempts += 1;
+        Err(Error::snapshot_changed())
+    });
+    assert!(read.is_err_and(|e| e.is_busy()));
+    assert_eq!(attempts, 1, "past the deadline a busy read is the answer");
 }

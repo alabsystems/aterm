@@ -56,11 +56,11 @@ const UNITS: [&str; 6] = ["min", "ms", "us", "s", "h", "d"];
 #[must_use]
 pub fn normalized(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
+    let mut chars = line.chars();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
             // CSI: ESC [ parameters… final byte in @..~; any other escape: its next char.
-            if chars.peek() == Some(&'[') {
+            if chars.as_str().starts_with('[') {
                 chars.next();
                 for f in chars.by_ref() {
                     if ('@'..='~').contains(&f) {
@@ -75,12 +75,12 @@ pub fn normalized(line: &str) -> String {
         if c.is_ascii_digit() {
             // A number, and the time unit glued to it (systemd's "1min 59s", "2.5ms").
             while chars
-                .peek()
-                .is_some_and(|n| n.is_ascii_digit() || *n == '.')
+                .as_str()
+                .starts_with(|n: char| n.is_ascii_digit() || n == '.')
             {
                 chars.next();
             }
-            let rest: String = chars.clone().take(4).collect();
+            let rest = chars.as_str();
             let glued = UNITS.iter().find(|unit| {
                 rest.strip_prefix(**unit)
                     .is_some_and(|after| !after.starts_with(char::is_alphanumeric))
@@ -94,14 +94,17 @@ pub fn normalized(line: &str) -> String {
             continue;
         }
         if c.is_whitespace() {
-            if !out.ends_with(' ') {
+            if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
             }
             continue;
         }
         out.push(c);
     }
-    out.trim().to_string()
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 /// `line` cut to [`LINE_BYTES`] on a character boundary.
@@ -128,10 +131,14 @@ impl Console {
         let mut seen = Vec::new();
         for &b in bytes {
             if b == b'\n' || b == b'\r' {
-                let raw = std::mem::take(&mut self.partial);
-                let line = String::from_utf8_lossy(&raw).into_owned();
-                if let Some(s) = self.line(&line, now) {
-                    seen.push(s);
+                if !self.partial.is_empty() {
+                    let mut raw = std::mem::take(&mut self.partial);
+                    let line = String::from_utf8_lossy(&raw);
+                    if let Some(s) = self.line(&line, now) {
+                        seen.push(s);
+                    }
+                    raw.clear();
+                    self.partial = raw;
                 }
             } else if self.partial.len() < 4 * LINE_BYTES {
                 self.partial.push(b);
@@ -190,7 +197,8 @@ impl Console {
     /// The tail: the last [`TAIL_LINES`] lines, each capped, one per line.
     #[must_use]
     pub fn tail(&self) -> String {
-        let mut out = String::new();
+        let cap: usize = self.tail.iter().map(|line| line.len() + 1).sum();
+        let mut out = String::with_capacity(cap);
         for line in &self.tail {
             out.push_str(line);
             out.push('\n');

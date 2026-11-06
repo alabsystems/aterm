@@ -14,6 +14,14 @@ pub(super) struct Preparation {
 }
 
 impl Preparation {
+    pub(super) fn transfers(&self, request: &Prepare, binding: &Binding) -> bool {
+        self.recorded
+            && self
+                .predecessor
+                .as_deref()
+                .is_some_and(|(parent, capability)| parent == request && capability == binding)
+    }
+
     #[cfg(test)]
     pub(super) fn recorded_for_test() -> Self {
         let mut preparation = Self::new(false, None);

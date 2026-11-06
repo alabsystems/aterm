@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aterm_durable::Flush;
 
@@ -194,6 +194,8 @@ struct Journal {
     /// on the media, so are those writes' bytes: a file whose entry is ruled
     /// in holds no version older than the last of them ([`data_floor`]).
     file_points: Vec<(u64, PathBuf, usize)>,
+    /// The durable replaces of `logpin` made, in every boot ([`Device::pin_durable_replaces`]).
+    pin_durable: u64,
 }
 
 /// Whether a flush of a file's first `covered` writes, its point on the media,
@@ -203,6 +205,56 @@ struct Journal {
 /// Then no image holds fewer of those writes, nor tears the last of them.
 fn data_flushed(durable: &Version, pending: &[Pending], covered: usize, floor: usize) -> bool {
     covered > 0 && newest_entry(durable, &pending[..covered]).is_none_or(|e| e < floor)
+}
+
+/// The floor a cut at `cut` gives `path`'s first `keep` writes, and how many of them its
+/// file flushes put on the media whole ([`Device::cut_files`]): the ordered directory
+/// flushes and the flushes of the file where it is whose points are below the cut.
+fn floors(
+    dir_points: &[(u64, PathBuf, BTreeMap<PathBuf, usize>)],
+    file_points: &[(u64, PathBuf, usize)],
+    path: &Path,
+    f: &File,
+    keep: usize,
+    cut: u64,
+) -> (usize, usize) {
+    let mut floor = f.floor;
+    for (at, dir, lens) in dir_points {
+        if *at >= cut || path.parent() != Some(dir.as_path()) {
+            continue;
+        }
+        let covered = lens.get(path).copied().unwrap_or(0).min(keep);
+        if let Some(e) = newest_entry(&f.durable, &f.pending[..covered]) {
+            floor = floor.max(e + 1);
+        }
+    }
+    let mut data_on_media = 0;
+    for (at, flushed, covered) in file_points {
+        if *at < cut && flushed == path {
+            let covered = (*covered).min(keep);
+            if data_flushed(&f.durable, &f.pending, covered, floor) {
+                floor = floor.max(covered);
+                data_on_media = data_on_media.max(covered);
+            }
+        }
+    }
+    (floor, data_on_media)
+}
+
+/// Whether the image of `versions[pick]` may be torn by a cut ([`Device::cut_files`]): on a
+/// device that tears, one that holds a write no file flush at or below the cut put on the
+/// media whole, of an append or of a replace whose bytes no flush point below the cut holds.
+fn tearable(
+    tears: bool,
+    versions: &[(Version, Option<usize>, bool)],
+    pick: usize,
+    floor: usize,
+    data_on_media: usize,
+) -> bool {
+    // How many of its pending writes the picked version holds
+    // ([`File::versions`]: the media's own first where `floor` is 0).
+    let writes = if floor == 0 { pick } else { floor + pick };
+    tears && writes > data_on_media && (versions[pick].1.is_some() || versions[pick].2)
 }
 
 impl Journal {
@@ -247,13 +299,68 @@ impl Journal {
         self.points += 1;
         self.persisted = self.points;
     }
+
+    /// A FULL FLUSH ANOTHER PROCESS ISSUED ON THE DEVICE (critic item F07): a broker's, its log
+    /// on the state dir's device ([`Drain`]). As the bridge's own, it is a flush point and every
+    /// one before it is on the media, and it drains every write issued before it, whichever
+    /// file's: Apple's fcntl(2), "data that had been fsync'd on the same device before is
+    /// guaranteed to be persisted when this call returns". Then each file that any power cut
+    /// could only leave one image of, whole, holds that image for sure: its media's own is
+    /// that image, as a durable replace of it would leave it, which is what
+    /// [`Device::pin_fenced`] reads. A cut draws the same image of it either way.
+    fn drained(&mut self, tears: bool) {
+        self.full_flush();
+        let cut = self.points;
+        let settled: Vec<(PathBuf, Version)> = self
+            .files
+            .iter()
+            .filter(|(_, f)| !f.pending.is_empty())
+            .filter_map(|(path, f)| {
+                let keep = f.pending.iter().take_while(|p| p.epoch <= cut).count();
+                if keep < f.pending.len() {
+                    return None;
+                }
+                let (floor, data_on_media) =
+                    floors(&self.dir_points, &self.file_points, path, f, keep, cut);
+                let versions = f.versions(keep, floor, cut);
+                if versions.len() != 1 || tearable(tears, &versions, 0, floor, data_on_media) {
+                    return None;
+                }
+                Some((path.clone(), versions[0].0.clone()))
+            })
+            .collect();
+        for (path, image) in settled {
+            if let Some(f) = self.files.get_mut(&path) {
+                f.durable = image;
+                f.pending.clear();
+                f.floor = 0;
+            }
+            self.forget(&path);
+        }
+    }
+}
+
+/// A BROKER'S HOLD ON THE STATE DIR'S DEVICE (critic item F07): what the simulated broker of a
+/// world whose log is on that device keeps, so that each of its full flushes is one of the
+/// device's ([`Journal::drained`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Drain {
+    journal: Arc<Mutex<Journal>>,
+    tears: bool,
+}
+
+impl Drain {
+    /// The broker's full flush, on the state dir's device.
+    pub(crate) fn full_flush(&self) {
+        lock(&self.journal).drained(self.tears);
+    }
 }
 
 /// THE DEVICE under one world's state dir.
 #[derive(Debug)]
 pub(crate) struct Device {
     root: PathBuf,
-    journal: Mutex<Journal>,
+    journal: Arc<Mutex<Journal>>,
     /// A CONTROL: a device that keeps every write (no power cut loses anything), so a failure only a lossy cut can cause vanishes under it.
     pub(crate) lossless: bool,
     /// POSIX's worst case.
@@ -276,7 +383,7 @@ impl Device {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
-            journal: Mutex::new(Journal::default()),
+            journal: Arc::new(Mutex::new(Journal::default())),
             lossless: false,
             tears: false,
             pin_total: Mutex::new(0),
@@ -451,6 +558,16 @@ impl Device {
 
     /// THE STATE DIR MADE `w` ([`crate::fx::Disk::after`]).
     pub(crate) fn made(&self, w: Write<'_>) -> io::Result<()> {
+        if let Write::Replace {
+            path,
+            flush: Some(Flush::Durable),
+            ..
+        } = w
+        {
+            if path == self.root.join(crate::state::LOGPIN) {
+                lock(&self.journal).pin_durable += 1;
+            }
+        }
         match (self.fails_after(w), w) {
             (
                 Some(After::Renamed),
@@ -512,10 +629,27 @@ impl Device {
         *lock(&self.pin_total)
     }
 
+    /// The broker's hold on this device ([`Drain`]), for a world whose log is on it: made
+    /// once the device's tearing is set.
+    pub(crate) fn drain(&self) -> Drain {
+        Drain {
+            journal: Arc::clone(&self.journal),
+            tears: self.tears,
+        }
+    }
+
+    /// How many durable replaces of `logpin` the device made: the bridge's own full flushes
+    /// for its pin (two each), the fence's on a broker whose flush settles nothing here.
+    pub(crate) fn pin_durable_replaces(&self) -> u64 {
+        lock(&self.journal).pin_durable
+    }
+
     /// WHETHER THE MEDIA HOLDS THE PIN'S FENCE: what it holds of `logpin` for sure, whatever
     /// a power cut does to the writes since, is a pin of this build
     /// ([`crate::mirror::Pin::by_this_build`]), as a durable write of it leaves it
-    /// (`StateDir::ensure_logpin_durable`; critic item D06's law, `World::check_always`).
+    /// (`StateDir::ensure_logpin_durable`; critic item D06's law, `World::check_always`), or a
+    /// barriered one a broker's full flush on this device drained after it (critic item F07,
+    /// [`Journal::drained`]).
     pub(crate) fn pin_fenced(&self) -> bool {
         lock(&self.journal)
             .files
@@ -701,26 +835,7 @@ impl Device {
         let mut notes = Vec::new();
         for (path, f) in &mut j.files {
             let keep = f.pending.iter().take_while(|p| p.epoch <= cut).count();
-            let mut floor = f.floor;
-            for (at, dir, lens) in &dir_points {
-                if *at >= cut || path.parent() != Some(dir.as_path()) {
-                    continue;
-                }
-                let covered = lens.get(path).copied().unwrap_or(0).min(keep);
-                if let Some(e) = newest_entry(&f.durable, &f.pending[..covered]) {
-                    floor = floor.max(e + 1);
-                }
-            }
-            let mut data_on_media = 0;
-            for (at, flushed, covered) in &file_points {
-                if *at < cut && flushed == path {
-                    let covered = (*covered).min(keep);
-                    if data_flushed(&f.durable, &f.pending, covered, floor) {
-                        floor = floor.max(covered);
-                        data_on_media = data_on_media.max(covered);
-                    }
-                }
-            }
+            let (floor, data_on_media) = floors(&dir_points, &file_points, path, f, keep, cut);
             let versions = f.versions(keep, floor, cut);
             if versions.is_empty() {
                 continue;
@@ -730,12 +845,7 @@ impl Device {
                 (newest, false)
             } else {
                 let pick = usize::try_from(rng.below(versions.len() as u64)).unwrap_or(newest);
-                // How many of its pending writes the picked version holds
-                // ([`File::versions`]: the media's own first where `floor` is 0).
-                let writes = if floor == 0 { pick } else { floor + pick };
-                let tearable = self.tears
-                    && writes > data_on_media
-                    && (versions[pick].1.is_some() || versions[pick].2);
+                let tearable = tearable(self.tears, &versions, pick, floor, data_on_media);
                 (pick, tearable && rng.chance(1, 4))
             };
             let (version, torn_from, replace) = versions[pick].clone();

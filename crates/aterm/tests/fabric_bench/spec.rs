@@ -41,6 +41,11 @@ pub const fn backlog_max(populations: usize) -> usize {
     EV_RULE_BYTES / (FILL_RECORD_BYTES * if populations == 0 { 1 } else { populations })
 }
 
+/// The seeded records each cold-read pass of a broker in a process of its own fetches (F09,
+/// `run::seeded`): a seed of fewer, `backlog` times the attach populations, is refused
+/// ([`outside_refusal`]), since a pass would run short only after the whole timed world.
+pub const COLD_RECORDS: usize = 100_000;
+
 /// The most rows the ask world's asked table takes pre-filled: the table's
 /// cap (`aterm_link::state::ASKED_KEEP`), which the ask world's tests hold it to.
 pub const ASKED_PREFILL_MAX: usize = 1024;
@@ -82,7 +87,8 @@ pub struct Spec {
     /// run names it off.
     pub rate_limit: bool,
     /// Whether each world's log is sealed at rest under a key, as `aterm link broker` opens a log
-    /// with a `rest.key` beside it: on unless a run names it off, what a fabric root ships.
+    /// with a `rest.key` beside it: on unless a run names it off, what a fabric root ships. A
+    /// broker in a process of its own is always sealed ([`outside_refusal`]).
     pub at_rest: bool,
     /// Bridge `--log` mirror mode.
     pub log: Log,
@@ -102,7 +108,14 @@ pub struct Spec {
     /// The attach world's backlog (B09): records filled on an `ev` face
     /// after every session's mail is seen, so each session's refill
     /// watermark trails the head by this many when the bridge restarts. 0
-    /// (the default) is the attach world without it.
+    /// (the default) is the attach world without it. With the broker in a
+    /// process of its own (F09) the log is seeded instead: this many records
+    /// for each attach population, at least [`COLD_RECORDS`] in all, written
+    /// in this process before the broker starts (the total the in-process
+    /// world reaches by its last population). No session there marks its mail
+    /// seen, so none has a watermark: each restart's refill starts the bridge's
+    /// floor span (4,096 records) below the head, among the seed's newest
+    /// records while the head is within that span of the seed's end.
     pub backlog: usize,
     /// The ask world's asked table pre-filled to this many rows before its
     /// legs (C04): written as a build before the asks journal wrote the table,
@@ -406,8 +419,8 @@ impl Spec {
 /// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, paced notes past
 /// [`PACED_NOTES_MAX`] or on a run that measures no messaging, `tally=on` on a run that measures
 /// only the ping-pong world (which counts with both tallies anyway), a broker in a process of its
-/// own with a knob its shipped argv cannot carry or a world it does not measure
-/// ([`outside_refusal`]), or an empty output path.
+/// own with a knob its shipped argv cannot carry, a log it does not seal, a world it does not
+/// measure or a seed short of its cold reads ([`outside_refusal`]), or an empty output path.
 pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
     if out.as_os_str().is_empty() {
         return Err(format!("{OUT_ENV} names where the report goes"));
@@ -578,8 +591,11 @@ pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
 
 /// Why a run with its broker in a process of its own ([`BrokerProcess::outside`]) cannot be the
 /// one `spec` names: the shipped argv takes a tier and a key beside the log and nothing else of
-/// what the bench sets on an in-process broker, and the out-of-process worlds are the messaging,
-/// ping-pong and attach worlds' outside stamps only (`run::outside`).
+/// what the bench sets on an in-process broker, its log is sealed (a fabric root's broker mints
+/// its key at its first start), and the out-of-process worlds are the messaging, ping-pong and
+/// attach worlds' outside stamps only (`run::outside`), the attach world's log seeded by a
+/// backlog (`run::seeded`, F09) of at least [`COLD_RECORDS`] records in all, which each of its
+/// cold-read passes fetches.
 fn outside_refusal(spec: &Spec) -> Option<String> {
     if !spec.broker_process.outside() {
         return None;
@@ -605,11 +621,29 @@ fn outside_refusal(spec: &Spec) -> Option<String> {
     if spec.log != Log::Auto {
         return refused("with the bridge's auto mirror");
     }
-    if spec.backlog > 0 || spec.paced_notes > 0 || spec.bystanders > 0 || spec.tally {
+    if !spec.at_rest {
+        // `at_rest::prepare` mints a key for a log with a mint secret beside it, as every fabric
+        // root's is: a run named `at_rest=off` would serve sealed under the name plaintext.
         return refused(
-            "and its worlds take no backlog=, paced_notes=, bystanders= or tally=on: they read \
-             the outside stamps alone",
+            "sealed at rest: a fabric root's broker mints its key beside the log at its first \
+             start, so at_rest=off is no broker that ships",
         );
+    }
+    if spec.paced_notes > 0 || spec.bystanders > 0 || spec.tally {
+        return refused(
+            "and its worlds take no paced_notes=, bystanders= or tally=on: they read the outside \
+             stamps alone",
+        );
+    }
+    let seeded = spec.backlog.saturating_mul(spec.attach.len());
+    if spec.backlog > 0 && seeded < COLD_RECORDS {
+        return Some(format!(
+            "and a seeded log's cold reads fetch {COLD_RECORDS} seeded records a pass, past the \
+             {seeded} that backlog={} at {} attach size(s) seeds: name a backlog of at least {}",
+            spec.backlog,
+            spec.attach.len(),
+            COLD_RECORDS.div_ceil(spec.attach.len().max(1)),
+        ));
     }
     None
 }

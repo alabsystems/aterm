@@ -573,10 +573,10 @@ fn account_counts(
     cells: &std::collections::BTreeMap<(String, String), crate::database::Cell>,
 ) -> AccountCounts {
     let mut counts = AccountCounts::default();
-    for ((collection, _), cell) in cells {
-        if collection != "accounts" {
-            continue;
-        }
+    for (_, cell) in cells
+        .range((String::from("accounts"), String::new())..)
+        .take_while(|((collection, _), _)| collection == "accounts")
+    {
         if cell.stopped {
             counts.stopped += 1;
         } else if cell.candidates.len() != 1 {

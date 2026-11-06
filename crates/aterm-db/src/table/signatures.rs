@@ -72,14 +72,13 @@ impl Cache {
         crypto::verify(signer, DOMAIN, &wire[..signed_end], &wire[signed_end..])?;
         if self.capacity > 0
             && let Ok(mut entries) = self.entries.try_lock()
-            && !entries.known.contains(&key)
+            && entries.known.insert(key)
         {
             if entries.order.len() == self.capacity
                 && let Some(oldest) = entries.order.pop_front()
             {
                 entries.known.remove(&oldest);
             }
-            entries.known.insert(key);
             entries.order.push_back(key);
         }
         Ok(id)

@@ -991,13 +991,18 @@ fn archive_container(path: &Path) -> Result<Container> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        .unwrap_or_default();
+    let ends_with_ignore_case = |ext: &str| {
+        name.len() >= ext.len()
+            && name
+                .get(name.len() - ext.len()..)
+                .is_some_and(|s| s.eq_ignore_ascii_case(ext))
+    };
+    if ends_with_ignore_case(".tar.gz") || ends_with_ignore_case(".tgz") {
         Ok(Container::TarGz)
-    } else if name.ends_with(".tar") {
+    } else if ends_with_ignore_case(".tar") {
         Ok(Container::Tar)
-    } else if name.ends_with(".zip") {
+    } else if ends_with_ignore_case(".zip") {
         Ok(Container::Zip)
     } else {
         Err(Error::usage(format!(

@@ -36,6 +36,10 @@ mod owner_keys_save_tests;
 #[path = "app_documents_private_tests.rs"]
 mod private_tests;
 
+#[cfg(all(test, unix))]
+#[path = "app_documents_conceal_tests.rs"]
+mod conceal_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
     Select {
@@ -1421,8 +1425,14 @@ impl App {
             _ => None,
         };
 
-        self.editor_workspace.granted =
-            crate::command_registry::editor_grant(self.person_gesture_refused());
+        let mut granted = crate::command_registry::editor_grant(self.person_gesture_refused());
+        // A concealed document's values reach the clipboard only on the person's own gesture: an
+        // accessibility client's or another process's posted input copies none of them (one-mesh
+        // design §4.8, "Revealed values stay out of the accessibility tree").
+        if self.document_store.concealed(document).is_some() && self.gesture_unvouched().is_some() {
+            granted.retain(|class| *class != crate::native_editor::CommandAuthority::Clipboard);
+        }
+        self.editor_workspace.granted = granted;
         // A yank is a key, not text: the engine writes a kill's CRLF as LF into this document.
         self.editor_workspace.crlf_on_disk = crlf_on_disk;
         let effects = {
@@ -5372,6 +5382,21 @@ impl App {
         if read_only && existing.is_some() {
             return Err("ERR refused open: a read-only edit opens a file no buffer holds\n".into());
         }
+        // `edit … secret=`: the columns of a private grid its readers never get. A private
+        // document that names none conceals every cell; any other document takes no `secret=`,
+        // since only a private document's text is withheld from every other reader too.
+        let private = crate::native_document_journal::private_uri(admitted.canonical_uri());
+        let secret = match placement {
+            Placement::NewTabAfter { ticket } => self
+                .native_documents
+                .edits
+                .secret(ticket)
+                .map(<[String]>::to_vec),
+            Placement::FocusOrNewTab | Placement::NewTab => None,
+        };
+        if secret.is_some() && !private {
+            return Err("ERR refused open: secret= names the columns of a private grid\n".into());
+        }
         let access = if kind == AppKind::Editor && !read_only {
             GrantAccess::ReadWrite
         } else {
@@ -5472,6 +5497,21 @@ impl App {
                 "the read-only document could not be marked: {error:?}"
             ));
         }
+        // Concealed for the document's life: an earlier open's concealment stands.
+        if private
+            && let Err(error) = self.document_store.set_concealed(
+                document,
+                secret.map_or(
+                    crate::document_store::Concealed::All,
+                    crate::document_store::Concealed::Columns,
+                ),
+            )
+        {
+            let _ = self.document_store.remove_if_unattached(document);
+            return Err(format!(
+                "the private document could not be concealed: {error:?}"
+            ));
+        }
         if let Some(listing) = granted.directory.clone() {
             self.replace_directory_listing(document, listing)?;
         }
@@ -5561,7 +5601,9 @@ impl App {
                         snapshot.text.as_ref(),
                     )),
                     AppKind::Editor => {
-                        NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
+                        let mut editor = EditorApp::new_with_uri(document, title, uri.to_string());
+                        editor.concealed = self.document_store.concealed(document).cloned();
+                        NativeApp::Editor(editor)
                     }
                     AppKind::Mail
                     | AppKind::About

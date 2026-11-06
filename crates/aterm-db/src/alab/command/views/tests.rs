@@ -170,7 +170,16 @@ fn in_a_persons_tab_show_passwords_opens_a_read_only_grid_beside_it() {
         assert_eq!(opening.beside, Some(TAB), "beside the person's tab");
         assert!(opening.read_only, "opened to be read");
         assert_eq!(opening.line, 1);
+        // The password column, by the header the grid writes, is named to the window as
+        // concealed (`edit … secret=`): no reader of it but the person's eyes gets those cells.
+        assert_eq!(opening.secret, ["password".to_string()]);
         let path = opening.file;
+        let header = std::fs::read_to_string(path).unwrap();
+        let header = header.lines().next().unwrap_or_default();
+        assert!(
+            header.split('\t').any(|named| named == "password"),
+            "the named header is the grid's own: {header}"
+        );
         assert!(
             aterm_types::private_edit::is_private(path),
             "{}",
@@ -249,6 +258,11 @@ fn in_a_persons_tab_the_editable_grid_opens_beside_it() {
         let mut opened = Vec::new();
         let mut open = |opening: &Opening<'_>| -> Result<()> {
             opened.push((opening.beside.map(str::to_owned), opening.read_only));
+            assert_eq!(
+                opening.secret,
+                ["password".to_string()],
+                "revealed, editable"
+            );
             Ok(())
         };
         let edited = view(
@@ -276,6 +290,18 @@ fn in_a_persons_tab_the_editable_grid_opens_beside_it() {
         )
         .is_err()
     );
+}
+
+/// A grid names to the window, as concealed, each live `Secret` column by the header it writes:
+/// the plain name where the column is revealed, `=`-marked where it shows masked and read-only;
+/// a table with no `Secret` column names none.
+#[test]
+fn a_grid_names_its_secret_columns_by_the_headers_it_writes() {
+    use crate::alab::registry::{ADDRESS, MACHINE, PHONE};
+    assert_eq!(grid::secret_headers(&ADDRESS, true), ["password"]);
+    assert_eq!(grid::secret_headers(&ADDRESS, false), ["=password"]);
+    assert_eq!(grid::secret_headers(&PHONE, true), ["number"]);
+    assert!(grid::secret_headers(&MACHINE, true).is_empty());
 }
 
 /// The one line a tab gets names the Editor tab and what it holds, never a value.
@@ -631,4 +657,32 @@ fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
     assert_eq!(Noun::parse("emails"), Some(Noun::Emails));
     assert_eq!(Noun::parse("ai_accounts"), Some(Noun::AiAccounts));
     assert_eq!(Noun::parse(&email), None);
+}
+
+/// E1: on a loaded Mac a read of a registry that was there failed ("application pass deadline
+/// expired", or busy while a sync landed), and the view and `check` answered
+/// `"registry": "not imported"` with an import as the next step. "Not imported" is now the
+/// catalog's word: a declared registry's failed read is that error.
+/// NEGATIVE CONTROL: with `unread` answering "not imported" for every error (its old rule), the
+/// first assertion fails; observed.
+#[test]
+fn a_failed_read_of_a_declared_registry_is_that_error_and_never_not_imported() {
+    let lab = imported(1);
+    for error in [
+        Error::new("application pass deadline expired"),
+        Error::snapshot_changed(),
+    ] {
+        let said = error.to_string();
+        let answer = super::super::unread(&lab.paths[0], error, "next");
+        assert!(answer.is_err_and(|e| e.to_string() == said), "{said}");
+    }
+    let bare = Lab::new(&[Role::Writer]);
+    let missing = super::super::unread(
+        &bare.paths[0],
+        Error::new("application table is not initialized"),
+        "next",
+    )
+    .unwrap();
+    assert_eq!(missing["registry"].as_str(), Some("not imported"));
+    assert_eq!(missing["next"].as_str(), Some("next"));
 }

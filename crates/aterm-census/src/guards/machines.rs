@@ -3,7 +3,7 @@
 
 //! `machines-root-door`: root tools `aterm machines` runs stay inside its crate.
 
-use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
+use super::rules::{CENSUS_CRATE, PRODUCT};
 use super::{Bound, Finding, Line, Rule, SourceFile, Tree, brace_close, has, hits};
 
 const MACHINES_CRATE: &str = "crates/aterm-machines/";
@@ -66,7 +66,9 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let mut needles: Vec<&str> = ROOT_TOOLS.to_vec();
     needles.push("aterm_machines");
     for file in product(tree) {
-        if file.rel.starts_with(MACHINES_CRATE) || test_path(&file.rel) || !file.mentions(&needles)
+        if file.rel.starts_with(MACHINES_CRATE)
+            || tree.corpus.test_code().holds(&file.rel)
+            || !file.mentions(&needles)
         {
             continue;
         }

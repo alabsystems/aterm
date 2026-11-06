@@ -11,7 +11,7 @@
 //! The separate enrollment file detects a missing established journal; neither
 //! it nor a signed log protects against rollback of the whole custody tree.
 
-use super::native_act::{Binding, NativePlan, Prepare, Request};
+use super::native_act::{Binding, ImagePhase, NativePlan, Prepare, Request};
 use aterm_journal::{Committed, Limits, Log};
 use aterm_secrets::{age::Identity, client::Paths};
 use aterm_uds::private_file::{self, PrivateFileError};
@@ -27,6 +27,7 @@ const SUBJECT: &str = "native/noexec/1";
 const BODY_BYTES: usize = 4 + 8 + 8 + 32 * 5;
 const ISSUER_SUBJECT: &str = "native/issuer/2";
 const ISSUER_BYTES: usize = BODY_BYTES + 1 + 32;
+const PHASE_SUBJECT: &str = "native/issuer/4";
 const SUCCESSOR_SUBJECT: &str = "native/successor/3";
 const SUCCESSOR_BYTES: usize = ISSUER_BYTES + 32;
 const ISSUER_FRAME: usize = ISSUER_BYTES + ISSUER_SUBJECT.len() + aterm_journal::APPEND_OVERHEAD;
@@ -162,12 +163,23 @@ struct Entry {
     state: IssuerState,
     predecessor: Option<Digest>,
     successor: Option<Digest>,
+    closed_phase: Option<ImagePhase>,
 }
 
 /// A verified observation, deliberately without any reusable native capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Observed {
     /// Local wall-clock timestamp, for attribution, not ordering or authorization.
+    pub recorded_ms: u64,
+}
+
+/// An exact local closure observation, without execution or succession authority.
+/// The caller supplies the original preparation and binding on every lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhaseObserved {
+    /// The phase explicitly committed by the original issuer.
+    pub phase: ImagePhase,
+    /// Local attribution time; it is not an ordering or authorization clock.
     pub recorded_ms: u64,
 }
 
@@ -208,7 +220,8 @@ impl View {
         let legacy = body.len() == BODY_BYTES && &body[..4] == b"ANE1";
         let issuer = body.len() == ISSUER_BYTES && &body[..4] == b"ANI2";
         let successor = body.len() == SUCCESSOR_BYTES && &body[..4] == b"ANI3";
-        if !legacy && !issuer && !successor {
+        let phased = body.len() == ISSUER_BYTES && &body[..4] == b"ANI4";
+        if !legacy && !issuer && !successor && !phased {
             return Err(invalid());
         }
         hmac::verify(&key.mac, &body[..body.len() - 32], &body[body.len() - 32..])
@@ -224,6 +237,15 @@ impl View {
             capability: digest(116),
         };
         let old = self.entries.get(&receipt.operation);
+        let closed_phase = if phased {
+            Some(match body[148] {
+                5 => ImagePhase::Forward,
+                6 => ImagePhase::Rollback,
+                _ => return Err(invalid()),
+            })
+        } else {
+            old.and_then(|entry| entry.closed_phase)
+        };
         let predecessor = if successor {
             let predecessor = digest(181);
             let parent = self.entries.get(&predecessor).ok_or_else(invalid)?;
@@ -253,7 +275,12 @@ impl View {
                 return Err(invalid());
             }
             (
-                Event::parse(body[148])?.advance(old.map(|old| old.state))?,
+                if phased {
+                    Event::NoExec
+                } else {
+                    Event::parse(body[148])?
+                }
+                .advance(old.map(|old| old.state))?,
                 Some(epoch),
             )
         };
@@ -285,6 +312,7 @@ impl View {
                 epoch,
                 predecessor,
                 successor: retained_successor,
+                closed_phase,
             },
         );
         self.sequence = next_sequence;
@@ -334,6 +362,25 @@ impl View {
         body.truncate(ISSUER_BYTES - 32);
         body[..4].copy_from_slice(b"ANI3");
         body.extend_from_slice(&predecessor);
+        body.extend_from_slice(hmac::sign(&key.mac, &body).as_ref());
+        body
+    }
+
+    fn encode_phase(
+        &self,
+        key: &Key,
+        receipt: &Receipt,
+        epoch: Digest,
+        phase: ImagePhase,
+        now_ms: u64,
+    ) -> Vec<u8> {
+        let mut body = self.encode_event(key, receipt, epoch, Event::NoExec, now_ms);
+        body.truncate(ISSUER_BYTES - 32);
+        body[..4].copy_from_slice(b"ANI4");
+        body[148] = match phase {
+            ImagePhase::Forward => 5,
+            ImagePhase::Rollback => 6,
+        };
         body.extend_from_slice(hmac::sign(&key.mac, &body).as_ref());
         body
     }
@@ -439,6 +486,7 @@ fn record_subject(subject: &str, body: &[u8]) -> bool {
     (subject == SUBJECT && body.starts_with(b"ANE1"))
         || (subject == ISSUER_SUBJECT && body.starts_with(b"ANI2"))
         || (subject == SUCCESSOR_SUBJECT && body.starts_with(b"ANI3"))
+        || (subject == PHASE_SUBJECT && body.starts_with(b"ANI4"))
 }
 
 fn open(paths: &Paths, key: &Key, limits: Limits) -> io::Result<(Log, View)> {
@@ -814,6 +862,77 @@ fn record_event_at_limits(
     event: Option<Event>,
     limits: Limits,
 ) -> io::Result<Observed> {
+    record_with_phase_at_limits(paths, prepare, binding, event, None, limits)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NoExecPhase",
+        action = "Close",
+        project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NoExecPhase",
+        action = "Conflict",
+        project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NoExecPhase",
+        action = "Retry",
+        project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NoExecPhase",
+        action = "Refused",
+        project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NoExecPhase",
+        action = "Legacy",
+        reason = "A prior issuer supplied a phase-less closure in the authenticated history"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NoExecPhase",
+        action = "LostReply",
+        reason = "A transport can lose a response after the durable closure was recorded"
+    )
+)]
+fn record_with_phase_at_limits(
+    paths: &Paths,
+    prepare: &Prepare,
+    binding: &Binding,
+    event: Option<Event>,
+    phase: Option<ImagePhase>,
+    limits: Limits,
+) -> io::Result<Observed> {
+    if (phase.is_some() && event != Some(Event::NoExec))
+        || (phase == Some(ImagePhase::Rollback)
+            && !matches!(
+                &prepare.plan,
+                NativePlan::Restart {
+                    rollback: Some(_),
+                    ..
+                }
+            ))
+    {
+        return Err(invalid());
+    }
     if !valid_pair(prepare, binding) {
         return Err(invalid());
     }
@@ -832,6 +951,10 @@ fn record_event_at_limits(
         if old.receipt != receipt
             || (event.is_some() && old.epoch != Some(epoch) && !legacy_observation)
         {
+            return Err(invalid());
+        }
+        if phase.is_some() && old.state == IssuerState::NoExec && old.closed_phase != phase {
+            // A phase-less closure cannot acquire a guessed phase on retry.
             return Err(invalid());
         }
         if event.map_or(old.state == IssuerState::NoExec, |event| {
@@ -853,15 +976,22 @@ fn record_event_at_limits(
     let observed = Observed {
         recorded_ms: aterm_time::unix_millis().ok_or_else(invalid)?,
     };
-    let (subject, body) = event.map_or_else(
-        || (SUBJECT, view.encode(&key, &receipt, observed.recorded_ms)),
-        |event| {
-            (
-                ISSUER_SUBJECT,
-                view.encode_event(&key, &receipt, epoch, event, observed.recorded_ms),
-            )
-        },
-    );
+    let (subject, body) = if let Some(phase) = phase {
+        (
+            PHASE_SUBJECT,
+            view.encode_phase(&key, &receipt, epoch, phase, observed.recorded_ms),
+        )
+    } else {
+        event.map_or_else(
+            || (SUBJECT, view.encode(&key, &receipt, observed.recorded_ms)),
+            |event| {
+                (
+                    ISSUER_SUBJECT,
+                    view.encode_event(&key, &receipt, epoch, event, observed.recorded_ms),
+                )
+            },
+        )
+    };
     log.append(subject, body)?;
     Ok(observed)
 }
@@ -924,6 +1054,76 @@ pub fn noexec(prepare: &Prepare, binding: &Binding) -> io::Result<Observed> {
         binding,
         Some(Event::NoExec),
     )
+}
+
+/// Persist the host's retained closed phase beside a positive NoExec fact.
+/// The caller must obtain the phase from its live closed-restart witness. This
+/// function authenticates storage, not that witness, and grants no authority.
+/// # Errors
+/// Refuses conflicting phases, legacy terminal observations, possible execution,
+/// absent preparation, mismatched identities or damaged custody.
+pub fn noexec_in_phase(
+    prepare: &Prepare,
+    binding: &Binding,
+    phase: ImagePhase,
+) -> io::Result<PhaseObserved> {
+    let observed = record_with_phase_at_limits(
+        &Paths::locate().map_err(|_| invalid())?,
+        prepare,
+        binding,
+        Some(Event::NoExec),
+        Some(phase),
+        LIMITS,
+    )?;
+    Ok(PhaseObserved {
+        phase,
+        recorded_ms: observed.recorded_ms,
+    })
+}
+
+/// Observe a phase-bearing closure for this exact preparation and capability.
+/// Legacy NoExec remains unknown here; replay never restores live authority.
+/// # Errors
+/// Refuses malformed requests and damaged or untrusted established custody.
+pub fn observe_phase(prepare: &Prepare, binding: &Binding) -> io::Result<Option<PhaseObserved>> {
+    observe_phase_at(&Paths::locate().map_err(|_| invalid())?, prepare, binding)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NoExecPhase",
+        action = "Read",
+        project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+fn observe_phase_at(
+    paths: &Paths,
+    prepare: &Prepare,
+    binding: &Binding,
+) -> io::Result<Option<PhaseObserved>> {
+    if !valid_pair(prepare, binding) {
+        return Err(invalid());
+    }
+    let Some((key, view)) = read(paths)? else {
+        return Ok(None);
+    };
+    let expected = receipt(&key, prepare, binding)?;
+    let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
+    Ok(view
+        .entries
+        .get(&expected.operation)
+        .filter(|entry| {
+            entry.receipt == expected
+                && entry.epoch == Some(epoch)
+                && entry.state == IssuerState::NoExec
+        })
+        .and_then(|entry| {
+            entry.closed_phase.map(|phase| PhaseObserved {
+                phase,
+                recorded_ms: entry.observed.recorded_ms,
+            })
+        }))
 }
 
 /// Seal a completed operation without claiming it executed or did not execute.

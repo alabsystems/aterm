@@ -202,7 +202,7 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
                     let mut bytes = zeroize::Zeroizing::new(Vec::new());
                     std::io::stdin().take(MAX_VALUE as u64 + 1).read_to_end(&mut bytes)?;
                     if bytes.len() > MAX_VALUE { return Err(crate::Error::new("give accepts at most 64 KiB")); }
-                    SecretBytes::from(bytes.to_vec())
+                    SecretBytes::from(std::mem::take(&mut *bytes))
                 };
                 Ok(bytes)
             }).map_err(|error| (error.to_string(), 1))?;
@@ -341,11 +341,13 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
         .threads
         .values()
         .map(|thread| {
-            let required: Vec<_> = observed
+            let requester_current = observed.members.contains(&thread.requester);
+            let required_sweeps = observed.members.len() - usize::from(requester_current);
+            let swept_current = observed
                 .members
                 .iter()
-                .filter(|member| **member != thread.requester)
-                .collect();
+                .filter(|member| **member != thread.requester && thread.swept.contains(*member))
+                .count();
             aterm_json::json!({
                 "id": hex::encode_lower(&thread.id),
                 "want": thread.want.key(),
@@ -353,10 +355,10 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
                 "requester": hex::encode_lower(&thread.requester),
                 "delivery_origin": thread.origin.map(|actor| hex::encode_lower(&actor)),
                 "own": thread.requester == observed.observer,
-                "requester_current": observed.members.contains(&thread.requester),
+                "requester_current": requester_current,
                 "offers": thread.offers.len(),
-                "swept_current": required.iter().filter(|member| thread.swept.contains(**member)).count(),
-                "required_sweeps": required.len(),
+                "swept_current": swept_current,
+                "required_sweeps": required_sweeps,
                 "sweeps_complete": thread.swept_by_all(&observed.members),
                 "want_window_ended": thread.window_ended(observed.at_ms),
                 "needs_person": thread.needs_person,

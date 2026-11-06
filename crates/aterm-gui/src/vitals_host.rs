@@ -21,10 +21,10 @@ use aterm_vitals::explain::{
 };
 use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
-    AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
-    LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
-    Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens, Thermal,
-    Throttle, Ticks, VolumeSample,
+    AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample,
+    Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample,
+    ProcState, Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens,
+    Thermal, Throttle, Ticks, VolumeSample,
 };
 use aterm_vitals::ring::{GapKind, SavedRing, TimeGap};
 use aterm_vitals::sys::Machine;
@@ -375,6 +375,13 @@ pub(crate) struct Request {
     pub(crate) note_gaps: Vec<aterm_vitals::TimeGap>,
     /// Strip events (crash, restart, sleep/wake, spike) queued on the host.
     pub(crate) note_events: Vec<aterm_vitals::StripEvent>,
+    /// The front tab's working directory, as its focused pane last reported it (OSC 7), where
+    /// this machine made the report: the Disk row draws its device beside home's when it is
+    /// another (A1 §4.4).
+    pub(crate) front_dir: Option<PathBuf>,
+    /// The closed tabs the host told of, by key ([`VitalsHost::left_told`]): the leftover pass
+    /// keeps them told ([`crate::vitals_left::LeftPass::keep_told`]).
+    pub(crate) left_told: Vec<u64>,
 }
 
 /// One agent session's token totals and when the footer's resolver last read them.
@@ -656,6 +663,8 @@ pub(crate) enum Msg {
     Pull,
     CpuPolicy(aterm_vitals::sys::json::Jv),
     Name(Box<crate::sys_naming::Request>),
+    /// The host's tellings at once, as the next request would carry them ([`Request::left_told`]).
+    Told(Vec<u64>),
 }
 
 /// The loop's side of the probe thread.
@@ -1041,6 +1050,11 @@ impl VitalsHost {
     /// peaks and the free history.
     pub(crate) fn stop_at_exit(&mut self, bound: Duration) -> bool {
         self.stopping.store(true, Ordering::Release);
+        // The host's last tellings, for the stop's write of the closed-tab record; a full channel
+        // leaves it the last request's.
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(Msg::Told(self.left_told.iter().copied().collect()));
+        }
         self.tx = None;
         if let Some(shared) = self.sys.take() {
             shared.uninstall();
@@ -1139,6 +1153,12 @@ trait Source {
     fn jobs_armed(&self) -> bool {
         false
     }
+    /// The host's tellings, by closed tab's key ([`Request::left_told`]): the leftover pass keeps
+    /// them told ([`crate::vitals_left::LeftPass::keep_told`]).
+    fn note_told(&mut self, _told: &[u64]) {}
+    /// The thread's stop, after its last reading, with the host's last tellings: the leftover pass
+    /// closes the tabs it holds at it ([`crate::vitals_left::LeftPass::at_stop`]).
+    fn at_stop(&mut self, _told: &[u64]) {}
     fn capture_name(
         &self,
         _session: u64,
@@ -1194,6 +1214,16 @@ impl Source for Reader {
 
     fn jobs_armed(&self) -> bool {
         self.jobs_armed.armed()
+    }
+
+    fn note_told(&mut self, told: &[u64]) {
+        self.left
+            .keep_told(told, u64::try_from(unix_ms_now()).unwrap_or(0));
+    }
+
+    fn at_stop(&mut self, told: &[u64]) {
+        self.left
+            .at_stop(told, u64::try_from(unix_ms_now()).unwrap_or(0));
     }
 
     fn capture_name(
@@ -1277,6 +1307,7 @@ impl Asked {
                 self.names.push(*request);
                 self.pull = true;
             }
+            Msg::Told(told) => req.left_told = told,
         }
     }
 }
@@ -1379,6 +1410,10 @@ fn run(
         while let Ok(more) = rx.try_recv() {
             asked.take(more, &mut req);
         }
+        // A quit's last tellings wait for the stop's one write (`Source::at_stop`).
+        if !stopping.load(Ordering::Acquire) {
+            source.note_told(&req.left_told);
+        }
         let policy_changed = asked.cpu_policy.is_some();
         if let Some(policy) = asked.cpu_policy.take() {
             source.model().record_cpu_policy(policy);
@@ -1449,7 +1484,13 @@ fn run(
             if let Some(sys) = sys {
                 sys.uninstall();
             }
-            while rx.recv().is_ok() {}
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    Msg::Told(told) => req.left_told = told,
+                    Msg::Read(r) | Msg::Facts(r) => req.left_told = r.left_told,
+                    Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) => {}
+                }
+            }
             break;
         }
         finish_names(&source, replies);
@@ -1481,6 +1522,8 @@ fn run(
     );
     // The lock goes only after the stop's write, so the aterm that takes it next writes after it.
     drop(writer);
+    // After the files above, so a slow write of the closed-tab record delays none of them.
+    source.at_stop(&req.left_told);
 }
 
 /// A worker's pull: a whole reading, or a cold one's pair [`COLD_PAIR`] apart, with the thread's
@@ -2413,6 +2456,7 @@ impl WhyFixture {
             thermal: scene.thermal.or(live.thermal),
             gpu: live.gpu.clone(),
             gpu_clients: live.gpu_clients.clone(),
+            ane: live.ane,
             volume: live.volume.clone(),
             cadence_ms: live.cadence_ms,
             machine_only: live.machine_only,
@@ -2489,6 +2533,9 @@ pub(crate) struct Reader {
     watched: Option<Arc<aterm_vitals::jobs::JobsView>>,
     thermal: ThermalProbe,
     counter_throttle: Option<(Instant, Option<Thermal>)>,
+    /// The Neural Engine reader (A2 §3.1), which every reading reads beside the GPU; `None`
+    /// where the OS has none, and in a unit test's reader, which reads no registry.
+    pub(crate) ane: Option<aterm_sysprobe::neural_engine::Reader>,
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
     pub(crate) split: SplitReader,
@@ -2501,6 +2548,8 @@ pub(crate) struct Reader {
     fixture: Option<WhyFixture>,
     /// The machine's words, read once.
     pub(crate) machine: Machine,
+    /// The block-storage reader, which keeps each volume's walk to its device.
+    block: aterm_sysprobe::blockio::BlockReader,
 }
 
 /// What a reading takes of its tabs before its sweep ([`Request::tab_reads`]): the pass's clock,
@@ -2628,6 +2677,7 @@ impl Reader {
         );
         let mut reader = Self {
             probe: aterm_sysprobe::Probe::new(),
+            block: aterm_sysprobe::blockio::BlockReader::new(),
             hardware: aterm_sysprobe::cpu_hardware::Probe::default(),
             hardware_read: if cfg!(test) {
                 HardwareProbe::INERT
@@ -2661,6 +2711,11 @@ impl Reader {
                 platform_thermal
             },
             counter_throttle: None,
+            ane: if cfg!(test) {
+                None
+            } else {
+                aterm_sysprobe::neural_engine::Reader::native()
+            },
             split,
             jobs_armed: if cfg!(test) {
                 Box::leak(Box::new(Arming::new()))
@@ -2933,7 +2988,16 @@ impl Reader {
     fn machine_sample(&mut self, req: &Request, at_unix_ms: i64) -> Sample {
         let since = self.epoch.elapsed();
         let shelf = &crate::disk_board::SHELF;
-        let (volume, key) = home_volume(&self.home, shelf.watched());
+        let MachineVolumes {
+            home: volume,
+            key,
+            block,
+        } = machine_volumes(
+            &self.home,
+            shelf.watched(),
+            req.front_dir.as_deref(),
+            |mounts| self.block.read(mounts),
+        );
         let load = aterm_sysprobe::load_average();
         let links = (self.net.links)(&mut self.scratch)
             .map(|links| links.iter().map(link_sample).collect());
@@ -2954,6 +3018,7 @@ impl Reader {
             mem: aterm_sysprobe::memory_detail().map(mem_sample),
             gpu: aterm_sysprobe::gpu().map(gpu_sample),
             gpu_clients: None,
+            ane: self.ane.as_mut().map(|engine| ane_sample(engine.read())),
             volume: volume.map(|v| VolumeSample {
                 total: v.total,
                 free: v.free,
@@ -3004,6 +3069,7 @@ impl Reader {
             coal_lane: self.split.lane,
             note_events: req.note_events.clone(),
             note_gaps: req.note_gaps.clone(),
+            block,
         }
     }
 }
@@ -3099,6 +3165,9 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
         app: m.app.saturating_add(m.shared.unwrap_or(0)),
         wired: m.wired,
         compressed: m.compressed,
+        stored: m.stored,
+        // macOS's file-backed pages hold its speculative ones: adding them again would count
+        // them twice (A1 §4.3, amended by R4).
         cached: m.file_backed.saturating_add(m.purgeable.unwrap_or(0)),
         free: m.free,
         swap_used: m.swap_used,
@@ -3120,9 +3189,50 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
             decompressions: c.decompressions,
             compressions: c.compressions,
             pageins: c.pageins,
+            page_bytes: c.page_bytes,
         }),
         kernel_available_pct: m.kernel_available_pct,
+        exact: m.exact,
     }
+}
+
+#[cfg(not(windows))]
+fn block_sample(b: aterm_sysprobe::blockio::BlockReading) -> aterm_vitals::BlockSample {
+    use aterm_sysprobe::blockio::BlockLocation;
+    use aterm_vitals::DiskLocation;
+    aterm_vitals::BlockSample {
+        id: b.id,
+        name: b.name,
+        location: match b.location {
+            BlockLocation::Internal => DiskLocation::Internal,
+            BlockLocation::External => DiskLocation::External,
+            BlockLocation::Image => DiskLocation::Image,
+            BlockLocation::Unknown => DiskLocation::Unknown,
+        },
+        read_bytes: b.counters.read_bytes,
+        write_bytes: b.counters.write_bytes,
+        reads: b.counters.reads,
+        writes: b.counters.writes,
+        read_ns: b.counters.read_ns,
+        write_ns: b.counters.write_ns,
+    }
+}
+
+/// The Neural Engine reader's answer as the model takes it.
+fn ane_sample(
+    read: Result<aterm_sysprobe::neural_engine::Reading, aterm_sysprobe::neural_engine::Check>,
+) -> Result<AneSample, AneCheck> {
+    use aterm_sysprobe::neural_engine::Check;
+    read.map(|r| AneSample {
+        cores: r.cores,
+        powered: r.powered,
+    })
+    .map_err(|check| match check {
+        Check::Matched => AneCheck::Matched,
+        Check::Cores => AneCheck::Cores,
+        Check::PowerState => AneCheck::PowerState,
+        Check::Cost => AneCheck::Cost,
+    })
 }
 
 fn gpu_sample(g: aterm_sysprobe::GpuReading) -> GpuSample {
@@ -3213,14 +3323,35 @@ pub(crate) fn tab_volume(path: &Path) -> Option<aterm_sysprobe::VolumeReading> {
     }
 }
 
-fn home_volume(
+/// What a machine reading reads of the volumes, from one mount table.
+struct MachineVolumes {
+    /// Home's volume.
+    home: Option<aterm_sysprobe::VolumeReading>,
+    /// Its key, while the shelf watches it.
+    key: Option<VolumeKey>,
+    /// The devices home's volume and the front tab's are stored on, home's first.
+    block: Vec<aterm_vitals::BlockSample>,
+}
+
+/// Home's volume, its key and the devices under home's and `front`'s volumes, which
+/// `read_block` reads (the reader's [`aterm_sysprobe::blockio::BlockReader::read`]).
+fn machine_volumes(
     home: &Path,
     keyed: bool,
-) -> (Option<aterm_sysprobe::VolumeReading>, Option<VolumeKey>) {
+    front: Option<&Path>,
+    read_block: impl FnOnce(
+        &[&aterm_sysprobe::volumes::Mount],
+    ) -> Vec<aterm_sysprobe::blockio::BlockReading>,
+) -> MachineVolumes {
     #[cfg(windows)]
     {
-        let _ = keyed;
-        (aterm_sysprobe::volume(home), None)
+        // No block reader on Windows: the Disk row draws no units (A1 §4.4).
+        let _ = (keyed, front, read_block);
+        MachineVolumes {
+            home: aterm_sysprobe::volume(home),
+            key: None,
+            block: Vec::new(),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -3229,8 +3360,49 @@ fn home_volume(
             .then(|| aterm_agent::harness::disk::volume_of(home, &table).ok())
             .flatten()
             .map(|r| r.key);
-        (local_volume(home, &table, aterm_sysprobe::volume), key)
+        MachineVolumes {
+            home: local_volume(home, &table, aterm_sysprobe::volume),
+            key,
+            block: read_block(&block_mounts(home, front, &table))
+                .into_iter()
+                .map(block_sample)
+                .collect(),
+        }
     }
+}
+
+/// The local mounts holding `home` and `front`, home's first, each once: a front tab under home's
+/// volume (the usual case) asks the block reader for one mount, not the same one twice.
+#[cfg(not(windows))]
+fn block_mounts<'t>(
+    home: &Path,
+    front: Option<&Path>,
+    table: &'t aterm_sysprobe::volumes::Table,
+) -> Vec<&'t aterm_sysprobe::volumes::Mount> {
+    let mut out: Vec<&aterm_sysprobe::volumes::Mount> = Vec::new();
+    for m in std::iter::once(home)
+        .chain(front)
+        .filter_map(|p| local_mount(p, table))
+    {
+        if !out.iter().any(|o| o.on == m.on) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// The mount holding `path` where a reading reads it: a local volume the automounter did not
+/// mount, from a complete table.
+#[cfg(not(windows))]
+fn local_mount<'t>(
+    path: &Path,
+    table: &'t aterm_sysprobe::volumes::Table,
+) -> Option<&'t aterm_sysprobe::volumes::Mount> {
+    if !table.complete {
+        return None;
+    }
+    aterm_sysprobe::volumes::mount_of(path, table)
+        .filter(|m| m.local && !m.automounted && m.fstype != "autofs")
 }
 
 #[cfg(not(windows))]
@@ -3239,14 +3411,7 @@ fn local_volume(
     table: &aterm_sysprobe::volumes::Table,
     mut read: impl FnMut(&Path) -> Option<aterm_sysprobe::VolumeReading>,
 ) -> Option<aterm_sysprobe::VolumeReading> {
-    if !table.complete {
-        return None;
-    }
-    let mount = aterm_sysprobe::volumes::mount_of(path, table)?;
-    if !mount.local || mount.automounted || mount.fstype == "autofs" {
-        return None;
-    }
-    read(&mount.on)
+    read(&local_mount(path, table)?.on)
 }
 
 fn disk_facts(
@@ -3651,7 +3816,7 @@ enum StripLock {
 impl StripLock {
     /// The lock at `path` taken without waiting.
     fn take(path: Option<PathBuf>) -> Self {
-        path.and_then(|p| open_strip_lock(&p).ok())
+        path.and_then(|p| open_lock_file(&p).ok())
             .map_or(Self::Unlocked, Self::try_take)
     }
 
@@ -3679,10 +3844,11 @@ impl StripLock {
     }
 }
 
-/// [`STRIP_LOCK`] opened to be locked, read and write and created when missing; on unix created
-/// 0600, never through a link and never waiting on what is there. Anything but a regular file is
-/// refused.
-fn open_strip_lock(path: &Path) -> std::io::Result<std::fs::File> {
+/// A lock file beside a kept file ([`STRIP_LOCK`], the closed-tab record's
+/// [`crate::vitals_left_closed::LOCK`]) opened to be locked, read and write and created when
+/// missing; on unix created 0600, never through a link and never waiting on what is there.
+/// Anything but a regular file is refused.
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -3695,7 +3861,7 @@ fn open_strip_lock(path: &Path) -> std::io::Result<std::fs::File> {
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "the strip lock is not a regular file",
+            "the lock is not a regular file",
         ));
     }
     Ok(file)
@@ -3877,7 +4043,9 @@ fn convert_cpu_report_value(
     })
 }
 
-fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
+/// The text of the regular file at `path`; `None` when it does not open, holds more than
+/// `max_bytes` or is not UTF-8.
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
     let (file, meta) = crate::logging::open_regular_nonblock_with_meta(path).ok()?;
     if meta.len() > max_bytes {
         return None;
@@ -3909,11 +4077,7 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
         peaks: peaks
             .to_pairs()
             .into_iter()
-            .map(|(name, read_s, days)| PeakDoc {
-                name: name.to_owned(),
-                read_s,
-                days,
-            })
+            .map(|(name, read_s, days)| PeakDoc { name, read_s, days })
             .collect(),
     };
     aterm_json::to_string(&doc).ok()
@@ -4570,8 +4734,16 @@ impl crate::App {
         let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.left.clone()) else {
             return;
         };
+        let mut told = false;
         for tab in crate::message_reporters::newly_left(&mut self.vitals.left_told, &after) {
             let _ = self.post_message(crate::message_reporters::left_record(tab, &after));
+            told = true;
+        }
+        // At once, so the pass keeps them told before an update's Commit can end this process;
+        // every request carries them too.
+        if told {
+            let told = self.vitals.left_told.iter().copied().collect();
+            self.vitals.offer(Msg::Told(told));
         }
     }
 
@@ -4854,6 +5026,7 @@ impl crate::App {
         let mut tokens = Vec::new();
         let mut accounts: Vec<AccountKey> = Vec::new();
         let mut front_plan = None;
+        let mut front_dir = None;
         // A pane shown in two tabs (Open Active Session in New Window) is one root, in the tab
         // listed first; each tab then takes the least key of the panes it keeps, so a split tab
         // whose least pane a twin listed first shows keeps its other panes under their own.
@@ -4868,6 +5041,12 @@ impl crate::App {
                 };
                 let focused = terminal(tab.focus);
                 let in_front = Some(*wid) == front && active == Some(i);
+                if in_front {
+                    front_dir = focused
+                        .and_then(|k| self.pool.get(k))
+                        .and_then(|s| crate::sys_host::local_cwd_of(&s.term))
+                        .map(PathBuf::from);
+                }
                 let first = tabs.len();
                 let name = self.tab_name(tab, i);
                 for pane in self.tab_sessions(tab) {
@@ -4998,6 +5177,8 @@ impl crate::App {
             lenses: self.open_lens_rows(),
             note_gaps: Vec::new(),
             note_events: Vec::new(),
+            front_dir,
+            left_told: self.vitals.left_told.iter().copied().collect(),
         }
     }
 

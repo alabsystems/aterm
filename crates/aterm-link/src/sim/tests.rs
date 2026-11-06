@@ -241,6 +241,56 @@ fn every_seed_holds_every_law_against_a_broker_that_does_not_gap_fence() {
     );
 }
 
+/// A world of the committed seeds whose broker's log is on the state dir's device
+/// ([`Opts::same_device`], critic item F07).
+fn same_device(seed: u64) -> Opts {
+    let mut o = Opts::seed(seed);
+    o.same_device = true;
+    o
+}
+
+/// THE MIRROR PIN'S FENCE BY THE BROKER'S FULL FLUSH (critic item F07): with the log on the
+/// state dir's device, every committed seed holds every law, the `mirror fence:` law among them,
+/// while each open's fence goes by the pin's barriers and the broker's settle, the bridge's own
+/// full flush of the pin made only where an open met no settle (a recovery's pin, written before
+/// any pass). The control is the committed sweep's own worlds, each log on another device: the
+/// bridge flushes every fence itself and sends no settle.
+#[test]
+fn every_seed_holds_every_law_with_the_log_on_the_state_dirs_device() {
+    let outs = run_all(&same_device, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds break a law with the log on the state dir's device:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+    let settles: u64 = outs.iter().map(|out| out.stats.settles).sum();
+    let durable: u64 = outs.iter().map(|out| out.stats.pin_durable_replaces).sum();
+    let other = run_all(&Opts::seed, 1..=SEEDS);
+    let other_settles: u64 = other.iter().map(|out| out.stats.settles).sum();
+    let other_durable: u64 = other.iter().map(|out| out.stats.pin_durable_replaces).sum();
+    assert!(settles > 0, "no open fenced its pin by the broker's settle");
+    assert_eq!(
+        other_settles, 0,
+        "a broker on another device was asked to settle the state dir's"
+    );
+    assert!(
+        other_durable > 0,
+        "on another device the bridge flushed no pin itself"
+    );
+    assert!(
+        durable < other_durable,
+        "the settle spared no full flush of the pin: {durable} durable replaces on the state \
+         dir's device, {other_durable} on another"
+    );
+}
+
 /// A world of the committed seeds under a rate limit that binds ([`super::world::binding_rate`],
 /// critic item E06).
 fn rate_bound(seed: u64) -> Opts {
@@ -323,8 +373,9 @@ fn every_seed_holds_every_law_under_a_rate_limit_that_binds() {
 /// `Bridge::land_group`): the self-lane log's offset, then the post's own records, then aterm's
 /// `outbox sent`, then the in-flight entry's end and the reservation's, each step's posts at
 /// once, and every law holds across a kill between any two of them (the committed sweeps hold
-/// them; here, the order's three controls). The hole E06 recorded is closed for a post (a
-/// receipt's entry still ends at its ack): under ten records a second and a burst of four
+/// them; here, the order's three controls). The hole E06 recorded is closed for a post (and,
+/// since F15, for a receipt: [`a_landed_receipts_entry_stands_until_aterm_retired_it`]): under
+/// ten records a second and a burst of four
 /// ([`super::world::binding_rate`]), seed 78 ended a post's entry at its ack, killed the bridge
 /// before its `outbox sent`, and left the next one the record to deliver while the post stood
 /// queued; once retention gave the record up, the drain's retry at the pin appended a second
@@ -355,7 +406,7 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
             Mutant::LandedBeforeAcked,
             Box::new(|s| Opts::seed(s).with(Mutant::LandedBeforeAcked)),
             "forged-self",
-            26,
+            42,
         ),
         (
             Mutant::RetireBeforeOutboxSent,
@@ -392,6 +443,43 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
             report(on)
         );
     }
+}
+
+/// A LANDED RECEIPT'S ENTRY STANDS UNTIL ATERM RETIRED IT (critic item F15,
+/// `Bridge::receipt_landed`): a receipt is settled by a post's steps (`Bridge::land_group`), so
+/// its in-flight entry ends once aterm answered its `deliver <sid> receipt=<rid>`, and every
+/// law holds across a kill between its ack and that answer. NEGATIVE CONTROL: the entry ended
+/// at the ack, as every build before F15 ended it, answers one decision twice (the `receipt:`
+/// law). Under ten records a second and a burst of four ([`super::world::binding_rate`]), seed
+/// 515 kills a bridge between its receipt's ack (@11) and the retirement; the next bridge's
+/// attach hands @11 over, its entry ended, a cut gives it up, and the drain's retry at the pin
+/// finds no entry to read back from (a receipt's pin holds no head) and lands the answer again
+/// (@19). The committed worlds, with no rate limit, reach it in no seed to 20,000 (searched
+/// with `ATERM_SIM_DISCOVER_WITNESSES=1`, F15). With the rule on, seed 515 holds every law.
+#[test]
+fn a_landed_receipts_entry_stands_until_aterm_retired_it() {
+    const LAW: &str = "decision on";
+    let control = |s| rate_bound(s).with(Mutant::ReceiptRetiredAtAck);
+    let off = breaking_at(&control, LAW, 515, RARE_SEEDS).unwrap_or_else(|| {
+        panic!(
+            "NEGATIVE CONTROL: with ReceiptRetiredAtAck, no seed within {RARE_SEEDS} breaks `{LAW}`"
+        )
+    });
+    eprintln!(
+        "ReceiptRetiredAtAck at seed {}: {}",
+        off.seed,
+        off.violations
+            .iter()
+            .find(|v| breaks(v, LAW))
+            .map_or("", String::as_str)
+    );
+    let on = run(&with_every_rule(control(off.seed)));
+    assert!(
+        on.violations.is_empty(),
+        "with the rule on, seed {} breaks a law: {}",
+        off.seed,
+        report(&on)
+    );
 }
 
 #[test]
@@ -856,11 +944,14 @@ fn each_rule_switched_off_is_caught() {
             "never moved",
             1,
         ),
+        // Critic item F17's self-lane log (no append for a post off this node's lanes) moved
+        // every seed's state-dir writes, and this pin with six below (108, 7324, 106, 660, 205,
+        // 13) off its law; each is the first seed within its bound that shows it again.
         (
             "`session-exited` publishes the session's `exited` row",
             Box::new(|s| Opts::seed(s).with(Mutant::SkipExitedRow)),
             "presence:",
-            194,
+            322,
         ),
         (
             "a session's exit moves the roster's count",
@@ -906,12 +997,6 @@ fn each_rule_switched_off_is_caught() {
             7,
         ),
         (
-            "an offset below the self-lane window is not added to it",
-            Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
-            "forged-self",
-            108,
-        ),
-        (
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
@@ -936,6 +1021,24 @@ fn each_rule_switched_off_is_caught() {
             2,
         ),
         (
+            "a settled fence is held only once the broker answered its settle (F07)",
+            Box::new(|s| same_device(s).with(Mutant::FenceBeforeTheSettle)),
+            "mirror fence:",
+            62,
+        ),
+        (
+            "the pin's settle goes only once its barriers returned (F07)",
+            Box::new(|s| same_device(s).with(Mutant::SettleAheadOfTheBarrier)),
+            "mirror fence:",
+            3,
+        ),
+        (
+            "only a flush of the state dir's own device settles its pin (F07)",
+            Box::new(|s| Opts::seed(s).with(Mutant::TrustAnotherDevicesFlush)),
+            "mirror fence:",
+            2,
+        ),
+        (
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
@@ -945,7 +1048,7 @@ fn each_rule_switched_off_is_caught() {
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            7324,
+            2127,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
@@ -1048,7 +1151,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            106,
+            430,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1108,19 +1211,19 @@ fn each_rule_switched_off_is_caught() {
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            660,
+            202,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            205,
+            1943,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            13,
+            282,
         ),
     ];
     // The replay's drain rule (a record the attach published again is delivered once its
@@ -1130,7 +1233,6 @@ fn each_rule_switched_off_is_caught() {
     // within the rare search that met it (18017), and no seed within 60,000 of these worlds,
     // nor 30,000 of worlds without retention, meets it now.
     const RARE: &[&str] = &[
-        "an offset below the self-lane window is not added to it",
         "a run whose recovery is owed makes no clean stop",
         "a mirror floor covers a batch only once this open made it durable",
         "an attach delivers on a new log only once its witness is written",
@@ -1328,10 +1430,12 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "an entry read back from its head on a log a move continued below it",
     ),
-    // Composing grouped landing with main moved 106 and 13 off their bugs, and the E07 review's
-    // fix 28. Each replacement is the first seed to 60,000 that breaks its law with the rule off
-    // and holds all with it on.
-    (108, 400, "a deduped replay moved the self-lane window down"),
+    // Composing grouped landing with main moved 13 off this bug; the replacement is the first
+    // seed to 60,000 that breaks its law with the rule off and holds all with it on. The row
+    // before it, "a deduped replay moved the self-lane window down" (seeds 106, 28, 108 and
+    // 142), went with its rule at critic item F17's review: the window's floor is its own, apart
+    // from the offsets it holds (`bridge::self_window`), so a replay's offset below it moves
+    // nothing, and no rule is left for a mutant to switch off.
     (
         14,
         400,
@@ -1350,10 +1454,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
 ];
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
-    // Grouped landing moved 3273 off it, and the E07 review's fix 558; the first replacement in
-    // this world to 60,000.
+    // Grouped landing moved 3273 off it, the E07 review's fix 558, and critic item F17's
+    // self-lane log 7324; the first replacement in this world to 60,000.
     (
-        7324,
+        2127,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1380,9 +1484,10 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // it finds standing) moved 16088 off it, and no seed of this world to 60,000 reaches it with
     // its rule off since. `FOUND_ERRING`'s row and a bridge unit test hold it.
     // Main replaced the obsolete carried-cut seed 31508 with 1179. Grouped landing moved that
-    // row too, and the E07 review's fix 462; this is the first replacement in this world to 60,000.
+    // row too, the E07 review's fix 462, and critic item F17's self-lane log 931; this is the
+    // first replacement in this world to 60,000.
     (
-        931,
+        1634,
         400,
         "a read back that went on at the floor missed the record a hold rule carried below it",
     ),
@@ -1511,11 +1616,6 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "a pin judged before the reconcile a write error stopped",
         Mutant::JudgePinBeforeRecovery,
         "mirror",
-    ),
-    (
-        "a deduped replay moved the self-lane window down",
-        Mutant::RememberBelowTheWindow,
-        "forged-self",
     ),
     (
         "a sweep a write error stopped, closed by the run record",
@@ -2149,6 +2249,98 @@ fn the_device_keeps_a_durable_write_and_may_roll_back_the_rest() {
     });
     lossless.power_cut(&mut rng);
     assert_eq!(std::fs::read(&seq).expect("seq"), b"3\n");
+}
+
+/// A BROKER'S FULL FLUSH ON THE STATE DIR'S DEVICE SETTLES THE PIN ITS BARRIERS ORDERED, AND ONLY
+/// THAT (critic item F07, `device::Drain`): the pin replaced by a barrier ahead of its rename and
+/// the directory's barrier over the rename, then the broker's full flush, is the media's own pin
+/// ([`Device::pin_fenced`]) and every power cut after it keeps it whole on a device that tears.
+/// The controls, each over the same writes: a flush issued before the barriers (a settle ahead
+/// of them), a pin with no directory barrier over its rename, and a device no broker's flush
+/// reaches (the log on another device): none of them fences the pin, and a cut loses it.
+#[test]
+fn a_brokers_full_flush_settles_the_pin_its_barriers_ordered_on_its_device_only() {
+    use crate::fx::Write;
+    use aterm_durable::Flush;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("sim-drain")
+        .tempdir_in("/tmp")
+        .expect("scratch");
+    let root = dir.path();
+    let logpin = root.join(crate::state::LOGPIN);
+    let pin = crate::mirror::Pin {
+        inc: 1,
+        total: 5,
+        key: Some([7; 16]),
+        ..crate::mirror::Pin::default()
+    }
+    .render();
+    assert!(crate::mirror::Pin::by_this_build(pin.as_bytes()));
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Order {
+        Settled,
+        FlushAhead,
+        NoDirectoryBarrier,
+        AnotherDevice,
+    }
+    let mut rng = Rng::new(23);
+    for order in [
+        Order::Settled,
+        Order::FlushAhead,
+        Order::NoDirectoryBarrier,
+        Order::AnotherDevice,
+    ] {
+        let mut lost = false;
+        for _ in 0..64 {
+            let _ = std::fs::remove_file(&logpin);
+            let mut device = Device::new(root);
+            device.tears = true;
+            let drain = device.drain();
+            if order == Order::FlushAhead {
+                drain.full_flush();
+            }
+            std::fs::write(&logpin, &pin).expect("write the pin");
+            device.journal(Write::Replace {
+                path: &logpin,
+                bytes: pin.as_bytes(),
+                flush: Some(Flush::Ordered),
+                mode: 0o600,
+            });
+            if order != Order::NoDirectoryBarrier {
+                device.journal(Write::SyncDir {
+                    path: root,
+                    flush: Flush::Ordered,
+                });
+            }
+            assert!(
+                !device.pin_fenced(),
+                "{order:?}: barriers alone fence nothing"
+            );
+            if matches!(order, Order::Settled | Order::NoDirectoryBarrier) {
+                drain.full_flush();
+            }
+            assert_eq!(
+                device.pin_fenced(),
+                order == Order::Settled,
+                "{order:?}: the media's own pin"
+            );
+            device.power_cut(&mut rng);
+            let kept = std::fs::read(&logpin).ok();
+            if order == Order::Settled {
+                assert_eq!(
+                    kept.as_deref(),
+                    Some(pin.as_bytes()),
+                    "a settled pin is kept whole"
+                );
+            }
+            lost |= kept.as_deref() != Some(pin.as_bytes());
+        }
+        assert_eq!(
+            lost,
+            order != Order::Settled,
+            "{order:?}: a cut lost the pin"
+        );
+    }
 }
 
 #[test]
@@ -3899,7 +4091,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 173, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 201, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",
@@ -3967,7 +4159,7 @@ fn the_round_refines_its_exactly_once_model() {
         o.mirror = false;
         o
     };
-    let taken = witnessed(&lossy, 105, RARE_SEEDS, &|out| {
+    let taken = witnessed(&lossy, 288, RARE_SEEDS, &|out| {
         out.model.2.contains("DeliverTaken")
     })
     .expect("some run delivered a record a move took");

@@ -10,25 +10,29 @@
 //! the child exits, so every tethered spawn forks on a spawner, a thread that lives as long as the
 //! process (`spawned`): the child ends with the process, not with the thread that asked for it,
 //! which may end while the child runs on (its wait handed to the reaper). An exec in the process's
-//! place ends every other thread, the spawners among them, so on Linux it ends tethered children
-//! too, where Darwin's watcher waits for an exit. A process serving [`VERB`] on Linux sets the
-//! signal on itself, so it is tied to whichever thread forked it. Darwin has none, so a tethered
-//! spawn there runs this process's own executable as [`VERB`] first, under [`NAME`], and that
-//! tether leaves a watcher behind as it execs the child in its own place: the parent's handle
-//! names the child itself, its pid, its signals and its exit status. The watcher is a grandchild
-//! of the tether, adopted by launchd, holding a kqueue `NOTE_EXIT` watch on the parent and on the
-//! child. It leads a session of its own, made before it arms, so a listing of the child's group (a
-//! stage sweep's), a kill of that group and a hangup of the child's terminal never count or reach
-//! it; it still ends with the child by its exit watch. When the parent exits, the watcher attempts
-//! to end the child through [`end_proven`] ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one
-//! still there [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid
-//! still reads the birth and kernel unique id the tether read of itself before it forked the
-//! watcher ([`Watched`]), and its one thread has run ([`Proof`]): a child macOS's program check
-//! holds before its first instruction gets no signal. The watcher exits after that attempt, even
-//! if the proof did not read or the thread had not run, including during an exec; such a child can
-//! run on. It also exits when the child exits first. The tether execs the child only once the
-//! watcher is armed and the parent is still its own parent. A kill by the parent's name passes the
-//! watcher by.
+//! place ends every other thread, the spawners among them, so it ends tethered children too. A
+//! process serving [`VERB`] on Linux sets the signal on itself, so it is tied to whichever thread
+//! forked it. Darwin has none, so a tethered spawn there runs this process's own executable as
+//! [`VERB`] first, under [`NAME`], and that tether leaves a watcher behind as it execs the child in
+//! its own place: the parent's handle names the child itself, its pid, its signals and its exit
+//! status. The watcher is a grandchild of the tether, adopted by launchd, holding a kqueue watch on
+//! the parent's exit and exec (`NOTE_EXIT`, `NOTE_EXEC`) and on the child's exit. It leads a
+//! session of its own, made before it arms, so a listing of the child's group (a stage sweep's), a
+//! kill of that group and a hangup of the child's terminal never count or reach it; it still ends
+//! with the child by its exit watch. When the parent exits, or execs in its own place (an update's
+//! cold lane) as Linux's spawners end at, the watcher ends the child through [`end_proven`]
+//! ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
+//! [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid still reads the
+//! birth and kernel unique id the tether read of itself before it forked the watcher
+//! ([`Watched`]), and its one thread has run ([`Proof`]). A child macOS's program check holds
+//! before its first instruction, the tether's own exec of it included, gets no signal while it is
+//! held: the watcher reads it again every [`HELD_RECHECK`] until its thread has run, then ends
+//! it, or until it exits (`end_once_run`). The watcher exits after that end, which signals
+//! nothing when the proof does not hold (a moved unique id, or one that does not read), so such a
+//! child can run on. It also exits when the child exits first. The tether execs the child only
+//! once the watcher is armed and the parent is still its own parent; an exec of the parent before
+//! the watcher armed (on Linux, before the child set its signal) ends nothing. A kill by the
+//! parent's name passes the watcher by.
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -129,6 +133,37 @@ pub fn end_watched(
     })
 }
 
+/// How long a Darwin watcher waits on its child's exit before it reads a held child again.
+pub const HELD_RECHECK: Duration = Duration::from_millis(250);
+
+/// The watcher's end of its child once the parent is gone, by its exit or by an exec in its
+/// place. While the child is held before its first instruction (its pid still reads its birth,
+/// and `proof` reads the unique id it was armed with and a thread that has not run) it gets no
+/// signal, and `exited` waits on it up to [`HELD_RECHECK`], answering `true` once it has exited;
+/// once anything else reads, it is ended as [`end_watched`] ends it. `None` when it exited while
+/// held, with no signal sent.
+#[cfg(any(target_vendor = "apple", test))]
+fn end_once_run(
+    watched: Watched,
+    grace: Duration,
+    control: &mut impl EndControl,
+    mut proof: impl FnMut(i32) -> Option<Proof>,
+    mut exited: impl FnMut() -> bool,
+) -> Option<Result<Ended, EndRefusal>> {
+    let held = Proof {
+        uniqueid: watched.uniqueid,
+        ran: false,
+    };
+    while Versionless(&mut *control).identity(watched.pid) == Some(watched.token())
+        && proof(watched.pid) == Some(held)
+    {
+        if exited() {
+            return None;
+        }
+    }
+    Some(end_watched(watched, grace, control, proof))
+}
+
 /// An [`EndControl`] whose identity reads drop their pid version, for a token that has none. Its
 /// signals get that token as it is, with no pid version: an inner arm whose signal re-reads the
 /// identity must judge it as these reads do.
@@ -212,6 +247,21 @@ pub fn entry() -> Option<ExitCode> {
 #[must_use]
 pub fn executable() -> Option<&'static Path> {
     THROUGH.get()?.as_ref()?.unchanged()
+}
+
+/// Whether this process's tethered spawns have lost their tie: its `main` served the tether
+/// ([`entry`]), or a test named an executable ([`through`]), but no unchanged executable is
+/// recorded now (an update or a rebuild put another file at its path, or none read when it was
+/// recorded), so on Darwin a tethered spawn starts its child untethered. `false` where nothing
+/// was recorded (a test binary's own spawns), and off Darwin, whose tie needs no executable.
+#[must_use]
+pub fn lost() -> bool {
+    cfg!(target_vendor = "apple") && lost_of(THROUGH.get())
+}
+
+/// [`lost`] for what was `recorded`, on Darwin.
+fn lost_of(recorded: Option<&Option<Through>>) -> bool {
+    recorded.is_some_and(|recorded| recorded.as_ref().and_then(Through::unchanged).is_none())
 }
 
 /// TEST SEAM: this process's tethered spawns run through `exe`, an executable whose `main` calls
@@ -540,34 +590,56 @@ fn hold(parent: i32) -> Result<(), String> {
     }
 }
 
-/// One `EVFILT_PROC` `NOTE_EXIT` change for `pid`, with a receipt.
+/// One `EVFILT_PROC` change for `pid`'s `notes`, with a receipt.
 #[cfg(target_vendor = "apple")]
-const fn exit_of(pid: i32) -> libc::kevent {
+const fn watch_of(pid: i32, notes: u32) -> libc::kevent {
     libc::kevent {
         ident: pid.unsigned_abs() as usize,
         filter: libc::EVFILT_PROC,
         flags: libc::EV_ADD | libc::EV_RECEIPT,
-        fflags: libc::NOTE_EXIT,
+        fflags: notes,
         data: 0,
         udata: std::ptr::null_mut(),
     }
 }
 
-/// Whether `events` hold `pid`'s exit.
+/// Whether `events` hold one of `notes` for `pid`.
 #[cfg(target_vendor = "apple")]
-fn exited(events: &[libc::kevent], pid: i32) -> bool {
+fn noted(events: &[libc::kevent], pid: i32, notes: u32) -> bool {
     events
         .iter()
-        .any(|e| e.ident == pid.unsigned_abs() as usize && e.fflags & libc::NOTE_EXIT != 0)
+        .any(|e| e.ident == pid.unsigned_abs() as usize && e.fflags & notes != 0)
+}
+
+/// Waits on `kq` up to [`HELD_RECHECK`] for `child`'s exit: `true` once it has exited, or when
+/// the wait itself fails (the watcher then gives up its watch, as it gives up an unread proof).
+///
+/// # Safety
+/// As [`watch`]'s, with `kq` the watcher's queue.
+#[cfg(target_vendor = "apple")]
+unsafe fn child_exited_within(kq: i32, child: i32) -> bool {
+    const BLANK: libc::kevent = watch_of(0, 0);
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::c_long::try_from(HELD_RECHECK.as_nanos()).unwrap_or(0),
+    };
+    let mut events = [BLANK; 2];
+    // SAFETY: `events` is a live array of two kevents the call fills; nothing is changed.
+    let got = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), 2, &pause) };
+    match usize::try_from(got) {
+        Ok(got) => noted(&events[..got.min(2)], child, libc::NOTE_EXIT),
+        Err(_) => std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted,
+    }
 }
 
 /// The watcher: a session of its own (`setsid`; one it cannot lead exits, unarmed, and the tether
-/// starts nothing), stdio on `/dev/null`, a kqueue exit watch on `parent` and on the `watched`
-/// child, the arming byte, then a wait. The child's exit ends it; the parent's ends the child
-/// first, as [`end_watched`] ends one, with the live reads and `kill(2)` ([`EndControlLive`]), the
-/// child's [`Proof`] read by [`read_lineage`] and [`thread_ran`]. A child whose exit came first
-/// reads as gone there (a zombie reads nothing, a reused pid another birth) and gets no signal, as
-/// does one whose thread has not run.
+/// starts nothing), stdio on `/dev/null`, a kqueue watch on `parent`'s exit and exec and on the
+/// `watched` child's exit, the arming byte, then a wait. The child's exit ends it; the parent's
+/// exit or exec ends the child first, as [`end_once_run`] ends one, with the live reads and
+/// `kill(2)` ([`EndControlLive`]), the child's [`Proof`] read by [`read_lineage`] and
+/// [`thread_ran`]. A child whose exit came first reads as gone there (a zombie reads nothing, a
+/// reused pid another birth) and gets no signal; one whose thread has not run gets none until it
+/// has.
 ///
 /// [`EndControlLive`]: crate::process::EndControlLive
 /// [`read_lineage`]: crate::process::read_lineage
@@ -579,7 +651,7 @@ fn exited(events: &[libc::kevent], pid: i32) -> bool {
 /// on.
 #[cfg(target_vendor = "apple")]
 unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i32) -> ! {
-    const BLANK: libc::kevent = exit_of(0);
+    const BLANK: libc::kevent = watch_of(0, 0);
     let child = watched.pid;
     // SAFETY (whole body): the function's contract.
     unsafe {
@@ -600,7 +672,10 @@ unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i3
         if kq < 0 {
             libc::_exit(1);
         }
-        let changes = [exit_of(parent), exit_of(child)];
+        let changes = [
+            watch_of(parent, libc::NOTE_EXIT | libc::NOTE_EXEC),
+            watch_of(child, libc::NOTE_EXIT),
+        ];
         let mut receipts = [BLANK; 2];
         let got = libc::kevent(
             kq,
@@ -638,11 +713,11 @@ unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i3
                 libc::_exit(1);
             };
             let events = &events[..got.min(2)];
-            if exited(events, child) {
+            if noted(events, child, libc::NOTE_EXIT) {
                 libc::_exit(0);
             }
-            if exited(events, parent) {
-                let _ended = end_watched(
+            if noted(events, parent, libc::NOTE_EXIT | libc::NOTE_EXEC) {
+                let _ended = end_once_run(
                     watched,
                     crate::process::END_GRACE,
                     &mut crate::process::EndControlLive,
@@ -652,6 +727,7 @@ unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i3
                             ran: crate::process::thread_ran(pid)?,
                         })
                     },
+                    || child_exited_within(kq, child),
                 );
                 libc::_exit(0);
             }
@@ -661,7 +737,7 @@ unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i3
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Through, parent_pid};
+    use super::{Through, lost_of, parent_pid};
     use std::ffi::OsStr;
 
     #[test]
@@ -696,11 +772,29 @@ mod tests {
             "nothing recorded"
         );
     }
+
+    /// The tie is lost once the file recorded to run through was replaced, or none read when it
+    /// was recorded, and never where nothing was recorded: a test binary's own spawns, which were
+    /// never tied there.
+    #[test]
+    fn a_tie_is_lost_only_once_its_recorded_executable_was_replaced() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let exe = dir.path().join("aterm");
+        std::fs::write(&exe, b"the build this process started from").expect("write");
+        assert!(!lost_of(None), "nothing recorded");
+        let recorded = Some(Through::of(exe.clone()));
+        assert!(!lost_of(Some(&recorded)), "the recorded file");
+        let next = dir.path().join("aterm.next");
+        std::fs::write(&next, b"an update's build").expect("write");
+        std::fs::rename(&next, &exe).expect("rename over");
+        assert!(lost_of(Some(&recorded)), "another file at its path");
+        assert!(lost_of(Some(&None)), "nothing read when it was recorded");
+    }
 }
 
 #[cfg(test)]
 mod watcher_tests {
-    use super::{Proof, Watched, end_watched};
+    use super::{Proof, Watched, end_once_run, end_watched};
     use crate::process::{Birth, EndControl, EndRefusal, Ended, Identity, Lineage};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -879,6 +973,95 @@ mod watcher_tests {
                 "{name}: every signal went to the child's pid alone: {:?}",
                 control.signals
             );
+        }
+    }
+
+    /// Once its parent is gone, a child held before its first instruction gets no signal and is
+    /// waited on until its thread has run, then ended by proof; one that exits while held gets
+    /// none at all, and one whose pid reads another birth is not waited on.
+    #[test]
+    fn a_held_child_is_ended_once_its_thread_has_run() {
+        let same = read(BIRTH, None);
+        let reborn = read(Birth(BIRTH.0 + 1), None);
+        let proven = Some(Proof {
+            uniqueid: UNIQUE,
+            ran: true,
+        });
+        let held = Some(Proof {
+            uniqueid: UNIQUE,
+            ran: false,
+        });
+        /// One run of `end_once_run` against a scripted child.
+        struct Case {
+            name: &'static str,
+            /// What each identity read of the child returns, in turn.
+            reads: Vec<Option<Identity>>,
+            /// What each proof read of the child returns, in turn.
+            proofs: Vec<Option<Proof>>,
+            /// The wait at which the child is seen to have exited.
+            exits_at_wait: usize,
+            /// What `end_once_run` returns.
+            want: Option<Result<Ended, EndRefusal>>,
+            /// The signals the child is sent.
+            signals: Vec<i32>,
+        }
+        let cases = [
+            Case {
+                name: "held for two reads, then run",
+                reads: vec![same, same, same, same, same, None],
+                proofs: vec![held, held, proven, proven],
+                exits_at_wait: usize::MAX,
+                want: Some(ended(false, true)),
+                signals: vec![SIGTERM],
+            },
+            Case {
+                name: "held, then exited",
+                reads: vec![same],
+                proofs: vec![held],
+                exits_at_wait: 1,
+                want: None,
+                signals: vec![],
+            },
+            Case {
+                name: "its pid reused, another birth",
+                reads: vec![reborn, reborn],
+                proofs: vec![],
+                exits_at_wait: usize::MAX,
+                want: Some(Err(EndRefusal::Stale)),
+                signals: vec![],
+            },
+        ];
+        for Case {
+            name,
+            reads,
+            proofs,
+            exits_at_wait,
+            want,
+            signals,
+        } in cases
+        {
+            let mut control = Script {
+                reads: reads.into(),
+                signals: Vec::new(),
+            };
+            let mut proofs = proofs.into_iter();
+            let mut waits = 0;
+            let out = end_once_run(
+                armed(),
+                Duration::ZERO,
+                &mut control,
+                |pid| {
+                    assert_eq!(pid, PID, "{name}: the proof read is the child's");
+                    proofs.next().flatten()
+                },
+                || {
+                    waits += 1;
+                    waits >= exits_at_wait
+                },
+            );
+            let sent: Vec<i32> = control.signals.iter().map(|&(_, sig)| sig).collect();
+            assert_eq!(out, want, "{name}: sent {sent:?} after {waits} waits");
+            assert_eq!(sent, signals, "{name}");
         }
     }
 }

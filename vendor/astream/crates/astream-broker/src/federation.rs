@@ -12,7 +12,7 @@ use crate::client::{
     broker_refusal, connect, AnyClient, Closer, Event, Pipelined, Transport, ACK_SEQ_BASE,
 };
 use crate::logid::{Lineage, LogIdentity};
-use crate::proto::{Gap, ERR_ORIGIN_REFUSED, ERR_SUBJECT_BOUND};
+use crate::proto::{Gap, ERR_ORIGIN_REFUSED, ERR_ORIGIN_UNKNOWN, ERR_SUBJECT_BOUND};
 use crate::store::is_hidden_subject;
 use astream_wire::{CausalCut, CausalEdge, CutViolation, Filter, Offset as WireOffset, Subject};
 
@@ -28,9 +28,11 @@ use std::time::Duration;
 #[path = "federation_island.rs"]
 mod federation_island;
 #[cfg(not(clean_islands))]
-pub use crate::twins::{federation_cursor_advance, federation_seq_clamp};
+pub use crate::twins::{federation_commit_bound, federation_cursor_advance, federation_seq_clamp};
 #[cfg(clean_islands)]
-pub use federation_island::{federation_cursor_advance, federation_seq_clamp};
+pub use federation_island::{
+    federation_commit_bound, federation_cursor_advance, federation_seq_clamp,
+};
 
 contract_fn! {
     /// Verified check that a federated record's hop count lies strictly below `max_hops`
@@ -45,6 +47,14 @@ contract_fn! {
 
 /// Maximum burst of records pipelined to the destination broker in one round trip.
 const FEDERATION_BATCH_CAP: usize = 256;
+
+/// The most relayed records one [`FederationBridge::run`] keeps in hand for a destination that did
+/// not take their origin ([`ERR_ORIGIN_UNKNOWN`]). Past it, or past [`HELD_BYTES`], a record is
+/// kept by its offset alone, and the run reads again from there once the rest are answered.
+pub const HELD_CAP: usize = 4096;
+
+/// The most body bytes the records of [`HELD_CAP`] may take; a run always keeps the first.
+pub const HELD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Wire transport for dialing a source or destination broker in [`FederationEndpoint`].
 #[derive(Clone)]
@@ -424,11 +434,20 @@ pub struct FederationReport {
     /// Records skipped by loop-exclusion / hop-limit / prefix policy, and, on a relay, those whose
     /// producer is not their subject's owner: no destination would take them.
     pub skipped: usize,
-    /// Relayed records the destination refused for good: a bad signature, a revoked or unknown
-    /// origin, or an origin over its subject budget there. Not retried; the rest of the burst
-    /// still lands, so one bad record does not stop an edge.
+    /// Relayed records the destination refused for good: a bad signature, a revoked origin, a
+    /// record that is not its origin's, or an origin over its subject budget there; and a record
+    /// whose origin the destination did not know and the source no longer seats
+    /// ([`FederationBridge::hold_while`]). Not retried; the rest of the burst still lands, so one
+    /// bad record does not stop an edge.
     pub refused: usize,
-    /// Highest `source` offset durably committed for `group` at the end of this step, if any.
+    /// Relayed records the run holds back after this step, a gauge: the destination did not take
+    /// their origin ([`ERR_ORIGIN_UNKNOWN`]), and the source still seats it
+    /// ([`FederationBridge::hold_while`]). The first of each origin's is offered again with every
+    /// later burst and mark, and the group is never committed past the lowest of them.
+    pub held: usize,
+    /// Highest `source` offset durably committed for `group` at the end of this step, if any: a
+    /// commit is inclusive, so a restarted bridge resumes one past it. A relay's commit stays
+    /// below every record it holds.
     pub committed_upto: Option<Offset>,
     /// Bridge's next `source` fetch cursor after this step.
     pub next_cursor: Offset,
@@ -470,6 +489,13 @@ pub enum FederationError {
     OffsetInReservedHalf(Offset),
     /// Rewritten subject failed validation.
     Rewrite(String),
+    /// A relay held more records than one run keeps ([`HELD_CAP`], [`HELD_BYTES`]) for a
+    /// destination that did not take their origin, and the destination has answered all it kept:
+    /// its group is committed below `from`, so the next run reads again from there.
+    HeldBack {
+        /// The lowest offset held by offset alone.
+        from: Offset,
+    },
     /// Underlying broker or socket I/O error.
     Io(io::Error),
 }
@@ -498,6 +524,10 @@ impl fmt::Display for FederationError {
                 "federation source offset {off} enters reserved ACK_SEQ_BASE half"
             ),
             FederationError::Rewrite(msg) => write!(f, "federation subject rewrite error: {msg}"),
+            FederationError::HeldBack { from } => write!(
+                f,
+                "federation relay held more records than it keeps for origins its destination did not take; it reads again from {from}"
+            ),
             FederationError::Io(e) => write!(f, "federation I/O error: {e}"),
         }
     }
@@ -517,7 +547,11 @@ pub struct FederationBridge {
     cursor: Offset,
     closer: FederationBridgeCloser,
     liveness: Duration,
+    seated: Option<Seated>,
 }
+
+/// Whether the source still seats a relayed record's owner ([`FederationBridge::hold_while`]).
+pub type Seated = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl FederationBridge {
     /// Validate `cfg`, dial `source` and `dest`, pin both [`LogIdentity`] values, and
@@ -582,6 +616,7 @@ impl FederationBridge {
             cursor,
             closer: FederationBridgeCloser::default(),
             liveness: IDLE_MARK_DEADLINE,
+            seated: None,
         })
     }
 
@@ -712,7 +747,7 @@ impl FederationBridge {
             }
         }
 
-        let (links, deduped_count, _refused) = self.mirror(staged)?;
+        let Answers { links, deduped, .. } = self.mirror(staged)?;
 
         let committed_upto = match highest_src_off {
             Some(upto) => {
@@ -733,9 +768,10 @@ impl FederationBridge {
         Ok(FederationReport {
             fetched,
             mirrored: links.len(),
-            deduped: deduped_count,
+            deduped,
             skipped,
             refused: 0,
+            held: 0,
             committed_upto,
             next_cursor: self.cursor,
             links,
@@ -743,18 +779,14 @@ impl FederationBridge {
         })
     }
 
-    /// Pipeline `staged` onto `dest` and read every ack: the mirrored links, how many of them
-    /// deduplicated, and how many relayed records were refused for good.
-    fn mirror(
-        &mut self,
-        staged: Vec<Staged>,
-    ) -> Result<(Vec<FederationLink>, usize, usize), FederationError> {
-        let mut links: Vec<FederationLink> =
-            Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
-        let mut deduped_count = 0usize;
-        let mut refused = 0usize;
+    /// Pipeline `staged` onto `dest` and read every ack ([`Answers`]).
+    fn mirror(&mut self, staged: Vec<Staged>) -> Result<Answers, FederationError> {
+        let mut answers = Answers {
+            links: Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP)),
+            ..Answers::default()
+        };
         if staged.is_empty() {
-            return Ok((links, deduped_count, refused));
+            return Ok(answers);
         }
         let mut pipe_ops: Vec<Pipelined<'_>> =
             Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
@@ -786,15 +818,19 @@ impl FederationBridge {
             let (dst_off, deduped) = match self.dst.recv_publish_ack() {
                 Ok(ack) => ack,
                 Err(e) => {
-                    let refused_for_good = self.cfg.relay
-                        && matches!(
-                            broker_refusal(&e),
-                            Some(r) if r.code == ERR_SUBJECT_BOUND || r.code == ERR_ORIGIN_REFUSED
-                        );
-                    if refused_for_good {
-                        refused = refused.saturating_add(1);
-                    } else if failed.is_none() {
-                        failed = Some(e);
+                    let code = broker_refusal(&e)
+                        .map(|r| r.code)
+                        .filter(|_| self.cfg.relay);
+                    match code {
+                        Some(ERR_SUBJECT_BOUND | ERR_ORIGIN_REFUSED) => {
+                            answers.refused = answers.refused.saturating_add(1);
+                        }
+                        Some(ERR_ORIGIN_UNKNOWN) => answers.unknown.push(rec),
+                        _ => {
+                            if failed.is_none() {
+                                failed = Some(e);
+                            }
+                        }
                     }
                     if self.dst.owed_acks() == 0 {
                         break;
@@ -803,9 +839,9 @@ impl FederationBridge {
                 }
             };
             if deduped {
-                deduped_count = deduped_count.saturating_add(1);
+                answers.deduped = answers.deduped.saturating_add(1);
             }
-            links.push(FederationLink {
+            answers.links.push(FederationLink {
                 src_log: self.src_log,
                 src_offset: rec.src_off,
                 dst_log: self.dst_log,
@@ -816,8 +852,41 @@ impl FederationBridge {
         }
         match failed {
             Some(e) => Err(FederationError::Io(e)),
-            None => Ok((links, deduped_count, refused)),
+            None => Ok(answers),
         }
+    }
+
+    /// Pipeline `records` onto `dest` in bursts of at most `FEDERATION_BATCH_CAP`, gathering the
+    /// answers.
+    fn mirror_all(&mut self, mut records: Vec<Staged>) -> Result<Answers, FederationError> {
+        let mut all = Answers::default();
+        while !records.is_empty() {
+            let rest = records.split_off(records.len().min(FEDERATION_BATCH_CAP));
+            let answers = self.mirror(std::mem::replace(&mut records, rest))?;
+            all.links.extend(answers.links);
+            all.deduped = all.deduped.saturating_add(answers.deduped);
+            all.refused = all.refused.saturating_add(answers.refused);
+            all.unknown.extend(answers.unknown);
+        }
+        Ok(all)
+    }
+
+    /// Hold a relayed record the destination answers [`ERR_ORIGIN_UNKNOWN`] while `seated` says the
+    /// source still seats its owner (the subject's owner, `astream_cap::relay_owner`): the
+    /// destination may yet be given that origin's key, or see its revocation lifted. Once it says
+    /// no, the record is counted refused and let go, as no destination will be told to take an
+    /// origin the source does not. A bridge never told holds nothing: each such record is counted
+    /// refused at once, as one that is not its origin's is.
+    pub fn hold_while(&mut self, seated: Seated) {
+        self.seated = Some(seated);
+    }
+
+    /// Whether a record of `subject` its destination did not take is still owed to it.
+    fn still_seated(&self, subject: &str) -> bool {
+        let Some(seated) = self.seated.as_ref() else {
+            return false;
+        };
+        relay_owner(subject).is_some_and(|owner| seated(owner))
     }
 
     /// A handle that stops [`run`](Self::run) from another thread.
@@ -835,11 +904,25 @@ impl FederationBridge {
     }
 
     /// Mirror until stopped, by push: park on a `subscribe_group` of `source`, so a record reaches
-    /// `dest` as soon as `source` can deliver it and an idle bridge does nothing at all. Up to `max_records` (`1..=256`) go to `dest` as one pipelined
-    /// burst, cut where the source says its tail caught up ([`Request::BurstMarks`]), and the group
-    /// is committed once per burst, only after `dest` acknowledged all of it. `on_burst` sees the
-    /// report of each; a burst of nothing but a retention gap is reported too, for a caller that
-    /// repairs on one.
+    /// `dest` as soon as `source` can deliver it and an idle bridge does nothing at all. Up to
+    /// `max_records` (`1..=256`) go to `dest` as one pipelined burst, cut where the source says its
+    /// tail caught up ([`Request::BurstMarks`]), and the group is committed once per burst, only
+    /// after `dest` acknowledged all of it, through the last offset the burst scanned. A group
+    /// commit is inclusive (the group resumes one past it), so a burst cut at its cap commits the
+    /// offset before the cut, a burst a mark ended the one before the mark's `next`, and a
+    /// restarted bridge starts its scan at the cut or at that `next`. `on_burst` sees the report
+    /// of each; a burst of nothing but a retention gap is reported too, for a caller that repairs
+    /// on one.
+    ///
+    /// A relayed record whose origin the destination does not take now ([`ERR_ORIGIN_UNKNOWN`])
+    /// is held back while the source seats it ([`hold_while`](Self::hold_while)), and so is every
+    /// later record of that origin, unsent behind it, so an origin's records arrive in the order
+    /// they left. The first of each origin's is offered again with every later burst, and with
+    /// every mark while any is held (so at least every [`IDLE_MARK`](crate::broker::IDLE_MARK) on a
+    /// quiet source); once the destination takes it, the rest of that origin's go at once. The group
+    /// is committed below the lowest record held, so a restarted run delivers each again, and no
+    /// record is passed for a destination that was only behind (`TlaPushEdge` in the island:
+    /// `NoSkip`).
     ///
     /// Returns `Ok(())` once [`FederationBridgeCloser::close`] ends it. A lost connection, or a
     /// source silent past its liveness deadline ([`IDLE_MARK_DEADLINE`] unless
@@ -876,6 +959,7 @@ impl FederationBridge {
             return Err(FederationError::Io(e));
         }
         let mut burst = Burst::default();
+        let mut held = Held::default();
         loop {
             let event = sub.recv_event();
             match event {
@@ -887,11 +971,11 @@ impl FederationBridge {
                     burst.take(self, offset, sub.last_origin(), subject, body)?;
                     if burst.fetched >= burst_cap {
                         let upto = burst.next;
-                        self.finish_burst(&mut burst, upto, on_burst)?;
+                        self.finish_burst(&mut burst, &mut held, upto, on_burst)?;
                     }
                 }
                 Ok(Some(Event::Mark { next, .. })) => {
-                    self.finish_burst(&mut burst, next, on_burst)?;
+                    self.finish_burst(&mut burst, &mut held, next, on_burst)?;
                 }
                 Ok(Some(Event::Gap(gap))) => burst.gaps.push(gap),
                 Ok(None) => {
@@ -935,39 +1019,219 @@ impl FederationBridge {
         }
     }
 
-    /// Mirror `burst`, commit the group to `upto` on `source`, and report. Nothing delivered is
-    /// nothing to commit: a tail that only scanned past other subjects moves no cursor.
+    /// Offer the records `held` back and `burst`'s, commit the group on `source`, and report.
+    /// `upto` is exclusive, the offset the tail scans next (the cut's [`Burst::next`] or a mark's
+    /// `next`), and a burst that delivered a record makes it the run's scan and the bridge's
+    /// cursor. The group then resumes at the bound [`federation_commit_bound`] takes of the scan
+    /// and the lowest record still held ([`Client::commit_before`](crate::client::Client::commit_before)):
+    /// the island's `TlaPushEdge.Commit`. A run commits no bound it committed before, so a tail
+    /// that only scans past its own commits moves nothing. What retention gave up is reported
+    /// before any commit passes it (`TlaPushEdge.Gap`), so a stop between the two loses no word of
+    /// it: the next run is told again.
     fn finish_burst(
         &mut self,
         burst: &mut Burst,
+        held: &mut Held,
         upto: Offset,
         on_burst: &mut dyn FnMut(&FederationReport),
     ) -> Result<(), FederationError> {
-        let taken = std::mem::take(burst);
-        if taken.fetched == 0 && taken.gaps.is_empty() {
+        let mut taken = std::mem::take(burst);
+        if !taken.gaps.is_empty() {
+            on_burst(&FederationReport {
+                held: held.count.saturating_add(held.past_count),
+                committed_upto: held.committed(),
+                next_cursor: self.cursor,
+                gaps: std::mem::take(&mut taken.gaps),
+                ..FederationReport::default()
+            });
+        }
+        if taken.fetched == 0 && held.is_empty() {
             return Ok(());
         }
-        let (links, deduped, refused) = self.mirror(taken.staged)?;
-        let mut committed_upto = None;
-        if taken.fetched > 0 {
-            if let Err(e) = self.src_ctl.commit(&self.cfg.group, upto) {
-                return Err(FederationError::Io(e));
+        let mut refused = held.let_go(|subject| self.still_seated(subject));
+        // The first of each origin's held records goes again, ahead of what is new; a new record
+        // of an origin held waits behind it, unsent.
+        let mut probed = std::collections::BTreeSet::new();
+        let mut offered = held.probes();
+        for rec in &offered {
+            probed.insert(rec.producer_id);
+        }
+        for rec in taken.staged {
+            if probed.contains(&rec.producer_id) || held.queues.contains_key(&rec.producer_id) {
+                held.keep(rec);
+            } else {
+                offered.push(rec);
             }
-            committed_upto = Some(upto);
+        }
+        let mut answered = Answers::default();
+        loop {
+            let answers = self.mirror_all(offered)?;
+            answered.links.extend(answers.links);
+            answered.deduped = answered.deduped.saturating_add(answers.deduped);
+            refused = refused.saturating_add(answers.refused);
+            let mut still = std::collections::BTreeSet::new();
+            for rec in answers.unknown {
+                if self.still_seated(&rec.subject) {
+                    still.insert(rec.producer_id);
+                    held.keep(rec);
+                } else {
+                    refused = refused.saturating_add(1);
+                }
+            }
+            // An origin whose first record the destination took now: the rest of its go too.
+            offered = probed
+                .difference(&still)
+                .flat_map(|id| held.release(*id))
+                .collect();
+            probed.clear();
+            if offered.is_empty() {
+                break;
+            }
+        }
+        if taken.fetched > 0 {
+            held.scanned = Some(upto);
             self.cursor = federation_cursor_advance(self.cursor, upto);
+        }
+        if let Some(scanned) = held.scanned {
+            let bound = federation_commit_bound(scanned, held.lowest());
+            if held.resumes.is_none_or(|last| bound > last) {
+                if let Err(e) = self.src_ctl.commit_before(&self.cfg.group, bound) {
+                    return Err(FederationError::Io(e));
+                }
+                held.resumes = Some(bound);
+            }
         }
         on_burst(&FederationReport {
             fetched: taken.fetched,
-            mirrored: links.len(),
-            deduped,
+            mirrored: answered.links.len(),
+            deduped: answered.deduped,
             skipped: taken.skipped,
             refused,
-            committed_upto,
+            held: held.count.saturating_add(held.past_count),
+            committed_upto: held.committed(),
             next_cursor: self.cursor,
-            links,
-            gaps: taken.gaps,
+            links: answered.links,
+            gaps: Vec::new(),
         });
-        Ok(())
+        match held.past {
+            Some(from) if held.queues.is_empty() => Err(FederationError::HeldBack { from }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What [`FederationBridge::mirror`] read back from `dest`.
+#[derive(Default)]
+struct Answers {
+    /// The records `dest` appended or already held.
+    links: Vec<FederationLink>,
+    /// How many of `links` it already held.
+    deduped: usize,
+    /// Relayed records it refused for good.
+    refused: usize,
+    /// Relayed records whose origin it does not take now, in the order sent.
+    unknown: Vec<Staged>,
+}
+
+/// What one [`FederationBridge::run`] keeps between its bursts. It ends with the run: the next
+/// run's subscription resumes at or below the lowest record held, so it delivers each again.
+#[derive(Default)]
+struct Held {
+    /// The records the destination did not take the origin of, by origin, each in source order:
+    /// the first of each is offered again, the rest wait behind it.
+    queues: std::collections::BTreeMap<u64, std::collections::VecDeque<Staged>>,
+    /// How many records the queues keep, at most [`HELD_CAP`].
+    count: usize,
+    /// How many body bytes they keep, at most [`HELD_BYTES`].
+    bytes: usize,
+    /// The lowest record held by its offset alone, past either bound.
+    past: Option<Offset>,
+    /// How many records are held by offset alone.
+    past_count: usize,
+    /// The offset after the last record this run's bursts delivered.
+    scanned: Option<Offset>,
+    /// Where this run's last commit has the group resume.
+    resumes: Option<Offset>,
+}
+
+impl Held {
+    fn is_empty(&self) -> bool {
+        self.queues.is_empty() && self.past.is_none()
+    }
+
+    /// The inclusive commit this run made last, if it made one.
+    fn committed(&self) -> Option<Offset> {
+        self.resumes.and_then(|next| next.checked_sub(1))
+    }
+
+    /// Keep `rec` behind its origin's earlier records, or by its offset alone past the bounds: a
+    /// run keeps its first record whatever its size, so one body over [`HELD_BYTES`] is offered
+    /// again rather than read again forever.
+    fn keep(&mut self, rec: Staged) {
+        let fits = self.count == 0
+            || (self.count < HELD_CAP && self.bytes.saturating_add(rec.body.len()) <= HELD_BYTES);
+        if self.past.is_some() || !fits {
+            self.past = Some(self.past.map_or(rec.src_off, |past| past.min(rec.src_off)));
+            self.past_count = self.past_count.saturating_add(1);
+            return;
+        }
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(rec.body.len());
+        let queue = self.queues.entry(rec.producer_id).or_default();
+        // A record offered again goes back before the ones that waited behind it.
+        if queue
+            .front()
+            .is_some_and(|first| first.src_off < rec.src_off)
+        {
+            queue.push_back(rec);
+        } else {
+            queue.push_front(rec);
+        }
+    }
+
+    /// Take the first record of each origin's queue, to offer again.
+    fn probes(&mut self) -> Vec<Staged> {
+        let mut probes = Vec::with_capacity(self.queues.len());
+        for queue in self.queues.values_mut() {
+            if let Some(rec) = queue.pop_front() {
+                self.count = self.count.saturating_sub(1);
+                self.bytes = self.bytes.saturating_sub(rec.body.len());
+                probes.push(rec);
+            }
+        }
+        self.queues.retain(|_, queue| !queue.is_empty());
+        probes
+    }
+
+    /// Take every record held of origin `id`.
+    fn release(&mut self, id: u64) -> std::collections::VecDeque<Staged> {
+        let queue = self.queues.remove(&id).unwrap_or_default();
+        for rec in &queue {
+            self.count = self.count.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub(rec.body.len());
+        }
+        queue
+    }
+
+    /// Let go of every origin's records the source no longer seats, answering how many.
+    fn let_go(&mut self, seated: impl Fn(&str) -> bool) -> usize {
+        let gone: Vec<u64> = self
+            .queues
+            .iter()
+            .filter(|(_, queue)| queue.front().is_some_and(|rec| !seated(&rec.subject)))
+            .map(|(id, _)| *id)
+            .collect();
+        gone.into_iter().map(|id| self.release(id).len()).sum()
+    }
+
+    /// The lowest offset held, by body or by offset alone: [`Offset::MAX`] when none is.
+    fn lowest(&self) -> Offset {
+        self.queues
+            .values()
+            .filter_map(|queue| queue.front().map(|rec| rec.src_off))
+            .chain(self.past)
+            .min()
+            .unwrap_or(Offset::MAX)
     }
 }
 
@@ -1055,6 +1319,18 @@ fn relay_owns(subject: &str, id: u64) -> bool {
 #[cfg(not(feature = "cap"))]
 const fn relay_owns(_subject: &str, _id: u64) -> bool {
     false
+}
+
+/// The owner a relayed record's subject names.
+#[cfg(feature = "cap")]
+fn relay_owner(subject: &str) -> Option<&str> {
+    astream_cap::relay_owner(subject)
+}
+
+/// A build without `cap` relays nothing, so it holds nothing back.
+#[cfg(not(feature = "cap"))]
+const fn relay_owner(_subject: &str) -> Option<&str> {
+    None
 }
 
 /// Stops a [`FederationBridge::run`] from another thread: it shuts the parked subscription, and

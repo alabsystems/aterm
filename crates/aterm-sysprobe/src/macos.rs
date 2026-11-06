@@ -786,7 +786,7 @@ pub(crate) fn cf_text(value: CFTypeRef) -> Option<String> {
 }
 
 /// An IOKit object, released on drop.
-struct Io(io_object_t);
+pub(crate) struct Io(pub(crate) io_object_t);
 
 impl Drop for Io {
     fn drop(&mut self) {
@@ -1108,6 +1108,140 @@ fn accel() -> Option<&'static Accel> {
             })
         })
         .as_ref()
+}
+
+/// The keys the Neural Engine reader reads (A2 §3.1), made once.
+pub(crate) struct AneKeys {
+    /// The entry's `DeviceProperties`, read once.
+    pub(crate) device: Cf,
+    cores: Cf,
+    /// The entry's `IOPowerManagement`, read each reading.
+    pub(crate) power: Cf,
+    current: Cf,
+    max: Cf,
+}
+
+impl AneKeys {
+    pub(crate) fn new() -> Option<Self> {
+        Some(Self {
+            device: Cf::string(c"DeviceProperties")?,
+            cores: Cf::string(c"ANEDevicePropertyNumANECores")?,
+            power: Cf::string(c"IOPowerManagement")?,
+            current: Cf::string(c"CurrentPowerState")?,
+            max: Cf::string(c"MaxPowerState")?,
+        })
+    }
+}
+
+/// The Neural Engine's registry entry (class `H11ANEIn`), matched once per process, with the
+/// keys its readings read.
+struct Ane {
+    service: Io,
+    keys: AneKeys,
+}
+
+// SAFETY: As for `Accel`: a Mach port name and immutable CFStrings, kept for the process in a
+// `OnceLock` and usable from any thread; Rust dereferences none of them.
+unsafe impl Send for Ane {}
+// SAFETY: As for `Send`.
+unsafe impl Sync for Ane {}
+
+fn ane() -> Option<&'static Ane> {
+    static ANE: OnceLock<Option<Ane>> = OnceLock::new();
+    ANE.get_or_init(|| {
+        // SAFETY: A NUL-terminated class name; the dictionary is +1 and consumed by
+        // `IOServiceGetMatchingService`, whose service is kept for the process.
+        let service = unsafe {
+            let matching = iokit::IOServiceMatching(c"H11ANEIn".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const())
+        };
+        if service == 0 {
+            return None;
+        }
+        let service = Io(service);
+        Some(Ane {
+            service,
+            keys: AneKeys::new()?,
+        })
+    })
+    .as_ref()
+}
+
+/// A borrowed CF value read as a signed integer: a `CFNumber` whose value an `i64` holds
+/// exactly, and nothing else.
+fn cf_i64(value: CFTypeRef) -> Option<i64> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` is a live CF object (borrowed for this call); its type is checked before
+    // it is read as a number, into an `i64`.
+    unsafe {
+        if iokit::CFGetTypeID(value) != iokit::CFNumberGetTypeID() {
+            return None;
+        }
+        let mut n: i64 = 0;
+        (iokit::CFNumberGetValue(
+            value.cast(),
+            iokit::kCFNumberSInt64Type,
+            (&raw mut n).cast::<c_void>(),
+        ) != 0)
+            .then_some(n)
+    }
+}
+
+/// `key`'s value in a borrowed dictionary `dict`, as [`cf_i64`] reads it; `None` where `dict` is
+/// no dictionary.
+fn dict_i64(dict: CFTypeRef, key: &Cf) -> Option<i64> {
+    if dict.is_null() {
+        return None;
+    }
+    // SAFETY: `dict` is a live CF object (borrowed); its type is checked before it is read as a
+    // dictionary, and the value it answers is borrowed while it lives.
+    unsafe {
+        if iokit::CFGetTypeID(dict) != iokit::CFDictionaryGetTypeID() {
+            return None;
+        }
+        cf_i64(iokit::CFDictionaryGetValue(dict.cast(), key.0))
+    }
+}
+
+/// The core count in a borrowed `DeviceProperties` value.
+pub(crate) fn ane_cores_of(props: CFTypeRef, keys: &AneKeys) -> Option<i64> {
+    dict_i64(props, &keys.cores)
+}
+
+/// The two power states in a borrowed `IOPowerManagement` value.
+pub(crate) fn ane_power_of(power: CFTypeRef, keys: &AneKeys) -> crate::neural_engine::Power {
+    crate::neural_engine::Power {
+        current: dict_i64(power, &keys.current),
+        max: dict_i64(power, &keys.max),
+    }
+}
+
+/// [`crate::neural_engine::Source::native`]'s entry: the matched engine's core count, read once
+/// from its `DeviceProperties`; `None` where no `H11ANEIn` entry matches.
+pub(crate) fn ane_entry() -> Option<crate::neural_engine::Entry> {
+    let a = ane()?;
+    let props = Cf::property(a.service.0, a.keys.device.0);
+    Some(crate::neural_engine::Entry {
+        cores: props.and_then(|p| ane_cores_of(p.0, &a.keys)),
+    })
+}
+
+/// [`crate::neural_engine::Source::native`]'s reading: one copy of the matched engine's
+/// `IOPowerManagement` dictionary, its two states read from it. Measured on this M5 by MR-mac
+/// (2026-11-04): 89.8 µs p95 a reading under load.
+pub(crate) fn ane_power() -> crate::neural_engine::Power {
+    let Some(a) = ane() else {
+        return crate::neural_engine::Power::default();
+    };
+    Cf::property(a.service.0, a.keys.power.0)
+        .map_or_else(crate::neural_engine::Power::default, |pm| {
+            ane_power_of(pm.0, &a.keys)
+        })
 }
 
 /// [`crate::gpu`] on macOS: the cached accelerator's `PerformanceStatistics`, copied once per call.

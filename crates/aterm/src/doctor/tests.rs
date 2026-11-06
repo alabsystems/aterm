@@ -2230,6 +2230,136 @@ fn base_agents_primer_runs_the_window_pass_and_settles() {
     assert_eq!(PASSES.load(SeqCst), 3);
 }
 
+/// A shared sheet that assigns Claude elsewhere does not require a Claude login here. Init
+/// still provisions Codex, rejects conflicting Claude assignments, and notices a later valid
+/// assignment without a manual opt-in or another source configuration.
+#[test]
+fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
+    use aterm_agent::ai::connector::Cli;
+    use aterm_agent::harness::{accounts, accounts_sync, cli::Env};
+    use aterm_converge::Probe;
+    let scratch = Scratch::new("unassigned-claude");
+    let home = scratch.home();
+    let config = home.join(".config/aterm");
+    let secrets = home.join(".secrets");
+    for dir in [&config, &secrets] {
+        aterm_types::fs_restricted::ensure_private_dir(dir).unwrap();
+    }
+    aterm_uds::atomic_file::write(
+        &config.join("aterm.toml"),
+        b"[fleet]\nmachine = 'm183'\n",
+        0o600,
+    )
+    .unwrap();
+    let env = Env {
+        state: scratch.root.join("state"),
+        aterm_state: None,
+        cwd: home.clone(),
+        home: Some(home.clone()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        codex_login: None,
+        now: 1_792_660_000,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.join("aterm.toml")),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    let sheet = secrets.join(accounts_sync::ACCOUNTS_CSV_FILE);
+    let write_sheet = |contents: &str| {
+        aterm_uds::atomic_file::write(&sheet, contents.as_bytes(), 0o600).unwrap();
+    };
+    write_sheet(
+        "email,computer,claude,Open AI\ncode@example.test,m183,0,1\nclaude@example.test,m22,1,0\n",
+    );
+    assert!(matches!(
+        super::ai_accounts_claude_probe(&env),
+        Probe::NotApplicable { .. }
+    ));
+    assert!(matches!(
+        super::ai_accounts_probe(&env),
+        Probe::Change { .. }
+    ));
+    let due = super::ai_accounts_observation(super::ai_accounts_probe(&env));
+    assert_eq!(due.standing, aterm_types::macos_setup::Standing::Waiting);
+    let why = due.note.unwrap();
+    assert!(why.contains("codex"), "{why}");
+    assert!(!why.contains("Claude"), "{why}");
+    super::ai_accounts_apply(&env).unwrap();
+    let codex_path = env.accounts_roster_for(Cli::Codex).unwrap();
+    let codex = accounts::Roster::load_for(Cli::Codex, &codex_path).unwrap();
+    assert!(
+        codex
+            .rows
+            .iter()
+            .any(|row| row.email.as_deref() == Some("code@example.test"))
+    );
+    assert!(!env.accounts_roster().unwrap().exists());
+    assert!(matches!(super::ai_accounts_probe(&env), Probe::Ok { .. }));
+    assert_eq!(
+        super::ai_accounts_observation(super::ai_accounts_probe(&env)).standing,
+        aterm_types::macos_setup::Standing::InPlace
+    );
+    assert_eq!(
+        accounts_sync::resync_due(&home, &env.state, &env.accounts_roster().unwrap(), env.now),
+        None
+    );
+
+    // A desired assignment rejected because the sheet conflicts is a real failure.
+    write_sheet(
+        "email,computer,claude,Open AI\ncode@example.test,m183,0,1\nclaude@example.test,m183,1,0\nclaude@example.test,m22,1,0\n",
+    );
+    assert!(matches!(
+        super::ai_accounts_claude_probe(&env),
+        Probe::Change { .. }
+    ));
+    let failure = super::ai_accounts_apply(&env).unwrap_err();
+    assert!(failure.contains("conflicting assignments"), "{failure}");
+    assert!(!env.accounts_roster().unwrap().exists());
+    assert_eq!(
+        accounts::Roster::load_for(Cli::Codex, &codex_path).unwrap(),
+        codex
+    );
+
+    write_sheet(
+        "email,computer,claude,Open AI\ncode@example.test,m183,0,1\nclaude@example.test,m183,1,0\n",
+    );
+    let due = super::ai_accounts_observation(super::ai_accounts_probe(&env));
+    assert_eq!(due.standing, aterm_types::macos_setup::Standing::Waiting);
+    assert!(
+        due.note
+            .unwrap()
+            .contains("Claude account provisioning pending")
+    );
+    assert!(
+        accounts_sync::resync_due(
+            &home,
+            &env.state,
+            &env.accounts_roster().unwrap(),
+            env.now + 1
+        )
+        .is_some()
+    );
+    super::ai_accounts_apply(&env).unwrap();
+    assert_eq!(
+        accounts::Roster::load(&env.accounts_roster().unwrap())
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert!(matches!(super::ai_accounts_probe(&env), Probe::Ok { .. }));
+}
+
 /// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
 /// (`…; other CLIs: codex 1, kimi 1`), stands on those pools alone where Claude Code has no
 /// source, and is a change where Codex's pool, which syncs by default, has a row of this

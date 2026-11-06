@@ -31,9 +31,11 @@ fn mesh_on(state: &Path) -> NodeServeConfig {
         mesh: NodeMesh {
             on: true,
             clock: ManualClock::new() as Arc<dyn aterm_net::fleet::link::LinkClock>,
-            note: Arc::new(|_| {}),
+            watch: Arc::new(|_| {}),
             units: Arc::new(|| None),
             on_neighbours: None,
+            bus: None,
+            ..NodeMesh::live()
         },
     }
 }

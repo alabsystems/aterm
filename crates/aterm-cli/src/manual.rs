@@ -113,7 +113,8 @@ Offered, nothing waits on it, and setup finishes without it. One quiet press at 
 page, Turn On macOS Access…, asks for them together (a record on this Mac keeps that press);
 `aterm init` and `doctor --apply` never ask macOS for a grant. Debugger access is no such
 grant: the Mac Setup tab's one password turns developer mode on, and the Debugger row reads
-Waiting until it does. Once that tab was stopped, `aterm init --only base.clt` asks for the
+Waiting until it does. That authorized tab retries network and catalog failures by itself,
+without another password. Once that tab was stopped, `aterm init --only base.clt` asks for the
 password now, or aterm's Settings ▸ Security turns it on. Once you pressed Turn On macOS
 Access…, the permission pages, like the Messages and FaceTime sign-outs, start
 while System State is in front and you are at the Mac (a key, click or trackpad used
@@ -161,7 +162,8 @@ Setup choices:
   Set up aterm's macOS permissions (switches still need your clicks)
   Sync the secrets vault (default http://alab-secrets.local:7484/v1/alab, or the vault
     this Mac is in; editable)
-  Authenticate GitHub via synced credentials and clone your own repositories
+  Authenticate GitHub via synced credentials, clone your own repositories and initialize
+    dependencies selected by the private inventory at exact gitlink commits; no --develop
 
 Approved setup resumes unfinished steps on later launches, silently, and so does a
 choice cut short by a quit or a crash, which still sets only what it changed. A step
@@ -209,7 +211,9 @@ A shell that ran one keeps working once they arrive: `git`, `cc` and the
 rest run through Apple's own `/usr/bin/<tool>` then, `xcrun` included, with the SDK it sets.
 The tab ends on one line that says they are installed, or why the install did not finish; an
 install that failed, or a tab whose program never started, asks again at the next launch where
-that tab's own ask spent this build's opening. One you stopped (a Ctrl-C, a closed tab, or
+that tab's own ask spent this build's opening. Network and catalog outages keep the already
+authorized run waiting and retrying by itself; they ask for no further password. One you
+stopped (System State's Stop, a Ctrl-C, a closed tab, or
 Apple's installer window closed without installing them) does not by itself on that build, and
 neither does a failed Install… you pressed after you declined on that build or after your own
 `aterm pkg install` or `update` asked: the card's Install Command Line Tools… opens it at once.
@@ -219,8 +223,8 @@ that is not one of the Mac's administrators is told so, with no Install…. Whil
 installer window for them is open, however long ago it opened and whether or not you pressed
 Install there, System State asks you to finish there, and `aterm init` leaves them to it and
 asks no password: finish in that window, or quit it so aterm can install them. Where Apple's
-catalog offers them none, the install opens that window and waits on it; closing it without
-installing them ends the wait at once. `aterm init` asks for your
+catalog offers them none, the authorized install keeps retrying the catalog. Closing an
+existing Apple installer window without installing them ends that wait at once. `aterm init` asks for your
 Mac password for them only at this Mac's screen, in a terminal, with nothing installing them
 already; anywhere else it leaves them waiting and exits 0. One you type asks each time. The one
 your own `aterm pkg install` or `update` ends with asks by itself at most once per build, the
@@ -228,10 +232,11 @@ tab's ask included, and never after you press Stop; otherwise it names Install C
 Tools… and `aterm init --only base.clt`, and one that failed asks again on that build. Each run
 says why on one line before `sudo` asks, and `sudo` asks afresh: a password you typed for an
 earlier `sudo` never stands in, and none is kept once the install ends, in the tab and in your
-own terminal alike. A Ctrl-C during it waits until the install's step has ended.
-System State reads GitHub
-repositories again whenever you return to it, and by itself only once a renewed token
-reaches this Mac through the vault. A join turns sync on; with sync turned off since, the join lands
+own terminal alike. A Ctrl-C or System State's Stop during it lets the current install step
+finish, then ends the authorized run; it takes an explicit restart to ask again.
+System State reads GitHub repositories again whenever you return to it. Automatic setup also
+retries failed passes and rechecks repository metadata synced from the vault. A join turns
+sync on; with sync turned off since, the join lands
 once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
 While aterm cannot read this Mac's vault settings (`aterm secrets status` says why), Join
 joins nothing and System State says so calmly: the first launch's answer goes ahead
@@ -2245,6 +2250,7 @@ const EXTRA_PAGES: &[&str] = &[
     "windowing",
     "drive",
     "fleet",
+    "name",
     "node",
     "trust-backends",
     "permissions",
@@ -2392,6 +2398,9 @@ fn overview_page() -> String {
             crate::Verb::Fleet => {
                 "a LAN fleet's membership (init | join | peers | allow | publish | sync | census \
                  | leave); `ctl --host` drives where allowed"
+            }
+            crate::Verb::Name => {
+                "this machine's name: its NAME (m8, m0 until numbered) and nickname"
             }
             crate::Verb::Node => {
                 "the windowless fleet & Commons node job (status | on | off | serve; Unix)"
@@ -3719,6 +3728,52 @@ FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
     watch = true                   # poll the fleet every minute for the macOS ❯ menu
                                    # (default false)"#;
 
+/// `aterm help name`: this machine's name (`docs/DESIGN-machine-names-2026-11-04.md` §5.7).
+const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `m0` until it is numbered) and nickname
+
+  aterm name [--json]
+  aterm name nick <word> | --random  [--dry-run] [--json]
+
+  Unix only for now: elsewhere it exits 2, keeping no name.
+
+WHAT IT SAYS
+  One line, `m8 Heron  class=seeded fleet=in node=<node id>`: the NAME and nickname this
+  machine goes by, how the NAME was claimed (`auto`, aterm picked it; `chosen`, a person
+  did; `seeded`, from an older build's names), whether this machine holds a fleet key that
+  reads (`fleet=in`, else `fleet=out`), a migration from an older build's names not
+  finished yet (`migration=pending` or `migration=waiting`), and this machine's fleet node
+  once it has one. `--json` prints one object: `name`, `number` (null while `m0`), `nick`,
+  `title`, `class`, `nick_class`, `since`, `rev`, `migration`, `fleet`, `node`, and `made`,
+  where a name this run wrote came from (`kept` when it was there already). On macOS the
+  menu bar shows the same title right of the version, its nickname clipped to 16 letters.
+
+THE NICKNAME
+  `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and
+  `--random` draws another noun, drawn again up to eight times while it is one that other
+  machines' records in view carry or the one held. Either is `chosen`, so it never changes
+  by itself; the NAME, its class and `since` stay as they were, and `rev` rises once a
+  name record has seeded the file. It prints the name as it then stands, says so on
+  stderr when the nickname was held already or another machine in view goes by it too
+  (two may share one), and `--dry-run` changes no nickname (a first run still makes the
+  name, as any read does). Who asked is kept beside it: an agent when the command runs in
+  an aterm session whose `status` names an agent program or an agent's state, a person
+  otherwise, or when that session does not answer within 2 seconds. Clearing the
+  nickname waits for name records to travel.
+
+THE FIRST RUN
+  The first reader to find no `machine-name.toml` makes it, under its lock, so every other
+  reader reads the same name back. It takes this machine's own newest name record that its
+  key signed in its fleet books (`made=floor`), else what an older build kept: the NAME in
+  `fleet-name` or the vault roster's label, and a word in `fleet-name` as the nickname,
+  pending migration (`made=evidence`), else `m0` and a short noun drawn at random, drawn
+  again up to eight times while another machine's record in view carries it as its
+  nickname (`made=drawn`). A `fleet-name`, node key or vault roster that cannot be read
+  makes nothing: `aterm name` says why and exits 1, and the next run tries again, so a
+  passing failure never leaves an established Mac named `m0`.
+
+FILES (`<state>` is `~/Library/Application Support/aterm` on macOS)
+  `machine-name.toml` (0600) and its `machine-name.lock`."#;
+
 /// `aterm help node`: the windowless fleet, Commons and steward node job (`systems.alab.aterm-node`).
 const NODE_PAGE: &str = r#"node — the windowless fleet, Commons and steward node job (`aterm node`)
 
@@ -5028,6 +5083,12 @@ fn agent_page(sid: Option<&str>) -> String {
     s.push_str(aterm_types::identity::ORIGIN_LINE);
     s.push_str("\n\n");
     s.push_str(&overview());
+    s.push_str(
+        "\n\nREPOSITORY SETUP\n  \
+         `aterm init` clones the repositories in the private inventory and initializes only\n  \
+         its selected required dependencies, at exact recorded gitlink commits. This needs\n  \
+         no `--develop`; unselected submodules stay untouched (`aterm help init`).",
+    );
     s.push_str("\n\nWHERE YOU ARE\n  ");
     s.push_str(&you);
     if let Some(id) = sid {
@@ -5133,7 +5194,10 @@ fn agent_page(sid: Option<&str>) -> String {
          you now. `timeout=` goes up to 600000; a tool that ends commands sooner needs a\n  \
          shorter one. aterm removes only build caches no build holds and no process uses,\n  \
          never source, and records each removal in `aterm harness ledger disk`. A build\n  \
-         directory you delete by hand may be one another session's build is using.\n",
+         directory you delete by hand may be one another session's build is using.\n  \
+         Measure `aterm ctl @self sys disk` before and after cleanup on the same volume.\n  \
+         Directory sizes and counted removals can share storage; compare `free_bytes` and\n  \
+         report the net change separately, since other sessions can write or remove data.\n",
     );
     s.push_str(
         "\nLEFTOVERS (what your tab and its verify runs left running)\n  \
@@ -5540,6 +5604,7 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("drive") => (DRIVE_PAGE.to_string(), 0),
         Some("permissions") => (permissions_page(), 0),
         Some("fleet") => (FLEET_PAGE.to_string(), 0),
+        Some("name") => (NAME_PAGE.to_string(), 0),
         Some("node") => (NODE_PAGE.to_string(), 0),
         Some("fabric") => (FABRIC_PAGE.to_string(), 0),
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),

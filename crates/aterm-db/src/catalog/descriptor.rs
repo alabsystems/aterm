@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_json::{Value, json};
+use aterm_json::Value;
 
 /// Immutable, inert table metadata. Schema names never load code or authorize
 /// credentials. A schema version change keeps its identity and conflicts until
@@ -19,29 +19,27 @@ pub struct Descriptor {
 impl Descriptor {
     /// An independently created table, even if another table has the same name.
     pub fn fresh(trust: Trust, application: &str, role: &str, version: u32) -> Result<Self> {
-        let descriptor = Self {
+        Self::validate_fields(application, role, version, None, false)?;
+        Ok(Self {
             scope: Scope::fresh(trust)?,
             application: application.into(),
             role: role.into(),
             version,
             name: None,
             deterministic: false,
-        };
-        descriptor.validate()?;
-        Ok(descriptor)
+        })
     }
     /// Independent offline opens of an application role name the same table.
     pub fn application(trust: Trust, application: &str, role: &str, version: u32) -> Result<Self> {
-        let descriptor = Self {
+        Self::validate_fields(application, role, version, None, true)?;
+        Ok(Self {
             scope: application_scope(trust, application, role)?,
             application: application.into(),
             role: role.into(),
             version,
             name: None,
             deterministic: true,
-        };
-        descriptor.validate()?;
-        Ok(descriptor)
+        })
     }
     pub(crate) fn is_twin_of(&self, retired: &Self) -> bool {
         retired.version.checked_add(1) == Some(self.version)
@@ -51,33 +49,73 @@ impl Descriptor {
             && self.name == retired.name
             && self.deterministic == retired.deterministic
     }
-    fn validate(&self) -> Result<()> {
-        if !crate::crypto::name(&self.application)
-            || !crate::crypto::name(&self.role)
-            || self.application == "aterm.catalog"
-            || self.version == 0
-            || (self.deterministic && self.name.is_some())
-            || self.name.as_ref().is_some_and(|name| {
+    fn validate_fields(
+        application: &str,
+        role: &str,
+        version: u32,
+        name: Option<&str>,
+        deterministic: bool,
+    ) -> Result<()> {
+        if !crate::crypto::name(application)
+            || !crate::crypto::name(role)
+            || application == "aterm.catalog"
+            || version == 0
+            || (deterministic && name.is_some())
+            || name.is_some_and(|name| {
                 name.is_empty() || name.len() > 128 || name.chars().any(char::is_control)
             })
-            || (self.deterministic
-                && self.scope
-                    != application_scope(self.scope.trust(), &self.application, &self.role)?)
         {
             return Err(Error::new("invalid table declaration"));
         }
         Ok(())
     }
+    fn validate(&self) -> Result<()> {
+        Self::validate_fields(
+            &self.application,
+            &self.role,
+            self.version,
+            self.name.as_deref(),
+            self.deterministic,
+        )?;
+        if self.deterministic
+            && self.scope != application_scope(self.scope.trust(), &self.application, &self.role)?
+        {
+            return Err(Error::new("invalid table declaration"));
+        }
+        Ok(())
+    }
+    fn encode_unchecked(&self) -> Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct WireDescriptor<'a> {
+            admission: &'static str,
+            application: &'a str,
+            deterministic: bool,
+            generation: u64,
+            kind: &'static str,
+            merge: &'static str,
+            name: Option<&'a str>,
+            role: &'a str,
+            table: &'a str,
+            version: u32,
+        }
+        let table = aterm_codec::hex::encode_lower(self.scope.table());
+        aterm_json::to_vec(&WireDescriptor {
+            admission: "commons-writers-v1",
+            application: &self.application,
+            deterministic: self.deterministic,
+            generation: self.scope.generation(),
+            kind: "create-table-v1",
+            merge: "causal-log-v1",
+            name: self.name.as_deref(),
+            role: &self.role,
+            table: &table,
+            version: self.version,
+        })
+        .map_err(|_| Error::new("table declaration could not be encoded"))
+    }
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        aterm_json::to_vec(&json!({
-            "kind": "create-table-v1", "table": aterm_codec::hex::encode_lower(self.scope.table()),
-            "generation": self.scope.generation(), "application": self.application,
-            "role": self.role, "version": self.version, "name": self.name,
-            "deterministic": self.deterministic,
-            "merge": "causal-log-v1", "admission": "commons-writers-v1"
-        }))
-        .map_err(|_| Error::new("table declaration could not be encoded"))
+        self.encode_unchecked()
     }
     pub(crate) fn decode(trust: Trust, payload: &[u8]) -> Result<Self> {
         if payload.len() > 4096 {
@@ -131,7 +169,7 @@ impl Descriptor {
         descriptor.validate()?;
         // One wire representation prevents duplicate keys and alternative JSON
         // spellings from becoming distinct statements of identical metadata.
-        if descriptor.encode()? != payload {
+        if descriptor.encode_unchecked()? != payload {
             return Err(Error::new("table declaration is not canonical"));
         }
         Ok(descriptor)

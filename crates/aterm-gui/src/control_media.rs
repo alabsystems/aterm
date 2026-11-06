@@ -5338,7 +5338,7 @@ mod worker_start_app_tests {
                     waited.elapsed() < std::time::Duration::from_secs(60),
                     "the launcher never held"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(hold().map(|hold| hold.until), Some(until));
 

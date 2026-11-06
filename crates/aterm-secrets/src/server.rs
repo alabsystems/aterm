@@ -4876,29 +4876,49 @@ pub fn dns_sd_args(name: &str, port: u16, ip: Ipv4Addr, txt: Option<&VaultTxt>) 
     args
 }
 
-/// Where one `dns-sd -P` registration is made: the address it names and, on a Mac on several
-/// networks at once, the interface it is scoped to ([`advert_targets`]).
+/// Where one `dns-sd -P` registration is made: the address it names and the LAN interface it is
+/// scoped to ([`advert_targets`]). Proxy records never register on every interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// The interface (`en0`) the registration is made on alone, or `None` for every interface.
+    /// The interface (`en0`) the registration is made on alone. An absent scope cannot register.
     pub scope: Option<String>,
     /// The address `<name>.local` names.
     pub ip: Ipv4Addr,
 }
 
-/// [`dns_sd_args`] for a registration at `target`: `-i <interface>` first where it is scoped.
+/// [`dns_sd_args`] for a registration at `target`, with `-i <interface>` first. `dns-sd` refuses
+/// an interface that disappeared before it starts rather than registering on every interface.
+///
+/// # Errors
+/// The target names no interface, or its scope is not an interface name.
 pub fn registration_args(
     target: &Target,
     name: &str,
     port: u16,
     txt: Option<&VaultTxt>,
-) -> Vec<String> {
-    let mut args = match &target.scope {
-        Some(interface) => vec!["-i".to_owned(), interface.clone()],
-        None => Vec::new(),
-    };
+) -> io::Result<Vec<String>> {
+    let interface = target
+        .scope
+        .as_deref()
+        .filter(|name| advert_interface(name))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no LAN interface for vault advertisement",
+            )
+        })?;
+    let mut args = vec!["-i".to_owned(), interface.to_owned()];
     args.extend(dns_sd_args(name, port, target.ip, txt));
-    args
+    Ok(args)
+}
+
+/// An interface name rather than a numeric index or a `dns-sd` option: special interface
+/// indexes must never turn a proxy record into an all-interface or loopback registration.
+fn advert_interface(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 /// Where this Mac advertises its vault now ([`advert_targets`] over its interfaces and
@@ -4914,19 +4934,16 @@ fn lan_targets() -> Vec<Target> {
 /// its vault: one registration per network it is on, each at an address its peers on that
 /// network reach.
 ///
-/// - **One network** (the usual case): one registration on every interface at `routed`, else at
-///   that network's address.
-/// - **Several networks:** one registration per network, scoped to one of its interfaces and
-///   naming that interface's own address. `routed`'s interface goes first, and serves its own
-///   network. An example is a Mac on a phone hotspot over Wi-Fi and on the LAN over a wire, as
-///   m22 was when it came back on 2026-10-28. Each link then hears an address valid on it,
-///   whichever link the default route takes. One address named on every link sends one side to
-///   an address it cannot reach.
+/// Each registration is scoped to one network's interface and names that interface's own
+/// address, including on a Mac with only one LAN. `routed`'s interface goes first, and serves
+/// its own network. Each link hears an address valid on it, whichever link the default route
+/// takes. Unscoped proxy records also claim loopback, where macOS's own hostname record can
+/// have another address: a vault advertised under the Mac's name then conflicts with itself.
 ///
 /// A network is the IPv4 subnet of an interface that is up and running and can broadcast and
 /// multicast, so no tunnel or loopback counts. Link-local addresses are left out. An interface
 /// counts once: an interface holding addresses on several subnets is counted at its lowest
-/// network's address.
+/// network's address. A routed address with no eligible interface registers nothing of its own.
 #[must_use]
 pub fn advert_targets(
     interfaces: &[crate::network::InterfaceAddress],
@@ -4938,6 +4955,7 @@ pub fn advert_targets(
     let mut lan: Vec<(Ipv4Addr, Ipv4Addr, &str)> = interfaces
         .iter()
         .filter(|at| at.flags & WANTED == WANTED && at.flags & REFUSED == 0)
+        .filter(|at| advert_interface(&at.name))
         .filter_map(|at| match (at.address, at.netmask) {
             (IpAddr::V4(ip), Some(IpAddr::V4(mask)))
                 if !ip.is_link_local() && !ip.is_loopback() && !ip.is_unspecified() =>
@@ -4964,13 +4982,6 @@ pub fn advert_targets(
                 },
             ));
         }
-    }
-    if chosen.len() < 2 {
-        return routed
-            .or_else(|| chosen.first().map(|(_, target)| target.ip))
-            .map(|ip| Target { scope: None, ip })
-            .into_iter()
-            .collect();
     }
     chosen.into_iter().map(|(_, target)| target).collect()
 }
@@ -5708,7 +5719,7 @@ impl Seams {
             })),
             targets: Box::new(lan_targets),
             spawn: Box::new(|name, port, target, txt| {
-                quiet(DNS_SD, &registration_args(target, name, port, txt))
+                quiet(DNS_SD, &registration_args(target, name, port, txt)?)
             }),
             every: ADVERTISE_EVERY,
             power: Box::new(aterm_uds::power::listen),
@@ -9043,11 +9054,10 @@ mod tests {
         assert_eq!(pid(&set), again);
     }
 
-    /// A Mac on a phone hotspot over Wi-Fi and on the LAN over a wire (m22 on its return,
-    /// 2026-10-28) advertises on each link the address valid on it, whichever link the route to
-    /// mDNS's group takes. One on a single network, two interfaces of it included, keeps one
-    /// registration on every interface at the routed address. Tunnels, link-local addresses and
-    /// a second address of one interface start nothing of their own.
+    /// A Mac on several LANs advertises on each link the address valid on it. A single LAN,
+    /// two interfaces of it included, keeps one scoped registration at the routed address.
+    /// Tunnels, loopback, link-local addresses and a second address of one interface start
+    /// nothing of their own.
     /// NEGATIVE CONTROL: targets that name only the routed address (the first one) leave the LAN
     /// with the hotspot's address.
     #[test]
@@ -9097,7 +9107,8 @@ mod tests {
             };
             assert_eq!(targets, [first, second], "routed by {routed:?}");
         }
-        let args = registration_args(&scoped("en7", [192, 168, 1, 5]), "alab-secrets", 7484, None);
+        let args = registration_args(&scoped("en7", [192, 168, 1, 5]), "alab-secrets", 7484, None)
+            .unwrap();
         assert_eq!(
             args[..4],
             ["-i", "en7", "-P", "alab-secrets"],
@@ -9110,26 +9121,64 @@ mod tests {
             wired.clone(),
             v4("en0", [192, 168, 1, 20], [255, 255, 255, 0], LAN_FLAGS),
         ];
-        let unscoped = vec![Target {
-            scope: None,
-            ip: Ipv4Addr::new(192, 168, 1, 5),
-        }];
-        assert_eq!(advert_targets(&one_lan, routed), unscoped);
+        let single = vec![scoped("en7", [192, 168, 1, 5])];
+        assert_eq!(advert_targets(&one_lan, routed), single);
         assert_eq!(
             advert_targets(&noise, routed),
-            unscoped,
-            "noise is no network"
+            [scoped("en7", [192, 168, 99, 5])],
+            "an unmatched route never replaces the interface's own address"
         );
         assert_eq!(
-            registration_args(&unscoped[0], "alab-secrets", 7484, None),
-            dns_sd_args("alab-secrets", 7484, Ipv4Addr::new(192, 168, 1, 5), None)
+            registration_args(&single[0], "alab-secrets", 7484, None).unwrap(),
+            args,
+            "one LAN stays scoped too, so its proxy record never claims loopback"
         );
         assert_eq!(
             advert_targets(&[wired], None),
-            unscoped,
+            single,
             "no route to the group: the one network's address"
         );
         assert!(advert_targets(&[], None).is_empty());
+        assert!(
+            advert_targets(&[], routed).is_empty(),
+            "a route alone names no interface on which a proxy record is safe"
+        );
+        let excluded = [
+            v4("lo0", [127, 0, 0, 1], [255, 0, 0, 0], LAN_FLAGS),
+            v4(
+                "lo0",
+                [192, 168, 1, 5],
+                [255, 255, 255, 0],
+                LAN_FLAGS | libc::IFF_LOOPBACK as u32,
+            ),
+            v4("", [192, 168, 1, 5], [255, 255, 255, 0], LAN_FLAGS),
+        ];
+        assert!(advert_targets(&excluded, routed).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_registration_without_a_lan_scope_is_refused() {
+        for scope in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("en0\0"),
+            Some("en0 -R"),
+            Some("*"),
+        ] {
+            let target = Target {
+                scope: scope.map(str::to_owned),
+                ip: Ipv4Addr::new(192, 0, 2, 5),
+            };
+            assert_eq!(
+                registration_args(&target, "aterm-scope-test", 7484, None)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "{scope:?}: a missing interface must never fall back to all interfaces"
+            );
+        }
     }
 
     /// Back on the LAN, the advert re-registers at the address the move brought as soon as the

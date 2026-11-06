@@ -1189,3 +1189,61 @@ fn local_1742_reads_yesterdays_offset_across_sydneys_daylight_change() {
         "CONTROL: reading local digits as UTC lands after the change and is an hour off"
     );
 }
+
+/// A carried usage-limit failure keeps the same pane and task at both sides of the handoff.
+/// Negative control: a working worker crosses the same park without acquiring a failure.
+#[test]
+fn a_walled_worker_and_a_working_worker_cross_the_update_with_their_panes() {
+    use crate::task_record::{TaskMark, TaskState, WHY_USAGE_LIMIT, mark_session_task};
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let host = idle_host();
+    let mut parent = desk(&host);
+    let mut workers = Vec::new();
+    for state in [TaskState::Failed, TaskState::Working] {
+        let id = crate::worker_reaper::tests::worker_tab(&mut parent);
+        crate::worker_reaper::tests::set_task(&parent, id, "/workspace");
+        let ctx = parent.pool.get(id).unwrap().ctx.clone();
+        let mut mark = TaskMark::new(state);
+        mark.why = (state == TaskState::Failed).then_some(WHY_USAGE_LIMIT);
+        mark_session_task(&ctx, id, &mark).expect("unfenced");
+        claude(&parent, id);
+        crate::feed_session_for_test(
+            &parent,
+            id,
+            b"You've hit your 5-hour limit. Usage limit reached; continuing automatically.\r\n",
+        );
+        workers.push((sid(&parent, id), state));
+    }
+    assert!(
+        parent
+            .reap_workers(Instant::now() + crate::worker_reaper::LINGER * 100)
+            .is_empty()
+    );
+    let handoff = park(&mut parent);
+    let records: Vec<_> = workers
+        .iter()
+        .map(|(sid, state)| {
+            let record = record_of(&handoff, sid);
+            assert!(
+                record
+                    .task
+                    .as_ref()
+                    .is_some_and(|row| row.contains(state.as_str()))
+            );
+            record
+        })
+        .collect();
+    let (mut next, ids) = successor(&records, &host);
+    for ((id, record), (_, state)) in ids.iter().zip(&records).zip(&workers) {
+        let ctx = next.pool.get(*id).unwrap().ctx.clone();
+        crate::task_record::seed_carried(&ctx, record.task.as_deref());
+        crate::worker_reaper::tests::mark_ephemeral(&mut next, *id);
+        assert_eq!(ctx.timeline.lock().unwrap().task().unwrap().state, *state);
+    }
+    assert!(
+        next.reap_workers(Instant::now() + crate::worker_reaper::LINGER * 100)
+            .is_empty()
+    );
+    assert!(ids.iter().all(|id| next.pool.get(*id).is_some()));
+    host.shutdown_and_join();
+}

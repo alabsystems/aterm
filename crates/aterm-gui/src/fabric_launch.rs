@@ -20,12 +20,24 @@ const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 /// healthy-then-dying runs launches about once per this.
 const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
 
-/// How long a retired generation's lanes get to end ([`Launched::retire`]). They must: hung up,
-/// each has only a verb it is already in to finish, and then the loss to say.
+/// How long a retired generation's lanes get to end before a warning says they have not
+/// ([`Retiring::watch`]). They should: hung up, each has only a verb it is already in to finish,
+/// and then the loss to say. No relaunch waits on them.
 const LANES_END_WAIT: Duration = Duration::from_secs(60);
 
-/// What a served lane holds until its thread is done, its loss said ([`Launched::retire`]).
+/// What a served lane holds until its thread is done, its loss said ([`Retiring::watch`]).
 pub(crate) type LaneEnded = std::sync::mpsc::Sender<std::convert::Infallible>;
+
+/// What the supervisor tells the link of a generation one of whose lanes it served, on its own
+/// thread: the attach once the lanes are served ([`launch_serving`]), the loss once its bridge
+/// has exited ([`Launched::retire`]). Told there, one generation's attach, its loss and the next
+/// one's attach reach the link in that order, however its lanes are scheduled and however long
+/// they take to end. Each lane tells the attach too, before it serves a verb, and the loss as it
+/// ends; the link takes a generation's attach once.
+struct Told {
+    attached: fn(crate::fabric::BridgeGeneration),
+    lost: Box<dyn FnOnce(crate::fabric::BridgeGeneration)>,
+}
 
 /// How long a QUIT waits for its bridge to take `bye quit` ([`bye`]).
 pub(crate) const BYE_WAIT: Duration = Duration::from_secs(1);
@@ -385,7 +397,7 @@ fn supervise_with(
                 let started = Instant::now();
                 let status = launched.wait();
                 let ran = started.elapsed();
-                launched.retire(LANES_END_WAIT);
+                launched.retire().watch_behind(LANES_END_WAIT);
                 backoff = next_backoff(backoff, Some(ran));
                 let how = match &status {
                     Ok(s) => s.to_string(),
@@ -426,6 +438,9 @@ fn next_backoff(current: Duration, ran: Option<Duration>) -> Duration {
 struct Launched {
     child: LaneChild,
     near: [std::os::unix::net::UnixStream; 2],
+    generation: crate::fabric::BridgeGeneration,
+    /// [`Told::lost`], when one of its lanes was served.
+    lost: Option<Box<dyn FnOnce(crate::fabric::BridgeGeneration)>>,
     /// Disconnected once no lane holds a [`LaneEnded`] any more.
     lanes_ended: std::sync::mpsc::Receiver<std::convert::Infallible>,
 }
@@ -435,35 +450,90 @@ impl Launched {
         self.child.wait()
     }
 
-    /// Hang up the lanes of a bridge that has exited and wait for their threads to end.
+    /// Hang up the lanes of a bridge that has exited and tell its generation's loss, waiting on
+    /// none of them: what is left is their ending ([`Retiring`]).
     ///
-    /// THE ORDER A RELAUNCH AT ONCE RESTS ON: each lane says the loss of its generation as it
-    /// ends (`BridgeLostGuard`), and a loss that lands after the next generation's attach is
-    /// the link's transition skipped and a `fabric-lost` sweep over sessions the new bridge
-    /// serves. A lane past `within` is a warning, not a bridge held off for good.
-    fn retire(self, within: Duration) {
+    /// THE ORDER A RELAUNCH AT ONCE RESTS ON: the loss is told here, on the supervisor's thread,
+    /// before it launches the next generation ([`Told`]), so the link's hearers read this
+    /// generation `disconnected` ahead of the next one's attach and, under `[fabric]
+    /// hold_on_bridge_lost`, every session it governed is held before a new bridge can free it.
+    /// A `hold` its lanes had already read lands before that sweep takes its session, or moves
+    /// nothing (`fabric::HOLD_LANE_LOST`): no verb of a lost generation lifts the sweep's hold
+    /// or halts a session the next bridge serves. Each lane says the loss again as it ends
+    /// (`BridgeLostGuard`). Ahead of the next attach that sweeps again (a session a verb still in
+    /// flight touched is held too). Past it the generation is a dead one, whose loss neither
+    /// moves the link nor holds or advises a session the new bridge serves
+    /// (`fabric::bridge_lost_waking`).
+    fn retire(self) -> Retiring {
         for lane in &self.near {
             aterm_uds::hangup::hang_up(lane);
         }
-        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-            self.lanes_ended.recv_timeout(within)
-        {
+        if let Some(lost) = self.lost {
+            lost(self.generation);
+        }
+        Retiring {
+            lanes_ended: self.lanes_ended,
+        }
+    }
+}
+
+/// A retired generation's lanes, ending behind the next launch ([`Launched::retire`]).
+struct Retiring {
+    /// Disconnected once no lane holds a [`LaneEnded`] any more.
+    lanes_ended: std::sync::mpsc::Receiver<std::convert::Infallible>,
+}
+
+impl Retiring {
+    /// Wait for every lane to let go of its [`LaneEnded`], warning if one has not `within` the
+    /// bridge's exit: whether all had.
+    fn watch(self, within: Duration) -> bool {
+        let ended = !matches!(
+            self.lanes_ended.recv_timeout(within),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        if !ended {
             aterm_log::warn!(
-                "fabric bridge lanes had not ended {:.1}s after its exit; the next bridge starts \
-                 without them, and their loss lands after its attach",
+                "fabric bridge lanes had not ended {:.1}s after its exit; the next bridge runs \
+                 beside them, and their late loss neither moves the link nor holds a session",
                 within.as_secs_f64()
+            );
+        }
+        ended
+    }
+
+    /// [`Self::watch`] on a thread of its own, so the next launch waits on none of the lanes.
+    fn watch_behind(self, within: Duration) {
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-fabric-retire".to_string(),
+            crate::qos::Role::Background,
+            move || {
+                self.watch(within);
+            },
+        );
+        if let Err(e) = spawned {
+            aterm_log::warn!(
+                "fabric bridge lanes cannot be watched to their end ({e}); one that does not end \
+                 goes unwarned of"
             );
         }
     }
 }
 
 fn launch_once(argv: &[String]) -> std::io::Result<Launched> {
-    launch_serving(argv, crate::control::attach_fabric_bridge)
+    launch_serving(
+        argv,
+        crate::control::attach_fabric_bridge,
+        Told {
+            attached: crate::fabric::bridge_attached,
+            lost: Box::new(crate::control::fabric_bridge_exited),
+        },
+    )
 }
 
 fn launch_serving(
     argv: &[String],
     attach: impl Fn(std::os::unix::net::UnixStream, crate::fabric::BridgeGeneration, LaneEnded) -> bool,
+    told: Told,
 ) -> std::io::Result<Launched> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -491,15 +561,23 @@ fn launch_serving(
 
     let generation = crate::fabric::next_bridge_generation();
     let (ended, lanes_ended) = std::sync::mpsc::channel();
-    if !attach(near_verb, generation, ended.clone()) {
+    let verb = attach(near_verb, generation, ended.clone());
+    if !verb {
         aterm_log::warn!("fabric bridge verb lane could not be served");
     }
-    if !attach(near_push, generation, ended) {
+    let push = attach(near_push, generation, ended);
+    if !push {
         aterm_log::warn!("fabric bridge push lane could not be served");
+    }
+    let served = verb || push;
+    if served {
+        (told.attached)(generation);
     }
     Ok(Launched {
         child,
         near,
+        generation,
+        lost: served.then_some(told.lost),
         lanes_ended,
     })
 }
@@ -539,6 +617,14 @@ mod tests {
         Config::parse(text).map_err(|e| e.to_string())
     }
 
+    /// A [`Told`] that tells the process-wide link nothing, for a test about the lanes alone.
+    fn untold() -> Told {
+        Told {
+            attached: |_| {},
+            lost: Box::new(|_| {}),
+        }
+    }
+
     fn true_program() -> String {
         ["/usr/bin/true", "/bin/true"]
             .into_iter()
@@ -558,7 +644,7 @@ mod tests {
                 &argv,
                 |argv| {
                     launches.set(launches.get() + 1);
-                    launch_serving(argv, |_, _, _| true)
+                    launch_serving(argv, |_, _, _| true, untold())
                 },
                 || launches.get() > 0,
                 |_| {},
@@ -655,7 +741,8 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let mut launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let mut launched =
+            launch_serving(&argv, recorder, untold()).expect("launch the stand-in bridge");
         let (mut verb, push) = {
             let mut near = served.lock().unwrap();
             assert_eq!(near.len(), 2, "both lanes served");
@@ -672,7 +759,7 @@ mod tests {
             .expect("the holder's pid");
         let holder: i32 = line.trim().parse().expect("a pid");
         let status = launched.wait().expect("reap the bridge");
-        launched.retire(LANES_END_WAIT);
+        launched.retire();
         let mut byte = [0u8; 1];
         let read = verb.read(&mut byte);
         // SAFETY: sends a signal to the live holder pid started by this test's bridge.
@@ -712,7 +799,8 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let mut launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let mut launched =
+            launch_serving(&argv, recorder, untold()).expect("launch the stand-in bridge");
         let (verb, push) = {
             let mut near = served.lock().unwrap();
             assert_eq!(near.len(), 2, "both lanes served");
@@ -727,7 +815,7 @@ mod tests {
             .expect("the holder's pid");
         let holder: i32 = line.trim().parse().expect("a pid");
         let status = launched.wait().expect("reap the bridge");
-        launched.retire(LANES_END_WAIT);
+        launched.retire();
         let wrote = (&verb).write(b"after the retire\n").map_err(|e| e.kind());
         // SAFETY: sends a signal to the live holder pid started by this test's bridge.
         unsafe {
@@ -901,7 +989,11 @@ mod tests {
             |argv| {
                 let first = launches.get() == 0;
                 launches.set(launches.get() + 1);
-                launch_serving(if first { &healthy } else { argv }, |_, _, _| true)
+                launch_serving(
+                    if first { &healthy } else { argv },
+                    |_, _, _| true,
+                    untold(),
+                )
             },
             || launches.get() == 3,
             |waited| paused.borrow_mut().push(waited),
@@ -912,45 +1004,131 @@ mod tests {
         );
     }
 
-    /// Two bridges one straight after the other, no wait between them, as a healthy run's
-    /// relaunch has it: the first retired within `within`, its lanes each staying up to `linger`
-    /// past their hang-up for the second to attach before they say their loss. Answers what the
-    /// link's hook told its hearer, the node log (`session_log_node::install`), as `(state,
-    /// generation)` in order.
-    fn the_link_over_a_relaunch(within: Duration, linger: Duration) -> Vec<(String, u64)> {
+    /// What [`the_link_over_a_relaunch`] read.
+    struct Relaunch {
+        /// What the link's hook told its hearer, the node log (`session_log_node::install`), as
+        /// `(state, generation)` in order.
+        heard: Vec<(String, u64)>,
+        /// What the loop asked to wait after each bridge's exit.
+        paused: Vec<Duration>,
+        /// Whether both of the first bridge's lanes, hung up, were still up when the second
+        /// bridge had attached and freed the session.
+        freed_beside_the_first: bool,
+        /// The governed session's hold once the first bridge's lanes had said their loss, the
+        /// second bridge still up and serving it.
+        hold_after_the_late_loss: Option<String>,
+    }
+
+    /// Two bridges under the supervisor's own loop, its pauses recorded and not slept, over one
+    /// session they govern, with `[fabric] hold_on_bridge_lost` on. Each bridge reads its verb
+    /// lane until aterm's end of it closes for writing, so its verb lane says when it exits.
+    ///
+    /// The lanes are what `control::attach_fabric_bridge` and its `serve_bridge` do of a lane,
+    /// reduced to the attach, reading to the hang-up and then saying the loss (`BridgeLostGuard`).
+    /// The first bridge frees the session (a `hold off`, which governs it) and exits. Its lanes
+    /// stay past their hang-up until the second bridge has attached and freed the session as a
+    /// reconnecting bridge's `hold off` does. The second bridge stays up until both of them have
+    /// said their loss and the session's hold is read.
+    ///
+    /// `exit_tells_loss` is the supervisor telling each generation's loss at its exit, as
+    /// `control::fabric_bridge_exited` does; with it off, the lanes alone say it.
+    fn the_link_over_a_relaunch(exit_tells_loss: bool) -> Relaunch {
         use std::os::unix::net::UnixStream;
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+        crate::fabric::set_hold_on_bridge_lost(true);
         let log = crate::session_log_node::node_log();
         let before = log.last_seq();
         let store = crate::session_store::new_store();
-        let argv = vec![true_program()];
+        let handle = crate::session_store::test_handle(1);
+        let sid = handle.sid.as_str().to_string();
+        let ctx = handle.ctx.clone();
+        store.write().unwrap().register(handle);
+        let argv: Vec<String> = ["/bin/sh", "-c", "exec cat <&3 >/dev/null"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let threads = Arc::new(Mutex::new(Vec::new()));
-        let next_attached = Arc::new(AtomicBool::new(false));
-        // What `control::attach_fabric_bridge` and its `serve_bridge` do of a lane, the serving
-        // and its guard reduced to reading to the hang-up and then saying the loss.
-        let lane = |linger: Duration, attaches_next: bool| {
-            let store = store.clone();
-            let threads = Arc::clone(&threads);
-            let next_attached = Arc::clone(&next_attached);
+        let freed = Arc::new(AtomicBool::new(false));
+        let lingered = Arc::new(AtomicUsize::new(0));
+        let late_said = Arc::new(AtomicUsize::new(0));
+        let hold_read = Arc::new(Mutex::new(None::<Option<String>>));
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let lane = |first: bool| {
+            let (store, sid, threads) = (store.clone(), sid.clone(), Arc::clone(&threads));
+            let (freed, lingered) = (Arc::clone(&freed), Arc::clone(&lingered));
+            let (late_said, hold_read, ctx) =
+                (Arc::clone(&late_said), Arc::clone(&hold_read), ctx.clone());
+            let (answers, exits) = (Arc::clone(&answers), Arc::clone(&exits));
+            let lanes = AtomicUsize::new(0);
             move |near: UnixStream,
                   generation: crate::fabric::BridgeGeneration,
                   ended: LaneEnded| {
-                let store = store.clone();
-                let next_attached = Arc::clone(&next_attached);
+                let verb = lanes.fetch_add(1, Ordering::SeqCst) == 0;
+                let (store, sid) = (store.clone(), sid.clone());
+                let (freed, lingered) = (Arc::clone(&freed), Arc::clone(&lingered));
+                let (late_said, hold_read, ctx) =
+                    (Arc::clone(&late_said), Arc::clone(&hold_read), ctx.clone());
+                let answers = Arc::clone(&answers);
+                let free = {
+                    let store = store.clone();
+                    move || {
+                        let rest = format!("{sid} off");
+                        crate::fabric::cmd_hold(&store, &rest, crate::fabric::HoldIssuer::Bridge)
+                    }
+                };
+                let must = |done: &dyn Fn() -> bool| {
+                    aterm_spec::wait::within(
+                        aterm_spec::wait::MUST_HAPPEN,
+                        Duration::from_millis(1),
+                        || done().then_some(()),
+                    )
+                    .is_some()
+                };
+                // Asserting nothing here: a lane that panicked before its shutdown would leave its
+                // bridge reading for good and the supervisor's wait with it. The test asserts what
+                // the lanes recorded once every one has been joined.
+                let exit = {
+                    let exits = Arc::clone(&exits);
+                    move |near: &UnixStream| {
+                        let shut = near.shutdown(std::net::Shutdown::Write);
+                        exits.lock().unwrap().push(shut.map_err(|e| e.kind()));
+                    }
+                };
                 let thread = crate::qos::spawn_lane_thread(
                     "aterm-fabric-bridge".to_string(),
                     crate::qos::Role::Responsive,
                     move || {
                         let _ended = ended;
+                        crate::fabric::set_lane_generation(generation);
                         crate::fabric::bridge_attached(generation);
-                        next_attached.fetch_or(attaches_next, Ordering::SeqCst);
-                        let _ = std::io::copy(&mut &near, &mut std::io::sink());
-                        let _ = aterm_spec::wait::within(linger, Duration::from_millis(1), || {
-                            next_attached.load(Ordering::SeqCst).then_some(())
-                        });
-                        crate::fabric::bridge_lost(&store, generation);
+                        if first {
+                            if verb {
+                                let answer = free();
+                                exit(&near);
+                                answers.lock().unwrap().push(("first", answer));
+                            }
+                            let _ = std::io::copy(&mut &near, &mut std::io::sink());
+                            if must(&|| freed.load(Ordering::SeqCst)) {
+                                lingered.fetch_add(1, Ordering::SeqCst);
+                            }
+                            crate::fabric::bridge_lost(&store, generation);
+                            late_said.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            if verb {
+                                let answer = free();
+                                freed.store(true, Ordering::SeqCst);
+                                let _ = must(&|| late_said.load(Ordering::SeqCst) == 2);
+                                *hold_read.lock().unwrap() =
+                                    Some(ctx.fabric.hold().map(|hold| hold.reason));
+                                exit(&near);
+                                answers.lock().unwrap().push(("second", answer));
+                            }
+                            let _ = std::io::copy(&mut &near, &mut std::io::sink());
+                            crate::fabric::bridge_lost(&store, generation);
+                        }
                     },
                 )
                 .expect("a lane's thread");
@@ -958,17 +1136,45 @@ mod tests {
                 true
             }
         };
-        let mut first =
-            launch_serving(&argv, lane(linger, false)).expect("launch the first bridge");
-        first.wait().expect("reap the first bridge");
-        first.retire(within);
-        let mut second =
-            launch_serving(&argv, lane(Duration::ZERO, true)).expect("launch the second bridge");
-        second.wait().expect("reap the second bridge");
-        second.retire(LANES_END_WAIT);
+        let told = || Told {
+            attached: crate::fabric::bridge_attached,
+            lost: if exit_tells_loss {
+                let store = store.clone();
+                Box::new(move |generation| {
+                    crate::fabric::bridge_lost(&store, generation);
+                })
+            } else {
+                Box::new(|_| {})
+            },
+        };
+        let launches = std::cell::Cell::new(0_u32);
+        let paused = std::cell::RefCell::new(Vec::new());
+        supervise_with(
+            &argv,
+            |argv| {
+                let first = launches.get() == 0;
+                launches.set(launches.get() + 1);
+                launch_serving(argv, lane(first), told())
+            },
+            || launches.get() == 2,
+            |waited| paused.borrow_mut().push(waited),
+        );
         for thread in std::mem::take(&mut *threads.lock().unwrap()) {
             thread.join().expect("a lane's thread");
         }
+        assert_eq!(
+            *exits.lock().unwrap(),
+            [Ok(()), Ok(())],
+            "each bridge's verb lane shut for writing"
+        );
+        assert_eq!(
+            *answers.lock().unwrap(),
+            [
+                ("first", "OK hold=0\n".to_string()),
+                ("second", "OK hold=0\n".to_string())
+            ],
+            "the first bridge governs the session, and the second frees it"
+        );
         let word = |line: &str, key: &str| -> String {
             line.split(key)
                 .nth(1)
@@ -976,7 +1182,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("no{key} in {line}"))
                 .to_string()
         };
-        log.lines()
+        let heard = log
+            .lines()
             .into_iter()
             .filter(|l| {
                 l.split(' ').next().and_then(|s| s.parse::<u64>().ok()) > Some(before)
@@ -986,17 +1193,30 @@ mod tests {
                 let generation = word(&l, " gen=").parse().expect("a generation");
                 (word(&l, " state="), generation)
             })
-            .collect()
+            .collect();
+        let hold_after_the_late_loss = hold_read
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the second bridge read the hold");
+        Relaunch {
+            heard,
+            paused: paused.into_inner(),
+            freed_beside_the_first: lingered.load(Ordering::SeqCst) == 2,
+            hold_after_the_late_loss,
+        }
     }
 
-    /// THE ORDER A RELAUNCH AT ONCE RESTS ON, and its negative control: the same two bridges with
-    /// a retire that does not wait for the lanes (planted by a `within` of zero) lose the first
-    /// one's `Lost` to the second one's attach.
+    /// THE ORDER A RELAUNCH AT ONCE RESTS ON, however long the old generation's lanes take: the
+    /// first bridge's lanes say their loss only after the second has attached, and the link still
+    /// reads the first `disconnected` ahead of the second's attach. Its negative control: the same
+    /// relaunch with the loss said by the lanes alone (planted by `exit_tells_loss` off) loses the
+    /// first one's `Lost` to the second one's attach.
     #[test]
     fn a_relaunched_generation_attaches_after_the_old_generations_loss() {
         crate::session_log_node::install();
         crate::fabric::with_link_reset(|| {
-            let heard = the_link_over_a_relaunch(LANES_END_WAIT, Duration::from_millis(100));
+            let Relaunch { heard, .. } = the_link_over_a_relaunch(true);
             let states: Vec<&str> = heard.iter().map(|(state, _)| state.as_str()).collect();
             assert_eq!(
                 states,
@@ -1008,7 +1228,7 @@ mod tests {
             assert!(heard[1].1 < heard[2].1, "{heard:?}");
         });
         crate::fabric::with_link_reset(|| {
-            let heard = the_link_over_a_relaunch(Duration::ZERO, aterm_spec::wait::MUST_HAPPEN);
+            let Relaunch { heard, .. } = the_link_over_a_relaunch(false);
             let lost: Vec<u64> = heard
                 .iter()
                 .filter(|(state, _)| state == "disconnected")
@@ -1018,8 +1238,40 @@ mod tests {
             assert_eq!(
                 Some(lost.as_slice()),
                 attached.map(|(_, generation)| std::slice::from_ref(generation)),
-                "unwaited for, the old generation's loss lands past the attach and is no \
-                 transition: {heard:?}"
+                "said by the lanes alone, the old generation's loss lands past the attach and is \
+                 no transition: {heard:?}"
+            );
+        });
+    }
+
+    /// A RELAUNCH WAITS ON NO LANE OF THE BRIDGE IT REPLACES, AND THAT BRIDGE'S LATE LOSS HOLDS NO
+    /// SESSION THE NEW ONE FREED. Under `[fabric] hold_on_bridge_lost`, the first bridge's exit
+    /// holds the session it governed; the second launches after the back-off alone, while the
+    /// first's lanes are still up, and frees it. The first's lanes then say their loss, a dead
+    /// generation's, and the session stays free.
+    ///
+    /// NEGATIVE CONTROL: without the `superseded` check on `HoldAct::Lost` in
+    /// `aterm_gui_fabric::apply_hold_as`, the late loss holds the session again
+    /// (`hold_after_the_late_loss` reads `Some("fabric-lost")`, 2026-11-05).
+    #[test]
+    fn a_relaunch_waits_on_no_old_lane_and_the_old_ones_late_loss_holds_no_session() {
+        crate::session_log_node::install();
+        crate::fabric::with_link_reset(|| {
+            let relaunch = the_link_over_a_relaunch(true);
+            assert_eq!(
+                relaunch.paused,
+                [RELAUNCH_MIN * 2, RELAUNCH_MIN * 4],
+                "the loop waits the back-off after each young death and nothing else"
+            );
+            assert!(
+                relaunch.freed_beside_the_first,
+                "the second bridge attached and freed the session while the first's lanes were \
+                 still up: {:?}",
+                relaunch.heard
+            );
+            assert_eq!(
+                relaunch.hold_after_the_late_loss, None,
+                "a dead generation's late loss held a session the new bridge serves"
             );
         });
     }
@@ -1040,14 +1292,22 @@ mod tests {
         let argv = vec![true_program()];
         let warning = |logged: &[String]| logged.iter().any(|l| l.contains("had not ended"));
 
-        let mut wedged = launch_serving(&argv, &recorder).expect("launch the stand-in bridge");
+        let mut wedged =
+            launch_serving(&argv, &recorder, untold()).expect("launch the stand-in bridge");
         wedged.wait().expect("reap the bridge");
-        let logged = crate::test_log::logged_while(|| wedged.retire(Duration::from_millis(1)));
+        let retiring = wedged.retire();
+        let logged = crate::test_log::logged_while(|| {
+            assert!(!retiring.watch(Duration::from_millis(1)), "a lane is held");
+        });
         assert!(warning(&logged), "{logged:?}");
 
-        let mut ended = launch_serving(&argv, |_, _, _| true).expect("launch the stand-in bridge");
+        let mut ended =
+            launch_serving(&argv, |_, _, _| true, untold()).expect("launch the stand-in bridge");
         ended.wait().expect("reap the bridge");
-        let logged = crate::test_log::logged_while(|| ended.retire(LANES_END_WAIT));
+        let retiring = ended.retire();
+        let logged = crate::test_log::logged_while(|| {
+            assert!(retiring.watch(LANES_END_WAIT), "no lane is held");
+        });
         assert!(!warning(&logged), "{logged:?}");
     }
 
@@ -1291,7 +1551,7 @@ mod tests {
                     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                     while seq(&store) < 3 {
                         assert!(Instant::now() < deadline, "the quit was never said");
-                        std::thread::yield_now();
+                        aterm_uds::deadline::poll_yield();
                     }
                     crate::fabric::cmd_link(&store, "bye quit", Some(generation))
                 })

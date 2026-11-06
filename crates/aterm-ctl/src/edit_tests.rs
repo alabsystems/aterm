@@ -255,6 +255,7 @@ fn err_reply_selects_terminal_face() {
             for_word: None,
             wait: true,
             read_only: false,
+            secret: None,
         };
         let err = edit_over(&mut wire, sid, &request).expect_err("invalid session");
         assert!(matches!(err, EditErr::Unsendable(_)), "{sid:?}: {err:?}");
@@ -296,6 +297,7 @@ fn err_reply_selects_terminal_face() {
         for_word: Some("git".to_string()),
         wait: true,
         read_only: false,
+        secret: None,
     };
     let mut wire = Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::NotFound.into())]);
     let err = edit_over(&mut wire, SID, &request).expect_err("nothing to ask");
@@ -407,6 +409,7 @@ fn edit_and_await_edit_over_a_real_socket() {
         for_word: None,
         wait: true,
         read_only: false,
+        secret: None,
     };
     let opened = edit_over(&mut wire, SID, &request).expect("opened");
     let outcome = await_over(&mut wire, SID, AwaitKey::Ticket(opened.ticket), &opened.uri)

@@ -295,6 +295,17 @@ pub const fn federation_seq_clamp(src_offset: u64, max_seq: u64) -> u64 {
     }
 }
 
+/// `federation_commit_bound` as `federation_island.rs` defines it in Clean:
+/// `if upto < held then upto else held`.
+#[must_use]
+pub const fn federation_commit_bound(upto: u64, held: u64) -> u64 {
+    if upto < held {
+        upto
+    } else {
+        held
+    }
+}
+
 /// `relay_floor_raise` as `relay_island.rs` defines it in Clean:
 /// `if floor < seq then seq else floor`.
 #[cfg(any(test, all(feature = "retention", feature = "relay")))]
@@ -539,6 +550,11 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::rate_tokens_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::federation_seq_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| super::federation_seq_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::federation::federation_commit_bound(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::federation_commit_bound(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::failover_quorum_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| super::failover_quorum_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::refill_debt_clamp(a, b)), want);

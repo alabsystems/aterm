@@ -347,6 +347,71 @@ fn a_bundle_of_the_vault_this_mac_waits_for_under_another_name_writes_nothing() 
     a.server.stop();
 }
 
+/// A bundle that moves this Mac to a vault its acknowledged history has no room for is refused as
+/// the write will refuse it, before the write has saved the new configuration and forgotten what
+/// this Mac held. The history judges such a move as the replacement it will be (`afresh`), which
+/// asks for room where the check of an ordinary write stops at no applied frontier.
+///
+/// NEGATIVE CONTROL (2026-11-05): with `validate_configured` passing `false` for `afresh`, the
+/// joiner takes a bundle the write then refuses, the write having gone part way: `accepted Ok(()),
+/// written Err("retained membership context capacity exhausted"), same configuration false, same
+/// floor and envelope false`.
+#[test]
+fn a_move_the_history_has_no_room_for_is_refused_before_anything_is_written() {
+    let _answering = ServersAnswering::set();
+    let (a, b) = two_vaults();
+    let mac = &a.m7;
+    retained_history::fill_contexts(mac);
+    let admin = admin_open(&a.m22).unwrap();
+    admin_revoke(&a.m22, &admin, "m7", false).unwrap();
+    let _ = sync(mac, None);
+    assert_eq!(
+        load_state(mac).unwrap().membership,
+        Stored::Revoked,
+        "PRECONDITION: A let m7 go"
+    );
+    let device = Device::open(mac).unwrap().expect("a device");
+    let member = Bootstrap::required(&b.m7).unwrap();
+    let trust = member.trust();
+    let request = device.request(trust.network, trust.authority).unwrap();
+    let allowed = member
+        .device()
+        .with_seed(|seed| crate::members::Allowed::sign(request.binding(), "m30", seed))
+        .unwrap();
+    let (bundle, logged) = hand(&b.m7, &request, &allowed, true);
+    assert!(logged, "PRECONDITION: B's member hands its log");
+
+    let held = |mac: &Paths| {
+        let state = load_state(mac).unwrap();
+        (
+            state.seq,
+            state.digest,
+            state.records_digest,
+            std::fs::read(mac.cache_file()).unwrap(),
+        )
+    };
+    let config_before = configured(mac).unwrap();
+    let before = held(mac);
+    let accepted = accepts_bundle(mac, &bundle).map_err(|e| e.to_string());
+    let written = write_from_log_bundle(mac, &bundle)
+        .map(drop)
+        .map_err(|e| e.to_string());
+    let same_config = configured(mac).unwrap() == config_before;
+    let same_held = held(mac) == before;
+    let no_room = |result: &Result<(), String>| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("context capacity exhausted"))
+    };
+    assert!(
+        no_room(&accepted) && no_room(&written) && same_config && same_held,
+        "accepted {accepted:?}, written {written:?}, same configuration {same_config}, same floor \
+         and envelope {same_held}"
+    );
+    a.server.stop();
+    b.server.stop();
+}
+
 /// A member's bundle of the vault this Mac waits to be let into, by its log
 /// (`write_from_log_bundle`) and by its `[everyone]` files (`write_from_bundle`): the same vault
 /// keeps the version and the envelope digest this Mac applied of it, and its cached envelope, so

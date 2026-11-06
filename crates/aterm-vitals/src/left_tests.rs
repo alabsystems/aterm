@@ -24,6 +24,8 @@ fn closed_tab() -> ClosedTab {
         closed_ms: 1_792_000_000_000,
         agent_spans: Vec::new(),
         left: 0,
+        restored: false,
+        told: false,
     }
 }
 

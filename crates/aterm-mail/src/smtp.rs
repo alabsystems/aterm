@@ -31,10 +31,13 @@ fn submit(
         Authentication::Password { .. } => ("PLAIN", auth.plain()),
         Authentication::OAuth { .. } => ("XOAUTH2", auth.xoauth2()),
     };
-    let encoded =
-        aterm_codec::base64::encode(credentials.ok_or("Missing mail credentials")?.as_bytes())
-            .map_err(|e| e.to_string())?;
+    let credentials = credentials.ok_or("Missing mail credentials")?;
+    let encoded = zeroize::Zeroizing::new(
+        aterm_codec::base64::encode(credentials.as_bytes()).map_err(|e| e.to_string())?,
+    );
+    drop(credentials);
     authenticate(&mut wire, mechanism, &encoded)?;
+    drop(encoded);
     command(&mut wire, &format!("MAIL FROM:<{}>", draft.from), 250)?;
     for recipient in draft.to.iter().chain(&draft.cc).chain(&draft.bcc) {
         command(&mut wire, &format!("RCPT TO:<{recipient}>"), 250)?;
@@ -52,16 +55,25 @@ fn submit(
 }
 
 fn authenticate(wire: &mut Wire, mechanism: &str, encoded: &str) -> Result<(), String> {
-    let inline = format!("AUTH {mechanism} {encoded}");
+    let inline_len = 5 + mechanism.len() + 1 + encoded.len();
     // RFC 4954 §4: when `AUTH <mech> <initial-response>\r\n` would exceed SMTP's 512-octet command
     // line limit (typical for OAuth2 bearer tokens), send `AUTH <mech>` first and transmit the
     // base64 response after the server's `334` SASL continuation.
-    let mut code = if inline.len() + 2 <= 512 {
-        wire.write(format!("{inline}\r\n").as_bytes())?;
+    let mut code = if inline_len + 2 <= 512 {
+        let mut line = zeroize::Zeroizing::new(Vec::with_capacity(inline_len + 2));
+        line.extend_from_slice(b"AUTH ");
+        line.extend_from_slice(mechanism.as_bytes());
+        line.push(b' ');
+        line.extend_from_slice(encoded.as_bytes());
+        line.extend_from_slice(b"\r\n");
+        wire.write(&line)?;
         read_code(wire)?
     } else {
         command(wire, &format!("AUTH {mechanism}"), 334)?;
-        wire.write(format!("{encoded}\r\n").as_bytes())?;
+        let mut line = zeroize::Zeroizing::new(Vec::with_capacity(encoded.len() + 2));
+        line.extend_from_slice(encoded.as_bytes());
+        line.extend_from_slice(b"\r\n");
+        wire.write(&line)?;
         read_code(wire)?
     };
     if code == 334 {
@@ -152,10 +164,11 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
             if !subject.is_empty() {
                 subject.push_str("\r\n ");
             }
-            subject.push_str(&format!(
-                "=?UTF-8?B?{}?=",
-                aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?
-            ));
+            subject.push_str("=?UTF-8?B?");
+            subject.push_str(
+                &aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?,
+            );
+            subject.push_str("?=");
             part.clear();
         }
         part.push(ch);
@@ -164,10 +177,9 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
         if !subject.is_empty() {
             subject.push_str("\r\n ");
         }
-        subject.push_str(&format!(
-            "=?UTF-8?B?{}?=",
-            aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?
-        ));
+        subject.push_str("=?UTF-8?B?");
+        subject.push_str(&aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?);
+        subject.push_str("?=");
     }
     let mut normalized = Vec::with_capacity(draft.text.len().saturating_add(draft.text.len() / 16));
     let raw_text = draft.text.as_bytes();
@@ -197,23 +209,53 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
     let date = mail_date(now)?;
     let mut identifier = [0u8; 16];
     aterm_uds::rand::fill(&mut identifier).map_err(|_| "Could not generate message identity")?;
-    let identifier = aterm_codec::base64::encode(&identifier)
+    let mut identifier = aterm_codec::base64::encode(&identifier)
         .map_err(|e| e.to_string())?
-        .trim_end_matches('=')
-        .replace('+', "-")
-        .replace('/', "_");
+        .into_bytes();
+    while identifier.last() == Some(&b'=') {
+        identifier.pop();
+    }
+    for b in &mut identifier {
+        match *b {
+            b'+' => *b = b'-',
+            b'/' => *b = b'_',
+            _ => {}
+        }
+    }
+    let identifier = String::from_utf8(identifier).map_err(|e| e.to_string())?;
     let domain = draft.from.split_once('@').ok_or("Invalid sender")?.1;
-    let mut message = format!(
+    let mut message =
+        String::with_capacity(256 + subject.len() + body.len() + (body.len() / 76) * 2);
+    use std::fmt::Write as _;
+    let _ = write!(
+        message,
         "Date: {date}\r\nMessage-ID: <{identifier}@{domain}>\r\nFrom: {}\r\n",
         draft.from
     );
     if !draft.to.is_empty() {
-        message.push_str(&format!("To: {}\r\n", draft.to.join(", ")));
+        message.push_str("To: ");
+        for (i, addr) in draft.to.iter().enumerate() {
+            if i > 0 {
+                message.push_str(", ");
+            }
+            message.push_str(addr);
+        }
+        message.push_str("\r\n");
     }
     if !draft.cc.is_empty() {
-        message.push_str(&format!("Cc: {}\r\n", draft.cc.join(", ")));
+        message.push_str("Cc: ");
+        for (i, addr) in draft.cc.iter().enumerate() {
+            if i > 0 {
+                message.push_str(", ");
+            }
+            message.push_str(addr);
+        }
+        message.push_str("\r\n");
     }
-    message.push_str(&format!("Subject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"));
+    let _ = write!(
+        message,
+        "Subject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+    );
     for line in body.as_bytes().chunks(76) {
         message.push_str(std::str::from_utf8(line).map_err(|_| "Invalid encoded body")?);
         message.push_str("\r\n");

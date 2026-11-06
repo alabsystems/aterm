@@ -14,6 +14,11 @@
     reason = "never linked into the shipped binary: the release cutter, run from source"
 )]
 
+// The durable flushes of this binary's process tree are plain `fsync(2)`s on Apple
+// (aterm-durable's seam): the cutter's journals flush at the points they ship with, without the
+// drive-cache drain only a power loss shows.
+aterm_durable::plain_durable_flushes_in_tests!();
+
 #[path = "../../src/accepted_measure.rs"]
 #[allow(dead_code)]
 mod accepted_measure;
@@ -89,6 +94,9 @@ mod machines;
 #[path = "../../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../../src/profile_pilot.rs"]
+#[allow(dead_code)]
+mod profile_pilot;
 #[path = "../../src/provision.rs"]
 #[allow(dead_code)]
 mod provision;
@@ -107,6 +115,9 @@ mod release_status;
 #[path = "../../src/release_steps.rs"]
 #[allow(dead_code)]
 mod release_steps;
+#[path = "../../src/release_timeline.rs"]
+#[allow(dead_code)]
+mod release_timeline;
 #[path = "../../src/service_qualification.rs"]
 #[allow(
     dead_code,

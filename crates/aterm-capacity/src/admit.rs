@@ -526,16 +526,22 @@ fn disk_reservers(short: &Shortfall) -> Vec<(u64, u32, u64)> {
 
 impl fmt::Display for Shortfall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shorts: Vec<String> = self.shorts.iter().map(ToString::to_string).collect();
-        f.write_str(&shorts.join("; "))?;
+        for (i, s) in self.shorts.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{s}")?;
+        }
         if !self.shorts.iter().any(Short::held_by_claims) {
             return Ok(());
         }
         if self.holders.is_empty() {
             write!(f, "; no claim holds it: other work on {HOST}")
         } else {
-            let holders: Vec<String> = self.holders.iter().map(ToString::to_string).collect();
-            write!(f, "; {}", holders.join("; "))
+            for h in &self.holders {
+                write!(f, "; {h}")?;
+            }
+            Ok(())
         }
     }
 }
@@ -721,15 +727,16 @@ const fn unservable(record: &Record, volume: &Volume) -> bool {
 /// child, a drive's second window), so it never waits behind its own holder, nor behind a quiet
 /// claim that waits for that holder to end.
 pub(crate) fn covered(pid: u32, records: &[&Record], procs: Option<&Procs>) -> bool {
-    let holders: Vec<u32> = records
-        .iter()
-        .filter(|r| {
-            r.accounting == crate::Accounting::Holder && r.held.is_some() && r.need.quiet.is_some()
-        })
-        .map(|r| r.pid)
-        .collect();
-    holders.contains(&pid)
-        || procs.is_some_and(|p| p.ancestors(pid).iter().any(|a| holders.contains(a)))
+    let line = std::cell::OnceCell::new();
+    records.iter().any(|r| {
+        r.accounting == crate::Accounting::Holder
+            && r.held.is_some()
+            && r.need.quiet.is_some()
+            && (r.pid == pid
+                || line
+                    .get_or_init(|| procs.map(|p| p.ancestors(pid)).unwrap_or_default())
+                    .contains(&r.pid))
+    })
 }
 
 /// Whether the process `pid` or one of its ancestors in `procs` holds a measured claim admitted

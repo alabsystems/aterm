@@ -505,94 +505,6 @@ fn a_rows_keep_as_tab_button_keeps_it_and_the_rows_follow() {
     );
 }
 
-/// A REAPED WORKER'S ROW READS FINISHED UNTIL A PERSON DISMISSES OR CLEARS IT: the list stays
-/// while a Finished row does, even with no worker left parked, Dismiss takes its one row off the
-/// page and Clear Finished the rest, and the list goes with the last of them; what each left is
-/// still kept for its manager, a Workers tab's close dropping none of it either. CONTROL: a worker
-/// a person closed leaves no Finished row; a row's Read Result with no result to read is refused.
-#[test]
-fn finished_rows_stay_until_dismissed_or_cleared() {
-    let (mut app, _, workers) = listing(4);
-    assert!(app.close_session_tab_for_test(workers[3]));
-    for &worker in &workers[..3] {
-        mark(&app, worker, TaskState::Done);
-    }
-    let steps = app.reap_workers(std::time::Instant::now() + crate::worker_reaper::LINGER);
-    assert_eq!(steps.len(), 3, "{steps:?}");
-    assert_eq!(set(&app).parked().len(), 0);
-    assert!(
-        set(&app).home().is_some(),
-        "the list stays for its Finished rows"
-    );
-    let finished = |app: &App| {
-        rows(app)
-            .iter()
-            .filter(|row| row.finished)
-            .map(|row| row.session)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        finished(&app),
-        workers[..3],
-        "CONTROL: a person's close keeps no row"
-    );
-    assert!(
-        app.read_result(WID, workers[0]).is_err(),
-        "no result was left to read"
-    );
-
-    let kept = |app: &App| {
-        let store = app.store.read().unwrap_or_else(|p| p.into_inner());
-        workers[..3]
-            .iter()
-            .filter(|&&worker| store.retired_workers().by_local(worker).is_some())
-            .count()
-    };
-    press_control(&mut app, &format!("workers/dismiss/{}", workers[0]));
-    assert_eq!(finished(&app), workers[1..3]);
-    assert!(set(&app).home().is_some());
-    assert_eq!(
-        kept(&app),
-        3,
-        "Dismiss takes a row off the page, not its result"
-    );
-    press_control(&mut app, "workers/clear-finished");
-    assert_eq!(finished(&app), Vec::<u64>::new());
-    assert_eq!(set(&app).home(), None, "the list went with its last row");
-    assert_eq!(
-        kept(&app),
-        3,
-        "Clear Finished drops nothing its managers read"
-    );
-}
-
-/// CLOSING THE WORKERS TAB TAKES ITS FINISHED ROWS OFF ITS PAGE AND KEEPS WHAT THEY LEFT: a
-/// person's close of a list that shows only Finished rows ends the list, and each row still
-/// answers its manager. CONTROL: no row is listed any more, so no sync opens the list again.
-#[test]
-fn closing_the_workers_tab_keeps_what_its_finished_rows_left() {
-    let (mut app, _, workers) = listing(2);
-    for &worker in &workers {
-        mark(&app, worker, TaskState::Done);
-    }
-    let steps = app.reap_workers(std::time::Instant::now() + crate::worker_reaper::LINGER);
-    assert_eq!(steps.len(), 2, "{steps:?}");
-    let at = home_index(&app).expect("the list stays for its Finished rows");
-    app.switch_tab_in(WID, at);
-    app.close_active_native_tab_keeping(WID, None)
-        .expect("a list of Finished rows alone closes");
-    app.sync_window(WID);
-    assert_eq!(set(&app).home(), None, "CONTROL: nothing opens it again");
-    let store = app.store.read().unwrap_or_else(|p| p.into_inner());
-    for &worker in &workers {
-        let row = store
-            .retired_workers()
-            .by_local(worker)
-            .expect("what it left is kept");
-        assert_eq!(row.window, None, "listed on no page");
-    }
-}
-
 #[test]
 fn a_rows_press_opens_its_worker_in_place() {
     let (mut app, _, workers) = listing(2);
@@ -1312,6 +1224,22 @@ fn a_worker_whose_agent_has_gone_keeps_its_agents_name() {
         assert_ne!(title(running), "Claude Code");
     }
     assert_eq!(title(workers[3]), "release notes", "a pinned title wins");
+}
+
+/// The strip line's pushed tooltips are what the strip was given: one tip per shown tab, never a
+/// parked worker's, so a reader that matches them to the chips (`count=` against
+/// `pushed_tooltips=`, the lab's hover read) reads every tip while a worker is parked. Before,
+/// every tab's tip was kept, and the line named more tips than chips.
+#[test]
+fn the_strip_line_pushes_one_tooltip_per_shown_tab_while_workers_are_parked() {
+    let (mut app, _, _) = app_with(2, 1);
+    app.sync_window(WID);
+    let shown = set(&app).shown_len();
+    assert!(set(&app).tabs().len() > shown, "a worker is parked");
+    let pushed = &app.windows.get(&WID).expect("the window").tooltips_pushed;
+    assert_eq!(pushed.len(), shown, "{pushed:?}");
+    let line = app.stripless_tab_chrome().expect("the tab line");
+    assert!(line.contains(&format!("count={shown} ")), "{line}");
 }
 
 /// A candidate that ends before its Commit adopted its predecessor's Finished rows and owns none

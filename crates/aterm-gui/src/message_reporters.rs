@@ -4967,7 +4967,9 @@ pub(crate) fn end_record(
 
 /// The closed tabs `after` holds with processes left that `told` (the closes already told) does
 /// not hold, which takes them: each close is told once, at the first view that holds what it
-/// left, however its count moves after. `told` keeps only the closed tabs `after` still holds.
+/// left, however its count moves after, and one an earlier aterm told is not told again
+/// ([`aterm_vitals::left::ClosedTab::told`]). `told` keeps only the closed tabs `after` still
+/// holds.
 pub(crate) fn newly_left<'a>(
     told: &mut std::collections::BTreeSet<u64>,
     after: &'a aterm_vitals::left::LeftView,
@@ -4976,7 +4978,7 @@ pub(crate) fn newly_left<'a>(
     after
         .closed
         .iter()
-        .filter(|t| t.left > 0 && told.insert(t.key))
+        .filter(|t| t.left > 0 && !t.told && told.insert(t.key))
         .collect()
 }
 
@@ -5325,7 +5327,7 @@ const ACCOUNTS_LABELS_FILL: usize = 200;
 /// (`accounts::signed_out`), a fact for later: aterm's sign-in ladder signs a row in by its email,
 /// so no route exists for these, and it asks no one to sign them in. A signed-out row with an
 /// email is never on it: a report names its sign-in, the ladder makes it where a session here runs
-/// on the row or a person asks, and where no route can, the no-sign-in fact names each one tried
+/// on the row or ran on it within a week, or a person asks, and where no route can, the no-sign-in fact names each one tried
 /// ([`accounts_no_sign_in_entry`]).
 pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
     let first = labels.first()?;

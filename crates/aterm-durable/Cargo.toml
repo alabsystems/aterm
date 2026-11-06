@@ -19,7 +19,10 @@ description = "How aterm finishes a write: durable (on stable media at return, F
 # `DirFlushed::classify`) by astream's rules, plain judgements of the error that cross
 # into no kernel, and every flush it makes is astream-sys's, so `flush_tally` counts
 # each: `full_sync` and `full_sync_data` for a durable write and `plain_fsync` (Unix) for
-# `ordered_or_fsync`'s fallback. On Apple targets, the only ones with an ordering-only
+# every plain flush, which is `primitive::fsync`: `ordered_or_fsync`'s fallback and each
+# direct call (aterm-gui's crash journal and pinned folders; atpkg's store, lay,
+# `vendor_direct`, build cache and local harness), the one plain flush `clippy.toml`
+# leaves aterm, so a change to `plain_fsync` reaches all of them. On Apple targets, the only ones with an ordering-only
 # flush, it also calls `barrier_sync` (`fcntl(F_BARRIERFSYNC)`) and `barrier_refused`,
 # on files and on directories (`ordered_dir`), and reads and sets the test mark
 # (`test_plain_fsync`, `TEST_PLAIN_FSYNC_ENV`); it never installs the `SIGHUP` handler.

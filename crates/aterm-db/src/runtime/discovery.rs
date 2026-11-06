@@ -23,18 +23,21 @@ const WIRE_LEN: usize = 38;
 /// Progress can take three extra turns before ordinary discovery gets another turn.
 const FOLLOW_UP_BURST: usize = 3;
 
+fn delay_hash(own: &[u8; 32], attempt: u64) -> astream_wire::sync::Digest {
+    let mut sha = aterm_digest::Sha256::new();
+    sha.update(own);
+    sha.update(attempt.to_be_bytes());
+    sha.finalize()
+}
+
 fn retry_delay(own: &[u8; 32], attempt: u64) -> Duration {
-    let mut seed = own.to_vec();
-    seed.extend_from_slice(&attempt.to_be_bytes());
-    let hash = aterm_digest::Sha256::digest(&seed);
+    let hash = delay_hash(own, attempt);
     let jitter = u64::from(u16::from_be_bytes([hash[0], hash[1]])) % 2000;
     Duration::from_millis(3000 + jitter)
 }
 
 fn follow_up_delay(own: &[u8; 32], attempt: u64) -> Duration {
-    let mut seed = own.to_vec();
-    seed.extend_from_slice(&attempt.to_be_bytes());
-    let hash = aterm_digest::Sha256::digest(&seed);
+    let hash = delay_hash(own, attempt);
     let jitter = u64::from(u16::from_be_bytes([hash[2], hash[3]])) % 300;
     Duration::from_millis(200 + jitter)
 }
@@ -50,9 +53,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// The `streak`th wait in exponential backoff: [`BACKOFF_FIRST`] doubling to
 /// [`BACKOFF_MAX`], plus up to 2 s of jitter.
 fn backoff_delay(own: &[u8; 32], attempt: u64, streak: u32) -> Duration {
-    let mut seed = own.to_vec();
-    seed.extend_from_slice(&attempt.to_be_bytes());
-    let hash = aterm_digest::Sha256::digest(&seed);
+    let hash = delay_hash(own, attempt);
     let jitter = u64::from(u16::from_be_bytes([hash[4], hash[5]])) % 2000;
     let doubled = BACKOFF_FIRST.saturating_mul(1 << streak.saturating_sub(1).min(16));
     doubled.min(BACKOFF_MAX) + Duration::from_millis(jitter)
@@ -180,28 +181,21 @@ impl Hints {
         advertisements: BTreeMap<astream_wire::sync::Actor, (IpAddr, String)>,
         now: Instant,
     ) {
-        let versions: BTreeMap<_, _> = advertisements
-            .iter()
-            .map(|(actor, (_, version))| (*actor, version.clone()))
-            .collect();
         // A missing cache entry does not erase the last seat bound to an address. A new
         // authenticated advertisement can move that seat or assign the address to another.
         self.addresses
             .retain(|_, actor| !advertisements.contains_key(actor));
-        self.addresses.extend(
-            advertisements
-                .into_iter()
-                .map(|(actor, (ip, _))| (ip, actor)),
-        );
+        for (&actor, &(ip, _)) in &advertisements {
+            self.addresses.insert(ip, actor);
+        }
         self.needs_update.retain(|actor, blocked| {
+            let version = advertisements.get(actor).map(|(_, version)| version);
             if blocked.is_none() {
                 // Learning a previously unknown build is not a version change.
-                *blocked = versions.get(actor).cloned();
+                *blocked = version.cloned();
                 return true;
             }
-            let changed = versions
-                .get(actor)
-                .is_some_and(|version| blocked.as_ref() != Some(version));
+            let changed = version.is_some_and(|version| blocked.as_ref() != Some(version));
             if changed {
                 for (address, peer) in &mut self.peers {
                     if self.addresses.get(&address.ip()) == Some(actor)
@@ -213,18 +207,23 @@ impl Hints {
             }
             !changed
         });
-        self.versions.extend(versions);
+        self.versions.extend(
+            advertisements
+                .into_iter()
+                .map(|(actor, (_, version))| (actor, version)),
+        );
     }
-    pub(super) fn wire(&self, port: u16) -> Vec<u8> {
-        let mut wire = Vec::with_capacity(WIRE_LEN);
-        wire.extend_from_slice(b"ACH2");
-        wire.extend_from_slice(&self.own);
-        wire.extend_from_slice(&port.to_be_bytes());
+    pub(super) fn wire(&self, port: u16) -> [u8; WIRE_LEN] {
+        let mut wire = [0u8; WIRE_LEN];
+        wire[..4].copy_from_slice(b"ACH2");
+        wire[4..36].copy_from_slice(&self.own);
+        wire[36..38].copy_from_slice(&port.to_be_bytes());
         wire
     }
-    pub(super) fn presence_wire(&self) -> Vec<u8> {
-        let mut wire = b"ACH3".to_vec();
-        wire.extend_from_slice(&self.own);
+    pub(super) fn presence_wire(&self) -> [u8; 36] {
+        let mut wire = [0u8; 36];
+        wire[..4].copy_from_slice(b"ACH3");
+        wire[4..36].copy_from_slice(&self.own);
         wire
     }
     pub(super) fn observe_presence(&mut self, wire: &[u8], source: SocketAddr, now: Instant) {
@@ -423,16 +422,16 @@ impl Hints {
             self.established_cursor
         };
         let address = follow_up.or_else(|| {
-            self.peers
-                .iter()
+            use std::ops::Bound::{Excluded, Unbounded};
+            let tail = match cursor {
+                Some(cursor) => self.peers.range((Excluded(cursor), Unbounded)),
+                None => self.peers.range(..),
+            };
+            let head = cursor
+                .into_iter()
+                .flat_map(|cursor| self.peers.range(..=cursor));
+            tail.chain(head)
                 .filter(|(_, p)| eligible(p))
-                .filter(|(a, _)| cursor.is_none_or(|cursor| **a > cursor))
-                .chain(
-                    self.peers
-                        .iter()
-                        .filter(|(_, p)| eligible(p))
-                        .filter(|(a, _)| cursor.is_some_and(|cursor| **a <= cursor)),
-                )
                 .map(|(a, _)| *a)
                 .next()
         })?;
@@ -691,7 +690,7 @@ mod tests {
         Hints::new([4; 32])
     }
     fn wire(port: u16) -> Vec<u8> {
-        Hints::new([5; 32]).wire(port)
+        Hints::new([5; 32]).wire(port).to_vec()
     }
     #[test]
     fn untrusted_hints_have_size_source_and_capacity_bounds() {

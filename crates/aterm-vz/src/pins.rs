@@ -161,7 +161,10 @@ pub fn kernel_files(lookup: &Lookup) -> Result<(PathBuf, PathBuf), Error> {
 pub fn kernel_stamp_sha256() -> String {
     let mut sums = aterm_digest::Sha256::new();
     for file in [VMLINUZ, INITRD] {
-        sums.update(format!("{} *{}\n", file.sha256, file.name()).as_bytes());
+        sums.update(file.sha256.as_bytes());
+        sums.update(b" *");
+        sums.update(file.name().as_bytes());
+        sums.update(b"\n");
     }
     crate::hex(&sums.finalize())
 }

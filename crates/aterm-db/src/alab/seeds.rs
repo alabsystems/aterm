@@ -304,11 +304,18 @@ fn held(projection: &Projection, seed: &Seed) -> bool {
 /// # Errors
 /// A compiled seed breaks its column's type (a bug the tests catch).
 pub fn rows_for(cells: &Cells) -> Result<Vec<Vec<Change>>> {
+    let providers = cell::project(&PROVIDER, cells);
+    let clis = cell::project(&CLI, cells);
+    let plans = cell::project(&PLAN, cells);
     let mut out = Vec::new();
     for (collection, seeds) in rows() {
-        let projection = cell::project(collection, cells);
+        let projection = match collection.name {
+            "provider" => &providers,
+            "cli" => &clis,
+            _ => &plans,
+        };
         let mut row = Vec::new();
-        for seed in seeds.iter().filter(|seed| !held(&projection, seed)) {
+        for seed in seeds.into_iter().filter(|seed| !held(projection, seed)) {
             let key = CellKey {
                 pk: seed.pk,
                 col: seed.col,
@@ -317,7 +324,7 @@ pub fn rows_for(cells: &Cells) -> Result<Vec<Vec<Change>>> {
             row.push(cell::change(
                 collection,
                 key,
-                &CellValue::automatic(collection.version, seed.x.clone()),
+                &CellValue::automatic(collection.version, seed.x),
             )?);
         }
         if !row.is_empty() {

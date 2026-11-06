@@ -8,7 +8,6 @@ use std::sync::{Arc, PoisonError};
 
 use super::ActScope;
 use crate::session_store::{ExitActor, ExitReason};
-use crate::task_record::{TaskMark, TaskState};
 use crate::{App, SessionCtx, WindowId, stub_session};
 
 const WID: WindowId = WindowId(0);
@@ -184,47 +183,6 @@ fn a_close_names_reason_actor_and_totals_unavailable_never_zero() {
         Vec::<String>::new(),
         "CONTROL: no tab, no close"
     );
-}
-
-/// THE REAPER'S CLOSE OF A CONCLUDED WORKER IS aterm's ACT: `why=concluded out=reaper by=harness`
-/// with the task as it stood, `failed:could-not-finish`, and the exit ledger's row says `reaper`
-/// too. CONTROL: a person closing the same kind of tab says neither `concluded` nor `reaper`.
-#[test]
-fn the_reapers_close_is_harness_concluded_with_the_task_it_ended() {
-    let mut app = App::headless_for_test();
-    let (worker, worker_ctx) = parked_worker(&mut app);
-    let mut mark = TaskMark::new(TaskState::Failed);
-    mark.why = Some(crate::task_record::WHY_COULD_NOT_FINISH);
-    crate::task_record::mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
-    let (_, since) = crate::worker_reaper::tests::record(&app, worker);
-    let steps = app.reap_workers(since + crate::worker_reaper::LINGER);
-    assert_eq!(
-        steps.len(),
-        1,
-        "PRECONDITION: the reaper closed it: {steps:?}"
-    );
-    let lines = tab_lines(&worker_ctx);
-    let close = lines.last().expect("its close");
-    for (key, want) in [
-        ("act", "close"),
-        ("why", "concluded"),
-        ("parked", "1"),
-        ("out", "reaper"),
-        ("task", "failed:could-not-finish"),
-        ("by", "harness"),
-    ] {
-        assert_eq!(field(close, key), Some(want), "{key}: {close}");
-    }
-    let exits = crate::control::cmd_exits(&app.store, "", &[]);
-    assert!(exits.contains(" reason=reaper "), "{exits}");
-
-    let (person_worker, person_ctx) = parked_worker(&mut app);
-    crate::task_record::mark_session_task(&person_ctx, person_worker, &mark).expect("unfenced");
-    deregister(&app, person_worker, ExitReason::UiClose, ExitActor::Human);
-    let close = tab_lines(&person_ctx).pop().expect("its close");
-    assert_eq!(field(&close, "why"), None, "CONTROL: {close}");
-    assert_eq!(field(&close, "out"), Some("ui-close"), "CONTROL: {close}");
-    assert_eq!(field(&close, "task"), Some("failed:could-not-finish"));
 }
 
 /// A WORKER WHOSE SPAWN NOBODY TOOK CLOSES `by=harness why=unstarted`, the act that closed it.
@@ -487,62 +445,6 @@ fn a_tabs_tree_spent_each_live_processs_own_and_reaped_time_once() {
         crate::session_log::TreeSpent::default(),
         "CONTROL: no shell"
     );
-}
-
-/// THE REAPER'S CLOSE STAMPS WHAT THE WORKER'S TREE SPENT, read before its terminal closed: its
-/// CPU-seconds and peak MiB, and its agent's tokens and login though the agent had left the front
-/// (Stop, then the close). CONTROL: with a probe that reads nothing, both process totals are
-/// `unavailable`.
-#[test]
-fn the_reapers_close_stamps_the_workers_cpu_peak_and_tokens() {
-    for (probe, cpu, peak) in [
-        (TREE, "48", "6144"),
-        (super::TreeProbe::INERT, "unavailable", "unavailable"),
-    ] {
-        let mut app = App::headless_for_test();
-        app.tree_probe = probe;
-        let id = app.next_session_id;
-        app.next_session_id += 1;
-        let parent = app.new_tab_parent(WID);
-        let mut session = stub_session(id);
-        session.pid = 100;
-        app.install_tab_session_parked(WID, session, parent);
-        app.sync_window(WID);
-        let worker_ctx = ctx(&app, id);
-        {
-            let mut tl = worker_ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            assert!(tl.note_foreground_group(4242));
-            let facts = aterm_agent::harness::footer::FooterFacts {
-                usage: Some(aterm_agent::harness::session_usage::UsageFacts {
-                    models: vec![aterm_agent::harness::session_usage::ModelTokens {
-                        label: "opus".to_string(),
-                        input: 40_000,
-                        output: 8_211,
-                    }],
-                    complete: true,
-                    ..Default::default()
-                }),
-                account: Some("m9-2".to_string()),
-                ..Default::default()
-            };
-            assert!(tl.set_claude_footer(4242, Some(9), Some(facts)));
-            assert!(tl.note_foreground_group(100), "the agent left the front");
-        }
-        let mut mark = TaskMark::new(TaskState::Failed);
-        mark.why = Some(crate::task_record::WHY_COULD_NOT_FINISH);
-        crate::task_record::mark_session_task(&worker_ctx, id, &mark).expect("unfenced");
-        let (_, since) = crate::worker_reaper::tests::record(&app, id);
-        let steps = app.reap_workers(since + crate::worker_reaper::LINGER);
-        assert_eq!(steps.len(), 1, "PRECONDITION: reaped: {steps:?}");
-        let close = tab_lines(&worker_ctx).pop().expect("its close");
-        assert_eq!(field(&close, "cpu_s"), Some(cpu), "{close}");
-        assert_eq!(field(&close, "peak_mb"), Some(peak), "{close}");
-        assert_eq!(field(&close, "tokens"), Some("48211"), "{close}");
-        assert_eq!(field(&close, "account"), Some("m9-2"), "{close}");
-    }
 }
 
 /// A TAB'S CLOSE NAMES WHERE IT STANDS AT ITS CLOSE: a tab moved to a new window closes there,

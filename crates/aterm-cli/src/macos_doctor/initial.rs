@@ -1596,7 +1596,10 @@ pub(super) fn plan_in_scope(root: &Path, alab: impl FnOnce() -> bool) -> Selecti
         // A run the person stopped, or a standing Restore, widens nothing, as the window's watch
         // does not (`scope::upgrade_of`).
         Some((plan, _))
-            if aterms_own(records) && !records.stopped_run() && records.restored.is_none() =>
+            if aterms_own(records)
+                && !records.stopped_run()
+                && records.stop_request != Some(StopRequest::Unreadable)
+                && records.restored.is_none() =>
         {
             plan.selection.union(scope(alab()))
         }
@@ -6253,6 +6256,12 @@ fn secrets_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
 pub(super) fn row_status(row: &aterm_machines::model::ItemReport) -> &'static str {
     use aterm_converge::StoodAside;
     use aterm_machines::model::Outcome;
+    if matches!(row.outcome, Outcome::Ok | Outcome::Changed)
+        && aterm_machines::init_observe::standing(row)
+            == aterm_types::macos_setup::Standing::Differs
+    {
+        return "drift";
+    }
     match row.outcome {
         Outcome::Ok | Outcome::NotApplicable => "ok",
         Outcome::Changed => "applied",
@@ -6373,11 +6382,20 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         self.developer_tools_wanted = false;
         self.repositories_failure = None;
         self.token_wanted = false;
-        let ran = repositories::run_reading(
+        let start = initial_setup_holds();
+        let ran = repositories::run_reading_guarded(
             &sys,
             &self.context()?,
             vault,
             aterm_machines::model::Mode::Apply,
+            move || {
+                let now = initial_setup_holds();
+                if now.later(&start, Setting::Repositories) {
+                    Err(now.why(Setting::Repositories))
+                } else {
+                    Ok(true)
+                }
+            },
         )?;
         self.developer_tools_wanted = ran.developer_tools;
         self.repositories_failure = ran.failure;
@@ -10907,7 +10925,7 @@ mod tests {
     fn repositories_recover_after_an_interface_change(with_secrets: bool) {
         use aterm_machines::items::Ctx;
         use aterm_machines::model::{HostFacts, User};
-        use aterm_machines::port::{Fake as Native, GithubFailure, GithubResponse, Ran, Stat};
+        use aterm_machines::port::{Fake as Native, Ran, Stat};
 
         let root = aterm_tempfile::tempdir().unwrap();
         let mut plan = selected(&[Setting::Repositories]);
@@ -10938,26 +10956,11 @@ mod tests {
         let token = format!("{}/.secrets/gh_access_token", user.home);
         sys.file(&token, TOKEN.as_bytes())
             .stat_of(&token, stat(false, TOKEN.len() as u64));
-        for _ in 0..10 {
-            sys.fail_github_api(&user, "/user", GithubFailure::Unreached);
-        }
-        for (endpoint, body) in [
-            ("/user", aterm_json::json!({"login":"tester"})),
-            (
-                "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc&page=1",
-                aterm_json::json!([]),
-            ),
-        ] {
-            sys.on_github_api(
-                &user,
-                endpoint,
-                Ok(GithubResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: aterm_json::to_vec(&body).unwrap(),
-                }),
-            );
-        }
+        // Metadata has not arrived from the private vault on this network yet. Default
+        // repository setup waits without enumerating GitHub, then wakes on a new attachment.
+        const INVENTORY: &[u8] = b"{\"schema\":2,\"account\":\"tester\",\"repositories\":[]}";
+        let inventory_path = format!("{}/.secrets/github-repositories.json", user.home);
+        let inventory_stat = stat(false, INVENTORY.len() as u64);
         // The local helper already returns this token for all repositories.
         // A complete empty inventory therefore needs no credential writes or clones.
         sys.simulate(|_, command| {
@@ -11019,6 +11022,12 @@ mod tests {
         assert_eq!(parked, mark(1), "an unchanged network stays parked");
         let reattached = mark(2);
 
+        // The new network delivers the vault's complete private inventory. Its local account
+        // and repository list suffice; no GitHub identity or inventory request is needed.
+        let (sys, _) = host.native_repositories.as_ref().unwrap();
+        sys.file(&inventory_path, INVENTORY)
+            .stat_of(&inventory_path, inventory_stat);
+
         // A worker woken by the changed local attachment can finish the same
         // admitted run, without repeating Secrets or creating a new revision.
         let (report, next) = execute_initial_for_revision(
@@ -11049,13 +11058,7 @@ mod tests {
         );
         assert_eq!(attempts(&host, Stage::Repositories), 11);
         let (sys, _) = host.native_repositories.as_ref().unwrap();
-        assert_eq!(
-            sys.calls()
-                .iter()
-                .filter(|call| call.ends_with(" agh GET /user"))
-                .count(),
-            11
-        );
+        assert!(sys.calls().iter().all(|call| !call.contains(" agh GET ")));
         assert!(sys.fed().is_empty());
         assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
             && !call.contains("credential approve")
@@ -13218,6 +13221,9 @@ mod tests {
             !records.provisional,
             "a later ALab signal must not widen groups the person left as is"
         );
+        assert_eq!(scope::upgrade_of(&records, || true), None);
+        assert!(holds(&records).off.contains(Setting::Repositories));
+        assert_eq!(plan_in_scope(root.path(), || true), automatic.selection);
 
         // Set up now runs the plan as it stands: a provisional one stays so.
         save_plan_as(root.path(), &automatic, true).unwrap();
@@ -16223,6 +16229,42 @@ mod tests {
         authorize_at(root.path(), &selected(&[Setting::Permissions])).unwrap();
         let shown = snapshot_in_vault(root.path(), Err("source.toml: no name".into())).unwrap();
         assert_eq!(shown.plan, selected(&[Setting::Permissions]));
+    }
+
+    #[test]
+    fn partial_repository_readback_cannot_finish_its_setup_stage() {
+        use aterm_machines::init_observe::Reading;
+        use aterm_machines::model::{Effect, ItemReport, Outcome};
+        for outcome in [Outcome::Ok, Outcome::Changed] {
+            let report = ItemReport {
+                id: "init.github.native@alice".into(),
+                family: "github".into(),
+                title: Stage::Repositories.name().into(),
+                outcome,
+                from: None,
+                to: None,
+                why: None,
+                revert: None,
+                effect: Effect::Now,
+                detail: Some(
+                    Reading::Repositories {
+                        present: 0,
+                        count: 53,
+                        signed_in: true,
+                    }
+                    .token(),
+                ),
+                layer: None,
+                class: None,
+                explain: None,
+                stood_aside: None,
+                essential: false,
+                elapsed_ms: None,
+            };
+            let rows = item_rows(vec![report]);
+            assert_eq!(rows[0].status, "drift");
+            assert!(!rows_ready(&rows));
+        }
     }
 
     /// A Repositories step that failed says on the page the reason its step decided

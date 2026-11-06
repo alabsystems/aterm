@@ -28,7 +28,7 @@ use crate::supervise::classify::{
     QUOTED_SUBSTITUTION, SUBSTITUTION, brace_expansion, classify_command_except,
     classify_command_with, classify_except_rm, command_words, command_words_globbed,
     expanded_parameters, git_subcommand, glob_match, grammar_names_operand, path_operands_except,
-    plain_zsh_line, program, runs, unquoted_glob, unredirected,
+    path_operands_of, plain_zsh_line, program, runs, unquoted_glob, unredirected,
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
@@ -80,6 +80,8 @@ pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
 pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
 /// Claude Code's `Claude in Chrome` intro ([`chrome_intro`]).
 pub const RULE_CHROME_INTRO: &str = "chrome-intro@v1";
+/// Preserve the conversation selected by the resume path.
+pub const RULE_CONVERSATION_RESUME: &str = "conversation-resume@v1";
 /// A disk-free worker's fence ([`ApprovalCtx::disk_worker`], design
 /// `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4): a Bash box whose every command is a read or
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
@@ -1119,6 +1121,7 @@ const fn fenced(kind: PromptKind) -> bool {
         | PromptKind::AutocompactOffer
         | PromptKind::McpServer
         | PromptKind::AutoModeSetup
+        | PromptKind::ConversationResume
         | PromptKind::ChromeIntro
         | PromptKind::Other => false,
     }
@@ -1241,6 +1244,20 @@ fn decide_unfenced(
         );
     }
     note(trace, "supervisable", None, || Outcome::Passed);
+    if let Some(prompt) = reading.prompt.as_ref()
+        && prompt.kind == PromptKind::ConversationResume
+    {
+        let decision = if !draws_claude_boxes(reading.program)
+            || reading.phase != Phase::Prompt
+            || !reading.phase_authoritative
+            || ctx.approve == Approve::None
+        {
+            Decision::escalate("no authorized conversation resume dialog")
+        } else {
+            conversation_resume(prompt, rows)
+        };
+        return decided_at(trace, "conversation-resume", decision);
+    }
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::UsageLimit
     {
@@ -3382,6 +3399,7 @@ pub(crate) fn reads_from_stand(prompt: &PromptV2) -> bool {
             || segments.iter().any(|seg| {
                 runs(seg).ok().flatten().is_some_and(|run| {
                     descends(seg, run.at)
+                        .0
                         .iter()
                         .any(|(root, _)| from_stand(root))
                 })
@@ -3434,9 +3452,10 @@ impl Start<'_> {
 }
 
 /// [`secrets_unreached`] for the session `ctx` describes: its relative paths start in its cwd
-/// and where its Bash tool stands, or anywhere when its cwd is unknown; a glob meets a leading
-/// dot only by a literal one once its Bash tool's shell startup is read and proven to leave
-/// every glob off a leading dot ([`LeadingDot`], [`ShellStartup::may_dot_glob`]).
+/// and where its Bash tool stands, or anywhere when its cwd is unknown; a glob the shell may
+/// expand meets a leading dot only by a literal one once its Bash tool's shell startup is read
+/// and proven to leave every glob off a leading dot ([`LeadingDot`],
+/// [`ShellStartup::may_dot_glob`]).
 fn secrets_unreached_in(
     readings: &[String],
     ctx: &ApprovalCtx,
@@ -3473,14 +3492,29 @@ fn secrets_unreached_in(
 /// `GLOBIGNORE=zz` in bash's environment (bash took the variable, `echo $GLOBIGNORE` printing
 /// `zz`, and did not set `dotglob` by it, as it does for one the line sets); zsh with `setopt
 /// globdots` expanded the first three to `.credentials.json` (`*.json` to it and `a.json`).
+///
+/// A program may glob a word itself, by rules of its own: git matches a pathspec by wildmatch,
+/// where `*`, `?` and a bracket expression meet a leading dot and a `/` too (MEASURED 2026-11-05
+/// with git 2.56.0: `git grep --no-index token -- '*.json'`, `'?claude.json'` and
+/// `'*.claude.json'`, run in a home under `/bin/bash` and `/bin/zsh -f`, each printed
+/// `.claude.json`). So `Literal` holds only a word of a program on [`GLOB_SAFE`], which opens
+/// the names the shell expanded, or a word as written, and globs none itself; any other
+/// program's operand is met as `Any` ([`secrets_unreached`]): a glob in one may reach it as
+/// written (quoted, or matching nothing, which bash hands on as written), and it may glob that
+/// itself. A tree a reader descends ([`descends`]) needs no such reading: git grep's pathspecs
+/// are read as every file below their literal directories ([`pathspec_tree`]), a pathspec after
+/// `git diff --no-index`'s two paths only narrows what it reads below them (MEASURED 2026-11-05
+/// with git 2.56.0: `git diff --no-index --stat d1 d2 -- '*.json'` listed `.x.json` alone of
+/// `.x.json` and `y.rs`), and every other reader there opens its trees as the shell hands them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LeadingDot {
-    /// Only a literal `.`: the Bash tool's shell, whose startup [`super::shell_startup::read`]
-    /// proved free of `dotglob` and `GLOB_DOTS` (an option outside its inert lists fails the
-    /// read) and of every line that may set either unseen ([`ShellStartup::may_dot_glob`]).
+    /// Only a literal `.`: a word of a [`GLOB_SAFE`] program in the Bash tool's shell, whose
+    /// startup [`super::shell_startup::read`] proved free of `dotglob` and `GLOB_DOTS` (an option
+    /// outside its inert lists fails the read) and of every line that may set either unseen
+    /// ([`ShellStartup::may_dot_glob`]).
     Literal,
     /// Any of them: a shell whose options this check does not know (the advisory word's, and a
-    /// startup that may set one unseen).
+    /// startup that may set one unseen), and a word a program off [`GLOB_SAFE`] takes.
     Any,
 }
 
@@ -3489,7 +3523,8 @@ enum LeadingDot {
 /// read as naming no file) read by [`operand_comps`], a relative one also against every
 /// directory the line may run it in ([`line_bases`]) and below each it cannot place
 /// ([`secret_led`]); a glob held to the rules by what it may expand to ([`secret_reach`], a
-/// leading dot met as `dot` says); and
+/// leading dot met as `dot` says in a word of a program on [`GLOB_SAFE`] alone, and by any
+/// glob in a word another program takes, [`path_operands_of`], [`LeadingDot`]); and
 /// every tree a reader descends ([`descends`]) held to the home-rooted rules above which it
 /// starts, within the levels it reads (below a directory it cannot place, only a tree that is an
 /// operand or the `.` a reader names none in place of).
@@ -3498,8 +3533,9 @@ enum LeadingDot {
 ///
 /// The first read of a secret, named; else the first path this check cannot hold to the rules:
 /// one the line builds at run time (a shell expansion or substitution, or an awk program's own,
-/// [`path_operands_except`]), or a relative one after a move it cannot follow, on a line whose
-/// commands may stand in more than [`STANDS_MAX`] directories, or with the session's cwd unknown.
+/// [`path_operands_except`]), a relative one after a move it cannot follow, on a line whose
+/// commands may stand in more than [`STANDS_MAX`] directories, or with the session's cwd unknown,
+/// or a tree a reader descends from where this check cannot place it ([`descends`]).
 fn secrets_unreached(
     readings: &[String],
     secrets: &[SecretRule],
@@ -3517,10 +3553,17 @@ fn secrets_unreached(
         let name = reading_name(line);
         let not_read = |why: String| format!("not read-only ({name}): {why}");
         let operands = path_operands_except(line, passed).map_err(not_read)?;
+        let theirs = path_operands_of(line, &|p| p.is_none_or(|p| !GLOB_SAFE.contains(&p)))
+            .map_err(not_read)?;
         let segments = command_words(line).map_err(not_read)?;
         let bases = line_bases(&segments, start, home);
         for op in &operands {
             let reach = windows_reach(op, home, &bases, true, windows);
+            let dot = if theirs.contains(op) {
+                LeadingDot::Any
+            } else {
+                dot
+            };
             if let Some(rule) = reach.secret(secrets, 0, dot) {
                 return Err(format!("a read of a secret {rule} ({name}): {op}"));
             }
@@ -3532,7 +3575,11 @@ fn secrets_unreached(
             let Ok(Some(run)) = runs(seg) else {
                 continue;
             };
-            for (root, below) in descends(seg, run.at) {
+            let (trees, unplaced) = descends(seg, run.at);
+            if doubt.is_none() {
+                doubt = unplaced.map(|u| format!("{u} ({name})"));
+            }
+            for (root, below) in trees {
                 let mut reach = windows_reach(root, home, &bases, false, windows);
                 if root != "." && !operands.iter().any(|o| o == root) {
                     // A word the grammar reads as no path (grep's pattern), held to the rules
@@ -4270,11 +4317,14 @@ fn basename_meets(c: &str, glob: &str, dot: LeadingDot) -> bool {
 /// `rg`, `find` that runs `-exec`, `-execdir`, `-ok` or `-okdir`, and `git grep`, every word
 /// after the program that is no option (its operands among them), and `.` when it names no tree
 /// to start from (grep's and rg's operands past the pattern, by [`grammar_names_operand`]; find's
-/// paths before its expression, [`find_names_a_path`]; a path after git grep's `--`); for `diff
-/// -r` and `git diff --no-index`, its words; for `diff`, its words one level down, as it compares
-/// each file two directories both hold. A word built at run time is left to the operand check,
-/// which refuses it; a word a redirect takes is none.
-fn descends(seg: &[String], at: usize) -> Vec<(&str, usize)> {
+/// paths before its expression, [`find_names_a_path`]; a path after git grep's `--`); git grep's
+/// words read as pathspecs ([`pathspec_tree`]: every word past its `--`, a `-` led one among
+/// them, and every word that is no option where it has none); for `diff -r` and `git diff
+/// --no-index`, its words; for `diff`, its words one level down, as it compares each file two
+/// directories both hold. A word built at run time is left to the operand check, which refuses
+/// it; a word a redirect takes is none. Beside them, why the command may also read below a
+/// directory this check cannot place (a pathspec git reads from its repository's top).
+fn descends(seg: &[String], at: usize) -> (Vec<(&str, usize)>, Option<String>) {
     fn words(args: Vec<&str>, here: bool, below: usize) -> Vec<(&str, usize)> {
         args.into_iter()
             .filter(|w| !w.starts_with('-'))
@@ -4296,7 +4346,7 @@ fn descends(seg: &[String], at: usize) -> Vec<(&str, usize)> {
                 .is_some_and(|l| !l.is_empty() && names.iter().any(|n| n.starts_with(l)))
         })
     };
-    match program(&seg[at]) {
+    let trees = match program(&seg[at]) {
         "grep" | "egrep" | "fgrep"
             if short(&['r', 'R'])
                 || long(&["recursive", "dereference-recursive", "directories"])
@@ -4322,11 +4372,36 @@ fn descends(seg: &[String], at: usize) -> Vec<(&str, usize)> {
         "git" => match git_subcommand(seg, at) {
             Some((sub, "grep")) => {
                 let rest = unredirected(seg, sub + 1);
-                let here = rest
-                    .iter()
-                    .position(|a| *a == "--")
-                    .is_none_or(|k| k + 1 == rest.len());
-                words(rest, here, TREE)
+                let (before, specs) = match rest.iter().position(|a| *a == "--") {
+                    Some(k) if k + 1 < rest.len() => {
+                        let specs: Vec<(&str, usize)> = rest[k + 1..]
+                            .iter()
+                            .filter(|w| {
+                                !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION)
+                            })
+                            .map(|w| (*w, TREE))
+                            .collect();
+                        (words(rest[..k].to_vec(), false, TREE), specs)
+                    }
+                    _ => (Vec::new(), words(rest, true, TREE)),
+                };
+                let mut trees = before;
+                let mut unplaced = None;
+                for (spec, below) in specs {
+                    match pathspec_tree(spec) {
+                        Some(tree) => trees.push((tree, below)),
+                        None => {
+                            unplaced.get_or_insert_with(|| {
+                                format!(
+                                    "git grep's pathspec {spec}, read from a directory this check \
+                                     cannot place (the repository's top, past a `..` after a \
+                                     glob, or behind magic that never closes)"
+                                )
+                            });
+                        }
+                    }
+                }
+                return (trees, unplaced);
             }
             Some((sub, "diff")) if args.contains(&"--no-index") => {
                 words(unredirected(seg, sub + 1), false, TREE)
@@ -4334,7 +4409,66 @@ fn descends(seg: &[String], at: usize) -> Vec<(&str, usize)> {
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    };
+    (trees, None)
+}
+
+/// The tree git reads for `word`, a word `git grep` may take as a pathspec, as [`descends`] holds
+/// it: git matches a pathspec by wildmatch, where `*`, `?` and a bracket expression also match a
+/// `/` and a name's leading dot, so a word holding one (or a `\`, which may escape one) reads
+/// every file below the directory its components before that one name (`.` when the first holds
+/// it, `/` when only a leading `/` comes before it), and a word holding none reads the file or
+/// tree it names. Past its magic (`:(…)`, or `:` and its letters `/`, `!` and `^`), an exclusion
+/// (`exclude`, `!`, `^`) reads below `.`, as exclusions alone read the whole tree where git
+/// stands. `None` where git may read below a directory this check cannot place, the repository's
+/// top (`top`, `/`) or past a `..` after a glob, and for a long magic that never closes, which
+/// this does not read.
+///
+/// MEASURED 2026-11-05 with git 2.56.0, each pathspec quoted, in a scratch home holding
+/// `.claude.json`, `.config/gh/hosts.yml` and `proj/{.env,a.json,dir/x,sub/deep/x.rs}`
+/// (docs/measured/classifier-zsh-glob-2026-11-05.md): with `--no-index` and no repository,
+/// `*.yml` run in the home printed `.config/gh/hosts.yml`; `s?b?deep/x.rs`, `sub?deep?x.rs` and
+/// `sub[/]deep/x.rs` run in `proj` printed `sub/deep/x.rs`, and `d*` printed `dir/x`, where
+/// `d?r` printed nothing; `:!x` run in the home printed every file below it, dotfiles among them;
+/// `:/` run in `proj/sub` read below it alone. In a repository whose top is the home, run in
+/// `proj/sub`: `:/` read the whole top (`../../.claude.json` and `../../.config/gh/hosts.yml`
+/// among its files), with `--no-index` too; `:(top)*.yml` read `../../.config/gh/hosts.yml`;
+/// `../../*.json` read `../../.claude.json`; and `:!x` read below `proj/sub` alone.
+fn pathspec_tree(word: &str) -> Option<&str> {
+    let pattern = if let Some(long) = word.strip_prefix(":(") {
+        let (magic, rest) = long.split_once(')')?;
+        if magic.split(',').any(|m| m == "top") {
+            return None;
+        }
+        if magic.split(',').any(|m| m == "exclude") {
+            return Some(".");
+        }
+        rest
+    } else if let Some(short) = word.strip_prefix(':') {
+        let n = short
+            .find(|c| !matches!(c, '/' | '!' | '^'))
+            .unwrap_or(short.len());
+        if short[..n].contains('/') {
+            return None;
+        }
+        if n > 0 {
+            return Some(".");
+        }
+        short.strip_prefix(':').unwrap_or(short)
+    } else {
+        word
+    };
+    let Some(g) = pattern.find(['*', '?', '[', '\\']) else {
+        return Some(if pattern.is_empty() { "." } else { pattern });
+    };
+    if pattern[g..].split('/').any(|c| c == "..") {
+        return None;
     }
+    Some(match pattern[..g].rfind('/') {
+        Some(0) => "/",
+        Some(k) => &pattern[..k],
+        None => ".",
+    })
 }
 
 /// How many levels below a tree [`descends`] names a recursive reader reads: any.
@@ -5291,6 +5425,35 @@ fn auto_mode_setup(prompt: &PromptV2, rows: &[String]) -> Decision {
         choice: Choice::Digit(n),
         guard: row_guard(title_row),
         subject: format!("{}{SUBJECT_OPTION}{}", prompt.title, later.label),
+        unproven: None,
+    }
+}
+
+/// Keep the conversation the launch selected, regardless of the vendor's default focus.
+fn conversation_resume(prompt: &PromptV2, rows: &[String]) -> Decision {
+    let [resume, new] = prompt.options.as_slice() else {
+        return Decision::escalate("a conversation resume dialog with changed options");
+    };
+    if prompt.head_off_screen
+        || resume.label != aterm_phase::anchor!("conversation_resume.resume")
+        || !new
+            .label
+            .starts_with(aterm_phase::anchor!("conversation_resume.new"))
+    {
+        return Decision::escalate("a conversation resume dialog not read whole");
+    }
+    let choice = match choice_of(prompt, resume) {
+        Ok(choice) => choice,
+        Err(why) => return Decision::escalate(why),
+    };
+    let Some(title) = aterm_phase::prompt::title_row(prompt, rows) else {
+        return Decision::escalate("the conversation resume title is not on the screen");
+    };
+    Decision::Approve {
+        rule_id: RULE_CONVERSATION_RESUME,
+        choice,
+        guard: row_guard(title),
+        subject: format!("{}{SUBJECT_OPTION}{}", prompt.title, resume.label),
         unproven: None,
     }
 }

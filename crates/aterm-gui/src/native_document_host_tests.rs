@@ -154,7 +154,7 @@ fn cross_process_same_baseline_has_one_winner_and_no_temp_collision() {
                         std::time::Instant::now() < retry_deadline,
                         "save lock remained busy past the bounded retry window"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 other => panic!("unexpected child commit result: {other:?}"),
             }

@@ -11591,245 +11591,46 @@ fn land_wall(t: Instant, kind: WallKind, reset: Option<Instant>) -> TurnEndReadi
     }
 }
 
-/// A MANAGED WORKER'S USAGE WALL PAST THE HORIZON ENDS ITS WORK (owner, 2026-11-04: the claim
-/// workers sat a day and more at a weekly wall): under Land, a session a manager waits on whose
-/// session or weekly limit resets past [`MANAGED_WALL_HORIZON`], or names no reset (its first
-/// wait, the back-off's last rung, ends past the horizon), types nothing and concludes
-/// `failed why=usage-limit`, and rests there. A reset inside the horizon is waited out as for any
-/// tab. NEGATIVE CONTROL: a person's tab (no manager), and a managed worker under Cruise, which
-/// never rests, wait for the same wall as before, and nothing concludes them.
+/// A worker waits for quota on the same clock as a person, including resets days away.
+/// Negative control: a reset that has passed resumes instead of waiting.
 #[test]
-fn a_managed_workers_usage_wall_past_the_horizon_concludes_its_work() {
+fn a_managed_worker_waits_out_its_usage_wall() {
     let t = t0();
     for kind in [WallKind::UsageSession, WallKind::UsageWeekly] {
         for reset in [Some(t + 60 * MIN), Some(t + 30 * 60 * MIN), None] {
             let r = land_wall(t, kind, reset);
-            let mut person = TurnEndState::default();
-            let today = at(&mut person, &r, t);
-            assert!(
-                matches!(today, TurnEndAction::WaitUntil { .. }),
-                "CONTROL {kind:?} {reset:?}: {today:?}"
-            );
-            person.conclude_at_wall(&r, &cfg(), &today);
-            person.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
-            assert_eq!(person.gave_up(), None, "CONTROL a person's tab: {person:?}");
-            let cruising = under(Autopilot::Cruise, r.clone());
-            let mut st = managed();
-            assert!(
-                matches!(at(&mut st, &cruising, t), TurnEndAction::WaitUntil { .. }),
-                "CONTROL Cruise {kind:?} {reset:?}"
-            );
-            st.conclude_at_wall(&cruising, &cfg(), &TurnEndAction::Nothing);
-            assert_eq!(st.gave_up(), None, "CONTROL Cruise never rests: {st:?}");
-
-            let mut st = managed();
+            let mut worker = managed();
+            let person = at(&mut TurnEndState::default(), &r, t);
+            assert!(matches!(person, TurnEndAction::WaitUntil { .. }));
+            assert_eq!(at(&mut worker, &r, t), person);
+            assert_eq!(worker.gave_up(), None);
+            let advice = advised(&r, "work-2");
             assert_eq!(
-                at(&mut st, &r, t),
-                TurnEndAction::Nothing,
-                "{kind:?} {reset:?}"
+                at(&mut managed(), &advice, t),
+                at(&mut TurnEndState::default(), &advice, t)
             );
-            st.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
-            assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "{kind:?} {reset:?}");
-            assert!(st.task_done() && !st.landed(), "{st:?}");
-            assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing, "it rests");
         }
-        let near = land_wall(t, kind, Some(t + 10 * MIN));
-        let today = at(&mut TurnEndState::default(), &near, t);
-        assert!(waits_until(&today, t + 10 * MIN + GRACE), "{today:?}");
-        let mut st = managed();
-        assert_eq!(at(&mut st, &near, t), today, "{kind:?}: inside the horizon");
-        st.conclude_at_wall(&near, &cfg(), &today);
-        assert_eq!(st.gave_up(), None, "{kind:?}: {st:?}");
     }
+    let r = session_wall(t);
     assert_eq!(
-        GaveUp::of_word(crate::supervise::USAGE_LIMIT_WHY),
-        Some(GaveUp::UsageLimit)
+        at(&mut managed(), &r, t + 60 * MIN + GRACE),
+        typed(RULE_LIMIT_RESUME)
     );
-    let failed = format!(
-        "FAILED seq=9 rule={RULE_LAND} {} (autopilot land)",
-        GaveUp::UsageLimit.words()
-    );
-    assert_eq!(GaveUp::of_journal_line(&failed), Some(GaveUp::UsageLimit));
 }
 
-/// A MANAGED WORKER'S WALL STILL MOVES FIRST: where the roster advises another account (or the
-/// model's bucket has a fallback model), the move is made as for any tab, and only what it falls
-/// back on changes: a wait for a reset days off becomes one of [`MANAGED_WALL_HORIZON`], so a move
-/// that is not made has the point decided again within it, where the wall concludes the work. A
-/// move decided concludes nothing. NEGATIVE CONTROL: a person's tab falls back on the wait for the
-/// reset itself.
+/// A carried usage-limit failure is reopened, so an update cannot strand its worker.
 #[test]
-fn a_managed_workers_wall_moves_first_and_falls_back_within_the_horizon() {
-    let t = t0();
-    let far = t + 30 * 60 * MIN;
-    let horizon = TurnEndAction::WaitUntil {
-        until: t + MANAGED_WALL_HORIZON,
-        why: MANAGED_WALL_AGAIN.to_string(),
-        wait: WaitKind::Other,
-    };
-    let r = advised(&land_wall(t, WallKind::UsageWeekly, Some(far)), "work-2");
-    let person = at(&mut TurnEndState::default(), &r, t);
-    assert!(
-        restarts(
-            &person,
-            &to_account("work-2", AccountAt::Wall),
-            RULE_ACCOUNT
-        ),
-        "CONTROL {person:?}"
-    );
-    assert!(
-        waits_until(otherwise_of(&person), far + GRACE),
-        "CONTROL {person:?}"
-    );
-    let mut st = managed();
-    let moved = at(&mut st, &r, t);
-    assert!(
-        restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
-        "{moved:?}"
-    );
-    assert_eq!(otherwise_of(&moved), &horizon, "{moved:?}");
-    st.conclude_at_wall(&r, &cfg(), &moved);
-    assert_eq!(st.gave_up(), None, "a move concludes nothing: {st:?}");
-
-    let bucket = WallKind::ModelBucket { consent: false };
-    let r = land_wall(t, bucket, Some(far));
-    let mut st = managed();
-    let fell = at(&mut st, &r, t);
-    assert!(
-        matches!(&fell, TurnEndAction::Restart { why: Restart::Model { to }, .. } if to == "opus"),
-        "{fell:?}"
-    );
-    assert_eq!(otherwise_of(&fell), &horizon, "{fell:?}");
-    let alone = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
-    let mut st = managed();
-    assert_eq!(at_under(&mut st, &r, t, &alone), TurnEndAction::Nothing);
-    st.conclude_at_wall(&r, &alone, &TurnEndAction::Nothing);
-    assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "{st:?}");
-}
-
-/// A MANAGED WORKER WAITS FOR ANOTHER ACCOUNT THAT FREES UP INSIDE THE HORIZON, whatever its own
-/// wall's reset: the roster's advice to wait for another account (its 5-hour window reopens in
-/// minutes) and the hour's move breaker (a move allowed again in minutes) each cut the wait for a
-/// weekly reset 30 h off short, and that wait stands for a managed worker as for any tab, so
-/// rotation still comes first and nothing concludes there. NEGATIVE CONTROL: the same wall with
-/// no advice, with advice to wait past the horizon, and with the breaker freeing past it,
-/// concludes the work.
-#[test]
-fn a_managed_worker_waits_for_another_account_inside_the_horizon() {
-    let t = t0();
-    let wall = land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN));
-    for soon in [t + 5 * MIN, t + 8 * MIN, t + MANAGED_WALL_HORIZON] {
-        let r = advised_wait(&wall, soon);
-        let person = at(&mut TurnEndState::default(), &r, t);
-        assert!(
-            waits_until(&person, soon),
-            "CONTROL a person's tab: {person:?}"
-        );
-        let mut st = managed();
-        let a = at(&mut st, &r, t);
-        assert_eq!(a, person, "the same wait for a managed worker");
-        st.conclude_at_wall(&r, &cfg(), &a);
-        assert_eq!(st.gave_up(), None, "nothing concludes: {st:?}");
-    }
-    for r in [
-        wall.clone(),
-        advised_wait(&wall, t + MANAGED_WALL_HORIZON + MIN),
-    ] {
-        let mut st = managed();
-        let a = at(&mut st, &r, t);
-        assert_eq!(a, TurnEndAction::Nothing, "CONTROL {:?}", r.account);
-        st.conclude_at_wall(&r, &cfg(), &a);
-        assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "CONTROL {st:?}");
-    }
-
-    let moved = advised(&wall, "work-2");
-    let window = TurnEndState::default().timing.window;
-    for (frees, concludes) in [(5 * MIN, false), (MANAGED_WALL_HORIZON + 5 * MIN, true)] {
-        let mut st = managed();
-        st.seed_account_moves(&[window - frees; ACCOUNT_MOVES_PER_WINDOW], t);
-        let a = at(&mut st, &moved, t);
-        st.conclude_at_wall(&moved, &cfg(), &a);
-        if concludes {
-            assert_eq!(a, TurnEndAction::Nothing, "CONTROL {a:?}");
-            assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "CONTROL {st:?}");
-        } else {
-            assert!(waits_until(&a, t + frees), "the breaker's wait: {a:?}");
-            assert_eq!(st.gave_up(), None, "{st:?}");
-        }
-    }
-}
-
-/// THE MANAGED WALL IS THE WORKER'S OWN: a wall a moved login left behind, a resume owed past an
-/// account move, `resume_limits` off with the limit episode's word, a `/login` dialog over it, and
-/// Off each leave the managed rule out. NEGATIVE CONTROL: the same managed worker at the same wall
-/// with none of these concludes.
-#[test]
-fn a_managed_wall_is_concluded_only_at_the_workers_own_standing_wall() {
+fn a_carried_usage_limit_failure_does_not_conclude_the_worker() {
     let t = t0();
     let r = land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN));
     let mut st = managed();
     st.observe(&r, t);
-    assert!(managed_wall_ends(&st, &r, &cfg()), "CONTROL {st:?}");
-    let off = under(Autopilot::Off, r.clone());
-    assert!(!managed_wall_ends(&st, &off, &cfg()), "Off");
-    let dialog = TurnEndReading {
-        login_screen: Some(aterm_phase::LoginScreen::Browser),
-        ..r.clone()
-    };
-    assert!(!managed_wall_ends(&st, &dialog, &cfg()), "a /login dialog");
-    let taskless = TurnEndReading {
-        taskless: true,
-        ..r.clone()
-    };
-    assert!(!managed_wall_ends(&st, &taskless, &cfg()), "no task");
-    let busy = TurnEndReading {
-        phase: Phase::Busy,
-        ..r.clone()
-    };
-    assert!(!managed_wall_ends(&st, &busy, &cfg()), "no point");
-    let mut moved = st.clone();
-    moved.account_resume = true;
-    assert!(!managed_wall_ends(&moved, &r, &cfg()), "a resume owed");
-    let unresumed = SupervisorConfig {
-        resume_limits: false,
-        ..cfg()
-    };
-    assert!(
-        managed_wall_ends(&moved, &r, &unresumed),
-        "no resume is owed where none is typed"
-    );
-    let mut concluded = st.clone();
-    concluded.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
-    assert!(
-        concluded.task_done() && !managed_wall_ends(&concluded, &r, &cfg()),
-        "once"
-    );
-}
-
-/// A USAGE-LIMIT CONCLUSION THE LOOP BEFORE THIS ONE MADE STANDS AT ITS WALL (a harness restart):
-/// the record's `failed why=usage-limit` is seeded at the first point though the usage wall still
-/// shows, since that wall is where it was concluded. NEGATIVE CONTROL: a `Could not finish:`
-/// conclusion is opened again at a wall, as before.
-#[test]
-fn a_usage_limit_conclusion_is_seeded_at_its_own_wall() {
-    let t = t0();
-    let r = TurnEndReading {
-        worked: None,
-        ..land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN))
-    };
-    let mut st = managed();
-    st.observe(&r, t);
-    assert!(st.seed_gave_up(GaveUp::UsageLimit), "{st:?}");
-    assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit));
-    let mut st = managed();
-    st.observe(&r, t);
-    assert!(
-        !st.seed_gave_up(GaveUp::CouldNotFinish),
-        "CONTROL a wall opens it again: {st:?}"
-    );
+    assert!(!st.seed_gave_up(GaveUp::UsageLimit));
+    assert_eq!(st.gave_up(), None);
+    assert!(matches!(
+        at(&mut st, &r, t),
+        TurnEndAction::WaitUntil { .. }
+    ));
 }
 
 #[test]
@@ -16396,6 +16197,138 @@ fn a_managed_workers_opening_exchange_is_never_a_persons_under_land() {
     let a = at(&mut st, &recorded(claimed), now);
     assert!(!st.left_to_person(), "{a:?}: {st:?}");
     assert_ne!(a, TurnEndAction::Nothing, "Land acts: {st:?}");
+}
+
+/// A MANAGED WORKER UNDER LAND whose defense got the land check, answered `said` in a short turn a
+/// minute later: the state, the decision at that answer, and its time. A wait first (the back-off)
+/// is waited out on the same point read again.
+fn managed_check_answered(said: &str) -> (TurnEndState, TurnEndAction, Instant) {
+    let mut st = TurnEndState::default();
+    st.set_managed(true);
+    let now = t0();
+    assert_eq!(
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+        land_instruction()
+    );
+    let defended = land(idle(DEFENSE, Some(3 * MIN)));
+    let (a, now) = waited_out(&mut st, &defended, now + 3 * MIN);
+    let (b, now) = check_answered(&mut st, &defended, &a, now, said);
+    (st, b, now)
+}
+
+/// The decision at `r` at `start`, a wait waited out on the same point read again, the person's
+/// keys as old as the wait made them: the act and when it came.
+fn waited_out(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    start: Instant,
+) -> (TurnEndAction, Instant) {
+    let mut now = start;
+    let mut a = at(st, r, now);
+    for _ in 0..10 {
+        let TurnEndAction::WaitUntil { until, .. } = a else {
+            break;
+        };
+        now = until;
+        let again = TurnEndReading {
+            worked: None,
+            person: r.person.map(|ago| ago + (now - start)),
+            key: r.key.map(|ago| ago + (now - start)),
+            ..r.clone()
+        };
+        a = at(st, &again, now);
+    }
+    (a, now)
+}
+
+/// A person's short exchange under Land whose reply ended on `said`.
+fn persons_exchange(said: &str) -> TurnEndReading {
+    TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..land(idle(said, Some(Duration::from_secs(10))))
+    }
+}
+
+const GAVE_UP_AT_CHECK: &str =
+    "Could not finish: the grammar the parser needs was deleted upstream.";
+const LISTED_AT_CHECK: &str = "The parser's branch is not merged yet.";
+
+/// A CONCLUSION AT THE LAND CHECK LEAVES NO DEFENSE AUDITED: a managed worker that answers the
+/// check with `Could not finish:` concludes, and once a person's short exchange lifts the
+/// conclusion and Land's nudge follows, the defense the check had read, said again in a short turn
+/// that ran a tool, is owed the check again, as the `SupervisorLand` model's `YieldCouldNotFinish`
+/// leaves the books owing no defense anything. NEGATIVE CONTROL: answered with a list instead, the
+/// same defense said again in a short tooled turn is not checked again (the check read it, and no
+/// real work ran since).
+#[test]
+fn a_conclusion_at_the_land_check_leaves_no_defense_audited() {
+    let redefended = TurnEndReading {
+        ran_tools: true,
+        ..land(idle(DEFENSE, Some(Duration::from_secs(10))))
+    };
+    let restored = persons_exchange("Restored the grammar from the vendored copy.");
+    let (mut st, b, now) = managed_check_answered(GAVE_UP_AT_CHECK);
+    assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
+    assert_eq!(st.gave_up(), Some(GaveUp::CouldNotFinish), "{st:?}");
+    let (a, then) = waited_out(&mut st, &restored, now + MIN);
+    assert_eq!(st.gave_up(), None, "the exchange lifts the conclusion");
+    assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
+    st.acted(&a, &restored, then);
+    let (c, _) = waited_out(&mut st, &redefended, then + MIN);
+    assert_eq!(
+        c.rule_id(),
+        Some(RULE_LAND_CHECK),
+        "the defense is owed the check again: {c:?}"
+    );
+
+    let (mut st, _, now) = managed_check_answered(LISTED_AT_CHECK);
+    let listed = TurnEndReading {
+        worked: None,
+        ..answering(&land(idle(DEFENSE, Some(3 * MIN))), LISTED_AT_CHECK)
+    };
+    let (a, then) = waited_out(&mut st, &listed, now);
+    assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "CONTROL: {a:?}");
+    st.acted(&a, &listed, then);
+    let (c, _) = waited_out(&mut st, &redefended, then + MIN);
+    assert_eq!(
+        c.rule_id(),
+        Some(RULE_LAND_NUDGE),
+        "CONTROL: the defense the check read is not checked again: {c:?}"
+    );
+}
+
+/// A QUESTION IN A TURN AFTER THE LAND CHECK'S ANSWER IS ANSWERED: once the check's answer is a
+/// list, or a managed worker's `Could not finish:`, a person's short exchange whose reply ends on
+/// a question gets Land's answer, as that reply is no answer to the check. NEGATIVE CONTROL: the
+/// check's own answer ending on a question is read literally, as the agent's list, and gets
+/// Land's nudge.
+#[test]
+fn a_question_in_a_turn_after_the_land_checks_answer_is_answered() {
+    let asks =
+        persons_exchange("The vendored copy has the grammar. Should I restore it from there?");
+    for said in [GAVE_UP_AT_CHECK, LISTED_AT_CHECK] {
+        let (mut st, _, now) = managed_check_answered(said);
+        let (a, _) = waited_out(&mut st, &asks, now + MIN);
+        assert_eq!(st.gave_up(), None, "{said}");
+        assert_eq!(
+            a.rule_id(),
+            Some(RULE_LAND_ANSWER),
+            "{said}: the question gets Land's answer: {a:?}"
+        );
+    }
+    let asked = "The parser's branch is not merged yet. Should I merge it?";
+    let (mut st, _, now) = managed_check_answered(asked);
+    let again = TurnEndReading {
+        worked: None,
+        ..answering(&land(idle(DEFENSE, Some(3 * MIN))), asked)
+    };
+    let (a, _) = waited_out(&mut st, &again, now);
+    assert_eq!(
+        a.rule_id(),
+        Some(RULE_LAND_NUDGE),
+        "CONTROL: the check's own answer is read literally: {a:?}"
+    );
 }
 
 #[test]

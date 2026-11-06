@@ -313,6 +313,7 @@ pub(crate) struct Host {
     pub(crate) developer_tools: crate::clt_install::Install,
     /// Its dedicated children, including recovered ones: any live child owns the prompt slot.
     pub(crate) developer_tools_session: Vec<crate::clt_install::Terminal>,
+    pub(crate) developer_tools_stop: crate::clt_install::StopReach,
     /// The attempt whose result may change the install's state. Kept after its terminal leaves,
     /// so an older child's delayed status cannot become current again.
     pub(crate) developer_tools_attempt: Option<u64>,
@@ -471,6 +472,7 @@ impl Host {
             proxy_registered: false,
             developer_tools: launch.install(),
             developer_tools_session: Vec::new(),
+            developer_tools_stop: crate::clt_install::StopReach::for_launch(headless),
             developer_tools_attempt: None,
             developer_tools_unfinished: mark.opened(),
             c_toolchain_missing_held: false,
@@ -707,6 +709,7 @@ impl App {
         // A Command Line Tools install the stopped run asked for opens no tab, and its shim goes.
         self.workstation_setup.developer_tools = self.workstation_setup.developer_tools.withdrawn();
         self.withdraw_developer_tools_want();
+        self.stop_developer_tools_install();
         self.retire_launch_warmup();
     }
 

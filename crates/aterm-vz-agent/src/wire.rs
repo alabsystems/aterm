@@ -289,18 +289,24 @@ impl Take<'_> {
         Ok(u64::from_le_bytes(self.array()?))
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
+    fn slice(&mut self) -> Result<&[u8], WireError> {
         let len = self.u32()? as usize;
-        if len > self.0.len() {
-            return Err(WireError::Malformed("a byte string runs past the payload"));
-        }
-        let (b, rest) = self.0.split_at(len);
+        let (b, rest) = self
+            .0
+            .split_at_checked(len)
+            .ok_or(WireError::Malformed("a byte string runs past the payload"))?;
         self.0 = rest;
-        Ok(b.to_vec())
+        Ok(b)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
+        Ok(self.slice()?.to_vec())
     }
 
     fn text(&mut self) -> Result<String, WireError> {
-        String::from_utf8(self.bytes()?).map_err(|_| WireError::Malformed("text that is not UTF-8"))
+        std::str::from_utf8(self.slice()?)
+            .map(str::to_owned)
+            .map_err(|_| WireError::Malformed("text that is not UTF-8"))
     }
 
     /// A list's count, each item at least `min` bytes, so a count is never trusted past the

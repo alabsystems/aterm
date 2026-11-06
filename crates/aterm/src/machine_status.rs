@@ -548,7 +548,7 @@ pub(crate) fn fleet_area(
 /// name`, else the swarm `m<N>` label the vault's roster gave it), its fleet name against it, and
 /// whether the Mac's own names (Computer Name, Local hostname) say it yet.
 pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area {
-    use crate::converge::MacName;
+    use crate::converge::{MacName, MacNamePending};
     use aterm_agent::FleetName;
     const NAME: &str = "name";
     let (target, fleet, pending) = match name {
@@ -565,7 +565,7 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
             target,
             fleet,
             pending,
-        }) => (target, fleet, pending.as_deref()),
+        }) => (target, fleet, pending.as_ref()),
     };
     match fleet {
         FleetName::Due { from } => {
@@ -591,13 +591,23 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
         _ => format!("fleet name {target}"),
     };
     match pending {
-        Some(pending) => Area::due(
+        Some(MacNamePending::ThroughRule(pending)) => Area::working(
+            NAME,
+            format!("{target}; {fleet}; {pending}"),
+            "the next sync.identity pass repairs the Mac's names through its existing naming rule",
+        ),
+        Some(MacNamePending::Elevation(pending)) => Area::due(
             NAME,
             format!("{target}; {fleet}; {pending}"),
             Who::Person,
+            "complete setup's Mac password step (or run `aterm init` in your own Mac login)",
+        ),
+        Some(MacNamePending::Unread(pending)) => Area::unread(
+            NAME,
             format!(
-                "type the Mac password for `sudo aterm machines here apply --plain --name {target}`"
+                "{target}; {fleet}; {pending}; the existing naming permission could not be checked"
             ),
+            "check the Mac's existing naming permission before asking for another password",
         ),
         None => Area::ok(NAME, format!("{target}; {fleet}")),
     }
@@ -730,7 +740,7 @@ pub(crate) fn repos_area(
         Setup::Read { .. } => match setup.stage(stage_name) {
             None => Area::off(NAME, "the setup clones no repositories on this Mac"),
             Some(stage) => match stage.status.as_str() {
-                "applied" => Area::ok(NAME, "cloned by the setup"),
+                "applied" => owed_area(owed, token),
                 "stopped" => Area::off(NAME, "a Stop ended the setup before it cloned them"),
                 "running" => Area::working(NAME, "cloning", "the setup clones them"),
                 _ if stage
@@ -755,16 +765,21 @@ pub(crate) fn repos_area(
 }
 
 /// The repositories where no setup clones them: what `aterm init`'s owed clone says. With none
-/// owed, `aterm init` either cloned what it found or has not run; with a token here that is
-/// `ok` (`aterm init --only github` looks for new ones), and with none it is an agent's
-/// `aterm init`, whose owed clone the vault's sync then runs by itself.
+/// owed, `aterm init` either cloned what it found or has not run. Neither the absence of
+/// debt nor a token proves repositories are present: ask init to reconcile the inventory.
 fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
     const NAME: &str = "repos";
     match owed {
         Err(why) => Area::unread(NAME, why, "aterm doctor"),
-        Ok(OwedClone::Nothing(_)) if token => Area::ok(
+        Ok(OwedClone::Verified { present, total }) => Area::ok(
             NAME,
-            "aterm init owes no clone here (`aterm init --only github` looks for new ones)",
+            format!("{present}/{total} vault repositories verified on this machine"),
+        ),
+        Ok(OwedClone::Nothing(_)) if token => Area::due(
+            NAME,
+            "no clone is owed; repository contents have not been verified",
+            Who::Agent,
+            "`aterm init --only github` verifies and clones the vault's repository inventory",
         ),
         Ok(OwedClone::Nothing(_)) => Area::due(
             NAME,
@@ -1113,15 +1128,7 @@ fn read_areas() -> Vec<Area> {
         })
     };
     let agents = bounded(read_agents);
-    let owed = bounded(|| {
-        let state = aterm_types::dirs::account_state_dir()
-            .ok_or("no state directory holds the clone aterm init owes")?;
-        aterm_machines::init::owed_clone(
-            &aterm_machines::port::Live::new(),
-            &state,
-            &aterm_machines::init::Holds::NONE,
-        )
-    });
+    let owed = bounded(|| aterm_machines::sync::Ports::owed_clone(&crate::converge::Live::here()));
 
     let setup = setup(deadline);
     let mut areas = Vec::new();

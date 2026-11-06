@@ -3588,7 +3588,7 @@ mod deferred_reader_gate_tests {
             let _ = tx.send(waiter.wait_until_released(&waiter_stop));
         });
         while gate.parked() == 0 {
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(
             rx.try_recv().is_err(),
@@ -4240,14 +4240,14 @@ mod shell_exit_tests {
         let mut late_shown = row(&session).starts_with("byelate");
         let until = std::time::Instant::now() + patience;
         while exited && !late_shown && std::time::Instant::now() < until {
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
             late_shown = row(&session).starts_with("byelate");
         }
         aterm_pty::close_fd(slave);
         let reader_ended = session.reader_join.as_ref().is_some_and(|reader| {
             let until = std::time::Instant::now() + patience;
             while !reader.is_finished() && std::time::Instant::now() < until {
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             reader.is_finished()
         });
@@ -6281,6 +6281,10 @@ fn spawn_compress_worker(
                     }
                     prev = remaining;
                     crate::yield_to_ui_waiter(&ui_waiting);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "the compress worker's give-way between its bounded batches, so the PTY reader (which never registers) can take the lock: the worker waits for nobody, and no deadline waits on its drain"
+                    )]
                     std::thread::yield_now();
                 }
             }
@@ -6309,6 +6313,10 @@ fn relieve_flood_pressure(term: &Mutex<Terminal>, ui_waiting: &std::sync::atomic
         }
         owed = owed.saturating_sub(promoted);
         crate::yield_to_ui_waiter(ui_waiting);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the compress worker's give-way between its bounded relief batches, so the PTY reader (which never registers) can take the lock: the worker waits for nobody, and no deadline waits on its relief"
+        )]
         std::thread::yield_now();
     }
 }

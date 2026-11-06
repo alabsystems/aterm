@@ -290,6 +290,20 @@ fn arg0_helper_name(argv: &[String]) -> Option<&str> {
         .filter(|name| matches!(*name, "apply_patch" | "applypatch" | "codex-linux-sandbox"))
 }
 
+/// The option an option token `tok` names, as clap reads it, and whether its value is attached:
+/// a long one's `--name=value`, a short one's `-xvalue` or `-x=value`.
+pub(crate) fn option_name(tok: &str) -> (String, bool) {
+    if let Some((n, _)) = tok.split_once('=')
+        && n.starts_with("--")
+    {
+        (n.to_string(), true)
+    } else if !tok.starts_with("--") && tok.chars().count() > 2 {
+        (tok.chars().take(2).collect::<String>(), true)
+    } else {
+        (tok.to_string(), false)
+    }
+}
+
 /// The flags [`rewrite_argv`] carries from `argv` (`argv[0]` first), each where `keep`
 /// holds of its name and its tokens (the flag's own, then its values).
 pub(crate) fn kept_flags(
@@ -335,15 +349,7 @@ fn kept_flag_levels(
             }
             continue;
         }
-        let (name, attached) = if let Some((n, _)) = tok.split_once('=')
-            && n.starts_with("--")
-        {
-            (n.to_string(), true)
-        } else if !tok.starts_with("--") && tok.chars().count() > 2 {
-            (tok.chars().take(2).collect::<String>(), true)
-        } else {
-            (tok.to_string(), false)
-        };
+        let (name, attached) = option_name(tok);
         let (arity, fate) = flag(&name).ok_or_else(|| ArgvRefusal::UnknownFlag(name.clone()))?;
         if fate == Fate::Refuse {
             return Err(ArgvRefusal::NotResumable(name));

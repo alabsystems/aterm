@@ -2349,7 +2349,7 @@ pub(crate) use macos::{
     MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
     defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
-    update_version_menu,
+    update_machine_menu, update_version_menu,
 };
 
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2630,6 +2630,9 @@ mod macos {
         target: Retained<MenuTarget>,
         /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`).
         version_item: Obj,
+        /// The machine's top-level bar item right of Version (title `m8 Heron`), hidden until
+        /// its reader's first read ([`update_machine_menu`]).
+        machine_item: Obj,
     }
 
     aterm_objc::declare_class! {
@@ -2743,6 +2746,10 @@ mod macos {
             &super::version_menu_bar_title(false),
             build_version_menu(&target, None, None, false, false)?,
         )?;
+        let machine_item = attach_submenu(&main, "", new_menu()?)?;
+        // SAFETY: `-setHidden:` is `-(void)(BOOL)`, a plain main-thread setter on the live
+        // NSMenuItem just attached.
+        unsafe { appkit::send_v_bool(machine_item.id(), sel!(setHidden:), true) };
 
         // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit
         // singleton accessor (`_main_thread` is the witness); `-setMainMenu:` is
@@ -2758,7 +2765,43 @@ mod macos {
         Some(MenuHandle {
             target,
             version_item,
+            machine_item,
         })
+    }
+
+    /// Title the machine's bar item `view`'s title (`m8 Heron`, §5.1 of
+    /// `docs/DESIGN-machine-names-2026-11-04.md`) over a menu whose one row says what it is
+    /// (`m8 · Heron · in a fleet`), and show it.
+    pub(crate) fn update_machine_menu(
+        handle: &MenuHandle,
+        view: &crate::machine_title::MachineView,
+    ) {
+        let Some(_main_thread) = MainThread::new() else {
+            return;
+        };
+        let title = crate::machine_title::machine_menu_bar_title(view);
+        let (Some(ns_title), Some(menu)) = (appkit::nsstring(&title), new_menu()) else {
+            return;
+        };
+        let Some(row) = new_item(
+            &crate::machine_title::machine_menu_info_row(view),
+            Sel::NULL,
+            "",
+        ) else {
+            return;
+        };
+        // SAFETY: `-addItem:` is `-(void)(NSMenuItem *)` and retains; `-setTitle:` is
+        // `-(void)(NSString *)` and copies; `-setSubmenu:` is `-(void)(NSMenu *)` and retains;
+        // `-setHidden:` is `-(void)(BOOL)`: plain main-thread setters on live objects, so the
+        // +1 row, title and menu may drop at the end of this frame. A row with no action is
+        // disabled under the menu's default autoenabling, so it reads as information.
+        unsafe {
+            appkit::send_v_id(menu.id(), sel!(addItem:), row.id());
+            appkit::send_v_id(menu.id(), sel!(setTitle:), ns_title.id());
+            appkit::send_v_id(handle.machine_item.id(), sel!(setTitle:), ns_title.id());
+            appkit::send_v_id(handle.machine_item.id(), sel!(setSubmenu:), menu.id());
+            appkit::send_v_bool(handle.machine_item.id(), sel!(setHidden:), false);
+        }
     }
 
     /// Re-sync the live Version menu (title and items) to the update state.

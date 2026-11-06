@@ -376,7 +376,8 @@ impl App {
             if let Some(ready) = self.stats_lens_copy_ready(wid) {
                 ready
             } else if self.active_native_view(wid).is_some() {
-                self.native_has_selection(wid)
+                // A private document's Copy is the person's keystroke ([`App::menu_copies`]).
+                self.menu_copies(wid)
             } else {
                 self.terminal_selection_in(wid, |term| {
                     Some(crate::term_lock(term).text_selection().has_selection())
@@ -505,7 +506,7 @@ impl App {
         } else if let Some(ready) = front.and_then(|wid| self.stats_lens_copy_ready(wid)) {
             ready
         } else if let Some(wid) = front.filter(|wid| self.active_native_view(*wid).is_some()) {
-            self.native_has_selection(wid)
+            self.menu_copies(wid)
         } else if let Some(wid) = front {
             self.terminal_selection_in(wid, |term| {
                 crate::term_try_lock(term).map(|term| term.text_selection().has_selection())

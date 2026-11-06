@@ -229,15 +229,17 @@ impl Sid {
     pub fn parse(word: &str) -> Option<Sid> {
         crate::subject::parse_hex::<10>(word.strip_prefix("s-")?).map(Sid)
     }
+
+    #[must_use]
+    const fn to_ascii_bytes(self) -> [u8; 22] {
+        crate::subject::format_hex_lower::<10, 22>(b"s-", &self.0)
+    }
 }
 
 impl fmt::Display for Sid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("s-")?;
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
+        let buf = self.to_ascii_bytes();
+        f.write_str(std::str::from_utf8(&buf).unwrap_or_default())
     }
 }
 
@@ -278,16 +280,53 @@ impl Out {
 
     /// A text of at most 255 bytes: every text type here is shorter.
     fn text(&mut self, s: &str) {
-        let len = u8::try_from(s.len()).unwrap_or(u8::MAX);
+        self.bytes(s.as_bytes());
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        let len = u8::try_from(b.len()).unwrap_or(u8::MAX);
         self.0.push(len);
         self.0
-            .extend_from_slice(s.as_bytes().get(..usize::from(len)).unwrap_or_default());
+            .extend_from_slice(b.get(..usize::from(len)).unwrap_or_default());
     }
 
     fn opt_text(&mut self, s: Option<&str>) {
         self.flag(s.is_some());
         if let Some(s) = s {
             self.text(s);
+        }
+    }
+
+    fn sid(&mut self, sid: Sid) {
+        self.bytes(&sid.to_ascii_bytes());
+    }
+
+    fn opt_sid(&mut self, sid: Option<Sid>) {
+        self.flag(sid.is_some());
+        if let Some(sid) = sid {
+            self.sid(sid);
+        }
+    }
+
+    fn opt_node(&mut self, node: Option<Node>) {
+        self.flag(node.is_some());
+        if let Some(node) = node {
+            self.bytes(&node.to_ascii_bytes());
+        }
+    }
+
+    fn account(&mut self, account: AccountKey) {
+        self.bytes(&account.to_ascii_bytes());
+    }
+
+    fn home(&mut self, home: HomeKey) {
+        match home {
+            HomeKey::Home => self.bytes(b"home"),
+            HomeKey::Hashed(h) => {
+                let bytes = h.to_be_bytes();
+                let buf = crate::subject::format_hex_lower::<8, 17>(b"h", &bytes);
+                self.bytes(&buf);
+            }
         }
     }
 
@@ -506,7 +545,7 @@ impl QuotaRow {
         let mut o = Out::new(KIND_QUOTA);
         o.varint(self.at);
         o.text(self.cli.word());
-        o.text(&self.account.to_string());
+        o.account(self.account);
         o.text(self.label.as_str());
         o.text(self.condition.as_str());
         o.flag(self.enrolled);
@@ -627,7 +666,7 @@ impl AgyRow {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Out::new(KIND_AGY);
         o.varint(self.at);
-        o.text(&self.home.to_string());
+        o.home(self.home);
         let n = o.count(&self.groups, AGY_GROUPS_MAX);
         for g in self.groups.iter().take(n) {
             o.text(g.id.as_str());
@@ -709,7 +748,7 @@ impl PlaceRow {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Out::new(KIND_PLACE);
         o.varint(self.at);
-        o.text(&self.account.to_string());
+        o.account(self.account);
         o.text(self.place.as_str());
         o.varint(self.since);
         o.varint(self.until);
@@ -814,22 +853,22 @@ impl NeedsRow {
         o.varint(self.at);
         let k = o.count(&self.needs, NEEDS_MAX);
         for n in self.needs.iter().take(k) {
-            o.text(&n.sid.to_string());
+            o.sid(n.sid);
             o.text(n.word.as_str());
             o.flag(n.harness);
-            o.opt_text(n.worker_of.map(|s| s.to_string()).as_deref());
+            o.opt_sid(n.worker_of);
             o.opt(n.since);
         }
         let k = o.count(&self.held, NEEDS_MAX);
         for h in self.held.iter().take(k) {
-            o.text(&h.sid.to_string());
+            o.sid(h.sid);
             o.text(h.hold.as_str());
-            o.opt_text(h.by.map(|n| n.to_string()).as_deref());
+            o.opt_node(h.by);
             o.opt(h.since);
         }
         let k = o.count(&self.managers, NEEDS_MAX);
         for m in self.managers.iter().take(k) {
-            o.text(&m.sid.to_string());
+            o.sid(m.sid);
             o.varint(u64::from(m.workers));
         }
         o.0

@@ -648,6 +648,20 @@ impl EditorWorkspace {
             view.prefix_hud = None;
             return Ok(vec![EditorEffect::Status(refusal)]);
         }
+        // A concealed document's text leaves it only on the person's own keystroke (one-mesh
+        // design §4.8): input without clipboard authority would kill it to a ring of its own,
+        // and could yank it where the window's readers read it; a macro's replay is no keystroke
+        // of the person's (any input may replay one).
+        let concealed_kill = command.kills() && store.concealed(view.document).is_some();
+        if concealed_kill
+            && (self.playing_macro || !self.granted.contains(&CommandAuthority::Clipboard))
+        {
+            view.prefix_argument = None;
+            view.prefix_hud = None;
+            return Ok(vec![EditorEffect::Status(
+                super::grid::CONCEALED_STAYS.to_string(),
+            )]);
+        }
         if let Some(listing) = store.directory(view.document) {
             if matches!(
                 command,
@@ -724,9 +738,10 @@ impl EditorWorkspace {
         }
         self.remember_command(command.name());
         self.end_run(view.document);
-        let previous = view
-            .last_command
-            .filter(|_| self.last_left.as_ref() == Some(&LeftBy::now(store, view)));
+        // A concealed document's kill is a fresh entry, never appended to the one before it.
+        let previous = view.last_command.filter(|_| {
+            !concealed_kill && self.last_left.as_ref() == Some(&LeftBy::now(store, view))
+        });
         let mut result = if view.grid().is_some() {
             self.grid_run(store, view, command, argument, previous, args)
         } else {
@@ -747,11 +762,19 @@ impl EditorWorkspace {
             && let Ok(effects) = &mut result
             && std::mem::take(&mut self.kill_ring_changed)
             && self.granted.contains(&CommandAuthority::Clipboard)
-            && let Some(newest) = self.kill_ring.front()
         {
-            effects.push(EditorEffect::KillToClipboard {
-                text: newest.clone(),
-            });
+            // A concealed document's kill goes to the clipboard, the person's choice, and leaves
+            // the ring every document yanks from, so no later input, in any document, yanks a
+            // hidden value back out.
+            let newest = if concealed_kill {
+                self.grid_kill = None;
+                self.kill_ring.pop_front()
+            } else {
+                self.kill_ring.front().cloned()
+            };
+            if let Some(text) = newest {
+                effects.push(EditorEffect::KillToClipboard { text });
+            }
         }
         result
     }

@@ -55,25 +55,36 @@ fn secs(t: u64) -> i64 {
 /// The closed words one event carries beyond its kind: its window and figure, its reason, the
 /// other account of a switch by its lab label. Never free text: every word is the journal's.
 fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
-    let mut words = Vec::new();
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let sep = |out: &mut String| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+    };
     if let Some(window) = event.window {
-        words.push(window.word().to_owned());
+        out.push_str(window.word());
     }
     if let Some(p) = event.pct_x10 {
-        words.push(format!("{}.{}%", p / 10, p % 10));
+        sep(&mut out);
+        let _ = write!(out, "{}.{}%", p / 10, p % 10);
     }
     if let Some(why) = &event.why {
-        words.push(format!("why={}", why.as_str()));
+        sep(&mut out);
+        out.push_str("why=");
+        out.push_str(why.as_str());
     }
     if let Some(to) = &event.to {
+        sep(&mut out);
         let label = view
             .accounts
             .get(to.as_str())
-            .and_then(|a| a.label.clone())
-            .unwrap_or_else(|| to.as_str().to_owned());
-        words.push(format!("to={label}"));
+            .and_then(|a| a.label.as_deref())
+            .unwrap_or_else(|| to.as_str());
+        out.push_str("to=");
+        out.push_str(label);
     }
-    words.join(" ")
+    out
 }
 
 /// What the journal says, as the harness reads it: each account `seen` knows, its Macs named

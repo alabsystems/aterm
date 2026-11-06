@@ -746,7 +746,7 @@ fn a_readings_wall_clock_is_read_before_its_sweep() {
             let hang = Instant::now() + Duration::from_secs(60);
             while unix_ms_now() <= began {
                 assert!(Instant::now() < hang, "the wall clock stood still a minute");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             LISTED_MS.set(Some(began));
             Some(aterm_sysprobe::Sweep::default())

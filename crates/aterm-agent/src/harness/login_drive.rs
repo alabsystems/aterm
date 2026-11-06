@@ -582,8 +582,9 @@ pub enum Approval {
     Refused(String),
     /// It waited on Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::bot_check`]): why, naming Cloudflare and the page's host and
-    /// path, never its text. No person is asked for it: aterm never tries to pass a bot check,
-    /// and the sign-in ends as an error on record (design R-13).
+    /// path, never its text. Software never tries to pass one. A Claude flow may use the fleet
+    /// issuer's interactive challenge service; if that is unavailable or does not finish, the
+    /// sign-in ends as an error on record without asking the AI.
     BotCheck(String),
 }
 
@@ -748,7 +749,9 @@ pub(super) fn end(child: &mut aterm_uds::spawnfd::Child) {
 
 /// Runs `spec`'s child, hands its page to `approver` once its grammar named the URL (and, for a
 /// device flow, the code), and waits for it to say it is done and exit, all within
-/// [`Spec::hang`].
+/// [`Spec::hang`]. The child is tied to this process ([`super::align::tie`]), so a quit, an exec
+/// in its place, a crash or a `SIGKILL` of this process ends it too; where this process's
+/// executable was replaced since it started, so the tie cannot hold, it is not run.
 pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(spec.program);
@@ -762,15 +765,21 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         .stderr(Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
+    let not_run = |why: String| Drove {
+        outcome: Outcome::NotRun(why),
+        host: None,
+    };
+    if let Err(why) = super::align::tie(&mut cmd) {
+        return not_run(why);
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            return Drove {
-                outcome: Outcome::NotRun(format!("{}: {e}", spec.program.display())),
-                host: None,
-            };
-        }
+        Err(e) => return not_run(format!("{}: {e}", spec.program.display())),
     };
+    if let Err(why) = super::align::tie_held() {
+        end(&mut child);
+        return not_run(why);
+    }
     let now = Instant::now();
     let deadline = now
         .checked_add(spec.hang)

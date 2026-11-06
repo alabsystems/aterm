@@ -7,6 +7,7 @@ const NOW: i64 = 1_790_000_000;
 
 struct Bed {
     _root: aterm_tempfile::TempDir,
+    home: PathBuf,
     cli: Cli,
     store: accounts::Store,
     path: PathBuf,
@@ -15,6 +16,11 @@ struct Bed {
 }
 
 impl Bed {
+    /// The user home and state root the store is under.
+    fn paths(&self) -> (&Path, &Path) {
+        (&self.home, self._root.path())
+    }
+
     fn new(cli: Cli) -> Self {
         let root = aterm_tempfile::TempDir::new().unwrap();
         let store =
@@ -113,6 +119,7 @@ impl Bed {
             })
             .unwrap();
         Self {
+            home: root.path().join("home"),
             _root: root,
             cli,
             store,
@@ -242,7 +249,7 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
     }
     let _held = (fault == 6).then(|| bed.store.acquire().unwrap());
     let before = bed.records();
-    let result = read_renewal_candidates(cli, &bed.store, &bed.path, NOW);
+    let result = read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW);
     if fault != 1 {
         assert_eq!(bed.records(), before, "only admitted recovery may publish");
     }
@@ -278,7 +285,9 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
             );
             if later {
                 bed.later();
-                let fresh = read_renewal_candidates(cli, &bed.store, &bed.path, NOW + 1).unwrap();
+                let fresh =
+                    read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW + 1)
+                        .unwrap();
                 assert!(fresh.tiered.is_empty(), "no session needs the changed row");
                 assert_ne!(fresh.records.raw_roster, captured.raw_roster);
             }
@@ -383,7 +392,8 @@ fn renewal_admission_checks_policy_and_generation_but_allows_unrelated_budget_up
     for cli in [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok] {
         for change in 0..3 {
             let bed = Bed::new(cli);
-            let captured = read_renewal_candidates(cli, &bed.store, &bed.path, NOW).unwrap();
+            let captured =
+                read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW).unwrap();
             match change {
                 0 => {
                     let mut raw = bed.raw.clone();

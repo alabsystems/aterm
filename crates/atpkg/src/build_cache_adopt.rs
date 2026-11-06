@@ -221,7 +221,7 @@ fn publish_marker(root: &aterm_dirfd::OwnedFd, receipt: &Receipt) -> Option<()> 
         let _ = aterm_dirfd::unlinkat(root, name.as_str(), aterm_dirfd::AtFlags::empty());
         return None;
     }
-    aterm_dirfd::fsync(root).ok()
+    aterm_durable::primitive::fsync(root).ok()
 }
 
 /// Whether nothing named `name` stands in the folder `dir` holds, its absence known.

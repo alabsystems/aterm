@@ -11,8 +11,8 @@
 //! ALab vault under this Mac's own freshly minted recipient key. Elsewhere the
 //! automatic plan is the base plan, saved as provisional, and the launch that finds
 //! the signal, this one or a later one, widens it to the whole profile as a new
-//! revision. ALab membership also expands a saved partial choice, unless an explicit
-//! Stop or Restore holds it. This scoping never narrows a saved plan.
+//! revision. A plan the person shaped stays as chosen; a Stop, Cancel or Restore
+//! holds automatic expansion too. This scoping never narrows a saved plan.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -392,13 +392,13 @@ impl InitialSetupAuthorization {
     }
 }
 
-/// The plan a saved partial plan widens to, or `None` when it stays: the whole profile once
-/// this Mac shows the ALab signal (`alab`); otherwise, for a plan an older aterm saved before
+/// The plan aterm's own saved partial plan widens to, or `None` when it stays: the whole profile
+/// once this Mac shows the ALab signal (`alab`); otherwise, for a plan an older aterm saved before
 /// every Mac got the base plan (releases v0.130.0 to v0.144 saved aterm's permissions alone on a
 /// Mac that was not yet an ALab member), the base plan joined to it
 /// ([`aterm_types::macos_setup::BASE_PLAN`]), whatever `alab` says, so that Mac syncs and an ALab
-/// Mac can join its vault and widen. A stopped,
-/// cancelled or restored plan stays as it is (a widen a Stop put back stays held,
+/// Mac can join its vault and widen. A plan the person shaped, stopped,
+/// cancelled or restored stays as it is (a widen a Stop put back stays held,
 /// [`put_back_held_widen`]), and nothing narrows a plan. A Restore's record holds it for as long
 /// as it stands ([`Restored`]), whatever was admitted since: widening would set again the groups
 /// the Restore put back and sign Messages and FaceTime out, which nothing undoes.
@@ -406,8 +406,9 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
     let Some((plan, true)) = records.plan.as_ref() else {
         return None;
     };
-    if records.stopped_run()
-        || matches!(records.decision, Decision::Stopped(_))
+    if !aterms_own(records)
+        || records.stopped_run()
+        || records.stop_request == Some(StopRequest::Unreadable)
         || records.restored.is_some()
         || plan.selection == Selection::all()
     {
@@ -416,9 +417,6 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
     let selection = if alab() {
         Selection::all()
     } else {
-        if !records.provisional {
-            return None;
-        }
         plan.selection.union(aterm_types::macos_setup::BASE_PLAN)
     };
     (selection != plan.selection).then(|| Plan {
@@ -428,7 +426,7 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
 }
 
 /// Whether a look for the ALab signal has work ([`provisional_setup_widened`]): a saved
-/// partial plan can widen once this Mac shows the ALab
+/// automatic partial plan can widen once this Mac shows the ALab
 /// signal. Reads aterm's records only: no probe. An error when they cannot be read just now (a
 /// pass writing them, say) or whose person is not settled yet; a newer aterm's widen nothing.
 pub fn provisional_setup_widens() -> Result<bool, String> {
@@ -1326,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_requires_a_readable_vault_and_expands_saved_partial_plans() {
+    fn an_upgrade_requires_a_readable_vault_and_preserves_the_persons_plan() {
         let root = aterm_tempfile::tempdir().unwrap();
         let narrow = provisional(root.path());
         let before = observation_at(root.path()).unwrap();
@@ -1345,9 +1343,13 @@ mod tests {
         );
         save_plan_as(root.path(), &narrow, false).unwrap();
         assert!(
-            prepare_upgrade(root.path(), || true, || Ok(None))
-                .unwrap()
-                .is_some()
+            prepare_upgrade(
+                root.path(),
+                || true,
+                || panic!("the person's plan needs no vault read"),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1373,8 +1375,8 @@ mod tests {
             .unwrap()
             .expect("the person's narrow plan is durably admitted");
         assert!(
-            widens_at(root.path()).unwrap(),
-            "a partial plan expands on joining the fleet"
+            !widens_at(root.path()).unwrap(),
+            "joining the fleet preserves the person's choice"
         );
 
         // A partial publication is unknown, rather than a valid decision not to widen.
@@ -1382,10 +1384,10 @@ mod tests {
         assert!(widens_at(root.path()).is_err());
     }
 
-    /// A look that hears the ALab signal saves nothing, including when a saved partial plan
-    /// needs expansion. Only persistence starts the expanded run.
+    /// A look that hears the ALab signal saves nothing. Automatic plans can expand; the person's
+    /// choices stay held. Only persistence starts the expanded run.
     #[test]
-    fn a_look_saves_nothing_and_partial_plans_expand_on_the_fleet() {
+    fn a_look_saves_nothing_and_only_automatic_plans_expand_on_the_fleet() {
         let root = aterm_tempfile::tempdir().unwrap();
         let narrow = provisional(root.path());
         let before = observation_at(root.path()).unwrap();
@@ -1405,10 +1407,15 @@ mod tests {
         let revision = revision_at(root.path()).unwrap();
         let progress_before = std::fs::read(root.path().join("initial-setup.json")).unwrap();
         save_plan_as(root.path(), &narrow, false).unwrap();
-        assert!(widens_at(root.path()).unwrap());
+        assert!(!widens_at(root.path()).unwrap());
         assert_eq!(
-            widened_at(root.path(), || true, || Ok(None)).unwrap(),
-            Some((narrow, Plan::default()))
+            widened_at(
+                root.path(),
+                || true,
+                || panic!("the person's plan needs no vault read"),
+            )
+            .unwrap(),
+            None
         );
         assert_eq!(revision_at(root.path()).unwrap(), revision);
         assert_eq!(
@@ -1495,8 +1502,7 @@ mod tests {
     }
 
     /// The same busy look, but the writer that held the lock changed the plan in force: a Stop of
-    /// its run, a Restore, or another plan ends this attempt. Saving the same partial plan
-    /// as a choice still lets fleet expansion finish.
+    /// its run, a Restore, another plan, or a choice of the same partial plan ends this attempt.
     #[test]
     fn a_widen_apply_that_met_a_busy_lock_is_not_admitted_over_a_changed_plan() {
         for change in ["stop", "chosen", "restore", "another plan"] {
@@ -1543,22 +1549,11 @@ mod tests {
                 || Ok(None),
                 |ticket, full| ticket.upgrade_at(root.path(), full).result,
             );
-            if change == "chosen" {
-                assert!(
-                    second.unwrap().is_some(),
-                    "fleet expansion remains admitted"
-                );
-                assert_eq!(
-                    saved_plan(root.path()).unwrap().unwrap().selection,
-                    Selection::all()
-                );
-            } else {
-                assert_eq!(second, Ok(None), "{change}");
-                assert!(
-                    observation_at(root.path()).unwrap() == changed,
-                    "{change}: nothing written"
-                );
-            }
+            assert_eq!(second, Ok(None), "{change}");
+            assert!(
+                observation_at(root.path()).unwrap() == changed,
+                "{change}: nothing written"
+            );
             assert!(!upgrade.pending(), "{change}: the attempt ends");
         }
     }
@@ -1850,9 +1845,9 @@ mod tests {
         );
     }
 
-    /// Set up now releases a previous Stop, allowing fleet setup to expand the plan again.
+    /// Set up now releases a previous Stop for the plan shown, preserving the groups it left off.
     #[test]
-    fn set_up_now_after_a_stopped_widen_rearms_fleet_setup() {
+    fn set_up_now_after_a_stopped_widen_preserves_the_plan_shown() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (narrow, _, widened) = widened_and_stopped(root.path(), false);
         assert!(put_back_held_widen(root.path(), widened).unwrap());
@@ -1874,7 +1869,9 @@ mod tests {
         .result
         .unwrap()
         .expect("Set up now admitted");
-        assert!(widens_at(root.path()).unwrap());
+        assert!(!saved_plan_provisional(root.path()).unwrap());
+        assert!(!widens_at(root.path()).unwrap());
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(narrow));
     }
 
     /// A widened run that finished a step of its own, or that a choice replaced, keeps what
@@ -2024,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_membership_expands_partial_plans_and_respects_stops() {
+    fn fleet_membership_expands_only_automatic_plans_and_respects_holds() {
         let narrow = scoped(Plan::default(), false);
         let records = |provisional: bool, decision: Decision| Records {
             plan: Some((narrow.clone(), true)),
@@ -2044,9 +2041,9 @@ mod tests {
             None
         );
         assert_eq!(
-            upgrade_of(&records(false, Decision::Pending), || true).map(|plan| plan.selection),
-            Some(Selection::all()),
-            "fleet membership enables the complete setup"
+            upgrade_of(&records(false, Decision::Pending), || true),
+            None,
+            "fleet membership preserves the person's plan"
         );
         assert_eq!(
             upgrade_of(&records(true, Decision::Stopped(Stop::Cancelled)), || true),
@@ -2077,6 +2074,23 @@ mod tests {
             upgrade_of(&asked, || true),
             None,
             "a Stop stands from the moment it is asked for"
+        );
+        let mut finished = Progress::for_plan(&narrow);
+        finished.admitted = true;
+        finished.completed = true;
+        let unreadable_stop = Records {
+            progress: Some(finished),
+            stop_request: Some(StopRequest::Unreadable),
+            ..records(true, Decision::Pending)
+        };
+        assert!(
+            !unreadable_stop.stopped_run(),
+            "a completed run alone would ignore a late Stop request"
+        );
+        assert_eq!(
+            upgrade_of(&unreadable_stop, || true),
+            None,
+            "an unreadable Stop remains held even after completion"
         );
     }
 
@@ -2266,9 +2280,16 @@ mod tests {
         save_progress(root.path(), history).unwrap();
         let records = observation_at(root.path()).unwrap().records;
         assert!(records.provisional, "precondition: aterm's own plan");
+        assert!(
+            records.progress.as_ref().is_some_and(|progress| {
+                progress.admitted && progress.completed && progress.belongs_to(&old)
+            }),
+            "precondition: its run finished"
+        );
         assert!(!keeps_vault_sync(&records), "precondition: it never syncs");
         let reached = upgrade_of(&records, || false).expect("widens with no ALab signal");
         assert_eq!(reached.selection, aterm_types::macos_setup::BASE_PLAN);
+        assert!(reached.selection.contains(Setting::Repositories));
         assert_eq!(reached.vault_url, old.vault_url);
         assert_eq!(
             upgrade_of(&records, || true).map(|plan| plan.selection),

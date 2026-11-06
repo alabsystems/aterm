@@ -10660,3 +10660,133 @@ mod observe_table {
     use super::*;
     include!("observe_table_tests.rs");
 }
+
+/// THE SIDE PANEL'S TEXT IS NO WORD OF A POINT: the readers of the letters of a turn's rows read
+/// them through the screen's transcript (`ScreenReader::transcript`, Claude Code's: each row above
+/// the composer cut at its side panel's rule): a point's key (`point_key`, which a later read is
+/// held to as `moved_from` and which keys the handed, held and reasoned points), the mark of the
+/// turn's rows a counted submission is held to (`submit_mark`, `submitted_over`), the conversation's
+/// mark the turn-end policy holds one to (`policy::turn_end::conversation_mark`) and the agent's
+/// words the stuck-busy canary holds still (`wall_memory::still_words`). Read whole before
+/// (KI-1101-3), the panel's text beside those rows was among their letters, so the panel's text
+/// changing (a diff panel naming another file as background work edits one) moved a point that
+/// had not moved, read a counted submission as drawn though no turn was, and read the agent's
+/// words as moved. No capture draws the panel's text changing, so these screens are CONSTRUCTED
+/// from the measured 2.1.316 capture: its panel's measured `crates/target-iceb (untracked)` or
+/// `New file not yet staged.` after the rule beside the eight rows over its last said one, and its
+/// heading as measured (`1 file changed`) or as `2 files changed`. CONTROL: the agent's own last
+/// said words changing moves each.
+#[test]
+fn the_side_panels_text_is_no_word_of_a_point() {
+    use super::super::policy::turn_end::conversation_mark;
+    use super::wall_memory::still_words;
+    use aterm_phase::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen};
+    let measured = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+    let reader: &dyn ScreenReader = &aterm_phase::ClaudeReader;
+    let said = last_said_index(&measured).expect("the last said row");
+    let side = |i: usize| measured[i].split_once('│').expect("the panel's row").1;
+    let (untracked, unstaged) = (side(6), side(8));
+    assert_eq!(
+        (
+            untracked,
+            unstaged,
+            measured[said].trim_end_matches([' ', '│'])
+        ),
+        (
+            "crates/target-iceb (untracked)",
+            "New file not yet staged.",
+            "  NEEDS YOU: an xAI account for Grok on m21."
+        ),
+        "PRECONDITION: the panel's measured words and the last said row"
+    );
+    let beside = |text: &str| {
+        let mut rows = measured.clone();
+        for row in &mut rows[said - 7..=said] {
+            let left = row.split_once('│').expect("a row beside the panel").0;
+            *row = format!("{left}│{text}");
+        }
+        rows
+    };
+    let heading = |words: &str| {
+        let mut rows = measured.clone();
+        rows[1] = rows[1].replacen("1 file changed", words, 1);
+        rows
+    };
+    let said_else = |rows: &[String]| {
+        let mut rows = rows.to_vec();
+        rows[said] = rows[said].replacen("for Grok", "for Kimi", 1);
+        rows
+    };
+    let screen_of = |rows: Vec<String>, submits: u64| Screen {
+        rows,
+        seq: 7,
+        submits: Some(submits),
+        ..Screen::default()
+    };
+    let turn = |rows: Vec<String>| Turn {
+        phase: worker_phase(&rows),
+        screen: screen_of(rows, 3),
+        timed_out: false,
+    };
+    let key = |rows: Vec<String>| point_key(reader, &turn(rows));
+    let drawn = |then: Vec<String>, now: Vec<String>| {
+        submitted_over(
+            submit_mark(reader, &screen_of(then, 3)),
+            reader,
+            &screen_of(now, 4),
+        )
+    };
+    let mark = |rows: &[String]| conversation_mark(&reader.read(rows, None), rows);
+    let what = "2 background agents";
+    let words = |rows: &[String]| still_words(reader, rows, what);
+    let (a, b) = (beside(untracked), beside(unstaged));
+    let (one, two) = (measured.clone(), heading("2 files changed"));
+    let mut misread = Vec::new();
+    for (name, moved, want) in [
+        (
+            "the point's key, panel text beside it",
+            key(a.clone()) != key(b.clone()),
+            false,
+        ),
+        (
+            "a submission drawn, panel text beside it",
+            drawn(a.clone(), b.clone()),
+            false,
+        ),
+        (
+            "the conversation's mark, the panel's heading",
+            mark(&one) != mark(&two),
+            false,
+        ),
+        (
+            "the agent's still words, panel text beside them",
+            words(&a) != words(&b),
+            false,
+        ),
+        (
+            "CONTROL the point's key, the agent's words",
+            key(a.clone()) != key(said_else(&a)),
+            true,
+        ),
+        (
+            "CONTROL a submission drawn, the agent's words",
+            drawn(a.clone(), said_else(&a)),
+            true,
+        ),
+        (
+            "CONTROL the conversation's mark, the agent's words",
+            mark(&one) != mark(&said_else(&one)),
+            true,
+        ),
+        (
+            "CONTROL the agent's still words, the agent's words",
+            words(&a) != words(&said_else(&a)),
+            true,
+        ),
+    ] {
+        if moved != want {
+            misread.push(format!("{name}: moved {moved}"));
+        }
+    }
+    assert!(misread.is_empty(), "{misread:#?}");
+}

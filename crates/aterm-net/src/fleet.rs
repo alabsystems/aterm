@@ -525,7 +525,7 @@ impl DriveGrant {
 
 /// Local node id and Ed25519 key pair used to sign [`ALPN_NODES`] and [`ALPN_MESH`] channel
 /// proofs, and, where it dials the mesh, the verdict it judges each listener by
-/// ([`Self::dialing_mesh`]).
+/// ([`Self::dialing_mesh`]), and where it notes each peer the mesh proved ([`Self::noting`]).
 #[derive(Clone)]
 pub struct NodeIdentity {
     node: String,
@@ -534,6 +534,10 @@ pub struct NodeIdentity {
     /// This Mac's membership verdict, read fresh for each dial, where this node dials
     /// [`ALPN_MESH`] first; `None` where it dials [`ALPN_NODES`] alone.
     mesh: Option<DenyFn>,
+    /// The noting call each [`ALPN_MESH`] handshake this node completes, dialing or listening,
+    /// notes its peer into ([`heard::Heard`]); `None` where it notes none.
+    #[cfg(unix)]
+    heard: Option<heard::Heard>,
 }
 
 impl NodeIdentity {
@@ -550,6 +554,8 @@ impl NodeIdentity {
             key,
             pair: Arc::new(pair),
             mesh: None,
+            #[cfg(unix)]
+            heard: None,
         })
     }
 
@@ -572,6 +578,23 @@ impl NodeIdentity {
     #[must_use]
     pub const fn dials_mesh(&self) -> bool {
         self.mesh.is_some()
+    }
+
+    /// This node noting into `heard` the peer of each [`ALPN_MESH`] handshake it completes, as
+    /// the dialer ([`client_handshake_by`]) or as a listener's node ([`Listening::node`]): the
+    /// noting call of the heard ledger (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 B6). With
+    /// `None` it notes nothing, as a test's, a lab's or a process that keeps no state does.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn noting(self, heard: Option<heard::Heard>) -> Self {
+        Self { heard, ..self }
+    }
+
+    /// The noting call this node notes its mesh peers into ([`Self::noting`]).
+    #[cfg(unix)]
+    #[must_use]
+    pub const fn heard(&self) -> Option<&heard::Heard> {
+        self.heard.as_ref()
     }
 
     /// This machine's legacy or mesh node id.
@@ -1789,6 +1812,9 @@ fn client_handshake_by_on(
         }),
         error,
     };
+    // When this dial began, on the clock of the call that notes a mesh peer it proves.
+    #[cfg(unix)]
+    let began_ms = me.and_then(NodeIdentity::heard).map(heard::Heard::now_ms);
     let watchdog = arm(&tcp, within).map_err(|e| undialed(e, None))?;
     let (mut transport, (scope, peer, mesh)) = bounded(tcp, watchdog, within, |tcp| {
         let (mut conn, exporter, spoken) = connect_tls_on(tcp, config)?;
@@ -1820,6 +1846,15 @@ fn client_handshake_by_on(
     })
     .map_err(|e| undialed(e, refused_by.take()))?;
     release_deadlines(transport.stream().get_ref()).map_err(|e| undialed(e, None))?;
+    // A listener the mesh proved is a member's node-proven answer (§11 B6).
+    #[cfg(unix)]
+    if mesh
+        && let (Some(heard), Some(began_ms), Some(proof)) =
+            (me.and_then(NodeIdentity::heard), began_ms, peer.as_ref())
+        && let (Ok(addr), Ok(local)) = (transport.tcp().peer_addr(), transport.tcp().local_addr())
+    {
+        heard.note(proof, (addr, local), began_ms);
+    }
     Ok(Dialed {
         transport,
         scope,
@@ -2625,6 +2660,13 @@ fn serve_inner<H, E>(
                 // armed socket before releasing the slot, in the tuple's field order.
                 let connection = armed_conn;
                 let (armed, release) = connection;
+                // When this connection's handshake began, on the clock of the call that notes a
+                // mesh peer it proves.
+                #[cfg(unix)]
+                let began_ms = node
+                    .as_ref()
+                    .and_then(NodeIdentity::heard)
+                    .map(heard::Heard::now_ms);
                 let handshake: Result<_, FleetError> = (|| {
                     let admission = Admission::inspect(
                         armed.tcp(),
@@ -2672,6 +2714,18 @@ fn serve_inner<H, E>(
                             peer: proof,
                             mesh,
                         } = *accepted;
+                        // A dialer the mesh proved is a member's node-proven answer (§11 B6).
+                        #[cfg(unix)]
+                        if mesh
+                            && let (Some(heard), Some(began_ms), Some(proof)) = (
+                                node.as_ref().and_then(NodeIdentity::heard),
+                                began_ms,
+                                proof.as_ref(),
+                            )
+                            && let Ok(local) = transport.tcp().local_addr()
+                        {
+                            heard.note(proof, (peer, local), began_ms);
+                        }
                         tell(FleetEvent::Admitted { peer, op });
                         let served = Served {
                             transport,
@@ -3398,6 +3452,8 @@ fn read_line_within<R: Read>(stream: &mut R, max: usize) -> Result<Option<String
 #[path = "fleet_mesh_tests.rs"]
 mod mesh_tests;
 
+#[cfg(unix)]
+pub mod heard;
 pub mod link;
 
 #[cfg(test)]

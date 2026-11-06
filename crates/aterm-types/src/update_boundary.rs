@@ -355,7 +355,7 @@ mod tests {
         let deadline = Instant::now() + MUST_HAPPEN;
         while !holds() {
             assert!(Instant::now() < deadline, "{what} never happened");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 

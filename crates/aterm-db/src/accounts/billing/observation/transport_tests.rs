@@ -175,7 +175,7 @@ fn broker_transport_private_endpoint_round_trip_and_uncertain_result() {
             }
             assert!(!task.is_finished(), "client failed before connect");
             assert!(Instant::now() < until);
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         transport::serve_until(stream, &broker, deadline(), |request, credential, _| {
             assert_eq!(request.payload(), b"question");

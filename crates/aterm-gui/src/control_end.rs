@@ -296,7 +296,9 @@ fn end_one<C: EndControl>(
 
 /// The host's current roster, independent of the cached offer. Closed-window birth/horizon
 /// certificates are immutable historical evidence, usable only while the authoritative close
-/// index still confirms that exact key and sid. A newly closed session with no certificate is
+/// index still confirms that exact key and sid, or, for one an earlier aterm recorded
+/// ([`aterm_vitals::left::ClosedTab::restored`]), whose close this process's index never held,
+/// under a key no session of this process has. A newly closed session with no certificate is
 /// unknown, never kept live by an older offer.
 fn fresh_context(
     store: &crate::session_store::Store,
@@ -344,9 +346,10 @@ fn fresh_context_with(
             .closed
             .iter()
             .filter(|certificate| {
-                current.closed_logs().exits_since(0).any(|exit| {
-                    exit.local_id == certificate.key && exit.sid.as_str() == certificate.sid
-                })
+                certificate.restored
+                    || current.closed_logs().exits_since(0).any(|exit| {
+                        exit.local_id == certificate.key && exit.sid.as_str() == certificate.sid
+                    })
             })
             .cloned()
             .collect();

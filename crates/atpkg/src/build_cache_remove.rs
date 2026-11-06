@@ -826,7 +826,10 @@ mod sys {
         let taken = |e: Errno| e.raw_os_error() == libc::EEXIST;
         match dirfd::renameat_with(top, up, folder, name, RenameFlags::NOREPLACE) {
             Err(e) if taken(e) => {}
-            Ok(()) => return dirfd::fsync(top).is_ok() && dirfd::fsync(folder).is_ok(),
+            Ok(()) => {
+                return aterm_durable::primitive::fsync(top).is_ok()
+                    && aterm_durable::primitive::fsync(folder).is_ok();
+            }
             Err(_) => return false,
         }
         for _ in 0..8 {
@@ -834,7 +837,10 @@ mod sys {
             let beside = OsString::from(format!("{UP}-{moved}"));
             match dirfd::renameat_with(top, up, folder, &beside, RenameFlags::NOREPLACE) {
                 Err(e) if taken(e) => {}
-                Ok(()) => return dirfd::fsync(top).is_ok() && dirfd::fsync(folder).is_ok(),
+                Ok(()) => {
+                    return aterm_durable::primitive::fsync(top).is_ok()
+                        && aterm_durable::primitive::fsync(folder).is_ok();
+                }
                 Err(_) => return false,
             }
         }

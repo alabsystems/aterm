@@ -968,31 +968,40 @@ fn a_forged_origin_is_refused() {
     let mut changed = astream_broker::origin::seal(&a.seed, &mine, base + 3, b"signed");
     let at = changed.len() - 1;
     changed[at] ^= 1;
+    let refused = astream_broker::proto::ERR_ORIGIN_REFUSED;
+    let unknown = astream_broker::proto::ERR_ORIGIN_UNKNOWN;
     let forged = [
         (
             pid(&a.principal),
             base + 1,
             mine.clone(),
             astream_broker::origin::seal(&[55; 32], &mine, base + 1, b"wrong key"),
+            refused,
         ),
         (
             pid(&stranger),
             base + 2,
             theirs.clone(),
             astream_broker::origin::seal(&stranger_seed, &theirs, base + 2, b"unseated"),
+            unknown,
         ),
-        (pid(&a.principal), base + 3, mine.clone(), changed),
+        (pid(&a.principal), base + 3, mine.clone(), changed, refused),
     ];
-    let before = b.mesh().broker(MeshLog::Tables).stats().origin_refused;
-    for (producer, seq, subject, body) in &forged {
-        let refused = client
+    let counts = || {
+        let stats = b.mesh().broker(MeshLog::Tables).stats();
+        (stats.origin_refused, stats.origin_unknown)
+    };
+    let before = counts();
+    for (producer, seq, subject, body, code) in &forged {
+        let answer = client
             .relay(*producer, *seq, subject, body)
-            .expect_err("a forged record is refused");
-        let refusal = astream_broker::broker_refusal(&refused).expect("a broker refusal");
+            .expect_err("a forged or unseated record is refused");
+        let refusal = astream_broker::broker_refusal(&answer).expect("a broker refusal");
+        assert_eq!(refusal.code, *code, "{refusal:?}");
         assert_eq!(
-            refusal.code,
-            astream_broker::proto::ERR_ORIGIN_REFUSED,
-            "{refusal:?}"
+            refusal.is_permanent(),
+            *code == refused,
+            "a forgery is final, an unseated origin is not: {refusal:?}"
         );
     }
     let genuine = astream_broker::origin::seal(&a.seed, &mine, base + 4, b"genuine");
@@ -1000,10 +1009,11 @@ fn a_forged_origin_is_refused() {
         .relay(pid(&a.principal), base + 4, &mine, &genuine)
         .expect("the genuine record lands");
     assert!(!held, "it is new to B");
+    let after = counts();
     assert_eq!(
-        b.mesh().broker(MeshLog::Tables).stats().origin_refused - before,
-        3,
-        "each forgery is counted"
+        (after.0 - before.0, after.1 - before.1),
+        (2, 1),
+        "each forgery and the unseated origin are counted apart"
     );
     let held: Vec<String> = b
         .held(MeshLog::Tables, "/t/>")
@@ -1184,7 +1194,8 @@ fn a_kicked_relay_tries_again_after_the_first_step() {
 }
 
 /// A relay that ends right after a burst it cut at its cap resumes with nothing skipped: astream's
-/// push bridge commits one past such a burst, and the relay sends that one record again first.
+/// push bridge commits its group through the last offset the burst scanned, so the next run
+/// starts at the cut. A bridge that committed one past the cut would lose the record there.
 #[test]
 fn a_relay_cut_after_a_full_burst_skips_nothing() {
     let lab = Lab::new();
@@ -1242,6 +1253,377 @@ fn a_relay_cut_after_a_full_burst_skips_nothing() {
     let mut expected = vec!["before".to_owned()];
     expected.extend(payloads);
     assert_eq!(held, expected, "once each, in order");
+}
+
+/// A record whose origin a neighbour does not seat yet waits on the edge that carried it: B is
+/// told of D's seat after D's record reached it through A, and it then holds the record with no
+/// new traffic and no `Inventory`. The edge keeps the record back rather than passing it: B's
+/// "not a known origin" says only what B knows now.
+#[test]
+fn a_record_whose_origin_a_neighbour_does_not_seat_yet_reaches_it_once_it_does() {
+    let lab = Lab::new();
+    let mut macs: Vec<Mac> = (1..=3).map(|tag| Mac::new(&lab, tag)).collect();
+    let all = seating(&macs.iter().collect::<Vec<_>>());
+    let without_d = seating(&[&macs[0], &macs[1]]);
+    macs[0].read(all.clone());
+    macs[1].read(without_d);
+    macs[2].read(all.clone());
+    for mac in &mut macs {
+        mac.start(&lab);
+    }
+    let (a, b, d) = (&macs[0], &macs[1], &macs[2]);
+    a.until_following(&[b, d], 0);
+    d.until_following(&[a], 0);
+    b.until_following(&[a], 0);
+    let since = a.seen.mark();
+    d.table("0d", "from-d");
+    a.until_held(MeshLog::Tables, "/t/>", &["from-d"]);
+    a.seen.until("A holds D's record for B", |events| {
+        events.iter().skip(since).any(|e| {
+            matches!(e, Event::Burst { peer, log: MeshLog::Tables, held: 1.., .. }
+                if *peer == b.principal)
+        })
+    });
+    b.read(all);
+    b.follow();
+    b.until_held(MeshLog::Tables, "/t/>", &["from-d"]);
+    let held: Vec<String> = b
+        .held(MeshLog::Tables, "/t/>")
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(held, ["from-d"], "once");
+}
+
+/// A record an edge held for a neighbour that did not seat its origin is let go once this Mac
+/// no longer seats that origin either: counted refused, never held for good, never delivered.
+#[test]
+fn a_held_record_whose_origin_this_mac_removes_too_is_let_go() {
+    let lab = Lab::new();
+    let mut macs: Vec<Mac> = (1..=3).map(|tag| Mac::new(&lab, tag)).collect();
+    let all = seating(&macs.iter().collect::<Vec<_>>());
+    let without_d = seating(&[&macs[0], &macs[1]]);
+    macs[0].read(all.clone());
+    macs[1].read(without_d.clone());
+    macs[2].read(all);
+    for mac in &mut macs {
+        mac.start(&lab);
+    }
+    let (a, b, d) = (&macs[0], &macs[1], &macs[2]);
+    a.until_following(&[b, d], 0);
+    d.until_following(&[a], 0);
+    b.until_following(&[a], 0);
+    let since = a.seen.mark();
+    d.table("0d", "from-d");
+    a.until_held(MeshLog::Tables, "/t/>", &["from-d"]);
+    let to_b = |events: &[Event], since: usize, done: &dyn Fn(usize, usize) -> bool| {
+        events.iter().skip(since).any(|e| {
+            matches!(e, Event::Burst { peer, log: MeshLog::Tables, refused, held, .. }
+                if *peer == b.principal && done(*refused, *held))
+        })
+    };
+    a.seen.until("A holds D's record for B", |events| {
+        to_b(events, since, &|_, held| held >= 1)
+    });
+    let since = a.seen.mark();
+    let mut removed = without_d;
+    removed.removed.insert(d.key);
+    a.read(removed);
+    a.follow();
+    a.seen.until("A let D's record go", |events| {
+        to_b(events, since, &|refused, held| refused >= 1 && held == 0)
+    });
+    assert!(
+        b.held(MeshLog::Tables, "/t/>").is_empty(),
+        "B never took D's record"
+    );
+}
+
+/// The verdict judges keys by class, current winning: a class of one current key is an origin
+/// (this Mac's own always wins its class), a class of two or more is contested (each key revoked,
+/// and each principal no origin holds), and a removed or retired key is revoked by its key, and by
+/// its principal unless an origin holds that principal. The class is injected (the last byte), so
+/// collisions the 64-bit hash makes rare are written out.
+#[test]
+fn the_verdict_judges_keys_by_class_current_winning() {
+    let key = |head: u8, class: u8| {
+        let mut key = [head; 32];
+        key[31] = class;
+        key
+    };
+    let me = key(1, 1);
+    let rival = key(2, 1);
+    let alone = key(3, 3);
+    let (twin_a, twin_b) = (key(4, 4), key(5, 4));
+    let under_alone = sharing_principal(&alone, 9);
+    let under_me = sharing_principal(&me, 10);
+    let retired = key(6, 6);
+    let read = Standings {
+        current: [me, rival, alone, twin_a, twin_b, under_alone].into(),
+        removed: [under_alone, under_me].into(),
+        retired: [retired].into(),
+        ..Standings::default()
+    };
+    let verdict = crate::logs::Verdict::of(&read, &me, |key| u64::from(key[31]));
+    let p = astream_broker::identity_principal;
+    assert_eq!(verdict.origins, [me, alone].into());
+    assert_eq!(
+        verdict.keys,
+        [rival, twin_a, twin_b, under_alone, under_me, retired].into()
+    );
+    assert_eq!(
+        verdict.principals,
+        [p(&rival), p(&twin_a), p(&twin_b), p(&retired)].into()
+    );
+    let unread = crate::logs::Verdict::of(&Standings::default(), &me, |key| u64::from(key[31]));
+    assert_eq!(
+        unread.origins,
+        [me].into(),
+        "this Mac is its own origin alone"
+    );
+    assert!(unread.keys.is_empty() && unread.principals.is_empty());
+}
+
+/// A key whose first eight bytes are `prefix`'s: its astream principal (`n-` and those bytes in
+/// hex) is `prefix`'s, whatever the rest. Two such keys are one principal to a broker.
+fn sharing_principal(prefix: &[u8; 32], tail: u8) -> [u8; 32] {
+    let mut key = [tail; 32];
+    key[..8].copy_from_slice(&prefix[..8]);
+    key
+}
+
+/// A link stands for a seated principal's node only where its peer proved the seat's own key: of
+/// two links whose keys share the seat's principal (one a broker files as the seat), the overlay's
+/// view keeps the seat's, so the other carries none of its relays. Its control is the view before,
+/// keyed by principal alone, which takes whichever link came last.
+#[test]
+fn a_link_from_another_key_of_a_seats_principal_does_not_stand_for_the_seat() {
+    use crate::overlay::stands_for_its_node;
+    let p = astream_broker::identity_principal;
+    let seat = sharing_principal(&[0xcd; 32], 1);
+    let other = sharing_principal(&[0xcd; 32], 2);
+    let stranger = [0xef; 32];
+    assert_eq!(p(&seat), p(&other));
+    let seats = BTreeMap::from([(p(&seat), seat)]);
+    let linked = [seat, other, stranger];
+    let before: BTreeMap<String, [u8; 32]> = linked.iter().map(|key| (p(key), *key)).collect();
+    assert_eq!(
+        before[&p(&seat)],
+        other,
+        "control: by principal alone, the other key's link stands for the seat"
+    );
+    let view: BTreeMap<String, [u8; 32]> = linked
+        .iter()
+        .filter(|key| stands_for_its_node(key, &seats))
+        .map(|key| (p(key), *key))
+        .collect();
+    assert_eq!(
+        view,
+        BTreeMap::from([(p(&seat), seat), (p(&stranger), stranger)]),
+        "the seat's own link stands for it, and a principal that seats none is left as it is"
+    );
+}
+
+/// Two seats whose keys share a 64-bit principal are never one origin: a broker keys its origins
+/// by that principal, so each would shadow the other. The mesh reads both as contested (neither
+/// an origin, a seat nor a stream it admits, each revoked by its key and their principal revoked)
+/// while the other Macs relay on, and the one key left once the other goes is an origin again.
+#[test]
+fn seats_whose_keys_share_a_principal_read_as_contested() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let x = sharing_principal(&[0xab; 32], 1);
+    let y = sharing_principal(&[0xab; 32], 2);
+    let shared = astream_broker::identity_principal(&x);
+    assert_eq!(shared, astream_broker::identity_principal(&y));
+    let mut read = seating(&[a, b]);
+    read.current.extend([x, y]);
+    a.read(read.clone());
+    a.follow();
+    let mesh = a.mesh();
+    for key in [x, y] {
+        assert_eq!(
+            mesh.admits(&key),
+            Some(false),
+            "a shared principal admits no stream"
+        );
+        assert!(
+            !mesh.seats().expect("read").contains(&key),
+            "nor holds a seat"
+        );
+        assert!(!mesh.origins().contains(&key), "nor is an origin");
+        for log in MeshLog::ALL {
+            assert!(
+                mesh.broker(log).is_identity_revoked(&key),
+                "each key is revoked"
+            );
+        }
+    }
+    for log in MeshLog::ALL {
+        assert!(
+            mesh.broker(log).is_principal_revoked(&shared),
+            "and the principal"
+        );
+    }
+    assert_eq!(mesh.admits(&b.key), Some(true), "the other seats stand");
+    b.table("0e", "b-still-relays");
+    a.until_held(MeshLog::Tables, "/t/>", &["b-still-relays"]);
+
+    read.current.remove(&y);
+    read.removed.insert(y);
+    a.read(read);
+    a.follow();
+    assert_eq!(
+        mesh.admits(&x),
+        Some(true),
+        "the key left is an origin again"
+    );
+    assert!(mesh.origins().contains(&x));
+    for log in MeshLog::ALL {
+        let broker = mesh.broker(log);
+        assert!(!broker.is_identity_revoked(&x), "its key is lifted");
+        assert!(
+            broker.is_identity_revoked(&y),
+            "the removed one stays revoked by its key"
+        );
+        assert!(
+            !broker.is_principal_revoked(&shared),
+            "and the principal an origin holds is not"
+        );
+    }
+}
+
+/// Current wins a principal a removed key shares: the current seat is an origin, the removed key
+/// is revoked by its key alone (its own records stay refused), and the principal, whose rows are
+/// the seat's, is neither revoked nor retired. A removed key that shares this Mac's own principal
+/// revokes neither that principal nor this Mac's rows.
+#[test]
+fn a_seat_sharing_a_removed_keys_principal_is_an_origin_and_the_removed_key_stays_revoked() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    a.metric("now/presence", "a-here");
+    let removed = sharing_principal(&[0xcd; 32], 1);
+    let newcomer = sharing_principal(&[0xcd; 32], 2);
+    let mine = sharing_principal(&a.key, 3);
+    let mut read = seating(&[a, b]);
+    read.current.insert(newcomer);
+    read.removed.extend([removed, mine]);
+    a.read(read);
+    a.follow();
+    let mesh = a.mesh();
+    assert_eq!(mesh.admits(&newcomer), Some(true), "the current seat wins");
+    assert!(mesh.seats().expect("read").contains(&newcomer));
+    for log in MeshLog::ALL {
+        let broker = mesh.broker(log);
+        for key in [removed, mine] {
+            assert!(
+                broker.is_identity_revoked(&key),
+                "each removal stands by its key"
+            );
+        }
+        assert!(
+            !broker.is_principal_revoked(&astream_broker::identity_principal(&newcomer)),
+            "the principal the seat holds is not revoked"
+        );
+        assert!(
+            !broker.is_principal_revoked(&a.principal),
+            "this Mac's own principal is never revoked"
+        );
+        for seat in mesh.seats().expect("read") {
+            assert!(
+                !broker.is_identity_revoked(&seat)
+                    && !broker.is_principal_revoked(&astream_broker::identity_principal(&seat)),
+                "no seat stands revoked"
+            );
+        }
+    }
+    assert_eq!(rows_of(a, a), ["a-here"], "this Mac's rows are not retired");
+    b.table("0f", "b-still-relays");
+    a.until_held(MeshLog::Tables, "/t/>", &["b-still-relays"]);
+}
+
+/// A principal stays revoked while some key of it does, whichever key that is: a read in which
+/// one removed key gives way to another of the same principal leaves the principal revoked, never
+/// lifted with the key that left.
+#[test]
+fn a_principal_stays_revoked_while_another_of_its_keys_is_removed() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let first = sharing_principal(&[0xce; 32], 1);
+    let second = sharing_principal(&[0xce; 32], 2);
+    let shared = astream_broker::identity_principal(&first);
+    let mut read = seating(&[a, b]);
+    read.removed.insert(first);
+    a.read(read.clone());
+    a.follow();
+    read.removed = [second].into();
+    a.read(read);
+    a.follow();
+    let mesh = a.mesh();
+    for log in MeshLog::ALL {
+        let broker = mesh.broker(log);
+        assert!(
+            broker.is_principal_revoked(&shared),
+            "the principal stays revoked"
+        );
+        assert!(broker.is_identity_revoked(&second));
+        assert!(
+            !broker.is_identity_revoked(&first),
+            "the key that left is lifted"
+        );
+    }
+}
+
+/// A record sealed by a key that shares a seat's principal is the seat's to a broker, which
+/// judges it by the seat's key: it is refused as a forgery, for good, not held as unknown.
+#[test]
+fn a_record_under_a_seats_principal_but_another_key_is_refused_as_forged() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let forger_seed = [91; 32];
+    let forger = astream_broker::origin::public_key(&forger_seed);
+    let seat = sharing_principal(&forger, 0);
+    assert_ne!(seat, forger);
+    let principal = astream_broker::identity_principal(&seat);
+    assert_eq!(principal, astream_broker::identity_principal(&forger));
+    let mut read = seating(&[a, b]);
+    read.current.insert(seat);
+    b.read(read);
+    b.follow();
+    assert_eq!(b.mesh().admits(&seat), Some(true));
+    let link = a.run.as_ref().expect("runs").table.links().remove(0);
+    let (stream, grants) = BusDial::new(link, MeshLog::Tables)
+        .open()
+        .expect("B serves A's Bus stream");
+    let stream: Arc<dyn astream_broker::StreamLink> = Arc::new(stream);
+    stream.set_read_timeout(Some(HANG)).expect("bounded");
+    let (mut client, _closer) = astream_broker::connect_stream(stream);
+    client
+        .attach_all(grants.iter().map(|cap| (cap.filter.as_str(), &cap.tag[..])))
+        .expect("A's grants attach");
+    let base = astream_broker::incarnation_base(9).expect("an incarnation");
+    let subject = format!("/t/0c/{principal}");
+    let body = astream_broker::origin::seal(&forger_seed, &subject, base + 1, b"forged");
+    let answer = client
+        .relay(
+            astream_broker::producer_id_of(&principal),
+            base + 1,
+            &subject,
+            &body,
+        )
+        .expect_err("the forger's record is refused");
+    let refusal = astream_broker::broker_refusal(&answer).expect("a broker refusal");
+    assert_eq!(
+        refusal.code,
+        astream_broker::proto::ERR_ORIGIN_REFUSED,
+        "{refusal:?}"
+    );
+    assert!(refusal.is_permanent());
+    assert!(b.held(MeshLog::Tables, "/t/>").is_empty());
 }
 
 /// A removed Mac's rows whose retirement failed are retired at the watcher's next round.
@@ -1309,10 +1691,72 @@ struct Rebuilt {
     held: bool,
 }
 
+/// The incarnation a forged record is numbered in: far above any a lease here takes (seconds since
+/// 2026-01-01), and below `astream_broker::INC_MAX`, so a lease could still move above it.
+const FORGED_INC: u64 = 1 << 30;
+
+/// Plant on `on`'s `tables.log` what only a rogue broker would hold of `of`: a record on `of`'s
+/// table subject `/t/<shard>/<of>`, numbered in [`FORGED_INC`], signed with `signer` and
+/// published under the producer id of the key `under` derives. `on`'s broker refuses a forged
+/// record relayed (`a_forged_origin_is_refused`) and grants no Mac a plain publish, so the test
+/// mints the grant under `on`'s guard itself and publishes on a stream `on`'s broker adopts under
+/// `under`'s key.
+fn plant(on: &Mac, of: &Mac, shard: &str, signer: &[u8; 32], under: &[u8; 32]) {
+    let key = astream_broker::origin::public_key(under);
+    let principal = astream_broker::identity_principal(&key);
+    let hosted = on.mesh().hosted(MeshLog::Tables);
+    let grant = hosted
+        .mint(&format!(
+            "rw,p={principal}:{}",
+            MeshLog::Tables.own_filter(&of.principal)
+        ))
+        .expect("a grant under the guard");
+    let link = hosted
+        .adopt(key)
+        .expect("a stream under the publisher's key");
+    link.set_read_timeout(Some(HANG)).expect("bounded");
+    let (mut client, _closer) = astream_broker::connect_stream(link);
+    client
+        .attach_all([(grant.filter.as_str(), &grant.tag[..])])
+        .expect("the grant attaches");
+    let seq = astream_broker::incarnation_base(FORGED_INC).expect("an incarnation") + 1;
+    let subject = format!("/t/{shard}/{}", of.principal);
+    let body = astream_broker::origin::seal(signer, &subject, seq, b"forged");
+    assert_eq!(
+        astream_broker::origin::verify(&of.key, &subject, seq, &body),
+        *signer == of.seed,
+        "the forgery verifies under the origin's key exactly when that key signed it"
+    );
+    let (_, held) = client
+        .publish(
+            astream_broker::producer_id_of(&principal),
+            seq,
+            &subject,
+            &body,
+        )
+        .expect("the rogue broker appends the forgery");
+    assert!(!held, "the forgery is new to the log");
+}
+
+/// Plant both forgeries a lease must not settle on ([`plant`]): one under `of`'s producer id
+/// signed by another key, and one `of`'s own key signed under another producer id.
+fn plant_forgeries(on: &Mac, of: &Mac) {
+    plant(on, of, "0e", &[55; 32], &of.seed);
+    let stranger = [56; 32];
+    assert_ne!(
+        astream_broker::identity_principal(&astream_broker::origin::public_key(&stranger)),
+        of.principal,
+        "the second forgery goes under another producer id"
+    );
+    plant(on, of, "0f", &of.seed, &stranger);
+}
+
 /// A Mac publishes, is rebuilt with its node key kept (its mesh folder gone, its wall clock where
 /// it was), and publishes again once its first neighbour told it its high water. Its neighbour's
-/// cursor named the old log, so it starts again with the newest rows, not where it was.
-fn rebuild(reuse: bool) -> Rebuilt {
+/// cursor named the old log, so it starts again with the newest rows, not where it was. With
+/// `forge`, the neighbour's log also holds [`plant_forgeries`]' records of the Mac before it
+/// starts again.
+fn rebuild(reuse: bool, forge: bool) -> Rebuilt {
     let lab = Lab::new();
     let mut macs = lab_of(&lab, 2);
     macs[1].metric("now/presence", "b-now");
@@ -1324,6 +1768,9 @@ fn rebuild(reuse: bool) -> Rebuilt {
     macs[1].until_held(MeshLog::Tables, "/t/>", &["old-0", "old-1", "old-2"]);
     macs[0].stop();
     std::fs::remove_dir_all(macs[0].dir.path().join(MESH_DIR)).expect("the rebuild");
+    if forge {
+        plant_forgeries(&macs[1], &macs[0]);
+    }
     let since = macs[0].seen.mark();
     let started = std::thread::scope(|scope| {
         scope
@@ -1391,7 +1838,7 @@ fn rebuild(reuse: bool) -> Rebuilt {
 /// water, and numbers its next record above it, so the neighbour appends it.
 #[test]
 fn a_rebuild_keeps_sequence_numbers_above_the_old_ones() {
-    let rebuilt = rebuild(false);
+    let rebuilt = rebuild(false, false);
     assert!(
         rebuilt.seq > rebuilt.high,
         "{} above {}",
@@ -1404,12 +1851,44 @@ fn a_rebuild_keeps_sequence_numbers_above_the_old_ones() {
     );
 }
 
+/// A neighbour's log that holds, beside the rebuilt Mac's own records, two on its subjects
+/// numbered far above them, one under its producer id but signed by another key and one its own
+/// key signed under another producer id, does not move the fresh lease: it settles on the high
+/// water of the records the Mac itself published (`rebuild` asserts the `Settled` high water is
+/// the Mac's last record), and its next record is numbered just above that, not above a forgery.
+///
+/// NEGATIVE CONTROLS, each in `relay::high_water`: drop the own-key check
+/// (`&& astream_broker::origin::verify(&me.key, &subject, seq, &body)`), or the producer check
+/// (`&& pid == me.pid`). Either way the lease settles on a forged number, so `rebuild`'s
+/// high-water assertion fails.
+#[test]
+fn a_fresh_lease_settles_on_its_own_keys_high_water_only() {
+    let rebuilt = rebuild(false, true);
+    assert!(
+        rebuilt.seq > rebuilt.high,
+        "{} above {}",
+        rebuilt.seq,
+        rebuilt.high
+    );
+    assert!(
+        incarnation(rebuilt.seq) < FORGED_INC,
+        "{} is numbered above {}, not in the forgery's incarnation {}",
+        rebuilt.seq,
+        rebuilt.high,
+        FORGED_INC
+    );
+    assert!(
+        rebuilt.held,
+        "the neighbour appends the rebuilt Mac's record"
+    );
+}
+
 /// NEGATIVE CONTROL (`REUSED_INCARNATION`): a rebuilt Mac that settles at its neighbour's
 /// incarnation instead of above it numbers its next record with a number the neighbour holds,
 /// which answers it "already held": the record never lands.
 #[test]
 fn with_reused_incarnation_a_rebuilt_macs_record_is_lost() {
-    let rebuilt = rebuild(true);
+    let rebuilt = rebuild(true, false);
     assert!(
         rebuilt.seq <= rebuilt.high,
         "{} reuses {}",
@@ -1918,3 +2397,9 @@ mod rule {
         );
     }
 }
+
+/// `bus.log` in the node service (§11 C2), on this lab.
+mod bus;
+
+/// Presence on the metrics log (§11 B7c), on this lab.
+mod presence;

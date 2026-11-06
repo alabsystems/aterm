@@ -77,6 +77,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             app: 10 << 30,
             wired: 3 << 30,
             compressed: Some(1 << 30),
+            stored: Some(3 << 30),
             cached: 8 << 30,
             free: 9 << 30,
             swap_used: 1 << 30,
@@ -88,9 +89,11 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
                 decompressions: k * 40,
                 compressions: k * 30,
                 pageins: k * 10,
+                page_bytes: 16_384,
             }),
             kernel_available_pct: Some(61),
             commit: None,
+            exact: true,
         }),
         gpu: Some(GpuSample {
             device_pct: Some(4),
@@ -196,7 +199,7 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
     for view in [View::Overview, View::Global] {
         let text = all_text(&render_text(&query(view, false), &c));
         for figure in [
-            "7.60 TB used",
+            "7.76 TB used",
             "240 GB available",
             "8.00 TB total",
             "17.0 GiB available",
@@ -206,7 +209,9 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
         }
     }
     let json = global_json(&s);
-    assert_eq!(json.get("disk_used_bytes"), Some(&Jv::u(7_600_000_000_000)));
+    // Used is the total less what this user can still write: the 160 GB the volume keeps
+    // back from them counts as used, so used and available add up to the total.
+    assert_eq!(json.get("disk_used_bytes"), Some(&Jv::u(7_760_000_000_000)));
     assert_eq!(
         json.get("disk_available_bytes"),
         Some(&Jv::u(240_000_000_000))
@@ -432,9 +437,6 @@ fn scheduling_held_core_is_unavailable_in_core_cluster_and_global_views() {
         Some(&Jv::why("no_counter_delta"))
     );
     assert_eq!(s.total_cores(), Some(4));
-    let capacity = words::monitor_capacity(crate::model::Resource::Cpu, &s);
-    assert!(capacity[0].contains("4 cores total"), "{capacity:?}");
-    assert!(capacity[0].contains("unavailable"), "{capacity:?}");
     let c = ctx(&w, Some(&s), true, true);
     let overview = all_text(&render_text(&query(View::Overview, false), &c));
     assert!(overview.contains("4 cores total"), "{overview}");
@@ -1855,9 +1857,6 @@ fn an_idle_measured_tab_waited_for_no_core() {
 fn a_first_sweeps_procs_are_warming_never_zero() {
     let first = Vitals::new().absorb(&sample(10, &[0, 0, 0, 0], 0));
     assert_eq!(first.total_cores(), Some(4));
-    let capacity = words::monitor_capacity(crate::model::Resource::Cpu, &first);
-    assert!(capacity[0].contains("4 cores total"), "{capacity:?}");
-    assert!(capacity[0].contains("unavailable"), "{capacity:?}");
     let w = world();
     let c = ctx(&w, Some(&first), true, true);
     assert_eq!(machine_json(&c, &first).get("cpus"), Some(&Jv::u(4)));

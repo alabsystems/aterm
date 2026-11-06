@@ -108,6 +108,11 @@ fn members_at_home() -> Vec<Answer> {
         .collect()
 }
 
+/// Whether `now` is home on its fresh evidence alone: the rule before the 7-day condition.
+fn on_evidence(now: &Now) -> Result<HomeNet, Away> {
+    home_net_at(now, &HomeDays::default(), Rule { days: false })
+}
+
 /// A Mac on the home LAN, where three members proved their nodes, is home there, and holds
 /// another host on its subnet (IPv4-mapped too) as on the home ALab LAN.
 ///
@@ -115,7 +120,7 @@ fn members_at_home() -> Vec<Answer> {
 /// `TooFew { heard: 3 }` and this test fails.
 #[test]
 fn a_network_where_enough_members_proved_themselves_is_home() {
-    let home_net = home_net_at(&home(members_at_home()));
+    let home_net = on_evidence(&home(members_at_home()));
     assert_eq!(
         home_net,
         Ok(HomeNet::at(v4("192.168.1.20"), v4("255.255.255.0")))
@@ -152,7 +157,7 @@ fn a_hotspot_is_never_home_whatever_answered() {
         &[],
         answered,
     );
-    assert_eq!(home_net_at(&hotspot), Err(Away::Hotspot));
+    assert_eq!(on_evidence(&hotspot), Err(Away::Hotspot));
     for (path, why) in [
         (Some(path(true, Link::Wifi)), "expensive"),
         (Some(path(false, Link::Cellular)), "cellular"),
@@ -174,10 +179,10 @@ fn a_hotspot_is_never_home_whatever_answered() {
     ] {
         let mut now = home(members_at_home());
         now.facts.path = path;
-        assert_eq!(home_net_at(&now), Err(Away::Expensive), "{why}");
+        assert_eq!(on_evidence(&now), Err(Away::Expensive), "{why}");
     }
     // CONTROL: the same evidence on a usable Wi-Fi path that is not expensive reads home.
-    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(on_evidence(&home(members_at_home())).is_ok());
 }
 
 /// A café network where m22 sits with one other member (who answered three times) is no home:
@@ -198,7 +203,7 @@ fn a_cafe_beside_too_few_members_is_no_home() {
             answer("m9node", "10.0.0.8", "10.0.0.5", NOW - 4_000),
         ],
     );
-    assert_eq!(home_net_at(&cafe), Err(Away::TooFew { heard: 2 }));
+    assert_eq!(on_evidence(&cafe), Err(Away::TooFew { heard: 2 }));
 }
 
 /// No evidence is no home: none at all, evidence older than `FRESH`, evidence dated ahead of the
@@ -212,7 +217,7 @@ fn a_cafe_beside_too_few_members_is_no_home() {
 #[test]
 fn no_member_evidence_fails_closed() {
     assert_eq!(
-        home_net_at(&home(Vec::new())),
+        on_evidence(&home(Vec::new())),
         Err(Away::TooFew { heard: 0 })
     );
     let aged = |at_ms: u64| -> Vec<Answer> {
@@ -226,11 +231,11 @@ fn no_member_evidence_fails_closed() {
             .collect()
     };
     assert_eq!(
-        home_net_at(&home(aged(NOW - FRESH.as_millis() as u64))),
+        on_evidence(&home(aged(NOW - FRESH.as_millis() as u64))),
         Err(Away::TooFew { heard: 0 })
     );
     assert_eq!(
-        home_net_at(&home(aged(NOW + 2 * AHEAD_MS))),
+        on_evidence(&home(aged(NOW + 2 * AHEAD_MS))),
         Err(Away::TooFew { heard: 0 })
     );
     // A café that numbers its hosts 192.168.1.0/24 too, behind another router, read while the
@@ -242,7 +247,7 @@ fn no_member_evidence_fails_closed() {
         members_at_home(),
     );
     lookalike.stay_network = home(Vec::new()).stay_network;
-    assert_eq!(home_net_at(&lookalike), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&lookalike), Err(Away::TooFew { heard: 0 }));
     // The evidence came through 192.168.1.21, which this Mac no longer holds.
     let elsewhere: Vec<Answer> = members_at_home()
         .into_iter()
@@ -252,7 +257,7 @@ fn no_member_evidence_fails_closed() {
         })
         .collect();
     assert_eq!(
-        home_net_at(&home(elsewhere)),
+        on_evidence(&home(elsewhere)),
         Err(Away::TooFew { heard: 0 })
     );
     let unread = on(
@@ -261,12 +266,12 @@ fn no_member_evidence_fails_closed() {
         &[],
         members_at_home(),
     );
-    assert_eq!(home_net_at(&unread), Err(Away::NoGateway));
+    assert_eq!(on_evidence(&unread), Err(Away::NoGateway));
     let mut no_stay = home(members_at_home());
     no_stay.stay_since_ms = None;
-    assert_eq!(home_net_at(&no_stay), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&no_stay), Err(Away::TooFew { heard: 0 }));
     // CONTROL: the same evidence, fresh, behind the home router, reads home.
-    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(on_evidence(&home(members_at_home())).is_ok());
 }
 
 /// Only answers in the current stay count: three members that answered on the home LAN eight
@@ -289,7 +294,7 @@ fn only_this_stays_fleet_answers_count() {
         .collect();
     let mut back = home(before);
     back.stay_since_ms = Some(NOW - 60_000);
-    assert_eq!(home_net_at(&back), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&back), Err(Away::TooFew { heard: 0 }));
     let contacts: Vec<Answer> = members_at_home()
         .into_iter()
         .enumerate()
@@ -299,9 +304,9 @@ fn only_this_stays_fleet_answers_count() {
             ..a
         })
         .collect();
-    assert_eq!(home_net_at(&home(contacts)), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&home(contacts)), Err(Away::TooFew { heard: 0 }));
     // CONTROL: the same members heard in this stay over the fleet read home.
-    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(on_evidence(&home(members_at_home())).is_ok());
 }
 
 /// Only another host on the home subnet is on the home ALab LAN: a routed or relayed peer, a
@@ -319,7 +324,7 @@ fn only_another_host_on_the_home_subnet_is_held() {
         &["10.1.0.5"],
         members_at_home(),
     );
-    let home_net = home_net_at(&wired_too).unwrap();
+    let home_net = on_evidence(&wired_too).unwrap();
     for away in [
         "192.168.2.9",
         "93.184.216.34",
@@ -336,7 +341,7 @@ fn only_another_host_on_the_home_subnet_is_held() {
     // Three answers, one of them from this Mac's own address: two members.
     let mut own = members_at_home();
     own[2].addr = Some(ip("192.168.1.20"));
-    assert_eq!(home_net_at(&home(own)), Err(Away::TooFew { heard: 2 }));
+    assert_eq!(on_evidence(&home(own)), Err(Away::TooFew { heard: 2 }));
     // CONTROL: a host on the evidenced subnet.
     assert!(home_net.holds(ip("192.168.1.99")));
 }
@@ -372,7 +377,7 @@ fn only_the_default_routes_ethernet_or_wifi_can_be_home() {
         &[],
         three("192.168.64", "192.168.64.1", "bridge100"),
     );
-    assert_eq!(home_net_at(&bridge), Err(Away::Interface));
+    assert_eq!(on_evidence(&bridge), Err(Away::Interface));
     // A tunnel, and an `en` link that is point to point.
     for name in ["utun4", "en5"] {
         let mut tunnel = on(
@@ -382,16 +387,16 @@ fn only_the_default_routes_ethernet_or_wifi_can_be_home() {
             three("10.8.0", "10.8.0.2", name),
         );
         tunnel.point_to_point = true;
-        assert_eq!(home_net_at(&tunnel), Err(Away::Interface), "{name}");
+        assert_eq!(on_evidence(&tunnel), Err(Away::Interface), "{name}");
     }
     // No default route at all.
     let mut unrouted = home(members_at_home());
     unrouted.facts.route = None;
-    assert_eq!(home_net_at(&unrouted), Err(Away::Interface));
+    assert_eq!(on_evidence(&unrouted), Err(Away::Interface));
     // A full-tunnel VPN beside the home Wi-Fi: a tunnel holds the default route.
     let mut vpn = home(members_at_home());
     vpn.facts.tunnel = Some("utun3".to_owned());
-    assert_eq!(home_net_at(&vpn), Err(Away::Interface));
+    assert_eq!(on_evidence(&vpn), Err(Away::Interface));
     // The address the evidence came through is on another interface now.
     let rewired = on(
         ("en1", "192.168.1.20", 24),
@@ -399,9 +404,9 @@ fn only_the_default_routes_ethernet_or_wifi_can_be_home() {
         &[],
         members_at_home(),
     );
-    assert_eq!(home_net_at(&rewired), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&rewired), Err(Away::TooFew { heard: 0 }));
     // CONTROL: the same evidence on the interface it came through reads home.
-    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(on_evidence(&home(members_at_home())).is_ok());
     assert!(home_kind("en0", false) && home_kind("en12", false));
     assert!(!home_kind("en", false) && !home_kind("enx0", false) && !home_kind("awdl0", false));
     assert!(!home_kind("en0", true));
@@ -470,12 +475,12 @@ fn the_heartbeats_notes_in_the_network_place_read_back_as_evidence() {
     });
     let now = aterm_netplace::proof::read_with(root.path(), here, NOW);
     assert_eq!(now.answers.len(), 4, "every answer noted");
-    assert_eq!(home_net_at(&now), Ok(HomeNet::test()));
+    assert_eq!(on_evidence(&now), Ok(HomeNet::test()));
     // Without the third member's answer, the routed one does not make up the count.
     let mut two = now.clone();
     two.answers
         .retain(|answer| answer.member != member_key(Lane::Fleet, "node2"));
-    assert_eq!(home_net_at(&two), Err(Away::TooFew { heard: 2 }));
+    assert_eq!(on_evidence(&two), Err(Away::TooFew { heard: 2 }));
 }
 
 /// Answers heard on the home LAN count only on the home LAN, whatever the stay says: this Mac on
@@ -560,7 +565,7 @@ fn answers_heard_on_another_network_in_the_same_stay_are_no_evidence_here() {
     );
     assert_eq!(back.answers.len(), 3, "PRECONDITION: every answer noted");
     assert_eq!(
-        home_net_at(&back),
+        on_evidence(&back),
         Err(Away::TooFew { heard: 0 }),
         "booked on another network"
     );
@@ -569,7 +574,7 @@ fn answers_heard_on_another_network_in_the_same_stay_are_no_evidence_here() {
     for answer in &mut booked_here.answers {
         answer.network.clone_from(&lookalike.stay_network);
     }
-    assert!(home_net_at(&booked_here).is_ok());
+    assert!(on_evidence(&booked_here).is_ok());
 }
 
 /// Only answers a round under this Mac's vault's membership log heard are evidence: three members
@@ -586,16 +591,16 @@ fn only_answers_a_round_under_the_vaults_log_heard_are_evidence() {
         .map(|a| Answer { logged: false, ..a })
         .collect();
     assert_eq!(
-        home_net_at(&home(isolated)),
+        on_evidence(&home(isolated)),
         Err(Away::TooFew { heard: 0 }),
         "an isolated round's answers"
     );
     // Two under the log and one isolated: two members.
     let mut mixed = members_at_home();
     mixed[2].logged = false;
-    assert_eq!(home_net_at(&home(mixed)), Err(Away::TooFew { heard: 2 }));
+    assert_eq!(on_evidence(&home(mixed)), Err(Away::TooFew { heard: 2 }));
     // CONTROL: the same answers under the log read home.
-    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(on_evidence(&home(members_at_home())).is_ok());
 }
 
 /// A network the place merely remembers is no proof: back on the home LAN with nothing heard in
@@ -624,7 +629,7 @@ fn a_network_the_place_remembers_is_not_enough() {
     };
     let now = aterm_netplace::proof::read_with(root.path(), here, NOW);
     assert_eq!(now.stay_since_ms, Some(NOW - 60_000));
-    assert_eq!(home_net_at(&now), Err(Away::TooFew { heard: 0 }));
+    assert_eq!(on_evidence(&now), Err(Away::TooFew { heard: 0 }));
 }
 
 /// BACK ON THE HOME LAN, THE FIRST HEARTBEAT ROUND THERE ADMITS, with no wait: the keeper steps
@@ -655,7 +660,7 @@ fn back_on_the_home_lan_the_first_round_there_admits() {
         )
     };
     assert_eq!(
-        home_net_at(&read()),
+        on_evidence(&read()),
         Err(Away::TooFew { heard: 0 }),
         "PRECONDITION: nothing from before the hotspot counts"
     );
@@ -683,12 +688,12 @@ fn back_on_the_home_lan_the_first_round_there_admits() {
         "the stay since the return"
     );
     assert_eq!(
-        home_net_at(&now).map(|_| ()),
+        on_evidence(&now).map(|_| ()),
         Ok(()),
         "the first round back home admits"
     );
     assert!(
-        home_net_at(&now).is_ok_and(|net| net.holds(ip("192.168.1.40"))),
+        on_evidence(&now).is_ok_and(|net| net.holds(ip("192.168.1.40"))),
         "and a Mac on the subnet proves itself from home"
     );
 }
@@ -784,14 +789,350 @@ fn a_newer_answer_from_another_network_shadows_an_older_home_answer() {
     let mut answers = members_at_home();
     answers.push(away(NOW - 10_000));
     assert_eq!(
-        home_net_at(&home(answers)),
+        on_evidence(&home(answers)),
         Err(Away::TooFew { heard: 2 }),
         "a member last heard elsewhere"
     );
     let mut answers = members_at_home();
     answers.push(away(NOW - 120_000));
     assert!(
-        home_net_at(&home(answers)).is_ok(),
+        on_evidence(&home(answers)).is_ok(),
         "an older answer elsewhere shadows nothing"
+    );
+}
+
+/// The 7-day condition on, as the mesh turns it on.
+const MESH_RULE: Rule = Rule { days: true };
+
+/// The router of a network first seen after the seed, numbered like home.
+const NEW_HW: [u8; 6] = [0x02, 0x0e, 0x0e, 0x0e, 0x0e, 0x01];
+
+/// The first start of a build with the 7-day condition, as an hour of the injected clock: day
+/// 20,400 at 10:00 UTC, past [`NOW`].
+const SWITCH: u64 = 20_400 * DAY_MS + 10 * 60 * 60_000;
+
+/// One hour of the injected clock.
+const HOUR: u64 = 60 * 60_000;
+
+/// This Mac on the home LAN's subnet behind the router whose hardware address is `hw`.
+fn behind(hw: &[u8]) -> Now {
+    on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(hw)),
+        &[],
+        Vec::new(),
+    )
+}
+
+/// What this Mac reads of `now`'s network.
+fn here_of(now: &Now) -> Here {
+    Here {
+        facts: now.facts.clone(),
+        point_to_point: false,
+        own: now.own.clone(),
+    }
+}
+
+/// The network place under `root` as its keeper wrote it at `since`: a stay on `now`'s network
+/// since then, remembering `remembered`'s networks as the ALab LAN.
+fn keep_place(root: &Path, now: &Now, since: u64, remembered: &[&Now]) {
+    let (mut record, _) = aterm_netplace::step(
+        &aterm_netplace::Record::default(),
+        &now.facts,
+        &aterm_netplace::Evidence::default(),
+        None,
+        since,
+        Some(since),
+    );
+    record.remembered = remembered
+        .iter()
+        .filter_map(|on| on.stay_network.clone())
+        .map(|network| aterm_netplace::place::Known {
+            network,
+            learned_ms: since - 30 * DAY_MS,
+            confirmed_ms: since,
+        })
+        .collect();
+    aterm_netplace::record::write(
+        &aterm_netplace::record::dir(root),
+        &aterm_netplace::record::Written {
+            revision: 1,
+            keeper_pid: Some(std::process::id()),
+            keeper_started_ms: Some(since),
+            written_ms: since,
+            record,
+        },
+    )
+    .unwrap();
+}
+
+/// `members` members proving their nodes to this Mac on `now`'s network half a minute before
+/// `at_ms`, noted into the place under `root` as the mesh notes them (with the day each came on)
+/// or, `days` false, as the heartbeat does (without).
+fn members_prove(root: &Path, now: &Now, at_ms: u64, members: u8, days: bool) {
+    let dir = aterm_netplace::record::dir(root);
+    let answers: Vec<Answer> = (0..members)
+        .map(|n| Answer {
+            network: now.stay_network.clone(),
+            ..answer(
+                &format!("node{n}"),
+                &format!("192.168.1.{}", 30 + n),
+                "192.168.1.20",
+                at_ms - 30_500,
+            )
+        })
+        .collect();
+    aterm_netplace::heard::add(
+        &dir,
+        aterm_netplace::Evidence {
+            answers: answers.clone(),
+            ..aterm_netplace::Evidence::default()
+        },
+    )
+    .unwrap();
+    if days {
+        aterm_netplace::heard::note_days(&dir, &answers);
+    }
+}
+
+/// ON AN INJECTED CLOCK, A NETWORK HOME FOR FEWER THAN 7 DISTINCT DAYS ADMITS NOBODY BY ITSELF
+/// (§10, "LAN admission without the heartbeat"): three members prove themselves each day on a
+/// network this Mac does not remember, and with the 7-day condition it is refused as new until
+/// its seventh distinct day: a second look on one day adds no day, and a day only two members
+/// were heard on is no home day. The same evidence on the first day admits under the rule before
+/// the condition.
+///
+/// NEGATIVE CONTROL: `home_at` with its `rule.days` branch dropped admits on the first day, and
+/// "the first day is no home" fails; `home_days` counting every booked day (`heard_by(1)`) counts
+/// the day two members were heard on, and "two members make no home day" fails.
+#[test]
+fn a_network_home_on_fewer_than_seven_distinct_days_admits_nobody_by_itself() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let new = behind(&NEW_HW);
+    keep_place(root.path(), &new, SWITCH - HOUR, &[]);
+    assert!(matches!(
+        aterm_secrets_seed(root.path(), SWITCH - HOUR),
+        Seeding::Now(credited) if credited.is_empty()
+    ));
+    let judge = |at: u64, rule: Rule| home_net_with(root.path(), here_of(&new), at, rule);
+
+    members_prove(root.path(), &new, SWITCH, 3, true);
+    assert_eq!(
+        judge(SWITCH, MESH_RULE),
+        Err(Away::NewNetwork { days: 1 }),
+        "the first day is no home"
+    );
+    assert_eq!(
+        judge(SWITCH, Rule { days: false }),
+        Ok(HomeNet::test()),
+        "CONTROL: the rule before the condition admits on the first day"
+    );
+    members_prove(root.path(), &new, SWITCH + HOUR, 3, true);
+    assert_eq!(
+        judge(SWITCH + HOUR, MESH_RULE),
+        Err(Away::NewNetwork { days: 1 }),
+        "a second look on one day adds no day"
+    );
+    // Day 2: only two members are heard.
+    members_prove(root.path(), &new, SWITCH + DAY_MS, 2, true);
+    assert_eq!(
+        judge(SWITCH + DAY_MS, MESH_RULE),
+        Err(Away::TooFew { heard: 2 })
+    );
+    // Days 3 to 8: three members each day.
+    for day in 2..=7u64 {
+        let at = SWITCH + day * DAY_MS;
+        members_prove(root.path(), &new, at, 3, true);
+        let judged = judge(at, MESH_RULE);
+        if day < 7 {
+            let days = u32::try_from(day).unwrap();
+            assert_eq!(
+                judged,
+                Err(Away::NewNetwork { days }),
+                "two members make no home day (day {day})"
+            );
+        } else {
+            assert_eq!(judged, Ok(HomeNet::test()), "the seventh distinct day");
+        }
+    }
+    assert!(
+        Away::NewNetwork { days: 3 }
+            .to_string()
+            .contains("3 of the 7 days")
+    );
+}
+
+/// The seed at the first start, as the node service calls it.
+fn aterm_secrets_seed(root: &Path, at: u64) -> Seeding {
+    seed_at(root, at).expect("the seed")
+}
+
+/// THE SEED, ONCE (§10, "LAN admission without the heartbeat"; §11 B6): a network the place
+/// remembers as the ALab LAN before the first start of a build with the 7-day condition admits at
+/// once after that start, its fresh evidence as before. A second start credits nothing: a network
+/// the place came to remember between the two starts, three members heard there, admits nobody
+/// until its seventh distinct day.
+///
+/// NEGATIVE CONTROL: `seed_days` crediting again at a second start (its `seeded_ms` check
+/// dropped) credits the network remembered since, and "a second start credits nothing" fails.
+#[test]
+fn a_lan_remembered_before_the_first_start_admits_at_once_and_the_seed_runs_once() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let lan = behind(&HOME_HW);
+    let new = behind(&NEW_HW);
+    keep_place(root.path(), &lan, SWITCH - 3 * DAY_MS, &[&lan]);
+    assert_eq!(
+        aterm_secrets_seed(root.path(), SWITCH),
+        Seeding::Now(vec![lan.stay_network.clone().unwrap()])
+    );
+    members_prove(root.path(), &lan, SWITCH + 60_000, 3, true);
+    assert_eq!(
+        home_net_with(root.path(), here_of(&lan), SWITCH + 60_000, MESH_RULE),
+        Ok(HomeNet::test()),
+        "the remembered LAN admits at once"
+    );
+
+    // The Mac goes to the new network, which the place comes to remember; then it starts again.
+    let moved = SWITCH + 2 * DAY_MS;
+    keep_place(root.path(), &new, moved, &[&lan, &new]);
+    assert_eq!(
+        aterm_secrets_seed(root.path(), moved + HOUR),
+        Seeding::Before(SWITCH),
+        "a second start credits nothing"
+    );
+    for day in 0..7u64 {
+        let at = moved + HOUR + day * DAY_MS;
+        members_prove(root.path(), &new, at, 3, true);
+        let judged = home_net_with(root.path(), here_of(&new), at, MESH_RULE);
+        if day < 6 {
+            let days = u32::try_from(day + 1).unwrap();
+            assert_eq!(judged, Err(Away::NewNetwork { days }), "day {day}");
+        } else {
+            assert_eq!(judged, Ok(HomeNet::test()), "the seventh distinct day");
+        }
+    }
+}
+
+/// AUTOMATIC LAN ADMISSION NEVER STOPS ACROSS THE R2 SWITCH (§11 B6), on an injected clock: a
+/// Mac on its home LAN is looked at every hour from three days before the first start of a build
+/// with the 7-day condition to ten days after it. Before, its evidence is the heartbeat's, which
+/// books no day, under the rule before the condition; at the start it seeds; after, its
+/// evidence is the mesh's, under the condition. Every look admits.
+///
+/// NEGATIVE CONTROL (in the test): the same timeline with no seed at the start stops admitting
+/// at the first look after it, and admits again only on the seventh distinct day the mesh booked.
+#[test]
+fn automatic_lan_admission_never_stops_across_the_r2_switch() {
+    /// The looks of the timeline, and which of them admitted, `seeded` or not.
+    fn timeline(seeded: bool) -> Vec<(u64, Result<HomeNet, Away>)> {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let lan = behind(&HOME_HW);
+        keep_place(root.path(), &lan, SWITCH - 4 * DAY_MS, &[&lan]);
+        let mut looks = Vec::new();
+        let mut at = SWITCH - 3 * DAY_MS;
+        while at <= SWITCH + 10 * DAY_MS {
+            let after = at >= SWITCH;
+            if at == SWITCH && seeded {
+                aterm_secrets_seed(root.path(), at);
+            }
+            members_prove(root.path(), &lan, at, 3, after);
+            let rule = Rule { days: after };
+            looks.push((at, home_net_with(root.path(), here_of(&lan), at, rule)));
+            at += HOUR;
+        }
+        looks
+    }
+    let seeded = timeline(true);
+    assert_eq!(seeded.len(), 13 * 24 + 1);
+    for (at, judged) in &seeded {
+        assert_eq!(judged, &Ok(HomeNet::test()), "the look at {at}");
+    }
+
+    let unseeded = timeline(false);
+    for (at, judged) in &unseeded {
+        // The distinct day of the look, the switch's day the first.
+        let day = (at / DAY_MS).saturating_sub(SWITCH / DAY_MS) + 1;
+        if *at < SWITCH {
+            assert_eq!(judged, &Ok(HomeNet::test()), "before the switch, at {at}");
+        } else if day < 7 {
+            assert!(
+                matches!(judged, Err(Away::NewNetwork { .. })),
+                "CONTROL: with no seed admission stops after the switch, on day {day}: {judged:?}"
+            );
+        } else {
+            assert_eq!(
+                judged,
+                &Ok(HomeNet::test()),
+                "the seventh distinct day, at {at}"
+            );
+        }
+    }
+    assert!(
+        matches!(unseeded[3 * 24].1, Err(Away::NewNetwork { days: 1 })),
+        "the first look after the switch"
+    );
+}
+
+/// A home-day ledger with a line this build cannot read counts no day: the seed's credit read
+/// from it is not taken, so a damaged ledger admits nothing it did not prove.
+///
+/// NEGATIVE CONTROL: `home_net_with` taking the ledger whatever `read_days` passed over reads the
+/// credit beside the torn line, and this test fails.
+#[test]
+fn a_torn_home_day_ledger_counts_no_day() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let lan = behind(&HOME_HW);
+    keep_place(root.path(), &lan, SWITCH - DAY_MS, &[&lan]);
+    aterm_secrets_seed(root.path(), SWITCH);
+    members_prove(root.path(), &lan, SWITCH + 60_000, 3, false);
+    assert!(home_net_with(root.path(), here_of(&lan), SWITCH + 60_000, MESH_RULE).is_ok());
+    let dir = aterm_netplace::record::dir(root.path());
+    let file = dir.join(aterm_netplace::heard::DAYS_FILE);
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("d n0");
+    aterm_uds::private_file::write_private(&dir, aterm_netplace::heard::DAYS_FILE, text.as_bytes())
+        .unwrap();
+    assert_eq!(
+        home_net_with(root.path(), here_of(&lan), SWITCH + 60_000, MESH_RULE),
+        Err(Away::NewNetwork { days: 1 })
+    );
+}
+
+/// THE DESK'S PATH SEEDS BEFORE IT JUDGES: with the 7-day condition, `home_net`'s judgement
+/// ([`home_net_seeding`]) of a Mac whose place remembers its LAN, its node service not yet
+/// started (no seed ran), seeds first and so admits at once; with the condition off it writes
+/// no ledger at all.
+///
+/// NEGATIVE CONTROL: `home_net_seeding` without its `seed_at` call judges an unseeded ledger,
+/// and "the desk's first look admits" fails with `NewNetwork { days: 1 }`.
+#[test]
+fn the_desks_path_seeds_before_it_judges() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let lan = behind(&HOME_HW);
+    keep_place(root.path(), &lan, SWITCH - DAY_MS, &[&lan]);
+    members_prove(root.path(), &lan, SWITCH, 3, true);
+    let dir = aterm_netplace::record::dir(root.path());
+    assert_eq!(
+        home_net_seeding(root.path(), here_of(&lan), SWITCH, Rule { days: false }),
+        Ok(HomeNet::test())
+    );
+    assert_eq!(
+        aterm_netplace::heard::read_days(&dir).0.seeded_ms,
+        None,
+        "the condition off seeds nothing"
+    );
+    assert_eq!(
+        home_net_with(root.path(), here_of(&lan), SWITCH, MESH_RULE),
+        Err(Away::NewNetwork { days: 1 }),
+        "CONTROL: unseeded, the remembered LAN is new"
+    );
+    assert_eq!(
+        home_net_seeding(root.path(), here_of(&lan), SWITCH, MESH_RULE),
+        Ok(HomeNet::test()),
+        "the desk's first look admits"
+    );
+    assert_eq!(
+        aterm_netplace::heard::read_days(&dir).0.seeded_ms,
+        Some(SWITCH)
     );
 }

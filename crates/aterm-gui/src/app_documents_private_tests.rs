@@ -265,7 +265,7 @@ fn inspect_and_the_visible_text_withhold_a_private_document_s_text() {
 }
 
 /// A front terminal tab in window 0 with a session id no other test takes, as `edit` needs.
-fn caller(app: &mut App) -> u64 {
+pub(super) fn caller(app: &mut App) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(5 << 40);
     let sid = NEXT.fetch_add(1 << 12, Ordering::Relaxed);
@@ -289,6 +289,7 @@ fn edit(app: &mut App, session: u64, uri: &str, read_only: bool) -> String {
             for_word: None,
             wait: true,
             read_only,
+            secret: None,
         },
         reply,
     });

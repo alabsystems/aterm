@@ -9,7 +9,7 @@ use super::super::super::upgrade_muse_live::{self as live, Look, Open};
 use super::super::build_start;
 use super::super::upgrade::{Agent, Phase};
 use super::super::{
-    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, connect, held, load,
+    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, connect, held, load_record,
     managed_agent_twin, now_s, restore, said, save, save_checked, screen, store_version, terminate,
 };
 use super::{
@@ -136,8 +136,9 @@ pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>)
     tabs.iter()
         .filter(|t| {
             leader(tabs, &t.sid, &super::super::Live).is_some()
-                || load(opts, &key(&t.sid))
-                    .is_some_and(|st| st.agent == Agent::Muse && st.in_flight())
+                || load_record(opts, &key(&t.sid)).map_or(true, |record| {
+                    record.is_some_and(|st| st.agent == Agent::Muse && st.in_flight())
+                })
         })
         .filter_map(|t| {
             let mut single = opts.clone();
@@ -303,7 +304,15 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    let prior = load(opts, &session_key);
+    let prior = match load_record(opts, &session_key) {
+        Ok(prior) => prior,
+        Err(_) => {
+            return Some(said(
+                report(leader(tabs, &tab, k).unwrap_or(0)),
+                format!("wait:{}", super::super::UNREAD_SAVED_RECORD),
+            ));
+        }
+    };
     if let Some(st) = prior
         .as_ref()
         .filter(|st| st.agent == Agent::Muse && st.in_flight())

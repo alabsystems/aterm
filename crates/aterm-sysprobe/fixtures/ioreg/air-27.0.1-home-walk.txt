@@ -1,0 +1,33 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 39>
+  +-o J815AP  <class IOPlatformExpertDevice, id 0x1000002bc, registered, matched, active, busy 0 (39404 ms), retain 40>
+    +-o AppleARMPE  <class AppleARMPE, id 0x1000002c2, registered, matched, active, busy 0 (19542 ms), retain 44>
+      +-o arm-io@10F00000  <class IOPlatformDevice, id 0x1000002e3, registered, matched, active, busy 0 (18614 ms), retain 160>
+        +-o AppleSoCIO  <class AppleSoCIO, id 0x1000002f1, registered, matched, active, busy 0 (18620 ms), retain 158>
+          +-o ans@71600000  <class AppleARMIODevice, id 0x10000037d, registered, matched, active, busy 0 (395 ms), retain 9>
+            +-o AppleASCWrapV6  <class AppleASCWrapV6, id 0x1000003fb, !registered, !matched, active, busy 0 (292 ms), retain 5>
+              +-o iop-ans-nub  <class AppleA7IOPNub, id 0x100000533, registered, matched, active, busy 0 (292 ms), retain 8>
+                +-o RTBuddy(ANS2)  <class RTBuddy, id 0x100000534, registered, matched, active, busy 0 (292 ms), retain 24>
+                  +-o RTBuddyService  <class RTBuddyService, id 0x10000053d, registered, matched, active, busy 0 (291 ms), retain 7>
+                    +-o AppleANS3CGv2Controller  <class AppleANS3CGv2Controller, id 0x100000544, registered, matched, active, busy 0 (168 ms), retain 21>
+                      +-o NS_01@1  <class IOEmbeddedNVMeBlockDevice, id 0x100000862, registered, matched, active, busy 0 (152 ms), retain 7>
+                        |   "Device Characteristics" = {"Serial Number"="0000000000000001","Medium Type"="Solid State","Product Name"="APPLE SSD AP4096Z","Vendor Name"="","Product Revision Level"="241.0.12"}
+                        |   "Protocol Characteristics" = {"Physical Interconnect"="Apple Fabric","Physical Interconnect Location"="Internal"}
+                        +-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x100000879, registered, matched, active, busy 0 (151 ms), retain 8>
+                          |   "Statistics" = {"Operations (Write)"=143212648,"Latency Time (Write)"=0,"Bytes (Read)"=3115957231616,"Errors (Write)"=0,"Total Time (Read)"=16610253851647,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=4362165277010,"Bytes (Write)"=3591372808192,"Operations (Read)"=153387397,"Retries (Write)"=0}
+                          +-o APPLE SSD AP4096Z Media  <class IOMedia, id 0x10000087a, registered, matched, active, busy 0 (152 ms), retain 12>
+                            |   "BSD Name" = "disk0"
+                            +-o IOGUIDPartitionScheme  <class IOGUIDPartitionScheme, id 0x1000008a1, !registered, !matched, active, busy 0 (131 ms), retain 8>
+                              |   "UUID" = "00000000-0000-0000-0000-00000000D150"
+                              +-o Container@2  <class IOMedia, id 0x100000905, registered, matched, active, busy 0 (132 ms), retain 12>
+                                |   "UUID" = "00000000-0000-0000-0000-0000000000C2"
+                                |   "BSD Name" = "disk0s2"
+                                +-o AppleAPFSContainerScheme  <class AppleAPFSContainerScheme, id 0x100000908, !registered, !matched, active, busy 0 (102 ms), retain 7>
+                                  |   "Statistics" = {"Operations (Read)"=153384527,"Bytes (Write)"=3591358799872,"Operations (Write)"=143210705,"Bytes (Read)"=3115944050688}
+                                  +-o AppleAPFSMedia  <class AppleAPFSMedia, id 0x1000009cc, registered, matched, active, busy 0 (103 ms), retain 11>
+                                    |   "UUID" = "00000000-0000-0000-0000-0000000000A3"
+                                    |   "BSD Name" = "disk3"
+                                    +-o AppleAPFSContainer  <class AppleAPFSContainer, id 0x1000009e0, registered, matched, active, busy 0 (28 ms), retain 3612>
+                                      |   "UUID" = "00000000-0000-0000-0000-0000000000A3"
+                                      +-o Data@5  <class AppleAPFSVolume, id 0x100000a14, registered, matched, active, busy 0 (1 ms), retain 45>
+                                            "BSD Name" = "disk3s5"
+                                            "UUID" = "00000000-0000-0000-0000-0000000000D5"

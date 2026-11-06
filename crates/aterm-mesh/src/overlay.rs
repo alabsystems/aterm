@@ -11,7 +11,8 @@
 //! it answers which seats to dial and which links it dialed to let go ([`Plan`]). [`Attached`] runs
 //! it over one generation's neighbour table (`aterm_net::fleet::link::Neighbours`), and runs the
 //! relays: one push relay per log on every live link to a current seat, whichever end dialed it,
-//! so a link carries records both ways. Its thread parks on the link clock until its next timer
+//! so a link carries records both ways; a seat's link is one whose peer proved the seat's key, not
+//! another key of its principal. Its thread parks on the link clock until its next timer
 //! (a swap, a dial's back-off, a minute's recheck) or its bell, which a link joining
 //! ([`crate::Mesh::poke`]), a relay ending, a dial ending, a membership change and a neighbour's
 //! `Bus` stream ring.
@@ -168,7 +169,7 @@ impl Overlay {
         self.retry.retain(|node, _| sight.seats.contains(node));
         self.chosen.retain(|node| sight.seats.contains(node));
         for node in &self.chosen {
-            if sight.up.contains(node) {
+            if sight.up.contains(node) && !self.seen_up.contains(node) {
                 self.seen_up.insert(node.clone());
             }
         }
@@ -225,8 +226,10 @@ impl Overlay {
                 match self.next_swap {
                     None => self.next_swap = Some(now.saturating_add(SWAP_EVERY)),
                     Some(at) if now >= at => {
-                        let held: Vec<String> = self.chosen.iter().cloned().collect();
-                        let out = self.pick(&held.iter().collect::<Vec<_>>()).cloned();
+                        let len = u64::try_from(self.chosen.len()).unwrap_or(1);
+                        let out = usize::try_from(self.draw() % len)
+                            .ok()
+                            .and_then(|idx| self.chosen.iter().nth(idx).cloned());
                         let candidates: Vec<&String> = sight
                             .seats
                             .iter()
@@ -371,6 +374,23 @@ fn principal_of(link: &Link) -> String {
     astream_broker::identity_principal(link.peer().key.bytes())
 }
 
+/// Whether a link whose peer proved `key` stands for its principal's node: `seats` seats that
+/// key under the principal, or seats none there. A broker files a key by its 64-bit principal, so
+/// another key of a seated principal would pass for the seat; the seat's link is the one whose
+/// key is the seat's, as `Mesh::admits` takes a stream by the key alone.
+pub(crate) fn stands_for_its_node(key: &[u8; 32], seats: &BTreeMap<String, [u8; 32]>) -> bool {
+    seats
+        .get(&astream_broker::identity_principal(key))
+        .is_none_or(|seat| seat == key)
+}
+
+/// Whether `link`'s peer proved a current seat's key ([`Mesh::seats`]), not merely its principal:
+/// what a dial to a seat, for its relays or its mail, must reach.
+pub(crate) fn proves_a_seat(mesh: &Mesh, link: &Link) -> bool {
+    mesh.seats()
+        .is_some_and(|seats| seats.contains(link.peer().key.bytes()))
+}
+
 type Relays = BTreeMap<(String, MeshLog), (Arc<Slot>, JoinHandle<()>)>;
 
 impl Runtime {
@@ -406,6 +426,7 @@ impl Runtime {
                 .table
                 .links()
                 .into_iter()
+                .filter(|link| stands_for_its_node(link.peer().key.bytes(), &seats))
                 .map(|link| (principal_of(&link), link))
                 .collect();
             self.hook_ends(&mut hooked, &links);
@@ -489,7 +510,7 @@ impl Runtime {
         hooked.retain(|node, held| {
             links
                 .get(node)
-                .is_some_and(|link| Weak::ptr_eq(held, &Arc::downgrade(link)))
+                .is_some_and(|link| std::ptr::eq(held.as_ptr(), Arc::as_ptr(link)))
         });
         for (node, link) in links {
             if hooked.contains_key(node) {
@@ -594,7 +615,10 @@ impl Runtime {
                         break;
                     }
                     match runtime.table.dial(addr, DIAL_WITHIN) {
-                        Ok(link) if principal_of(&link) == named => {
+                        Ok(link)
+                            if principal_of(&link) == named
+                                && proves_a_seat(&runtime.mesh, &link) =>
+                        {
                             linked = true;
                             break;
                         }

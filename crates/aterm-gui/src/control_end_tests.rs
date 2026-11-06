@@ -106,6 +106,8 @@ fn view(rows: Vec<LeftRow>) -> LeftView {
             closed_ms: NOW - 7_200_000,
             agent_spans: Vec::new(),
             left: 1,
+            restored: false,
+            told: false,
         }],
         ..LeftView::default()
     }
@@ -997,6 +999,30 @@ fn a_caller_that_hung_up_ends_no_further_token() {
             token(4100)
         )
     );
+}
+
+/// A RESTORED CLOSE STANDS FOR `end`'S RE-PROOF: this process's close index never held a close an
+/// earlier aterm recorded, so a restored certificate (under a key no session here has) stands on
+/// its own, while one of this process's that the index does not confirm is dropped. NEGATIVE
+/// CONTROL: confirm every certificate by the index alone, and the restored one is dropped.
+#[test]
+fn a_restored_close_stands_without_this_processes_close_index() {
+    let store = crate::session_store::new_store();
+    let shown = view(Vec::new());
+    let restored = ClosedTab {
+        key: crate::vitals_left::RESTORED_KEYS,
+        sid: "s-0000000000000000a007".into(),
+        restored: true,
+        ..shown.closed[0].clone()
+    };
+    let offered = LeftView {
+        closed: vec![shown.closed[0].clone(), restored.clone()],
+        ..shown
+    };
+    let (handles, live, closed) =
+        fresh_context_with(&store, &offered, &|_| None, &|_| None).expect("an empty roster");
+    assert!(handles.is_empty() && live.is_empty());
+    assert_eq!(closed, [restored]);
 }
 
 /// THE LEFT DOOR RE-PROVES EACH ROW AT THE YIELD (the harness's `IdleHost::leftover`, over a fake

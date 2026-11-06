@@ -900,7 +900,7 @@ mod live_tests {
                     "{} was never exec'd",
                     copy.display()
                 );
-                std::thread::yield_now();
+                crate::deadline::poll_yield();
             }
             sleeper
         }
@@ -1018,7 +1018,7 @@ mod live_tests {
         let started = Instant::now();
         while std::fs::metadata(&dir).map(|m| m.uid()).ok() != Some(0) {
             assert!(started.elapsed() < HANG, "su never ran as root");
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
 
         let read = super::read_of(Path::new(PROC), pid, me, |table| super::holds(table, key));

@@ -5678,12 +5678,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             if review.unattended() {
                 // A person told now to close their own `/login` over the limit
                 // ([`Exception::tells_login_over_limit`]) is the limit's answer: no second notice.
-                // A managed worker whose usage wall ended its work (`failed why=usage-limit` past
-                // the horizon under Land, [`TurnEndState::conclude_at_wall`]) has its manager's
-                // report, so no limit badge is raised for it. One its wall did not conclude (under
-                // Cruise, or at a wall it waits out) has its limit episode as any tab does.
-                let handled = self.turn_end.gave_up() == Some(GaveUp::UsageLimit)
-                    || point_escalated
+                let handled = point_escalated
                     || !matches!(
                         turn_end,
                         TurnEndAction::Nothing | TurnEndAction::Escalate { .. }
@@ -8429,14 +8424,17 @@ fn said_line(reader: &dyn ScreenReader, rows: &[String], width: Option<usize>) -
 }
 
 /// The session's submit count on `screen` and the mark of the turn's rows above it ([`point_upto`],
-/// the point key's own cut, so a draft typed after a submission never moves it).
+/// the point key's own cut, so a draft typed after a submission never moves it), each row as the
+/// screen's transcript reads it ([`ScreenReader::transcript`]: beside Claude Code's side panel,
+/// its words up to the panel's rule, so the panel's text moves no mark).
 fn submit_mark(reader: &dyn ScreenReader, screen: &Screen) -> Option<(u64, u64)> {
     let rows = &screen.rows;
     let upto = point_upto(reader, rows);
     screen.submits.map(|n| {
+        let transcript = reader.transcript(rows);
         (
             n,
-            super::policy::turn_end::screen_mark(&rows[..upto.min(rows.len())]),
+            super::policy::turn_end::screen_mark(&transcript.rows()[..upto.min(rows.len())]),
         )
     })
 }
@@ -8503,6 +8501,10 @@ fn model_moved(then: Option<&str>, now: Option<&str>) -> bool {
     matches!((then, now), (Some(a), Some(b)) if a != b)
 }
 
+/// A POINT'S KEY: its phase, the agent's last words, the status row and the letters of the turn's
+/// last rows ([`push_words_above`]), each row of those as the screen's transcript reads it
+/// ([`ScreenReader::transcript`]: beside Claude Code's side panel, its words up to the panel's
+/// rule, so the panel's text moves no point); a box's own key where one stands ([`box_key`]).
 fn point_key(reader: &dyn ScreenReader, turn: &Turn) -> String {
     let rows = &turn.screen.rows;
     if turn.phase == Phase::Prompt
@@ -8523,7 +8525,7 @@ fn point_key(reader: &dyn ScreenReader, turn: &Turn) -> String {
         Some((a, _)) => a,
         None => point_upto(reader, rows),
     };
-    push_words_above(&mut key, &rows[..upto]);
+    push_words_above(&mut key, &reader.transcript(rows).rows()[..upto]);
     if let Some((a, b)) = span {
         for r in &rows[a..=b] {
             key.push_str(r.trim_end());

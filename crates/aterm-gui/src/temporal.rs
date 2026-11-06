@@ -1505,10 +1505,8 @@ impl SpineMark {
         CatchUpHost::Ok
     }
 
-    /// Flush any host-side mutations recorded on `term` (such as a retired drawer mark) onto `tx` when no output slice accompanies them, then a rekey when one is due ([`Self::rekey`]).
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn flush_host(&mut self, tx: &TemporalTx, term: &Terminal) {
-        self.sent_from = tx.sent();
+    /// Take up where a forget put the shared watermark, when one ran since this mark last looked.
+    fn follow_generation(&mut self) {
         let generation = self.shared.generation();
         if generation != self.generation {
             self.generation = generation;
@@ -1519,6 +1517,38 @@ impl SpineMark {
             self.since_witness = 0;
             self.witnessed_at = None;
         }
+    }
+
+    /// Hand `tx` the resizes, then the host mutations, `term` applied that no reader has handed the spine yet. A full queue or an overrun stops it and leaves the rest in the engine's journals: they hold no output, so nothing is lost, and the reader's next slice owes the same catch-up (or, past an overrun, a resync) before its bytes.
+    fn send_pending(&mut self, tx: &TemporalTx, term: &Terminal) -> CatchUpHost {
+        let seeded = self.shared.load().is_some();
+        if seeded && !self.catch_up_queue(tx, SpinePre::take(term), term) {
+            return CatchUpHost::QueueFull;
+        }
+        let sent = self.catch_up_host(tx, term);
+        if seeded && matches!(sent, CatchUpHost::Ok) {
+            term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
+        }
+        sent
+    }
+
+    /// Hand `tx` the host mutations `term` applied (a config install among them) at the change, with no keyframe: only on a seeded spine with no open break and no deep pullback owed, each of which needs a keyframe the reader's next slice projects. It never projects a keyframe, opens a break or counts a dropped input ([`Self::send_pending`]).
+    pub(crate) fn send_host_ops(&mut self, tx: &TemporalTx, term: &Terminal) {
+        self.follow_generation();
+        if self.broken
+            || self.shared.load().is_none()
+            || term.deep_history_pullback_ordinal() != self.deep_pullback_at
+        {
+            return;
+        }
+        let _ = self.send_pending(tx, term);
+    }
+
+    /// Flush any host-side mutations recorded on `term` (such as a retired drawer mark) onto `tx` when no output slice accompanies them: [`Self::send_host_ops`] then a rekey when one is due ([`Self::rekey`]), or the keyframe a break, a diverged witness, a deep pullback or an overrun owes.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn flush_host(&mut self, tx: &TemporalTx, term: &Terminal) {
+        self.sent_from = tx.sent();
+        self.follow_generation();
         if self.broken {
             self.resync(tx, term, None);
             return;
@@ -1539,15 +1569,9 @@ impl SpineMark {
             }
             return;
         }
-        if self.shared.load().is_some() && !self.catch_up_queue(tx, SpinePre::take(term), term) {
-            self.broken = true;
-            self.shared.dropped_input.fetch_add(1, Ordering::Release);
-            return;
-        }
-        match self.catch_up_host(tx, term) {
+        match self.send_pending(tx, term) {
             CatchUpHost::Ok => {
                 if self.shared.load().is_some() {
-                    term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
                     self.rekey(tx, term);
                 }
             }
@@ -1557,10 +1581,7 @@ impl SpineMark {
                     self.shared.dropped_input.fetch_add(1, Ordering::Release);
                 }
             }
-            CatchUpHost::QueueFull => {
-                self.broken = true;
-                self.shared.dropped_input.fetch_add(1, Ordering::Release);
-            }
+            CatchUpHost::QueueFull => {}
         }
     }
 
@@ -1589,17 +1610,7 @@ impl SpineMark {
             command: term.started_command_seq() != pre.started,
         };
         self.sent_from = tx.sent();
-        let generation = self.shared.generation();
-        if generation != self.generation {
-            // A forget cleared the spine: take up where it put the watermark.
-            self.generation = generation;
-            self.at = self.shared.load();
-            self.cell_px = self.shared.load_cell_px();
-            self.host_at = self.shared.load_host();
-            self.deep_pullback_at = self.shared.load_deep_pullback();
-            self.since_witness = 0;
-            self.witnessed_at = None;
-        }
+        self.follow_generation();
         if self.broken {
             self.resync(tx, term, None);
             return;
@@ -1965,6 +1976,15 @@ fn charge_of(checkpoint: &TerminalCheckpoint) -> usize {
     checkpoint.memory_used().saturating_add(ARC_HEADER)
 }
 
+/// What a kept host op costs beyond its slot in the store: a config install holds a whole config ([`HostOp::Config`]).
+const fn host_op_charge(op: &HostOp) -> usize {
+    if matches!(op, HostOp::Config { .. }) {
+        std::mem::size_of::<TerminalConfig>()
+    } else {
+        0
+    }
+}
+
 impl TemporalRecorder {
     /// A recorder with the default budget.
     #[must_use]
@@ -2201,16 +2221,13 @@ impl TemporalRecorder {
         self.host_resyncs_alt_screen = on;
     }
 
-    /// Replay under `config`, the config the live engine was given last ([`ReplayEngine::with_config`]); a change asks the reader for a live keyframe, so each chain replays under the config its keyframe was recorded with.
+    /// Replay under `config`, the config the live engine was given last ([`ReplayEngine::with_config`]): the config a keyframe projected from now on is recorded with. A chain recorded before it moves to it by the [`HostOp::Config`] the live engine journaled with the install, so a change asks for no keyframe.
     pub(crate) fn set_replay_config(&mut self, config: Option<Arc<TerminalConfig>>) {
         if self.replay_config.as_deref() == config.as_deref() {
             return;
         }
         self.spine.set_replay_config(config.clone());
         self.replay_config = config;
-        if !self.keyframes.is_empty() || self.spine.keyframes_queued.load(Ordering::Acquire) > 0 {
-            self.spine.keyframe_wanted.store(true, Ordering::Release);
-        }
     }
 
     /// The current tick on this recorder's timeline: micros since the epoch on a clock that counts time asleep, so ticks apart are time elapsed.
@@ -2565,11 +2582,7 @@ impl TemporalRecorder {
             .recorded_config
             .take()
             .unwrap_or_else(|| self.replay_config.clone());
-        let stale_config = config.as_deref() != self.replay_config.as_deref();
         self.record_keyframe_as(keyframe, follows, command, coalesceable, config);
-        if stale_config {
-            self.spine.keyframe_wanted.store(true, Ordering::Release);
-        }
     }
 
     fn has_chain_steps_after(&self, seq: Seq) -> bool {
@@ -2812,6 +2825,7 @@ impl TemporalRecorder {
     fn store_host_op(&mut self, op: HostOp, clock: Option<ClockReading>) -> HostOpId {
         let id = HostOpId(self.next_host_op);
         self.next_host_op += 1;
+        self.used += host_op_charge(&op);
         self.host_ops.push_back((op, clock));
         id
     }
@@ -2821,12 +2835,16 @@ impl TemporalRecorder {
     }
 
     fn pop_host_op(&mut self) -> bool {
-        self.host_ops.pop_front().is_some()
+        let Some((op, _)) = self.host_ops.pop_front() else {
+            return false;
+        };
+        self.used = self.used.saturating_sub(host_op_charge(&op));
+        true
     }
 
-    fn host_op(&self, id: HostOpId) -> Option<(HostOp, Option<ClockReading>)> {
+    fn host_op(&self, id: HostOpId) -> Option<&(HostOp, Option<ClockReading>)> {
         let idx = usize::try_from(id.0.checked_sub(self.host_op_base())?).ok()?;
-        self.host_ops.get(idx).copied()
+        self.host_ops.get(idx)
     }
 
     fn pop_keyframe(&mut self) -> bool {
@@ -3102,7 +3120,7 @@ impl TemporalRecorder {
                 Op::Resize { rows, cols } => Step::Resize { rows, cols },
                 Op::CellPx { width, height } => Step::CellPx { width, height },
                 Op::Host(id) => {
-                    let (op, clock) = self.host_op(id)?;
+                    let (op, clock) = self.host_op(id)?.clone();
                     Step::Host(op, clock)
                 }
                 Op::Witness(id) => match self.pending_witness(id) {
@@ -3287,7 +3305,7 @@ impl TemporalRecorder {
         self.plan(at.unwrap_or(latest))
     }
 
-    /// The distinct instants a Rewind view steps through, oldest first: the oldest keyframe every later instant replays from, then each later tick a slice, resize or live keyframe lands on, less each the live screen showed inside an open mode-2026 frame (its command start goes to the next kept instant) and each empty slice that ended no frame.
+    /// The distinct instants a Rewind view steps through, oldest first: the oldest keyframe every later instant replays from, then each later tick a slice, resize, screen-cutting host op or live keyframe lands on, less each the live screen showed inside an open mode-2026 frame (its command start goes to the next kept instant) and each empty slice that ended no frame. A run of recolouring config installs with nothing else starting a state between them (a palette browse, a preview) is one state, at the last of them.
     #[must_use]
     pub(crate) fn rewind_instants(&self) -> Vec<RewindInstant> {
         if self.spine.break_open() {
@@ -3303,7 +3321,10 @@ impl TemporalRecorder {
         });
         let mut sync_open = base.checkpoint.modes.synchronized_output();
         let mut carried = false;
+        // Whether a config install started the open state and nothing else joined it.
+        let mut open_by_config = false;
         for ev in self.log.live_after(base.seq) {
+            let mut config_cut = false;
             let (marks, starts) = match ev.op {
                 Op::RawIn(id) => {
                     let slice = self.blob(id);
@@ -3313,11 +3334,14 @@ impl TemporalRecorder {
                 }
                 Op::Resize { .. } => (None, true),
                 Op::Host(id) => match self.host_op(id) {
-                    Some((op, _)) if op.is_screen_cut() => (
-                        matches!(op, HostOp::Reset | HostOp::LeaveAlternateScreen)
-                            .then_some(SliceMarks::default()),
-                        true,
-                    ),
+                    Some((op, _)) if op.is_screen_cut() => {
+                        config_cut = matches!(op, HostOp::Config { .. });
+                        (
+                            matches!(op, HostOp::Reset | HostOp::LeaveAlternateScreen)
+                                .then_some(SliceMarks::default()),
+                            true,
+                        )
+                    }
                     _ => continue,
                 },
                 Op::Keyframe(_) => {
@@ -3332,7 +3356,12 @@ impl TemporalRecorder {
                 }
                 _ => continue,
             };
-            if open.is_none_or(|o| ev.ts > o.at) {
+            let later = open.is_none_or(|o| ev.ts > o.at);
+            if later && config_cut && open_by_config {
+                if let Some(o) = open.as_mut() {
+                    o.at = ev.ts;
+                }
+            } else if later {
                 if let Some(o) = open.take() {
                     if sync_open {
                         carried |= o.command;
@@ -3348,6 +3377,12 @@ impl TemporalRecorder {
                     command: false,
                 });
             }
+            open_by_config = open.is_some()
+                && match (later, starts) {
+                    (true, _) => config_cut,
+                    (false, true) => open_by_config && config_cut,
+                    (false, false) => open_by_config,
+                };
             if let Some(marks) = marks {
                 sync_open = marks.sync_open;
                 if let Some(o) = open.as_mut() {
@@ -3480,7 +3515,7 @@ impl TemporalRecorder {
                 .iter()
                 .filter_map(|ev| match ev.op {
                     Op::RawIn(id) => self.blob(id).map(|slice| slice.clock),
-                    Op::Host(id) => self.host_op(id).and_then(|(_, clock)| clock),
+                    Op::Host(id) => self.host_op(id).and_then(|(_, clock)| *clock),
                     _ => None,
                 })
                 .min_by_key(|clock| clock.monotonic);
@@ -3529,7 +3564,7 @@ impl TemporalRecorder {
                     Op::Resize { rows, cols } => chain.resize(rows, cols),
                     Op::CellPx { width, height } => chain.cell_px(width, height),
                     Op::Host(id) => {
-                        let (op, clock) = self.host_op(id)?;
+                        let (op, clock) = self.host_op(id)?.clone();
                         let pane_clock = clock.map(|clock| {
                             let offset =
                                 clock.monotonic.saturating_duration_since(origin.monotonic);
@@ -4064,7 +4099,7 @@ impl ReplayPlan {
                     continue;
                 }
                 Step::Host(op, clock) => {
-                    replay.apply_host_op(*op, *clock);
+                    replay.apply_host_op(op.clone(), *clock);
                     if !op.is_screen_cut() {
                         last = placed.seq;
                         continue;
@@ -4113,7 +4148,7 @@ impl ReplayPlan {
                     continue;
                 }
                 Step::Host(op, clock) if !op.is_screen_cut() => {
-                    replay.apply_host_op(*op, *clock);
+                    replay.apply_host_op(op.clone(), *clock);
                     continue;
                 }
                 Step::Host(..) => (None, None),
@@ -4141,7 +4176,7 @@ impl ReplayPlan {
             match &placed.step {
                 Step::RawIn(input) => replay.process_at(input.bytes(), input.clock),
                 Step::Resize { rows, cols } => replay.resize(*rows, *cols),
-                Step::Host(op, clock) => replay.apply_host_op(*op, *clock),
+                Step::Host(op, clock) => replay.apply_host_op(op.clone(), *clock),
                 Step::CellPx { .. } | Step::Witness(..) => {}
             }
         }
@@ -4187,7 +4222,7 @@ impl ReplayPlan {
                     work += STEP_WORK;
                 }
                 Step::Host(op, clock) => {
-                    replay.apply_host_op(*op, *clock);
+                    replay.apply_host_op(op.clone(), *clock);
                     work += STEP_WORK;
                 }
                 Step::Witness(id, live) => {
@@ -8384,9 +8419,21 @@ mod tests {
         }
     }
 
+    /// The main thread's install of `config` on `live`, as `session_theme::install_session_config` does it: the engine journals it, the recorder takes it for later keyframes, and it goes out on `tx` at once.
+    fn install(
+        live: &mut Terminal,
+        r: &mut TemporalRecorder,
+        tx: &TemporalTx,
+        config: &Arc<TerminalConfig>,
+    ) {
+        let _ = live.apply_config_shared(config.clone());
+        r.set_replay_config(Some(config.clone()));
+        SpineMark::attach(r.spine_watermark()).send_host_ops(tx, live);
+    }
+
+    /// A live keyframe in flight when the config moves keeps the config it was projected under; the move follows it on the spine as a host op that asks for no keyframe, so a soft reset after it takes the new config's cursor in a fold and in the pane task.
     #[test]
-    fn an_in_flight_live_keyframe_keeps_the_config_it_was_projected_under_when_replay_config_moves()
-    {
+    fn an_in_flight_live_keyframe_keeps_its_config_and_the_move_follows_it_as_a_host_op() {
         use aterm_aos::contract::Verdict;
         use aterm_aos_pane::PaneCode;
 
@@ -8403,36 +8450,39 @@ mod tests {
         let _ = live.apply_config(&c1);
         let mut r = TemporalRecorder::new();
         r.set_replay_config(Some(c1.clone()));
-        // Start from a pool-forgotten state (`keyframes` empty, `keyframe_wanted` true) so we
-        // exercise both an in-flight LiveKeyframe AND `set_replay_config` while `keyframes` is empty.
+        // A pool-forgotten recording: no keyframe kept, one wanted, so the first slice projects one.
         r.forget_for_pool();
 
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
 
-        // Reader projects LiveKeyframe under c1 onto `tx`, NOT yet drained by the writer thread.
+        // The reader projects a live keyframe under c1 onto `tx`, not yet drained by the writer.
         slice_at(&mut live, &mut mark, &tx, b"under-c1", clock(0));
         assert!(!r.spine_watermark().keyframe_wanted());
 
-        // Main thread switches `live` and `r` to c2 before the writer drains `rx`.
-        let _ = live.apply_config(&c2);
-        r.set_replay_config(Some(c2.clone()));
+        // The main thread installs c2 before the writer drains `rx`.
+        install(&mut live, &mut r, &tx, &c2);
         assert!(
-            r.spine_watermark().keyframe_wanted(),
-            "config move while a keyframe is in flight still asks the reader for a c2 keyframe"
+            !r.spine_watermark().keyframe_wanted(),
+            "a config move asks the reader for no keyframe"
         );
 
-        // Next reader slice resyncs a LiveKeyframe under c2, then soft-resets and witnesses under c2.
-        slice_at(&mut live, &mut mark, &tx, b"resync-c2", clock(100));
+        slice_at(&mut live, &mut mark, &tx, b"after-c2", clock(100));
         slice_at(&mut live, &mut mark, &tx, b"\x1b[2 qa", clock(200));
         slice_at(&mut live, &mut mark, &tx, b"\x1b[!pb", clock(1300));
 
         drain(&rx, &mut r);
-        assert_eq!(r.keyframe_count(), 2);
+        assert_eq!(r.keyframe_count(), 1, "the move cost no keyframe");
         assert_eq!(r.keyframes[0].config.as_deref(), Some(&*c1));
-        assert_eq!(r.keyframes[1].config.as_deref(), Some(&*c2));
+        assert!(
+            r.host_ops
+                .iter()
+                .any(|(op, _)| matches!(op, HostOp::Config { config, .. } if *config.0 == *c2)),
+            "the move is on the spine"
+        );
 
         let fold = r.replay_plan(None).expect("replay").fold();
+        assert_eq!(fold.term.cursor_style(), live.cursor_style());
         r.judge(fold.judged);
         assert_eq!((r.witnessed(), r.diverged()), (1, 0));
 
@@ -8446,7 +8496,7 @@ mod tests {
             );
         }
 
-        // A reader's rekey projected under c1 and still in flight when the config moves keeps c1, and landing stale asks again for a keyframe under c2.
+        // A reader's rekey projected under c1 and still in flight when the config moves keeps c1; the move follows it on the spine as a host op and asks for no keyframe, so a soft reset after it replays to c2's cursor.
         let mut live = Terminal::new(6, 30);
         let _ = live.apply_config(&c1);
         let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
@@ -8459,18 +8509,25 @@ mod tests {
             1,
             "the rekey is in flight"
         );
-        let _ = rig.live.apply_config(&c2);
-        rig.r.set_replay_config(Some(c2.clone()));
+        install(&mut rig.live, &mut rig.r, &rig.tx, &c2);
         assert!(
-            rig.r.spine.keyframe_wanted(),
-            "a config move while a rekey is in flight asks the reader for a c2 keyframe"
+            !rig.r.spine.keyframe_wanted(),
+            "a config move while a rekey is in flight asks for no keyframe"
         );
-        rig.queue(b"resync-c2", 100);
-        assert!(!rig.r.spine.keyframe_wanted());
-        assert_eq!(
-            rig.drain(),
-            ["in", "witness", "rekeyframe", "live-keyframe"]
-        );
+        rig.queue(b"\x1b[2 qa", 100);
+        rig.queue(b"\x1b[!pb", 200);
+        let names: Vec<String> = rig
+            .drain()
+            .into_iter()
+            .map(|name| {
+                if name.starts_with("host:") {
+                    "host".to_string()
+                } else {
+                    name
+                }
+            })
+            .collect();
+        assert_eq!(names, ["in", "witness", "rekeyframe", "host", "in", "in"]);
         let configs: Vec<_> = rig
             .r
             .keyframes
@@ -8479,15 +8536,177 @@ mod tests {
             .collect();
         assert_eq!(
             configs,
-            [(false, true), (true, true), (false, false)],
-            "the rekey keeps c1, the live keyframe c2"
+            [(false, true), (true, true)],
+            "the rekey keeps c1, and the move costs no keyframe"
         );
-        assert_eq!(rig.r.keyframes[2].config.as_deref(), Some(&*c2));
         assert!(
-            rig.r.spine.keyframe_wanted(),
-            "the rekey landing under the config that moved asks again"
+            !rig.r.spine.keyframe_wanted(),
+            "the rekey landing under c1 asks for none either: the move follows it"
+        );
+        assert_eq!(
+            rig.live.cursor_style(),
+            aterm_core::terminal::CursorStyle::SteadyUnderline,
+            "fixture: the soft reset took c2's cursor"
+        );
+        assert_eq!(
+            rig.r.replay_at(None).expect("replay").cursor_style(),
+            rig.live.cursor_style(),
+            "the replay takes c2's cursor too"
         );
         rig.assert_faithful("across the config move");
+    }
+
+    /// Six theme changes with a slice between each start no keyframe chain and evict none: one keyframe, the oldest instant still reachable, and each change a state of its own. Restoring the keyframe a config move asked for (the negative control, by hand) gives a chain per change.
+    #[test]
+    fn a_theme_change_costs_no_keyframe() {
+        let theme = |b: u8| {
+            Arc::new(TerminalConfig {
+                default_background: aterm_core::terminal::Rgb { r: b, g: b, b },
+                ..TerminalConfig::default()
+            })
+        };
+        for wanted in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let _ = live.apply_config(&theme(0));
+            let mut r = seeded(&live);
+            r.set_replay_config(Some(theme(0)));
+            let oldest = r.reachable_from();
+            let (tx, rx) = queue(64);
+            let mut mark = SpineMark::attach(r.spine_watermark());
+            for i in 1..=6u8 {
+                install(&mut live, &mut r, &tx, &theme(i * 30));
+                if wanted {
+                    r.want_keyframe();
+                }
+                slice_at(&mut live, &mut mark, &tx, b"x", clock(u64::from(i) * 10));
+                drain(&rx, &mut r);
+            }
+            if wanted {
+                assert_eq!(
+                    r.keyframe_count(),
+                    7,
+                    "negative control: a chain per change"
+                );
+                continue;
+            }
+            assert_eq!(r.keyframe_count(), 1);
+            assert_eq!(
+                r.reachable_from(),
+                oldest,
+                "the oldest instant still replays"
+            );
+            assert_eq!(
+                r.used,
+                used_from_scratch(&r).0,
+                "each kept install charges its config"
+            );
+            assert!(r.used >= 6 * std::mem::size_of::<TerminalConfig>());
+            assert_eq!(
+                r.rewind_instants().len(),
+                1 + 6 * 2,
+                "a state per change and per slice"
+            );
+            let fold = r.replay_plan(None).expect("replay").fold();
+            assert_eq!(fold.term.default_background(), live.default_background());
+        }
+    }
+
+    /// A reader's rekey past a theme change records the config in force, so its chain replays a soft reset to the new config's cursor in the pane task; a rekey recorded under the config before the change (the negative control, by hand) fails `WitnessMatches` there, though the GUI fold, whose keyframe carries the cursor default, matches either way.
+    #[test]
+    fn a_rekey_past_a_theme_change_replays_under_the_new_config() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::{PaneCode, WITNESS_MATCHES};
+
+        let c1 = Arc::new(TerminalConfig {
+            cursor_style: aterm_core::terminal::CursorStyle::SteadyBar,
+            ..TerminalConfig::default()
+        });
+        let c2 = Arc::new(TerminalConfig {
+            cursor_style: aterm_core::terminal::CursorStyle::SteadyUnderline,
+            ..TerminalConfig::default()
+        });
+        for keyed_under_old in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let _ = live.apply_config(&c1);
+            let mut r = TemporalRecorder::new();
+            r.set_replay_config(Some(c1.clone()));
+            r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+            let mut rig = ReaderRig::with(live, r);
+            let _ = rig.slice(b"\x1b[2 qa", 0);
+            install(&mut rig.live, &mut rig.r, &rig.tx, &c2);
+            rig.slice_keyed(b"b", 100);
+            let keyed = rig.r.keyframes.back_mut().expect("the rekey");
+            assert!(keyed.follows, "REACH: the slice keyed a rekey");
+            assert_eq!(keyed.config.as_deref(), Some(&*c2), "the config in force");
+            if keyed_under_old {
+                keyed.config = Some(c1.clone());
+            }
+            let _ = rig.slice(b"\x1b[2 qc", 1200);
+            let _ = rig.slice(b"\x1b[!pd", 2400);
+            let chains = rig.r.pane_chains().expect("chains");
+            let check = chains
+                .last()
+                .expect("the rekey's chain")
+                .check(PaneCode::ThisBuild, "test");
+            if keyed_under_old {
+                assert!(
+                    matches!(check.verdict, Verdict::Fail { law, .. } if law == WITNESS_MATCHES),
+                    "negative control: {:?}",
+                    check.verdict
+                );
+            } else {
+                assert_eq!(check.verdict, Verdict::Pass, "{:?}", check.verdict);
+            }
+            let fold = rig.r.replay_plan(None).expect("replay").fold();
+            assert!(
+                !fold.judged.is_empty(),
+                "REACH: the soft reset is witnessed"
+            );
+            rig.r.judge(fold.judged);
+            assert_eq!(rig.r.diverged(), 0, "keyed under old: {keyed_under_old}");
+        }
+    }
+
+    /// A theme change against a full recording queue opens no break, from the install or from a host flush (the Kitty animation's and the manual reset's path); the reader's next slice carries the change.
+    #[test]
+    fn a_theme_change_against_a_full_queue_opens_no_break() {
+        let c2 = Arc::new(TerminalConfig {
+            default_background: aterm_core::terminal::Rgb {
+                r: 240,
+                g: 240,
+                b: 230,
+            },
+            ..TerminalConfig::default()
+        });
+        for flushed in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let mut r = seeded(&live);
+            let (tx, rx) = queue(2);
+            let mut mark = SpineMark::attach(r.spine_watermark());
+            assert!(tx.send(TemporalMsg::Reply) && tx.send(TemporalMsg::Reply));
+            assert!(!tx.has_room(), "fixture: the queue is full");
+            let _ = live.apply_config_shared(c2.clone());
+            r.set_replay_config(Some(c2.clone()));
+            let mut main = SpineMark::attach(r.spine_watermark());
+            if flushed {
+                main.flush_host(&tx, &live);
+            } else {
+                main.send_host_ops(&tx, &live);
+            }
+            assert!(!r.spine_watermark().break_open(), "flushed: {flushed}");
+            assert_eq!(r.dropped_input(), 0);
+            drain(&rx, &mut r);
+            slice_at(&mut live, &mut mark, &tx, b"next", clock(0));
+            drain(&rx, &mut r);
+            assert!(
+                r.host_ops
+                    .iter()
+                    .any(|(op, _)| matches!(op, HostOp::Config { .. })),
+                "the next slice carried the change"
+            );
+            let folded = r.replay_plan(None).expect("replay").run();
+            assert_eq!(folded.default_background(), c2.default_background);
+        }
     }
 
     #[test]
@@ -9564,7 +9783,7 @@ mod tests {
         images
     }
 
-    /// `used` recomputed from what `r` keeps: each slice and its reply, each pending witness, each keyframe's charge less its images, and each distinct image any kept keyframe holds, once. Also returns the image bytes the keyframes hold summed over them (what charging each keyframe its images whole would count) and the distinct images' bytes. Asserts the ledger counts, for each image, exactly the kept keyframes that hold it, so a keyframe that went without letting go of its images fails here even while another kept keyframe still holds each of them.
+    /// `used` recomputed from what `r` keeps: each slice and its reply, each pending witness, each kept host op's config, each keyframe's charge less its images, and each distinct image any kept keyframe holds, once. Also returns the image bytes the keyframes hold summed over them (what charging each keyframe its images whole would count) and the distinct images' bytes. Asserts the ledger counts, for each image, exactly the kept keyframes that hold it, so a keyframe that went without letting go of its images fails here even while another kept keyframe still holds each of them.
     fn used_from_scratch(r: &TemporalRecorder) -> (usize, usize, usize) {
         let mut distinct: Vec<(usize, usize)> = Vec::new();
         let mut holders: HashMap<usize, usize> = HashMap::new();
@@ -9588,7 +9807,8 @@ mod tests {
         let once: usize = distinct.iter().map(|&(_, bytes)| bytes).sum();
         let blobs: usize = r.blobs.iter().flatten().map(InputSlice::charge).sum();
         let witnesses: usize = r.witnesses.iter().map(Witnessed::charge).sum();
-        (blobs + witnesses + own + once, per_keyframe, once)
+        let host: usize = r.host_ops.iter().map(|(op, _)| host_op_charge(op)).sum();
+        (blobs + witnesses + host + own + once, per_keyframe, once)
     }
 
     /// One 512 KiB Kitty image on screen while five non-adjacent live clipboard reads and a rekey make seven keyframes that all hold it: the recording charges it once, so a 2 MiB budget keeps every chain (charged to each keyframe, it kept the newest two). A distinct image per read is still charged each, and the budget drops the oldest chains for them.

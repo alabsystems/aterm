@@ -905,6 +905,15 @@ pub fn supervisor_cruise_model() -> Model {
 /// down though nothing retracted it). The owed
 /// check (`owed`) waits no back-off, so no back-off falls due while it is owed, and a measured
 /// outage holds it as it holds the other acts, its cap counted from the owed check.
+///
+/// THE LEFT LEG (`docs/DESIGN-leftovers-by-default-2026-10-30.md` §2): `left` is 1 while a process
+/// an act's turn or the check's left running (`LeaveProcess`) runs that no turn of the agent's
+/// ended (`EndProcess`) and no `keep <token>` line under a defense kept (`YieldDefenseKeeps`). At a
+/// land act's yield whose reply is a `Nothing left:` defense, and at the check's answer, it holds
+/// the landing while the episode's left holds (`lholds`) are fewer than three (`LEFT_HOLDS`): the
+/// defense owes no check, the check's `LANDED` lands nothing, each such yield counts one hold, and
+/// the host is told the left leg (64, `lheld`). Once it has held three, it holds no more, so the
+/// check and its landing go ahead over the row. `Buggy` 12 lands a `LANDED` over an unkept row.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_land_model() -> Model {
@@ -954,8 +963,19 @@ pub fn supervisor_land_model() -> Model {
             // is typed until another turn runs, and it is no landing.
             var failed = 0;
             var typed_failed = 0;
+            // An unkept process of the agent's runs; the yields the left leg held in the episode;
+            // whether it held the last land act's yield judged.
+            var left = 0;
+            var lholds = 0;
+            var lheld = 0;
 
-            action NetDown when (down == 0) {
+            // The measured outage and the left leg are walked apart (no outage begins while a
+            // process the agent left runs unkept or once the left leg has held, and none is left in
+            // a run an outage came to; a process left and ended before any hold leaves the leg
+            // nothing to hold): the outage holds each act whatever its words, and the left leg
+            // changes only what a defense owes and what the nudge says, which the other legs'
+            // defenses already put under the outage.
+            action NetDown when (down == 0 && left == 0 && lholds == 0) {
                 down = 1;
             }
             action NetUp when (down == 1) {
@@ -981,9 +1001,11 @@ pub fn supervisor_land_model() -> Model {
                 relanded = 0;
                 hold = 1;
                 hlegs = 0;
+                lheld = 0;
             }
             action Check when (
                 pending == 0 && walled == 0 && (owed == 1 || (Buggy == 7 && audited == 1)) &&
+                (left == 0 || lholds == 3) &&
                 failed == 0 && landed == 0 && other == 0 && quiet == 0 && held == 0 && rest == 0 &&
                 (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
@@ -1019,6 +1041,7 @@ pub fn supervisor_land_model() -> Model {
                 rest = 0;
                 hold = if landed == 1 { 0 } else if judged == 1 { 2 } else { 1 };
                 hlegs = if landed == 1 { 0 } else { hlegs };
+                lheld = if landed == 1 { 0 } else { lheld };
             }
             action Answer when (
                 pending == 0 && walled == 0 && asked == 1 && backoff == 0 && landed == 0 &&
@@ -1032,6 +1055,7 @@ pub fn supervisor_land_model() -> Model {
                 relanded = 0;
                 hold = if typed == 0 { 0 } else if judged == 1 { 2 } else { 1 };
                 hlegs = if typed == 0 { 0 } else { hlegs };
+                lheld = if typed == 0 { 0 } else { lheld };
             }
             action WallAct when (
                 pending == 0 && walled == 1 && landed == 0 && failed == 0 &&
@@ -1081,6 +1105,11 @@ pub fn supervisor_land_model() -> Model {
                 } else {
                     hlegs
                 };
+                lheld = if typed == 0 || relanded == 1 || (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else {
+                    lheld
+                };
                 same = 0;
             }
             action YieldAsk when (pending > 0 && pending <= 3) {
@@ -1113,6 +1142,11 @@ pub fn supervisor_land_model() -> Model {
                 } else {
                     hlegs
                 };
+                lheld = if typed == 0 || relanded == 1 || (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else {
+                    lheld
+                };
                 same = 1;
             }
             action YieldAskSame when (pending > 0 && pending <= 3 && same > 0 && said == 0) {
@@ -1144,6 +1178,11 @@ pub fn supervisor_land_model() -> Model {
                     if listed == 1 { 4 } else { 8 }
                 } else {
                     hlegs
+                };
+                lheld = if typed == 0 || relanded == 1 || (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else {
+                    lheld
                 };
                 same = 2;
             }
@@ -1202,6 +1241,11 @@ pub fn supervisor_land_model() -> Model {
                 } else {
                     hlegs
                 };
+                lheld = if typed == 0 || relanded == 1 || (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else {
+                    lheld
+                };
                 same = 0;
             }
             action YieldDefense when (pending > 0 && pending <= 3) {
@@ -1216,7 +1260,13 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                owed = if (Buggy <= 5 || Buggy > 6) && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                owed = if (Buggy <= 5 || Buggy > 6) && (pending == 1 || (pending == 3 && cut == 1)) &&
+                    (left == 0 || lholds == 3)
+                {
+                    1
+                } else {
+                    0
+                };
                 audited = 0;
                 judged = if Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1)) {
                     0
@@ -1240,9 +1290,66 @@ pub fn supervisor_land_model() -> Model {
                 } else if typed == 0 || relanded == 1 || (Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1))) {
                     0
                 } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if left == 1 && lholds <= 2 { 64 } else { 0 }
+                } else {
+                    hlegs
+                };
+                lholds = if (pending == 1 || (pending == 3 && cut == 1)) && left == 1 && lholds <= 2 {
+                    lholds + 1
+                } else {
+                    lholds
+                };
+                lheld = if typed == 0 || relanded == 1 || (Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1))) {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if left == 1 && lholds <= 2 { 1 } else { 0 }
+                } else {
+                    lheld
+                };
+                same = 0;
+            }
+            // A `Nothing left:` defense whose `keep <token>` line keeps the process the agent left:
+            // at a land act's yield the row holds nothing for the rest of the episode, so the
+            // defense owes the check. A yield Land does not judge (a wall's own act after someone
+            // else's turn) reads no defense, so its keep line keeps nothing.
+            action YieldDefenseKeeps when (pending > 0 && pending <= 3 && left == 1) {
+                left = if (pending == 1 || (pending == 3 && cut == 1)) { 0 } else { left };
+                listed = 0;
+                said = 2;
+                need = 0;
+                dirty = 0;
+                asked = 0;
+                landed = 0;
+                told = 0;
+                cut = 0;
+                short = if pending == 3 { short } else { 1 };
+                backoff = if pending == 3 { short } else { 1 };
+                pending = 0;
+                owed = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     0
                 } else {
                     hlegs
+                };
+                lheld = if typed == 0 || relanded == 1 || (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else {
+                    lheld
                 };
                 same = 0;
             }
@@ -1283,9 +1390,21 @@ pub fn supervisor_land_model() -> Model {
                 } else if typed == 0 || relanded == 1 {
                     0
                 } else if (pending == 1 || (pending == 3 && cut == 1)) {
-                    2
+                    if left == 1 && lholds <= 2 { 66 } else { 2 }
                 } else {
                     hlegs
+                };
+                lholds = if (pending == 1 || (pending == 3 && cut == 1)) && left == 1 && lholds <= 2 {
+                    lholds + 1
+                } else {
+                    lholds
+                };
+                lheld = if typed == 0 || relanded == 1 {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if left == 1 && lholds <= 2 { 1 } else { 0 }
+                } else {
+                    lheld
                 };
                 same = 0;
             }
@@ -1309,7 +1428,11 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                owed = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                owed = if (pending == 1 || (pending == 3 && cut == 1)) && (left == 0 || lholds == 3) {
+                    1
+                } else {
+                    0
+                };
                 audited = 0;
                 judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
@@ -1326,9 +1449,21 @@ pub fn supervisor_land_model() -> Model {
                 } else if typed == 0 || relanded == 1 {
                     0
                 } else if (pending == 1 || (pending == 3 && cut == 1)) {
-                    1
+                    if left == 1 && lholds <= 2 { 65 } else { 1 }
                 } else {
                     hlegs
+                };
+                lholds = if (pending == 1 || (pending == 3 && cut == 1)) && left == 1 && lholds <= 2 {
+                    lholds + 1
+                } else {
+                    lholds
+                };
+                lheld = if typed == 0 || relanded == 1 {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if left == 1 && lholds <= 2 { 1 } else { 0 }
+                } else {
+                    lheld
                 };
                 same = 0;
             }
@@ -1344,7 +1479,11 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                owed = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                owed = if (pending == 1 || (pending == 3 && cut == 1)) && (left == 0 || lholds == 3) {
+                    1
+                } else {
+                    0
+                };
                 audited = 0;
                 judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
@@ -1361,9 +1500,21 @@ pub fn supervisor_land_model() -> Model {
                 } else if typed == 0 || relanded == 1 {
                     0
                 } else if (pending == 1 || (pending == 3 && cut == 1)) {
-                    0
+                    if left == 1 && lholds <= 2 { 64 } else { 0 }
                 } else {
                     hlegs
+                };
+                lholds = if (pending == 1 || (pending == 3 && cut == 1)) && left == 1 && lholds <= 2 {
+                    lholds + 1
+                } else {
+                    lholds
+                };
+                lheld = if typed == 0 || relanded == 1 {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if left == 1 && lholds <= 2 { 1 } else { 0 }
+                } else {
+                    lheld
                 };
                 same = 0;
             }
@@ -1386,8 +1537,12 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if StaleHold == 1 || Buggy == 2 { hold } else { 0 };
                 hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 0 };
+                lheld = 0;
                 same = 0;
             }
+            // The check's `LANDED` over a clean repository: it lands, unless a process the agent
+            // left runs unkept and the left leg has held fewer than three times, where it holds the
+            // landing and audits no defense, so the defense said again is owed the check again.
             action YieldLanded when (pending == 4) {
                 listed = 0;
                 said = 4;
@@ -1395,16 +1550,31 @@ pub fn supervisor_land_model() -> Model {
                 need = if Buggy == 10 { 0 } else { need };
                 dirty = 0;
                 asked = 0;
-                landed = 1;
-                told = 1;
+                landed = if left == 0 || lholds == 3 || Buggy == 12 { 1 } else { 0 };
+                told = if left == 0 || lholds == 3 || Buggy == 12 { 1 } else { 0 };
                 cut = 0;
                 short = 1;
-                backoff = 0;
+                backoff = if left == 0 || lholds == 3 || Buggy == 12 { 0 } else { 1 };
                 pending = 0;
-                judged = 0;
-                relanded = 1;
-                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 0 };
-                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 0 };
+                audited = if left == 0 || lholds == 3 || Buggy == 12 { audited } else { 0 };
+                judged = if left == 0 || lholds == 3 || Buggy == 12 { 0 } else { 1 };
+                relanded = if left == 0 || lholds == 3 || Buggy == 12 { 1 } else { relanded };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if left == 0 || lholds == 3 || Buggy == 12 {
+                    0
+                } else {
+                    2
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if left == 0 || lholds == 3 || Buggy == 12 {
+                    0
+                } else {
+                    64
+                };
+                lholds = if left == 0 || lholds == 3 || Buggy == 12 { lholds } else { lholds + 1 };
+                lheld = if left == 0 || lholds == 3 || Buggy == 12 { 0 } else { 1 };
                 same = 1;
             }
             action YieldLandedDirty when (pending == 4) {
@@ -1420,9 +1590,18 @@ pub fn supervisor_land_model() -> Model {
                 short = 1;
                 backoff = 1;
                 pending = 0;
+                audited = if left == 1 && lholds <= 2 { 0 } else { audited };
                 judged = 1;
                 hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
-                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 2 };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if left == 1 && lholds <= 2 {
+                    66
+                } else {
+                    2
+                };
+                lholds = if left == 1 && lholds <= 2 { lholds + 1 } else { lholds };
+                lheld = if left == 1 && lholds <= 2 { 1 } else { 0 };
                 same = 1;
             }
             action YieldList when (pending == 4) {
@@ -1438,7 +1617,15 @@ pub fn supervisor_land_model() -> Model {
                 pending = 0;
                 judged = 1;
                 hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
-                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 4 };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if left == 1 && lholds <= 2 {
+                    68
+                } else {
+                    4
+                };
+                lholds = if left == 1 && lholds <= 2 { lholds + 1 } else { lholds };
+                lheld = if left == 1 && lholds <= 2 { 1 } else { 0 };
                 same = 1;
             }
             action YieldNeedOnly when (pending == 4) {
@@ -1456,7 +1643,15 @@ pub fn supervisor_land_model() -> Model {
                 rest = 1;
                 judged = 1;
                 hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
-                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 1 };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if left == 1 && lholds <= 2 {
+                    65
+                } else {
+                    1
+                };
+                lholds = if left == 1 && lholds <= 2 { lholds + 1 } else { lholds };
+                lheld = if left == 1 && lholds <= 2 { 1 } else { 0 };
                 same = 1;
             }
             action OtherTurnRuns when (pending == 0 && walled == 0 && other == 0) {
@@ -1465,6 +1660,7 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
+                lheld = 0;
             }
             action HumanWork when (pending == 0 && walled == 0) {
                 failed = 0;
@@ -1482,6 +1678,7 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
+                lheld = 0;
                 same = 0;
                 owed = 0;
                 audited = 0;
@@ -1503,6 +1700,7 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
+                lheld = 0;
                 same = 0;
                 owed = 0;
                 audited = 0;
@@ -1512,13 +1710,13 @@ pub fn supervisor_land_model() -> Model {
             // interrupts the work, a turn end Land carries on from as from a person's work (owner
             // ruling 2026-10-27). It is no prompt of aterm's, so it adds nothing to the short
             // streak (v6 §14.17.5.7): the streak stands at the agent's own short answers, and
-            // Land's next act waits the back-off they earned, from this point, or none. The
-            // exchange that opens a person's session is theirs (a managed worker's opening
-            // message is its task, never theirs), and lies outside this model, whose walks
+            // Land's next act waits the back-off they earned, from this point, or none. Nor is it
+            // real work or a new check, so the agent's list stands across it, quoted by Land's next
+            // nudge. The exchange that opens a person's session is theirs (a managed worker's
+            // opening message is its task, never theirs), and lies outside this model, whose walks
             // begin after a point.
             action PersonExchange when (pending == 0 && walled == 0 && (said > 0 || landed == 1)) {
                 failed = 0;
-                listed = 0;
                 said = 0;
                 need = 0;
                 dirty = 0;
@@ -1531,6 +1729,7 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
+                lheld = 0;
                 same = 0;
                 owed = 0;
                 rest = 0;
@@ -1550,14 +1749,17 @@ pub fn supervisor_land_model() -> Model {
                 judged = 0;
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
+                lheld = 0;
                 same = 0;
                 owed = 0;
                 audited = 0;
                 rest = 0;
             }
+            // A loop that follows takes on the landing its journal holds, which reads no process
+            // again: one the check made, which the left leg let land.
             action SeedLanded when (
                 pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && other == 0 &&
-                failed == 0
+                failed == 0 && (left == 0 || lholds == 3)
             ) {
                 landed = 1;
                 said = 4;
@@ -1567,6 +1769,7 @@ pub fn supervisor_land_model() -> Model {
                 relanded = 1;
                 hold = 0;
                 hlegs = 0;
+                lheld = 0;
             }
             action SpentAfterTwo when (
                 Buggy == 1 && nudges == 2 && pending == 0 && walled == 0 && landed == 0 &&
@@ -1580,9 +1783,19 @@ pub fn supervisor_land_model() -> Model {
             ) {
                 held = 1;
             }
+            // Within the turn of a land act or of the check: the agent leaves a process running
+            // (a work yield that leaves one is this, then YieldWork), or ends the one it left
+            // (`aterm ctl end <token>`), and the yield that follows reads it so.
+            action LeaveProcess when (left == 0 && down == 0 && (pending == 1 || pending == 4)) {
+                left = 1;
+            }
+            action EndProcess when (left == 1 && (pending == 1 || pending == 4)) {
+                left = 0;
+            }
 
             invariant LandNeverGoesQuiet: quiet == 0;
-            invariant LandedOnlyByAudit: landed == 0 || (said == 4 && dirty == 0);
+            invariant LandedOnlyByAudit:
+                landed == 0 || (said == 4 && dirty == 0 && (left == 0 || lholds == 3));
             invariant NoCheckOverDirty: typed_check_dirty == 0;
             invariant OneCheckPerDefense: typed_check_audited == 0;
             invariant ANeedRestTypesNothing: typed_in_rest == 0;
@@ -1609,7 +1822,8 @@ pub fn supervisor_land_model() -> Model {
                                 hlegs == (if said <= 1 && listed == 0 { 8 } else { 0 }) +
                                     (if listed == 1 { 4 } else { 0 }) +
                                     (if (said == 2 || said == 6) && need == 1 { 1 } else { 0 }) +
-                                    (if dirty == 1 { 2 } else { 0 })))));
+                                    (if dirty == 1 { 2 } else { 0 }) +
+                                    (if lheld == 1 { 64 } else { 0 })))));
         }
     }
 }
@@ -2857,13 +3071,8 @@ pub fn supervisor_survey_press_model() -> Model {
 
 /// Formal model for waiting out or resetting a standing usage-limit wall.
 ///
-/// A MANAGED WORKER (`Managed = 1`, the `scenario`: a session a manager waits on, under Land)
-/// never waits out a wall whose reset lies past `Horizon` (`MANAGED_WALL_HORIZON`; the
-/// 2026-11-04 claim workers sat a day at a weekly wall): at its own standing wall, shown or left,
-/// with no take window, dialog or cut notice over it, it concludes its work (`ManagedConcludes`,
-/// `failed why=usage-limit`), and no time passes there before it does (`Tick` is not enabled
-/// there). A reset inside the horizon is waited out as on any tab. This model has no second
-/// account: a move the roster advises comes first and wins (`SupervisorAccountRotation`).
+/// Managed workers wait for quota just as a person's session does. The managed scenario
+/// and its conclusion mutant prove that a usage wall never ends their work.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -2885,7 +3094,6 @@ pub fn supervisor_usage_wall_model() -> Model {
             const CutAt = 4;
             const Dialog = 1;
             const Managed = 0;
-            const Horizon = 1;
             scenario Managed = 1;
             var wall = 0;
             var bg = 0;
@@ -2947,31 +3155,14 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = 0;
                 waited = 0;
             }
-            // Time passes at a wall except at a managed worker's own wall that resets past the
-            // horizon: there it concludes first (`ManagedConcludes`), and its concluded wall
-            // (`wall = 7`) is its manager's, where nothing more is modelled.
+            // Quota waits keep their clock under managed Land too.
             action Tick when (
-                1 <= wall && wall <= 6 && clock <= Cap - 1 && (cut == 0 || 1 <= tap) && (
-                    Managed == 0 || held == 1 || 1 <= dialog || cut == 1 || 1 <= view ||
-                    ResetAt <= clock + Horizon || (2 <= wall && wall <= 5) ||
-                    (wall == 6 && mem == 0)
-                )
+                1 <= wall && wall <= 6 && clock <= Cap - 1 && (cut == 0 || 1 <= tap)
             ) {
                 clock = clock + 1;
                 waited = if waited <= Rung2 - 1 { waited + 1 } else { waited };
                 held = 0;
                 unread = 0;
-            }
-
-            // A MANAGED WORKER'S WALL PAST THE HORIZON ENDS ITS WORK: at its own wall, shown
-            // (`wall = 1`) or left and remembered (`wall = 6`), with no take window, `/login` or
-            // cut notice over it, whose reset lies past `Horizon` from now, its work concludes
-            // (`failed why=usage-limit`), its manager's report.
-            action ManagedConcludes when (
-                Managed == 1 && held == 0 && dialog == 0 && cut == 0 && view == 0 &&
-                clock + Horizon + 1 <= ResetAt && (wall == 1 || (wall == 6 && mem == 1))
-            ) {
-                wall = 7;
             }
 
             action WallHides when (Hidden == 1 && wall == 1 && bg == 1 && dialog == 0) {
@@ -3288,13 +3479,18 @@ pub fn supervisor_usage_wall_model() -> Model {
                 dialog = 2;
             }
 
-            // THE 2026-11-04 CLAIM WORKERS: a managed worker waits at a wall that resets a day
-            // and more off, as a person's tab does (`wall = 8`: it sits there until the reset).
-            action ManagedWaitsOut when (
+            // Negative control: the former policy concluded a managed worker at its wall.
+            // No action resumes wall 7: quota timing is unobservable after that terminal
+            // conclusion, so canonicalize it instead of multiplying terminal histories.
+            action ManagedConcludes when (
                 Buggy == 1 && Managed == 1 && held == 0 && dialog == 0 && cut == 0 && view == 0 &&
-                clock + Horizon + 1 <= ResetAt && (wall == 1 || (wall == 6 && mem == 1))
+                (wall == 1 || (wall == 6 && mem == 1))
             ) {
-                wall = 8;
+                wall = 7;
+                due = 0;
+                clock = 0;
+                tries = 0;
+                waited = 0;
             }
 
             action CreditsReadAsWall when (Buggy == 1 && credits == 1 && wall == 0) {
@@ -3319,14 +3515,13 @@ pub fn supervisor_usage_wall_model() -> Model {
             // reaches: it closes a person's own `/login` once unused and the act is due
             // (`LoginClosed`), and the person may close it any time.
             invariant NoLoginLeftForGood: dialog <= 1;
-            // A managed worker waits at no wall of its own that resets past the horizon.
-            invariant NoManagedWaitPastHorizon: wall <= 7;
+            // A usage wall never concludes its worker.
+            invariant NoUsageWallConclusion: wall <= 6;
         }
     }
 }
 
-/// Liveness specification asserting a usage-limit wall eventually resumes work when tokens return,
-/// or, for a managed worker, concludes its work (`wall = 7`).
+/// A usage-limit wall eventually resumes work when tokens return.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(supervisor_usage_wall_model)]
@@ -3335,7 +3530,7 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
     Liveness {
         name: "TheUsageWallEnds",
         goal: or_(
-            or_(eq(var("wall"), int(0)), eq(var("wall"), int(7))),
+            eq(var("wall"), int(0)),
             le(var("clock"), sub(var("due"), int(1))),
         ),
         weak: vec!["Tick", "Act", "Taken", "DialogUnused", "LoginClosed"],

@@ -111,7 +111,12 @@ fn label_is_denied(label: &str, denied: &std::collections::BTreeSet<String>) -> 
     if trimmed.is_empty() {
         return false;
     }
-    if denied.contains(&trimmed.to_ascii_lowercase()) {
+    let is_denied = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        denied.contains(&trimmed.to_ascii_lowercase())
+    } else {
+        denied.contains(trimmed)
+    };
+    if is_denied {
         return true;
     }
     aterm_secrets::swarm_roster::leading_m_label(trimmed)

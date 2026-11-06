@@ -1172,7 +1172,7 @@ fn log_backed_account_preparation_survives_log_appends_and_epoch_rotations_until
         .configuration(&admin, ACCOUNT, "one", actor_1, vec![])
         .unwrap();
     let (_first, _) = a.issue(&admin, [2; 16], wanted).unwrap();
-    crate::table::tests::repair_commons(&lab, 3);
+    crate::table::fixture::repair_commons_complete(&lab, 3);
 
     let bconfig = client::config(&lab.paths[1]).unwrap().unwrap();
     assert_eq!(

@@ -226,9 +226,9 @@ fn show_raw(cell: Option<&crate::database::Cell>, field: Option<&Field>, reveal:
         };
     };
     let values: Vec<String> = super::cell::origins(cell)
-        .iter()
+        .into_iter()
         .map(|(_, value)| {
-            let x = CellValue::decode(value).map_or_else(|_| value.clone(), |v| v.x);
+            let x = CellValue::decode(&value).map_or(value, |v| v.x);
             compact(&raw_masked(&x, reveal))
         })
         .collect();
@@ -350,6 +350,30 @@ pub fn layout(collection: &'static Collection, projection: &Projection) -> Vec<G
     layout_with(collection, projection, false)
 }
 
+/// The grid column of schema column `column`, its `Secret` editable where `secrets` (the column
+/// is revealed).
+fn schema_column(column: &'static Column, secrets: bool) -> GridColumn {
+    GridColumn {
+        name: column.name.to_owned(),
+        source: Source::Schema(column),
+        read_only: read_only(column) && !(secrets && matches!(column.ty, Ty::Secret)),
+    }
+}
+
+/// The header of each live `Secret` column of `collection` as its grid writes it, revealed where
+/// `secrets` ([`layout_with`]): the columns a grid's opener names to the window as concealed
+/// (`edit … secret=`), whose cells no reader of the window but the person's eyes gets
+/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8).
+#[must_use]
+pub fn secret_headers(collection: &'static Collection, secrets: bool) -> Vec<String> {
+    collection
+        .columns
+        .iter()
+        .filter(|c| c.live_at(collection.version) && matches!(c.ty, Ty::Secret))
+        .map(|c| schema_column(c, secrets).header())
+        .collect()
+}
+
 /// [`layout`], with each `Secret` column editable where `secrets` (the column is revealed).
 fn layout_with(
     collection: &'static Collection,
@@ -360,11 +384,7 @@ fn layout_with(
         .columns
         .iter()
         .filter(|c| c.live_at(collection.version))
-        .map(|c| GridColumn {
-            name: c.name.to_owned(),
-            source: Source::Schema(c),
-            read_only: read_only(c) && !(secrets && matches!(c.ty, Ty::Secret)),
-        })
+        .map(|c| schema_column(c, secrets))
         .collect();
     let unknown: BTreeSet<&str> = projection
         .rows
@@ -530,10 +550,10 @@ type Registers = BTreeMap<(String, String), (Vec<Digest>, BTreeMap<String, Vec<D
 
 fn registers(collection: &Collection, cells: &Cells) -> Registers {
     let mut out = Registers::new();
-    for ((name, key), cell) in cells {
-        if name != collection.name {
-            continue;
-        }
+    for ((_, key), cell) in cells
+        .range((collection.name.to_owned(), String::new())..)
+        .take_while(|((name, _), _)| name == collection.name)
+    {
         let Ok(parsed) = CellKey::parse(key) else {
             continue;
         };
@@ -606,7 +626,7 @@ pub fn export_opened(
         )));
     }
     let projection = cell::project(collection, cells);
-    let registers = registers(collection, cells);
+    let mut registers = registers(collection, cells);
     let columns = layout_with(collection, &projection, opened.is_some());
     let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
     let mut rows = Vec::new();
@@ -619,8 +639,7 @@ pub fn export_opened(
         let mut seen = BTreeMap::new();
         for column in &columns {
             let (candidates, elements) = registers
-                .get(&(pk.clone(), column.name.clone()))
-                .cloned()
+                .remove(&(pk.clone(), column.name.clone()))
                 .unwrap_or_default();
             let mut raw = row.raw.contains(&column.name);
             let secret = opened.is_some()
@@ -1364,23 +1383,22 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
                 });
                 continue;
             }
-            let decoded: Vec<Option<CellValue>> = cell
-                .map(|c| {
-                    c.candidates
-                        .iter()
-                        .map(|c| CellValue::decode(&c.value).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let values: Vec<Value> = decoded
-                .iter()
-                .map(|v| v.as_ref().map_or(Value::Null, |v| v.x.clone()))
-                .collect();
             // An import's candidate (its value names a source) is the import's, never the
             // owner's, whatever it holds.
-            let imported = decoded
-                .iter()
-                .any(|v| v.as_ref().is_some_and(|v| v.s.is_some()));
+            let mut imported = false;
+            let mut values = Vec::new();
+            if let Some(c) = cell {
+                values.reserve(c.candidates.len());
+                for candidate in &c.candidates {
+                    match CellValue::decode(&candidate.value) {
+                        Ok(v) => {
+                            imported |= v.s.is_some();
+                            values.push(v.x);
+                        }
+                        Err(_) => values.push(Value::Null),
+                    }
+                }
+            }
             // A set element reads present when any candidate adds it (add-wins).
             let holds = !stopped
                 && match &edit.elem {

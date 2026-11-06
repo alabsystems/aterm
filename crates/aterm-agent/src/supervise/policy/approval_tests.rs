@@ -4490,6 +4490,193 @@ fn a_startup_that_may_set_a_dot_glob_unseen_meets_any_leading_dot() {
     }
 }
 
+/// The owner's home and a project in it, for the git pathspec tests.
+fn owner_dirs() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("C:/Users/_owner", "C:/Users/_owner/proj")
+    } else {
+        ("/Users/_owner", "/Users/_owner/proj")
+    }
+}
+
+/// A session of the owner's standing in `cwd`, its Bash tool's startup read as `shell`.
+fn owner_at(cwd: &str, shell: &Result<ShellStartup, String>) -> ApprovalCtx {
+    let home = Path::new(owner_dirs().0);
+    ApprovalCtx {
+        secrets: default_secrets(Some(home)),
+        home: Some(home.to_path_buf()),
+        cwd: PathBuf::from(cwd),
+        shell: shell.clone(),
+        ..git_host(ctx())
+    }
+}
+
+/// Startups proven to leave every shell glob off a leading dot, zsh's and bash's.
+fn free_startups() -> [Result<ShellStartup, String>; 2] {
+    [zsh_startup("", ""), Ok(ShellStartup::default())]
+}
+
+/// Each line, in its directory, under each free startup, escalates with a reason holding `why`.
+fn escalates_in(rows: &[(&str, &str)], why: &str) {
+    for (cwd, line) in rows {
+        for shell in &free_startups() {
+            let r = reason(&on_screen(&folder_box_with(line), &owner_at(cwd, shell))).to_string();
+            assert!(r.contains(why), "{line} in {cwd}: {r}");
+        }
+    }
+}
+
+/// Each line, in its directory, under each free startup, is approved as a read.
+fn reads_in(rows: &[(&str, &str)]) {
+    for (cwd, line) in rows {
+        for shell in &free_startups() {
+            let d = on_screen(&folder_box_with(line), &owner_at(cwd, shell));
+            assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line} in {cwd}: {d:?}");
+        }
+    }
+}
+
+/// git matches a pathspec by wildmatch, where `*`, `?` and a bracket expression cross `/`
+/// ([`pathspec_tree`], MEASURED 2026-11-05 with git 2.56.0: `git grep --no-index token --
+/// '*.yml'` run in a home printed `.config/gh/hosts.yml`), so a git grep pathspec holding one
+/// reads every file below its literal directory: run in the home, or moved there, `*.yml` reaches
+/// `~/.config/gh`, though no one component of it does. `src/*.rs` reads below `src` alone.
+#[test]
+fn a_git_pathspec_glob_reads_every_file_below_its_literal_directory() {
+    let (home, proj) = owner_dirs();
+    let work_dir = ctx().cwd.to_string_lossy().into_owned();
+    let work = work_dir.as_str();
+    escalates_in(
+        &[
+            (home, "git grep --no-index token -- '*.yml'"),
+            (home, "git grep --no-index token -- 'x' '*.yml'"),
+            (work, "cd ~ && git grep --no-index token -- '*.yml'"),
+            (work, "git -C ~ grep --no-index token -- 'g?/*.yml'"),
+        ],
+        "a read of a secret",
+    );
+    // NEGATIVE CONTROL
+    reads_in(&[
+        (home, "git grep TODO -- 'src/*.rs'"),
+        (home, "git grep TODO -- 'src/a?/*.rs'"),
+        (home, "git grep TODO -- src"),
+        (proj, "git grep TODO -- '*.rs'"),
+        (proj, "git grep TODO -- '*.yml'"),
+    ]);
+}
+
+/// A glob a program takes as written is met by that program's rules, whatever the shell's
+/// startup: git, off [`GLOB_SAFE`], matches a pathspec by wildmatch, where `*`, `?` and a
+/// bracket expression meet a leading dot ([`LeadingDot`], MEASURED 2026-11-05 with git 2.56.0:
+/// `git grep --no-index token -- '*.json'` printed `.claude.json`), so under a startup proven to
+/// leave every shell glob off a leading dot git's words still meet `.credentials.json` and
+/// `.env`. `cat *.json` and `head src/*env`, whose globs the shell expands, stay reads.
+#[test]
+fn a_word_a_program_off_glob_safe_takes_meets_any_leading_dot() {
+    let (home, proj) = owner_dirs();
+    escalates_in(
+        &[
+            (proj, "git grep --no-index token -- '*.json'"),
+            (proj, "git grep --no-index token -- '*'"),
+            (proj, "git grep --no-index token -- 'src/*env'"),
+            (proj, "git diff -- '*.json'"),
+            (proj, "git log -p -- '?credentials.json'"),
+        ],
+        "a read of a secret",
+    );
+    // NEGATIVE CONTROL
+    reads_in(&[
+        (home, "cat *.json"),
+        (proj, "cat *.json"),
+        (proj, "head src/*env"),
+        (proj, "git grep --no-index token -- '*.rs'"),
+    ]);
+}
+
+/// A git grep exclusion (`:!y`, `:^y`, `:(exclude)y`) only narrows, so exclusions alone read the
+/// whole tree where git stands (MEASURED 2026-11-05 with git 2.56.0: `:!x` run in a home printed
+/// every file below it, dotfiles among them); and every word past git grep's `--` is a
+/// pathspec, a `-` led one too (`-x/f` printed `-x/f`), held to the rules as a tree.
+#[test]
+fn a_git_pathspec_exclusion_reads_the_whole_tree_and_a_dash_led_one_is_a_pathspec() {
+    let (home, proj) = owner_dirs();
+    escalates_in(
+        &[
+            (home, "git grep --no-index token -- 'x' ':!y'"),
+            (home, "git grep --no-index token -- ':^y'"),
+        ],
+        "a read of a secret",
+    );
+    escalates_in(
+        &[(proj, "git grep token -- '-x/../../.config'")],
+        "a read of a secret",
+    );
+    // NEGATIVE CONTROL
+    reads_in(&[
+        (proj, "git grep -n TODO -- ':!vendor'"),
+        (proj, "git grep -n TODO -- '-x'"),
+    ]);
+}
+
+/// A git grep pathspec git reads from the repository's top (`:/`, `:!/x`; MEASURED 2026-11-05
+/// with git 2.56.0: `:/` run in a repository's subdirectory read the whole top, and
+/// `:(top)*.yml` its `.config/gh/hosts.yml`), or past a `..` after a glob, names a directory this
+/// check cannot place, so the line is unproven wherever it stands.
+#[test]
+fn a_git_pathspec_from_the_repository_top_is_unplaced() {
+    let (home, proj) = owner_dirs();
+    let rows: Vec<(&str, &str)> = [proj, home]
+        .into_iter()
+        .flat_map(|cwd| {
+            [
+                "git grep token -- ':/'",
+                "git grep token -- ':/src'",
+                "git grep token -- ':!/x'",
+                "git grep token -- src ':/'",
+            ]
+            .map(|line| (cwd, line))
+        })
+        .chain([(proj, "git grep token -- 's*/../../x'")])
+        .collect();
+    escalates_in(&rows, "cannot place");
+    // NEGATIVE CONTROL
+    reads_in(&[
+        (proj, "git grep token -- ':src'"),
+        (proj, "git grep token -- '../proj/src'"),
+    ]);
+}
+
+/// [`pathspec_tree`] reads a pathspec as git does: a glob below the directory its components
+/// before it name, past its magic; an exclusion as `.`; the repository's top, a `..` after a
+/// glob and a long magic that never closes as no directory this check can place.
+#[test]
+fn a_pathspec_is_read_below_its_literal_directory_past_its_magic() {
+    for (word, tree) in [
+        ("src", Some("src")),
+        ("*.rs", Some(".")),
+        ("src/a?/*.rs", Some("src")),
+        ("/x*", Some("/")),
+        ("../../*.json", Some("../..")),
+        ("a\\*", Some(".")),
+        (":(icase)src/*.rs", Some("src")),
+        (":(glob,icase)*", Some(".")),
+        (":src", Some("src")),
+        ("::src", Some("src")),
+        (":!x", Some(".")),
+        (":^x", Some(".")),
+        (":(exclude)x", Some(".")),
+        (":(icase)", Some(".")),
+        (":/", None),
+        (":!/x", None),
+        (":(top)src", None),
+        (":(icase,top)src", None),
+        (":(top", None),
+        ("*/../x", None),
+    ] {
+        assert_eq!(pathspec_tree(word), tree, "{word}");
+    }
+}
+
 /// A whole `**` (zsh's, and bash's under `globstar`) takes any run of components, so an `Under`
 /// rule two directories below it is reached, where a `*` takes one. The rule list is that one
 /// directory: a default `Component` rule, which any `*` meets, would refuse each line first.
@@ -11426,4 +11613,57 @@ fn a_claim_workers_chrome_tool_box_decides_as_for_every_session() {
     let d = on_screen(&other, &claim_worker(full()));
     let text = claim_declined(&d);
     assert!(text.contains(CLAIM_WORKER_TOOLS), "{text}");
+}
+
+/// A real 2.1.318 cold-cache resume warning retains its conversation, even with New focused.
+/// Negative controls: changed options, another dialog title, and approve=none.
+#[test]
+fn a_conversation_resume_warning_keeps_the_selected_conversation() {
+    let text =
+        include_str!("../../../../aterm-phase/src/fixtures/claude-2.1.318-conversation-resume.txt");
+    for text in [
+        text.to_owned(),
+        text.replace("❯ 1. Resume", "  1. Resume")
+            .replace("  2. Start", "❯ 2. Start"),
+    ] {
+        let rows = phase_fixtures::screen(&text);
+        let p = aterm_phase::parse_prompt_v2(&rows).expect("measured resume dialog");
+        assert_eq!(p.kind, PromptKind::ConversationResume);
+        for c in [ctx(), full()] {
+            let decision = on_screen(&rows, &c);
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Approve {
+                        rule_id: RULE_CONVERSATION_RESUME,
+                        choice: Choice::Digit(1),
+                        unproven: None,
+                        ..
+                    }
+                ),
+                "{decision:?}"
+            );
+        }
+        let none = ApprovalCtx {
+            approve: Approve::None,
+            ..ctx()
+        };
+        assert!(!matches!(on_screen(&rows, &none), Decision::Approve { .. }));
+        for changed in [
+            text.replace("1. Resume", "1. Delete"),
+            text.replace("Resume this conversation?", "Delete this conversation?"),
+        ] {
+            let decision = on_screen(&phase_fixtures::screen(&changed), &ctx());
+            assert!(
+                !matches!(
+                    decision,
+                    Decision::Approve {
+                        rule_id: RULE_CONVERSATION_RESUME,
+                        ..
+                    }
+                ),
+                "{decision:?}"
+            );
+        }
+    }
 }

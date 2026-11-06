@@ -92,8 +92,9 @@ impl Cache {
         store: Store,
         after_observation: impl FnOnce(),
     ) -> crate::Result<Store> {
-        let Some(mut reader) = fsx::open_owned_reader(&paths.records_data_file()?)? else {
-            paths.records_data_file()?;
+        let selected = crate::records_storage::selected(&paths.records_file())?;
+        let Some(mut reader) = fsx::open_owned_reader(selected.path())? else {
+            selected.confirm()?;
             return Ok(store);
         };
         let stamp = reader.stamp();
@@ -117,7 +118,7 @@ impl Cache {
         {
             after_observation();
             reader.check_unchanged()?;
-            paths.records_data_file()?;
+            selected.confirm()?;
             return Ok(entry.store.clone());
         }
         #[cfg(test)]
@@ -137,7 +138,7 @@ impl Cache {
             })
         {
             reader.check_unchanged()?;
-            paths.records_data_file()?;
+            selected.confirm()?;
             entry.stamp = stamp;
             return Ok(entry.store.clone());
         }
@@ -153,7 +154,7 @@ impl Cache {
             && let Some(entry) = entries.iter_mut().find(|entry| same(entry))
         {
             reader.check_unchanged()?;
-            paths.records_data_file()?;
+            selected.confirm()?;
             entry.stamp = stamp;
             return Ok(entry.store.clone());
         }
@@ -176,7 +177,7 @@ impl Cache {
             }
         };
         reader.check_unchanged()?;
-        paths.records_data_file()?;
+        selected.confirm()?;
         // The context keys and the cloned store each retain a lineage vector. Even an
         // empty records file must spend entry/context space, or zero-charge entries can
         // accumulate forever without triggering eviction.

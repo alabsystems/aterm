@@ -613,6 +613,7 @@ const MAX_BACK_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct TailCache {
     entry: Option<(TailKey, TailRead)>,
+    excerpts_from: Option<TailSource>,
     #[cfg(unix)]
     carry: Option<Carry>,
     process: Option<ProcessFacts>,
@@ -625,6 +626,21 @@ pub struct TailCache {
     reads: usize,
     #[cfg(all(test, unix))]
     appends: usize,
+}
+
+/// The transcript and process whose last successful excerpts may survive a failed read.
+#[derive(Debug)]
+struct TailSource {
+    path: PathBuf,
+    pid: u32,
+    started: Option<u64>,
+    since: u64,
+}
+
+impl TailSource {
+    fn matches(&self, path: &Path, pid: u32, started: Option<u64>, since: u64) -> bool {
+        self.path == path && self.pid == pid && self.started == started && self.since == since
+    }
 }
 
 /// One read of a transcript since the floor: what it decided, whether it met
@@ -769,8 +785,23 @@ impl TailCache {
         started: Option<u64>,
         since: u64,
     ) -> Option<TailRead> {
+        if self
+            .excerpts_from
+            .as_ref()
+            .is_none_or(|source| !source.matches(path, pid, started, since))
+        {
+            self.clear();
+            self.excerpts_from = Some(TailSource {
+                path: path.to_owned(),
+                pid,
+                started,
+                since,
+            });
+        }
         let read = self.read_tail_since(path, pid, started, since);
-        self.excerpts = read.as_ref().map(|read| read.excerpts.excerpts());
+        if let Some(read) = read.as_ref() {
+            self.excerpts = Some(read.excerpts.excerpts());
+        }
         read
     }
 
@@ -784,7 +815,13 @@ impl TailCache {
         let (mut file, before) = match open_regular_with_meta(path) {
             Some(opened) => opened,
             None => {
-                self.clear();
+                // An unavailable transcript is no new evidence for the survey. Keep its last
+                // excerpts, but require the next successful open to parse the file afresh.
+                self.entry = None;
+                #[cfg(unix)]
+                {
+                    self.carry = None;
+                }
                 return None;
             }
         };
@@ -997,6 +1034,7 @@ impl TailCache {
     /// Forget every transcript read: the next read is a fresh one.
     pub fn clear(&mut self) {
         self.entry = None;
+        self.excerpts_from = None;
         self.excerpts = None;
         self.len = None;
         #[cfg(unix)]
@@ -1005,13 +1043,15 @@ impl TailCache {
         }
     }
 
-    /// The survey's excerpts of the transcript the last read read ([`super::excerpt`]).
+    /// The survey's excerpts from the last successful read of this process and transcript
+    /// ([`super::excerpt`]), retained while that same source is unavailable.
     #[must_use]
     pub const fn excerpts(&self) -> Option<&super::excerpt::Excerpts> {
         self.excerpts.as_ref()
     }
 
-    /// How long the transcript the last read opened was, in bytes; `None` when it opened none.
+    /// The last opened length of this transcript, in bytes, retained over a failed open of
+    /// the same source; `None` before any open or after clearing or changing the source.
     #[must_use]
     pub const fn transcript_len(&self) -> Option<u64> {
         self.len

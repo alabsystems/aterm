@@ -54,6 +54,7 @@ mod open_migration;
 mod own_head;
 mod peer_candidates;
 mod readmit;
+mod reads;
 mod records_cache;
 pub mod release;
 mod release_migration;
@@ -122,10 +123,11 @@ pub use ledger_publish::{
 };
 pub(crate) use log_entries::local_swarm_roster_for_log_held;
 pub use log_entries::{
-    admin_mirror_log, admit_member_in_log, applied_version_names_log, check_log_commons_enrollment,
-    configure_log_member, enroll_commons_member_in_log, keyed_epochs_environment,
-    local_swarm_roster_for_log, member_denied_by_roster, publish_local_node_key,
-    remove_member_in_log, trusted_commons_log,
+    CommonsLog, GAP_STEP_MS, Overtaken, Overtaker, REMOVER_GRACE_MS, SETTLE_GRACE_MS,
+    acknowledged_commons_log, admin_mirror_log, admit_member_in_log, applied_version_names_log,
+    check_log_commons_enrollment, configure_log_member, enroll_commons_member_in_log,
+    keyed_epochs_environment, local_swarm_roster_for_log, member_denied_by_roster,
+    publish_local_node_key, remove_member_in_log, trusted_commons_log,
 };
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
@@ -143,10 +145,12 @@ pub use readmit::{
     ProofAdmissionCapacity, Proven, READMIT_EVERY_MS, Readmit, admit_by_proof, kept_seats,
     prove_at, prove_at_ms, refuses_before_possession, refuses_before_possession_at_ms,
 };
+use reads::{HeldLog, Reads};
 pub use remove::{
-    ListedMac, MemberRemoval, RemovedNote, RemovedNotes, UndoOffer, UndoShare,
-    epoch_convergence_environment, gap_heal_environment, member_list, read_after_cutoff_lines,
-    remove_member, removed_notes, removes_by_log, reseal_waits, revoke_by_log, tend_epochs,
+    ListedMac, MemberRemoval, NodePass, NodePassHost, NodePassPace, NodePassReceipt, NodePassSaid,
+    RemovedNote, RemovedNotes, UndoOffer, UndoShare, epoch_convergence_environment,
+    gap_heal_environment, member_list, node_pass_receipt, read_after_cutoff_lines, remove_member,
+    removed_notes, removes_by_log, reseal_waits, revoke_by_log, run_node_pass, tend_epochs,
     tend_epochs_at, undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
@@ -208,6 +212,8 @@ mod envelope_denial_tests;
 mod lab_start_over_tests;
 #[cfg(test)]
 mod log_only_tests;
+#[cfg(test)]
+mod observe_reads_tests;
 #[cfg(test)]
 mod probe_reads_tests;
 #[cfg(test)]
@@ -1864,6 +1870,15 @@ pub fn on_live_genesis(paths: &Paths) -> bool {
 
 /// The configured source, if any.
 pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
+    config_with(paths, |pin| cached_chain(paths, pin))
+}
+
+/// `source.toml`, with `chain` answering the keys its signer was reached from where it names no
+/// `followed`.
+fn config_with(
+    paths: &Paths,
+    chain: impl FnOnce(&[u8; 32]) -> Vec<[u8; 32]>,
+) -> crate::Result<Option<Config>> {
     let Some(table) = read_toml(&paths.source_file(), "source.toml", 4 << 20)? else {
         return Ok(None);
     };
@@ -1895,7 +1910,7 @@ pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
             );
         }
     } else if let Some(pin) = &signer {
-        followed = cached_chain(paths, pin);
+        followed = chain(pin);
     }
     let host = get("host").unwrap_or("machine").to_string();
     // A mirror carries no authority, so no entry of `mirrors` fails the read: one this build
@@ -2390,7 +2405,7 @@ pub fn conflicts(paths: &Paths) -> crate::Result<Vec<String>> {
     let Some(config) = config(paths)? else {
         return Ok(Vec::new());
     };
-    let store = load_records_for(paths, &config)?;
+    let store = load_records_for(&Reads::new(paths), &config)?;
     let store = log_entries::checked_author_projection_for(paths, &config, &store)?;
     let Some(opened) = store
         .log()
@@ -2673,6 +2688,8 @@ pub struct MaterializationSnapshot {
     seq: u64,
     digest: Option<[u8; 32]>,
     manifest: Manifest,
+    /// A caller's registered input entries; `None` observes the whole materialization.
+    entries: Option<BTreeSet<String>>,
     network_materialization: Option<VaultNetworkMaterialization>,
 }
 
@@ -2682,6 +2699,7 @@ impl PartialEq for MaterializationSnapshot {
             && self.seq == other.seq
             && self.digest == other.digest
             && self.manifest == other.manifest
+            && self.entries == other.entries
     }
 }
 
@@ -2692,6 +2710,10 @@ pub struct Materialized<T> {
     pub inputs: T,
     pub snapshot: MaterializationSnapshot,
 }
+
+#[cfg(test)]
+#[path = "client/materialization_scope_tests.rs"]
+mod materialization_scope_tests;
 
 /// Why one guarded local materialization observation could not read its inputs.
 /// These reasons reveal no entry names, credentials, paths or source payloads.
@@ -2737,7 +2759,9 @@ impl MaterializationSnapshot {
     /// Whether the same vault is still configured, ready and intact, holding the files this
     /// snapshot read: a later version that writes none of them (a machine let in, which on an
     /// open vault every join publishes) leaves it current, and one that changes, adds or
-    /// removes a file does not. A writer holding the state lock (an apply now) is waited for,
+    /// removes a file does not. An entry-scoped observation compares only its named inputs,
+    /// while still requiring the whole current materialization to be ready and intact.
+    /// A writer holding the state lock (an apply now) is waited for,
     /// up to [`CURRENT_WAIT`], since a busy lock says nothing either way.
     /// This is a point-in-time check, not a lease over later effects.
     /// # Errors
@@ -2761,7 +2785,16 @@ impl MaterializationSnapshot {
 
     /// The same vault, with the same files at the same digests ([`Self::is_current`]).
     fn holds_the_files_of(&self, then: &Self) -> bool {
-        self.config == then.config && self.manifest == then.manifest
+        self.config == then.config
+            && match &then.entries {
+                None => self.manifest == then.manifest,
+                Some(entries) => entries.iter().all(|name| {
+                    then.manifest
+                        .files
+                        .get(name)
+                        .is_some_and(|digest| self.manifest.files.get(name) == Some(digest))
+                }),
+            }
     }
 }
 
@@ -2789,6 +2822,33 @@ pub fn with_materialization_ready<T>(
     })
 }
 
+/// Capture local inputs under the complete ready vault's shared state lock, retaining only
+/// the named registered entries as the subsequent snapshot's change dependencies. Unrelated
+/// entry updates may leave that snapshot current; incomplete materialization, changed source,
+/// revoked membership, or a missing or changed named entry may not. `read` must do local reads
+/// only, with no network, subprocesses or effects. Missing entries return `None` before `read`.
+///
+/// # Errors
+/// The entry set is empty, local configuration/state cannot be read, or the input reader fails.
+pub fn with_materialization_ready_for_entries<T>(
+    paths: &Paths,
+    expected: &Config,
+    entries: &[&str],
+    read: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<Option<Materialized<T>>> {
+    if entries.is_empty() {
+        return Err(Error::new(
+            "entry-scoped materialization needs at least one registered entry",
+        ));
+    }
+    with_ready_state(paths, Some(expected), files_intact, Some(entries), read).map(|observation| {
+        match observation {
+            MaterializationObservation::Ready(inputs) => Some(*inputs),
+            MaterializationObservation::Blocked(_) => None,
+        }
+    })
+}
+
 /// Observe readiness and read local inputs under one shared state lock.
 /// `read` runs only when the configured vault still equals `expected` and its
 /// materialization passes the ordinary readiness guard. It must perform only
@@ -2800,7 +2860,7 @@ pub fn observe_materialization<T>(
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state(paths, Some(expected), files_intact, read)
+    with_ready_state(paths, Some(expected), files_intact, None, read)
 }
 
 fn materialization_ready_with(
@@ -2809,7 +2869,7 @@ fn materialization_ready_with(
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
     Ok(matches!(
-        with_ready_state(paths, expected, intact, || Ok(()))?,
+        with_ready_state(paths, expected, intact, None, || Ok(()))?,
         MaterializationObservation::Ready(_)
     ))
 }
@@ -2826,6 +2886,7 @@ fn with_ready_state<T>(
     paths: &Paths,
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
+    entries: Option<&[&str]>,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
@@ -2861,6 +2922,17 @@ fn with_ready_state<T>(
     if !intact(paths, &state) {
         return blocked(Blocker::LocalFilesIncomplete);
     }
+    let entries = if let Some(entries) = entries {
+        if entries
+            .iter()
+            .any(|name| !state.manifest.files.contains_key(*name))
+        {
+            return blocked(Blocker::LocalFilesIncomplete);
+        }
+        Some(entries.iter().map(|name| (*name).to_owned()).collect())
+    } else {
+        None
+    };
     Ok(MaterializationObservation::Ready(Box::new(Materialized {
         inputs: read()?,
         snapshot: MaterializationSnapshot {
@@ -2869,6 +2941,7 @@ fn with_ready_state<T>(
             seq: state.seq,
             digest: state.digest.or(state.records_digest),
             manifest: state.manifest,
+            entries,
         },
     })))
 }
@@ -3038,7 +3111,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         return Ok(None);
     }
     let seeded = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-    if !log_entries::applied_log_available(&state, seeded.as_ref()) {
+    if !log_entries::applied_log_available(&state, seeded.as_ref().map(|(_, digest)| *digest)) {
         return Ok(None);
     }
     let mut hidden = false;
@@ -3147,7 +3220,7 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let unavailable = |reason| Ok(Observation::Unavailable(reason));
-    let Some(observation) = StateLock::observe(paths)? else {
+    let Some(_observation) = StateLock::observe(paths)? else {
         if fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
             return unavailable(Unavailable::Busy);
         }
@@ -3156,13 +3229,14 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         }
         return unavailable(Unavailable::MissingStateLock);
     };
-    let Some(config) = config(paths)? else {
+    let reads = Reads::new(paths);
+    let Some(config) = reads.config()? else {
         return unavailable(Unavailable::Unconfigured);
     };
     let Some(pin) = config.signer else {
         return unavailable(Unavailable::UnsignedSource);
     };
-    let state = load_state(paths)?;
+    let state = reads.state()?;
     if state.membership == Stored::Revoked {
         return unavailable(Unavailable::Revoked);
     }
@@ -3173,36 +3247,37 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         return unavailable(Unavailable::IncompleteApply);
     }
     if state.digest.is_none() && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-        if state.source_identity != Some(source_identity(&config)) {
+        if state.source_identity != Some(source_identity(config)) {
             return unavailable(Unavailable::SourceChanged);
         }
-        if !pin_admitted(&config, None) {
+        if !pin_admitted(config, None) {
             return unavailable(Unavailable::UntrustedPin);
         }
-        let Some(identity) = read_identity(paths)? else {
+        let Some(identity) = reads.identity()? else {
             return unavailable(Unavailable::MissingIdentity);
         };
-        let Some(configured) = log_entries::trusted_configured_log(paths, &config)? else {
+        let Some(configured) = reads.configured()? else {
             return unavailable(Unavailable::IncompleteApply);
         };
+        let log = configured.log();
         let obs_key = (
             config.clone(),
             state.seq,
             None,
             identity.recipient().0,
             [0; 32],
-            Some(log_entries::records_heads_digest(&configured.log)),
+            Some(configured.digest()),
         );
-        if configured.log.recipient_is_removed(&identity.recipient())
-            || configured.log.audience_left_out_recipient(
+        if log.recipient_is_removed(&identity.recipient())
+            || log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
             )
-            || steward::local_recipient_denial_held(paths, &observation)?
+            || steward::local_recipient_denied(&reads)?
         {
             return unavailable(Unavailable::Revoked);
         }
-        if configured.log.audience_left_out_recipient(
+        if log.audience_left_out_recipient(
             &crate::membership_log::EpochAudience::Commons,
             &identity.recipient(),
         ) {
@@ -3213,45 +3288,42 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         {
             return Ok(Observation::Visible(snapshot.clone()));
         }
-        return Ok(
-            match open_commons_control_from_log(&configured.log, &identity)? {
-                Some(control) => {
-                    let snapshot = crate::commons::Snapshot::verified_from_log(
-                        config,
-                        pin,
-                        *configured.log.genesis().id(),
-                        identity.recipient(),
-                        control,
-                    );
-                    if let Ok(mut cache) = OBSERVE_COMMONS_CACHE.lock() {
-                        if cache.len() >= 16 {
-                            cache.pop_front();
-                        }
-                        cache.push_back((obs_key, snapshot.clone()));
+        return Ok(match open_commons_control_from_log(log, identity)? {
+            Some(control) => {
+                let snapshot = crate::commons::Snapshot::verified_from_log(
+                    config.clone(),
+                    pin,
+                    *log.genesis().id(),
+                    identity.recipient(),
+                    control,
+                );
+                if let Ok(mut cache) = OBSERVE_COMMONS_CACHE.lock() {
+                    if cache.len() >= 16 {
+                        cache.pop_front();
                     }
-                    Observation::Visible(snapshot)
+                    cache.push_back((obs_key, snapshot.clone()));
                 }
-                None => Observation::Unavailable(Unavailable::ControlNotVisible),
-            },
-        );
+                Observation::Visible(snapshot)
+            }
+            None => Observation::Unavailable(Unavailable::ControlNotVisible),
+        });
     }
     let Some(digest) = state.digest else {
         return unavailable(Unavailable::IncompleteApply);
     };
-    if !source_bound(&config, &state) {
+    if !source_bound(config, state) {
         return unavailable(Unavailable::SourceChanged);
     }
-    if !pin_admitted(&config, None) {
+    if !pin_admitted(config, None) {
         return unavailable(Unavailable::UntrustedPin);
     }
-    let Some(identity) = read_identity(paths)? else {
+    let Some(identity) = reads.identity()? else {
         return unavailable(Unavailable::MissingIdentity);
     };
-    let Some(bytes) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
+    let Some(vault) = reads.vault()? else {
         return unavailable(Unavailable::MissingCache);
     };
-    let (envelope, pinned, verdict) = envelope::verify_for_reader(
-        bytes.as_slice(),
+    let (envelope, pinned, verdict) = vault.verify_for_reader(
         &config.name,
         &pin,
         &config.followed,
@@ -3261,27 +3333,36 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         return unavailable(Unavailable::PendingApply);
     }
     let mut control = None;
-    let seeded = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-    if !log_entries::applied_log_available(&state, seeded.as_ref()) {
+    let seeded = reads.seeded()?;
+    if !log_entries::applied_log_available(state, seeded.as_ref().map(HeldLog::digest)) {
         return unavailable(Unavailable::IncompleteApply);
     }
-    if steward::local_recipient_denial_held(paths, &observation)? {
+    if steward::local_recipient_denied(&reads)? {
         return unavailable(Unavailable::Revoked);
     }
-    if let Some((log, _)) = &seeded
-        && (log.removes(&identity.recipient())
-            || (log_entries::log_base(Some(log), &envelope, &identity)?
-                != log_entries::LogBase::Behind
-                && log.audience_left_out_recipient(
-                    &crate::membership_log::EpochAudience::Everyone,
-                    &identity.recipient(),
-                )))
+    // How the seeded log stands to this envelope, asked once it holds no explicit removal.
+    let seeded_base = match &seeded {
+        Some(seeded) if seeded.log().removes(&identity.recipient()) => {
+            return unavailable(Unavailable::Revoked);
+        }
+        Some(seeded) => Some((
+            seeded.log(),
+            log_entries::log_base(Some(seeded.log()), envelope, identity)?,
+        )),
+        None => None,
+    };
+    if let Some((log, base)) = seeded_base
+        && base != log_entries::LogBase::Behind
+        && log.audience_left_out_recipient(
+            &crate::membership_log::EpochAudience::Everyone,
+            &identity.recipient(),
+        )
     {
         return unavailable(Unavailable::Revoked);
     }
-    if let Some((log, _)) = &seeded
+    if let Some((log, base)) = seeded_base
         && log.has_commons_epochs()
-        && log_entries::log_base(Some(log), &envelope, &identity)? != log_entries::LogBase::Behind
+        && base != log_entries::LogBase::Behind
         && log.audience_left_out_recipient(
             &crate::membership_log::EpochAudience::Commons,
             &identity.recipient(),
@@ -3294,25 +3375,25 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         state.seq,
         Some(digest),
         identity.recipient().0,
-        envelope::digest_bytes(bytes.as_slice()),
-        seeded.as_ref().map(|(_, digest)| *digest),
+        envelope.digest(),
+        seeded.as_ref().map(HeldLog::digest),
     );
     if let Ok(cache) = OBSERVE_COMMONS_CACHE.lock()
         && let Some((_, snapshot)) = cache.iter().find(|(k, _)| *k == obs_key)
     {
         return Ok(Observation::Visible(snapshot.clone()));
     }
-    if let Some((log, _)) = &seeded
+    if let Some((log, base)) = seeded_base
         && log.has_commons_epochs()
-        && log_entries::log_base(Some(log), &envelope, &identity)? != log_entries::LogBase::Behind
-        && log_entries::reads_log(log, &identity)
+        && base != log_entries::LogBase::Behind
+        && log_entries::reads_log(log, identity)
     {
-        control = log.open_commons_control(&identity)?;
-    } else if let Some((log, _)) = &seeded
-        && log_entries::log_base(Some(log), &envelope, &identity)? == log_entries::LogBase::Covers
-        && log_entries::reads_log(log, &identity)
+        control = log.open_commons_control(identity)?;
+    } else if let Some((log, base)) = seeded_base
+        && base == log_entries::LogBase::Covers
+        && log_entries::reads_log(log, identity)
     {
-        control = open_commons_control_from_log(log, &identity)?;
+        control = open_commons_control_from_log(log, identity)?;
     } else {
         for locker in envelope
             .lockers
@@ -3320,7 +3401,7 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
             .filter(|locker| locker.label != "admin")
         {
             let plain =
-                match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
+                match age::decrypt(std::slice::from_ref(identity), locker.armored.as_bytes()) {
                     Ok(plain) => plain,
                     Err(age::AgeError::NoMatch) => continue,
                     Err(error) => return Err(Error::new(format!("Commons locker: {error}"))),
@@ -3350,8 +3431,8 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     Ok(match control {
         Some(control) => {
             let snapshot = crate::commons::Snapshot::verified(
-                config,
-                &envelope,
+                config.clone(),
+                envelope,
                 identity.recipient(),
                 control,
             );
@@ -3746,7 +3827,10 @@ fn pin_gives_way(config: &Config) -> bool {
 }
 
 fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
-    chain_cache::read(paths, pin)
+    fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |bytes| chain_cache::parsed(bytes).chain(pin))
 }
 
 fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
@@ -3892,28 +3976,9 @@ fn read_verified_cached_envelope(
     config: &Config,
     state: &State,
 ) -> crate::Result<Option<Vec<u8>>> {
-    let Some(pin) = config.signer else {
-        return Ok(None);
-    };
-    if !source_bound(config, state) || pin_gives_way(config) {
-        return Ok(None);
-    }
-    let Some(cached) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
-        return Ok(None);
-    };
-    let Ok((envelope, _, _)) = envelope::verify_for_reader(
-        cached.as_slice(),
-        &config.name,
-        &pin,
-        &config.followed,
-        None,
-    ) else {
-        return Ok(None);
-    };
-    Ok(
-        (envelope.seq == state.seq && Some(envelope.digest()) == state.digest)
-            .then(|| cached.as_slice().to_vec()),
-    )
+    Ok(Reads::new(paths)
+        .verified_under(config, state)?
+        .map(|envelope| envelope.raw().to_vec()))
 }
 
 fn missing(config: &Config) -> Error {
@@ -4012,17 +4077,17 @@ fn sync_without_reconcile(
 /// The vault `source.toml` names and this Mac's empty record store for it
 /// ([`records_store_for`]).
 fn records_store(paths: &Paths) -> crate::Result<(String, crate::membership_log::Store)> {
-    let config = config(paths)?;
-    records_store_selected(paths, config.as_ref())
+    let reads = Reads::new(paths);
+    records_store_selected(&reads, reads.config()?)
 }
 
 fn records_store_selected(
-    paths: &Paths,
+    reads: &Reads<'_>,
     config: Option<&Config>,
 ) -> crate::Result<(String, crate::membership_log::Store)> {
     let (name, store) = records_store_for(config)?;
     if let Some(config) = config
-        && let Some(network) = retained_history::pinned_network(paths, config)?
+        && let Some(network) = retained_history::pinned_network(reads, config)?
     {
         if store
             .pinned_network()
@@ -4038,7 +4103,7 @@ fn records_store_selected(
         ));
     }
     let store = match config {
-        Some(config) => store.under(&retained_history::lineage(paths, config)),
+        Some(config) => store.under(&reads.lineage(config)),
         _ => store,
     };
     Ok((name, store))
@@ -4137,8 +4202,9 @@ pub fn load_acknowledged_and_ahead(paths: &Paths) -> crate::Result<AcknowledgedR
 /// One read of the store, projected under the configured vault; with `ahead`, the raw store kept
 /// where the projection dropped records.
 fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRecords> {
-    let config = config(paths)?;
-    let (vault, store) = records_store_selected(paths, config.as_ref())?;
+    let reads = Reads::new(paths);
+    let config = reads.config()?;
+    let (vault, store) = records_store_selected(&reads, config)?;
     let raw = records_cache::read(paths, vault, store)?;
     let Some(config) = config else {
         return Ok(AcknowledgedRecords {
@@ -4147,7 +4213,7 @@ fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRe
         });
     };
     let kept = ahead.then(|| raw.clone());
-    let acknowledged = retained_history::project_store(paths, &config, raw)?;
+    let acknowledged = retained_history::project_store(&reads, config, raw)?;
     let heads =
         |store: &crate::membership_log::Store| store.log().map(crate::membership_log::Log::heads);
     let ahead = kept.filter(|raw| heads(raw) != heads(&acknowledged));
@@ -4159,9 +4225,12 @@ fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRe
 
 /// An envelope-verified replacement is evaluated under its prospective configuration,
 /// before that configuration can replace the currently materialized source on disk.
-fn load_records_for(paths: &Paths, config: &Config) -> crate::Result<crate::membership_log::Store> {
-    let (vault, store) = records_store_selected(paths, Some(config))?;
-    records_cache::read(paths, vault, store)
+fn load_records_for(
+    reads: &Reads<'_>,
+    config: &Config,
+) -> crate::Result<crate::membership_log::Store> {
+    let (vault, store) = records_store_selected(reads, Some(config))?;
+    records_cache::read(reads.paths(), vault, store)
 }
 
 /// Verify and merge `records` into `paths.records_file()` under the client state lock, returning
@@ -6534,7 +6603,7 @@ fn apply_until(
     if matches!(pinned, Pin::Rotated(_)) {
         retained_history::acknowledge_for(
             paths,
-            &load_records_for(paths, &next_config)?,
+            &load_records_for(&Reads::new(paths), &next_config)?,
             &next_config,
         )?;
     }
@@ -6613,7 +6682,7 @@ fn apply_until(
     if let Pin::Replaced(_) = pinned {
         retained_history::acknowledge_replacement(
             paths,
-            &load_records_for(paths, &next_config)?,
+            &load_records_for(&Reads::new(paths), &next_config)?,
             &next_config,
         )?;
         state.seq = 0;
@@ -7468,12 +7537,18 @@ fn subscriber_loop_until(
     let mut converge = crate::converge::Due::default();
     let mut runner: Option<aterm_uds::spawnfd::Child> = None;
     let mut notary = release::NotaryRounds::default();
-    let converge_if = |due: bool, runner: &mut Option<aterm_uds::spawnfd::Child>| {
+    let converge_clock = Instant::now();
+    let now_ms = || u64::try_from(converge_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let converge_if = |due: bool,
+                       converge: &mut crate::converge::Due,
+                       runner: &mut Option<aterm_uds::spawnfd::Child>| {
         if let (true, Some(exe)) = (due, program.path()) {
             *runner = (converging.start)(exe);
+            if runner.is_none() {
+                converge.reaped(crate::converge::Last::Failed, now_ms());
+            }
         }
     };
-    let now_ms = || aterm_time::unix_millis().unwrap_or(0);
     // `[swarm] enabled = false` holds every round: no ask, long-poll, apply or converge pass
     // until it is on again, looked at each [`SWARM_LOOK`] at the cost of one `stat`.
     let mut swarm = crate::swarm::Switch::new(&paths.home);
@@ -7482,9 +7557,9 @@ fn subscriber_loop_until(
         let due = converge.at_start(
             now_ms(),
             (converging.routes)(),
-            crate::converge::Last::of(runner.as_mut()),
+            crate::converge::Last::of(&mut runner),
         );
-        converge_if(due, &mut runner);
+        converge_if(due, &mut converge, &mut runner);
     } else {
         // The first healthy pass once sharing is on starts it.
         converge.failed();
@@ -7497,7 +7572,7 @@ fn subscriber_loop_until(
         // Every round, healthy or not, reaps a runner that ended (how it ended is kept for the
         // next healthy round's due check): one started while the vault cannot be reached is no
         // zombie for as long as that lasts.
-        let _ = crate::converge::Last::of(runner.as_mut());
+        converge.reaped(crate::converge::Last::of(&mut runner), now_ms());
         if program.replaced() {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
@@ -7550,10 +7625,10 @@ fn subscriber_loop_until(
                     &outcome,
                     now_ms(),
                     (converging.routes)(),
-                    crate::converge::Last::of(runner.as_mut()),
+                    crate::converge::Last::of(&mut runner),
                     pass.source,
                 );
-                converge_if(due, &mut runner);
+                converge_if(due, &mut converge, &mut runner);
                 let requested = || load_state(paths).ok().map(|state| state.requested);
                 let before = requested();
                 ask_again_if_due(paths, &config, log);
@@ -10976,6 +11051,12 @@ pub struct Admin {
     /// Entries a person saved ([`Admin::resolving`]): the publish settles a conflict the log holds
     /// for each.
     resolve: BTreeSet<(Audience, String)>,
+    /// This Mac's `[everyone]` writes waiting for a removal's new key that `doc` shows over the
+    /// log's values ([`Admin::waiting`]), which a publish drafts against (one-mesh W3).
+    shown: log_entries::Waiting,
+    /// This Mac's waiting writes a later change overtook that no view showed yet
+    /// ([`Admin::overtaken`]).
+    overtaken: Vec<Overtaken>,
 }
 
 impl Drop for Admin {
@@ -10995,6 +11076,21 @@ impl Admin {
     /// Immutable authenticated baseline, excluding edits to the public draft.
     pub fn published_document(&self) -> &Document {
         &self.published_doc
+    }
+
+    /// The `[everyone]` entries `doc` shows as this Mac's writes waiting for a removal's new key
+    /// (one-mesh M4, W3): each as this Mac's waiting write leaves it, over the value the log holds.
+    /// A vault pass signs each once the key arrives; a publish that changes one, or sets it back to
+    /// the log's value (or removes one the log does not hold), takes it back.
+    pub fn waiting(&self) -> Vec<String> {
+        self.shown.names()
+    }
+
+    /// This Mac's waiting writes a later change overtook, and a vault pass dropped, that no view
+    /// showed yet: a record of each, never a value ([`Overtaken::line`]). [`overtaken_shown`]
+    /// marks them shown.
+    pub fn overtaken(&self) -> &[Overtaken] {
+        &self.overtaken
     }
 
     /// Entry from the authenticated snapshot, unaffected by edits to `doc`.
@@ -11521,7 +11617,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         .collect();
     let mut doc = opened.doc.clone();
     let mut admissions = opened.admissions.clone();
-    let log_base = admin_base(
+    let (log_base, shown) = admin_base(
         paths,
         &config,
         &envelope,
@@ -11529,6 +11625,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         &opened,
         &mut doc,
         &mut admissions,
+        true,
     );
     Ok(Admin {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
@@ -11552,7 +11649,53 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         parented: !envelope.parents.is_empty(),
         log_base,
         resolve: BTreeSet::new(),
+        shown,
+        overtaken: unshown_overtaken(paths),
     })
+}
+
+/// The records of this Mac's journal of overtaken writes no view showed yet ([`Admin::overtaken`]);
+/// none where the journal cannot be read.
+fn unshown_overtaken(paths: &Paths) -> Vec<Overtaken> {
+    log_entries::read_overtaken(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| !record.shown)
+        .collect()
+}
+
+/// A file of this Mac's `[everyone]` writes that it cannot read ([`waiting_unread`]).
+pub enum UnreadWaiting {
+    /// The writes waiting for a removal's new key: no save that writes `[everyone]` goes until
+    /// they read, since any write it makes may be over one of them.
+    Waiting(String),
+    /// A publish's pending set: no save whose `[everyone]` writes wait for the new key, or
+    /// replace a waiting one, goes until it reads, since it may be a stored version's writes.
+    Pending(String),
+}
+
+/// The files of this Mac's `[everyone]` writes waiting for a removal's new key, or pending on a
+/// publish's version, that it cannot read: while one is there, nothing waiting is signed or
+/// landed over it (one-mesh W3). Empty where every one reads, or this Mac has no identity.
+pub fn waiting_unread(paths: &Paths) -> Vec<UnreadWaiting> {
+    let Ok(Some(identity)) = read_identity(paths) else {
+        return Vec::new();
+    };
+    let (waiting, pending) = log_entries::unread_waiting(paths, &identity);
+    waiting
+        .map(UnreadWaiting::Waiting)
+        .into_iter()
+        .chain(pending.into_iter().map(UnreadWaiting::Pending))
+        .collect()
+}
+
+/// Mark `admin`'s overtaken records ([`Admin::overtaken`]) shown: a person read them, and no
+/// later view shows them again. They stay in the journal, a record a person may read.
+///
+/// # Errors
+/// The state lock is not taken, or the journal cannot be read or written.
+pub fn overtaken_shown(paths: &Paths, admin: &Admin) -> crate::Result<()> {
+    log_entries::overtaken_seen(paths, &admin.overtaken)
 }
 
 /// How this Mac's seeded log stands to the version `envelope` an admin opened, with `doc` (that
@@ -11560,7 +11703,13 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
 /// with no seat in the log published, or one whose records this log lacks, is edited as it
 /// stands: the log never reverts or deletes what it does not hold. Where the log's entries do not
 /// fit the version's text (the overlay fails), the version reads as one the log is behind
-/// ([`log_entries::LogBase::Behind`]), so no edit is diffed into the log from that text.
+/// ([`log_entries::LogBase::Behind`]), so no edit is diffed into the log from that text. Where
+/// `land`, the sets pending on the version opened land first (`log_entries::view_waiting`); a
+/// cached open, whose callers may hold the state lock, passes none.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the opened version, the text and ledger it fills, and whether its sets land"
+)]
 fn admin_base(
     paths: &Paths,
     config: &Config,
@@ -11569,7 +11718,8 @@ fn admin_base(
     opened: &admin_keys::AdminText,
     doc: &mut Document,
     admissions: &mut admission::Ledger,
-) -> log_entries::LogBase {
+    land: bool,
+) -> (log_entries::LogBase, log_entries::Waiting) {
     // An unreadable records file or locker opens the version as it stands, never fails the open
     // (`admin_cached` answers whether this Mac is an admin at all).
     let seeded = log_entries::trusted_seeded_log(paths, config, envelope)
@@ -11577,6 +11727,7 @@ fn admin_base(
         .flatten();
     let base = log_entries::log_base(seeded.as_ref().map(|(log, _)| log), envelope, identity)
         .unwrap_or(log_entries::LogBase::Behind);
+    let mut shown = log_entries::Waiting::default();
     if base == log_entries::LogBase::Covers
         && let Some((log, _)) = &seeded
     {
@@ -11598,7 +11749,30 @@ fn admin_base(
             // The version's text without the log's entries is no base to diff the log against:
             // an edit drafted from it would write the version's older values over every log-only
             // edit. The edit goes out unstamped, read from its lockers, as from a log behind it.
-            return log_entries::LogBase::Behind;
+            return (log_entries::LogBase::Behind, shown);
+        }
+        // One-mesh W3: this Mac's `[everyone]` writes that wait for a removal's new key show over
+        // the log's values, so a person sees them and can change or take them back; the edit is
+        // drafted against this view (`log_entries::everyone_edit`). The sets pending on the
+        // version opened, which a server holds, land first. Where they do not fit the text, the
+        // view is the log's alone.
+        let waiting = log_entries::view_waiting(
+            paths,
+            identity,
+            log,
+            &log_entries::stored_versions(envelope),
+            land,
+        );
+        let mut with = doc.clone();
+        if !waiting.is_empty()
+            && log_entries::overlay_waiting_onto_document(&mut with, &waiting).is_ok()
+            && admin_keys::validate_commons(&with, &opened.commons_seed).is_ok()
+            && let Ok(with_admissions) = opened.admissions.retained(&with)
+            && with_admissions.validate(&with, envelope.seq).is_ok()
+        {
+            *doc = with;
+            *admissions = with_admissions;
+            shown = waiting;
         }
     } else if base == log_entries::LogBase::Unstamped
         && let Some((log, _)) = &seeded
@@ -11619,10 +11793,10 @@ fn admin_base(
             *doc = overlaid;
             *admissions = next_admissions;
         } else {
-            return log_entries::LogBase::Behind;
+            return (log_entries::LogBase::Behind, shown);
         }
     }
-    base
+    (base, shown)
 }
 
 fn recipients_of(names: &[String], doc: &Document) -> crate::Result<Vec<Recipient>> {
@@ -11844,6 +12018,11 @@ pub struct Published {
     pub held: Vec<Request>,
     /// Why this machine's own sync after the publish failed, if it did. The publish stands.
     pub local: Option<String>,
+    /// The `[everyone]` entries this publish changed that wait for a removal's new key (one-mesh
+    /// M4): this Mac's vault pass signs them once the key arrives, and until then a view shows
+    /// them as waiting ([`Admin::waiting`]). A take-back waits with them, unnamed: it is done once
+    /// its version lands, and nothing is signed for it.
+    pub waiting: Vec<String>,
 }
 
 /// Compiled-in keys required after an ALab vault rotation, in padded base64.
@@ -12249,8 +12428,11 @@ fn publish_as_with_removal(
     // are kept once a server took the envelope, so a refused ordinary edit leaves nothing
     // behind. An explicit revoke prepares the entire security operation and keeps it atomically
     // after sealing but before publication: failed publication cannot undo its retirement.
+    // One-mesh W3: no vault pass signs this Mac's waiting writes from before the draft reads the
+    // log until the pending set is written (`log_entries::claim_draft`).
+    let claim = log_entries::claim_draft(paths, deadline)?;
     let mut attempt = 0;
-    let (drafted, waiting, bytes, release, pairs) = loop {
+    let (drafted, everyone, bytes, release, pairs) = loop {
         let prepared = match removing.as_ref() {
             Some((recipients, _)) => Some(removal_plan::prepare(
                 paths, admin, doc, &identity, recipients, deadline,
@@ -12259,8 +12441,11 @@ fn publish_as_with_removal(
         };
         // A removal's prepared batch rotates itself; an edit's `[everyone]` writes may wait for
         // the new key of a removal here whose rotation this Mac lacks (one-mesh M4).
-        let (drafted, waiting) = if let Some(prepared) = &prepared {
-            (prepared.drafted.clone(), log_entries::Waiting::default())
+        let (drafted, everyone) = if let Some(prepared) = &prepared {
+            (
+                prepared.drafted.clone(),
+                log_entries::EveryoneWrites::none(),
+            )
         } else {
             match admin.log_base {
                 log_entries::LogBase::Covers | log_entries::LogBase::Unstamped => {
@@ -12279,17 +12464,20 @@ fn publish_as_with_removal(
                             resolve: Some(&admin.resolve),
                             readmit: None,
                         },
+                        // Drafted against what the person saw: the log with this Mac's waiting
+                        // writes over it (one-mesh W3).
+                        Some(&admin.shown),
                         deadline,
                     )?
                     .map_or(
-                        (None, log_entries::Waiting::default()),
-                        |(drafted, waiting)| (Some(drafted), waiting),
+                        (None, log_entries::EveryoneWrites::none()),
+                        |(drafted, everyone)| (Some(drafted), everyone),
                     )
                 }
                 // A log behind the version edited would draft the older values it holds: the edit goes
                 // out unstamped, read from its lockers until a writer whose log holds it imports it.
                 log_entries::LogBase::Behind | log_entries::LogBase::NoLog => {
-                    (None, log_entries::Waiting::default())
+                    (None, log_entries::EveryoneWrites::none())
                 }
             }
         };
@@ -12362,8 +12550,12 @@ fn publish_as_with_removal(
             }
             retirement::validate_removals(paths, admin, doc)?;
         }
-        break (drafted, waiting, bytes, release, pairs);
+        break (drafted, everyone, bytes, release, pairs);
     };
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DRAFT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     // The drafted records are held from here until what became of the envelope that stamps them
     // is known, in a hold of this version's own beside every server the envelope may reach: one
     // stored by a publish that never got to keep them (the process ended, every reply was lost)
@@ -12396,18 +12588,28 @@ fn publish_as_with_removal(
         log_entries::hold_drafted(paths, drafted, seq, &version, &reach)?;
     }
     // The `[everyone]` writes waiting for the new key are kept from here too, pending on this
-    // version: they wait only once a server took it (`log_entries::land_waiting`), here or at a
-    // later sync or mirror that reads it from a server, and are dropped where every server
-    // refused it.
+    // version beside the servers it may reach: they wait only once a server took it
+    // (`log_entries::land_waiting`), here or at a later sync or mirror that reads it from a
+    // server, and are dropped where every server refused it, or where each it may have reached
+    // took a version that leaves it out for good (`log_entries::land_published`). So are the
+    // writes that settle this Mac's waiting ones the edit replaces, where its records sign them.
     log_entries::wait_for_key(
         paths,
         &identity,
-        &waiting,
+        &everyone.pending,
+        seq,
         &version,
+        &reach,
         &admin.opened_heads,
         deadline,
     )?;
-    publication_current(deadline)?;
+    drop(claim);
+    // A publish whose deadline ends here sent nothing: its set goes, where the state lock is free
+    // now, rather than hold back the names it writes for good (`log_entries::forget_unsent`).
+    if let Err(error) = publication_current(deadline) {
+        log_entries::forget_unsent(paths, &version);
+        return Err(error);
+    }
     #[cfg(test)]
     if CUT_BEFORE_STORE.with(std::cell::Cell::take) {
         return Err(Error::new(
@@ -12446,7 +12648,7 @@ fn publish_as_with_removal(
                     // This version's hold alone: a server that refused it as not newer may hold
                     // an earlier one of this Mac's whose reply was lost.
                     log_entries::forget_held_draft(paths, seq, &version, deadline);
-                    log_entries::forget_waiting(paths, &identity, &version);
+                    log_entries::forget_waiting(paths, &version);
                 }
                 for (_, res) in outcomes {
                     if let Err(err) = res {
@@ -12504,7 +12706,7 @@ fn publish_as_with_removal(
                 deadline,
             );
             // Best effort: a sync or mirror that reads this version lands them where this does not.
-            let _ = log_entries::land_waiting(paths, &identity, &[version], deadline);
+            log_entries::land_published(paths, &identity, seq, &version, parents, &took, deadline);
             // A server took this version: it is this Mac's own last version now, the one its
             // mirror carries an approval back from should every server drop it at a heal
             // (`own_head`), unless the one kept still carries a Mac this version lacks.
@@ -12544,14 +12746,15 @@ fn publish_as_with_removal(
                 // This version's hold alone, as above.
                 log_entries::forget_held_draft(paths, seq, &version, deadline);
                 // Outside the state lock, which forgetting the waiting writes takes.
-                log_entries::forget_waiting(paths, &identity, &version);
+                log_entries::forget_waiting(paths, &version);
             }
             published?;
-            // Best effort, as above.
-            let _ = log_entries::land_waiting(paths, &identity, &[version], deadline);
             if let Some(drafted) = &drafted {
                 log_entries::keep_drafted_until(paths, drafted, &[], deadline, None)?;
             }
+            // Best effort, as above: the vault's file took this version. After its records are
+            // kept, as above, so a pass never signs again a write those records sign.
+            log_entries::land_published(paths, &identity, seq, &version, parents, &reach, deadline);
             // As above: this version is this Mac's head, and the vault's file took it.
             log_entries::forget_landed_draft(
                 paths,
@@ -12580,6 +12783,11 @@ fn publish_as_with_removal(
         queued: matches!(admin.config.source, Source::Url(_)),
         held,
         local,
+        waiting: if everyone.waits {
+            everyone.shows
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -12606,6 +12814,15 @@ thread_local! {
     /// A test's deadline for the records posts that follow the next publish on this thread once
     /// its version lands, in place of one exchange from then.
     static LANDED_POSTS_BY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hook, run once by the next publish on this thread between its draft and the
+    /// pending set it keeps (`log_entries::wait_for_key`): a vault pass racing it, as one in
+    /// another process may.
+    pub(crate) static AFTER_DRAFT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

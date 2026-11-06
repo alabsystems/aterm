@@ -148,6 +148,9 @@ const PHONE_DIGITS: usize = 7;
 /// (`2026-11-01`) is not counted, nor is a dotted IPv4 address.
 pub fn phone_shaped(text: &str) -> bool {
     let bytes = text.as_bytes();
+    if bytes.len() < PHONE_DIGITS {
+        return false;
+    }
     let mut at = 0;
     while at < bytes.len() {
         let starts = matches!(bytes[at], b'0'..=b'9' | b'+' | b'(')
@@ -156,35 +159,46 @@ pub fn phone_shaped(text: &str) -> bool {
             at += 1;
             continue;
         }
-        let mut groups: Vec<(usize, u8)> = Vec::new();
-        let mut digits = 0;
-        let mut separator = b' ';
+        let mut total_digits = 0usize;
         let mut end = at;
         let mut after_digit = at;
         while end < bytes.len() {
             match bytes[end] {
                 b'0'..=b'9' => {
-                    digits += 1;
+                    total_digits += 1;
                     after_digit = end + 1;
                 }
-                b @ (b' ' | b'-' | b'.' | b'(' | b')') => {
-                    if digits > 0 {
-                        groups.push((digits, separator));
-                        digits = 0;
-                    }
-                    separator = b;
-                }
+                b' ' | b'-' | b'.' | b'(' | b')' => {}
                 b'+' if end == at => {}
                 _ => break,
             }
             end += 1;
         }
-        if digits > 0 {
-            groups.push((digits, separator));
-        }
         let apart = after_digit == bytes.len() || !bytes[after_digit].is_ascii_alphanumeric();
-        if apart && phone_groups(&groups) {
-            return true;
+        if total_digits >= PHONE_DIGITS && apart {
+            let mut groups: Vec<(usize, u8)> = Vec::new();
+            let mut digits = 0;
+            let mut separator = b' ';
+            for (idx, &b) in bytes[at..end].iter().enumerate() {
+                match b {
+                    b'0'..=b'9' => digits += 1,
+                    b' ' | b'-' | b'.' | b'(' | b')' => {
+                        if digits > 0 {
+                            groups.push((digits, separator));
+                            digits = 0;
+                        }
+                        separator = b;
+                    }
+                    b'+' if idx == 0 => {}
+                    _ => break,
+                }
+            }
+            if digits > 0 {
+                groups.push((digits, separator));
+            }
+            if phone_groups(&groups) {
+                return true;
+            }
         }
         at = end.max(at + 1);
     }
@@ -219,6 +233,9 @@ fn base32(word: &str) -> bool {
 /// least four space-separated groups of four (`JBSW Y3DP EHPK 3PXP`), holding a digit `2`–`7`
 /// (so plain words in capitals stay) and a letter past `f` (so a hex digest stays).
 fn base32_seed(text: &str) -> bool {
+    if text.len() < SEED_CHARS {
+        return false;
+    }
     let digit = |word: &str| {
         word.bytes().any(|b| (b'2'..=b'7').contains(&b))
             && word.bytes().any(|b| b.to_ascii_lowercase() > b'f')
@@ -230,17 +247,33 @@ fn base32_seed(text: &str) -> bool {
     {
         return true;
     }
-    let groups: Vec<&str> = text.split(' ').collect();
-    groups.windows(SEED_CHARS / 4).any(|run| {
-        run.iter().all(|group| group.len() == 4 && base32(group))
-            && (run
-                .iter()
-                .all(|g| g.bytes().all(|b| !b.is_ascii_lowercase()))
-                || run
+    const GROUP_RUN: usize = SEED_CHARS / 4;
+    if text.len() < SEED_CHARS + (GROUP_RUN - 1) {
+        return false;
+    }
+    let mut run = [""; GROUP_RUN];
+    let mut filled = 0usize;
+    for group in text.split(' ') {
+        if group.len() == 4 && base32(group) {
+            run.copy_within(1.., 0);
+            run[GROUP_RUN - 1] = group;
+            filled += 1;
+            if filled >= GROUP_RUN
+                && (run
                     .iter()
-                    .all(|g| g.bytes().all(|b| !b.is_ascii_uppercase())))
-            && run.iter().any(|group| digit(group))
-    })
+                    .all(|g| g.bytes().all(|b| !b.is_ascii_lowercase()))
+                    || run
+                        .iter()
+                        .all(|g| g.bytes().all(|b| !b.is_ascii_uppercase())))
+                && run.iter().any(|g| digit(g))
+            {
+                return true;
+            }
+        } else {
+            filled = 0;
+        }
+    }
+    false
 }
 
 /// Whether free text names a secret.

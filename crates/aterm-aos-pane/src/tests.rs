@@ -47,6 +47,8 @@ enum Live<'a> {
     Out(&'a [u8], u64),
     Resize(u16, u16),
     CellPx(u16, u16),
+    /// The host installs a config (the person's theme), recorded as the op the engine journals.
+    Config(&'a TerminalConfig),
     Witness,
 }
 
@@ -85,6 +87,15 @@ fn record_with_env(
                 live.set_cell_pixel_size(width, height);
                 let _ = live.take_reports();
                 rec.cell_px(width, height);
+            }
+            Live::Config(config) => {
+                let from = live.host_ordinal();
+                let _ = live.apply_config(config);
+                let (reports, lost) = live.host_journal_since(from);
+                assert_eq!(lost, 0);
+                for report in reports {
+                    rec.host(report.op, None);
+                }
             }
             Live::Witness => {
                 let seen = live.checkpoint_visible().expect("at ground");
@@ -728,9 +739,26 @@ fn host_ops_roundtrip_and_enforce_clock_and_canonical_state_laws() {
         (HostOp::WithdrawShellRekey([0xCC; 32]), None),
         (HostOp::SettleShellRekey([0xCC; 32]), None),
         (HostOp::AdvanceKittyAnimations, Some(sample_clock)),
+        (
+            HostOp::Config {
+                config: aterm_core::terminal::HostConfig(Arc::new(env().config)),
+                recolored: true,
+            },
+            None,
+        ),
+        (
+            HostOp::Config {
+                config: aterm_core::terminal::HostConfig(Arc::new(TerminalConfig::default())),
+                recolored: false,
+            },
+            None,
+        ),
     ];
     for (op, clock) in all_ops {
-        let input = PaneInput::Host { op, clock };
+        let input = PaneInput::Host {
+            op: op.clone(),
+            clock,
+        };
         let mut e = Enc::new();
         schema.encode_input(&input, &mut e);
         let bytes = e.finish();
@@ -775,7 +803,7 @@ fn host_ops_roundtrip_and_enforce_clock_and_canonical_state_laws() {
     for op in [HostOp::LeaveAlternateScreen, HostOp::AdvanceKittyAnimations] {
         let mut unclocked = PaneRecording::new(at, start.clone());
         unclocked.bytes(Arc::from(&b"\x1b[?1049hhi"[..]), Some(sample_clock), b"");
-        unclocked.host(op, None);
+        unclocked.host(op.clone(), None);
         assert_eq!(
             law(&unclocked.check(PaneCode::ThisBuild, BUILD).verdict),
             Some((CLOCK_RECORDED, 1)),
@@ -799,6 +827,56 @@ fn host_ops_roundtrip_and_enforce_clock_and_canonical_state_laws() {
             field: "state.carry.awaiting_shell_nonce"
         })
     ));
+}
+
+/// A chain across a config install replays under the installed config from there on: a soft reset after it takes the new default cursor and the witness matches; a step that keeps the old config (the negative control) restores the old default and fails `WitnessMatches` at that witness.
+#[test]
+fn a_config_install_moves_the_state_and_a_step_that_keeps_the_old_one_fails_witness_matches() {
+    let installed = TerminalConfig {
+        cursor_style: aterm_core::terminal::CursorStyle::SteadyUnderline,
+        default_background: Rgb {
+            r: 0xf0,
+            g: 0xf0,
+            b: 0xe8,
+        },
+        ..env().config
+    };
+    let script = [
+        Live::Out(b"\x1b[2 qa", 0),
+        Live::Witness,
+        Live::Config(&installed),
+        Live::Witness,
+        Live::Out(b"\x1b[!pb", 50),
+        Live::Witness,
+    ];
+    let (rec, live) = record(origin(), &script);
+    assert_eq!(
+        live.cursor_style(),
+        aterm_core::terminal::CursorStyle::SteadyUnderline,
+        "fixture: the soft reset took the installed default"
+    );
+    assert_eq!(live.default_background(), installed.default_background);
+    let check = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(check.verdict, Verdict::Pass, "{check:?}");
+    let file = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("the trace builds")
+        .encode();
+    let there = PaneTrace::decode(&file)
+        .and_then(|t| t.check(origin(), BUILD))
+        .expect("the trace replays");
+    assert_eq!(
+        there.verdict,
+        Verdict::Pass,
+        "the install survives the wire"
+    );
+
+    let _kept = config_step::keep_old();
+    assert_eq!(
+        law(&rec.check(PaneCode::ThisBuild, BUILD).verdict),
+        Some((WITNESS_MATCHES, 5)),
+        "the soft reset restores the old default cursor"
+    );
 }
 
 #[test]

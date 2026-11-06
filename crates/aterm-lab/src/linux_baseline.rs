@@ -2162,8 +2162,10 @@ impl Session<'_> {
             return Err(format!("lane-bus {verb} did not start"));
         }
         if !self.sh(&guest::wait_file(&seat.ready, 60)).ok() {
-            let why = self.unit_journal(&seat.name);
+            // Stopped first: this wait and the seat's own hang detector are one minute each, so
+            // the line naming a stalled peer lands as this wait ends.
             seat.stop(self);
+            let why = self.unit_journal(&seat.name);
             return Err(format!(
                 "the seat's keyboard never had the window's focus (60 s): {why}"
             ));
@@ -2171,6 +2173,8 @@ impl Session<'_> {
         Ok(seat)
     }
 
+    /// What the unit's own processes last wrote. `-u` would add the manager's `Started <argv>`,
+    /// whose length used up the cap below and hid what the process said.
     fn unit_journal(&self, name: &str) -> String {
         let out = self.sh(&[
             "journalctl".into(),
@@ -2180,8 +2184,7 @@ impl Session<'_> {
             "cat".into(),
             "-n".into(),
             "3".into(),
-            "-u".into(),
-            name.into(),
+            format!("_SYSTEMD_USER_UNIT={name}.service"),
         ]);
         crate::util::one_line(&out.text, 300)
     }

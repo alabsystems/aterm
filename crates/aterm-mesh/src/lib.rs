@@ -13,8 +13,9 @@
 //! first. The overlay ([`overlay`]) keeps the neighbours; the membership log decides who is an
 //! origin and whose streams are refused ([`logs::Standings`]).
 //!
-//! Every module the mesh will have is declared here. Four start empty and are filled by later
-//! steps: [`egress`] and [`ingest`] (B7b), [`inventory`] (B7b) and [`presence`] (B7c).
+//! [`presence`] supplies the origin-signed presence rows and their per-seat reading (B7c).
+//! [`mail`] runs the fabric's mail pushes over the same links, one hop to the addressed Mac (C3).
+//! [`egress`], [`ingest`] and [`inventory`] remain for B7b.
 //!
 //! Nothing here runs unless the node service is built with `aterm_types::mesh_switch::MESH` on:
 //! the node service opens a [`Mesh`] only then.
@@ -29,6 +30,7 @@ pub mod egress;
 pub mod ingest;
 pub mod inventory;
 pub mod logs;
+pub mod mail;
 pub mod overlay;
 pub mod presence;
 pub mod relay;

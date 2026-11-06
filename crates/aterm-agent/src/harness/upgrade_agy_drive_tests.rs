@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::super::{Job, parse_exit_status};
 use super::*;
 use crate::harness::relaunch::{AgentRun, AgyRun, ExitCause, ExitRecord, Snapshot, exit_record};
+use crate::harness::upgrade_drive::load;
 use crate::supervise::ScratchDir;
 
 const TAB: &str = "s-0123456789abcdef4a67";

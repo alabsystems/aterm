@@ -4748,7 +4748,7 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
         ));
     }
     if let Some(vol) = &snap.volume {
-        let used = vol.occupied();
+        let used = vol.used();
         let pct = ((used.saturating_mul(100)) / vol.total.max(1)).min(100) as u8;
         parts.push(format!(
             "Disk {}/{} ({pct}% \u{b7} {} free)",

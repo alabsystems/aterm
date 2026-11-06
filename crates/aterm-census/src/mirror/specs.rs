@@ -59,13 +59,19 @@ impl Clause<'_> {
     /// its words single-spaced.
     #[must_use]
     pub fn digest(&self) -> String {
-        let said: Vec<String> = self
-            .cells
-            .iter()
-            .filter(|c| c.said)
-            .map(|c| c.text.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
-        fnv(&said.join("\t"))
+        let mut said = String::new();
+        for (ci, c) in self.cells.iter().filter(|c| c.said).enumerate() {
+            if ci > 0 {
+                said.push('\t');
+            }
+            for (wi, w) in c.text.split_whitespace().enumerate() {
+                if wi > 0 {
+                    said.push(' ');
+                }
+                said.push_str(w);
+            }
+        }
+        fnv(&said)
     }
 }
 
@@ -101,9 +107,10 @@ fn header_of(cells: &[&str]) -> Option<(usize, Option<usize>)> {
     if cells.first() != Some(&"id") {
         return None;
     }
-    let statement = cells
-        .iter()
-        .position(|c| c.to_ascii_lowercase().starts_with("statement"))?;
+    let statement = cells.iter().position(|c| {
+        c.get(..9)
+            .is_some_and(|p| p.eq_ignore_ascii_case("statement"))
+    })?;
     let functions = cells.iter().position(|c| matches!(*c, "functions" | "fn"));
     Some((statement, functions))
 }

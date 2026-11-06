@@ -516,12 +516,20 @@ fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
 
 /// Whether `codesign -d -r-` output pins the leaf `hash`.
 fn names_leaf(codesign_output: &str, hash: &str) -> bool {
-    let leaf = format!("h\"{}\"", hash.to_ascii_lowercase());
+    const LEAF_MARKER: &[u8] = b"certificate leaf";
     crate::sign::classify_dr(codesign_output) == crate::sign::DrClass::Identity
         && crate::sign::designated_requirement(codesign_output).is_some_and(|dr| {
-            let dr = dr.to_ascii_lowercase();
-            dr.split_once("certificate leaf")
-                .is_some_and(|(_, pinned)| pinned.contains(&leaf))
+            dr.as_bytes()
+                .windows(LEAF_MARKER.len())
+                .position(|w| w.eq_ignore_ascii_case(LEAF_MARKER))
+                .and_then(|pos| dr.get(pos + LEAF_MARKER.len()..))
+                .is_some_and(|pinned| {
+                    let leaf = format!("h\"{hash}\"");
+                    pinned
+                        .as_bytes()
+                        .windows(leaf.len())
+                        .any(|w| w.eq_ignore_ascii_case(leaf.as_bytes()))
+                })
         })
 }
 

@@ -248,8 +248,8 @@ impl fmt::Display for Divergence {
             Divergence::State { a, b } => write!(
                 f,
                 "the runs end in different states ({} against {})",
-                a.short(),
-                b.short()
+                a.short_display(),
+                b.short_display()
             ),
             Divergence::Observation { cursor } => {
                 write!(f, "the runs observe differently at cursor {cursor}")

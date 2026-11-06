@@ -290,6 +290,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         presence: crate::presence::Mode::Meta,
         receipts: true,
         log: crate::mirror::LogMode::Auto,
+        mesh: None,
     };
     let mut token_file: Option<String> = None;
     let mut it = args.iter();
@@ -346,6 +347,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.state_dir.is_empty() {
         cfg.state_dir = default_state_dir();
     }
+    // With the mesh on (§11 C3) the node key names this bridge's node, in the one fleet.
+    cfg.mesh = crate::federate::MeshPaths::of(aterm_types::mesh_switch::MESH, &cfg.broker);
     if let Some(path) = token_file {
         cfg.token = Some(
             aterm_ctl::read_control_token_file(std::path::Path::new(&path))

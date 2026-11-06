@@ -724,7 +724,7 @@ fn freed_today(facts: &RowFacts) -> Option<u64> {
 
 fn disk_shapes(view: &ResourceView) -> Option<(Option<(String, String)>, String)> {
     let used = view.now?.max(0.0) as u64;
-    let alone = format!("{} unavailable", bytes_dec(used));
+    let alone = format!("{} used", bytes_dec(used));
     let both = view
         .capacity
         .map(|c| c as u64)
@@ -733,8 +733,8 @@ fn disk_shapes(view: &ResourceView) -> Option<(Option<(String, String)>, String)
             let p = parts_of(total, &[used, total.saturating_sub(used)]);
             let (u, t, unit) = (&p.parts[0], &p.whole, p.unit);
             (
-                format!("{u} of {t} {unit} unavailable"),
-                format!("{u}/{t} {unit} unavailable"),
+                format!("{u} of {t} {unit} used"),
+                format!("{u}/{t} {unit} used"),
             )
         });
     Some((both, alone))
@@ -998,22 +998,15 @@ pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     })
 }
 
-/// Strip-spanning status sentence forms when a resource has no live cells. Known GPU hardware
-/// keeps its capacity caption even while utilization is unread.
+/// Strip-spanning status sentence forms when a resource has no live cells.
 #[must_use]
 pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     let view = &snap.resources[res.index()];
     match res {
-        Resource::Gpu
-            if snap.seq > 0
-                && view.ring.iter().all(|c| c.mean.is_none())
-                && monitor_capacity(res, snap).is_empty() =>
-        {
-            Some(vec![
-                "no GPU reading on this system".into(),
-                "no GPU reading".into(),
-            ])
-        }
+        Resource::Gpu if snap.seq > 0 && view.ring.iter().all(|c| c.mean.is_none()) => Some(vec![
+            "no GPU reading on this system".into(),
+            "no GPU reading".into(),
+        ]),
         Resource::Tokens if view.basis == CapBasis::Learning => {
             let (n, of) = (snap.facts.tokens_read_s / 60, TOKENS_LEARN_S / 60);
             Some(vec![
@@ -1256,7 +1249,19 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
                 first.words.clone(),
             )
         }
-        Resource::Cpu | Resource::Network | Resource::Tokens => return None,
+        Resource::Cpu => {
+            // The machine's thermal level, not the CPU's: its words say "thermal", never "CPU"
+            // (A2 §3.2), and its clause is its word.
+            let thermal = snap.thermal.filter(|t| t.state().is_some())?;
+            let phrase = thermal.phrase();
+            (
+                worst,
+                vec![phrase.clone()],
+                thermal.word().to_owned(),
+                phrase,
+            )
+        }
+        Resource::Network | Resource::Tokens => return None,
     };
     let (mark, ink) = state_mark(res, state);
     let amount_forms = match res {
@@ -1296,7 +1301,7 @@ pub fn details(res: Resource, snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
 
 fn cpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     let view = &snap.resources[Resource::Cpu.index()];
-    let mut out = Vec::new();
+    let mut out: Vec<Clause> = thermal_clause(snap).into_iter().collect();
     if let (Some(load), Some(n)) = (snap.facts.load1, view.capacity) {
         let l = fixed(load, 1);
         let on = format!("load {l} on {n:.0} cores");
@@ -1312,6 +1317,20 @@ fn cpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     out.extend(cause(snap));
     out.extend(busiest(snap));
     out
+}
+
+/// The CPU row's state clause, while the OS reports serious or critical
+/// ([`crate::model::Thermal::state`]): `thermal serious` with its ●, kept so it leads Details,
+/// as Memory's pressure does.
+fn thermal_clause(snap: &Snapshot) -> Option<Clause> {
+    let thermal = snap.thermal?;
+    let (mark, ink) = state_mark(Resource::Cpu, thermal.state()?);
+    Some(
+        Clause::new(0, vec![thermal.phrase()])
+            .kept()
+            .marked(Some(mark))
+            .inked(ink),
+    )
 }
 
 fn cause(snap: &Snapshot) -> Option<Clause> {
@@ -1827,15 +1846,27 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
     Some(format!("Yes. {fact}{action}"))
 }
 
-/// Format used, writable available and total volume bytes, each in a readable decimal unit.
+/// A volume's space as the Disk lens's first line says it: used (its size less what this user
+/// could still write, [`VolumeSample::used`]), available and total, each in a readable decimal
+/// unit (`2.34 TB used · 1.66 TB available · 4.00 TB total`).
 #[must_use]
 pub fn disk_space_line(v: &VolumeSample) -> String {
     format!(
         "{} used · {} available · {} total",
-        bytes_dec(v.occupied()),
+        bytes_dec(v.used()),
         bytes_dec(v.available.min(v.total)),
         bytes_dec(v.total)
     )
+}
+
+/// The free blocks a volume keeps from this user's writes (an ext4 root reserve), where they are
+/// 1 % of its size or more: `40 GB reserved`. Its used figure counts them
+/// ([`disk_space_line`]); the lens and speech say them after it.
+#[must_use]
+pub fn disk_reserved(v: &VolumeSample) -> Option<String> {
+    let reserved = v.free.saturating_sub(v.available);
+    (v.total > 0 && reserved > 0 && u128::from(reserved) * 100 >= u128::from(v.total))
+        .then(|| format!("{} reserved", bytes_lone(reserved)))
 }
 
 /// Format used, available (free plus reclaimable file cache) and total physical memory.
@@ -1852,188 +1883,28 @@ pub fn memory_space_line(m: &MemSample) -> String {
     )
 }
 
-/// Capacity and hardware facts kept visible in the monitor, with compact forms for narrow rows.
+/// The GPU as its lens's first line names it: the device, its cores and the memory it holds in
+/// use (`Apple M5 · 10 cores · 623 MiB in use`), each where read; `None` where none is.
 #[must_use]
-pub fn monitor_capacity(res: Resource, snap: &Snapshot) -> Vec<String> {
-    match res {
-        Resource::Cpu => {
-            let Some(total) = snap.total_cores() else {
-                return Vec::new();
-            };
-            let Some(busy) = snap.cpu.as_ref().and_then(|cpu| cpu.current_busy()) else {
-                return vec![
-                    format!("{total} cores total · utilization unavailable"),
-                    format!("{total} cores · usage unavailable"),
-                ];
-            };
-            let idle = (total as f32 - busy).max(0.0);
-            vec![
-                format!(
-                    "{} cores busy · {} idle · {} total",
-                    cores(busy),
-                    cores(idle),
-                    total
-                ),
-                format!(
-                    "{}/{} cores busy · {} idle",
-                    cores(busy),
-                    total,
-                    cores(idle)
-                ),
-            ]
-        }
-        Resource::Memory => snap
-            .mem
-            .as_ref()
-            .filter(|m| m.sample.total > 0)
-            .map_or_else(Vec::new, |m| {
-                let s = &m.sample;
-                let available = s.available().map_or_else(
-                    || "avail not reported".into(),
-                    |bytes| format!("{}GiB avail", gib_total(bytes)),
-                );
-                let compact = format!(
-                    "{}/{}GiB used · {available}",
-                    gib_total(s.used()),
-                    gib_total(s.total),
-                );
-                vec![
-                    memory_space_line(s),
-                    format!(
-                        "{}/{} GiB used · {}",
-                        gib_total(s.used()),
-                        gib_total(s.total),
-                        available.replace("GiB", " GiB")
-                    ),
-                    compact,
-                    format!(
-                        "{}/{}GiB used · {available}",
-                        gib_total(s.used()),
-                        gib_total(s.total)
-                    ),
-                ]
-            }),
-        Resource::Disk => snap
-            .volume
-            .as_ref()
-            .filter(|v| v.total > 0)
-            .map_or_else(Vec::new, |v| {
-                let p = parts_of(
-                    v.total,
-                    &[v.occupied(), v.total.saturating_sub(v.occupied())],
-                );
-                let compact = format!(
-                    "{}/{}{} used · {} avail",
-                    p.parts[0],
-                    p.whole,
-                    p.unit,
-                    bytes_dec(v.available.min(v.total)).replace(' ', "")
-                );
-                vec![
-                    disk_space_line(v),
-                    format!(
-                        "{}/{} {} used · {} avail",
-                        p.parts[0],
-                        p.whole,
-                        p.unit,
-                        bytes_dec(v.available.min(v.total))
-                    ),
-                    compact,
-                    format!(
-                        "{}/{}{} used · {} avail",
-                        p.parts[0],
-                        if p.whole.contains('.') {
-                            p.whole.trim_end_matches('0').trim_end_matches('.')
-                        } else {
-                            &p.whole
-                        },
-                        p.unit,
-                        bytes_dec(v.available.min(v.total)).replace(' ', "")
-                    ),
-                ]
-            }),
-        Resource::Gpu => {
-            let Some(g) = snap.gpu_sample() else {
-                return Vec::new();
-            };
-            let name = g
-                .name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or("GPU");
-            if name == "GPU" && g.cores.is_none() && g.in_use_bytes.is_none() {
-                return Vec::new();
-            }
-            let cores = g.cores.map(|n| format!(" · {n} cores")).unwrap_or_default();
-            let memory = g
-                .in_use_bytes
-                .map(|n| format!(" · {} in use", mem(n)))
-                .unwrap_or_default();
-            let short = compact_cpu_brand(name);
-            let mut forms = vec![
-                format!("{name}{cores}{memory}"),
-                format!("{short}{cores}{memory}"),
-                format!("{short}{cores}"),
-            ];
-            forms.dedup();
-            forms
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// The monitor's physical used/total amount, separate from a ResourceView's binding amount.
-/// In particular, a volume's occupied blocks are `used`; its unavailable bytes also include
-/// free blocks this user cannot write, so the generic disk amount keeps its own label.
-#[must_use]
-pub fn monitor_amount(res: Resource, snap: &Snapshot) -> Vec<String> {
-    let (used, total, unit) = match res {
-        Resource::Memory => {
-            let Some(m) = snap.mem.as_ref().filter(|m| m.sample.total > 0) else {
-                return Vec::new();
-            };
-            (gib_total(m.sample.used()), gib_total(m.sample.total), "GiB")
-        }
-        Resource::Disk => {
-            let Some(v) = snap.volume.as_ref().filter(|v| v.total > 0) else {
-                return Vec::new();
-            };
-            let p = parts_of(
-                v.total,
-                &[v.occupied(), v.total.saturating_sub(v.occupied())],
-            );
-            (p.parts[0].clone(), p.whole, p.unit)
-        }
-        _ => return Vec::new(),
-    };
-    vec![
-        format!("{used} of {total} {unit} used"),
-        format!("{used}/{total} {unit} used"),
+pub fn gpu_source(snap: &Snapshot) -> Option<String> {
+    let g = snap.gpu_sample()?;
+    let name = g.name.as_deref().filter(|n| !n.is_empty());
+    let parts: Vec<String> = [
+        name.map(str::to_owned),
+        g.cores.map(|n| format!("{n} cores")),
+        g.in_use_bytes.map(|b| format!("{} in use", mem(b))),
     ]
-}
-
-/// Available space for the monitor's history caption when its amount column already says
-/// used and total. Unknown memory availability stays explicit rather than becoming zero.
-#[must_use]
-pub fn monitor_available(res: Resource, snap: &Snapshot) -> Vec<String> {
-    let amount = match res {
-        Resource::Memory => snap.mem.as_ref().filter(|m| m.sample.total > 0).map(|m| {
-            m.sample
-                .available()
-                .map(|bytes| format!("{} GiB", gib_total(bytes)))
-        }),
-        Resource::Disk => snap
-            .volume
-            .as_ref()
-            .filter(|v| v.total > 0)
-            .map(|v| Some(bytes_dec(v.available.min(v.total)))),
-        _ => None,
-    };
-    match amount {
-        Some(Some(amount)) => vec![format!("{amount} available"), format!("{amount} avail")],
-        Some(None) => vec!["available not reported".into(), "avail not reported".into()],
-        None => Vec::new(),
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        return None;
     }
+    let mut line = parts.join(" \u{b7} ");
+    if name.is_none() {
+        line.insert_str(0, "GPU \u{b7} ");
+    }
+    Some(line)
 }
 
 const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
@@ -2134,6 +2005,29 @@ fn capacity_words(res: Resource, view: &ResourceView) -> &'static str {
         (Resource::Processes, _) if second_binds(view) => "your limit",
         (Resource::Processes, _) => "the limit",
         _ => "capacity",
+    }
+}
+
+/// Memory's and Disk's exact figures as their lens's first line says them, which speech and ⌘C
+/// say too: used, available and total ([`memory_space_line`], [`disk_space_line`]), with a
+/// volume's reserved blocks where it keeps 1 % or more ([`disk_reserved`]); `None` for the other
+/// rows and an unread sample.
+#[must_use]
+pub fn space_line(res: Resource, snap: &Snapshot) -> Option<String> {
+    match res {
+        Resource::Memory => snap
+            .mem
+            .as_ref()
+            .filter(|m| m.sample.total > 0)
+            .map(|m| memory_space_line(&m.sample)),
+        Resource::Disk => snap.volume.as_ref().filter(|v| v.total > 0).map(|v| {
+            let line = disk_space_line(v);
+            match disk_reserved(v) {
+                Some(r) => format!("{line} \u{b7} {r}"),
+                None => line,
+            }
+        }),
+        _ => None,
     }
 }
 
@@ -2295,7 +2189,10 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
     } else if view.binding().now.is_none() {
         return format!("{name}: not read.");
     } else {
-        let amount = spoken_amount(res, &view, &snap.facts, loc);
+        let amount = space_line(res, snap).map_or_else(
+            || spoken_amount(res, &view, &snap.facts, loc),
+            |l| speak(&l),
+        );
         out.push(match view.heat_now {
             Some(h) => format!(
                 "{name} {} of {}: {amount}.",
@@ -2304,6 +2201,11 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
             ),
             None => format!("{name}: {amount}."),
         });
+        if res == Resource::Gpu
+            && let Some(source) = gpu_source(snap)
+        {
+            out.push(format!("{}.", speak(&source)));
+        }
         out.extend(learning.as_ref().map(|c| c.spoken.clone()));
     }
     out.extend(scope_sentences(res, &view, snap, panes, loc));
@@ -2339,7 +2241,10 @@ const GLANCE_KB_BELOW_BPS: f64 = 0.95e6;
 /// A row's one figure run in the deck's glance, said once at the end of its scope bar (the
 /// owner, 2026-10-26: "the stats in columns after the time series doesn't make sense to me"):
 /// this Mac's reading in the row's unit, longest first, with the row's maximum (`11.0 of 18
-/// cores`, `112.6 of 128 GiB`, `1.36 of 2.00 TB`), then without it (`11.0 cores`). A share of
+/// cores`), then without it (`11.0 cores`). Memory and Disk say how much is used of their total
+/// (`112.6 of 128 GiB used`, `112.6/128 GiB used`, then `112.6 GiB used`; a volume's used is its
+/// size less what this user can still write, `docs/DESIGN-stats-deck-flow-2026-11-02.md` §3), so
+/// the legend gives its totals over to the run where one stands. A share of
 /// something other than the row's own capacity keeps its base: Network's peak (`8 of 200 KB/s
 /// peak`), the per-user process limit where it binds (`897 of 10,666 yours`). Processes say no
 /// other maximum (the system's limit is no use as one) and give way to their bare count last.
@@ -2365,17 +2270,25 @@ pub fn glance_run(
             None => (None, Vec::new()),
         },
         Resource::Gpu => (None, Vec::new()),
-        Resource::Memory => match view.now {
-            Some(now) => (
-                Some(fixed(now / GIB, 1)),
-                match view.capacity {
-                    Some(t) => vec![format!("of {} GiB", gib_total(t as u64)), "GiB".into()],
-                    None => vec!["GiB".into()],
-                },
-            ),
-            None => (None, Vec::new()),
-        },
-        Resource::Disk => glance_disk(view),
+        Resource::Memory => {
+            let Some(now) = view.now else {
+                return Vec::new();
+            };
+            let n = fixed(now / GIB, 1);
+            let alone = format!("{n} GiB used");
+            return match view.capacity {
+                Some(t) => {
+                    let t = gib_total(t as u64);
+                    vec![
+                        format!("{n} of {t} GiB used"),
+                        format!("{n}/{t} GiB used"),
+                        alone,
+                    ]
+                }
+                None => vec![alone],
+            };
+        }
+        Resource::Disk => return glance_disk(view),
         Resource::Network if net_rates_read(snap) && view.binding().now.is_some() => {
             return net_amount_det_forms(snap);
         }
@@ -2402,20 +2315,21 @@ fn net_rates_read(snap: &Snapshot) -> bool {
         .is_some_and(|n| n.state != NetState::Offline && n.rates.is_some())
 }
 
-/// The used part of the volume in its parts' shared unit, and that unit with the volume's size:
-/// `1.36`, `of 2.00 TB`.
-fn glance_disk(view: &ResourceView) -> (Option<String>, Vec<String>) {
-    let Some(used) = view.now.map(|u| u.max(0.0) as u64) else {
-        return (None, Vec::new());
+/// The used part of the volume of its size, in their shared unit: `1.36 of 2.00 TB used`,
+/// `1.36/2.00 TB used`, then `1.36 TB used`; none where the size is unread.
+fn glance_disk(view: &ResourceView) -> Vec<String> {
+    let used = view.now.map(|u| u.max(0.0) as u64);
+    let total = view.capacity.map(|c| c as u64).filter(|&t| t > 0);
+    let (Some(used), Some(total)) = (used, total) else {
+        return Vec::new();
     };
-    match view.capacity.map(|c| c as u64).filter(|&t| t > 0) {
-        Some(total) => {
-            let p = parts_of(total, &[used, total.saturating_sub(used)]);
-            let unit = vec![format!("of {} {}", p.whole, p.unit), p.unit.to_owned()];
-            (p.parts.first().cloned(), unit)
-        }
-        None => (None, vec![bytes_dec(used)]),
-    }
+    let p = parts_of(total, &[used, total.saturating_sub(used)]);
+    let (u, w, unit) = (&p.parts[0], &p.whole, p.unit);
+    vec![
+        format!("{u} of {w} {unit} used"),
+        format!("{u}/{w} {unit} used"),
+        format!("{u} {unit} used"),
+    ]
 }
 
 /// The rate against its peak or link: `8`, `of 200 KB/s peak`, then `of 200 KB/s` (so a run too
@@ -2537,7 +2451,7 @@ fn glance_writes(snap: &Snapshot, panes: &[u64]) -> Option<Clause> {
 
 fn glance_cpu(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     let view = &snap.resources[Resource::Cpu.index()];
-    let mut out = Vec::new();
+    let mut out: Vec<Clause> = thermal_clause(snap).into_iter().collect();
     if let (Some(load), Some(n)) = (snap.facts.load1, view.capacity) {
         let l = fixed(load, 1);
         let waiting = half_up(load - n);
@@ -2762,39 +2676,135 @@ fn disk_total_compact(bytes: u64) -> (String, String) {
     }
 }
 
+/// One form of the machine's totals the deck's legend says after its noun: the words, and the
+/// template the legend measures them by, each used figure's digits `8`s and as many as its total
+/// allows (`88.8 of 32 GiB`, `8.88 of 4 TB`), so a changing reading never moves the legend from
+/// one form to another (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TotalsForm {
+    /// What the legend says: `10 cores · 14.4 of 32 GiB · 2.34 of 4 TB`.
+    pub said: String,
+    /// What the legend measures: `10 cores · 88.8 of 32 GiB · 8.88 of 4 TB`.
+    pub widest: String,
+    /// Whether it says how much is used, not the totals alone: the figures a long form's
+    /// short one keeps, which the legend gives up no figure of for the over mark's key's room
+    /// (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4).
+    pub used: bool,
+}
+
+/// `figure` with every digit an `8`.
+fn eights(figure: &str) -> String {
+    figure
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '8' } else { c })
+        .collect()
+}
+
+/// A volume's used bytes in its total's unit ([`disk_total_compact`]), at a fixed precision:
+/// 0.01 TB on a total of 1 TB or more, whole GB below it (whole MB below 1 GB); and the widest
+/// that figure can be, the total's own at that precision.
+fn disk_used_figure(used: u64, total: u64) -> (String, String) {
+    let (div, places) = if total >= 1_000_000_000_000 {
+        (1e12, 2)
+    } else if total >= 1_000_000_000 {
+        (1e9, 0)
+    } else {
+        (1e6, 0)
+    };
+    let at = |b: u64| format!("{:.*}", places, b as f64 / div);
+    (at(used.min(total)), eights(&at(total)))
+}
+
 /// The machine's totals the deck's legend says after its noun where no row's run says its
-/// maximum, longest first: its cores, memory and disk (`18 cores \u{b7} 128 GiB \u{b7} 2 TB`, then
-/// `18c \u{b7} 128G \u{b7} 2T`, 0.144's head); each only where read, and none where none is.
+/// maximum, longest first: its cores, and its memory and disk as used of total where read
+/// (`10 cores · 14.4 of 32 GiB · 2.34 of 4 TB`, then `10c · 14.4/32G · 2.34/4T`), then the
+/// totals alone (`10 cores · 32 GiB · 4 TB`, `10c · 32G · 4T`); each part only where read, and
+/// none where none is. Used is memory's in use (to 0.1 GiB) and the volume's size less what this
+/// user could still write (to 0.01 TB, or whole GB on a smaller volume), the figures the
+/// Memory and Disk lenses' first lines say.
 #[must_use]
-pub fn machine_totals(snap: &Snapshot) -> Vec<String> {
+pub fn machine_totals(snap: &Snapshot) -> Vec<TotalsForm> {
     let cap = |res: Resource| {
         snap.resources[res.index()]
             .capacity
             .filter(|c| c.is_finite() && *c > 0.0)
     };
     let cores = cap(Resource::Cpu).map(|c| half_up(c) as u64);
-    let mem = cap(Resource::Memory).map(|b| gib_total(b as u64));
-    let hd = cap(Resource::Disk).map(|b| disk_total_compact(b as u64));
-    let long: Vec<String> = [
-        cores.map(|n| format!("{n} cores")),
-        mem.as_ref().map(|g| format!("{g} GiB")),
-        hd.as_ref().map(|(l, _)| l.clone()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let short: Vec<String> = [
-        cores.map(|n| format!("{n}c")),
-        mem.map(|g| format!("{g}G")),
-        hd.map(|(_, s)| s),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if long.is_empty() {
-        return Vec::new();
+    let mem_total = cap(Resource::Memory).map(|b| b as u64);
+    let disk_total = cap(Resource::Disk).map(|b| b as u64);
+    let mem = mem_total.map(gib_total);
+    let hd = disk_total.map(disk_total_compact);
+    // Each used figure with its widest, where read.
+    let mem_used = mem_total
+        .zip(snap.mem.as_ref().filter(|m| m.sample.total > 0))
+        .map(|(total, m)| (gib_figure(m.sample.used()), eights(&gib_figure(total))));
+    let disk_used = disk_total
+        .zip(snap.volume.as_ref().filter(|v| v.total > 0))
+        .map(|(total, v)| disk_used_figure(v.used(), total));
+    let join = |parts: Vec<Option<String>>| -> Option<String> {
+        let parts: Vec<String> = parts.into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+    };
+    let long_core = cores.map(|n| format!("{n} cores"));
+    let short_core = cores.map(|n| format!("{n}c"));
+    let totals = |long: bool| -> Option<String> {
+        if long {
+            join(vec![
+                long_core.clone(),
+                mem.as_ref().map(|g| format!("{g} GiB")),
+                hd.as_ref().map(|(l, _)| l.clone()),
+            ])
+        } else {
+            join(vec![
+                short_core.clone(),
+                mem.as_ref().map(|g| format!("{g}G")),
+                hd.as_ref().map(|(_, s)| s.clone()),
+            ])
+        }
+    };
+    // Used of total, the used figure taken by `pick` (said, or its widest).
+    let used = |long: bool, pick: fn(&(String, String)) -> &String| -> Option<String> {
+        let m = mem.as_ref().map(|g| match (&mem_used, long) {
+            (Some(u), true) => format!("{} of {g} GiB", pick(u)),
+            (Some(u), false) => format!("{}/{g}G", pick(u)),
+            (None, true) => format!("{g} GiB"),
+            (None, false) => format!("{g}G"),
+        });
+        let d = hd.as_ref().map(|(l, sh)| match (&disk_used, long) {
+            (Some(u), true) => format!("{} of {l}", pick(u)),
+            (Some(u), false) => format!("{}/{sh}", pick(u)),
+            (None, true) => l.clone(),
+            (None, false) => sh.clone(),
+        });
+        let core = if long {
+            long_core.clone()
+        } else {
+            short_core.clone()
+        };
+        join(vec![core, m, d])
+    };
+    let mut forms = Vec::with_capacity(4);
+    if mem_used.is_some() || disk_used.is_some() {
+        for long in [true, false] {
+            if let (Some(said), Some(widest)) = (used(long, |u| &u.0), used(long, |u| &u.1)) {
+                forms.push(TotalsForm {
+                    said,
+                    widest,
+                    used: true,
+                });
+            }
+        }
     }
-    vec![long.join(" \u{b7} "), short.join(" \u{b7} ")]
+    for long in [true, false] {
+        if let Some(said) = totals(long) {
+            forms.push(TotalsForm {
+                widest: said.clone(),
+                said,
+                used: false,
+            });
+        }
+    }
+    forms
 }
 
 fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
@@ -2895,7 +2905,9 @@ mod tests {
     use crate::explain::{ActivityId, CoalLane, DeckCause, WhyFacts};
     use crate::history::Rates;
     use crate::jobs::{Class, Consumer, Findings, JobKind, JobRow, JobsView, Tick, ZombieParent};
-    use crate::model::{Busiest, DiskFacts, GpuSample, Hog, LinkSample, PlanFact, Series};
+    use crate::model::{
+        Busiest, DiskFacts, GpuSample, Hog, LinkSample, PlanFact, Series, Thermal, Throttle,
+    };
     use crate::ring::Cell;
     use std::sync::Arc;
 
@@ -3207,18 +3219,18 @@ mod tests {
                     vec!["42.1/128 GiB"],
                 ],
                 (Resource::Disk, _) => [
-                    vec!["1.11 of 2.00 TB unavailable"],
+                    vec!["1.11 of 2.00 TB used"],
                     vec![
-                        "1.11 of 2.00 TB unavailable · freed 41 GB",
-                        "1.11/2.00 TB unavailable · freed 41 GB",
-                        "1.11 TB unavailable · freed 41 GB",
-                        "1.11 of 2.00 TB unavailable",
-                        "1.11/2.00 TB unavailable",
+                        "1.11 of 2.00 TB used · freed 41 GB",
+                        "1.11/2.00 TB used · freed 41 GB",
+                        "1.11 TB used · freed 41 GB",
+                        "1.11 of 2.00 TB used",
+                        "1.11/2.00 TB used",
                     ],
                     vec![
-                        "1.11/2.00 TB unavailable · freed 41 GB",
-                        "1.11 TB unavailable · freed 41 GB",
-                        "1.11/2.00 TB unavailable",
+                        "1.11/2.00 TB used · freed 41 GB",
+                        "1.11 TB used · freed 41 GB",
+                        "1.11/2.00 TB used",
                     ],
                 ],
                 (Resource::Network, _) => [
@@ -3259,7 +3271,7 @@ mod tests {
             Resource::Cpu => form.contains("cores"),
             Resource::Gpu => form.contains("busy") && form.contains('%'),
             Resource::Memory => form.contains("GiB"),
-            Resource::Disk => form.contains(" unavailable"),
+            Resource::Disk => form.contains(" used"),
             Resource::Network => {
                 form.contains("MB/s") && (form.contains("peak") || form.contains("link"))
             }
@@ -3288,17 +3300,17 @@ mod tests {
         let calm = RowFacts::default();
         assert_eq!(
             amount_forms(Resource::Disk, &disk, &calm, Cols, &MAC),
-            strings(&["1.11 of 2.00 TB unavailable", "1.11/2.00 TB unavailable"])
+            strings(&["1.11 of 2.00 TB used", "1.11/2.00 TB used"])
         );
         let mut off = freed_facts();
         off.disk.as_mut().expect("facts").watch = false;
         assert_eq!(
             amount_forms(Resource::Disk, &disk, &off, NoCols, &MAC),
-            strings(&["1.11/2.00 TB unavailable"])
+            strings(&["1.11/2.00 TB used"])
         );
         assert_eq!(
             amount_forms(Resource::Disk, &row(512e9, 994e9), &calm, Det, &MAC),
-            strings(&["512 of 994 GB unavailable"])
+            strings(&["512 of 994 GB used"])
         );
 
         let mut link = row(2.1e6, 22.9e6);
@@ -3397,7 +3409,7 @@ mod tests {
                 Ladder::NoCols,
                 &MAC
             ),
-            strings(&["1.96/2.00 TB unavailable"])
+            strings(&["1.96/2.00 TB used"])
         );
         let quanta = |s: &str| s.replace('.', "").parse::<u64>().expect("a figure");
         for whole in [
@@ -3665,7 +3677,7 @@ mod tests {
                 clauses: strings(&["full in ~34 min, filling 1.2 GB/min", "full in ~34 min"]),
                 word: "full ~34 min".into(),
                 label: "Disk full ~34 min".into(),
-                amount_forms: strings(&["1.96/2.00 TB unavailable", "1.96 TB unavailable"]),
+                amount_forms: strings(&["1.96/2.00 TB used", "1.96 TB used"]),
                 mark: Mark::Low,
                 ink: InkKind::Warn,
             }
@@ -3731,10 +3743,60 @@ mod tests {
             )
         );
 
+        // The CPU's state is the machine's thermal level (A2 §3.2): its words say "thermal",
+        // the OS's word alone where a run has room for no more, and its header label is the
+        // clause itself, which names no row.
+        let mut s = snap();
+        let mut cpu = row(9.2, 10.0);
+        cpu.state = Some(State::Warn);
+        set(&mut s, Resource::Cpu, cpu);
+        let level = |level: Throttle, raw: u8, exact: bool| Thermal {
+            level,
+            raw,
+            low_power: Some(false),
+            exact,
+        };
+        s.thermal = Some(level(Throttle::Heavy, 2, true));
+        let w = words(&s, Resource::Cpu);
+        assert_eq!(
+            (
+                w.state,
+                w.clauses,
+                w.word.as_str(),
+                w.label.as_str(),
+                w.mark,
+                w.ink
+            ),
+            (
+                State::Warn,
+                strings(&["thermal serious"]),
+                "serious",
+                "thermal serious",
+                Mark::Dot,
+                InkKind::Warn
+            )
+        );
+        s.resources[Resource::Cpu.index()].state = Some(State::Critical);
+        s.thermal = Some(level(Throttle::Severe, 3, true));
+        let w = words(&s, Resource::Cpu);
+        assert_eq!(
+            (w.label.as_str(), w.word.as_str(), w.ink),
+            ("thermal critical", "critical", InkKind::Critical)
+        );
+        // No words without the exact level that makes the state.
+        for thermal in [
+            None,
+            Some(level(Throttle::Light, 1, true)),
+            Some(level(Throttle::Severe, 0, false)),
+        ] {
+            s.thermal = thermal;
+            assert_eq!(state(Resource::Cpu, &s, &MAC), None, "{thermal:?}");
+        }
+
         let mut s = snap();
         for res in Resource::ALL {
             let mut v = row(1.0, 2.0);
-            if matches!(res, Resource::Cpu | Resource::Network | Resource::Tokens) {
+            if matches!(res, Resource::Network | Resource::Tokens) {
                 v.state = Some(State::Warn);
             }
             set(&mut s, res, v);
@@ -3879,6 +3941,53 @@ mod tests {
         assert_eq!(
             shape(&details(Resource::Memory, &s, &MAC))[0],
             (0, false, None, Words2, f(&["pressure normal"]))
+        );
+
+        // The CPU's thermal state leads its Details and its glance, kept and marked as Memory's
+        // pressure is, ahead of a kept "waiting" clause; it is said "Thermal serious.".
+        let mut c = snap();
+        set(&mut c, Resource::Cpu, row(9.2, 10.0));
+        c.facts.load1 = Some(14.0);
+        c.thermal = Some(Thermal {
+            level: Throttle::Heavy,
+            raw: 2,
+            low_power: None,
+            exact: true,
+        });
+        let full = details(Resource::Cpu, &c, &MAC);
+        assert_eq!(
+            shape(&full)[..2],
+            [
+                (0, true, Some(Mark::Dot), Warn, f(&["thermal serious"])),
+                (
+                    0,
+                    false,
+                    None,
+                    Words,
+                    f(&["4 waiting for a core (load 14.0)", "load 14.0 on 10 cores"])
+                ),
+            ]
+        );
+        assert_eq!(full[0].spoken, "Thermal serious.");
+        let glance = glance_details(Resource::Cpu, &c, &[], &MAC);
+        assert_eq!(
+            shape(&glance)[..2],
+            [
+                (0, true, Some(Mark::Dot), Warn, f(&["thermal serious"])),
+                (0, true, None, Words, f(&["4 waiting for a core"])),
+            ]
+        );
+        c.thermal = Some(Thermal {
+            level: Throttle::Light,
+            raw: 1,
+            ..c.thermal.expect("a level")
+        });
+        assert!(
+            details(Resource::Cpu, &c, &MAC)
+                .iter()
+                .chain(&glance_details(Resource::Cpu, &c, &[], &MAC))
+                .all(|c| !c.forms[0].starts_with("thermal")),
+            "CONTROL: fair says no thermal clause"
         );
         let service = |exe: &str, footprint: u64| crate::explain::CoalRow {
             id: 777,
@@ -4255,8 +4364,8 @@ mod tests {
 
         assert_eq!(
             row_sentence(Resource::Disk, &disk_trouble(), &[2], &MAC),
-            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes unavailable. aterm writes 38 \
-             megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
+            "Disk 98 percent of capacity: 1.96 terabytes used, 44.8 gigabytes available, 2.00 \
+             terabytes total. aterm writes 38 megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
              45 gigabytes free. 2 sessions stuck on a full disk. aterm freed 41 gigabytes \
              today. Used grew 2.6 gigabytes in the last 10 minutes. Most in ~/aterm/target, 212 \
@@ -4408,8 +4517,11 @@ mod tests {
         });
         assert_eq!(
             strip_words(Resource::Gpu, &s),
-            None,
-            "known hardware keeps its caption while utilization is unread"
+            Some(strings(&[
+                "no GPU reading on this system",
+                "no GPU reading"
+            ])),
+            "known hardware captions no capacity over the strip: unread utilization says so"
         );
         assert!(s.resources[Resource::Gpu.index()].now.is_none());
         set(&mut s, Resource::Gpu, steady(row(12.0, 100.0), 0));
@@ -4481,8 +4593,14 @@ mod tests {
             [
                 (Resource::Cpu, strings(&["17.7 of 18 cores", "17.7 cores"])),
                 (Resource::Gpu, Vec::new()),
-                (Resource::Memory, strings(&["42.1 of 128 GiB", "42.1 GiB"])),
-                (Resource::Disk, strings(&["1.11 of 2.00 TB", "1.11 TB"])),
+                (
+                    Resource::Memory,
+                    strings(&["42.1 of 128 GiB used", "42.1/128 GiB used", "42.1 GiB used"]),
+                ),
+                (
+                    Resource::Disk,
+                    strings(&["1.11 of 2.00 TB used", "1.11/2.00 TB used", "1.11 TB used"]),
+                ),
                 (
                     Resource::Network,
                     strings(&["2.1 of 11.8 MB/s peak", "2.1 of 11.8 MB/s", "2.1 MB/s"]),
@@ -4713,25 +4831,30 @@ mod tests {
             net_amount_det_forms(&s),
             ["\u{2193}12.4M \u{2191}1.8M/s".to_owned()]
         );
-        // The legend's totals: the machine's cores, memory and disk, long then short.
+        // The legend's totals where neither memory nor disk is read: the machine's cores,
+        // memory and disk, long then short, each measured by itself.
         s.resources[Resource::Cpu.index()].capacity = Some(18.0);
         s.resources[Resource::Memory.index()].capacity = Some(128.0 * f64::from(1u32 << 30));
         s.resources[Resource::Disk.index()].capacity = Some(2.0e12);
+        s.mem = None;
+        s.volume = None;
+        let said = |s: &Snapshot| -> Vec<String> {
+            machine_totals(s).into_iter().map(|t| t.said).collect()
+        };
         assert_eq!(
-            machine_totals(&s),
+            said(&s),
             [
-                "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
-                "18c \u{b7} 128G \u{b7} 2T".to_owned()
+                "18 cores \u{b7} 128 GiB \u{b7} 2 TB",
+                "18c \u{b7} 128G \u{b7} 2T"
             ]
+        );
+        assert!(
+            machine_totals(&s)
+                .iter()
+                .all(|t| t.widest == t.said && !t.used)
         );
         s.resources[Resource::Disk.index()].capacity = None;
-        assert_eq!(
-            machine_totals(&s),
-            [
-                "18 cores \u{b7} 128 GiB".to_owned(),
-                "18c \u{b7} 128G".to_owned()
-            ]
-        );
+        assert_eq!(said(&s), ["18 cores \u{b7} 128 GiB", "18c \u{b7} 128G"]);
 
         fn dst_offset(unix_s: i64) -> Option<i64> {
             // 2026-11-01T09:00:00Z: PDT (-7h) -> PST (-8h).
@@ -4751,70 +4874,104 @@ mod tests {
         assert_eq!(dst_loc.clock(at_pdt_ms, now_pst_ms), "00:30");
     }
 
-    #[test]
-    fn capacity_readings_keep_available_space_distinct_from_total_and_reserved_free() {
-        let volume = VolumeSample {
+    /// A volume that keeps 160 GB of its free blocks from this user: 8 TB, 400 GB free,
+    /// 240 GB of it available.
+    fn reserving_volume() -> VolumeSample {
+        VolumeSample {
             total: 8_000_000_000_000,
             free: 400_000_000_000,
             available: 240_000_000_000,
             mount: "/".into(),
-        };
-        let line = disk_space_line(&volume);
-        assert!(line.contains("7.60 TB used"), "{line}");
-        assert!(line.contains("240 GB available"), "{line}");
-        assert!(line.contains("8.00 TB total"), "{line}");
-        assert!(
-            !line.contains("400 GB"),
-            "reserved blocks are not writable: {line}"
-        );
+        }
+    }
 
+    /// Every Disk word says used, the volume's size less what this user can still write
+    /// (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §3): the row's run and Details, the lens's
+    /// first line, the legend's totals and speech say `used` and never `unavailable`, and the
+    /// lens and speech add the blocks the volume keeps back where they are 1 % of it or more.
+    /// CONTROL: this volume's free figure differs from its available one, so a word that took
+    /// used as size less free (`7.60 TB`) would show here.
+    #[test]
+    fn every_disk_word_says_used_for_total_less_available() {
+        let volume = reserving_volume();
+        let occupied = bytes_dec(volume.total - volume.free);
+        assert_eq!(occupied, "7.60 TB", "CONTROL: size less free differs");
         let mut s = Snapshot {
+            seq: 1,
             volume: Some(volume.clone()),
             ..Snapshot::default()
         };
-        let disk = monitor_capacity(Resource::Disk, &s);
-        assert!(disk[0].contains("240 GB available"), "{disk:?}");
-        assert_eq!(monitor_available(Resource::Disk, &s)[0], "240 GB available");
+        let view = row(7.76e12, 8e12);
+        s.resources[Resource::Disk.index()] = view.clone();
+        let line = disk_space_line(&volume);
         assert_eq!(
-            monitor_amount(Resource::Disk, &s)[0],
-            "7.60 of 8.00 TB used"
+            line,
+            "7.76 TB used \u{b7} 240 GB available \u{b7} 8.00 TB total"
         );
+        assert_eq!(disk_reserved(&volume).as_deref(), Some("160 GB reserved"));
         assert_eq!(
-            amount_forms(
-                Resource::Disk,
-                &row(7.76e12, 8e12),
-                &s.facts,
-                Ladder::Det,
-                &MAC
-            )[0],
-            "7.76 of 8.00 TB unavailable"
-        );
-        assert!(
-            amount_forms(
-                Resource::Disk,
-                &row(7.76e12, 8e12),
-                &s.facts,
-                Ladder::Det,
-                &MAC
+            space_line(Resource::Disk, &s).as_deref(),
+            Some(
+                "7.76 TB used \u{b7} 240 GB available \u{b7} 8.00 TB total \u{b7} 160 GB reserved"
             )
-            .iter()
-            .all(|form| form.contains("unavailable"))
         );
-        s.mem = Some(MemView {
-            sample: MemSample {
-                total: 128 << 30,
-                app: 80 << 30,
-                wired: 12 << 30,
-                compressed: Some(4 << 30),
-                cached: 24 << 30,
-                free: 8 << 30,
-                ..MemSample::default()
-            },
-            ..MemView::default()
-        });
-        let memory = monitor_capacity(Resource::Memory, &s);
-        assert!(memory[0].contains("32.0 GiB available"), "{memory:?}");
-        assert!(memory[0].contains("128 GiB"), "{memory:?}");
+        let mut words: Vec<String> = Vec::new();
+        for ladder in [Ladder::Det, Ladder::Cols] {
+            words.extend(amount_forms(Resource::Disk, &view, &s.facts, ladder, &MAC));
+        }
+        assert_eq!(words[0], "7.76 of 8.00 TB used");
+        let run = glance_run(Resource::Disk, &view, &s, &MAC);
+        assert_eq!(
+            run,
+            ["7.76 of 8.00 TB used", "7.76/8.00 TB used", "7.76 TB used"]
+        );
+        words.extend(run);
+        words.push(line);
+        s.resources[Resource::Cpu.index()].capacity = Some(10.0);
+        s.resources[Resource::Disk.index()].capacity = Some(8e12);
+        words.extend(machine_totals(&s).into_iter().map(|t| t.said));
+        let spoken = row_sentence(Resource::Disk, &s, &[], &MAC);
+        assert!(spoken.contains("7.76 terabytes used"), "{spoken}");
+        assert!(spoken.contains("160 gigabytes reserved"), "{spoken}");
+        words.push(spoken);
+        for w in &words {
+            assert!(!w.contains("unavailable"), "{w:?}");
+            assert!(!w.contains("7.60"), "size less free: {w:?}");
+        }
+        // Blocks kept back under 1 % of the volume, or none, go unsaid.
+        for free in [240_000_000_000, 300_000_000_000] {
+            let v = VolumeSample {
+                free,
+                ..reserving_volume()
+            };
+            assert_eq!(disk_reserved(&v), None, "{free}");
+        }
+    }
+
+    /// Memory's first line keeps available distinct from total: free plus reclaimable cache,
+    /// bounded by what is not in use, never the unclassified rest, and `not reported` where a
+    /// sparse sample reads neither class; an unread view says no figure rather than zero.
+    #[test]
+    fn memory_words_keep_available_distinct_from_total_and_unread_from_zero() {
+        let mut s = Snapshot {
+            mem: Some(MemView {
+                sample: MemSample {
+                    total: 128 << 30,
+                    app: 80 << 30,
+                    wired: 12 << 30,
+                    compressed: Some(4 << 30),
+                    cached: 24 << 30,
+                    free: 8 << 30,
+                    ..MemSample::default()
+                },
+                ..MemView::default()
+            }),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            space_line(Resource::Memory, &s).as_deref(),
+            Some("96.0 GiB used \u{b7} 32.0 GiB available \u{b7} 128 GiB total")
+        );
         let unread = glance_run(Resource::Memory, &ResourceView::default(), &s, &MAC);
         assert!(
             unread.is_empty(),
@@ -4823,22 +4980,108 @@ mod tests {
         let m = &mut s.mem.as_mut().unwrap().sample;
         m.app = 64 << 30;
         m.cached = 16 << 30;
-        let memory = monitor_capacity(Resource::Memory, &s);
+        let line = space_line(Resource::Memory, &s).unwrap_or_default();
         assert!(
-            memory[0].contains("24.0 GiB available"),
-            "unclassified remainder is not available: {memory:?}"
+            line.contains("24.0 GiB available"),
+            "unclassified remainder is not available: {line}"
         );
         let sample = &mut s.mem.as_mut().unwrap().sample;
         sample.free = 0;
         sample.cached = 0;
-        assert_eq!(
-            monitor_available(Resource::Memory, &s)[0],
-            "available not reported"
-        );
         let sparse = memory_space_line(&s.mem.as_ref().unwrap().sample);
         assert!(
             sparse.contains("available not reported"),
             "sparse memory classes must not become invented free bytes: {sparse}"
+        );
+    }
+
+    /// The legend's totals say memory and disk as used of total where read, longest first,
+    /// and the template each is measured by has every used digit an `8`, so it is the same for
+    /// every reading of the same machine (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §4).
+    /// CONTROL: the words themselves differ in width between two readings.
+    #[test]
+    fn the_legends_totals_say_used_of_total_measured_by_their_widest_figures() {
+        let mut s = Snapshot {
+            mem: Some(MemView {
+                sample: MemSample {
+                    total: 32 << 30,
+                    app: 15_461_882_265,
+                    ..MemSample::default()
+                },
+                ..MemView::default()
+            }),
+            volume: Some(VolumeSample {
+                total: 4_000_000_000_000,
+                free: 1_660_000_000_000,
+                available: 1_660_000_000_000,
+                mount: "/".into(),
+            }),
+            ..Snapshot::default()
+        };
+        s.resources[Resource::Cpu.index()].capacity = Some(10.0);
+        s.resources[Resource::Memory.index()].capacity = Some(f64::from(32_u32) * GIB);
+        s.resources[Resource::Disk.index()].capacity = Some(4e12);
+        let forms = machine_totals(&s);
+        let pairs: Vec<(&str, &str)> = forms
+            .iter()
+            .map(|t| (t.said.as_str(), t.widest.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (
+                    "10 cores \u{b7} 14.4 of 32 GiB \u{b7} 2.34 of 4 TB",
+                    "10 cores \u{b7} 88.8 of 32 GiB \u{b7} 8.88 of 4 TB"
+                ),
+                (
+                    "10c \u{b7} 14.4/32G \u{b7} 2.34/4T",
+                    "10c \u{b7} 88.8/32G \u{b7} 8.88/4T"
+                ),
+                (
+                    "10 cores \u{b7} 32 GiB \u{b7} 4 TB",
+                    "10 cores \u{b7} 32 GiB \u{b7} 4 TB"
+                ),
+                ("10c \u{b7} 32G \u{b7} 4T", "10c \u{b7} 32G \u{b7} 4T"),
+            ]
+        );
+        assert_eq!(
+            forms.iter().map(|t| t.used).collect::<Vec<_>>(),
+            [true, true, false, false],
+            "the used of total, then the totals alone"
+        );
+        // Another reading of the same machine: other words, the same templates.
+        let before: Vec<String> = forms.iter().map(|t| t.widest.clone()).collect();
+        s.mem.as_mut().unwrap().sample.app = 3 << 30;
+        s.volume.as_mut().unwrap().available = 3_990_000_000_000;
+        let after = machine_totals(&s);
+        assert_eq!(
+            after[0].said,
+            "10 cores \u{b7} 3.0 of 32 GiB \u{b7} 0.01 of 4 TB"
+        );
+        assert_eq!(
+            after.iter().map(|t| t.widest.clone()).collect::<Vec<_>>(),
+            before
+        );
+        s.mem.as_mut().unwrap().sample.app = 9 << 30;
+        assert_ne!(
+            machine_totals(&s)[0].said.len(),
+            forms[0].said.len(),
+            "CONTROL: the words' own widths differ"
+        );
+        // A smaller volume's used figure is whole GB; an unread memory says its total alone.
+        s.volume = Some(VolumeSample {
+            total: 994_000_000_000,
+            free: 482_000_000_000,
+            available: 482_000_000_000,
+            mount: "/".into(),
+        });
+        s.resources[Resource::Disk.index()].capacity = Some(994e9);
+        s.mem = None;
+        let small = machine_totals(&s);
+        assert_eq!(small[0].said, "10 cores \u{b7} 32 GiB \u{b7} 512 of 994 GB");
+        assert_eq!(
+            small[0].widest,
+            "10 cores \u{b7} 32 GiB \u{b7} 888 of 994 GB"
         );
     }
 }

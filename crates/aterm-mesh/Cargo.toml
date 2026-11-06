@@ -26,6 +26,8 @@ astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 aterm-link = { path = "../aterm-link" }
 # The metrics log's retention (`rules::rules`) and the relay filter of every row a Mac shares.
 aterm-metrics = { path = "../aterm-metrics" }
+# The verdict on a read, the proved kernels and folds (`relay::Verdict`, `relay_island.rs`).
+aterm-mesh-core = { path = "../aterm-mesh-core" }
 # The neighbour links the relay rides (`fleet::link`), their `Bus` streams and the node key's file.
 aterm-net = { workspace = true }
 # The membership log, whose current seats are the origins and whose removed and retired keys are
@@ -41,6 +43,8 @@ aterm-types = { workspace = true }
 aterm-log = { workspace = true }
 # The flush a test may skip (`plain_durable_flushes_in_tests!`).
 aterm-durable = { workspace = true }
+# SHA-256 for the two digests a presence row carries (`presence::Held`).
+aterm-digest = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Scratch folders for each test Mac.

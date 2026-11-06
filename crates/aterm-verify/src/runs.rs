@@ -252,7 +252,7 @@ impl GroupReport {
 
     /// The report once the group's leader is reaped: a group listed only in part (a `/proc`
     /// mounted with `hidepid` hides what it cannot show) whose sweep named nothing is listed in
-    /// full when `empty`, one answer of the kernel about the whole group
+    /// full when `empty`, the kernel's answer about the whole group
     /// ([`crate::exec::group::empty`]), finds no process in it. Any other answer, a survivor
     /// named, or a group never listed leaves it as it was. A member the sweep ended that its new
     /// parent has not reaped yet is still in the group, so such a group may stay open.

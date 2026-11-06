@@ -3268,7 +3268,8 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
         .expect("endpoint present");
     let peer_request = Request::decode(&ep2.hello[84..HELLO_FIXED]).unwrap();
     verify_peer_against_local_log(Custody::Log(&m1), trust, &peer_request, Some(&peer_log))
-        .expect("restored + node-rotated member must pass verify_peer_against_local_log");
+        .expect("restored + node-rotated member must pass verify_peer_against_local_log")
+        .waive();
 
     // 3. Direct writer-key denial in `verify_peer_against_local_log`:
     // Even if `m2`'s recipient has an un-denied row in `SwarmRoster`, denying `req2.binding().writer()`
@@ -3558,48 +3559,84 @@ fn a_roster_read_that_gives_none_keeps_the_roster_read_before_it() {
     );
 }
 
-/// A Commons peer is checked against the deny list whatever its roster read gave: with no roster
-/// read a node the vault roster's `deny_nodes` removed is still refused; a deny list that fails
-/// with none read before refuses the peer where the roster was read; one read before is used
-/// while a read fails; and an `Ok(None)` with none read before adds nothing. Neither ever read
-/// (membership records every vault read refuses) leaves the peer to the membership log, as the
-/// recovery exchange needs.
+/// A Commons peer is checked against the deny list whatever its roster read gave: with a settled
+/// read that found no roster, a node the vault roster's `deny_nodes` removed is still refused; a
+/// deny list that fails with none read before refuses the peer; one read before is used while a
+/// read fails; and an `Ok(None)` with none read before adds nothing. A roster that does not read
+/// (a busy writer, or a failed read with none kept) is never "no roster" (PF4): it refuses
+/// whatever the deny list gives, since its rows could deny the peer, at either custody. Neither
+/// ever read (membership records every vault read refuses) leaves the peer to a journal
+/// endpoint's journal, as the recovery exchange needs, and refuses at a log endpoint.
 ///
-/// NEGATIVE CONTROLS (2026-11-01): with `roster_to_check` checking the deny list only where a
-/// roster was read (the shape the review found: `None => None`), this fails (`the deny list is
-/// checked while no roster is`); with `denied_after` answering an empty list after a failed read,
-/// it fails (`an unread deny list refuses`).
+/// Measured before PF4 (73f67aba52): `roster_to_check(None, Some(Vec::new()))` answered
+/// `Ok(None)`, nothing to check, for a busy roster with an empty deny list, though N3 says a busy
+/// writer never yields a permissive verdict.
+///
+/// NEGATIVE CONTROLS: the gate before PF4 ([`mutants::Mutant::BusyRosterIsNoRoster`]) answers
+/// nothing to check for that read; (2026-11-01) with `roster_to_check` checking the deny list
+/// only where a roster was read (the shape the review found: `None => None`), this fails (`the
+/// deny list is checked while no roster is`); with `denied_after` answering an empty list after a
+/// failed read, it fails (`an unread deny list refuses`).
 #[test]
 fn a_peer_is_checked_against_the_deny_list_while_no_roster_is_read() {
+    use aterm_db_core::peer_check::Custody;
     use aterm_secrets::swarm_roster::SwarmRoster;
-    let checked = roster_to_check(None, Some(vec!["ff00".to_owned()]))
-        .expect("a deny list read")
-        .expect("the deny list is checked while no roster is");
-    assert!(checked.is_node_denied("ff00"));
-    let checked = roster_to_check(Some(None), Some(vec!["ff00".to_owned()]))
-        .expect("a deny list read")
-        .expect("and while the vault has none");
-    assert!(checked.is_node_denied("ff00"));
-    assert_eq!(roster_to_check(Some(None), Some(Vec::new())).unwrap(), None);
-    let roster = SwarmRoster {
-        deny_nodes: vec!["aa11".to_owned()],
-        ..SwarmRoster::default()
-    };
-    let checked = roster_to_check(Some(Some(roster)), Some(vec!["ff00".to_owned()]))
-        .unwrap()
-        .unwrap();
-    assert!(checked.is_node_denied("aa11") && checked.is_node_denied("ff00"));
+    for custody in [Custody::Journal, Custody::Log] {
+        let checked = roster_to_check(custody, Some(None), Some(vec!["ff00".to_owned()]))
+            .expect("a deny list read")
+            .expect("the deny list is checked while the vault has no roster");
+        assert!(checked.is_node_denied("ff00"));
+        assert_eq!(
+            roster_to_check(custody, Some(None), Some(Vec::new())).unwrap(),
+            None
+        );
+        let roster = SwarmRoster {
+            deny_nodes: vec!["aa11".to_owned()],
+            ..SwarmRoster::default()
+        };
+        let checked = roster_to_check(custody, Some(Some(roster)), Some(vec!["ff00".to_owned()]))
+            .unwrap()
+            .unwrap();
+        assert!(checked.is_node_denied("aa11") && checked.is_node_denied("ff00"));
+        assert!(
+            roster_to_check(custody, None, Some(Vec::new())).is_err(),
+            "a busy roster with an empty deny list is not 'no roster'"
+        );
+        assert!(
+            roster_to_check(custody, None, Some(vec!["ff00".to_owned()])).is_err(),
+            "a busy roster refuses though the deny list read"
+        );
+        assert_eq!(
+            mutants::with(mutants::Mutant::BusyRosterIsNoRoster, || {
+                roster_to_check(custody, None, Some(Vec::new()))
+            })
+            .unwrap(),
+            None,
+            "CONTROL: the gate before PF4 reads a busy roster as none"
+        );
+    }
+    assert_eq!(
+        roster_to_check(Custody::Journal, None, None).unwrap(),
+        None,
+        "neither read: the journal's recovery exchange"
+    );
+    assert!(
+        roster_to_check(Custody::Log, None, None).is_err(),
+        "neither read refuses at a log endpoint"
+    );
 
     let last: LastRead<Vec<String>> = LastRead::new();
     let dir = Path::new("/vault/a");
     let failed = || Err(aterm_secrets::Error::new("unreadable"));
     let denied = denied_after(&last, dir, failed());
-    assert!(
-        roster_to_check(Some(None), denied.clone()).is_err()
-            && roster_to_check(Some(Some(SwarmRoster::default())), denied).is_err(),
-        "an unread deny list refuses"
-    );
-    assert_eq!(roster_to_check(None, None).unwrap(), None);
+    for custody in [Custody::Journal, Custody::Log] {
+        assert!(
+            roster_to_check(custody, Some(None), denied.clone()).is_err()
+                && roster_to_check(custody, Some(Some(SwarmRoster::default())), denied.clone())
+                    .is_err(),
+            "an unread deny list refuses"
+        );
+    }
     assert_eq!(
         denied_after(&last, dir, Ok(None)),
         Some(Vec::new()),

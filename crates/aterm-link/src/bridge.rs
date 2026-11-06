@@ -88,7 +88,10 @@ const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 /// already) before it says the outage again, with the redials it stood for.
 const LINK_DOWN_RETELL: Duration = Duration::from_secs(30);
 
-const REFILL_FLOOR_SPAN: u64 = 4096;
+/// How far below the head a session's refill starts when it has no `seen` watermark (it never
+/// ran `inbox seen`): `Bridge::refill` and the attach's shared refill (`refill_together`) both
+/// read its lane from there, so their scans cross whatever the log holds in that span.
+pub const REFILL_FLOOR_SPAN: u64 = 4096;
 
 // The attach's shared refill read is weighed by astream's `SharedRefillMeter` at its defaults
 // (`Bridge::refill_node`). Its `REFILL_ROW_COST`, what one record the read carries and offers to
@@ -266,6 +269,37 @@ const NEW_LANES_PER_NODE: usize = 64;
 enum NoLane {
     Undrained,
     Capped,
+    /// Another Mac's lane, with the mesh on, while the node service's hand-off cannot route to
+    /// it ([`NoHandoff`]).
+    Handoff(NoHandoff),
+}
+
+/// Why no other Mac is routed to, with the mesh on (§11 C3): the node service's hand-off, which
+/// names the members, is missing, stale or unreadable. Routing to another Mac fails closed: a
+/// post to one is retired `unroutable`, and an answer or receipt to one is recorded unsent, each
+/// with this word on the bus (`why=` on an `undeliverable` record, `reason=` on an `unacked` or
+/// `unnotified` one) and the reason in full on stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoHandoff {
+    /// No hand-off: the node service has not written one (it is not running, or its mail pushes
+    /// have not started).
+    Missing,
+    /// The hand-off names another node as this Mac's: written before this Mac's node key changed,
+    /// and not rewritten since.
+    Stale,
+    /// The hand-off cannot be read, or says what this build cannot parse.
+    Unreadable,
+}
+
+impl NoHandoff {
+    /// The word the bus records it with.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Missing => "hand-off-missing",
+            Self::Stale => "hand-off-stale",
+            Self::Unreadable => "hand-off-unreadable",
+        }
+    }
 }
 
 const DEADLINE_RETRY: Duration = Duration::from_millis(250);
@@ -883,12 +917,14 @@ fn refused_for_good(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(|r| r.is_permanent() && !r.is_expired())
 }
 
-/// Whether aterm's answer to a landed post's `outbox sent` says the post left its outbox: `OK`
-/// retired it, and `ERR no such post` or `ERR no such session` say aterm holds it no more.
-/// Every other answer leaves it queued at its pin (aterm-gui-fabric's `retire_post` answers
-/// `ERR busy update-committing`, the row untouched, while a seamless update's commit fences
-/// retirements), so its in-flight entry stands for the drain's retry ([`Bridge::land_group`]).
-fn post_left_the_outbox(reply: &Reply) -> bool {
+/// Whether aterm's answer to a landed post's `outbox sent`, or a landed receipt's `deliver
+/// <sid> receipt=<rid>`, says it left aterm's outbox: `OK` retired it (a receipt's `OK` also
+/// answers one aterm no longer owes), and `ERR no such post` or `ERR no such session` say aterm
+/// holds it no more. Every other answer leaves it queued at its pin (aterm-gui-fabric's
+/// `retire_post` and `deliver_receipt` answer `ERR busy update-committing`, the outbox
+/// untouched, while a seamless update's commit fences retirements), so its in-flight entry
+/// stands for the drain's retry ([`Bridge::land_group`]).
+fn left_the_outbox(reply: &Reply) -> bool {
     reply.ok() || matches!(reply.header(), "ERR no such post" | "ERR no such session")
 }
 
@@ -1067,6 +1103,9 @@ enum Then {
         upto: u64,
         retry: bool,
     },
+    /// The broker's SETTLE of its log's device, sent once the mirror pin's barriers returned
+    /// (critic item F07, [`Bridge::make_the_pin_fence`]): its answer makes the fence.
+    Settle,
 }
 
 fn commit_refusal_is_an_answer(then: &Then, answer: &io::Result<(u64, bool)>) -> bool {
@@ -1084,6 +1123,10 @@ impl Then {
 
     const fn is_commit(&self) -> bool {
         matches!(self, Then::Commit { .. })
+    }
+
+    const fn is_settle(&self) -> bool {
+        matches!(self, Then::Settle)
     }
 
     const fn waited_when_idle(&self) -> bool {
@@ -1130,13 +1173,14 @@ struct SentPost {
     journaled: bool,
 }
 
-/// A POST THE BROKER LANDED at `off`, its bookkeeping owed (critic item E07,
-/// [`Bridge::land_group`]): its offset in the self-lane log, its key's and its ask's records,
-/// aterm's `outbox sent`, and in the post journal its reservation's end and, where `entry`
-/// names one, its in-flight entry's.
+/// A POST OR AN OWED RECEIPT THE BROKER LANDED at `off`, its bookkeeping owed (critic items E07
+/// and F15, [`Bridge::land_group`]): its offset in the self-lane log where its record is this
+/// node's own ([`Landing::remembers`]), a post's key's and ask's records, aterm's retirement of
+/// it from its outbox, its reservation's end and, where `entry` names one, its in-flight
+/// entry's.
 #[derive(Debug)]
 struct Landing {
-    post: QueuedPost,
+    of: Outboxed,
     subject: String,
     pin: PublishPin,
     off: u64,
@@ -1145,9 +1189,49 @@ struct Landing {
     /// The identity of the record at `off`, where it is known.
     actual: Option<PublishIdentity>,
     /// The in-flight entry at the pin's sequence this landing ends, by whether its record is
-    /// this node's own ([`Bridge::settle_landed`]'s `ours`): `None` for a post with no entry
+    /// this node's own ([`Bridge::settle_landed`]'s `ours`): `None` for a record with no entry
     /// (one onto another node's lane), or one whose entry is not this landing's to end.
     entry: Option<bool>,
+}
+
+/// WHAT A [`Landing`] RETIRES FROM ATERM'S OUTBOX, and how ([`Bridge::landing_line`]).
+#[derive(Debug)]
+enum Outboxed {
+    /// A queued post, by its `outbox sent`; its reservation is the post journal's.
+    Post(QueuedPost),
+    /// An owed receipt, by its `deliver <sid> receipt=<rid> off=<n>` (critic item F15); its
+    /// reservation is its own file ([`StateDir::receipt_pin`]).
+    Receipt(OwedReceipt),
+}
+
+impl Outboxed {
+    /// The session whose outbox holds it.
+    fn sid(&self) -> &str {
+        match self {
+            Self::Post(post) => &post.sid,
+            Self::Receipt(r) => &r.sid,
+        }
+    }
+}
+
+impl Landing {
+    /// Whether its offset goes into the self-lane log ([`Bridge::land_group`]'s first step):
+    /// only where the record at `off` lies on one of this node's own lanes (`on_own_lane`,
+    /// [`Bridge::on_own_lane`]), a post's as an owed receipt's (critic item F17, "THE SELF-LANE
+    /// LOG TAKES THIS NODE'S OWN RECORDS ONLY" at [`Bridge::land_group`]). The record's face is
+    /// the identity read at `off` where one is known (a keyed post's dedup answers its key's
+    /// winner, whose face can be another lane's), else the attempt's, as
+    /// [`Bridge::publish_journaled_entry`] judges an entry's record its own. A post or a receipt
+    /// onto another node's lane or a person's is never this node's own. One whose entry an
+    /// earlier settle ended had its offset remembered then, which the window holds already.
+    fn remembers(&self, on_own_lane: impl Fn(&str) -> bool) -> bool {
+        let face = self
+            .actual
+            .as_ref()
+            .or(self.pin.identity.as_ref())
+            .map_or(self.subject.as_str(), |identity| identity.subject.as_str());
+        on_own_lane(face)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1244,6 +1328,10 @@ pub struct Config {
     pub receipts: bool,
     /// Session-log bus mirroring mode (`auto`, `off`, or `turns`).
     pub log: crate::mirror::LogMode,
+    /// With the mesh on (§11 C3): where this Mac's node key names the bridge's node, and where
+    /// the node service hands it the members it routes to. The fleet is then
+    /// [`crate::federate::FLEET`], whatever `fleet` says. `None` with the mesh off.
+    pub mesh: Option<crate::federate::MeshPaths>,
 }
 
 impl std::fmt::Debug for Config {
@@ -1259,6 +1347,7 @@ impl std::fmt::Debug for Config {
             presence,
             receipts,
             log,
+            mesh,
         } = self;
         f.debug_struct("Config")
             .field("fleet", fleet)
@@ -1271,6 +1360,7 @@ impl std::fmt::Debug for Config {
             .field("presence", presence)
             .field("receipts", receipts)
             .field("log", log)
+            .field("mesh", mesh)
             .finish()
     }
 }
@@ -1288,6 +1378,16 @@ pub struct Bridge {
     cfg: Config,
     node: String,
     producer_id: u64,
+    /// The node service's hand-off as last read, by the file's identity (§11 C3).
+    handoff: HandoffSeen,
+    /// Why the last route [`Bridge::resolve_to`] refused was refused, when the hand-off refused
+    /// it ([`NoHandoff`]).
+    unrouted: Option<NoHandoff>,
+    /// With the mesh on, the held topics this bridge last named on its node's topics face
+    /// ([`Bridge::say_held_topics`]); `None` until it names them on this attach.
+    topics_said: Option<BTreeSet<String>>,
+    /// Whether the last try to name them was refused, so a lasting refusal is said once.
+    topics_refused: bool,
     inc: u64,
     witnessed_dead: Option<(u64, String)>,
     mark: Option<String>,
@@ -1392,6 +1492,9 @@ pub struct Bridge {
     /// nothing committed ([`Bridge::committed_through`]).
     committed: Option<u64>,
     commit_refused: bool,
+    /// This link's broker refused to settle the mirror pin's fence (critic item F07,
+    /// [`Bridge::pin_settle_refused`]): the bridge flushes the pin itself until the next attach.
+    settle_refused: bool,
     endpoint_lane: u32,
     mirror: Option<Box<mirror_run::MirrorRun>>,
     broker_retains: Option<bool>,
@@ -1445,9 +1548,17 @@ pub struct Bridge {
     /// A record written onto a subject just ahead of its retire, as a successor or a sender would.
     #[cfg(test)]
     written_before_retire: Option<(String, Vec<u8>)>,
+    /// The forged-self window ([`forged_self`]): the newest [`SELF_ACK_KEEP`] offsets this node
+    /// knows hold its own records on its own lanes.
     self_acked: BTreeSet<u64>,
+    /// The window's floor, the lowest offset it accuses, kept apart from the offsets it holds
+    /// (critic item F17's review, [`self_window`]).
+    self_floor: u64,
     acked_entries: usize,
     acked_appendable: bool,
+    /// Whether the `acked` file names the window's floor (`AckedLog::floor`): until it does,
+    /// the next write names it ([`Bridge::remember_self_acks`]).
+    acked_floored: bool,
     unsettled: BTreeMap<u64, u64>,
     awaiting_drain: BTreeMap<u64, (u64, bool)>,
     /// OFFSETS THIS BRIDGE KNOWS HOLD ONE SEQUENCE'S RECORD, on the log it names (aterm-link B05
@@ -1685,7 +1796,7 @@ impl Bridge {
     }
 
     fn assemble(
-        cfg: Config,
+        mut cfg: Config,
         fx: Fx,
         state: StateDir,
         caps: Vec<Cap>,
@@ -1706,7 +1817,13 @@ impl Bridge {
             }
         };
         let state_lock = hold_state_dir(&state, &mut ctl, push.as_ref(), attachment)?;
-        let node = node_for(&state, &caps)?;
+        let node = match &cfg.mesh {
+            Some(mesh) => {
+                crate::federate::FLEET.clone_into(&mut cfg.fleet);
+                mesh_node(&state, &caps, mesh)?
+            }
+            None => node_for(&state, &caps)?,
+        };
         let producer_id = astream_cap::producer_id_of(&node);
         let _ = aterm_uds::atomic_file::write(
             &state.root().join("pid"),
@@ -1720,18 +1837,27 @@ impl Bridge {
         state.time_ops(waits.on());
         let log_witness = state.log_witness().unwrap_or_default();
         let acked = state.self_acked_log();
+        let (acked_entries, acked_appendable, acked_floored) =
+            (acked.entries, acked.appendable, acked.floor.is_some());
+        let (self_acked, self_floor) = self_window(acked);
         let mirror = mirror_run::MirrorRun::new(cfg.log, &state, fx.now(), || fx.alias_key());
         let (asked, deadlines) = state.asks_tables();
         let now = fx.now();
         Ok(Self {
             node,
             producer_id,
+            handoff: HandoffSeen::default(),
+            unrouted: None,
+            topics_said: None,
+            topics_refused: false,
             inc: 0,
             witnessed_dead: None,
             mark: None,
-            self_acked: newest(acked.offsets, SELF_ACK_KEEP),
-            acked_entries: acked.entries,
-            acked_appendable: acked.appendable,
+            acked_entries,
+            acked_appendable,
+            acked_floored,
+            self_acked,
+            self_floor,
             unsettled: BTreeMap::new(),
             awaiting_drain: BTreeMap::new(),
             claims: None,
@@ -1811,6 +1937,7 @@ impl Bridge {
             halt_reason: String::new(),
             committed: None,
             commit_refused: false,
+            settle_refused: false,
             endpoint_lane: 0,
             mirror,
             broker_retains: None,
@@ -2440,6 +2567,22 @@ impl Bridge {
         let commit = owed.tag.is_commit();
         self.waits.ack(reading, commit);
         let rider = owed.rider;
+        if owed.tag.is_settle() {
+            // A settle's answer is a full flush's, not a round trip's: no link rtt is judged by
+            // it, and a refusal (a broker that cannot settle here) leaves the link in step.
+            match answer {
+                Ok(_) => self.pin_settled(),
+                Err(e) if refusal_is_ack(&e) => self.pin_settle_refused(&e),
+                Err(e) => {
+                    let read = read.unwrap_or_else(|| self.fx.now());
+                    self.judge_at(owed.sent.max(waiting), read, Err(&e), None);
+                }
+            }
+            if let Some(off) = rider.filter(|_| self.conn.is_some()) {
+                self.inbox_pending = Some(self.inbox_pending.map_or(off, |have| have.max(off)));
+            }
+            return;
+        }
         let other = (commit && !commit_refusal_is_an_answer(&owed.tag, &answer)).then_some("read");
         self.note_refused(&answer);
         let read = read.unwrap_or_else(|| self.fx.now());
@@ -2526,6 +2669,9 @@ impl Bridge {
                 stderr_line!("aterm-link: commit through {upto} failed: {e}");
                 self.commit_refused = self.conn.is_some();
             }
+            // Concluded where its answer is read ([`Bridge::settled_now`]); one never sent was
+            // never owed ([`Bridge::send_pin_settle`]).
+            (Then::Settle, _) => {}
         }
     }
 
@@ -2967,24 +3113,29 @@ impl Bridge {
         if exact_record && !legacy {
             return Err(self.collision(pin.seq, off));
         }
+        // A legacy reservation's dedup answer that no read back verified is its own earlier
+        // attempt where the durable self-lane log holds the offset. Since critic item F17 no
+        // build writes an offset there off this node's own lanes (`Bridge::land_group`), so onto
+        // another node's lane or a person's this vouches only for an attempt an older build
+        // landed, while its entries last, and one a build since landed is held below, as
+        // unverifiable.
         if legacy && self.state.self_acked().contains(&off) {
             return Ok((off, true, None));
         }
         // A CUT VERIFIES NOTHING: retention gave up the record the answer named, and its dedup
         // key with it, so the retry at the pinned sequence appends anew, as every retry past a
         // cut does where no copy can be read (`Bridge::landed_since`). On an own lane a post's
-        // record is not delivered while the post stands queued (its entry stands until the
-        // post left aterm's outbox, `Bridge::land_group`), so the copy given up went unread and
-        // the one the retry appends is the one a reader is handed. A receipt's entry still
-        // ends at its ack, ahead of its `outbox sent` (`Bridge::send_receipt`), so a receipt
-        // retried past such a cut can be a second copy its asker is handed.
-        // On another node's lane nothing held the copy back from that node's reader,
-        // which may have read it before retention gave it up: there the retry is a second copy
-        // that node is handed (the limit `Bridge::landed_since` states, a second node on one
-        // broker being only aterm-lab's, the tests' and the bench's today). A record retention
-        // still holds is read, not taken for a cut, on a broker that
-        // tells fetches ([`Bridge::read_at`]), so there the retry never puts a second copy
-        // beside one a reader can still be handed. On one that does not (`ReadAt::Untold`) the
+        // or an owed receipt's record is not delivered while aterm still holds it in its outbox
+        // (its entry stands until aterm answered its `outbox sent` or its `deliver <sid>
+        // receipt=<rid> off=<n>` saying it left, `Bridge::land_group`, critic items E07 and
+        // F15), so the copy given up went unread and the one the retry appends is the one a
+        // reader is handed. On another node's lane nothing held the copy back from that node's
+        // reader, which may have read it before retention gave it up: there the retry is a
+        // second copy that node is handed (the limit `Bridge::landed_since` states, a second
+        // node on one broker being only aterm-lab's, the tests' and the bench's today). A record
+        // retention still holds is read, not taken for a cut, on a broker that tells fetches
+        // ([`Bridge::read_at`]), so there the retry never puts a second copy beside one a
+        // reader can still be handed. On one that does not (`ReadAt::Untold`) the
         // refusal decides nothing: the retry is sent as past a cut, and where retention still
         // holds the record it puts a second copy beside it, which the reason says.
         let reason = match (legacy, untold, cut) {
@@ -3072,6 +3223,7 @@ impl Bridge {
 
     fn bring_presence_up(&mut self) -> io::Result<()> {
         self.mark = self.state.mark(&self.node);
+        self.topics_said = None;
         let subject = subject::node_face(&self.cfg.fleet, &self.node, "presence");
         let (bus_inc, witnessed_dead) = {
             let fx = self.fx.clone();
@@ -3136,6 +3288,15 @@ impl Bridge {
             self.fx
                 .mutant(crate::sim::world::Mutant::AdoptAfterTheAttach),
         );
+        #[cfg(test)]
+        let bus_inc = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::IgnoreBusIncarnation)
+        {
+            0
+        } else {
+            bus_inc
+        };
         self.inc = self.state.take_incarnation(bus_inc)?;
         let mut gone = format!(
             "v=1 t={} state={} inc={} fabric=disconnected {}",
@@ -4180,7 +4341,8 @@ impl Bridge {
     }
 
     /// THE COMMIT AHEAD OF THE FENCE (critic item D06's review): a mirror pass whose open has
-    /// yet to make the pin's fence ([`StateDir::ensure_logpin_durable`], two full flushes)
+    /// yet to make the pin's fence ([`Bridge::make_the_pin_fence`]: two full flushes, or two
+    /// barriers and the broker's settle, critic item F07)
     /// sends the inbox commit its burst would carry ([`Bridge::take_commit_for_the_mirror`])
     /// first, alone. The first delivery after an attach or a handoff goes ahead of that pass
     /// ([`Bridge::mirror_yields`]), so its commit trails it by no more than the round's
@@ -4537,7 +4699,7 @@ impl Bridge {
         if addr.src == self.node && !self.settled_before_delivery(off) {
             if self.link.down_wants_report("error") {
                 let why = if self.held_for_the_drain(off) {
-                    "its post is not retired yet"
+                    "aterm has not retired its post or receipt yet"
                 } else {
                     "the state dir refused a write"
                 };
@@ -4887,14 +5049,27 @@ impl Bridge {
 
     fn is_forged_self(&mut self, off: u64) -> bool {
         let waiting = self.fx.now();
-        while forged_self(&self.self_acked, off)
+        while self.window_accuses(off)
             && self
                 .conn
                 .as_ref()
                 .is_some_and(|link| link.owed().any(Then::own_lane_post))
             && self.settle_one(waiting)
         {}
-        forged_self(&self.self_acked, off)
+        self.window_accuses(off)
+    }
+
+    /// [`forged_self`] over this bridge's window and its floor.
+    fn window_accuses(&self, off: u64) -> bool {
+        #[cfg(test)]
+        let floor = if self.fx.mutant(crate::sim::world::Mutant::FloorOffTheOldest) {
+            self.self_acked.first().copied().unwrap_or(0)
+        } else {
+            self.self_floor
+        };
+        #[cfg(not(test))]
+        let floor = self.self_floor;
+        forged_self(&self.self_acked, floor, off)
     }
 
     /// The kind `addr`'s record is delivered as, the kind it claimed when the receiver demoted
@@ -5016,6 +5191,7 @@ impl Bridge {
                 let reason = match no {
                     NoLane::Undrained => why,
                     NoLane::Capped => "lane-cap",
+                    NoLane::Handoff(no) => no.word(),
                 };
                 self.publish_ev_for(
                     Some(&addr.sid),
@@ -5095,7 +5271,7 @@ impl Bridge {
             || !WAITING_KINDS.contains(&r.kind.as_str())
             || !crate::body::is_verdict(&r.verdict)
         {
-            self.retire_receipt(r, None);
+            self.retire_receipt(r);
             return Ok(());
         }
         if r.earlier_log {
@@ -5106,7 +5282,7 @@ impl Bridge {
                     r.off, r.verdict
                 ),
             );
-            self.retire_receipt(r, None);
+            self.retire_receipt(r);
             return Ok(());
         }
         let prefix = match self.receipt_lane(&r.from)? {
@@ -5115,17 +5291,19 @@ impl Bridge {
                 let reason = match no {
                     NoLane::Undrained => "no-lane",
                     NoLane::Capped => "lane-cap",
+                    NoLane::Handoff(no) => no.word(),
                 };
                 self.publish_ev_for(
                     Some(&r.sid),
                     &format!("unacked re={} verdict={} reason={reason}", r.off, r.verdict),
                 );
-                self.retire_receipt(r, None);
+                self.retire_receipt(r);
                 return Ok(());
             }
         };
         let subject = format!("{prefix}/ack");
-        let encoded = receipt_body(self.fx.wall_ms(), &r.sid, r.off, &r.verdict).encode();
+        let re = self.wire_re(&prefix, r.off)?;
+        let encoded = receipt_body(self.fx.wall_ms(), &r.sid, re, &r.verdict).encode();
         let pinned = self.state.receipt_pin(&r.sid, r.rid)?;
         #[cfg(test)]
         let pinned = pinned.filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshReceiptSeq));
@@ -5151,15 +5329,30 @@ impl Bridge {
         if retry {
             if let Some(off) = self.landed_at_its_pin(&pin, &subject, &encoded)? {
                 self.claim(off, pin.seq);
-                self.retire_receipt(r, Some(off));
+                // The entry an earlier attempt left standing, its record held for this retry
+                // (`Bridge::awaiting_drain`): aterm's answer here ends it, as a post's read back
+                // does ([`Bridge::land_group`]).
+                let entry = self.awaiting_drain.get(&pin.seq).map(|&(_, ours)| ours);
+                self.receipt_landed(r, subject, pin, off, false, entry);
                 return Ok(());
             }
         }
+        // Its entry stands until aterm retired the receipt ([`Bridge::land_group`]); the control
+        // ends it at the ack, as every build before critic item F15 did.
+        #[cfg(test)]
+        let at_the_ack = self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReceiptRetiredAtAck);
+        #[cfg(not(test))]
+        let at_the_ack = false;
         let published = match self.staged_refusal(&r.sid) {
             Some(refused) => Err(refused),
-            None => self.publish_journaled(&pin, &subject, &encoded),
+            None if at_the_ack => self
+                .publish_journaled(&pin, &subject, &encoded)
+                .map(|(off, deduped, actual)| (off, deduped, actual, None)),
+            None => self.publish_journaled_entry(&pin, &subject, &encoded, None),
         };
-        let (at, deduped, _) = match published {
+        let (at, deduped, _, entry) = match published {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 self.state.clear_receipt_seq(&r.sid, r.rid);
                 return Err(e);
@@ -5173,7 +5366,7 @@ impl Bridge {
                     Some(&r.sid),
                     &format!("unacked re={} verdict={} reason=refused", r.off, r.verdict),
                 );
-                self.retire_receipt(r, None);
+                self.retire_receipt(r);
                 return Ok(());
             }
             Err(e) if past_the_budget(&e) && self.writes_alone(&subject) => {
@@ -5189,7 +5382,7 @@ impl Bridge {
                         r.off, r.verdict
                     ),
                 );
-                self.retire_receipt(r, None);
+                self.retire_receipt(r);
                 return Ok(());
             }
             answer => answer?,
@@ -5203,14 +5396,43 @@ impl Bridge {
                 &format!("ack re={} off={at} verdict={}", r.off, r.verdict),
             );
         }
-        self.retire_receipt(r, Some(at));
+        self.receipt_landed(r, subject, pin, at, deduped, entry);
         Ok(())
     }
 
-    fn retire_receipt(&mut self, r: &OwedReceipt, at: Option<u64>) {
-        let off = at.map_or_else(|| "-".to_string(), |n| n.to_string());
-        match self.ctl_request(&format!("deliver {} receipt={} off={off}", r.sid, r.rid)) {
-            Ok(reply) if reply.ok() || reply.header().starts_with("ERR no such session") => {
+    /// A RECEIPT THE BROKER LANDED at `off`, settled alone through a post's steps (critic item
+    /// F15, [`Bridge::land_group`]): its offset in the self-lane log where its record is this
+    /// node's own, aterm's `deliver <sid> receipt=<rid> off=<off>`, then its in-flight entry's
+    /// end (`entry`, the one its publish or an earlier attempt left standing) and its
+    /// reservation's. So the entry stands until the receipt left aterm's outbox, and its record
+    /// is not delivered before: a bridge killed between the ack and the retirement leaves the
+    /// next one the entry, whose replay holds the record until the drain's retry at the pin
+    /// reads it back and retires the receipt, so a cut before that retry gives up a copy no
+    /// reader was handed.
+    fn receipt_landed(
+        &mut self,
+        r: &OwedReceipt,
+        subject: String,
+        pin: PublishPin,
+        off: u64,
+        deduped: bool,
+        entry: Option<bool>,
+    ) {
+        self.land_alone(Landing {
+            of: Outboxed::Receipt(r.clone()),
+            subject,
+            pin,
+            off,
+            deduped,
+            actual: None,
+            entry,
+        });
+    }
+
+    /// Retire an owed receipt that was not published (`off=-`): no record, so no entry.
+    fn retire_receipt(&mut self, r: &OwedReceipt) {
+        match self.ctl_request(&format!("deliver {} receipt={} off=-", r.sid, r.rid)) {
+            Ok(reply) if left_the_outbox(&reply) => {
                 self.state.clear_receipt_seq(&r.sid, r.rid);
             }
             Ok(reply) => stderr_line!(
@@ -5237,8 +5459,17 @@ impl Bridge {
             {
                 return Ok(Err(NoLane::Undrained));
             }
+            let node = if self.cfg.mesh.is_some() && node != self.node {
+                match self.member_for(node) {
+                    Ok(Some(member)) => member,
+                    Ok(None) => return Ok(Err(NoLane::Undrained)),
+                    Err(no) => return Ok(Err(NoLane::Handoff(no))),
+                }
+            } else {
+                node.to_owned()
+            };
             let lane = format!("/f/{fleet}/in/{node}/{sid}/{}", self.node);
-            let allowed = self.may_answer_on(node, &lane)?;
+            let allowed = self.may_answer_on(&node, &lane)?;
             return Ok(allowed.then_some(lane).ok_or(NoLane::Capped));
         }
         if !subject::is_principal(from) {
@@ -5247,7 +5478,10 @@ impl Bridge {
         if from.starts_with("s-") {
             return Ok(match self.resolve_to(&format!("@{from}"), None)? {
                 Route::To(prefix) => Ok(prefix),
-                _ => Err(NoLane::Undrained),
+                _ => Err(self
+                    .unrouted
+                    .take()
+                    .map_or(NoLane::Undrained, NoLane::Handoff)),
             });
         }
         if from.starts_with("n-") {
@@ -5352,7 +5586,10 @@ impl Bridge {
         if addr.src.starts_with("s-") {
             return match self.resolve_to(&format!("@{}", addr.src), None) {
                 Ok(Route::To(prefix)) => Ok(prefix),
-                _ => Err(NoLane::Undrained),
+                _ => Err(self
+                    .unrouted
+                    .take()
+                    .map_or(NoLane::Undrained, NoLane::Handoff)),
             };
         }
         if addr.src.starts_with("n-") {
@@ -5361,8 +5598,18 @@ impl Bridge {
                 .as_deref()
                 .filter(|s| s.starts_with("s-") && subject::is_principal(s))
                 .ok_or(NoLane::Undrained)?;
-            let lane = format!("/f/{fleet}/in/{}/{sid}/{}", addr.src, self.node);
-            return match self.may_answer_on(&addr.src, &lane) {
+            // With the mesh on (§11 C3) another Mac's notice goes to the member it is now.
+            let src = if self.cfg.mesh.is_some() && addr.src != self.node {
+                match self.member_for(&addr.src) {
+                    Ok(Some(member)) => member,
+                    Ok(None) => return Err(NoLane::Undrained),
+                    Err(no) => return Err(NoLane::Handoff(no)),
+                }
+            } else {
+                addr.src.clone()
+            };
+            let lane = format!("/f/{fleet}/in/{src}/{sid}/{}", self.node);
+            return match self.may_answer_on(&src, &lane) {
                 Ok(true) => Ok(lane),
                 Ok(false) => Err(NoLane::Capped),
                 Err(_) => Err(NoLane::Undrained),
@@ -6430,7 +6677,7 @@ impl Bridge {
         !self.unsettled.contains_key(&off)
     }
 
-    /// Whether the own record at `off` is held for the drain that retires its post
+    /// Whether the own record at `off` is held for the drain that retires its post or receipt
     /// ([`Bridge::awaiting_drain`]), not for a write the state dir refused.
     fn held_for_the_drain(&self, off: u64) -> bool {
         self.unsettled
@@ -6442,20 +6689,28 @@ impl Bridge {
         self.remember_self_acks([off])
     }
 
+    /// Read the forged-self window back from the `acked` log ([`self_window`]).
+    fn load_self_window(&mut self) {
+        let acked = self.state.self_acked_log();
+        self.acked_entries = acked.entries;
+        self.acked_appendable = acked.appendable;
+        self.acked_floored = acked.floor.is_some();
+        (self.self_acked, self.self_floor) = self_window(acked);
+    }
+
     /// Remember `offs` as this node's own, in the self-lane window and, past it, in the acked
     /// log: the ones it does not hold yet in one append, or the whole window rewritten where
-    /// the log is due its compaction or its last write failed (critic item E07: an ack pass's
-    /// landed posts are one write, where each was one).
+    /// the log is due its compaction, its last write failed, or it holds offsets and names no
+    /// floor, as an older build's file does (critic item E07: an ack pass's landed posts are one
+    /// write, where each was one). The first append into a file that names no floor names it
+    /// ahead of them ([`self_window`]). An offset below the window's floor is not added: the
+    /// window accuses nothing there, so it would vouch for nothing and take a slot. Past
+    /// [`SELF_ACK_KEEP`] the window drops its oldest and its floor rises to the oldest it keeps,
+    /// so the dropped offset, unknown now, is not accused.
     fn remember_self_acks(&mut self, offs: impl IntoIterator<Item = u64>) -> io::Result<()> {
-        #[cfg(test)]
-        let below_too = self
-            .fx
-            .mutant(crate::sim::world::Mutant::RememberBelowTheWindow);
-        #[cfg(not(test))]
-        let below_too = false;
         let mut fresh = Vec::new();
         for off in offs {
-            if !below_too && self.self_acked.first().is_some_and(|oldest| off < *oldest) {
+            if off < self.self_floor {
                 continue;
             }
             if !self.self_acked.insert(off) && self.acked_appendable {
@@ -6464,25 +6719,32 @@ impl Bridge {
             fresh.push(off);
             while self.self_acked.len() > SELF_ACK_KEEP {
                 self.self_acked.pop_first();
+                if let Some(&oldest) = self.self_acked.first() {
+                    self.self_floor = self.self_floor.max(oldest);
+                }
             }
         }
         if fresh.is_empty() {
             return Ok(());
         }
-        let compact = !self.acked_appendable || self.acked_entries >= 2 * SELF_ACK_KEEP;
+        let compact = !self.acked_appendable
+            || self.acked_entries >= 2 * SELF_ACK_KEEP
+            || (!self.acked_floored && self.acked_entries > 0);
         let written = if compact {
             self.state
-                .set_self_acked(&self.self_acked, SELF_ACK_KEEP)
+                .set_self_acked(&self.self_acked, self.self_floor, SELF_ACK_KEEP)
                 .map(|()| self.self_acked.len())
         } else {
+            let floor = (!self.acked_floored).then_some(self.self_floor);
             self.state
-                .append_self_acked(&fresh)
+                .append_self_acked(floor, &fresh)
                 .map(|()| self.acked_entries + fresh.len())
         };
         match written {
             Ok(entries) => {
                 self.acked_entries = entries;
                 self.acked_appendable = true;
+                self.acked_floored = true;
                 Ok(())
             }
             Err(e) => {
@@ -6995,10 +7257,7 @@ impl Bridge {
         self.unsettled.retain(|off, _| kept(*off));
         self.awaiting_drain.retain(|_, (off, _)| kept(*off));
         let before = self.deadlines.len();
-        let acked = self.state.self_acked_log();
-        self.self_acked = newest(acked.offsets, SELF_ACK_KEEP);
-        self.acked_entries = acked.entries;
-        self.acked_appendable = acked.appendable;
+        self.load_self_window();
         self.deadlines.retain(|off, _| kept(*off));
         self.deadlines_unwritten.retain(|off, _| kept(*off));
         self.asked.retain(|off, _| kept(*off));
@@ -8314,8 +8573,16 @@ impl Bridge {
         true
     }
 
-    fn drain_post(&mut self, post: QueuedPost) -> bool {
-        let routed = match self.resolve_to(&post.to, Some(&post.sid)) {
+    fn drain_post(&mut self, mut post: QueuedPost) -> bool {
+        let routed = self
+            .resolve_to(&post.to, Some(&post.sid))
+            .and_then(|routed| {
+                if let (Route::To(prefix), Some(re)) = (&routed, post.re) {
+                    post.re = Some(self.wire_re(prefix, re)?);
+                }
+                Ok(routed)
+            });
+        let routed = match routed {
             Ok(routed) => routed,
             Err(e) => {
                 stderr_line!(
@@ -8497,8 +8764,8 @@ impl Bridge {
                             // ([`Bridge::land_group`]), so the refill after this drain delivers
                             // the record rather than meeting it held.
                             let entry = self.awaiting_drain.get(&pin.seq).map(|&(_, ours)| ours);
-                            let next = self.post_landed(Landing {
-                                post,
+                            let next = self.land_alone(Landing {
+                                of: Outboxed::Post(post),
                                 subject,
                                 pin,
                                 off,
@@ -8528,8 +8795,8 @@ impl Bridge {
                             self.claim(off, pin.seq);
                         }
                         self.settle_a_retry_answered_ahead(&post, off);
-                        self.post_landed(Landing {
-                            post,
+                        self.land_alone(Landing {
+                            of: Outboxed::Post(post),
                             subject,
                             pin,
                             off,
@@ -8709,7 +8976,7 @@ impl Bridge {
                 // LANDED: its bookkeeping waits for its pass's group (critic item E07).
                 let actual = pin.identity.clone();
                 self.landings.push(Landing {
-                    post,
+                    of: Outboxed::Post(post),
                     subject,
                     pin,
                     off,
@@ -8783,10 +9050,11 @@ impl Bridge {
         }
     }
 
-    /// A post a retry, or a read back, landed, settled alone ([`Bridge::land_group`]), every
-    /// landing a pass left ahead of it settled first: its `entry` is the in-flight entry the
-    /// retry's publish left standing, if it journaled one ([`Bridge::publish_journaled_entry`]).
-    fn post_landed(&mut self, landing: Landing) -> PostNext {
+    /// A post a retry, or a read back, landed, or a receipt ([`Bridge::receipt_landed`]),
+    /// settled alone ([`Bridge::land_group`]), every landing a pass left ahead of it settled
+    /// first: its `entry` is the in-flight entry its publish, or an earlier attempt's, left
+    /// standing, if one journaled one ([`Bridge::publish_journaled_entry`]).
+    fn land_alone(&mut self, landing: Landing) -> PostNext {
         self.flush_landings();
         let grouping = std::mem::replace(&mut self.grouping, false);
         let next = self
@@ -8820,14 +9088,60 @@ impl Bridge {
     /// LANDED POSTS SETTLED AS ONE GROUP (critic item E07): for every post of `group`, in the
     /// order of its acks,
     ///
-    /// 1. its offset in the self-lane log, the group's in one append
-    ///    ([`Bridge::remember_self_acks`]);
+    /// 1. its offset in the self-lane log where its record is this node's own
+    ///    ([`Landing::remembers`]), the group's in one append ([`Bridge::remember_self_acks`]);
     /// 2. its key's identity, its ask's recipient and its deadline, each post's own
     ///    ([`Bridge::landing_line`]);
     /// 3. aterm's `outbox sent`, the group's back to back on the verb lane
     ///    ([`Bridge::retire_on_the_lane`]);
     /// 4. its in-flight entry's end and its reservation's, the group's in one journal write
     ///    ([`StateDir::settle_posts`]).
+    ///
+    /// THE SELF-LANE LOG TAKES THIS NODE'S OWN RECORDS ONLY (critic item F17): step 1 writes no
+    /// offset of a post or a receipt onto another node's lane or a person's. The log answers one
+    /// question, whether a record on this node's own lane under its own `<src>` is one it
+    /// published ([`forged_self`], read where a record is delivered and where `inbox get
+    /// @<off>` fetches one, [`Bridge::fetch_record`]), from a window of its newest
+    /// [`SELF_ACK_KEEP`] offsets over a floor of its own, which accuses nothing below it and
+    /// rises only where the window drops its oldest ([`self_window`], critic item F17's review).
+    /// An offset on another lane is never an own-lane record's (a log's offsets are its
+    /// records', and a move replaces the set, [`StateDir::forget_log_offsets`]), so it decides
+    /// no verdict by membership; but it takes a slot, and a full window drops an own offset for
+    /// it and raises its floor past that record. Every build before F17 wrote every landed
+    /// post's offset (each post's alone from the bridge's first build, E07's group in one
+    /// append), and every other record's only on its own lanes
+    /// ([`Bridge::publish_journaled_entry`]): a node whose posts go mostly to people and other
+    /// nodes vouched for its last 4,096 posts rather than its last 4,096 own records, so a
+    /// forged own record behind that edge, fetched by its offset or offered by a refill, went
+    /// unaccused, and each group of them cost an append and brought the log's compaction
+    /// nearer. Those builds also read the floor off the window's oldest offset, so a fresh
+    /// window's first landed post, to a person or not, ended the empty window that accuses
+    /// every offset; with the floor kept apart (`Mutant::FloorOffTheOldest`,
+    /// `tests::a_fresh_windows_first_own_record_moves_no_floor`) the own-only window accuses
+    /// every offset the wide one did. A window loaded from an older build's `acked` file, which
+    /// names no floor, keeps that build's entries, every landed post's, over the floor that
+    /// build read off its oldest: it accuses at least what that build's window did, and those
+    /// entries age out as the window takes [`SELF_ACK_KEEP`] own records.
+    ///
+    /// The one reader that took a post's offset off this node's lanes for evidence is a
+    /// reservation of a build before publication identities ([`Bridge::publish_reserved`]'s
+    /// `legacy`), whose dedup answer the log vouched for where no record could be read back. On
+    /// another node's lane or a person's, such a reservation whose attempt a build since F17
+    /// landed is held there as unverifiable, and past a cut is sent again at its pin, as every
+    /// other reservation onto another node's lane is. NEGATIVE CONTROL: `Mutant::WideAckedSet`
+    /// writes every landed post's offset, as E07 did, and in a full window a post to a person
+    /// raises the floor past a forged own record, which goes unaccused
+    /// (`tests::a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_window`).
+    ///
+    /// AN OWED RECEIPT IS SETTLED BY THE SAME STEPS (critic item F15, a group of one,
+    /// [`Bridge::receipt_landed`]): its retirement is `deliver <sid> receipt=<rid> off=<off>`
+    /// where a post's is `outbox sent`, it has no step 2, and its reservation's end follows the
+    /// journal's write. So every rule below holds for it as for a post. Before F15 a
+    /// receipt's entry ended at its ack, and the hole E06 recorded for posts stayed open for
+    /// receipts: a bridge killed before the retirement left the next one the receipt's record to
+    /// deliver while aterm still owed the receipt, and the drain's retry at the pin, past a cut
+    /// that gave that record up, landed the answer a second time (the sim's `receipt:` law,
+    /// `answered 2 times`, at seed 515 under a rate limit that binds).
     ///
     /// AN OWN RECORD'S ENTRY STANDS UNTIL ATERM ANSWERED ITS POST'S `outbox sent`. While it
     /// stands the record is not delivered: a kill there leaves the next bridge the entry, whose
@@ -8838,7 +9152,7 @@ impl Bridge {
     /// build before E07 did) left the next bridge the record to deliver while the post stood
     /// queued, and a retry past such a cut appended a second copy (`dup delivery`, the sim's
     /// seed 78 under a rate limit of ten records a second and a burst of four, recorded at E06).
-    /// The entry ends once the post left aterm's outbox ([`post_left_the_outbox`]): its `OK`
+    /// The entry ends once the post left aterm's outbox ([`left_the_outbox`]): its `OK`
     /// retired it, or aterm said it holds no such post or session. A post still queued leaves
     /// the entry standing and its record held, as the attach's replay leaves one, for the
     /// drain's retry at its pin to read back and retire ([`Bridge::drain_outbox`]), or for a
@@ -8858,15 +9172,16 @@ impl Bridge {
     /// Answers each post's sender and what it does next.
     fn land_group(&mut self, group: Vec<Landing>) -> Vec<(String, PostNext)> {
         #[cfg(test)]
-        let (ends_first, ends_at_the_ack, retires_first) = (
+        let (ends_first, ends_at_the_ack, retires_first, wide) = (
             self.fx.mutant(crate::sim::world::Mutant::LandedBeforeAcked),
             self.fx
                 .mutant(crate::sim::world::Mutant::LandedBeforeOutboxSent),
             self.fx
                 .mutant(crate::sim::world::Mutant::RetireBeforeOutboxSent),
+            self.fx.mutant(crate::sim::world::Mutant::WideAckedSet),
         );
         #[cfg(not(test))]
-        let (ends_first, ends_at_the_ack, retires_first) = (false, false, false);
+        let (ends_first, ends_at_the_ack, retires_first, wide) = (false, false, false, false);
         let every_entry = |group: &[Landing], remembered: bool| -> Vec<Option<u64>> {
             group
                 .iter()
@@ -8881,7 +9196,15 @@ impl Bridge {
             let ends = every_entry(&group, true);
             self.settle_group(&group, &ends, &[]);
         }
-        let remembered = self.remember_self_acks(group.iter().map(|l| l.off)).is_ok();
+        let own: Vec<u64> = group
+            .iter()
+            .filter(|l| {
+                l.remembers(|face| self.on_own_lane(face))
+                    || (wide && matches!(l.of, Outboxed::Post(_)))
+            })
+            .map(|l| l.off)
+            .collect();
+        let remembered = self.remember_self_acks(own).is_ok();
         if ends_at_the_ack {
             let ends = every_entry(&group, remembered);
             self.settle_group(&group, &ends, &[]);
@@ -8908,14 +9231,29 @@ impl Bridge {
         }
         let sent: Vec<&str> = lines.iter().map(|(_, line)| line.as_str()).collect();
         let replies = self.retire_on_the_lane(&sent);
-        // By place: whether aterm's answer retired the post, and whether it left the outbox.
+        // By place: whether aterm's answer retired the post (a receipt's reservation goes once
+        // it left, as it always went), and whether it left the outbox.
         let (mut retired, mut left) = (vec![false; group.len()], vec![false; group.len()]);
         #[cfg(test)]
         let mut answered = vec![false; group.len()];
-        for ((i, _), reply) in lines.iter().zip(replies) {
+        for ((i, line), reply) in lines.iter().zip(replies) {
+            let gone = match &reply {
+                Ok(reply) => left_the_outbox(reply),
+                Err(_) => false,
+            };
+            if !gone {
+                let answer = match &reply {
+                    Ok(reply) => reply.header().to_string(),
+                    Err(e) => e.to_string(),
+                };
+                stderr_line!("aterm-link: `{line}` left it queued at its pin: {answer}");
+            }
             if let Ok(reply) = reply {
-                retired[*i] = reply.ok();
-                left[*i] = post_left_the_outbox(&reply);
+                retired[*i] = match group[*i].of {
+                    Outboxed::Post(_) => reply.ok(),
+                    Outboxed::Receipt(_) => gone,
+                };
+                left[*i] = gone;
                 #[cfg(test)]
                 {
                     answered[*i] = true;
@@ -8956,51 +9294,59 @@ impl Bridge {
         group
             .into_iter()
             .zip(nexts)
-            .map(|(landing, next)| (landing.post.sid, next))
+            .map(|(landing, next)| (landing.of.sid().to_string(), next))
             .collect()
     }
 
-    /// Write `group`'s in-flight ends (`ends`, a sequence where one ends) and reservations' ends
-    /// (`retired`, by place; a shorter slice retires the rest of none) in one journal write
-    /// ([`StateDir::settle_posts`]), and let each ended entry's record be delivered; one the
-    /// write did not end is delivered once a later settle ends it, as
-    /// [`Bridge::settle_landed`] leaves one.
+    /// Write `group`'s in-flight ends (`ends`, a sequence where one ends) and its posts'
+    /// reservations' ends (`retired`, by place; a shorter slice retires the rest of none) in one
+    /// journal write ([`StateDir::settle_posts`]), and let each ended entry's record be
+    /// delivered; one the write did not end is delivered once a later settle ends it, as
+    /// [`Bridge::settle_landed`] leaves one. A retired receipt's reservation, a file of its own,
+    /// is forgotten after that write ([`StateDir::clear_receipt_seq`]), as a post's `Retire`
+    /// frame follows its `Landed` one.
     fn settle_group(&mut self, group: &[Landing], ends: &[Option<u64>], retired: &[bool]) {
+        let retires = |i: usize| retired.get(i).copied().unwrap_or(false);
         let settles: Vec<crate::state::PostSettle<'_>> = group
             .iter()
             .enumerate()
             .map(|(i, landing)| crate::state::PostSettle {
                 landed: ends.get(i).copied().flatten(),
-                retired: retired
-                    .get(i)
-                    .copied()
-                    .unwrap_or(false)
-                    .then_some((landing.post.sid.as_str(), landing.post.id)),
+                retired: match &landing.of {
+                    Outboxed::Post(post) if retires(i) => Some((post.sid.as_str(), post.id)),
+                    _ => None,
+                },
             })
             .collect();
         if settles
             .iter()
-            .all(|s| s.landed.is_none() && s.retired.is_none())
+            .any(|s| s.landed.is_some() || s.retired.is_some())
         {
-            return;
-        }
-        let written = self.state.settle_posts(&settles);
-        for (landing, end) in group.iter().zip(ends) {
-            let Some(seq) = *end else {
-                continue;
-            };
-            match &written {
-                Ok(()) => {
-                    self.unsettled.retain(|_, s| *s != seq);
-                    self.awaiting_drain.remove(&seq);
+            let written = self.state.settle_posts(&settles);
+            for (landing, end) in group.iter().zip(ends) {
+                let Some(seq) = *end else {
+                    continue;
+                };
+                match &written {
+                    Ok(()) => {
+                        self.unsettled.retain(|_, s| *s != seq);
+                        self.awaiting_drain.remove(&seq);
+                    }
+                    Err(e) => {
+                        stderr_line!(
+                            "aterm-link: the in-flight entry at sequence {seq} (@{}) could not \
+                             be cleared: {e}; the record is delivered once it is",
+                            landing.off
+                        );
+                        self.unsettled.insert(landing.off, seq);
+                    }
                 }
-                Err(e) => {
-                    stderr_line!(
-                        "aterm-link: the in-flight entry at sequence {seq} (@{}) could not be \
-                         cleared: {e}; the record is delivered once it is",
-                        landing.off
-                    );
-                    self.unsettled.insert(landing.off, seq);
+            }
+        }
+        for (i, landing) in group.iter().enumerate() {
+            if let Outboxed::Receipt(r) = &landing.of {
+                if retires(i) {
+                    self.state.clear_receipt_seq(&r.sid, r.rid);
                 }
             }
         }
@@ -9008,10 +9354,11 @@ impl Bridge {
 
     /// One landed post's own steps ahead of its `outbox sent` ([`Bridge::land_group`]): its key's
     /// identity, its ask's recipient and its deadline. Answers the `outbox sent` line, or that
-    /// the post is held for its retry.
+    /// the post is held for its retry. A receipt has none of those steps: its line is its
+    /// `deliver <sid> receipt=<rid> off=<off>` (critic item F15).
     fn landing_line(&mut self, landing: &Landing) -> Result<String, PostNext> {
         let Landing {
-            post,
+            of,
             subject,
             pin,
             off,
@@ -9020,6 +9367,12 @@ impl Bridge {
             entry: _,
         } = landing;
         let (off, deduped) = (*off, *deduped);
+        let post = match of {
+            Outboxed::Post(post) => post,
+            Outboxed::Receipt(r) => {
+                return Ok(format!("deliver {} receipt={} off={off}", r.sid, r.rid));
+            }
+        };
         let (seq, via_key) = (pin.seq, pin.via_key);
         let own_attempt = if !deduped || !via_key {
             Some(true)
@@ -9200,7 +9553,14 @@ impl Bridge {
         if retired.is_ok_and(|r| r.ok()) {
             self.state.clear_post_seq(&post.sid, post.id);
         }
-        self.publish_ev(&format!("undeliverable to={} reason={why}", post.to));
+        match self.unrouted.take() {
+            Some(no) => self.publish_ev(&format!(
+                "undeliverable to={} reason={why} why={}",
+                post.to,
+                no.word()
+            )),
+            None => self.publish_ev(&format!("undeliverable to={} reason={why}", post.to)),
+        }
     }
 
     fn writes_alone(&self, subject: &str) -> bool {
@@ -9290,6 +9650,7 @@ impl Bridge {
     }
 
     fn resolve_to(&mut self, to: &str, from_sid: Option<&str>) -> io::Result<Route> {
+        self.unrouted = None;
         let to = crate::pct::decode(to);
         let fleet = self.cfg.fleet.clone();
         if to == "say" || to.starts_with("say:") {
@@ -9318,6 +9679,19 @@ impl Bridge {
                 hosted = self.per_sid.epochs.contains_key(&sid);
             }
             let node = match (node, hosted) {
+                (Some(n), _) if self.cfg.mesh.is_some() && n != self.node => {
+                    // With the mesh on (§11 C3) another Mac's sessions are not on this bus: the
+                    // node service's hand-off names the members, and the push to the one named
+                    // carries the post there, or holds it here until that Mac reads it.
+                    match self.member_for(&n) {
+                        Ok(Some(member)) => member,
+                        Ok(None) => return Ok(Route::Unroutable),
+                        Err(no) => {
+                            self.unrouted = Some(no);
+                            return Ok(Route::Unroutable);
+                        }
+                    }
+                }
                 (Some(n), _) => {
                     if !subject::is_principal(&n) || !n.starts_with("n-") {
                         return Ok(Route::Unroutable);
@@ -9355,8 +9729,94 @@ impl Bridge {
         })
     }
 
+    /// The member `node` names now, with the mesh on (§11 C3): this Mac's own node, a current
+    /// member, or the member a key rotation made of it, as the node service's hand-off says;
+    /// `None` for any other node, and with the mesh off.
+    ///
+    /// # Errors
+    /// Another Mac's node while the hand-off is missing, stale (it names another node as this
+    /// Mac's) or unreadable: routing to another Mac fails closed, and stderr says why.
+    fn member_for(&mut self, node: &str) -> Result<Option<String>, NoHandoff> {
+        if node == self.node {
+            return Ok(Some(node.to_owned()));
+        }
+        let Some(root) = self.cfg.mesh.as_ref().map(|mesh| mesh.root.clone()) else {
+            return Ok(None);
+        };
+        let me = self.node.clone();
+        let handoff = self.handoff.read(&root, &me)?;
+        Ok(handoff.current(node).map(str::to_owned))
+    }
+
+    /// The `re=` a record bound for the lane `prefix` carries (§11 C3). An offset on this bus
+    /// means nothing on another Mac's, so with the mesh on, an answer or receipt to another Mac
+    /// names the record it answers, when a push brought that record here from its sender, by the
+    /// record's sequence number, which the push set to the offset the record has on the sender's
+    /// bus. Any other record keeps `off`: one this Mac wrote, and one retention gave up.
+    ///
+    /// # Errors
+    /// A broker that cannot be read.
+    fn wire_re(&mut self, prefix: &str, off: u64) -> io::Result<u64> {
+        let to = prefix
+            .strip_prefix(&format!("/f/{}/in/", self.cfg.fleet))
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default();
+        if self.cfg.mesh.is_none() || to == self.node || !to.starts_with("n-") {
+            return Ok(off);
+        }
+        let inbox = format!("/f/{}/in/{}/>", self.cfg.fleet, self.node);
+        let (mut reader, _closer) = self.connect()?;
+        let rows = match reader.fetch(off, &inbox, 1) {
+            Ok((rows, _)) => rows,
+            Err(e) if astream_broker::broker_refusal(&e).is_some() => return Ok(off),
+            Err(e) => return Err(e),
+        };
+        let Some((at, subject, _)) = rows.into_iter().next() else {
+            return Ok(off);
+        };
+        let from = match subject::parse_in(&self.cfg.fleet, &self.node, &subject) {
+            Ok(addr) if at == off && addr.src != self.node && addr.src.starts_with("n-") => {
+                astream_cap::producer_id_of(&addr.src)
+            }
+            _ => return Ok(off),
+        };
+        if !reader.origin_stamps()? {
+            return Ok(off);
+        }
+        let mut sub = reader.subscribe(off, &subject)?;
+        loop {
+            match sub.recv_event()? {
+                Some(astream_broker::Event::Delivery { offset, .. }) if offset == off => {
+                    return Ok(match sub.last_origin() {
+                        Some((pid, seq)) if pid == from && seq < astream_broker::ACK_SEQ_BASE => {
+                            seq
+                        }
+                        _ => off,
+                    });
+                }
+                Some(astream_broker::Event::Mark { next, .. }) if next <= off => {}
+                _ => return Ok(off),
+            }
+        }
+    }
+
     fn pinned_node_for(&mut self, sid: &str) -> io::Result<Result<String, Route>> {
         let pinned = self.state.pins().get(sid).cloned();
+        if let Some(pinned) = pinned
+            .as_deref()
+            .filter(|pinned| self.cfg.mesh.is_some() && *pinned != self.node)
+        {
+            // With the mesh on (§11 C3) no other Mac's presence is on this bus: the pin routes,
+            // to the member it names now.
+            return Ok(match self.member_for(pinned) {
+                Ok(Some(member)) => Ok(member),
+                Ok(None) => Err(Route::Unroutable),
+                Err(no) => {
+                    self.unrouted = Some(no);
+                    Err(Route::Unroutable)
+                }
+            });
+        }
         #[cfg(test)]
         let settle = pinned.is_some() && !self.route_on_a_pin_that_reads;
         #[cfg(not(test))]
@@ -9836,6 +10296,7 @@ impl Bridge {
         };
         self.conn = Some(Link::from(conn));
         self.commit_refused = false;
+        self.settle_refused = false;
         let Some((halts, (fleet_from, head))) = self.read_fleet_halts() else {
             stderr_line!("aterm-link: the standing fleet halt could not be read; not attaching");
             self.conn = None;
@@ -10106,6 +10567,7 @@ impl Bridge {
 
     fn sync_say_face(&mut self) -> bool {
         let wanted = self.attachment != Attachment::Observer && !self.per_sid.topics.is_empty();
+        self.say_held_topics();
         match (wanted, self.say_face_held()) {
             (true, false) => self.open_say_face(),
             (false, true) => {
@@ -10114,6 +10576,39 @@ impl Bridge {
                 true
             }
             _ => true,
+        }
+    }
+
+    /// With the mesh on (§11 C3), name the topics this Mac's sessions hold on its node's topics
+    /// face ([`crate::federate::topics_face`]) where they changed since this attach last did: the
+    /// node service reads it into this Mac's presence row, and the other Macs push their topic
+    /// broadcasts here while it names one. A refused write is tried at the next sync and said
+    /// once until one lands.
+    fn say_held_topics(&mut self) {
+        if self.cfg.mesh.is_none() || self.attachment == Attachment::Observer || self.conn.is_none()
+        {
+            return;
+        }
+        let held: BTreeSet<String> = self
+            .per_sid
+            .topics
+            .values()
+            .flat_map(|topics| topics.keys().cloned())
+            .collect();
+        if self.topics_said.as_ref() == Some(&held) {
+            return;
+        }
+        let body = crate::federate::topics_body(self.fx.wall_ms(), &held);
+        match self.publish(&crate::federate::topics_face(&self.node), body.as_bytes()) {
+            Ok(_) => {
+                self.topics_said = Some(held);
+                self.topics_refused = false;
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut self.topics_refused, true) {
+                    stderr_line!("aterm-link: the topics this Mac holds were not said: {e}");
+                }
+            }
         }
     }
 
@@ -11115,7 +11610,18 @@ impl Bridge {
             if self.commit_held.is_some() && !for_the_mirror {
                 self.flush_inbox_commit();
             }
-            self.settle_acks();
+            // THE PIN'S SETTLE IS NOT WAITED ON (critic item F07): its answer comes once the
+            // broker's full flush returns, which the loop leaves to the broker; a round reads it
+            // once it is in, each park's backstop no later than the grace.
+            if self
+                .conn
+                .as_ref()
+                .is_some_and(|link| link.owed().all(Then::is_settle))
+            {
+                self.try_settle_acks();
+            } else {
+                self.settle_acks();
+            }
             self.tally_idle();
         }
         go_on
@@ -11434,11 +11940,30 @@ fn bye_of(line: &str) -> Option<Bye> {
     Bye::parse(toks.next()?)
 }
 
-fn forged_self(acked: &BTreeSet<u64>, off: u64) -> bool {
-    if acked.contains(&off) {
-        return false;
-    }
-    !matches!(acked.first(), Some(oldest) if off < *oldest)
+/// Whether the record at `off`, on this node's own lane under its own `<src>`, is one it did not
+/// publish (forged-self-window): an offset its window `acked` does not hold, at or above the
+/// window's `floor`. Below the floor the window knows nothing, and accuses nothing.
+fn forged_self(acked: &BTreeSet<u64>, floor: u64, off: u64) -> bool {
+    off >= floor && !acked.contains(&off)
+}
+
+/// The forged-self window an `acked` log loads as, and its floor (critic item F17's review):
+/// its newest [`SELF_ACK_KEEP`] offsets, under the floor the file names, raised to the oldest
+/// kept where the keep drops any. A file that holds offsets and names no floor is an older
+/// build's, whose readers took the window's oldest offset for its floor: it loads there, so it
+/// accuses nothing that build did not, and its entries, every landed post's, age out as own
+/// records land ([`Bridge::land_group`]). One that holds neither (no file, or one that cannot
+/// be read) loads at 0 and accuses every offset, as an empty window always has.
+fn self_window(acked: crate::state::AckedLog) -> (BTreeSet<u64>, u64) {
+    let held = acked.offsets.len();
+    let kept = newest(acked.offsets, SELF_ACK_KEEP);
+    let oldest = kept.first().copied();
+    let floor = match (acked.floor, oldest) {
+        (Some(floor), Some(oldest)) if kept.len() < held => floor.max(oldest),
+        (Some(floor), _) => floor,
+        (None, oldest) => oldest.unwrap_or(0),
+    };
+    (kept, floor)
 }
 
 fn newest(mut offsets: BTreeSet<u64>, keep: usize) -> BTreeSet<u64> {
@@ -11799,6 +12324,138 @@ fn hostname() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| aterm_uds::process::host_name().unwrap_or_else(|| "-".to_string()))
         .clone()
+}
+
+/// The node service's hand-off as a bridge last read it (§11 C3): the file's identity, and what it
+/// said. Read again only when the file was replaced.
+struct HandoffSeen {
+    stamp: Option<(u64, u64, i64, i64, u64)>,
+    handoff: Result<crate::federate::Handoff, (NoHandoff, String)>,
+    told: Option<String>,
+}
+
+impl Default for HandoffSeen {
+    fn default() -> Self {
+        Self {
+            stamp: None,
+            handoff: Err((NoHandoff::Missing, String::new())),
+            told: None,
+        }
+    }
+}
+
+impl HandoffSeen {
+    /// The hand-off in `root` for this Mac (`me`), read again if the file changed since.
+    ///
+    /// # Errors
+    /// The hand-off is missing, unreadable, or names another node as this Mac's (stale): said
+    /// once on stderr for each reason in turn.
+    fn read(
+        &mut self,
+        root: &std::path::Path,
+        me: &str,
+    ) -> Result<&crate::federate::Handoff, NoHandoff> {
+        use std::os::unix::fs::MetadataExt;
+        let path = root.join(crate::federate::HANDOFF_FILE);
+        let at = std::fs::metadata(&path);
+        let stamp = at
+            .as_ref()
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.size()));
+        if stamp.is_none() || stamp != self.stamp {
+            self.stamp = stamp;
+            let missing = || {
+                (
+                    NoHandoff::Missing,
+                    format!(
+                        "{} does not exist: the node service writes it as its mail pushes start \
+                         (`aterm node status` says whether it runs)",
+                        path.display()
+                    ),
+                )
+            };
+            let unreadable = |e: &io::Error| {
+                (
+                    NoHandoff::Unreadable,
+                    format!(
+                        "{} cannot be read ({e}): the node service rewrites it when the members \
+                         change, or at its next start (`aterm node status`)",
+                        path.display()
+                    ),
+                )
+            };
+            self.handoff = match at {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Err(missing()),
+                Err(e) => Err(unreadable(&e)),
+                Ok(_) => match crate::federate::Handoff::read(root) {
+                    Ok(Some(handoff)) => Ok(handoff),
+                    Ok(None) => Err(missing()),
+                    Err(e) => Err(unreadable(&e)),
+                },
+            };
+        }
+        let refused = match &self.handoff {
+            Ok(handoff) if handoff.me == me => None,
+            Ok(handoff) => Some((
+                NoHandoff::Stale,
+                format!(
+                    "{} names {} as this Mac, which is {me}: the node service has not rewritten \
+                     it since this Mac's node key changed (`aterm node status`)",
+                    path.display(),
+                    handoff.me
+                ),
+            )),
+            Err((no, why)) => Some((*no, why.clone())),
+        };
+        if let Some((no, why)) = refused {
+            if self.told.as_deref() != Some(why.as_str()) {
+                stderr_line!("aterm-link: no other Mac is routed to: {why}");
+                self.told = Some(why);
+            }
+            return Err(no);
+        }
+        self.told = None;
+        self.handoff.as_ref().map_err(|(no, _)| *no)
+    }
+}
+
+/// The node this Mac's node key names, with the mesh on (§11 C3), recorded as `state`'s node: a
+/// cap ring minted for another node is refused, as [`node_for`] refuses it.
+fn mesh_node(
+    state: &StateDir,
+    caps: &[Cap],
+    mesh: &crate::federate::MeshPaths,
+) -> io::Result<String> {
+    let node = crate::federate::node_of_key(&mesh.keys)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} holds no {}: the node service writes this Mac's node key as it starts \
+                 (`aterm node on`)",
+                mesh.keys.display(),
+                crate::federate::NODE_KEY_FILE
+            ),
+        )
+    })?;
+    let bound = ring_binds(caps);
+    if !bound.is_empty() && !bound.contains(&node) {
+        let named = bound.iter().cloned().collect::<Vec<_>>().join(", ");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "this Mac's node key names {node}, but the cap files are minted for {named}: a \
+                 guarded broker refuses every publish of {node} under them. `aterm fabric on` \
+                 re-mints the root's cap for {node}"
+            ),
+        ));
+    }
+    if let Some(old) = state.name_node(&node)? {
+        stderr_line!(
+            "aterm-link: this Mac's node is {node}, named by its node key (it was {old}); each \
+             sender carries the mail it holds for {old} here"
+        );
+    }
+    Ok(node)
 }
 
 fn mint_node_id() -> String {
@@ -12186,20 +12843,7 @@ mod tests {
     #[test]
     fn receipt_and_expired_bodies_are_what_astream_reads() {
         use astream_wire::{Offset, ReceiptError, ReceiptVerdict, V1Receipt};
-        use std::collections::BTreeSet;
         const T: u64 = 1_700_000_000_999;
-        let aterm_words: BTreeSet<&str> = crate::body::VERDICTS.into_iter().collect();
-        let astream_words: BTreeSet<&str> =
-            ReceiptVerdict::ALL.iter().map(|v| v.as_str()).collect();
-        assert_eq!(
-            aterm_words.len(),
-            crate::body::VERDICTS.len(),
-            "no word twice"
-        );
-        assert_eq!(
-            aterm_words, astream_words,
-            "aterm's verdict words are astream's, both ways"
-        );
         for verdict in ReceiptVerdict::ALL {
             let word = verdict.as_str();
             let wire = receipt_body(T, "s-host", 41, word).encode();
@@ -12721,6 +13365,7 @@ mod tests {
                 presence: Mode::Meta,
                 receipts: true,
                 log: crate::mirror::LogMode::Off,
+                mesh: None,
             })
             .unwrap();
             bridge.attachment = Attachment::Inherited;
@@ -13446,6 +14091,7 @@ mod tests {
             presence: Mode::Meta,
             receipts: true,
             log: crate::mirror::LogMode::Off,
+            mesh: None,
         };
         let printed = format!("{cfg:?}");
         assert!(
@@ -13625,12 +14271,64 @@ mod tests {
     #[test]
     fn the_self_lane_check_accuses_only_inside_the_window_it_remembers() {
         let acked: BTreeSet<u64> = [100, 200, 300].into_iter().collect();
-        assert!(!forged_self(&acked, 200));
-        assert!(forged_self(&acked, 250));
-        assert!(forged_self(&acked, 9_000));
-        assert!(!forged_self(&acked, 99));
-        assert!(!forged_self(&acked, 0));
-        assert!(forged_self(&BTreeSet::new(), 7));
+        for floor in [100, 0] {
+            assert!(!forged_self(&acked, floor, 200), "floor {floor}");
+            assert!(forged_self(&acked, floor, 250), "floor {floor}");
+            assert!(forged_self(&acked, floor, 9_000), "floor {floor}");
+        }
+        assert!(
+            !forged_self(&acked, 100, 99),
+            "below the floor: unknown, not accused"
+        );
+        assert!(!forged_self(&acked, 100, 0));
+        assert!(
+            forged_self(&acked, 0, 99),
+            "a floor below the oldest offset held accuses between them"
+        );
+        assert!(forged_self(&BTreeSet::new(), 0, 7));
+        assert!(
+            !forged_self(&BTreeSet::new(), 12, 7),
+            "below a move's floor"
+        );
+        assert!(forged_self(&BTreeSet::new(), 12, 12));
+    }
+
+    /// **A WINDOW LOADS AT THE FLOOR ITS FILE NAMES, AND AN OLDER BUILD'S AT ITS OLDEST OFFSET**
+    /// (critic item F17's review, `self_window`): a file this build wrote names its floor, which
+    /// loads apart from the offsets it holds; one an older build wrote names none and loads at
+    /// its oldest offset, the floor that build read off it, so it accuses nothing that build did
+    /// not; no file accuses every offset; and past its keep the window's floor rises to the
+    /// oldest it keeps.
+    #[test]
+    fn a_window_loads_at_the_floor_its_file_names_and_an_older_builds_at_its_oldest_offset() {
+        let log = |offsets: &[u64], floor: Option<u64>| crate::state::AckedLog {
+            offsets: offsets.iter().copied().collect(),
+            floor,
+            entries: offsets.len(),
+            appendable: true,
+        };
+        let set = |offsets: &[u64]| offsets.iter().copied().collect::<BTreeSet<u64>>();
+        assert_eq!(self_window(log(&[], None)), (set(&[]), 0), "no file");
+        assert_eq!(
+            self_window(log(&[40, 60], None)),
+            (set(&[40, 60]), 40),
+            "an older build's file, at its oldest offset"
+        );
+        assert_eq!(
+            self_window(log(&[40, 60], Some(0))),
+            (set(&[40, 60]), 0),
+            "this build's, at the floor it names"
+        );
+        assert_eq!(self_window(log(&[], Some(12))), (set(&[]), 12), "a move's");
+        let keep = SELF_ACK_KEEP as u64;
+        let past: Vec<u64> = (10..=10 + keep).collect();
+        for floor in [Some(0), None] {
+            assert_eq!(
+                self_window(log(&past, floor)),
+                ((11..=10 + keep).collect(), 11),
+                "{floor:?}: past its keep, at the oldest kept"
+            );
+        }
     }
 
     #[test]
@@ -14228,6 +14926,15 @@ mod tests {
             sessions: &[(u64, &str)],
             previous: Option<&std::path::Path>,
         ) -> (Self, Bridge) {
+            Self::bridge_configured(sessions, previous, None)
+        }
+
+        /// [`FakeVerbLane::bridge_with_state`], with the mesh on where `mesh` names its paths.
+        fn bridge_configured(
+            sessions: &[(u64, &str)],
+            previous: Option<&std::path::Path>,
+            mesh: Option<crate::federate::MeshPaths>,
+        ) -> (Self, Bridge) {
             use std::io::{BufRead, BufReader, Write};
             let lease = FixtureLease::take();
             let dir = aterm_tempfile::Builder::new()
@@ -14391,7 +15098,7 @@ mod tests {
                                 if let (Some(frame), Some(sid), Some(id)) =
                                     (outbox.lock().unwrap().as_mut(), sid, id)
                                 {
-                                    *frame = without_post(frame, sid, id);
+                                    *frame = without_row(frame, sid, &format!("id={id}"));
                                 }
                             }
                             sent.lock().unwrap().push(line);
@@ -14470,8 +15177,27 @@ mod tests {
                             .split_whitespace()
                             .next()
                             .and_then(|sid| deliver_answers.lock().unwrap().get(sid).cloned());
+                        // A receipt's retirement, refused as aterm refuses it while a seamless
+                        // update commits, or taken out of the outbox it retires.
+                        let receipt = rest
+                            .split_whitespace()
+                            .find_map(|word| word.strip_prefix("receipt="));
+                        let refused = receipt.is_some()
+                            && retirements_refused.load(std::sync::atomic::Ordering::SeqCst);
+                        if answer.is_none()
+                            && !refused
+                            && outbox_retires.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            let sid = rest.split_whitespace().next();
+                            if let (Some(frame), Some(sid), Some(rid)) =
+                                (outbox.lock().unwrap().as_mut(), sid, receipt)
+                            {
+                                *frame = without_row(frame, sid, &format!("rid={rid}"));
+                            }
+                        }
                         match (answer, off) {
                             (Some(answer), _) => answer,
+                            (None, _) if refused => "ERR busy update-committing\n".to_string(),
                             (None, Some(off)) => {
                                 let mut ring = delivered.lock().unwrap();
                                 let id = match ring.iter().position(|have| *have == off) {
@@ -14541,6 +15267,7 @@ mod tests {
                 presence: Mode::default(),
                 receipts: true,
                 log: crate::mirror::LogMode::Off,
+                mesh,
             })
             .expect("a bridge on the fake lane");
             assert_eq!(bridge.attachment, Attachment::Observer);
@@ -15967,7 +16694,7 @@ mod tests {
             let (seq, off) = published[0];
             bridge.close_subscriptions();
             bridge.conn = None;
-            bridge.self_acked = bridge.state.self_acked();
+            bridge.load_self_window();
             bridge.set_aside_torn_state();
             bridge.retire_in_flight_state();
             bridge.begin_run();
@@ -16238,7 +16965,7 @@ mod tests {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while bridge.mailbox.paused(Source::Inbox).is_none() {
             assert!(Instant::now() < deadline, "the inbox reader never paused");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert_eq!(
             bridge.mailbox.paused(Source::Inbox),
@@ -17233,6 +17960,127 @@ mod tests {
         }
     }
 
+    /// The offsets `lane` handed `sid` a receipt's answer at (`kind=ack`).
+    #[cfg(unix)]
+    fn answers_delivered(lane: &FakeVerbLane, sid: &str) -> BTreeSet<String> {
+        let head = format!("deliver {sid} ");
+        lane.deliveries()
+            .iter()
+            .filter(|l| l.starts_with(&head) && l.split_whitespace().any(|w| w == "kind=ack"))
+            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("off=")))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// **A LANDED RECEIPT ATERM STILL OWES IS NOT DELIVERED BEFORE ITS RETRY** (critic item F15):
+    /// aterm answers the receipt's `deliver <sid> receipt=<rid>` with `ERR busy
+    /// update-committing` (aterm-gui-fabric's `deliver_receipt` while a seamless update's commit
+    /// fences retirements), so the receipt stays owed at its pin. Its in-flight entry stands and
+    /// the live tail holds its record back. The next attach's replay reads the record back where
+    /// it landed, its drain's retry finds it there and retires the receipt, and aterm's `OK`
+    /// ends the entry: the asker is handed the answer once, and the bus holds it once. Its offset
+    /// is remembered as this node's own from the first attempt on (`Landing::remembers` keeps an
+    /// own receipt's, the reverse of
+    /// `a_receipt_onto_a_persons_lane_lands_without_an_acked_write`). NEGATIVE
+    /// CONTROL: the entry ended at the ack, as every build before F15 ended it, lets the tail
+    /// hand the answer over while aterm still owes the receipt, which a retry past a cut that
+    /// gave the record up lands a second time (the sim's seed 515,
+    /// `sim::tests::a_landed_receipts_entry_stands_until_aterm_retired_it`). The sim's endpoint
+    /// never answers busy, so only this test covers that path.
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
+        for control in [false, true] {
+            let case = format!("control={control}");
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ReceiptRetiredAtAck);
+            }
+            let (a, _broker, _server) = serve_log(&lane, &format!("owed-receipt-{control}"));
+            bridge.cfg.broker = a;
+            assert!(bridge.attach_broker(), "{case}: the first attach");
+            lane.refuse_retirements(true);
+            *lane.outbox.lock().unwrap() =
+                Some("receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n".to_string());
+            bridge.drain_outbox();
+            let pin = bridge
+                .state
+                .receipt_pin("s-b", 1)
+                .unwrap()
+                .expect("the receipt's pin stays while aterm still owes it");
+            let face = pin.identity.as_ref().unwrap().subject.clone();
+            let (rows, _) = bridge.conn_now().unwrap().fetch(0, &face, 1).unwrap();
+            let on_bus = rows.first().expect("the answer on the bus").0;
+            assert_eq!(
+                bridge.state.in_flight().unwrap().len(),
+                usize::from(!control),
+                "{case}: the entry stands while aterm still owes the receipt"
+            );
+            // Its offset is this node's own ahead of its retirement, in memory and on disk
+            // (`Bridge::land_group`'s first step, `Landing::remembers`): an own receipt that
+            // step skipped would leave the next bridge, once its entry ended, an own record
+            // neither in flight nor known as its own, which it refuses as forged.
+            assert!(
+                bridge.self_acked.contains(&on_bus)
+                    && bridge.state.self_acked_log().offsets.contains(&on_bus),
+                "{case}: the own receipt's offset @{on_bus} is remembered as this node's own"
+            );
+            assert!(
+                offer_live_record(&mut bridge, on_bus),
+                "{case}: the live tail reached the answer"
+            );
+            assert_eq!(
+                answers_delivered(&lane, "s-a").contains(&format!("off={on_bus}")),
+                control,
+                "{case}: the answer handed to s-a while aterm still owed the receipt"
+            );
+            bridge.close_subscriptions();
+            bridge.conn = None;
+
+            lane.refuse_retirements(false);
+            lane.retire_from_outbox();
+            assert!(
+                bridge.attach_broker(),
+                "{case}: the attach after the commit"
+            );
+            bridge.drain_outbox();
+            let (mut writer, _) = bridge.connect().unwrap();
+            let sentinel_face = format!(
+                "/f/{}/in/{}/s-a/h-writer/note",
+                bridge.cfg.fleet, bridge.node
+            );
+            let (sentinel, _) = writer
+                .publish(81, 1, &sentinel_face, b"v=1 t=1 text=sentinel")
+                .unwrap();
+            assert!(
+                offer_live_record(&mut bridge, sentinel),
+                "{case}: the live tail reached the sentinel"
+            );
+            assert!(
+                bridge.state.in_flight().unwrap().is_empty(),
+                "{case}: aterm's OK ended the entry"
+            );
+            assert!(
+                bridge.state.receipt_pin("s-b", 1).unwrap().is_none(),
+                "{case}: the reservation went with the receipt"
+            );
+            let (answers, _) = bridge.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+            assert_eq!(
+                answers.iter().map(|(off, _, _)| *off).collect::<Vec<_>>(),
+                vec![on_bus],
+                "{case}: the answer on the bus once"
+            );
+            assert_eq!(
+                answers_delivered(&lane, "s-a"),
+                [format!("off={on_bus}")].into(),
+                "{case}: s-a handed the answer at its one offset: {:?}",
+                lane.deliveries()
+            );
+            bridge.close_subscriptions();
+        }
+    }
+
     /// **A SUCCESSOR ATTACHES ONCE AFTER ATERM WENT AWAY DURING A LANDED POST'S RETIREMENT** (E07
     /// review): the first bridge's `outbox sent` meets aterm gone, so the post's in-flight entry
     /// stands. The successor's replay holds the record, and its drain's retry reads the record
@@ -17285,6 +18133,366 @@ mod tests {
         bridge.close_subscriptions();
     }
 
+    /// **A SUCCESSOR ATTACHES ONCE AFTER ATERM WENT AWAY DURING A LANDED RECEIPT'S RETIREMENT**
+    /// (critic item F15): the first bridge's `deliver <sid> receipt=<rid>` meets aterm gone, so
+    /// the receipt's in-flight entry stands, as a post's does. The successor's replay holds the
+    /// record, and its drain's retry finds it at the receipt's pin and retires the receipt:
+    /// aterm's `OK` there ends the entry, so the attach's refill hands the asker the answer once
+    /// and the attach goes on. A read back that ended no entry would leave the refill to meet
+    /// the record held and drop the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_receipts_retirement() {
+        let sessions = [(1, "s-a"), (2, "s-b")];
+        let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+        let state = first.state.root().to_path_buf();
+        let (a, _broker_a, _server_a) = serve_log(&lane, "gone-receipt");
+        first.cfg.broker = a.clone();
+        assert!(first.attach_broker(), "the first bridge's attach");
+        let receipt = "receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n".to_string();
+        *lane.outbox.lock().unwrap() = Some(receipt.clone());
+        lane.hang_up_at("deliver s-b receipt=");
+        first.drain_outbox();
+        assert!(first.aterm_gone(), "the retirement met aterm gone");
+        assert_eq!(
+            first.state.in_flight().unwrap().len(),
+            1,
+            "the landed receipt's entry stands"
+        );
+        first.close_subscriptions();
+        drop(first);
+
+        let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+        bridge.cfg.broker = a;
+        second.retire_from_outbox();
+        *second.outbox.lock().unwrap() = Some(receipt);
+        let links_before = second.links.lock().unwrap().len();
+        assert!(
+            bridge.attach_broker(),
+            "the successor's first attach goes on; links told: {:?}",
+            second.links.lock().unwrap()[links_before..].to_vec()
+        );
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "aterm's OK to the read back's retirement ended the entry"
+        );
+        assert!(
+            second
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("deliver s-b receipt=1 off=") && !l.ends_with("off=-")),
+            "the successor retired the receipt at its offset"
+        );
+        assert_eq!(
+            answers_delivered(&second, "s-a").len(),
+            1,
+            "the successor's attach handed the answer over once: {:?}",
+            second.deliveries()
+        );
+        bridge.close_subscriptions();
+    }
+
+    /// **A RECEIPT ONTO A PERSON'S LANE IS NOT REMEMBERED AS THIS NODE'S OWN** (critic item
+    /// F15, `Landing::remembers`): it lands through a post's steps, and its offset stays out of
+    /// the self-lane log, as every build before F15 kept it out: it journals no entry and is no
+    /// record of this node's lanes, so an `acked` write for it would be one more append that
+    /// guards nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_onto_a_persons_lane_lands_without_an_acked_write() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+        let (a, _broker, _server) = serve_log(&lane, "person-receipt");
+        bridge.cfg.broker = a;
+        assert!(bridge.attach_broker(), "the attach");
+        lane.retire_from_outbox();
+        *lane.outbox.lock().unwrap() =
+            Some("receipt sid=s-a rid=1 off=3 verdict=handled kind=task from=h-x\n".to_string());
+        let acked_before = bridge.self_acked.clone();
+        bridge.drain_outbox();
+        let face = format!("{}/ack", subject::person_lane("f", "h-x", &bridge.node));
+        let (rows, _) = bridge.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+        let [(off, _, _)] = rows.as_slice() else {
+            panic!("the answer on the person's lane once: {rows:?}");
+        };
+        assert!(
+            lane.requests
+                .lock()
+                .unwrap()
+                .contains(&format!("deliver s-a receipt=1 off={off}")),
+            "aterm told the receipt's offset"
+        );
+        assert!(
+            bridge.state.receipt_pin("s-a", 1).unwrap().is_none(),
+            "the reservation went with the receipt"
+        );
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "no entry for a record off this node's lanes"
+        );
+        assert_eq!(
+            bridge.self_acked, acked_before,
+            "the receipt's offset @{off} is not this node's own"
+        );
+        bridge.close_subscriptions();
+    }
+
+    /// **A POST ONTO A PERSON'S LANE OR ANOTHER NODE'S TAKES NO SLOT OF THE SELF-LANE WINDOW**
+    /// (critic item F17, `Landing::remembers`): a co-holder of the node cap writes a record onto
+    /// this node's own lane under its `<src>`, and the node's window, full with its newest
+    /// [`SELF_ACK_KEEP`] own offsets, the oldest just below the forged record, accuses it. A post
+    /// to a person then lands above it, and one to another node's session settles beside it:
+    /// neither offset goes into the self-lane log, in memory or on disk, so the window and its
+    /// floor stay as they were and the forged record offered after them is refused as
+    /// `forged-self`. A post to a session of this node is remembered, as every own record is.
+    /// NEGATIVE CONTROL (`Mutant::WideAckedSet`, every landed post's offset written, as every
+    /// build before F17 wrote it): each post takes a slot, so the full window drops its oldest
+    /// own offset for the person's post, its floor rises past the forged record, and the record
+    /// is delivered as this node's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_window() {
+        for wide in [false, true] {
+            let case = format!("wide={wide}");
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+            if wide {
+                bridge.fx = Fx::os_without(crate::sim::world::Mutant::WideAckedSet);
+            }
+            assert!(bridge.refresh_sessions().is_ok());
+            let (a, _broker, _server) = serve_log(&lane, &format!("wide-acked-{wide}"));
+            bridge.cfg.broker = a;
+            assert!(bridge.attach_broker(), "{case}: the attach");
+            let own_lane = subject::post_lane("f", &bridge.node, "s-r", &bridge.node, "note");
+            let forged_body = b"v=1 t=1 text=forged".to_vec();
+            let (mut forger, _) = bridge.connect().unwrap();
+            let (forged, _) = forger
+                .publish(bridge.producer_id ^ 1, 1, &own_lane, &forged_body)
+                .unwrap();
+            assert!(
+                forged > 0 && bridge.self_acked.is_empty() && bridge.self_floor == 0,
+                "{case}: PRECONDITION: a fresh window below @{forged}: floor {}, {:?}",
+                bridge.self_floor,
+                bridge.self_acked
+            );
+            // The node's newest own records: the oldest just below the forged one, the rest
+            // above every offset this test reaches.
+            let far = 1u64 << 40;
+            let keep = SELF_ACK_KEEP as u64;
+            assert!(
+                bridge
+                    .remember_self_acks(std::iter::once(forged - 1).chain(far..far + keep - 1))
+                    .is_ok(),
+                "{case}: the window filled"
+            );
+            let full = bridge.self_acked.clone();
+            assert!(
+                full.len() == SELF_ACK_KEEP && bridge.window_accuses(forged),
+                "{case}: PRECONDITION: the full window accuses @{forged}"
+            );
+
+            *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "h-x", "to a person"));
+            bridge.drain_outbox();
+            bridge.settle_acks();
+            let person = format!("{}/>", subject::person_lane("f", "h-x", &bridge.node));
+            let (rows, _) = forger.fetch(0, &person, 8).unwrap();
+            let [(to_person, _, _)] = rows.as_slice() else {
+                panic!("{case}: the note on the person's lane once: {rows:?}");
+            };
+            assert!(
+                *to_person > forged
+                    && retirements(&lane).contains(&("s-a".to_string(), 1, Some(*to_person))),
+                "{case}: the person's note landed above @{forged} and was retired: {:?}",
+                retirements(&lane)
+            );
+            let other_lane =
+                subject::post_lane("f", "n-9ee7000000000002", "s-x", &bridge.node, "note");
+            let post = parse_drain(b"post sid=s-a id=2 to=@s-x kind=note len=5\nthere")
+                .posts
+                .remove(0);
+            let identity = publication_identity(&other_lane, b"there");
+            let pin = PublishPin {
+                seq: bridge.next_seq().unwrap(),
+                via_key: false,
+                identity: Some(identity.clone()),
+                original: None,
+                original_off: None,
+                owner: Some(2),
+                at: None,
+            };
+            let to_other = to_person + 1;
+            assert_eq!(
+                bridge.land_alone(Landing {
+                    of: Outboxed::Post(post),
+                    subject: other_lane,
+                    pin,
+                    off: to_other,
+                    deduped: false,
+                    actual: Some(identity),
+                    entry: None,
+                }),
+                PostNext::Moves,
+                "{case}: the other node's post settled"
+            );
+            let (held, floor) = (bridge.self_acked.clone(), bridge.self_floor);
+            let on_disk = bridge.state.self_acked_log();
+            if wide {
+                assert!(
+                    held.contains(&to_other) && !held.contains(&(forged - 1)) && floor > forged,
+                    "{case}: the control writes the posts' offsets, each dropping the window's \
+                     oldest, and the floor rises past @{forged} to {floor}"
+                );
+            } else {
+                assert!(
+                    held == full
+                        && floor == 0
+                        && on_disk.offsets == full
+                        && on_disk.floor == Some(0),
+                    "{case}: no post off this node's lanes is its own: floor {floor}, disk's {:?}",
+                    on_disk.floor
+                );
+            }
+
+            bridge.on_inbox_record(&(forged, own_lane.clone(), forged_body.clone()));
+            bridge.settle_acks();
+            let (accused, delivered) = forged_verdict(&lane, &mut forger, forged);
+            assert_eq!(
+                (accused, delivered),
+                (!wide, wide),
+                "{case}: the forged record @{forged} below the posts: accused {accused}, \
+                 delivered {delivered}; floor {}",
+                bridge.self_floor
+            );
+
+            *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 3, "@s-r", "to a session"));
+            bridge.drain_outbox();
+            bridge.settle_acks();
+            let (rows, _) = forger.fetch(forged + 1, &own_lane, 8).unwrap();
+            let [(own, _, _)] = rows.as_slice() else {
+                panic!("{case}: the note on s-r's lane once: {rows:?}");
+            };
+            assert!(
+                bridge.self_acked.contains(own) && bridge.state.self_acked().contains(own),
+                "{case}: the own post's offset @{own} is remembered, in memory and on disk"
+            );
+            bridge.close_subscriptions();
+        }
+    }
+
+    /// Whether the forged record at `forged` was accused (`undeliverable … reason=forged-self` on
+    /// the node's face) and whether it was delivered.
+    #[cfg(unix)]
+    fn forged_verdict(lane: &FakeVerbLane, reader: &mut Conn, forged: u64) -> (bool, bool) {
+        let delivered = lane.transcript().contains(&format!("deliver {forged}"));
+        let (rows, _) = reader.fetch(0, "/f/f/pub/>", 4096).unwrap();
+        let accused = rows.iter().any(|(_, _, raw)| {
+            let ev = crate::pct::decode(&String::from_utf8_lossy(raw));
+            ev.contains(&format!("undeliverable off={forged} reason=forged-self"))
+        });
+        (accused, delivered)
+    }
+
+    /// **A FRESH WINDOW'S FIRST OWN RECORD MOVES NO FLOOR** (critic item F17's review,
+    /// `self_window`): a node whose window is fresh (its floor 0, so it accuses every offset)
+    /// posts to a person, landed; a co-holder of the node cap then writes a record onto this
+    /// node's own lane under its `<src>`; and the node's first own post lands above it. The
+    /// window holds the own post's offset alone, and its floor, kept apart from what it holds,
+    /// stays 0, in memory and in the `acked` file, which names it, so the window a relaunch
+    /// reads back has it too: the forged record offered after them is refused as `forged-self`.
+    /// Writing every landed post's offset (`Mutant::WideAckedSet`, as every build before F17
+    /// wrote it) puts the person's post in the window too, and the record is refused all the
+    /// same: the own-only window accuses what the wide one did. NEGATIVE CONTROL
+    /// (`Mutant::FloorOffTheOldest`, the floor read off the window's oldest offset, as every
+    /// build before the review read it): the own post's offset is the floor, above the forged
+    /// record, which is delivered as this node's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_windows_first_own_record_moves_no_floor() {
+        use crate::sim::world::Mutant;
+        for (i, mutant) in [
+            None,
+            Some(Mutant::WideAckedSet),
+            Some(Mutant::FloorOffTheOldest),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = format!("{mutant:?}");
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+            if let Some(mutant) = mutant {
+                bridge.fx = Fx::os_without(mutant);
+            }
+            assert!(bridge.refresh_sessions().is_ok());
+            let (a, _broker, _server) = serve_log(&lane, &format!("fresh-floor-{i}"));
+            bridge.cfg.broker = a;
+            assert!(bridge.attach_broker(), "{case}: the attach");
+            assert!(
+                bridge.self_acked.is_empty() && bridge.self_floor == 0,
+                "{case}: PRECONDITION: a fresh window: floor {}, {:?}",
+                bridge.self_floor,
+                bridge.self_acked
+            );
+            let (mut forger, _) = bridge.connect().unwrap();
+
+            *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "h-x", "to a person"));
+            bridge.drain_outbox();
+            bridge.settle_acks();
+            let person = format!("{}/>", subject::person_lane("f", "h-x", &bridge.node));
+            let (rows, _) = forger.fetch(0, &person, 8).unwrap();
+            let [(to_person, _, _)] = rows.as_slice() else {
+                panic!("{case}: the note on the person's lane once: {rows:?}");
+            };
+            let own_lane = subject::post_lane("f", &bridge.node, "s-r", &bridge.node, "note");
+            let forged_body = b"v=1 t=1 text=forged".to_vec();
+            let (forged, _) = forger
+                .publish(bridge.producer_id ^ 1, 1, &own_lane, &forged_body)
+                .unwrap();
+            *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 2, "@s-r", "to a session"));
+            bridge.drain_outbox();
+            bridge.settle_acks();
+            let (rows, _) = forger.fetch(forged + 1, &own_lane, 8).unwrap();
+            let [(own, _, _)] = rows.as_slice() else {
+                panic!("{case}: the note on s-r's lane once: {rows:?}");
+            };
+            assert!(
+                *to_person < forged && forged < *own,
+                "{case}: PRECONDITION: @{to_person} < @{forged} < @{own}"
+            );
+            let want = if mutant == Some(Mutant::WideAckedSet) {
+                BTreeSet::from([*to_person, *own])
+            } else {
+                BTreeSet::from([*own])
+            };
+            let on_disk = bridge.state.self_acked_log();
+            assert_eq!(
+                (
+                    (bridge.self_acked.clone(), bridge.self_floor),
+                    (on_disk.offsets, on_disk.floor)
+                ),
+                ((want.clone(), 0), (want, Some(0))),
+                "{case}: the window and the acked file, the floor 0 apart from what they hold"
+            );
+            bridge.load_self_window();
+            assert_eq!(
+                bridge.self_floor, 0,
+                "{case}: a relaunch's window, read back"
+            );
+
+            bridge.on_inbox_record(&(forged, own_lane.clone(), forged_body.clone()));
+            bridge.settle_acks();
+            let (accused, delivered) = forged_verdict(&lane, &mut forger, forged);
+            let control = mutant == Some(Mutant::FloorOffTheOldest);
+            assert_eq!(
+                (accused, delivered),
+                (!control, control),
+                "{case}: the forged record @{forged} between the posts: accused {accused}, \
+                 delivered {delivered}; window {:?}",
+                bridge.self_acked
+            );
+            bridge.close_subscriptions();
+        }
+    }
+
     /// **AN ANSWER READ AFTER A LANDED POST IS TIMED TO ITS READ** (E07 review): a pass reads a
     /// post's ack, which waits for its group, then another answer, whose conclusion settles the
     /// group first (`Bridge::settled`). That settle's `outbox sent` takes thirty seconds on a
@@ -17311,7 +18519,7 @@ mod tests {
         };
         let subject = format!("/f/f/in/{0}/s-b/{0}/note", bridge.node);
         bridge.landings.push(Landing {
-            post,
+            of: Outboxed::Post(post),
             subject,
             pin,
             off: 4,
@@ -20441,17 +21649,23 @@ mod tests {
         let acked = bridge.state.root().join("acked");
         let state = bridge.state.root().to_path_buf();
         // Whether `acked` took the landed offset by one append (its text grown by that offset
-        // alone, nothing replaced), and how many replaces the drain made.
+        // alone, after the window's floor where the file named none, nothing replaced), and how
+        // many replaces the drain made.
         let post = |lane: &FakeVerbLane, bridge: &mut Bridge, id: u64| {
             *lane.outbox.lock().unwrap() = Some(format!(
                 "post sid=s-a id={id} to=@s-b kind=note len=4\nping"
             ));
             let text = || std::fs::read_to_string(&acked).unwrap_or_default();
             let (before, was) = (bridge.state.ops(), text());
+            let named = if was.contains("floor=") {
+                String::new()
+            } else {
+                format!("floor={},", bridge.self_floor)
+            };
             bridge.drain_outbox();
             let spent = bridge.state.ops() - before;
             let off = retired_off(lane, id);
-            let appended = spent.replaces == 0 && text() == format!("{was}{off},");
+            let appended = spent.replaces == 0 && text() == format!("{was}{named}{off},");
             (off, u64::from(appended), spent.replaces)
         };
         let (first, appends, replaces) = post(&lane, &mut bridge, 1);
@@ -20492,11 +21706,26 @@ mod tests {
         let (_second_lane, bridge) =
             FakeVerbLane::bridge_with_state(&[(1, "s-a"), (2, "s-b")], Some(&state));
         assert_eq!(
-            bridge.self_acked,
-            (window..2 * window).collect::<BTreeSet<u64>>(),
-            "the newest window of a longer log"
+            (bridge.self_acked.clone(), bridge.self_floor),
+            ((window..2 * window).collect::<BTreeSet<u64>>(), window),
+            "the newest window of a longer log an older build wrote, at its oldest kept"
         );
         assert_eq!(bridge.acked_entries, 2 * SELF_ACK_KEEP);
+        drop(bridge);
+
+        std::fs::write(&acked, "7,9,").unwrap();
+        let (_third_lane, mut bridge) =
+            FakeVerbLane::bridge_with_state(&[(1, "s-a"), (2, "s-b")], Some(&state));
+        let before = bridge.state.ops();
+        assert!(bridge.remember_self_ack(11).is_ok());
+        assert_eq!(
+            (
+                (bridge.state.ops() - before).replaces,
+                std::fs::read_to_string(&acked).unwrap()
+            ),
+            (1, "floor=7,7,9,11,".to_string()),
+            "an older build's file, short of its compaction, is replaced whole to name its floor"
+        );
     }
 
     #[cfg(unix)]
@@ -20966,8 +22195,9 @@ mod tests {
             "{resumed:?}"
         );
         assert!(
-            bridge.self_acked.first().is_some_and(|w| *w + 1 >= b_head),
-            "the self-lane window starts at B's head: {:?}",
+            bridge.self_floor >= b_head && bridge.self_acked.first().is_none_or(|w| *w >= b_head),
+            "the self-lane window starts at B's head: floor {}, {:?}",
+            bridge.self_floor,
             bridge.self_acked
         );
         assert!(bridge.deadlines.is_empty() && bridge.asked.is_empty());
@@ -25508,8 +26738,10 @@ mod tests {
         )
     }
 
-    fn without_post(frame: &str, sid: &str, id: &str) -> String {
-        let (sid, id) = (format!("sid={sid}"), format!("id={id}"));
+    /// `frame` without the outbox row of `sid` that names `id` (`id=<n>` for a post, `rid=<n>`
+    /// for a receipt).
+    fn without_row(frame: &str, sid: &str, id: &str) -> String {
+        let sid = format!("sid={sid}");
         let mut kept = String::new();
         let mut rest = frame;
         while let Some((line, tail)) = rest.split_once('\n') {
@@ -25522,7 +26754,7 @@ mod tests {
                 .unwrap_or(0)
                 .min(tail.len());
             let (body, next) = tail.split_at(len);
-            if !(words.contains(&sid.as_str()) && words.contains(&id.as_str())) {
+            if !(words.contains(&sid.as_str()) && words.contains(&id)) {
                 kept.push_str(line);
                 kept.push('\n');
                 kept.push_str(body);
@@ -27252,7 +28484,7 @@ mod tests {
             },
         );
         assert!(
-            forged_self(&bridge.self_acked, off),
+            forged_self(&bridge.self_acked, bridge.self_floor, off),
             "the control: with its ack unread the set calls the node's own post a forgery"
         );
         bridge.on_inbox_record(&(off, lane_of.clone(), raw));
@@ -31120,6 +32352,7 @@ mod tests {
                     presence: Mode::Meta,
                     receipts: true,
                     log: crate::mirror::LogMode::Off,
+                    mesh: None,
                 };
                 // These sentinels are not sockets: a skipped capability check fails at a
                 // different boundary, without waiting for an endpoint that will never reply.
@@ -31229,5 +32462,9 @@ mod tests {
 
     mod roster_count {
         include!("bridge_roster_tests.rs");
+    }
+
+    mod mesh {
+        include!("bridge_federate_tests.rs");
     }
 }

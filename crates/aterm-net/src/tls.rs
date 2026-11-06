@@ -1176,7 +1176,7 @@ mod tests {
                 Instant::now() < filled,
                 "the relay never filled its local end"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(aterm_uds::hangup::hang_up(&line), "the cut shuts the line");
         let over = relayed.recv_timeout(HANG);
@@ -1232,7 +1232,7 @@ mod tests {
                 Instant::now() < filled,
                 "the relay never filled its local end"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         drop(relay_side);
         svc_b.write_all(b"answered\n").unwrap();

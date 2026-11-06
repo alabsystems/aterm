@@ -202,7 +202,7 @@ impl MachineFootprints {
             .filter(|r| r.selection.work == selection.work)
             .filter_map(|r| r.figure(floor, cold).map(|f| (r, f)))
             .collect();
-        let mut covers: Vec<Cover> = same
+        let mut best: Option<Cover> = same
             .iter()
             .filter(|(r, _)| r.selection.holds(selection))
             .map(|(r, f)| Cover {
@@ -212,9 +212,9 @@ impl MachineFootprints {
                 exact: r.selection == *selection,
                 floor,
             })
-            .collect();
+            .min_by_key(|c| (c.bytes, !c.exact, c.selections));
         if let Some(crates) = selection.crates.as_ref().filter(|c| !c.is_empty()) {
-            let mut picked: Vec<usize> = Vec::new();
+            let mut picked: Vec<usize> = Vec::with_capacity(crates.len());
             let all = crates.iter().all(|name| {
                 let cheapest = same
                     .iter()
@@ -230,7 +230,7 @@ impl MachineFootprints {
                 cheapest.is_some()
             });
             if all {
-                covers.push(Cover {
+                let candidate = Cover {
                     bytes: picked
                         .iter()
                         .fold(0u64, |sum, i| sum.saturating_add(same[*i].1)),
@@ -238,12 +238,16 @@ impl MachineFootprints {
                     runs: picked.iter().map(|i| same[*i].0.runs.len()).sum(),
                     exact: false,
                     floor,
-                });
+                };
+                if best.as_ref().is_none_or(|b| {
+                    (candidate.bytes, !candidate.exact, candidate.selections)
+                        < (b.bytes, !b.exact, b.selections)
+                }) {
+                    best = Some(candidate);
+                }
             }
         }
-        covers
-            .into_iter()
-            .min_by_key(|c| (c.bytes, !c.exact, c.selections))
+        best
     }
 
     /// The record as the file holds it, schema [`SCHEMA`]: each selection's work, its crates
@@ -394,7 +398,16 @@ impl MachineFootprints {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
-        options.open(&staged)?.write_all(encoded.as_bytes())?;
+        let mut file = options.open(&staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        file.write_all(encoded.as_bytes())?;
+        drop(file);
         std::fs::rename(&staged, path)
     }
 

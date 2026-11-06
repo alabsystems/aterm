@@ -430,7 +430,7 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
             started.elapsed() < Duration::from_secs(60),
             "pid {pid} never ran /bin/sleep"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     let shell = read_identity(i32::try_from(launcher.id()).expect("a pid"))
         .expect("the launcher reads while it waits on its stdin");

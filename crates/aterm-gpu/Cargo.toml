@@ -103,12 +103,14 @@ aterm-models-render = { workspace = true }
 aterm-effects = { workspace = true }
 # The frame records (`frame_record_tests`) hold each frame by its SHA-256.
 aterm-digest = { workspace = true }
+# A test's poll pauses with `aterm_uds::deadline::poll_yield` (clippy.toml: a wait
+# that wakes); the GL arm's windowed X11 test (`gl::glx`) runs its work in a child.
+aterm-uds = { workspace = true }
 
 # The GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test
 # binary run again, with its output in a scratch directory: Xlib's error and IO
 # handlers are process-wide.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-aterm-uds = { workspace = true }
 aterm-tempfile = { workspace = true }
 
 # `benches/quiet_commit.rs` reads its own footprint (`proc_pid_rusage`).

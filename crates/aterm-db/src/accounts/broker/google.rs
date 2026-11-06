@@ -104,11 +104,12 @@ fn prepare(adapter: &str, bytes: &[u8], deadline: Instant) -> io::Result<Prepare
     }
     let prompt = std::str::from_utf8(input.prompt.expose()).map_err(|_| refused())?;
     let escaped = Zeroizing::new(aterm_json::quoted_string(prompt).map_err(|_| refused())?);
+    use std::io::Write as _;
     let mut body = Zeroizing::new(Vec::with_capacity(escaped.len() + 200));
     body.extend_from_slice(br#"{"contents":[{"role":"user","parts":[{"text":"#);
     body.extend_from_slice(&escaped);
     body.extend_from_slice(br#"}]}],"generationConfig":{"candidateCount":1,"maxOutputTokens":"#);
-    body.extend_from_slice(input.max_output_tokens.to_string().as_bytes());
+    let _ = write!(&mut *body, "{}", input.max_output_tokens);
     body.extend_from_slice(br#", "responseModalities":["TEXT"]}}"#);
     if Instant::now() >= deadline {
         return Err(refused());
@@ -145,7 +146,7 @@ fn perform(
         .exchange(Body::Bytes(prepared.body.expose()))
         .ok()?;
     let status = response.status();
-    let mut body = Zeroizing::new(Vec::with_capacity(RESPONSE_MAX + 1));
+    let mut body = Zeroizing::new(Vec::with_capacity(4096));
     response
         .into_body()
         .take((RESPONSE_MAX + 1) as u64)

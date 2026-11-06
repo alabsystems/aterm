@@ -36,8 +36,8 @@ const TABLE_BURST: usize = 4;
 /// How many times a round reads its local state before state that keeps moving is its answer
 /// ([`Round::local`]).
 const LOCAL_READS: usize = 4;
-const PROBE: &[u8] = b"ACTP3";
-const READY: &[u8] = b"ACTA3";
+const PROBE: &[u8; 5] = b"ACTP3";
+const READY: &[u8; 5] = b"ACTA3";
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeMismatch {
@@ -1453,7 +1453,7 @@ impl Round<'_> {
     }
 
     #[cfg(test)]
-    fn receive_probe(&self, stream: &mut impl Read, tag: &[u8]) -> Result<()> {
+    fn receive_probe(&self, stream: &mut impl Read, tag: &[u8; 5]) -> Result<()> {
         self.receive_probe_value(stream, tag, &self.observation, None)
             .map(|_| ())
             .map_err(ProbeFailure::into_error)
@@ -1462,27 +1462,30 @@ impl Round<'_> {
     fn send_probe_value(
         &self,
         stream: &mut impl Write,
-        tag: &[u8],
+        tag: &[u8; 5],
         value: &[u8; 64],
     ) -> Result<()> {
-        control::send_frame(stream, &[tag, value].concat())
+        let mut frame = [0; 69];
+        frame[..5].copy_from_slice(tag);
+        frame[5..].copy_from_slice(value);
+        control::send_frame(stream, &frame)
     }
 
     fn receive_probe_value(
         &self,
         stream: &mut impl Read,
-        tag: &[u8],
+        tag: &[u8; 5],
         expected: &[u8; 64],
         alternate: Option<[u8; 64]>,
     ) -> std::result::Result<[u8; 64], ProbeFailure> {
         let mut size = [0; 4];
         stream.read_exact(&mut size).map_err(ProbeFailure::io)?;
-        if u32::from_le_bytes(size) as usize != tag.len() + 64 {
+        let mut frame = [0; 69];
+        if u32::from_le_bytes(size) as usize != frame.len() {
             return Err(ProbeFailure::Mismatch(ProbeMismatch::Malformed));
         }
-        let mut frame = vec![0; tag.len() + 64];
         stream.read_exact(&mut frame).map_err(ProbeFailure::io)?;
-        let value: [u8; 64] = frame[tag.len()..].try_into().expect("fixed probe length");
+        let value: [u8; 64] = frame[5..].try_into().expect("fixed probe length");
         if let Err(mismatch) = validate_probe(&frame, tag, expected) {
             match mismatch {
                 ProbeMismatch::History { .. } if alternate == Some(value) => {}
@@ -1524,9 +1527,8 @@ impl Round<'_> {
         needs: &BTreeSet<Digest>,
         report: &mut Report,
     ) -> Result<()> {
-        let keys = self.local(peer, |session| {
-            session.handoffs(peer, &needs.iter().copied().collect::<Vec<_>>())
-        })?;
+        let requested: Vec<_> = needs.iter().copied().collect();
+        let keys = self.local(peer, |session| session.handoffs(peer, &requested))?;
         for key in keys {
             stream.write_all(&[u8::from(key.is_some())])?;
             if let Some(key) = key {
@@ -1619,7 +1621,7 @@ impl Round<'_> {
                     sampled_at,
                 },
                 known,
-                offered: store.replication_inventory(session)?.copied().collect(),
+                offered: store.replication_inventory_unchecked().copied().collect(),
             }))
         });
         Self::table_read(read, refusal, cause)
@@ -1714,7 +1716,7 @@ impl Round<'_> {
         let prepare = |session: &Session<'_>| {
             self.prepare_batch(session, id, &proofs, |session, store, key| {
                 store
-                    .proof_wire(session, key)?
+                    .proof_wire_unchecked(session, key)?
                     .ok_or_else(|| Error::new("table conflict disappeared"))
             })
         };
@@ -1826,9 +1828,9 @@ impl Round<'_> {
             repair.records.insert(id, *last);
         }
         let prepare = |session: &Session<'_>| {
-            self.prepare_batch(session, id, &ids, |session, store, key| {
+            self.prepare_batch(session, id, &ids, |_, store, key| {
                 store
-                    .wire(session, key)?
+                    .wire_unchecked(key)
                     .map(ToOwned::to_owned)
                     .ok_or_else(|| Error::new("table record disappeared"))
             })
@@ -2017,10 +2019,12 @@ impl Round<'_> {
                 }
             }
         }
+        let mut receipts = Vec::with_capacity(wires.len() * 33);
         for ((record, _), accepted) in wires.iter().zip(verdicts) {
-            stream.write_all(record)?;
-            stream.write_all(&[u8::from(accepted)])?;
+            receipts.extend_from_slice(record);
+            receipts.push(u8::from(accepted));
         }
+        stream.write_all(&receipts)?;
         stream.flush()?;
         Ok(())
     }
@@ -2030,12 +2034,13 @@ fn cycle<const N: usize>(
     ids: &BTreeSet<[u8; N]>,
     after: Option<[u8; N]>,
 ) -> impl Iterator<Item = &[u8; N]> {
-    ids.iter()
-        .filter(move |id| after.is_none_or(|after| **id > after))
-        .chain(
-            ids.iter()
-                .filter(move |id| after.is_some_and(|after| **id <= after)),
-        )
+    use std::ops::Bound::{Excluded, Unbounded};
+    let tail = match after {
+        Some(after) => ids.range((Excluded(after), Unbounded)),
+        None => ids.range::<[u8; N], _>(..),
+    };
+    let head = after.into_iter().flat_map(move |after| ids.range(..=after));
+    tail.chain(head)
 }
 /// `local` with the clock mark of `wall` (ms) where one is given and the list has room for it
 /// below [`MAX_TABLES`], which every receiver since 0.145 enforces (`receive_ids`): a full list
@@ -2079,10 +2084,12 @@ fn send_ids<const N: usize>(
     if ids.len() > max {
         return Err(Error::new("application inventory exceeds its bound"));
     }
-    stream.write_all(&(ids.len() as u32).to_le_bytes())?;
+    let mut frame = Vec::with_capacity(4 + ids.len() * N);
+    frame.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for id in ids {
-        stream.write_all(id)?;
+        frame.extend_from_slice(id);
     }
+    stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
@@ -2091,14 +2098,16 @@ fn receive_ids<const N: usize>(stream: &mut impl Read, max: usize) -> Result<BTr
     if n > max {
         return Err(Error::new("application inventory exceeds its bound"));
     }
+    let mut wire = vec![0; n * N];
+    stream.read_exact(&mut wire)?;
     let mut ids = BTreeSet::new();
-    for _ in 0..n {
-        let mut id = [0; N];
-        stream.read_exact(&mut id)?;
-        if ids.last().is_some_and(|last| last >= &id) {
+    let mut previous: Option<[u8; N]> = None;
+    for id in wire.as_chunks::<N>().0 {
+        if previous.is_some_and(|last| &last >= id) {
             return Err(Error::new("application inventory is not sorted and unique"));
         }
-        ids.insert(id);
+        previous = Some(*id);
+        ids.insert(*id);
     }
     Ok(ids)
 }

@@ -63,7 +63,9 @@ impl Want<'_> {
     /// new directory and never rewrites one a booted VM read.
     #[must_use]
     pub fn key(&self) -> String {
-        let short = |s: &str| s.get(..16).unwrap_or(s).to_string();
+        fn short(s: &str) -> &str {
+            s.get(..16).unwrap_or(s)
+        }
         format!("{}-{}", short(self.image.sha256), short(self.initrd.sha256))
     }
 }
@@ -237,7 +239,8 @@ pub fn lay(dir: &Path, vmlinuz: &Path, initrd: &Path, want: &Want<'_>) -> Result
             dir.display()
         )));
     }
-    let dest = dir.join(want.key());
+    let key = want.key();
+    let dest = dir.join(&key);
     let kernel = Kernel {
         image: dest.join(IMAGE),
         initrd: dest.join(INITRD),
@@ -284,7 +287,7 @@ pub fn lay(dir: &Path, vmlinuz: &Path, initrd: &Path, want: &Want<'_>) -> Result
         }
         aterm_durable::durable_dir(dir).map_err(|e| io("flush", dir, &e))?;
     }
-    reclaim(dir, &want.key());
+    reclaim(dir, &key);
     Ok(kernel)
 }
 

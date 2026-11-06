@@ -729,8 +729,8 @@ fn with_repositories() -> Plan {
     Plan::from(selection)
 }
 
-/// One console account, in no vault, at `home` on an inert machine whose GitHub answers with
-/// nothing to clone, with the GitHub token this Mac signs in with there or not (`token`).
+/// One console account, in no vault, with an explicit personal GitHub profile at `home` on an
+/// inert machine whose GitHub answers with nothing to clone, with its token present or not.
 fn github(home: &Path, token: bool) -> (aterm_machines::port::Fake, aterm_machines::items::Ctx) {
     use aterm_machines::items::Ctx;
     use aterm_machines::model::{HostFacts, User};
@@ -762,6 +762,12 @@ fn github(home: &Path, token: bool) -> (aterm_machines::port::Fake, aterm_machin
         sys.file(&token, TOKEN.as_bytes())
             .stat_of(&token, stat(false, TOKEN.len() as u64));
     }
+    let profile = home.join(".config/aterm/init.toml");
+    let contents = b"[github]\naccount='tester'\nowner='tester'\n";
+    sys.file(profile.to_str().unwrap(), contents).stat_of(
+        profile.to_str().unwrap(),
+        stat(false, contents.len() as u64),
+    );
     for (endpoint, body) in [
         ("/user", aterm_json::json!({"login": "tester"})),
         (
@@ -808,7 +814,7 @@ fn github(home: &Path, token: bool) -> (aterm_machines::port::Fake, aterm_machin
 
 /// On a Mac outside ALab whose plan sets up GitHub repositories, a Secrets try that left the ALab
 /// vault off this network (nobody answered, or a server there holds none) has the Repositories
-/// stage run on this Mac's own GitHub credentials, and the row reads them so: in place with a
+/// stage run on its explicit personal GitHub profile, and the row reads them so: in place with a
 /// token of the Mac's own, read from GitHub, and waiting for the vault's token, as the stage does,
 /// only with none. Where that try says nothing, on another network, the row waits for the vault's
 /// token as the stage does there, asking GitHub nothing.
@@ -900,7 +906,7 @@ fn swarm_off_leaves_the_vault_row_settled_not_a_change_to_make() {
     assert_eq!(vault_row(false, unjoined).standing, Standing::Differs);
 }
 
-/// With `[swarm] enabled = false` the Repositories stage runs on this Mac's own GitHub token
+/// With `[swarm] enabled = false` the Repositories stage runs on its explicit personal profile
 /// ([`vault_not_here`]: the Secrets stage's one row says the switch is off), so the row reads them
 /// so where nothing was heard at the ALab vault's address: in place with a token of the Mac's own,
 /// read from GitHub, and waiting for the vault's token, as the stage does, only with none. With the

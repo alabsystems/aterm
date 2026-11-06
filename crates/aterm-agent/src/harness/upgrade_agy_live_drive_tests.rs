@@ -11,6 +11,7 @@ use crate::harness::relaunch::ended_by_restart;
 use crate::harness::upgrade::Request;
 use crate::harness::upgrade_agy_live::{self as pure, Look, Message, STATUS_IDLE};
 use crate::harness::upgrade_drive::build_start::{NamedProbe, PROBE, Probe};
+use crate::harness::upgrade_drive::load;
 use crate::harness::upgrade_drive::{Ask, ask_for};
 use crate::harness::upgrade_drive::{Due, LiveTab, descendants_in};
 
@@ -1404,7 +1405,7 @@ fn a_claim_that_cannot_be_written_signals_nothing() {
         std::fs::read(&kept).expect("destination retained"),
         b"keep the existing destination"
     );
-    assert_eq!(refused.step, "wait:claim-unwritten", "{refused:?}");
+    assert_eq!(refused.step, "wait:record-unreadable", "{refused:?}");
     assert!(
         blocked.asked("signal").is_empty() && blocked.asked("turn").is_empty(),
         "AGY_CLAIM_MUST_BE_WRITTEN_BEFORE_SIGNAL: {refused:?}"

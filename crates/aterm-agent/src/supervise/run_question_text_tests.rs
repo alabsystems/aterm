@@ -419,6 +419,106 @@ fn a_land_text_the_dialog_never_took_gets_the_recommended_option() {
     );
 }
 
+/// A TEXT REFUSED BEFORE ITS WRITE IS NEVER TRIED AGAIN: the loop's one move toward the free-text
+/// row lands two rows down, so the text is refused before any `send` ("the focus did not land on
+/// the row it was moved to"); under every text priority (Land's, by its Autopilot, and the
+/// long-term and short-term words) the tab then falls back outright (`policy_text_unconfirmed`)
+/// and its recommended option is pressed under that priority's rule, no `send` ever made and never
+/// a person's. MUTANT: the tab not remembered as fallen back, which writes the text on the next
+/// pass.
+#[test]
+fn a_policy_text_refused_before_its_write_falls_back_and_is_never_sent() {
+    const MISSED: &str = "the focus did not land on the row it was moved to";
+    let red = guarded("❯ 1. Red (Recommended)");
+    for (autopilot, word, text, rule) in [
+        (Some("land"), LONG, LAND_TEXT, RULE_ANSWER_LAND),
+        (None, LONG, LONG_TERM_TEXT, RULE_ANSWER_LONG_TERM),
+        (None, SHORT, SHORT_TERM_TEXT, RULE_ANSWER_SHORT_TERM),
+    ] {
+        let (opt1, opt2, free, _) = single_screens(text);
+        let mut m = texting(vec![opt1.clone(), free, opt2, opt1, idle_screen()]);
+        m.key_gates = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
+        m.autopilot = autopilot;
+        let book = Book::new("text-unreached");
+        {
+            let mut s = session(&mut m, None);
+            s.set_approval_env(owner_env());
+            book.keep(&mut s);
+            s.supervise(&answering_by(word)).expect("supervise");
+        }
+        let (lines, rows) = (book.escalated(), ledger_rows(&book.path));
+        assert!(sends(&m).is_empty(), "{rule} never sent: {:#?}", m.requests);
+        let presses = m.presses();
+        assert!(
+            presses
+                .last()
+                .is_some_and(|p| p.ends_with(" enter") && p.contains(&red)),
+            "{rule}: {presses:#?} {lines:#?} {rows:#?}"
+        );
+        assert!(lines.is_empty(), "{rule} never a person's: {lines:#?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("\"rule_id\":\"{rule}\""))
+                    && r.contains("\"decision\":\"skipped\"")
+                    && r.contains(MISSED)),
+            "{rule}: {rows:#?}"
+        );
+    }
+}
+
+/// A NOTE THE LOOP WROTE STAYS A PERSON'S: under every text priority, Muse Code's notes field
+/// never draws the note the loop wrote, so the note's press ends unconfirmed ("the question did
+/// not show the …"), and the dialog is handed over as that press left it, never decided again: an
+/// Enter on that field would send what it holds (`policy_text_unconfirmed`). CONTROL: Claude
+/// Code's free-text row is decided again where its text was not taken
+/// ([`a_land_text_the_dialog_never_took_gets_the_recommended_option`]). MUTANT: a written note
+/// decided again.
+#[test]
+fn a_note_the_loop_wrote_is_handed_over_never_decided_again() {
+    use aterm_phase::muse::fixtures as u;
+    for (autopilot, word, text) in [
+        (Some("land"), LONG, LAND_TEXT),
+        (None, LONG, LONG_TERM_TEXT),
+        (None, SHORT, SHORT_TERM_TEXT),
+    ] {
+        let mut m = texting(vec![
+            cx(u::QUESTION),
+            cx(u::QUESTION_DOWN),
+            cx(u::QUESTION_NONE),
+            cx(u::QUESTION_NOTE_OPEN),
+        ]);
+        m.program = "muse";
+        m.autopilot = autopilot;
+        let book = Book::new("muse-note-undrawn");
+        {
+            let mut s = session(&mut m, None);
+            s.set_approval_env(owner_env());
+            book.keep(&mut s);
+            s.supervise(&answering_by(word)).expect("supervise");
+        }
+        let (lines, rows) = (book.escalated(), ledger_rows(&book.path));
+        assert_eq!(
+            m.writes(),
+            [
+                "down".to_string(),
+                "down".to_string(),
+                "tab".to_string(),
+                format!("text:{text}"),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert!(
+            lines.len() == 1 && lines[0].contains("the question did not show the"),
+            "{text}: {lines:#?} {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("decided again")),
+            "{rows:#?}"
+        );
+    }
+}
+
 #[test]
 fn cruise_text_refusal_uses_the_recommendation_without_overwriting_a_person() {
     let red = guarded("❯ 1. Red (Recommended)");

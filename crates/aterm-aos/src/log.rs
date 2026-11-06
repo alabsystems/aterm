@@ -227,8 +227,8 @@ impl fmt::Display for LogFault {
             LogFault::Ancestor { expected, found } => write!(
                 f,
                 "the log extends checkpoint {}, not the checkpoint {} beside it",
-                found.short(),
-                expected.short()
+                found.short_display(),
+                expected.short_display()
             ),
             LogFault::SealCount { sealed, found } => write!(
                 f,
@@ -237,8 +237,8 @@ impl fmt::Display for LogFault {
             LogFault::SealDigest { sealed, found } => write!(
                 f,
                 "the log's seal names digest {} and its events digest to {}",
-                sealed.short(),
-                found.short()
+                sealed.short_display(),
+                found.short_display()
             ),
             LogFault::Kind { at, kind } => {
                 write!(
@@ -582,9 +582,26 @@ impl<S: Schema> EventLog<S> {
             }));
         }
         let mut inputs = Vec::with_capacity(events.len());
+        let mut again = Enc::new();
+        let mut seal_hasher = seal.as_ref().map(|_| {
+            let from = header.first_cursor;
+            let to = from.saturating_add(n);
+            let mut b = DigestBuilder::new(TRACE_DOMAIN);
+            b.part(&schema.id().digest.0);
+            b.part(&header.identity.digest().0);
+            b.part(&header.ancestor.0);
+            b.part(&header.log_epoch.to_le_bytes());
+            b.part(&from.to_le_bytes());
+            b.part(&to.to_le_bytes());
+            b
+        });
         for (step, range) in events {
             let body = bytes.get(range.clone()).ok_or(LogFault::MissingHeader)?;
-            inputs.push(read_event(schema, *step, body)?);
+            let (input, encoded) = read_event(schema, *step, body, &mut again)?;
+            if let Some(b) = &mut seal_hasher {
+                b.part(encoded);
+            }
+            inputs.push(input);
         }
         let mut log = EventLog {
             header,
@@ -609,7 +626,9 @@ impl<S: Schema> EventLog<S> {
         if sealed != n {
             return Err(LogFault::SealCount { sealed, found: n });
         }
-        let found = log.seal_digest(schema);
+        let found = seal_hasher
+            .map(DigestBuilder::finish)
+            .unwrap_or_else(|| log.seal_digest(schema));
         if digest != found {
             return Err(LogFault::SealDigest {
                 sealed: digest,
@@ -702,7 +721,12 @@ fn read_seal(step: u64, body: &[u8]) -> Result<(u64, Digest), LogFault> {
     Ok((count, digest))
 }
 
-fn read_event<S: Schema>(schema: &S, step: u64, body: &[u8]) -> Result<S::Input, LogFault> {
+fn read_event<'a, S: Schema>(
+    schema: &S,
+    step: u64,
+    body: &'a [u8],
+    again: &mut Enc,
+) -> Result<(S::Input, &'a [u8]), LogFault> {
     let mut d = Dec::new(body);
     let version = d.u8("record.version")?;
     if version != RECORD_VERSION {
@@ -715,10 +739,11 @@ fn read_event<S: Schema>(schema: &S, step: u64, body: &[u8]) -> Result<S::Input,
     let rest = body.get(d.position()..).unwrap_or(&[]);
     let input = schema.decode_input(&mut d)?;
     d.finish()?;
-    let mut again = Enc::with_capacity(rest.len());
-    schema.encode_input(&input, &mut again);
+    again.clear();
+    again.reserve(rest.len());
+    schema.encode_input(&input, again);
     if again.as_bytes() != rest {
         return Err(LogFault::Wire(WireFault::NonCanonical { field: "event" }));
     }
-    Ok(input)
+    Ok((input, rest))
 }

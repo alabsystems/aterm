@@ -477,8 +477,7 @@ impl Session {
                 })?;
             }
             Authentication::OAuth { .. } => {
-                let raw_xoauth2 =
-                    zeroize::Zeroizing::new(authentication.xoauth2().ok_or("Missing OAuth token")?);
+                let raw_xoauth2 = authentication.xoauth2().ok_or("Missing OAuth token")?;
                 let encoded = zeroize::Zeroizing::new(
                     aterm_codec::base64::encode(raw_xoauth2.as_bytes())
                         .map_err(|e| e.to_string())?,
@@ -497,9 +496,8 @@ impl Session {
                         challenged = true;
                         break;
                     }
-                    let text = String::from_utf8_lossy(&line)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_owned();
+                    let raw = String::from_utf8_lossy(&line);
+                    let text = raw.trim_end_matches(['\r', '\n']);
                     if let Some(status) = text.strip_prefix(&tag_prefix) {
                         if status
                             .split_whitespace()
@@ -560,16 +558,18 @@ impl Session {
         let mut size = 0usize;
         let tag_prefix = format!("{tag} ");
         loop {
-            let line = self.wire.line()?;
+            let mut line = self.wire.line()?;
             size = size
                 .checked_add(line.len())
                 .ok_or("IMAP response too large")?;
             if size > crate::wire::MAX_MESSAGE {
                 return Err("IMAP response too large".into());
             }
-            let text = String::from_utf8_lossy(&line)
-                .trim_end_matches(['\r', '\n'])
-                .to_owned();
+            while line.last().is_some_and(|b| matches!(*b, b'\r' | b'\n')) {
+                line.pop();
+            }
+            let text = String::from_utf8(line)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
             if let Some(status) = text.strip_prefix(&tag_prefix) {
                 if status
                     .split_whitespace()

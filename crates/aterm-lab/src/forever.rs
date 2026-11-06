@@ -376,8 +376,23 @@ const SCROLL_HELD_MS: i64 = 10_000;
 /// recheck is 5 s at the most) and decided there, long before the first point's due.
 pub const SCROLL_WATCH_MS: i64 = 40_000;
 
-/// F3's reply to its tool's result: no words, so the turn ends on the tool's row ([`read_call`]).
+/// F3's reply to its tool's result: no words, so the turn ends on the tool's row ([`read_call`]);
+/// agy's is a space ([`tool_after`]).
 pub const TOOL_AFTER: &str = "";
+
+/// F3's reply to its tool's result on harness `h`: [`TOOL_AFTER`], but a single space on agy. agy
+/// refuses a reply holding neither text nor a tool call (it sends "Error: model output error:
+/// model output must contain either output text or tool calls, these cannot both be empty, please
+/// try again" as a turn of its own and asks again), but takes one whose text is a space, draws
+/// nothing for it and ends its turn on the tool's row (`● Explored 1 file (README.md)`, then `?
+/// for shortcuts`), as agy 1.5.1's cast read on 2026-11-05.
+#[must_use]
+pub fn tool_after(h: Harness) -> &'static str {
+    match h {
+        Harness::Agy => " ",
+        Harness::Claude | Harness::Muse => TOOL_AFTER,
+    }
+}
 
 /// The factor `--mode ladder` scales the short back-off ladder by (`turn_end::LADDER_SCALE_SEAM`):
 /// an eighth, so the steps of 2 to 60 min are 15 s to 7.5 min, and the ladder to its cap and the
@@ -424,10 +439,9 @@ fn minutes_scaled(minutes: &[i64], n: u32, scale: f64) -> i64 {
 }
 
 /// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical
-/// path), which Claude Code (`Read`) and Muse Code (`read_file`, with a path relative to its
-/// workspace root: its file policy allows an absolute one only in some places) run with no
-/// confirm in the lab's jail. agy's is `read_file` as agy 1.4.10 declares it, but no lab runs
-/// it: F3 is out of agy's reach ([`tool_end_out_of_reach`]).
+/// path), which Claude Code (`Read`), agy (`read_file`, its `Path`) and Muse Code (`read_file`,
+/// with a path relative to its workspace root: its file policy allows an absolute one only in
+/// some places) run with no confirm in the lab's jail.
 #[must_use]
 pub fn read_call(h: Harness, file: &Path) -> J {
     let abs = file.to_string_lossy().into_owned();
@@ -472,15 +486,6 @@ pub fn dialog_call() -> J {
 pub fn dialog_out_of_reach(h: Harness) -> Option<&'static str> {
     (h != Harness::Claude).then_some(
         "the stub scripts no question tool of agy's or Muse Code's: L20 and C5 call Claude Code's AskUserQuestion",
-    )
-}
-
-/// Why F3 is out of this lab's reach on harness `h`: `None` where a turn can end on a tool's row
-/// with no words after it.
-#[must_use]
-pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
-    (h == Harness::Agy).then_some(
-        "agy refuses a reply holding neither text nor a tool call: after the tool's result it sends \"Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again\" as a turn of its own and asks again, so no turn of its ends on a tool's row with no words after it",
     )
 }
 
@@ -919,7 +924,8 @@ pub enum Chain {
     NarrowTapWall,
     /// HL (Land: one defense to every act over an untracked file, held at its second answer).
     SameLand,
-    /// HC (Cruise: one reply to every done check, held at its second answer).
+    /// HC (Cruise: one reply to every act, paced on the ladder and then asked for a different
+    /// approach, never stopped: [`paced`]).
     SameCruise,
     /// LH (a clean defense with a clause the reader reads open: the hinted land check, landed).
     LandHinted,
@@ -947,7 +953,8 @@ pub enum Chain {
     CommandDraft,
     /// SWF (Cruise in a back-off, switched to Land then Off within 300 ms).
     SwitchFlip,
-    /// SWO (Cruise held at the same reply, switched to Land, the same reply to Land's one ask).
+    /// SWO (Cruise's replies repeated, switched to Land, the same reply to Land's one ask, which
+    /// Land holds: [`switch::judge_over_held`]).
     SwitchOverHeld,
     /// SWB (Cruise switched to Land 5 s into a long busy turn).
     SwitchBusy,
@@ -1321,7 +1328,10 @@ impl Scenario {
             Scenario::Witnessed => {
                 "the second tab of one route resumes on the first's answered turn: has cleared, no blind try past the clearing"
             }
-            Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
+            Scenario::F18 => {
+                "a person's key into an instant Cruise turn: judged on the ladder, no short \
+                 answer added, the work on at its due"
+            }
             Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
             Scenario::SameWords => "a new turn answered with the same words: its own point",
             Scenario::Scrolled => {
@@ -1330,7 +1340,10 @@ impl Scenario {
             Scenario::F3 => "a first turn ended on a tool's row after a launch: judged",
             Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
             Scenario::HL => "one defense to every Land act: held at its second answer, and said so",
-            Scenario::HC => "one reply to every done check: held at its second answer, and said so",
+            Scenario::HC => {
+                "one reply to every act under Cruise: paced on the ladder, then a different \
+                 approach asked, never stopped"
+            }
             Scenario::LH => "a clean defense read open: the hinted land check, LANDED, landed",
             Scenario::LL => "the check answered with a list: quoted, worked, checked again, landed",
             Scenario::LS => "the check's list, then the same defense: held, the list quoted",
@@ -1357,7 +1370,7 @@ impl Scenario {
             }
             Scenario::SwitchFlip => "Land then Off within 300 ms: nothing typed",
             Scenario::SwitchOverHeld => {
-                "a tab held under Cruise switched to Land: Land asks once, held again at the same \
+                "a Cruise tab's repeated reply switched to Land: Land asks once, held at the same \
                  answer"
             }
             Scenario::SwitchBusy => {
@@ -1590,14 +1603,13 @@ impl Chain {
     }
 
     /// The chains of `mode` harness `h` runs: those out of its reach left out
-    /// ([`wall_out_of_reach`], [`tool_end_out_of_reach`]).
+    /// ([`wall_out_of_reach`]).
     #[must_use]
     pub fn of_mode_on(mode: Mode, h: Harness) -> Vec<Chain> {
         Chain::of_mode(mode)
             .into_iter()
             .filter(|c| match c {
                 Chain::WallHid => wall_out_of_reach(h, Mode::WallHid).is_none(),
-                Chain::ToolEnd => tool_end_out_of_reach(h).is_none(),
                 Chain::RedrawWall => wall_out_of_reach(h, Mode::WallRedraw).is_none(),
                 Chain::UnreadWall => wall_out_of_reach(h, Mode::WallUnread).is_none(),
                 Chain::RelaunchWall => wall_out_of_reach(h, Mode::WallRelaunch).is_none(),
@@ -1747,6 +1759,7 @@ impl Chain {
             Chain::SwitchWall => WALL_SWITCH_LIMIT_MS,
             Chain::UnreadWall => WALL_UNREAD_LIMIT_MS,
             Chain::CruiseAngles => angles::LIMIT_MS,
+            Chain::SameCruise => paced::LIMIT_MS,
             Chain::LandOutage | Chain::CruiseOutage => outage::LIMIT_MS,
             Chain::SysOverload
             | Chain::SysOutage
@@ -2046,14 +2059,17 @@ impl Chain {
     }
 
     /// Its script answers the acts it meets before its watch ends with one canned reply, so under
-    /// ruling F (`4cefe18775`) aterm stops typing into it at that reply's second answer (the
-    /// same-reply hold, `EXCEPTION … kind=stalled`): land@v1 and the nudge answered alike (land-b,
-    /// land-c and land-f to land-i, and land-same-list, the land check's list between; land-e
-    /// lands at the first; land-d rests on its check's need, nudged never), each done check
+    /// Land ruling F (`4cefe18775`) stops aterm's typing into it at that reply's second answer
+    /// (the same-reply hold, `EXCEPTION … kind=stalled`): land@v1 and the nudge answered alike
+    /// (land-b, land-c and land-f to land-i, and land-same-list, the land check's list between;
+    /// land-e lands at the first; land-d rests on its check's need, nudged never), each done check
     /// answered alike (`cruise`, and `wrote-c`'s `W_CHECKED`), and the two chains made for the
-    /// hold. Each such chain is watched past its hold and wants the hold
-    /// said ([`surfaces::held`]); any other chain of the measured pass or the coverage chains
-    /// fails at a `kind=stalled` ([`surfaces::held::stall_fault`]).
+    /// hold. Under Cruise the same reply holds nothing since the continuous-forward design of
+    /// 2026-11-01: Cruise waits the ladder's step and asks for a different approach
+    /// ([`paced`], HC). A chain held anyway is watched past its hold; a Land chain wants the hold
+    /// said ([`surfaces::held`]), and a Cruise chain or any other chain of the measured pass or
+    /// the coverage chains fails at a `kind=stalled` ([`surfaces::held::stall_fault`]).
+    /// `switch-over-held`'s holds are its own judge's ([`switch::judge_over_held`]).
     #[must_use]
     pub const fn same_reply(self) -> bool {
         matches!(
@@ -2072,7 +2088,6 @@ impl Chain {
                 | Chain::LandSameList
                 | Chain::LandReworded
                 | Chain::LandContradictedList
-                | Chain::SwitchOverHeld
         )
     }
 
@@ -2146,6 +2161,16 @@ impl Chain {
     #[must_use]
     pub fn gated(self) -> bool {
         self.need_gate().is_some() || self.landed_gate().is_some()
+    }
+
+    /// Whether the chain's first judged span closes on its program's own clock, sooner than a
+    /// loaded lab prompts a full run: cruise-n's N1 at its first need's 2 min back-off, land-j's
+    /// and land-k's L16 and L17 at the landing, about 45 s after `land@v1`. The watch's reads begin
+    /// once every chain is prompted, which took Muse Code's 26 tabs about 2 min on 2026-11-05, so
+    /// these go in late, before the gated chains ([`prompt_order`]).
+    #[must_use]
+    pub fn timed_from_its_start(self) -> bool {
+        matches!(self, Chain::CruiseN | Chain::LandJ | Chain::LandK)
     }
 
     /// The first prompt (L13's a person's question; L15's the worker's task).
@@ -2579,7 +2604,7 @@ pub fn spec(chains: &[Chain]) -> J {
 
 /// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order), each
 /// tool call that harness's read of the chain's own `README.md` ([`read_call`]): F3's first turn
-/// is answered with one, and land-listed's and land-reworded's work on their quoted lists runs
+/// is answered with one, its words after it that harness's ([`tool_after`]), and land-listed's and land-reworded's work on their quoted lists runs
 /// one before it says what it did, as an agent's work does (a long answer with no tool row, where
 /// the reader reads them, is no work to the policy, so the list would stand); so does
 /// land-contradicted-list's first defense, so it is no no-work answer the same reply could hold.
@@ -2612,8 +2637,11 @@ pub fn spec_on(chains: &[Chain], h: Harness, dirs: &[PathBuf]) -> J {
                 let ours = calls.iter().find(|(token, l, _)| {
                     when.as_deref() == Some(token.as_str()) && last.as_deref() == Some(*l)
                 });
-                if let Some((_, _, call)) = ours {
+                if let Some((token, _, call)) = ours {
                     r.set("tool", call.clone());
+                    if *token == Chain::ToolEnd.token() {
+                        r.set("text", J::s(tool_after(h)));
+                    }
                 }
                 r
             })
@@ -3376,7 +3404,8 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::SameWords => cover::judge_same_words(seen, t0),
             Scenario::F3 => cover::judge_tool_end(seen, land, t0),
             Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
-            Scenario::HL | Scenario::HC => surfaces::held::judge_hold(chain, seen, t0),
+            Scenario::HL => surfaces::held::judge_hold(seen, t0),
+            Scenario::HC => paced::judge(seen, paced::SHIPPED, t0),
             Scenario::Angles => angles::judge(seen, t0),
             Scenario::SwitchAgent => switch::judge_at_rest(seen, t0),
             Scenario::SwitchSeq => switch::judge_draft(seen, t0),
@@ -5084,6 +5113,28 @@ fn backoff_due(line: &str) -> Option<i64> {
     crate::workers::iso_ms(rest.split_whitespace().next()?)
 }
 
+/// CRUISE'S WAIT BEFORE ITS REQUEST FOR A DIFFERENT APPROACH (the continuous-forward design of
+/// 2026-11-01, `docs/DESIGN-continuous-forward-2026-11-01.md`): `WAITING … until=<t>
+/// <turn_end::REPEAT_RECOVERY_WAIT>`, the loop's answer to a repeated report under Cruise. It
+/// waits the short back-off ladder's step for the streak its point closed, and names none.
+#[must_use]
+pub fn recovery_wait(line: &str) -> bool {
+    line.starts_with("WAITING ")
+        && line.split_once(" until=").is_some_and(|(_, rest)| {
+            rest.split_once(' ')
+                .is_some_and(|(_, words)| words.trim() == turn_end::REPEAT_RECOVERY_WAIT)
+        })
+}
+
+/// A [`recovery_wait`]'s `until=`, unix ms.
+fn recovery_due(line: &str) -> Option<i64> {
+    if !recovery_wait(line) {
+        return None;
+    }
+    let (_, rest) = line.split_once(" until=")?;
+    crate::workers::iso_ms(rest.split_whitespace().next()?)
+}
+
 const SAME_DUE_MS: i64 = 1000;
 
 fn same_backoff(a: &str, b: &str) -> bool {
@@ -5132,21 +5183,39 @@ pub struct Step {
 /// The short back-off ladder's steps from `t0`, as the journal decided them: the first turn-end
 /// `WAITING … N short turn(s) in a row: …` of each point, in order — a wall's back-off and the take
 /// window's left out, and a step told again left out whether under its point's `seq=` or a
-/// re-read's own ([`same_backoff`]: the same streak and due).
+/// re-read's own ([`same_backoff`]: the same streak and due). Cruise's wait before its request for
+/// a different approach ([`recovery_wait`]) is a step too, the one after the step before it (its
+/// streak one more, or one where it is the first): the loop waits the ladder's step for the
+/// streak its point closed there, in words that name none.
 #[must_use]
 pub fn ladder_steps(seen: &Seen, t0: i64) -> Vec<Step> {
     let mut seqs: Vec<Option<String>> = Vec::new();
     let mut out: Vec<Step> = Vec::new();
     for (t, l) in &seen.journal {
-        let Some(streak) = backoff_streak(l).filter(|_| *t >= t0 && backoff_named(l)) else {
+        if *t < t0 {
+            continue;
+        }
+        let streak = if backoff_named(l) {
+            backoff_streak(l)
+        } else if recovery_wait(l) {
+            Some(out.last().map_or(1, |st| st.streak.saturating_add(1)))
+        } else {
+            None
+        };
+        let Some(streak) = streak else {
             continue;
         };
         let seq = word(l, "seq");
-        if seqs.contains(&seq) || out.iter().any(|st| same_backoff(&st.line, l)) {
+        let told = |st: &Step| {
+            same_backoff(&st.line, l)
+                || (recovery_wait(&st.line)
+                    && recovery_due(l).is_some_and(|d| (d - st.due).abs() <= SAME_DUE_MS))
+        };
+        if seqs.contains(&seq) || out.iter().any(told) {
             continue;
         }
         seqs.push(seq);
-        if let Some(due) = backoff_due(l) {
+        if let Some(due) = backoff_due(l).or_else(|| recovery_due(l)) {
             out.push(Step {
                 at: *t,
                 streak,
@@ -5234,10 +5303,10 @@ fn lost_after(seen: &Seen, t: i64, t0: i64) -> Option<String> {
     match seen
         .journal
         .iter()
-        .rfind(|(at, l)| *at > t && backoff_named(l))
+        .rfind(|(at, l)| *at > t && (backoff_named(l) || recovery_wait(l)))
     {
         Some((tw, wl)) => {
-            let due = backoff_due(wl)?;
+            let due = backoff_due(wl).or_else(|| recovery_due(wl))?;
             (seen.end_ms >= due + PERSISTENCE_GRACE_MS).then(|| {
                 format!(
                     "PERSISTENCE LOST: the back-off at +{} ({}) named its act due at +{}, and nothing was typed by +{}, {} past it",
@@ -7088,8 +7157,8 @@ fn dialog_answers_of(run: &Run, token: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for body in crate::stub::turn_dumps(&run.w.join("dump"))
         .into_iter()
-        .filter_map(|(_, p)| std::fs::read(p).ok())
-        .filter(|body| String::from_utf8_lossy(body).contains(token))
+        .filter_map(|(_, p)| crate::util::read_regular_file(&p).ok())
+        .filter(|body| body.windows(token.len()).any(|w| w == token.as_bytes()))
     {
         for r in crate::stub::message_results(&body) {
             if !out.contains(&r) {
@@ -7420,12 +7489,16 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
             let typed = usize::from(tab.seen.ledger.iter().any(|r| r.decision == "typed"));
             Some(StubSeen::within(&dumps_of(run, &token), *t1, until, typed))
         }
+        // To the due of the back-off at the person's reply: the act there is Cruise's own.
         Chain::InstantPerson => {
             let asked = tab.seen.asked_ms?;
+            let until = own_backoff_after(&tab.seen, asked)
+                .and_then(|(_, l)| backoff_due(l))
+                .map_or(tab.seen.end_ms, |due| due.min(tab.seen.end_ms));
             Some(StubSeen::within(
                 &dumps_of(run, &token),
                 asked,
-                tab.seen.end_ms,
+                until,
                 typed_by(asked),
             ))
         }
@@ -8292,21 +8365,24 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
     tab.seen.end_ms = now;
 }
 
-/// THE ORDER THE CHAINS ARE PROMPTED IN, as indices into `chains`: theirs, but the gated chains
-/// ([`Chain::gated`]: the need chains, land-contradicted) last. The lab's watch, which reads each
-/// need, or lands land-contradicted's file, and opens its gate, begins once every chain is
+/// THE ORDER THE CHAINS ARE PROMPTED IN, as indices into `chains`: theirs, but the chains whose
+/// first span closes on their program's clock ([`Chain::timed_from_its_start`]) late and the gated
+/// chains ([`Chain::gated`]: the need chains, land-contradicted) last. The lab's watch, which reads
+/// each need, or lands land-contradicted's file, and opens its gate, begins once every chain is
 /// prompted, and prompting a full run takes longer than the gate's hang detector
-/// (`stub::GATE_HANG`): a need raised first stood unread until its gate gave way.
+/// (`stub::GATE_HANG`): a need raised first stood unread until its gate gave way, and a span that
+/// closed before the watch began was read by nobody.
 #[must_use]
 pub fn prompt_order(chains: &[Chain]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..chains.len()).collect();
-    order.sort_by_key(|&i| chains[i].gated());
+    order.sort_by_key(|&i| (chains[i].gated(), chains[i].timed_from_its_start()));
     order
 }
 
 /// WHETHER THE LAB HAS READ A NEED STANDING on every surface its need wants judge ([`Chain::need_gate`]):
 /// `status needs=ask needs_n=1` (L3), the `meta` entry (`attention_kinds` `ask:needs`, L1), and,
-/// where the windows are read (`window`), a `Needs you` row and the tab's `attention` state.
+/// where the windows are read (`window`), a `Needs you` row, the tab's `attention` state and a
+/// Harness page read once `status` showed Land's hold ([`hold_paged`]).
 #[must_use]
 pub fn need_read(seen: &Seen, window: bool) -> bool {
     let status = seen.status.iter().any(|(_, s)| {
@@ -8323,8 +8399,26 @@ pub fn need_read(seen: &Seen, window: bool) -> bool {
                 .window
                 .strip
                 .iter()
-                .any(|(_, s)| surfaces::states(s).contains(&"attention")));
+                .any(|(_, s)| surfaces::states(s).contains(&"attention"))
+            && hold_paged(seen));
     status && meta && shown
+}
+
+/// Whether a Harness page read fell at or after the first `status` read that showed Land's hold
+/// (`land_held=` other than `-`): the read L3's hold judge takes the state line from
+/// (`hold::legs`, `no Harness page read after Land's instruction`). The watch reads the page at
+/// the head of each pass and `status` after it, so the page read that shows the hold's state line
+/// beside the pass whose `status` first shows the hold falls before that read: the next pass's
+/// is the first to count, and a gate opened without it let the landing fall before it under a
+/// loaded lab (26 tabs a harness, three harnesses at once).
+#[must_use]
+pub fn hold_paged(seen: &Seen) -> bool {
+    let held = seen
+        .status
+        .iter()
+        .find(|(_, s)| word(s, "land_held").is_some_and(|v| v != "-" && v != "?"))
+        .map(|(t, _)| *t);
+    held.is_some_and(|from| seen.window.page_reads.iter().any(|t| *t >= from))
 }
 
 /// OPENS `tab`'S NEED GATE once its need was read ([`need_read`]): the stub then answers the land
@@ -8554,9 +8648,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
                         .is_some_and(|(t, b)| *t > p && surfaces::held::stop_rows(b).is_empty())
             }) || done_since(20_000)
         }
-        Chain::SameCruise => {
-            (s.all_acts().len() >= 2 && surfaces::held::watched_past(s, now)) || done_since(20_000)
-        }
+        Chain::SameCruise => paced::watched(s, now, tab.t0) || done_since(20_000),
         Chain::InstantCruise => {
             let head: String = ASK_REPLY.chars().take(24).collect();
             let judged = s.asked_ms.and_then(|a| {
@@ -8609,6 +8701,8 @@ fn finished(tab: &Tab, now: i64) -> bool {
             .reply_ms
             .is_some_and(|r| now - r >= QUIET_UNDER_OFF_MS + 5000),
         Chain::LandJ | Chain::LandK => done_since(20_000),
+        // F18's turn is judged on the ladder (Cruise never parks): watched past its back-off's
+        // due to the act there, or past the grace where none came.
         Chain::InstantPerson => {
             let asked = s.asked_ms;
             let left = asked.and_then(|a| {
@@ -8617,14 +8711,17 @@ fn finished(tab: &Tab, now: i64) -> bool {
                     .find(|(t, l)| *t > a && l.starts_with("LEFT "))
                     .map(|(t, _)| *t)
             });
-            let decided = asked.and_then(|a| own_backoff_after(s, a)).map(|(t, _)| *t);
+            let decided = asked.and_then(|a| own_backoff_after(s, a));
+            let lost = decided
+                .and_then(|(_, l)| backoff_due(l))
+                .is_some_and(|due| now >= due + PERSISTENCE_GRACE_MS + 5000);
             let typed_into =
                 asked.is_some_and(|a| s.all_acts().iter().any(|(t, _)| *t > a && now - *t >= 3000));
             let unjudged =
                 asked.is_some_and(|a| left.is_none() && decided.is_none() && now - a > 150_000);
             let refused = s.ask_refused_ms.is_some_and(|a| now - a > 5000);
             left.is_some_and(|l| now - l >= QUIET_UNDER_OFF_MS + 5000)
-                || decided.is_some_and(|d| now - d >= 10_000)
+                || lost
                 || typed_into
                 || unjudged
                 || refused
@@ -9675,14 +9772,6 @@ pub fn cmd_forever(args: &[String]) -> Res {
             )));
         }
         let chains = a.chains(h);
-        let tool_end_asked = Chain::of_mode(a.mode).contains(&Chain::ToolEnd)
-            && a.chains
-                .as_ref()
-                .is_none_or(|only| only.contains(&Chain::ToolEnd));
-        if tool_end_asked && let Some(why) = tool_end_out_of_reach(h) {
-            println!("forever: {} F3 is out of this lab's reach: {why}", h.name());
-            lines.push((h, Scenario::F3, Verdict::Unobserved(why.to_string())));
-        }
         if a.mode == Mode::Sysmsg {
             for form in sysmsg::Form::ALL {
                 if let Some(why) = form.out_of_reach(h) {
@@ -9890,6 +9979,9 @@ pub mod angles;
 
 #[path = "forever_switch.rs"]
 pub mod switch;
+
+#[path = "forever_paced.rs"]
+pub mod paced;
 
 #[path = "forever_outage.rs"]
 pub mod outage;

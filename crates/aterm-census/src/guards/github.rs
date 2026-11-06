@@ -161,7 +161,9 @@ fn blanked_runs<'a>(line: &Line<'a>) -> Vec<&'a str> {
 }
 
 fn contains_ignore_case(hay: &str, needle: &str) -> bool {
-    hay.to_ascii_lowercase().contains(needle)
+    hay.as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn github_auth_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -202,13 +204,16 @@ fn door_clause(file: &SourceFile, out: &mut Vec<Finding>) {
 }
 
 fn bearer_literal(contents: &str) -> bool {
-    let lower = contents.to_ascii_lowercase();
-    lower.contains("authorization: bearer")
-        || lower.contains("authorization: token")
-        || lower == "bearer "
-        || lower == "token "
-        || lower.starts_with("bearer {")
-        || lower.starts_with("token {")
+    contains_ignore_case(contents, "authorization: bearer")
+        || contains_ignore_case(contents, "authorization: token")
+        || contents.eq_ignore_ascii_case("bearer ")
+        || contents.eq_ignore_ascii_case("token ")
+        || contents
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("bearer {"))
+        || contents
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("token {"))
 }
 
 fn bearer_clause(file: &SourceFile, out: &mut Vec<Finding>) {

@@ -3,6 +3,7 @@
 
 //! Layout planner for the stats deck.
 use aterm_vitals::MultiScaleSpec;
+use aterm_vitals::words::TotalsForm;
 
 use crate::deck_face::FaceMetrics;
 use crate::stats_deck::{FOLDED_PT, FULL_TABLE_PT};
@@ -1233,7 +1234,8 @@ pub(crate) enum Label {
     /// Right-aligned `"now"` over a percentage column.
     Now,
     /// A scope's name after its swatch, in the legend over the bars or in the key to the bars
-    /// under the % figures; the machine's may carry its totals (`this Mac · 18c · 128G · 2T`).
+    /// under the % figures; the machine's may carry its used of total
+    /// (`this Mac · 10c · 14.4/32G · 2.34/4T`).
     Scope(Bar),
     /// Details column header.
     Details,
@@ -1264,9 +1266,10 @@ pub(crate) struct HeaderText<'a> {
     /// The glance (Full wide and mid, and Folded) keys "over max" only then; Full narrow and
     /// slim key all three marks by rule K.
     pub(crate) over: [bool; 2],
-    /// The machine's totals, longest first (`18 cores · 128 GiB · 2 TB`, `18c · 128G · 2T`): the
-    /// legend says them after the machine's noun where no row's run says its maximum.
-    pub(crate) totals: &'a [String],
+    /// The machine's used of total, longest first (`10 cores · 14.4 of 32 GiB · 2.34 of 4 TB`,
+    /// `10c · 14.4/32G · 2.34/4T`, then the totals alone): the legend says them after the
+    /// machine's noun where no row's run says its maximum, each form measured by its widest.
+    pub(crate) totals: &'a [TotalsForm],
 }
 
 /// Worst-state strings for an `fslim` block header.
@@ -1719,11 +1722,13 @@ impl<'m> Header<'m> {
     /// The legend over the bars (`■ this Mac ■ aterm ■ Tab 1`), once, in `lo..hi`, from `lo` or,
     /// with `right`, ending at `hi` (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4): each
     /// scope's swatch in the bar's ink and its name, [`LEGEND_GAP`] apart. With `tail`, the
-    /// machine's name first carries its totals (`this Mac · 18c · 128G · 2T`), the longest form
-    /// that fits. Where it does not fit, the totals go first, then the machine's noun gives way to
-    /// its last word (`Mac`), then the tab's title to `Tab`; a title past [`TAB_HEAD_MAX`] is
-    /// `Tab` from the first. Where even that does not fit, nothing is laid (`None`). Answers where
-    /// it starts and ends.
+    /// machine's name first carries its used of total (`this Mac · 10c · 14.4/32G · 2.34/4T`,
+    /// `docs/DESIGN-stats-deck-flow-2026-11-02.md` §4), the longest form whose widest
+    /// ([`TotalsForm::widest`]) fits, so a changing reading never moves it to another form. Where
+    /// none fits, the totals go first, then the machine's noun gives way to its last word
+    /// (`Mac`), then the tab's title to `Tab`; a title past [`TAB_HEAD_MAX`] is `Tab` from the
+    /// first. Where even that does not fit, nothing is laid (`None`). Answers where it starts and
+    /// ends.
     fn legend(
         &mut self,
         (lo, hi): (f64, f64),
@@ -1731,17 +1736,31 @@ impl<'m> Header<'m> {
         tail: bool,
         right: bool,
     ) -> Option<(f64, f64)> {
-        let (global, tab, w) = self
+        let (global, tab, _) = self
             .legend_forms(text, tail)
             .into_iter()
             .find(|form| form.2 <= hi - lo + 1e-9)?;
-        let x = if right { hi - w } else { lo };
+        // The form fits by its widest; right-aligned, it stands by its words.
+        let x = if right {
+            hi - self.legend_need(&global, &tab)
+        } else {
+            lo
+        };
         Some((x, self.legend_at(x, &global, &tab)))
     }
 
-    /// The legend's forms, longest first: with the machine's totals where `tail`, then the
-    /// machine's name and the tab's title (`Tab` past [`TAB_HEAD_MAX`]), the machine's last
-    /// word, then `Tab`.
+    /// How wide the legend is with the machine's words `global` and the tab's `tab`.
+    fn legend_need(&self, global: &str, tab: &str) -> f64 {
+        3.0 * SWATCH_ADVANCE
+            + self.words(global)
+            + self.words("aterm")
+            + self.words(tab)
+            + 2.0 * LEGEND_GAP
+    }
+
+    /// The legend's forms, longest first, each with the room it needs: with the machine's used
+    /// of total where `tail`, measured by its widest, then the machine's name and the tab's
+    /// title (`Tab` past [`TAB_HEAD_MAX`]), the machine's last word, then `Tab`.
     fn legend_forms(&self, text: &HeaderText<'_>, tail: bool) -> Vec<LegendForm> {
         let machine = text.machine;
         let noun = machine.rsplit(' ').next().unwrap_or(machine);
@@ -1750,23 +1769,13 @@ impl<'m> Header<'m> {
         } else {
             text.tab
         };
-        let totals = text
-            .totals
-            .iter()
-            .filter(|_| tail)
-            .map(|t| (format!("{machine} \u{b7} {t}"), tab));
-        let plain = [(machine, tab), (noun, tab), (noun, "Tab")].map(|(g, t)| (g.to_owned(), t));
-        totals
-            .chain(plain)
-            .map(|(global, tab)| {
-                let need = 3.0 * SWATCH_ADVANCE
-                    + self.words(&global)
-                    + self.words("aterm")
-                    + self.words(tab)
-                    + 2.0 * LEGEND_GAP;
-                (global, tab.to_owned(), need)
-            })
-            .collect()
+        let totals = text.totals.iter().filter(|_| tail).map(|t| {
+            let need = self.legend_need(&format!("{machine} \u{b7} {}", t.widest), tab);
+            (format!("{machine} \u{b7} {}", t.said), tab.to_owned(), need)
+        });
+        let plain = [(machine, tab), (noun, tab), (noun, "Tab")]
+            .map(|(g, t)| (g.to_owned(), t.to_owned(), self.legend_need(g, t)));
+        totals.chain(plain).collect()
     }
 
     /// Lays the legend's three names from `x`, each after its swatch; where it ends.
@@ -2189,10 +2198,14 @@ pub(crate) fn header_full(
 /// Where the blocks lay a bar column (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4), block A's
 /// strip carries the time label and the scale, and block B's header ends with the legend, once
 /// for both blocks' bars: right-aligned to B's meter, over its bars and as far left over its
-/// strip's old end as it needs, with the machine's totals where no run says the rows' maxima. It
-/// never crosses the blocks' divider. Each block's state stands over its names beside `now`,
-/// else at its strip's left, leaving A's scale its short label and B's legend its least
-/// ([`Header::state`]); else over its names and %, `now` yielding.
+/// strip's old end as it needs, with the machine's used of total where no run says the rows'
+/// maxima, in the longest form that leaves the over mark's key its room over B's strip whether or
+/// not a cell draws the mark, so a changing reading never flips its form; where the form that
+/// fits beside the key says fewer figures than one that fits in its room, or none fits beside
+/// it, the legend takes that room and the key what is left. It never crosses the blocks'
+/// divider. Each block's state stands over its names beside `now`, else at its strip's left,
+/// leaving A's scale its short label and B's legend its least ([`Header::state`]); else over its
+/// names and %, `now` yielding.
 ///
 /// Where the bars stand under each % (fslim), an fslim block's state words stand over its names,
 /// and where they need more room they take the % column's too, `now` yielding to them, up to
@@ -2260,7 +2273,27 @@ pub(crate) fn header_folded(
         head.span(bar.x, end.min(a.at.end()), false);
     }
     let tail = a.meter.run.is_none();
-    match head.legend((b_lead, legend_hi), &text, tail, true) {
+    // The over mark's key keeps its room over B's strip before the legend takes a longer
+    // wording (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4), whether or not a cell draws the
+    // mark now: the over flags are readings, and a changing reading never flips the legend's
+    // form. It never costs a figure: where the form that fits beside it says fewer (the totals
+    // alone for the used of total, or no totals, which where no run stands alone say each row's
+    // maximum), the legend takes the room and the key what is left.
+    let key_room = KeyItem::Over.width(m) + KEY_GAP;
+    let forms = head.legend_forms(&text, tail);
+    let first_fit = |lo: f64| forms.iter().position(|f| f.2 <= legend_hi - lo + 1e-9);
+    // What a form says: the used of total, the totals alone, or no totals.
+    let figures = |i: usize| match text.totals.get(i).filter(|_| tail) {
+        Some(t) if t.used => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    let keyed = first_fit(b_lead + key_room)
+        .zip(first_fit(b_lead))
+        .is_some_and(|(keyed, alone)| figures(keyed) == figures(alone));
+    let lo = if keyed { b_lead + key_room } else { b_lead };
+    let legend = head.legend((lo, legend_hi), &text, tail, true);
+    match legend {
         Some((x0, _)) => head.strip_span(b_lead, x0 - KEY_GAP, text.over[1]),
         None => {
             head.strip_span(b_lead, legend_hi, text.over[1]);
@@ -2375,6 +2408,18 @@ mod tests {
 
     fn hn() -> FaceMetrics {
         FaceMetrics::helvetica_neue()
+    }
+
+    /// Totals forms that measure as they read: figures that never change.
+    fn said_totals(forms: &[&str]) -> Vec<TotalsForm> {
+        forms
+            .iter()
+            .map(|&f| TotalsForm {
+                said: f.to_owned(),
+                widest: f.to_owned(),
+                used: false,
+            })
+            .collect()
     }
 
     fn px(v: f64, s: f64) -> f64 {
@@ -3052,16 +3097,304 @@ mod tests {
         }
     }
 
+    /// The machine's used of total as `words::machine_totals` says it for a 10-core Mac of 32 GiB
+    /// and 4 TB, `mem` GiB and `disk` TB used: each form with the template it is measured by.
+    fn used_totals(mem: &str, disk: &str) -> Vec<TotalsForm> {
+        let form = |said: String, widest: &str, used: bool| TotalsForm {
+            said,
+            widest: widest.to_owned(),
+            used,
+        };
+        let totals = [
+            "10 cores \u{b7} 32 GiB \u{b7} 4 TB",
+            "10c \u{b7} 32G \u{b7} 4T",
+        ];
+        vec![
+            form(
+                format!("10 cores \u{b7} {mem} of 32 GiB \u{b7} {disk} of 4 TB"),
+                "10 cores \u{b7} 88.8 of 32 GiB \u{b7} 8.88 of 4 TB",
+                true,
+            ),
+            form(
+                format!("10c \u{b7} {mem}/32G \u{b7} {disk}/4T"),
+                "10c \u{b7} 88.8/32G \u{b7} 8.88/4T",
+                true,
+            ),
+            form(totals[0].to_owned(), totals[0], false),
+            form(totals[1].to_owned(), totals[1], false),
+        ]
+    }
+
+    /// Every form's plan at every width from 300 pt to 2560 pt that lays a header.
+    fn header_plans(m: &FaceMetrics) -> Vec<(DeckForm, f64, FullPlan, FoldedPlan)> {
+        let mut out = Vec::new();
+        for w in (300..=2_560).map(f64::from) {
+            let (full, folded) = (plan_full(w, m), plan_folded(w, m));
+            for form in [DeckForm::Full, DeckForm::Folded] {
+                out.push((form, w, full, folded));
+            }
+        }
+        out
+    }
+
+    /// What the legend's machine name says in `form` with `totals`, and whether a run stands
+    /// there (where the legend takes no totals); `None` where no legend or key names it.
+    fn legend_machine(
+        at: (DeckForm, &FullPlan, &FoldedPlan),
+        totals: &[TotalsForm],
+        m: &FaceMetrics,
+    ) -> Option<String> {
+        legend_machine_over(at, totals, [false; 2], m)
+    }
+
+    /// [`legend_machine`] with the blocks' cells drawing the over mark as `over` says.
+    fn legend_machine_over(
+        (form, full, folded): (DeckForm, &FullPlan, &FoldedPlan),
+        totals: &[TotalsForm],
+        over: [bool; 2],
+        m: &FaceMetrics,
+    ) -> Option<String> {
+        let text = HeaderText {
+            totals,
+            over,
+            ..TEXT
+        };
+        let head = match form {
+            DeckForm::Full => header_full(full, text, None, m),
+            DeckForm::Folded => header_folded(folded, text, [None, None], m),
+        };
+        heads(&head, m).into_iter().next().map(|h| h.0)
+    }
+
+    /// Which of `totals` the machine's name says (`this Mac · …`), or `None` for the name alone.
+    fn form_of(said: Option<&str>, totals: &[TotalsForm]) -> Option<usize> {
+        let said = said?;
+        totals
+            .iter()
+            .position(|t| said == format!("this Mac \u{b7} {}", t.said))
+    }
+
+    fn run_stands(form: DeckForm, full: &FullPlan, folded: &FoldedPlan) -> bool {
+        match form {
+            DeckForm::Full => full.meter.run.is_some(),
+            DeckForm::Folded => folded.blocks[0].meter.run.is_some(),
+        }
+    }
+
+    /// The legend says the machine's used of total in its longest form that fits
+    /// (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §4): at every width of both forms, the form
+    /// it says fits alone there and says the figures of the first of the four that does (the used
+    /// of total, else the totals alone, else neither), each measured by its widest, so a form
+    /// whose words fit but whose widest does not is not said. It is that first form itself but
+    /// where Folded's over mark's key keeps its room over block B's strip, which takes a long
+    /// wording to its short one and never costs a figure (`docs/DESIGN-stats-deck-meter-
+    /// 2026-10-26.md` §4). CONTROL: each used-of-total form and the totals alone are each said at
+    /// some width; the key's room shortens a form at some Folded width; and a form measured by
+    /// its words alone is said where its widest does not fit.
+    #[test]
+    fn the_legend_says_used_of_total_in_its_longest_form_that_fits() {
+        let m = hn();
+        let totals = used_totals("14.4", "2.34");
+        // What a form says: the used of total, the totals alone, or neither (`None`).
+        let figures = |i: Option<usize>| i.map_or(2, |i| usize::from(!totals[i].used));
+        let mut said = [0_usize; 5];
+        let (mut by_words, mut keyed) = (0, 0);
+        for (form, w, full, folded) in header_plans(&m) {
+            let at = (form, &full, &folded);
+            let chosen = form_of(legend_machine(at, &totals, &m).as_deref(), &totals);
+            let fits: Vec<bool> = totals
+                .iter()
+                .map(|t| {
+                    let one = std::slice::from_ref(t);
+                    form_of(legend_machine(at, one, &m).as_deref(), one) == Some(0)
+                })
+                .collect();
+            let first = fits.iter().position(|&f| f);
+            assert!(
+                chosen.is_none_or(|c| fits[c]),
+                "{form:?} {w} pt: says {chosen:?}, which does not fit alone: {fits:?}"
+            );
+            assert_eq!(
+                figures(chosen),
+                figures(first),
+                "{form:?} {w} pt: says {chosen:?} where {first:?} fits"
+            );
+            if chosen != first {
+                assert_eq!(form, DeckForm::Folded, "{w} pt: {chosen:?} for {first:?}");
+                assert_eq!(chosen, first.map(|f| f + 1), "{w} pt: its short wording");
+                keyed += 1;
+            }
+            said[chosen.unwrap_or(4)] += 1;
+            if !fits[0] {
+                let lying = TotalsForm {
+                    said: "10c".into(),
+                    widest: totals[0].widest.clone(),
+                    used: true,
+                };
+                let one = std::slice::from_ref(&lying);
+                assert_ne!(
+                    form_of(legend_machine(at, one, &m).as_deref(), one),
+                    Some(0),
+                    "{form:?} {w} pt: the words fit, the widest does not"
+                );
+                let honest = said_totals(&["10c"]);
+                by_words += usize::from(
+                    form_of(legend_machine(at, &honest, &m).as_deref(), &honest) == Some(0),
+                );
+            }
+        }
+        assert!(
+            said.iter().all(|&n| n > 0),
+            "CONTROL: each form is said: {said:?}"
+        );
+        assert!(
+            keyed > 0,
+            "CONTROL: the over mark's key's room shortens a form at some Folded width"
+        );
+        assert!(
+            by_words > 0,
+            "CONTROL: a short form's words fit where the long one does not"
+        );
+    }
+
+    /// A changing reading never flips the legend's form (`docs/DESIGN-stats-deck-flow-
+    /// 2026-11-02.md` §4): the same Mac read near empty, part used and near full, with the cells
+    /// of neither block, either or both drawing the over mark, says the same form at every width
+    /// of both forms, since each form is measured by its widest and Folded's keeps the over mark's
+    /// key its room over B's strip whether or not a cell draws the mark; and Folded's legend ends
+    /// at block B's meter whatever its words. CONTROL: the same forms measured by their words
+    /// alone flip at some width, and at some Folded width the legend says a shorter form than
+    /// fits in its room with the key's, so a legend that kept the key's room only while B draws
+    /// the mark would flip there.
+    #[test]
+    fn a_changing_reading_never_flips_the_legends_form() {
+        let m = hn();
+        let readings = [
+            ("0.1", "0.01"),
+            ("3.0", "0.95"),
+            ("14.4", "2.34"),
+            ("31.9", "3.99"),
+        ];
+        let overs = [[false, false], [false, true], [true, false], [true, true]];
+        let measured: Vec<Vec<TotalsForm>> =
+            readings.iter().map(|&(g, t)| used_totals(g, t)).collect();
+        let by_words: Vec<Vec<TotalsForm>> = measured
+            .iter()
+            .map(|forms| {
+                forms
+                    .iter()
+                    .map(|t| TotalsForm {
+                        said: t.said.clone(),
+                        widest: t.said.clone(),
+                        used: t.used,
+                    })
+                    .collect()
+            })
+            .collect();
+        let (mut flips, mut used, mut keyed) = (0, 0, 0);
+        for (form, w, full, folded) in header_plans(&m) {
+            let at = (form, &full, &folded);
+            let said = |totals: &[TotalsForm], over: [bool; 2]| {
+                form_of(legend_machine_over(at, totals, over, &m).as_deref(), totals)
+            };
+            let forms: Vec<Option<usize>> = overs
+                .iter()
+                .flat_map(|&over| measured.iter().map(move |t| (t, over)))
+                .map(|(t, over)| said(t, over))
+                .collect();
+            assert!(
+                forms.windows(2).all(|p| p[0] == p[1]),
+                "{form:?} {w} pt: {forms:?}"
+            );
+            used += usize::from(forms[0].is_some_and(|i| i < 2));
+            let words: Vec<Option<usize>> = by_words.iter().map(|t| said(t, [false; 2])).collect();
+            flips += usize::from(words.windows(2).any(|p| p[0] != p[1]));
+            if form == DeckForm::Folded
+                && let (Some(_), Some(b_end)) =
+                    (folded.blocks[0].meter.bar, folded.blocks[1].meter.end())
+            {
+                let hi = b_end.min(folded.blocks[1].at.end());
+                for (totals, over) in overs
+                    .iter()
+                    .flat_map(|&over| measured.iter().map(move |t| (t, over)))
+                {
+                    let text = HeaderText {
+                        totals,
+                        over,
+                        ..TEXT
+                    };
+                    let head = header_folded(&folded, text, [None, None], &m);
+                    if let Some(&(_, end)) = heads(&head, &m).last() {
+                        assert!(
+                            (end - hi).abs() < 1e-9,
+                            "W {w} {over:?}: the legend ends at {end}"
+                        );
+                    }
+                }
+                // The longest of these forms that fits in the legend's whole room, the key's
+                // included, against the one it says.
+                let text = HeaderText {
+                    totals: &measured[2],
+                    ..TEXT
+                };
+                let tail = folded.blocks[0].meter.run.is_none();
+                let lead = folded.blocks[1].strip.x + MARKER_ROOM;
+                let whole = Header::new(&m)
+                    .legend_forms(&text, tail)
+                    .iter()
+                    .position(|f| f.2 <= hi - lead + 1e-9)
+                    .filter(|&i| i < measured[2].len());
+                keyed += usize::from(forms[0] != whole);
+            }
+        }
+        assert!(used > 0, "CONTROL: a used-of-total form is said");
+        assert!(
+            flips > 0,
+            "CONTROL: measured by their words, the forms flip"
+        );
+        assert!(
+            keyed > 0,
+            "CONTROL: at some Folded width the key's room shortens the form it says"
+        );
+    }
+
+    /// Where a run stands at the end of the bars, it says each row's maximum, so the legend says
+    /// the machine's name alone (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4, kept by the
+    /// flow record's §4): at every width of both forms where one stands, no totals follow the
+    /// name. CONTROL: where none stands, the legend says the totals at some width.
+    #[test]
+    fn a_standing_run_takes_the_totals_from_the_legend() {
+        let m = hn();
+        let totals = used_totals("14.4", "2.34");
+        let (mut with_run, mut totals_said) = (0, 0);
+        for (form, w, full, folded) in header_plans(&m) {
+            let said = legend_machine((form, &full, &folded), &totals, &m);
+            if run_stands(form, &full, &folded) {
+                with_run += 1;
+                assert!(
+                    said.as_deref().is_none_or(|s| !s.contains('\u{b7}')),
+                    "{form:?} {w} pt: a run stands, yet the legend says {said:?}"
+                );
+            } else {
+                totals_said += usize::from(form_of(said.as_deref(), &totals).is_some());
+            }
+        }
+        assert!(
+            with_run > 0 && totals_said > 0,
+            "CONTROL: {with_run} runs, {totals_said} totals"
+        );
+    }
+
     /// The legend keys the bars once and never across the Folded blocks' divider: every scope
     /// name stands, with its swatch, inside one block, at every width, with and without the
     /// machine's totals. CONTROL: a legend is laid at most widths.
     #[test]
     fn the_legend_stays_inside_one_block() {
         let m = hn();
-        let totals = [
-            "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
-            "18c \u{b7} 128G \u{b7} 2T".to_owned(),
-        ];
+        let totals = said_totals(&[
+            "18 cores \u{b7} 128 GiB \u{b7} 2 TB",
+            "18c \u{b7} 128G \u{b7} 2T",
+        ]);
         let mut laid = 0;
         for w in (300..=2_560).map(f64::from) {
             let plan = plan_folded(w, &m);
@@ -3645,10 +3978,10 @@ mod tests {
         let over = placed(&head, KeyItem::Over).expect("the over mark's key");
         assert!(over + KeyItem::Over.width(&m) + KEY_GAP <= b_end - whole("this Mac") + 1e-9);
         assert_eq!(label_x(&head, Label::Details), None);
-        let totals = [
-            "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
-            "18c \u{b7} 128G \u{b7} 2T".to_owned(),
-        ];
+        let totals = said_totals(&[
+            "18 cores \u{b7} 128 GiB \u{b7} 2 TB",
+            "18c \u{b7} 128G \u{b7} 2T",
+        ]);
         for w in [1039.0, 940.0, 750.0] {
             let plan = plan_folded(w, &m);
             let [_, b] = plan.blocks;

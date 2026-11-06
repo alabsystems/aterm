@@ -192,6 +192,9 @@ aterm-aos-pane = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# The fabric worlds open their broker as the node service hosts `bus.log`
+# (`aterm_mesh::logs::open_bus`, one-mesh C2). Already in the graph through aterm-gui.
+aterm-mesh = { workspace = true }
 # The direct fleet mail suite (`tests/fleet_live_headless.rs`) writes and reads a session's
 # sealed mailbox as a handoff peer, through its own transaction. Both already in the graph
 # through aterm-gui.

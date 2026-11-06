@@ -49,36 +49,63 @@ pub fn cursor_effect_arms(reply: &str) -> Option<(u64, u64)> {
     Some((0, 0))
 }
 
+/// WHY A BURST VERDICT DID NOT PASS ([`effects_verdict`], [`hardware_key_verdict`]): what the
+/// machine's load can explain, and what it cannot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// A reading past its ceiling, or a count that booked samples but fewer than its floor: the
+    /// burst measured, and a burst that ran loaded (admitted loaded at its patience bound, or
+    /// entered on a busy machine) is no evidence either way, so there the breach is UNDECIDED,
+    /// stated beside the pass and never a finding (owner ruling 2026-11-05: a busy machine never
+    /// blocks a release). On a quiet admission it fails.
+    Breach(String),
+    /// What no load explains: a reply that cannot be read, native clocks that did not report,
+    /// effects that never engaged, a count that booked nothing at all, or a present retry, drop
+    /// or sync timeout-release. A finding however busy the machine was.
+    Fail(String),
+}
+
+impl Miss {
+    /// The line that says what missed.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            Self::Breach(why) | Self::Fail(why) => why,
+        }
+    }
+}
+
 /// The burst's verdict on its post-burst `metrics` summary.
 /// # Errors
-/// A summary missing either reading, effects that never engaged, or too many late arms.
-pub fn effects_verdict(reply: &str) -> Result<String, String> {
+/// [`Miss::Fail`] for a summary missing either reading or effects that never engaged;
+/// [`Miss::Breach`] for too many late arms.
+pub fn effects_verdict(reply: &str) -> Result<String, Miss> {
     let Some((arms, late)) = cursor_effect_arms(reply) else {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: metrics carry no deadline_arms_by_owner ledger -> {}",
             or_no_reply(reply)
-        ));
+        )));
     };
     let Some(under) = metric_u64(reply, "fx_under_frames") else {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: metrics carry no fx_under_frames -> {}",
             or_no_reply(reply)
-        ));
+        )));
     };
     if arms == 0 || under == 0 {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: the cursor effects never engaged — cursor_effect arms={arms}, \
              fx_under_frames={under} — so the burst measured an effects-off instance"
-        ));
+        )));
     }
     let over_share = late.saturating_mul(CURSOR_EFFECT_LATE_SHARE_DEN) > arms && late > 1;
     if late > CURSOR_EFFECT_LATE_MAX || over_share {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: cursor_effect booked {late} late arms of {arms} during a paced \
              burst (max {CURSOR_EFFECT_LATE_MAX}, and at most 1 in \
              {CURSOR_EFFECT_LATE_SHARE_DEN}) — the effects are arming deadlines they \
              already missed"
-        ));
+        )));
     }
     Ok(format!(
         "gui smoke: cursor_effect arms={arms} late={late} fx_under_frames={under}"
@@ -588,13 +615,25 @@ fn lapsed_or(
 }
 
 /// Why the collected burst is unqualified, or why its protection failed.
-fn check_burst_timing(timing: &BurstTiming) -> Result<Vec<String>, String> {
+fn check_burst_timing(timing: &BurstTiming) -> Result<Vec<aterm_capacity::Unqualified>, String> {
     let mut unqualified = timing.unqualified.clone();
     lapsed_or(timing.outer.timing_protection(), &mut unqualified)
         .map_err(|why| format!("outer timing hold: {why}"))?;
     lapsed_or(timing.entry.timing_protection(), &mut unqualified)
         .map_err(|why| format!("burst timing hold: {why}"))?;
-    Ok(unqualified.iter().map(ToString::to_string).collect())
+    Ok(unqualified)
+}
+
+/// Whether the burst ran loaded: its claim was admitted loaded at its patience bound, or its
+/// fresh entry read a busy machine. A hold that only lapsed is not load: the burst entered quiet,
+/// and its readings stand.
+fn ran_loaded(unqualified: &[aterm_capacity::Unqualified]) -> bool {
+    unqualified.iter().any(|u| {
+        matches!(
+            u,
+            aterm_capacity::Unqualified::Admission(_) | aterm_capacity::Unqualified::Entry(_)
+        )
+    })
 }
 
 struct BurstReadings {
@@ -661,7 +700,7 @@ fn guarded_burst<G>(
     r: &mut Report,
     enter: impl FnOnce() -> Result<(G, String), String>,
     collect: impl FnOnce(&G) -> Result<BurstReadings, BurstError>,
-    protected: impl FnOnce(&G) -> Result<Vec<String>, String>,
+    protected: impl FnOnce(&G) -> Result<Vec<aterm_capacity::Unqualified>, String>,
 ) {
     let (guard, note) = match enter() {
         Ok(entered) => entered,
@@ -707,11 +746,13 @@ fn guarded_burst<G>(
     let stated = if unqualified.is_empty() {
         String::new()
     } else {
+        let why: Vec<String> = unqualified.iter().map(ToString::to_string).collect();
         format!(
             "; ran without a qualified quiet admission (stated, not a finding): {}",
-            unqualified.join("; ")
+            why.join("; ")
         )
     };
+    let loaded = ran_loaded(&unqualified);
     if let Err(why) = bounded {
         r.fail(why);
         return;
@@ -724,7 +765,14 @@ fn guarded_burst<G>(
     for verdict in [effects, hardware] {
         match verdict {
             Ok(line) => r.pass(format!("{line}{stated}")),
-            Err(why) => r.fail(why),
+            // A ceiling or floor the loaded burst missed is UNDECIDED: its takes are no evidence
+            // either way on that load, so it is stated beside the pass, as a measure row the
+            // machine's load leaves undecided is (stages::stated_note).
+            Err(Miss::Breach(why)) if loaded => r.pass(format!(
+                "{why}; undecided, stated and not a finding: the burst ran loaded, so its takes \
+                 are no evidence either way{stated}"
+            )),
+            Err(Miss::Breach(why) | Miss::Fail(why)) => r.fail(why),
         }
     }
 }
@@ -876,9 +924,11 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
 /// be zero: dispatch-time fallback samples cannot establish latency including OS queue residence.
 /// The measured hardware-write floor is unchanged.
 /// # Errors
-/// A reply that cannot be parsed, unavailable native clocks, a sampled slice without its maximum,
-/// a burst under a floor, or any gated reading at or over its ceiling.
-pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<String, String> {
+/// [`Miss::Fail`] for a reply that cannot be parsed, unreported or unavailable native clocks, a
+/// floored count that booked nothing, a sampled slice without its maximum, or any present retry,
+/// drop or sync timeout-release, each judged before any breach; [`Miss::Breach`] for a floored
+/// count that booked some samples but too few, or any gated reading at or over its ceiling.
+pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<String, Miss> {
     let whole = |name: &str| metric_ms_whole(reply, name);
     let (
         Some(n_key_write),
@@ -902,10 +952,10 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         whole("present_glass_p99_ms"),
     )
     else {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: could not parse hardware-key percentiles -> {}",
             or_no_reply(reply)
-        ));
+        )));
     };
     let (Some(frames), Some(max_input), Some(retries), Some(drops), Some(sync_timeouts)) = (
         metric_u64(summary, "frames"),
@@ -914,18 +964,18 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         metric_u64(summary, "present_drops"),
         metric_u64(summary, "sync_rel_timeout"),
     ) else {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: could not parse the post-burst metrics -> {}",
             or_no_reply(summary)
-        ));
+        )));
     };
     let f = |name: &str| reply_field(reply, name);
     let max_ms = |name: &str| {
         reply_field(reply, name).parse::<f64>().map_err(|_| {
-            format!(
+            Miss::Fail(format!(
                 "gui smoke: a sampled slice published no {name}, so nothing can confirm or \
                  refute its p99 [{reply}]"
-            )
+            ))
         })
     };
     let bar = |ms: u64| f64::from(u32::try_from(ms).unwrap_or(u32::MAX));
@@ -933,103 +983,128 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         metric_u64(reply, "key_queue_unavailable"),
         metric_u64(reply, "key_write_unavailable"),
     ) else {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: hardware clock availability is unreported or invalid; the subject \
              must publish key_queue_unavailable and key_write_unavailable to validate \
              hardware latency [{reply}]"
-        ));
+        )));
     };
     if queue_unavailable != 0 || write_unavailable != 0 {
-        return Err(format!(
+        return Err(Miss::Fail(format!(
             "gui smoke: hardware latency is unconfirmed because native clock samples are \
              unavailable; input_clock=unconfirmed key_queue_unavailable={queue_unavailable} \
              key_write_unavailable={write_unavailable} n_key_write={n_key_write} \
              posted={posted} n_input={n_input} [{reply}]"
-        ));
+        )));
     }
-    if n_key_write < HW_KEY_WRITE_FLOOR {
-        return Err(format!(
-            "gui smoke: insufficient measured hardware key→write samples — \
-             n_key_write={n_key_write} of posted={posted} (< {HW_KEY_WRITE_FLOOR}); \
-             native queue age unavailable for {queue_unavailable} presses and \
-             {write_unavailable} write completions; n_input={n_input} [{reply}]"
-        ));
+    let floors = [
+        (
+            n_key_write,
+            HW_KEY_WRITE_FLOOR,
+            format!(
+                "gui smoke: insufficient measured hardware key→write samples — \
+                 n_key_write={n_key_write} of posted={posted} (< {HW_KEY_WRITE_FLOOR}); \
+                 native queue age unavailable for {queue_unavailable} presses and \
+                 {write_unavailable} write completions; n_input={n_input} [{reply}]"
+            ),
+        ),
+        (
+            n_input,
+            HW_INPUT_FLOOR,
+            format!(
+                "gui smoke: the burst booked n_input={n_input} input→present samples of \
+                 posted={posted} (< {HW_INPUT_FLOOR}), so the input→present ceilings measured \
+                 nothing [{reply}]"
+            ),
+        ),
+        (
+            frames,
+            FRAMES_FLOOR,
+            format!(
+                "gui smoke: present starvation — frames={frames} (< {FRAMES_FLOOR}) [{summary}]"
+            ),
+        ),
+    ];
+    // What no load explains is judged before any ceiling or floor, so a breach a loaded burst
+    // states as undecided never hides it: a floored count that booked nothing, a sampled slice
+    // without its maximum, and any present retry, drop or sync timeout-release.
+    if let Some((_, _, why)) = floors.iter().find(|(count, _, _)| *count == 0) {
+        return Err(Miss::Fail(why.clone()));
     }
-    if n_input < HW_INPUT_FLOOR {
-        return Err(format!(
-            "gui smoke: the burst booked n_input={n_input} input→present samples of \
-             posted={posted} (< {HW_INPUT_FLOOR}), so the input→present ceilings measured \
-             nothing [{reply}]"
-        ));
+    let acquire_max = if n_acquire > 0 {
+        Some(max_ms("max_acquire_wait_ms")?)
+    } else {
+        None
+    };
+    let glass_max = if n_present_glass > 0 {
+        Some(max_ms("max_present_glass_ms")?)
+    } else {
+        None
+    };
+    if retries != 0 || drops != 0 {
+        return Err(Miss::Fail(format!(
+            "gui smoke: present retries/drops during frontmost typing — \
+             redraw_retry_gated={retries} present_drops={drops} [{summary}]"
+        )));
     }
-    if frames < FRAMES_FLOOR {
-        return Err(format!(
-            "gui smoke: present starvation — frames={frames} (< {FRAMES_FLOOR}) [{summary}]"
-        ));
+    if sync_timeouts != 0 {
+        return Err(Miss::Fail(format!(
+            "gui smoke: sync timeout-releases during plain typing — \
+             sync_rel_timeout={sync_timeouts} [{summary}]"
+        )));
+    }
+    if let Some((_, _, why)) = floors.into_iter().find(|(count, floor, _)| count < floor) {
+        return Err(Miss::Breach(why));
     }
     if max_input >= INPUT_PRESENT_CEILING_MS {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: input→present latency — max {max_input}ms \
              (>= {INPUT_PRESENT_CEILING_MS}) [{summary}]"
-        ));
+        )));
     }
     if key_write > KEY_WRITE_P99_CEILING_MS {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: hardware key→write — p99 {key_write}ms (> {KEY_WRITE_P99_CEILING_MS}), \
              aterm's own dispatch with OS queue residence; press lock wait max {}ms, \
              acquire p99 {}ms, child echo p99 {}ms [{reply}]",
             f("max_term_wait_press_ms"),
             f("acquire_p99_ms"),
             f("echo_p99_ms"),
-        ));
+        )));
     }
     if press_max >= TERM_WAIT_PRESS_MAX_CEILING_MS {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: key-press terminal-mutex wait — max {press_max}ms \
              (>= {TERM_WAIT_PRESS_MAX_CEILING_MS}) over n={} [{reply}]",
             f("n_term_wait_press"),
-        ));
+        )));
     }
-    if n_acquire > 0
-        && max_ms("max_acquire_wait_ms")? >= bar(ACQUIRE_P99_CEILING_MS)
+    if acquire_max.is_some_and(|max| max >= bar(ACQUIRE_P99_CEILING_MS))
         && acquire > ACQUIRE_P99_CEILING_MS
     {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: drawable acquire — p99 {acquire}ms (> {ACQUIRE_P99_CEILING_MS}, and its max confirms it) \
              over n={n_acquire}, max {}ms [{reply}]",
             f("max_acquire_wait_ms"),
-        ));
+        )));
     }
-    if n_present_glass > 0
-        && max_ms("max_present_glass_ms")? >= bar(PRESENT_GLASS_P99_CEILING_MS)
+    if glass_max.is_some_and(|max| max >= bar(PRESENT_GLASS_P99_CEILING_MS))
         && glass > PRESENT_GLASS_P99_CEILING_MS
     {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: present→glass — p99 {glass}ms \
              (> {PRESENT_GLASS_P99_CEILING_MS}, and its max confirms it) over n={n_present_glass}, the compositor \
              leg AFTER present-return that every slice above stops short of; max {}ms, \
              {} drawable(s) never shown [{reply}]",
             f("max_present_glass_ms"),
             f("present_glass_skipped"),
-        ));
+        )));
     }
     if input > INPUT_PRESENT_CEILING_MS {
-        return Err(format!(
+        return Err(Miss::Breach(format!(
             "gui smoke: hardware input→present — p99 {input}ms (> {INPUT_PRESENT_CEILING_MS}), \
              input_clock=native [{reply}]"
-        ));
-    }
-    if retries != 0 || drops != 0 {
-        return Err(format!(
-            "gui smoke: present retries/drops during frontmost typing — \
-             redraw_retry_gated={retries} present_drops={drops} [{summary}]"
-        ));
-    }
-    if sync_timeouts != 0 {
-        return Err(format!(
-            "gui smoke: sync timeout-releases during plain typing — \
-             sync_rel_timeout={sync_timeouts} [{summary}]"
-        ));
+        )));
     }
     Ok(format!(
         "gui smoke: frames={frames} max_input_present={max_input}ms, no present retries, \
@@ -1073,8 +1148,23 @@ pub(crate) mod tests {
         )
     }
 
-    fn hv(reply: &str) -> Result<String, String> {
+    fn hv(reply: &str) -> Result<String, Miss> {
         hardware_key_verdict(30, &summary(41, "8.90", 0, 0, 0), reply)
+    }
+
+    /// A busy CPU window and load, as a loaded admission or entry reads them.
+    fn busy() -> aterm_capacity::Observed {
+        aterm_capacity::Observed {
+            window: aterm_capacity::CpuWindow {
+                interval_ns: 1_000_000_000,
+                observed_ms: 1,
+                cores: 14,
+                busy_ticks: 63,
+                total_ticks: 100,
+            },
+            load1: 9.0,
+            max: 4.0,
+        }
     }
 
     fn percentiles(
@@ -1256,11 +1346,7 @@ pub(crate) mod tests {
             &mut r,
             || Ok(((), String::new())),
             |_| Ok(burst_readings()),
-            |_| {
-                Ok(vec![
-                    "admitted loaded at its patience bound: CPU 63.0% busy".to_owned(),
-                ])
-            },
+            |_| Ok(vec![aterm_capacity::Unqualified::Admission(busy())]),
         );
         let passes: Vec<&str> = r
             .outcomes()
@@ -1286,6 +1372,177 @@ pub(crate) mod tests {
                 .outcomes()
                 .any(|(_, line)| line.contains("qualified quiet"))
         );
+    }
+
+    /// A CEILING OR FLOOR A LOADED BURST MISSED IS UNDECIDED, STATED BESIDE THE PASS: its takes
+    /// are no evidence either way on that load (owner ruling 2026-11-05). NEGATIVE CONTROLS: the
+    /// same breaches on a quiet admission, and on one whose hold only lapsed, fail; and what no
+    /// load explains fails however loaded the burst ran.
+    #[test]
+    fn a_breach_on_a_loaded_burst_is_undecided_and_on_a_quiet_one_fails() {
+        let breaching = || {
+            let mut readings = burst_readings();
+            readings.summary = readings
+                .summary
+                .replace("cursor_effect:100/0", "cursor_effect:100/10");
+            readings.percentiles = percentiles(30, "45.00", "0.10", "1.00", "10.00");
+            readings
+        };
+        let run = |readings: BurstReadings, unqualified: Vec<aterm_capacity::Unqualified>| {
+            let mut r = Report::new("burst");
+            guarded_burst(
+                &mut r,
+                || Ok(((), String::new())),
+                |_| Ok(readings),
+                |_| Ok(unqualified),
+            );
+            r.outcomes()
+                .map(|(o, line)| (o, line.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let failed = crate::ladder::Outcome::Fail(crate::ladder::Severity::GateFailed);
+        for loaded in [
+            aterm_capacity::Unqualified::Admission(busy()),
+            aterm_capacity::Unqualified::Entry(busy()),
+        ] {
+            let rows = run(
+                breaching(),
+                vec![loaded, aterm_capacity::Unqualified::Lapsed],
+            );
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            for (outcome, line) in &rows {
+                assert_eq!(*outcome, crate::ladder::Outcome::Ok, "{line}");
+                assert!(
+                    line.contains("; undecided, stated and not a finding"),
+                    "{line}"
+                );
+                assert!(line.contains("qualified quiet admission"), "{line}");
+            }
+            assert!(rows[0].1.contains("late arms"), "{rows:?}");
+            assert!(
+                rows[1].1.contains("hardware key→write — p99 45ms"),
+                "{rows:?}"
+            );
+            let mut unread = breaching();
+            unread.percentiles = unread.percentiles.replace("key_queue_unavailable=0 ", "");
+            let rows = run(unread, vec![loaded]);
+            assert_eq!(rows[1].0, failed, "unreported clocks fail under any load");
+        }
+        for quiet in [Vec::new(), vec![aterm_capacity::Unqualified::Lapsed]] {
+            let rows = run(breaching(), quiet);
+            assert_eq!(
+                rows.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+                [failed, failed],
+                "{rows:?}"
+            );
+            assert!(!rows.iter().any(|(_, line)| line.contains("undecided")));
+        }
+    }
+
+    /// EACH CEILING, AND EACH FLOOR A COUNT MISSED WITH SOME SAMPLES, IS A BREACH; WHAT NO LOAD
+    /// EXPLAINS IS A FAILURE: a count that booked nothing, an unreadable reply, clocks that did
+    /// not report, a slice without its maximum, a present retry, drop or sync timeout-release,
+    /// and effects that never engaged. A failure beside a breach is the one named, so an
+    /// undecided breach never hides it.
+    #[test]
+    fn the_verdicts_tell_a_breach_from_what_no_load_explains() {
+        let breach = |got: Result<String, Miss>| matches!(got, Err(Miss::Breach(_)));
+        let fail = |got: Result<String, Miss>| matches!(got, Err(Miss::Fail(_)));
+        let effects = |ledger: &str, under: u64| {
+            effects_verdict(&format!(
+                "OK frames=40 fx_under_frames={under} deadline_arms_by_owner={ledger}"
+            ))
+        };
+        assert!(breach(effects("cursor_effect:430/40", 30)), "late arms");
+        assert!(fail(effects("cursor_effect:80/0", 0)), "no ribbon composed");
+        assert!(fail(effects("session_status:12/0", 30)), "no arm at all");
+        assert!(
+            fail(effects_verdict("OK frames=40 fx_under_frames=3")),
+            "no ledger"
+        );
+        let hw = |n_key_write: u64, key_write: &str, press: &str, acquire: &str, input: &str| {
+            hv(&percentiles(n_key_write, key_write, press, acquire, input))
+        };
+        assert!(
+            hw(30, "6.00", "0.10", "1.00", "10.00").is_ok(),
+            "the control"
+        );
+        assert!(
+            breach(hw(30, "46.13", "0.10", "1.00", "10.00")),
+            "key→write"
+        );
+        assert!(
+            breach(hw(30, "6.00", "30.00", "1.00", "10.00")),
+            "press wait"
+        );
+        assert!(
+            breach(hw(30, "6.00", "0.10", "1.00", "260.00")),
+            "input p99"
+        );
+        assert!(
+            breach(hw(14, "6.00", "0.10", "1.00", "10.00")),
+            "too few writes"
+        );
+        assert!(
+            fail(hw(0, "0.00", "0.00", "0.02", "9.00")),
+            "no write at all"
+        );
+        let acquire = with_max(
+            &percentiles(30, "6.00", "0.10", "56.00", "10.00"),
+            "max_acquire_wait_ms",
+            "60.00",
+        );
+        assert!(breach(hv(&acquire)), "acquire");
+        assert!(breach(hv(&with_max(
+            &with_glass(31, "92.00"),
+            "max_present_glass_ms",
+            "91.50"
+        ))));
+        let healthy = percentiles(30, "6.00", "0.10", "1.00", "10.00");
+        let input = |n: u64| hv(&healthy.replace("n_input=30", &format!("n_input={n}")));
+        assert!(breach(input(9)), "too few input samples");
+        assert!(fail(input(0)), "no input sample at all");
+        let with = |frames, max_input: &str, retries, drops, sync| {
+            hardware_key_verdict(
+                30,
+                &summary(frames, max_input, retries, drops, sync),
+                &healthy,
+            )
+        };
+        assert!(breach(with(10, "8.90", 0, 0, 0)), "starved");
+        assert!(fail(with(0, "8.90", 0, 0, 0)), "no frame at all");
+        assert!(breach(with(41, "530.10", 0, 0, 0)), "slow");
+        assert!(fail(with(41, "8.90", 4, 0, 0)), "retries");
+        assert!(fail(with(41, "8.90", 0, 7, 0)), "drops");
+        assert!(fail(with(41, "8.90", 0, 0, 2)), "sync timeouts");
+        assert!(
+            fail(with(41, "530.10", 0, 7, 0)),
+            "a drop beside a slow maximum"
+        );
+        let slow_write = percentiles(30, "46.13", "0.10", "1.00", "10.00");
+        let beside = |summary: &str, reply: &str| hardware_key_verdict(30, summary, reply);
+        assert!(breach(beside(&summary(41, "8.90", 0, 0, 0), &slow_write)));
+        assert!(
+            fail(beside(&summary(0, "8.90", 0, 0, 0), &slow_write)),
+            "no frame at all beside a slow write"
+        );
+        assert!(
+            fail(beside(
+                &summary(41, "8.90", 0, 0, 0),
+                &slow_write.replace(" max_acquire_wait_ms=4.80", "")
+            )),
+            "a slice without its maximum beside a slow write"
+        );
+        assert!(fail(hv("OK n_input=30")), "unparsable");
+        assert!(
+            fail(hv(&healthy.replace(
+                "key_write_unavailable=0",
+                "key_write_unavailable=3"
+            ))),
+            "unavailable clocks"
+        );
+        let unmaxed = healthy.replace(" max_acquire_wait_ms=4.80", "");
+        assert!(fail(hv(&unmaxed)), "a sampled slice without its maximum");
     }
 
     #[test]
@@ -1414,13 +1671,15 @@ pub(crate) mod tests {
                 );
             let fallback =
                 hv(&mixed).expect_err("partial clocks cannot confirm whole-burst latency");
-            assert_eq!(reply_field(&fallback, "input_clock"), "unconfirmed");
+            assert!(matches!(fallback, Miss::Fail(_)), "{fallback:?}");
+            let fallback = fallback.why();
+            assert_eq!(reply_field(fallback, "input_clock"), "unconfirmed");
             assert_eq!(
-                reply_field(&fallback, "key_queue_unavailable"),
+                reply_field(fallback, "key_queue_unavailable"),
                 queue.to_string()
             );
             assert_eq!(
-                reply_field(&fallback, "key_write_unavailable"),
+                reply_field(fallback, "key_write_unavailable"),
                 write.to_string()
             );
         }

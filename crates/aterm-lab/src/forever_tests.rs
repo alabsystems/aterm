@@ -866,8 +866,7 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             LandSameList,
             LandReworded,
             LandContradictedList,
-            WroteC,
-            SwitchOverHeld
+            WroteC
         ]
     );
     assert!(SameLand.repo() == Repo::Untracked && SameCruise.repo() == Repo::Clean);
@@ -5957,9 +5956,10 @@ fn seen_cruise_n() -> Seen {
     }
 }
 
-/// N4's stand-in ask beside its report as [`surfaces::stopped::ask_step`] keeps it (§14.7): on a
-/// 7a build (`first`) the ask's row above the report's and pressed, the report's row carrying
-/// `product`'s tip; on main before it the older report above, pressed, with no tip.
+/// N4's stand-in ask beside its report as [`surfaces::stopped::ask_step`] keeps it (§14.7): on
+/// main (`first`) the ask's row above the report's and no tab pressed (continuous forward), the
+/// report's row carrying `product`'s tip; on main before 7a the older report above, pressed, with
+/// no tip.
 fn stopped_read(product: Option<&str>, first: bool) -> String {
     let ask = format!(
         "◇ {} — approve the stand-in request · 1s",
@@ -5981,7 +5981,7 @@ fn stopped_read(product: Option<&str>, first: bool) -> String {
                 false,
             )
         }),
-        pressing: if first { "@s-ask" } else { "@s-cn" }.into(),
+        pressing: if first { "-" } else { "@s-cn" }.into(),
     };
     format!("{} cleared=yes", read.line("s-ask", "s-cn"))
 }
@@ -6127,6 +6127,49 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
         one(Chain::CruiseN, &s, "claude", Scenario::N1).0,
         "UNOBSERVED"
     );
+}
+
+/// A STEP NO WINDOW READ FELL IN IS UNOBSERVED, never failed on rows nobody read: Muse Code's N1
+/// on 2026-11-05, whose first read came at +129.3 s, after its first need's 2 min back-off closed
+/// the span (`n_unglanced`). N2–N4, read in theirs, are judged as ever. Negative control: the
+/// window judges without that check fail N1 (`no chip line in its span`, rows `[]`).
+#[test]
+fn cruise_n_leaves_a_step_its_window_never_read_unobserved() {
+    let mut s = seen_cruise_n();
+    let watched = |v: &mut Vec<(i64, String)>| v.retain(|(t, _)| *t > T0 + 125_000);
+    for v in [
+        &mut s.status,
+        &mut s.meta,
+        &mut s.window.chip,
+        &mut s.window.strip,
+        &mut s.window.menu,
+        &mut s.window.page,
+    ] {
+        watched(v);
+    }
+    s.window.chip.insert(
+        0,
+        j(
+            129_000,
+            "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\"",
+        ),
+    );
+    s.window
+        .strip
+        .insert(0, j(129_000, "index=16 selected=1 states=selected"));
+    let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("no window read in N1's span"), "{why}");
+    assert!(!why.contains("FAIL"), "{why}");
+    assert_eq!(
+        verdicts(Chain::CruiseN, &s, "claude")[1..],
+        [("N2", "PASS"), ("N3", "PASS"), ("N4", "PASS")]
+    );
+    // One glance inside the span, its page read and nothing changed: N1's rows are judged again,
+    // and the rows that stood from before its reply say nothing of it.
+    s.window.page_reads.push(T0 + 60_000);
+    let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
+    assert_eq!(w, "FAIL", "{why}");
 }
 
 #[test]
@@ -7011,19 +7054,13 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
         ]
     );
     assert_eq!(Chain::of_mode(Mode::Ladder), [Ladder, Off]);
-    assert_eq!(
-        Chain::of_mode_on(Mode::Resid, Harness::Agy),
-        [InstantCruise, InstantPerson, SameWords, TallScroll, Off]
-    );
-    for h in [Harness::Claude, Harness::Muse] {
+    for h in Harness::ALL {
         assert_eq!(
             Chain::of_mode_on(Mode::Resid, h),
             Chain::of_mode(Mode::Resid),
             "{h:?}"
         );
-        assert_eq!(tool_end_out_of_reach(h), None, "{h:?}");
     }
-    assert!(tool_end_out_of_reach(Harness::Agy).is_some());
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     for (w, m) in [("resid", Mode::Resid), ("ladder", Mode::Ladder)] {
         let a = parse_args(&v(&["--harness", "agy", "--mode", w]))
@@ -7233,8 +7270,34 @@ fn a_dialog_is_judged_by_its_autopilots_rule_and_what_came_back() {
     let mut unsaid = land.clone();
     unsaid.cover.dialog_answers = Some(vec![rec]);
     assert_eq!(cover::judge_dialog(&unsaid, true, T0).word(), "FAIL");
+    // L20 wants one land check after the yield: a second one typed before the LANDED fails it.
+    let mut twice = land.clone();
+    let after = twice
+        .journal
+        .iter()
+        .position(|(t, l)| *t > T0 + 130_200 && l.starts_with("EVENT idle seq=3"))
+        .expect("the LANDED reply");
+    twice.journal.insert(
+        after,
+        j(
+            132_000,
+            "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+        ),
+    );
+    let v = cover::judge_dialog(&twice, true, T0);
+    assert_eq!(v.word(), "FAIL", "two land checks: {}", v.why());
+    assert!(
+        v.why().contains("2 land checks typed, not one"),
+        "{}",
+        v.why()
+    );
 }
 
+/// F3's first turn: the harness's read, on the prompt's rule alone, then words that draw nothing,
+/// so the turn ends on the tool's row: none on Claude Code and Muse Code, a single space on agy,
+/// which refuses a reply holding neither text nor a tool call with an error turn of its own
+/// ([`tool_after`]). Negative control: agy's reply empty as the others' (the error turn the lab
+/// named F3 out of agy's reach for, 2026-10-21).
 #[test]
 fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
     let dirs: Vec<PathBuf> = Chain::RESID
@@ -7266,7 +7329,10 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
             _ => assert_eq!(path("file_path").as_deref(), Some("/w/tool-end/README.md")),
         }
         assert_eq!(crate::stub::scripted_call(&first, true), None);
-        assert_eq!(first.get("text").and_then(J::as_str), Some(TOOL_AFTER));
+        let after = first.get("text").and_then(J::as_str).unwrap();
+        assert_eq!(after, tool_after(h), "{h:?}");
+        assert!(after.trim().is_empty(), "{h:?}: words after the tool's row");
+        assert_eq!(after.is_empty(), h != Harness::Agy, "{h:?}: {after:?}");
         let land =
             crate::stub::with_reply(sp.clone(), &[Chain::ToolEnd.prompt(), LAND.to_string()]);
         assert_eq!(crate::stub::scripted_call(&land, false), None);
@@ -7480,6 +7546,10 @@ fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
     )
 }
 
+/// F18 as main records it (bo1's branch run `b-cl-ip`, 2026-11-01, Claude Code 2.1.316): the
+/// person's Enter inside the second back-off, their reply read at once, their grace waited, then
+/// the back-off at its own point naming the streak that stood (2, 4 min from the reply), and
+/// Cruise's act at its due.
 fn person_instant() -> Seen {
     let mut s = instant_cruised();
     s.journal.truncate(5);
@@ -7487,14 +7557,25 @@ fn person_instant() -> Seen {
     s.journal
         .push(j(127_900, &format!("EVENT idle seq=3 {ASK_REPLY}")));
     s.journal.push(j(
-        127_950,
-        "LEFT seq=3 rule=left-to-person@v1 a person's own exchange (their message, answered within 10 min): nothing is typed until the next turn ends",
+        128_000,
+        &format!("WAITING seq=3 until={} a person is typing", stamp(247_900)),
     ));
-    s.ledger
-        .push(row(127_950, RULE_LEFT, "skipped", "", LEFT_REASON));
-    s.status.push(status(129_000, "theirs", "cruise"));
+    s.journal.push(j(
+        248_000,
+        &format!(
+            "WAITING seq=3 until={} 2 short turn(s) in a row: 4 min back-off",
+            stamp(367_900)
+        ),
+    ));
+    s.journal.push(j(
+        368_200,
+        "CONTINUED seq=3 rule=continue@v1 [aterm harness] x",
+    ));
+    s.ledger.push(typed(368_200, "continue@v1", CONTINUE_TEXT));
+    s.journal
+        .push(j(371_000, &format!("EVENT idle seq=4 {WORK}")));
     s.asked_ms = Some(T0 + 127_000);
-    s.end_ms = T0 + 410_000;
+    s.end_ms = T0 + 375_000;
     s.cover.ask_stamp = Some("1300".to_string());
     s.cover.window_stub = Some(StubSeen {
         baseline: 1,
@@ -7505,87 +7586,75 @@ fn person_instant() -> Seen {
 }
 
 #[test]
-fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
+fn f18_passes_only_where_the_persons_instant_turn_is_judged_on_the_ladder() {
     let f18 = |s: &Seen| one(Chain::InstantPerson, s, "claude", Scenario::F18);
     let (w, why) = f18(&person_instant());
     assert_eq!(w, "PASS", "{why}");
-    assert!(why.contains("left-to-person@v1"), "{why}");
-    let retold_at = |s: &mut Seen, due: i64| {
-        s.journal[4] = j(
-            121_700,
-            &format!(
-                "WAITING seq=2 until={} 2 short turn(s) in a row: 4 min back-off",
-                stamp(361_700)
-            ),
-        );
-        s.journal.insert(5, j(127_400, "EVENT idle seq=9 -"));
-        s.journal.insert(
-            6,
-            j(
-                127_500,
-                &format!(
-                    "WAITING seq=9 until={} 2 short turn(s) in a row: 4 min back-off",
-                    stamp(due)
-                ),
-            ),
-        );
-    };
-    let mut s = person_instant();
-    retold_at(&mut s, 361_700);
-    let (w, why) = f18(&s);
-    assert_eq!(w, "PASS", "{why}");
-    let mut s = person_instant();
-    retold_at(&mut s, 367_500);
-    let (w, why) = f18(&s);
-    assert_eq!(w, "FAIL", "{why}");
     assert!(
-        why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
+        why.contains("continue@v1 typed at +368.2 s, at its due"),
         "{why}"
     );
+    // NEGATIVE CONTROL, P4C's: the prompt counted as the conversation's own short answer.
     let mut s = person_instant();
-    s.journal[6] = j(
-        128_000,
-        "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
+    s.journal[7].1 = s.journal[7].1.replace(
+        "2 short turn(s) in a row: 4 min",
+        "3 short turn(s) in a row: 8 min",
     );
     let (w, why) = f18(&s);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
-        "{why}"
-    );
+    assert!(why.contains("ITS BACK-OFF NAMES 3 SHORT TURN(S)"), "{why}");
+    // The want this replaced: left to the person, theirs (a build before the 2026-10-26 ruling).
     let mut s = person_instant();
-    s.journal.truncate(6);
-    s.ledger.truncate(1);
-    s.status.pop();
-    s.journal.push(j(
-        361_700,
-        "CONTINUED seq=2 rule=continue-done-check@v1 [aterm harness] x",
-    ));
-    s.ledger
-        .push(typed(361_700, "continue-done-check@v1", DONE_CHECK));
+    s.journal.insert(
+        6,
+        j(
+            127_950,
+            "LEFT seq=3 rule=left-to-person@v1 a person's own exchange (their message, answered \
+             within 10 min): nothing is typed until the next turn ends",
+        ),
+    );
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("LEFT to the person"), "{why}");
+    let mut s = person_instant();
+    s.status.push(status(129_000, "theirs", "cruise"));
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("task=theirs"), "{why}");
+    // Typed before the due, or long past it; nothing past it at all.
+    let mut s = person_instant();
+    s.journal[8].0 = T0 + 200_000;
+    s.ledger[1].ts = T0 + 200_000;
     let (w, why) = f18(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("TYPED into the person's exchange"), "{why}");
     let mut s = person_instant();
-    s.journal.push(j(
-        361_700,
-        "CONTINUED seq=2 rule=continue@v1 [aterm harness] x",
-    ));
-    assert_eq!(f18(&s).0, "FAIL");
-    let mut s = person_instant();
-    s.ledger.push(typed(361_700, "continue@v1", CONTINUE_TEXT));
-    assert_eq!(f18(&s).0, "FAIL");
-    let mut s = person_instant();
-    s.journal[6].0 = T0 + 158_000;
+    s.journal[8].0 = T0 + 440_000;
+    s.journal[9].0 = T0 + 443_000;
+    s.end_ms = T0 + 450_000;
     let (w, why) = f18(&s);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("not as the reply showed"), "{why}");
+    assert!(why.contains("past its back-off's due"), "{why}");
     let mut s = person_instant();
-    s.status.pop();
-    assert_eq!(f18(&s).0, "FAIL");
+    s.journal.truncate(8);
+    s.ledger.truncate(1);
+    s.end_ms = T0 + 367_900 + 61_000;
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = T0 + 300_000;
+    assert_eq!(f18(&s).0, "UNOBSERVED");
     let mut s = person_instant();
-    s.journal.push(j(128_100, "DONE seq=3 rule=land@v1 x"));
-    assert_eq!(f18(&s).0, "FAIL");
+    s.journal.truncate(6);
+    s.ledger.truncate(1);
+    s.journal.push(j(
+        140_000,
+        "CONTINUED seq=3 rule=continue@v1 [aterm harness] x",
+    ));
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("with no back-off decided"), "{why}");
+    // A harness text at the stub before the due, an end, a need.
     let mut s = person_instant();
     s.cover.window_stub = Some(StubSeen {
         baseline: 1,
@@ -7594,26 +7663,14 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     });
     assert_eq!(f18(&s).0, "FAIL");
     let mut s = person_instant();
-    s.meta.push(needs_meta(130_000, "claude"));
+    s.journal.push(j(372_000, "DONE seq=4 rule=land@v1 x"));
     assert_eq!(f18(&s).0, "FAIL");
     let mut s = person_instant();
-    s.journal.truncate(6);
-    s.ledger.truncate(1);
-    s.status.pop();
-    s.end_ms = T0 + 430_000;
-    let (w, why) = f18(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    s.end_ms = T0 + 400_000;
-    assert_eq!(f18(&s).0, "UNOBSERVED");
-    let mut s = person_instant();
-    s.journal.remove(5);
-    assert_eq!(f18(&s).0, "UNOBSERVED");
+    s.meta.push(needs_meta(130_000, "claude"));
+    assert_eq!(f18(&s).0, "FAIL");
+    // Unobserved: the reply unread, the stub unread, a turn that ran, nobody's hand, no prompt.
     let mut s = person_instant();
     s.journal[5] = j(127_900, "EVENT idle seq=3 -");
-    assert_eq!(f18(&s).0, "UNOBSERVED");
-    let mut s = person_instant();
-    s.end_ms = T0 + 300_000;
     assert_eq!(f18(&s).0, "UNOBSERVED");
     let mut s = person_instant();
     s.cover.window_stub = None;
@@ -7652,12 +7709,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
         )
         .0,
         "PASS"
-    );
-    let mut s = person_instant();
-    s.journal.truncate(7);
-    assert_eq!(
-        one(Chain::InstantCruise, &s, "claude", Scenario::P4P).0,
-        "FAIL"
     );
 }
 
@@ -8147,6 +8198,78 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     }
 }
 
+/// F3 as main recorded it on Claude Code 2.1.318 (`e-cl-res`, 2026-11-04): the tool's row read
+/// at +1.3 s, Land's instruction typed at that point at once, the land check, LANDED.
+fn tool_ended_at_once() -> Seen {
+    Seen {
+        journal: vec![
+            j(1_300, "EVENT idle seq=1326 Read 1 file (ctrl+o to expand)"),
+            j(
+                1_900,
+                "CONTINUED seq=1326 rule=land@v1 [aterm harness] Autopilot is Land:",
+            ),
+            j(2_600, "EVENT idle seq=2199 ⏺ Nothing left: the parser"),
+            j(
+                3_100,
+                "CONTINUED seq=2199 rule=land-check@v1 [aterm harness] Land check:",
+            ),
+            j(3_800, "EVENT idle seq=3056 ⏺ LANDED"),
+            j(3_800, "DONE seq=3056 rule=land@v1 x"),
+        ],
+        ledger: vec![
+            point(1_300, 1),
+            typed(1_900, "land@v1", LAND),
+            point(2_600, 2),
+            typed(3_100, "land-check@v1", "[aterm harness] Land check:"),
+            task_done(3_800),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            status(8_200, "landed", "land"),
+        ],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 24_500,
+        cover: Cover {
+            tool_results: Some(4),
+            first_screen: Some((
+                T0 + 8_200,
+                vec!["  ⎿  Read 1 file (ctrl+o to expand)".into()],
+            )),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+/// Land's instruction typed at the tool-ended point at once is its judgment (v6 §14.10); typed
+/// past ten seconds of the point, or at a later point's seq, with no back-off, it is not.
+#[test]
+fn f3_takes_lands_instruction_at_the_tool_ended_point_at_once() {
+    let f3 = |s: &Seen| one(Chain::ToolEnd, s, "claude", Scenario::F3);
+    let (w, why) = f3(&tool_ended_at_once());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("+1.9 s CONTINUED seq=1326 rule=land@v1"),
+        "{why}"
+    );
+    assert!(why.contains("landed at +3.8 s"), "{why}");
+    let mut late = tool_ended_at_once();
+    late.journal[1].0 = T0 + 11_400;
+    late.ledger[1].ts = T0 + 11_400;
+    let (w, why) = f3(&late);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("nor land@v1 typed at the first point within 10 s"),
+        "{why}"
+    );
+    let mut other = tool_ended_at_once();
+    other.journal[1].1 = other.journal[1].1.replace("seq=1326", "seq=9999");
+    let (w, why) = f3(&other);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("no back-off decided before it"), "{why}");
+}
+
 fn laddered(scale: f64) -> Seen {
     laddered_late(scale, 0, 0)
 }
@@ -8177,6 +8300,90 @@ fn laddered_late(scale: f64, late: u32, extra: i64) -> Seen {
         }
     }
     s
+}
+
+/// [`laddered`] as main journals it past its forward recovery (`g2-cl-lad`, bo1's merged arm,
+/// 2026-11-01): the stub's one reply repeats from the second act on, so from step 3 each wait is
+/// the recovery's (`turn_end::REPEAT_RECOVERY_WAIT`), naming no streak.
+fn laddered_recovering(scale: f64) -> Seen {
+    let mut s = laddered(scale);
+    for (_, l) in &mut s.journal {
+        let Some(n) = l
+            .strip_prefix("WAITING seq=")
+            .and_then(|r| r.split_whitespace().next()?.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if n < 3 {
+            continue;
+        }
+        let until = word(l, "until").unwrap();
+        *l = format!(
+            "WAITING seq={n} until={until} {}",
+            turn_end::REPEAT_RECOVERY_WAIT
+        );
+    }
+    s
+}
+
+/// THE LADDER PAST THE RECOVERY: each recovery wait is the step after the one before, judged on
+/// the ladder's step for it. NEGATIVE CONTROL: waits in other words are no steps (2 of 7,
+/// unobserved, as main's lab reported `g2-cl-lad`), and a recovery that waits the wrong step
+/// fails.
+#[test]
+fn the_ladder_reads_the_recoverys_waits_as_its_steps() {
+    let lad = |s: &Seen| one(Chain::Ladder, s, "claude", Scenario::Ladder);
+    let s = laddered_recovering(LADDER_SCALE);
+    assert_eq!(
+        ladder_steps(&s, T0)
+            .iter()
+            .map(|st| st.streak)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7]
+    );
+    let (w, why) = lad(&s);
+    assert_eq!(w, "PASS", "{why}");
+    let mut other = s.clone();
+    for (_, l) in &mut other.journal {
+        *l = l.replace(
+            turn_end::REPEAT_RECOVERY_WAIT,
+            "standing decision refused; changing approach on the next turn",
+        );
+    }
+    assert_eq!(ladder_steps(&other, T0).len(), 2);
+    let (w, why) = lad(&other);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("2 of 7 steps"), "{why}");
+    let mut short = s.clone();
+    let k = short
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("WAITING seq=5 "))
+        .unwrap();
+    let t = short.journal[k].0 - T0;
+    short.journal[k].1 = format!(
+        "WAITING seq=5 until={} {}",
+        stamp(t + 60_000),
+        turn_end::REPEAT_RECOVERY_WAIT
+    );
+    let (w, why) = lad(&short);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("step 5"), "{why}");
+    let mut retold = s;
+    let k = retold
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("WAITING seq=4 "))
+        .unwrap();
+    let (t4, l4) = retold.journal[k].clone();
+    retold.journal.insert(
+        k + 1,
+        (
+            t4 + 2_000,
+            l4.replacen("WAITING seq=4 ", "WAITING seq=44 ", 1),
+        ),
+    );
+    assert_eq!(ladder_steps(&retold, T0).len(), LADDER_STEPS as usize);
 }
 
 #[test]
@@ -9002,9 +9209,32 @@ fn cruise_said() -> String {
     )
 }
 
+/// The same chain as continuous forward runs it (main since 2026-11-01): the second check's
+/// answer paced on the ladder, the recovery's wait in place of the hold.
+fn cruise_forward() -> Seen {
+    let mut s = cruise_on_main();
+    s.journal.extend([
+        j(
+            372_300,
+            "EVENT idle seq=2616 ⏺ Nothing left: the parser is committed and pushed to origin/main.",
+        ),
+        j(
+            372_300,
+            &format!(
+                "WAITING seq=2616 until=x {}",
+                turn_end::REPEAT_RECOVERY_WAIT
+            ),
+        ),
+    ]);
+    s.end_ms = T0 + 432_300;
+    s
+}
+
 /// 2a's negative control first (§14.2's Proof): main's watch ended the cruise chain at its second
 /// done check, before the hold, and C2 passed while aterm had stopped typing for good. Watched a
-/// minute past the hold, the chip that still says the mode's promise fails C2 as held, not said.
+/// minute past its second answer's point, the chain passes where Cruise paces it (continuous
+/// forward), and a hold there fails C2 as its records' fault, however the chip says it (THE
+/// NEGATIVE CONTROL: the said hold that passed before 2026-11-01).
 #[test]
 fn the_cruise_chain_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
     let main = cruise_on_main();
@@ -9016,45 +9246,39 @@ fn the_cruise_chain_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
         !finished(&tab_of(Chain::Cruise, main), T0 + 369_400),
         "the watch no longer ends at the act after the check"
     );
+    let forward = cruise_forward();
+    assert!(!finished(
+        &tab_of(Chain::Cruise, forward.clone()),
+        T0 + 432_299
+    ));
+    assert!(finished(
+        &tab_of(Chain::Cruise, forward.clone()),
+        T0 + 432_300
+    ));
+    assert_eq!(
+        verdicts(Chain::Cruise, &forward, "claude"),
+        [("C1", "PASS"), ("C2", "PASS")]
+    );
     let held = cruise_held(CRUISE_ON_MAIN);
     assert!(!finished(
         &tab_of(Chain::Cruise, held.clone()),
         T0 + 432_299
     ));
     assert!(finished(&tab_of(Chain::Cruise, held.clone()), T0 + 432_300));
-    let (w, why) = one(Chain::Cruise, &held, "claude", Scenario::C2);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("HELD, NOT SAID") && why.contains("held at +372.3 s"),
-        "{why}"
-    );
-    assert!(
-        why.contains("the title \"autopilot: cruise — keeps going for ever"),
-        "{why}"
-    );
-    let (w, why) = one(
-        Chain::Cruise,
-        &cruise_held(&cruise_said()),
-        "claude",
-        Scenario::C2,
-    );
-    assert_eq!(w, "FAIL", "said, but main's journal names no arm: {why}");
-    assert!(
-        !why.contains("HELD, NOT SAID") && why.contains("held=(none)"),
-        "{why}"
-    );
-    let (w, why) = one(
-        Chain::Cruise,
-        &three_a_said(cruise_held(&cruise_said()), Chain::Cruise),
-        "claude",
-        Scenario::C2,
-    );
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("journaled when=later held=same-reply")
-            && why.contains("no `Stopped typing` row"),
-        "{why}"
-    );
+    for s in [
+        held,
+        cruise_held(&cruise_said()),
+        three_a_said(cruise_held(&cruise_said()), Chain::Cruise),
+    ] {
+        let (w, why) = one(Chain::Cruise, &s, "claude", Scenario::C2);
+        assert_eq!(w, "FAIL", "{why}");
+        assert!(
+            why.starts_with("THE CHAIN'S RECORDS: aterm stopped typing into it at +372.3 s")
+                && why.contains("STOPPED FOR GOOD"),
+            "{why}"
+        );
+        assert!(!why.contains(surfaces::held::SAID), "{why}");
+    }
 }
 
 /// [`nudged`]'s records with the nudge's yield held (`b42ae72fc3`'s shape) in place of a
@@ -9154,7 +9378,8 @@ fn a_hold_fails_every_scenario_of_a_chain_that_scripts_no_same_reply() {
     assert!(why.contains("(its own judge: PASS"), "{why}");
 }
 
-/// HL and HC run in the measured pass, each to a minute past its second act's point.
+/// HL and HC run in the measured pass: HL to a minute past its second act's point, HC to a minute
+/// past a hold where one comes (STOPPED FOR GOOD), else to the recovery's answer or a loss.
 #[test]
 fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
     let held = three_a_said(nudged_held(&contradicted(Repo::Untracked)), Chain::SameLand);
@@ -9193,10 +9418,21 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
     gone.band_reads.push(p + 2_000);
     gone.end_ms = p + 2_000;
     assert!(finished(&tab_of(Chain::SameLand, gone.clone()), p + 2_000));
+    // same-cruise holds nothing (continuous forward): with no hold, its watch runs to the
+    // recovery's answer, or to a loss (here an act with no point judged after it).
     let mut cold = typed;
     cold.journal.truncate(2);
     cold.stop_person_ms = None;
-    assert!(!finished(&tab_of(Chain::SameCruise, cold), T0 + 900_000));
+    cold.end_ms = T0 + 125_000 + UNJUDGED_MS - 1;
+    assert!(!finished(
+        &tab_of(Chain::SameCruise, cold.clone()),
+        cold.end_ms
+    ));
+    cold.end_ms += 1;
+    assert!(finished(
+        &tab_of(Chain::SameCruise, cold.clone()),
+        cold.end_ms
+    ));
     let (w, why) = one(
         Chain::SameLand,
         &nudged_held(&contradicted(Repo::Untracked)),
@@ -9217,8 +9453,7 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
         Scenario::HC,
     );
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("HELD, NOT SAID"), "{why}");
-    assert!(why.contains("held=(none)"), "{why}");
+    assert!(why.starts_with("STOPPED FOR GOOD at +372.3 s"), "{why}");
     assert!(Chain::of_mode(Mode::Both).contains(&Chain::SameLand));
     assert!(surfaces::TITLED.contains(&Chain::SameCruise));
 }
@@ -9294,8 +9529,8 @@ fn wrote_c_held(line: &str) -> Seen {
 
 /// wrote-c answers each done check with `W_CHECKED`, so it is a same-reply chain: its watch runs a
 /// minute past its hold, where the watch before ended at the act after its check and C3 passed
-/// while aterm had stopped typing, and its hold fails C3 as held, not said, never as a chain that
-/// scripts no same reply.
+/// while aterm had stopped typing, and its hold fails C3 as its records' fault under Cruise
+/// (continuous forward), however the chip says it.
 #[test]
 fn wrote_c_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
     assert!(
@@ -9308,48 +9543,34 @@ fn wrote_c_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
         T0 + 432_799
     ));
     assert!(finished(&tab_of(Chain::WroteC, held.clone()), T0 + 432_800));
-    let (w, why) = one(Chain::WroteC, &held, "claude", Scenario::C3);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("HELD, NOT SAID") && why.contains("held at +372.8 s"),
-        "{why}"
-    );
-    assert!(!why.contains("THE CHAIN'S RECORDS"), "{why}");
-    let (w, why) = one(
-        Chain::WroteC,
-        &wrote_c_held(&cruise_said()),
-        "claude",
-        Scenario::C3,
-    );
-    assert_eq!(w, "FAIL", "said, but main's journal names no arm: {why}");
-    assert!(
-        !why.contains("HELD, NOT SAID") && why.contains("held=(none)"),
-        "{why}"
-    );
-    let (w, why) = one(
-        Chain::WroteC,
-        &three_a_said(wrote_c_held(&cruise_said()), Chain::WroteC),
-        "claude",
-        Scenario::C3,
-    );
-    // Its window's title want stays unread on these records (no opening sweep, no END).
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(
-        why.contains(&format!("{}: PASS", surfaces::held::ADDS))
-            && why.contains(&format!("{}: PASS", surfaces::held::SAID)),
-        "{why}"
-    );
+    for s in [
+        held,
+        three_a_said(wrote_c_held(&cruise_said()), Chain::WroteC),
+    ] {
+        let (w, why) = one(Chain::WroteC, &s, "claude", Scenario::C3);
+        assert_eq!(w, "FAIL", "{why}");
+        assert!(
+            why.starts_with("THE CHAIN'S RECORDS: aterm stopped typing into it at +372.8 s")
+                && why.contains("STOPPED FOR GOOD"),
+            "{why}"
+        );
+    }
     assert!(Chain::WroteC.same_reply());
 }
 
 /// THE NEED CHAINS ANSWER THE CHECK ONCE THE LAB READ THE NEED (L3's land-a, L14's land-w): their
 /// `LANDED` carries the gate the lab opens ([`Chain::need_gate`]) and no delay of its own, so the
 /// need is read standing however slow the lab's reads run; no other chain's answer waits on one;
-/// the gate opens only once every surface the need's wants judge has read it ([`need_read`]); and
-/// the need chains are prompted last ([`prompt_order`]), since the watch that opens the gate begins
-/// once every chain is prompted. Negative controls: a fixed delay in place of the gate (the 20 s
-/// race the lab lost under load); the chains prompted in their own order (Muse Code's land-a raised
-/// its need at +15.9 s, and the watch first read it at +111 s, after the gate gave way at 60 s).
+/// the gate opens only once every surface the need's wants judge has read it ([`need_read`]), the
+/// Harness page among them in a pass after the one whose `status` first showed Land's hold
+/// ([`hold_paged`]); and the need chains are prompted last ([`prompt_order`]), since the watch that
+/// opens the gate begins once every chain is prompted. Negative controls: a fixed delay in place of
+/// the gate (the 20 s race the lab lost under load); the chains prompted in their own order (Muse
+/// Code's land-a raised its need at +15.9 s, and the watch first read it at +111 s, after the gate
+/// gave way at 60 s); the gate opened on the pass that read the hold (agy's and Muse Code's land-a
+/// in the 2e landing tree's `--mode both`: the page read at +12.4 s, `status` at +12.5 s, the gate
+/// at +12.6 s, the landing at +16.0 s before the next pass's page read, and L3 read no page after
+/// Land's instruction).
 #[test]
 fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
     let chains = [Chain::LandA, Chain::LandW, Chain::LandB, Chain::LandP];
@@ -9382,7 +9603,7 @@ fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
     let mut seen = Seen::default();
     seen.status.push((
         1,
-        "task=open needs=ask needs_n=1 autopilot=land".to_string(),
+        "task=open needs=ask needs_n=1 autopilot=land land_held=-".to_string(),
     ));
     assert!(!need_read(&seen, false), "no meta entry read yet");
     seen.meta.push((
@@ -9398,6 +9619,24 @@ fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
     seen.window
         .strip
         .push((4, "index=1 selected=0 states=busy,attention".to_string()));
+    seen.window.page_reads.push(4);
+    assert!(
+        !need_read(&seen, true),
+        "a page read, but no status read showed Land's hold"
+    );
+    // One pass: the page read at its head, then `status`, which shows the hold.
+    seen.window.page_reads.push(5);
+    seen.status.push((
+        6,
+        "task=open needs=ask needs_n=1 autopilot=land land_held=needs".to_string(),
+    ));
+    assert!(
+        !need_read(&seen, true),
+        "no Harness page read once status showed the hold"
+    );
+    assert!(need_read(&seen, false), "the page is the window's alone");
+    // The next pass's page read.
+    seen.window.page_reads.push(9);
     assert!(need_read(&seen, true), "every surface");
     // Prompted last, so the lab's watch has begun when their need comes; the rest keep their order.
     let run = [Chain::LandA, Chain::LandB, Chain::LandW, Chain::LandP];
@@ -9406,4 +9645,29 @@ fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
         order,
         [Chain::LandB, Chain::LandP, Chain::LandA, Chain::LandW]
     );
+}
+
+/// THE CHAINS WHOSE FIRST SPAN CLOSES ON THEIR PROGRAM'S CLOCK ARE PROMPTED LATE, just before the
+/// gated ones ([`Chain::timed_from_its_start`], [`prompt_order`]): cruise-n's N1 closes at its
+/// first need's 2 min back-off and land-j's and land-k's L16 and L17 at a landing about 45 s
+/// after `land@v1`, and the watch's reads begin once every chain is prompted, which took Muse
+/// Code's 26 tabs about 2 min (2026-11-05: N1 read no window in its span, L16 and L17 no status
+/// read of the hold). Negative control: the prompts in the chains' own order but the gated last
+/// (cruise-n first, as the run had it).
+#[test]
+fn the_chains_their_programs_clock_closes_on_are_prompted_late() {
+    let run = Chain::ALL;
+    let order: Vec<Chain> = prompt_order(&run).into_iter().map(|i| run[i]).collect();
+    assert_eq!(order.len(), run.len());
+    assert_eq!(
+        order[run.len() - 5..],
+        [
+            Chain::LandJ,
+            Chain::LandK,
+            Chain::CruiseN,
+            Chain::LandA,
+            Chain::LandContradicted
+        ]
+    );
+    assert_eq!(order[..3], [Chain::LandN, Chain::LandO, Chain::LandB]);
 }

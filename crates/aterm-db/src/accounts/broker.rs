@@ -583,7 +583,7 @@ impl Broker {
     /// survives this function or is held over the caller's adapter callback.
     fn refresh(&self, digest: Digest, serial: Option<u64>, deadline: Instant) -> Result<Lease> {
         let mut state = self.lock_until(deadline)?;
-        let lease = held_lease(&state, digest).ok_or_else(denied)?;
+        let lease = held_lease(&state, digest).cloned().ok_or_else(denied)?;
         if serial.is_some_and(|serial| serial != lease.serial) {
             return Err(denied());
         }
@@ -785,7 +785,9 @@ impl Broker {
         let mut state = self
             .lock_until(Instant::now() + Duration::from_secs(60))
             .unwrap();
-        let lease = held_lease(&state, self.token_digest(token).unwrap()).unwrap();
+        let lease = held_lease(&state, self.token_digest(token).unwrap())
+            .cloned()
+            .unwrap();
         for (n, grant) in grants.iter().enumerate() {
             let key = aterm_digest::hmac_sha256_parts(
                 self.key.expose(),
@@ -836,11 +838,11 @@ impl Broker {
     }
 }
 
-fn held_lease(state: &State, digest: Digest) -> Option<Lease> {
+fn held_lease(state: &State, digest: Digest) -> Option<&Lease> {
     let mut found = None;
     for (key, lease) in &state.leases {
         if aterm_digest::ct_eq(key, &digest) {
-            found = Some(lease.clone());
+            found = Some(lease);
         }
     }
     found

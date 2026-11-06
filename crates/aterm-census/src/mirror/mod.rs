@@ -243,6 +243,14 @@ pub fn item_digest(src: &str, path: &str) -> Result<String, String> {
     item::item_tokens(src, path).map(|t| fnv(&t))
 }
 
+/// The digest of the item `path` in an already-parsed file `parsed`.
+///
+/// # Errors
+/// As [`item::item_tokens`].
+pub fn item_digest_in(parsed: &item::ParsedFile, path: &str) -> Result<String, String> {
+    parsed.item_tokens(path).map(|t| fnv(&t))
+}
+
 /// The directory (root-relative) of the package named `name`, from `manifests` (`(path of
 /// Cargo.toml, its text)`).
 pub fn package_dir<'a>(

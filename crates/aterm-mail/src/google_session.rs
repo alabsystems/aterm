@@ -140,6 +140,22 @@ fn save(_: &Path, _: &Grant) -> Result<(), String> {
 }
 
 #[cfg(unix)]
+fn decrypt_grant(
+    home: &Path,
+    path: &Path,
+    encrypted: &[u8],
+    identity: &aterm_secrets::age::Identity,
+) -> Result<Grant, String> {
+    let plaintext = aterm_secrets::age::decrypt(std::slice::from_ref(identity), encrypted)
+        .map_err(|_| "Google mail credentials could not be decrypted")?;
+    let grant = decode(plaintext.as_slice())?;
+    if location(home, &grant.email) != path {
+        return Err("Google mail credentials belong to another account".into());
+    }
+    Ok(grant)
+}
+
+#[cfg(unix)]
 fn load_grant(home: &Path, path: &Path) -> Result<Option<Grant>, String> {
     let Some(encrypted) =
         aterm_secrets::fsx::read_private(path, 65536).map_err(|error| error.to_string())?
@@ -150,13 +166,7 @@ fn load_grant(home: &Path, path: &Path) -> Result<Option<Grant>, String> {
     let identity = aterm_secrets::client::read_machine_identity(&paths)
         .map_err(|error| error.to_string())?
         .ok_or("Google mail encryption key is unavailable")?;
-    let plaintext = aterm_secrets::age::decrypt(&[identity], encrypted.as_slice())
-        .map_err(|_| "Google mail credentials could not be decrypted")?;
-    let grant = decode(plaintext.as_slice())?;
-    if location(home, &grant.email) != path {
-        return Err("Google mail credentials belong to another account".into());
-    }
-    Ok(Some(grant))
+    decrypt_grant(home, path, encrypted.as_slice(), &identity).map(Some)
 }
 
 #[cfg(not(unix))]
@@ -191,7 +201,7 @@ pub fn accounts(home: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
-    let mut accounts: Vec<_> = entries
+    let age_entries: Vec<_> = entries
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -201,11 +211,30 @@ pub fn accounts(home: &Path) -> Vec<String> {
                 .ends_with(b".age")
         })
         .take(128)
+        .collect();
+    if age_entries.is_empty() {
+        return Vec::new();
+    }
+    #[cfg(unix)]
+    let Some(identity) =
+        aterm_secrets::client::read_machine_identity(&aterm_secrets::client::Paths::for_home(home))
+            .ok()
+            .flatten()
+    else {
+        return Vec::new();
+    };
+    let mut accounts: Vec<_> = age_entries
+        .into_iter()
         .filter_map(|entry| {
-            load_grant(home, &entry.path())
+            let path = entry.path();
+            #[cfg(unix)]
+            let loaded = aterm_secrets::fsx::read_private(&path, 65536)
                 .ok()
                 .flatten()
-                .map(|grant| grant.email)
+                .and_then(|enc| decrypt_grant(home, &path, enc.as_slice(), &identity).ok());
+            #[cfg(not(unix))]
+            let loaded = load_grant(home, &path).ok().flatten();
+            loaded.map(|grant| grant.email)
         })
         .collect();
     accounts.sort();
@@ -299,8 +328,8 @@ impl Session {
                 let remaining = end.saturating_duration_since(Instant::now());
                 if !remaining.is_zero() {
                     std::thread::sleep(remaining.min(Duration::from_millis(250)));
-                    continue;
                 }
+                continue;
             }
             return result;
         }

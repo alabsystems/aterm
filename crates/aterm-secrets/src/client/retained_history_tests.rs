@@ -74,7 +74,11 @@ pub(crate) fn retained_commit_transition(
             next.insert("seen", 2);
         }
         "Read" => {
-            let view = retained_history::project_store(&paths, &fixture.config, raw.clone());
+            let view = retained_history::project_store(
+                &super::Reads::new(&paths),
+                &fixture.config,
+                raw.clone(),
+            );
             let seen = view.map_or(2, |view| {
                 i64::from(view.log().unwrap().heads() == fixture.new.log().unwrap().heads())
             });
@@ -100,8 +104,12 @@ pub(crate) fn retained_commit_transition(
         == b"damaged";
     next.insert("damaged", i64::from(damaged));
     if !damaged {
-        let floor =
-            retained_history::project_store(&paths, &fixture.config, fixture.new.clone()).unwrap();
+        let floor = retained_history::project_store(
+            &super::Reads::new(&paths),
+            &fixture.config,
+            fixture.new.clone(),
+        )
+        .unwrap();
         let version = i64::from(floor.log().unwrap().heads() == fixture.new.log().unwrap().heads());
         next.insert("floor", version);
         next.insert("known", state["known"].max(version));
@@ -424,8 +432,12 @@ fn retained_receipt_separates_raw_publication_from_authority_and_detects_loss() 
 
     // Crash after raw publication, before the acknowledgement: cold reads keep F_old.
     fsx::write_atomic(&lab.m7.records_data_file().unwrap(), &new.encode(), 0o600).unwrap();
-    let projected =
-        retained_history::project_store(&lab.m7, &config, load_records(&lab.m7).unwrap()).unwrap();
+    let projected = retained_history::project_store(
+        &super::Reads::new(&lab.m7),
+        &config,
+        load_records(&lab.m7).unwrap(),
+    )
+    .unwrap();
     assert_eq!(projected.log().unwrap().heads(), old.log().unwrap().heads());
     assert_eq!(retained_history::version(&lab.m7).unwrap(), before);
     log_entries::author_and_commit_records(&lab.m7, |snapshot| {
@@ -439,21 +451,27 @@ fn retained_receipt_separates_raw_publication_from_authority_and_detects_loss() 
     .unwrap();
     // The next exclusive writer acknowledges the same durable raw data without a network.
     drop(StateLock::take(&lab.m7).unwrap());
-    let projected =
-        retained_history::project_store(&lab.m7, &config, load_records(&lab.m7).unwrap()).unwrap();
+    let projected = retained_history::project_store(
+        &super::Reads::new(&lab.m7),
+        &config,
+        load_records(&lab.m7).unwrap(),
+    )
+    .unwrap();
     assert_eq!(projected.log().unwrap().heads(), new.log().unwrap().heads());
     assert_ne!(retained_history::version(&lab.m7).unwrap(), before);
 
     let checkpoint = lab.m7.dir.join("frontiers.checkpoint");
     let saved = lab.m7.dir.join("frontiers.checkpoint.saved");
     std::fs::rename(&checkpoint, &saved).unwrap();
-    assert!(retained_history::project_store(&lab.m7, &config, new.clone()).is_err());
+    assert!(
+        retained_history::project_store(&super::Reads::new(&lab.m7), &config, new.clone()).is_err()
+    );
     assert!(
         StateLock::take(&lab.m7).is_err(),
         "loss never permits re-adoption"
     );
     std::fs::rename(&saved, &checkpoint).unwrap();
-    assert!(retained_history::project_store(&lab.m7, &config, new).is_ok());
+    assert!(retained_history::project_store(&super::Reads::new(&lab.m7), &config, new).is_ok());
     lab.server.stop();
 }
 
@@ -468,16 +486,16 @@ fn retained_network_survives_label_endpoint_and_endorsed_signer_changes() {
     config.host = "m100".into();
     config.source = Source::Url("http://offline.local/alab".into());
     assert_eq!(
-        retained_history::pinned_network(&lab.m7, &config).unwrap(),
+        retained_history::pinned_network(&super::Reads::new(&lab.m7), &config).unwrap(),
         Some(network)
     );
     config.followed.push(original);
     config.signer = Some([71; 32]);
     assert_eq!(
-        retained_history::pinned_network(&lab.m7, &config).unwrap(),
+        retained_history::pinned_network(&super::Reads::new(&lab.m7), &config).unwrap(),
         Some(network)
     );
-    assert!(retained_history::project_store(&lab.m7, &config, store).is_ok());
+    assert!(retained_history::project_store(&super::Reads::new(&lab.m7), &config, store).is_ok());
     lab.server.stop();
 }
 

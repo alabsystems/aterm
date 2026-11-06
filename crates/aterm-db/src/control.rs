@@ -30,7 +30,10 @@ use std::{
 
 pub(crate) mod enrollment;
 mod frontier;
+mod peer_check;
 mod peers;
+
+use peer_check::Pass;
 
 /// Mutants of the session rules, which their tests switch on to show they catch them.
 #[cfg(test)]
@@ -53,6 +56,15 @@ pub(crate) mod mutants {
         /// Judge a peer by the records this Mac acknowledged alone, as the local log check did
         /// before X1, so a `Remove` made durable here and not yet acknowledged takes no one out.
         AcknowledgedOnly,
+        /// Read a busy or unread roster with an empty deny list as no roster, nothing to check,
+        /// as the roster gate did before PF4.
+        BusyRosterIsNoRoster,
+        /// Check a peer once per thread and pass every later check unwalked, as the legacy
+        /// (`atdb/2`, `atdb/3`, no ALPN) session did before PF4: one check, then every grant.
+        CheckedOnce,
+        /// Read an acknowledged log of another lineage as one with no Commons epoch, nothing to
+        /// judge by, as `trusted_commons_log`'s `Ok(None)` did for both before PF4.
+        LineageIsNoJudgement,
     }
 
     thread_local! {
@@ -965,7 +977,8 @@ impl Endpoint {
                     "pending device identity does not match its request",
                 ));
             }
-            let mut hello = b"ACE1".to_vec();
+            let mut hello = Vec::with_capacity(HELLO_FIXED);
+            hello.extend_from_slice(b"ACE1");
             let trust = bootstrap.trust();
             hello.extend_from_slice(&trust.network);
             hello.extend_from_slice(&trust.authority);
@@ -1054,14 +1067,14 @@ impl Endpoint {
                 "Commons writer differs from its persistent identity",
             ));
         }
-        let mut hello = b"ACX2".to_vec();
+        let encoded_records = aterm_secrets::membership_log::encode_records(log.records());
+        let mut hello = Vec::with_capacity(HELLO_FIXED + encoded_records.len());
+        hello.extend_from_slice(b"ACX2");
         hello.extend_from_slice(&trust.network);
         hello.extend_from_slice(&trust.authority);
         hello.extend_from_slice(&trust.genesis);
         hello.extend_from_slice(request.bytes());
-        hello.extend_from_slice(&aterm_secrets::membership_log::encode_records(
-            log.records(),
-        ));
+        hello.extend_from_slice(&encoded_records);
         let actor = request.binding().actor();
         let report = hearing::report(seed, trust.network, &actor, Version::own())
             .map_err(|error| local_failure("version report", error))?;
@@ -1110,7 +1123,8 @@ impl Endpoint {
                 "Commons writer differs from its persistent identity",
             ));
         }
-        let mut hello = b"ACX1".to_vec();
+        let mut hello = Vec::with_capacity(HELLO_FIXED + witness.len());
+        hello.extend_from_slice(b"ACX1");
         hello.extend_from_slice(&trust.network);
         hello.extend_from_slice(&trust.authority);
         hello.extend_from_slice(&trust.genesis);
@@ -1164,11 +1178,12 @@ impl Endpoint {
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
         // are mandatory before any inventory or control repair is exposed.
-        let mut domain = b"aterm/commons/control-transport/1\0".to_vec();
-        domain.extend_from_slice(&self.trust.network);
-        domain.extend_from_slice(&self.trust.authority);
-        domain.extend_from_slice(&self.trust.genesis);
-        let discriminator = FleetSecret::new(&Sha256::digest(&domain))
+        let mut domain = Sha256::new();
+        domain.update(b"aterm/commons/control-transport/1\0");
+        domain.update(self.trust.network);
+        domain.update(self.trust.authority);
+        domain.update(self.trust.genesis);
+        let discriminator = FleetSecret::new(&domain.finalize())
             .map_err(|_| Error::new("invalid Commons protocol discriminator"))?;
         #[cfg(test)]
         let negotiate_recovery = !self.legacy && !self.legacy_repair;
@@ -1320,12 +1335,17 @@ impl Endpoint {
         }
         let peer = authenticate(self.trust, self.actor, proof, &hello)?;
         let actor = peer.actor;
-        verify_peer_against_local_log(
-            self.custody(),
-            self.trust,
-            &peer.request,
-            peer.log.as_deref(),
-        )?;
+        // A fresh check before every grant: a `Remove` made durable here mid-session takes the
+        // peer out of every phase that follows it, as `atdb/5` sessions do.
+        let check = || {
+            verify_peer_against_local_log(
+                self.custody(),
+                self.trust,
+                &peer.request,
+                peer.log.as_deref(),
+            )
+        };
+        let pass = check()?;
         let authenticated_at = Instant::now();
         repair.prepare(self.trust, actor);
         repair.authenticated = Some(authenticated_at);
@@ -1335,7 +1355,7 @@ impl Endpoint {
         // responders cannot each keep the channel whose initiator just lost.
         let preferred = (self.actor < actor) == (side == Side::Initiator);
         repair.phase = Phase::PeerAdmission;
-        let mut lease = self.peers.acquire_on(actor, repair, preferred, until)?;
+        let mut lease = self.lease_on(pass, actor, repair, preferred, until)?;
         #[cfg(test)]
         tests::peer_cache_stage(tests::PeerCacheStage::Acquired(side));
         lease.prepare(self.trust, actor);
@@ -1352,21 +1372,24 @@ impl Endpoint {
         #[cfg(not(test))]
         let both_acx2 = self.hello.starts_with(b"ACX2") && hello.starts_with(b"ACX2");
         if !recovery_first && both_acx2 {
-            lease.membership = Some(self.sync_acx2_membership(stream, side, &mut lease)?);
+            lease.membership =
+                Some(self.sync_acx2_membership(check()?, stream, side, &mut lease)?);
         }
-        let report = self.repair_control(stream, side, &mut lease)?;
+        let report = self.repair_control(check()?, stream, side, &mut lease)?;
         if recovery_first {
             lease.phase = Phase::MembershipRecords;
-            let common = match self.trade_recovery(stream, side, &mut lease, both_acx2, protocol) {
-                Ok(common) => common,
-                Err(error) => {
-                    lease.membership_error = Some(error.to_string());
-                    return Ok(report);
-                }
-            };
+            let pass = check()?;
+            let common =
+                match self.trade_recovery(pass, stream, side, &mut lease, both_acx2, protocol) {
+                    Ok(common) => common,
+                    Err(error) => {
+                        lease.membership_error = Some(error.to_string());
+                        return Ok(report);
+                    }
+                };
             let application = common & 2 != 0;
             if application {
-                self.repair_application(stream, actor, side, &mut lease, protocol);
+                self.repair_application(check()?, stream, actor, side, &mut lease, protocol);
             }
             // A failed application exchange can leave buffered protocol bytes.
             // The recovery records are already retained; do not reuse that
@@ -1378,23 +1401,7 @@ impl Endpoint {
                     if common & 4 != 0 {
                         self.require_legacy_records()?;
                         lease.phase = Phase::Credentials;
-                        if let (Some(paths), Some((owner, config))) =
-                            (&self.paths, &self.credentials)
-                        {
-                            lease.handoff = Some(
-                                crate::credentials::handoff::exchange(
-                                    paths,
-                                    config,
-                                    owner,
-                                    self.trust.network,
-                                    self.actor,
-                                    actor,
-                                    side,
-                                    stream,
-                                )
-                                .map_err(|_| "credential handoff failed".to_owned()),
-                            );
-                        }
+                        lease.handoff = self.hand_off_credentials(check()?, actor, side, stream);
                     }
                     lease.phase = Phase::Complete;
                 } else {
@@ -1403,7 +1410,7 @@ impl Endpoint {
             }
             return Ok(report);
         }
-        self.repair_application(stream, actor, side, &mut lease, protocol);
+        self.repair_application(check()?, stream, actor, side, &mut lease, protocol);
         #[cfg(test)]
         if self.legacy {
             if lease.application.is_some() {
@@ -1420,9 +1427,63 @@ impl Endpoint {
             self.application.is_none()
         };
         if can_trade_membership && !both_acx2 {
-            lease.membership = self.trade_membership_records(stream, side, &mut lease);
+            lease.membership = self.trade_membership_records(check()?, stream, side, &mut lease);
         }
         Ok(report)
+    }
+
+    /// The lease on `actor`'s channel ([`peers::Cache::acquire_on`]), the grant `pass` clears.
+    fn lease_on<'a>(
+        &'a self,
+        pass: Pass,
+        actor: Actor,
+        repair: &'a mut Repair,
+        preferred: bool,
+        until: Instant,
+    ) -> Result<peers::Lease<'a>> {
+        pass.spend();
+        self.peers.acquire_on(actor, repair, preferred, until)
+    }
+
+    /// The lease on a pending device's channel ([`peers::Cache::acquire`]), the grant `pass`
+    /// clears: an enrollment its check passed.
+    fn lease<'a>(
+        &'a self,
+        pass: Pass,
+        actor: Actor,
+        repair: &'a mut Repair,
+    ) -> Result<peers::Lease<'a>> {
+        pass.spend();
+        self.peers.acquire(actor, repair)
+    }
+
+    /// Hand this endpoint's credentials to `actor` and take its own
+    /// ([`crate::credentials::handoff::exchange`]), the grant `pass` clears: `None` where this
+    /// endpoint holds no credentials custody.
+    fn hand_off_credentials(
+        &self,
+        pass: Pass,
+        actor: Actor,
+        side: Side,
+        stream: &mut (impl Read + Write),
+    ) -> Option<std::result::Result<usize, String>> {
+        pass.spend();
+        let (Some(paths), Some((owner, config))) = (&self.paths, &self.credentials) else {
+            return None;
+        };
+        Some(
+            crate::credentials::handoff::exchange(
+                paths,
+                config,
+                owner,
+                self.trust.network,
+                self.actor,
+                actor,
+                side,
+                stream,
+            )
+            .map_err(|_| "credential handoff failed".to_owned()),
+        )
     }
 
     /// Synchronize verified membership records (`ACX2`) across bounded passes before control/table
@@ -1430,10 +1491,12 @@ impl Endpoint {
     /// coalesce concurrent epochs ([`aterm_secrets::client::vault_pass_at`], `F18`).
     fn sync_acx2_membership(
         &self,
+        pass: Pass,
         stream: &mut (impl Read + Write),
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
+        pass.spend();
         let Some(paths) = self.paths.as_ref() else {
             return Err(Error::new("ACX2 endpoint requires local secrets custody"));
         };
@@ -1450,6 +1513,7 @@ impl Endpoint {
     /// describe configured services, not current application permission.
     fn trade_recovery(
         &self,
+        pass: Pass,
         stream: &mut (impl Read + Write),
         side: Side,
         repair: &mut Repair,
@@ -1486,10 +1550,13 @@ impl Endpoint {
             return Err(Error::new("invalid Commons repair capabilities"));
         }
         let common = flags & remote[4];
-        if common & RECORDS != 0 {
+        if common & RECORDS == 0 {
+            pass.waive();
+        } else {
             repair.membership = Some(if both_acx2 {
-                self.sync_acx2_membership(stream, side, repair)?
+                self.sync_acx2_membership(pass, stream, side, repair)?
             } else {
+                pass.spend();
                 exchange_membership(
                     stream,
                     &MembershipDisk::new(
@@ -1525,10 +1592,12 @@ impl Endpoint {
     /// unreadable or absent tag ends the round cleanly without failing control repair.
     fn trade_membership_records(
         &self,
+        pass: Pass,
         stream: &mut (impl Read + Write),
         side: Side,
         repair: &mut Repair,
     ) -> Option<Report> {
+        pass.spend();
         self.require_legacy_records().ok()?;
         const READY: &[u8; 4] = b"ALMR";
         const NONE: &[u8; 4] = b"ALMN";
@@ -1560,12 +1629,14 @@ impl Endpoint {
 
     fn repair_control(
         &self,
+        pass: Pass,
         stream: &mut (impl Read + Write),
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
         self.require_legacy_records()?;
         exchange(
+            pass,
             stream,
             &Disk {
                 dir: &self.dir,
@@ -1578,12 +1649,14 @@ impl Endpoint {
 
     fn repair_application(
         &self,
+        pass: Pass,
         stream: &mut (impl Read + Write),
         actor: Actor,
         side: Side,
         repair: &mut Repair,
         protocol: Protocol,
     ) {
+        pass.spend();
         if !matches!(protocol, Protocol::Frontier(_))
             && let Err(error) = self.require_legacy_records()
         {
@@ -1973,36 +2046,55 @@ fn denied_after(
     }
 }
 
-/// The roster a Commons peer is checked by: `roster` ([`roster_after`]) with `denied`
-/// ([`denied_after`]) added, whatever the roster read gave, so a node only the vault roster's
-/// `deny_nodes` removed is refused while the roster itself cannot be read. `None` (nothing to
-/// check here) where neither names anyone, and where neither was ever read: this device's
-/// membership records are unreadable, which every vault read refuses, and this exchange is how it
-/// recovers them
-/// (`unreadable_membership_recovery_preserves_control_but_never_reports_application_success`), so
-/// the peer is left to the membership log, as it always was.
+/// The roster a Commons peer is checked by at an endpoint of custody `custody`, as the
+/// kernel's roster stage decides ([`aterm_db_core::peer_check::roster`]): `roster`
+/// ([`roster_after`]) with `denied` ([`denied_after`]) added, whatever the roster read gave, so a
+/// node only the vault roster's `deny_nodes` removed is refused while no roster entry is. `None`
+/// (nothing to check here) where a settled read found no roster and the deny list is empty, and,
+/// at a journal endpoint, where neither was ever read: that device's membership records are
+/// unreadable, which every vault read refuses, and this exchange is how it recovers them
+/// (`unreadable_membership_recovery_preserves_control_but_never_reports_application_success`),
+/// so the peer is left to its journal.
 ///
 /// # Errors
-/// The deny list failed to read, none was read before, and the roster was: the list could name
-/// this peer.
+/// The roster did not read (a busy writer, or a failed read with none kept before) or the deny
+/// list did not read: either could name this peer.
 fn roster_to_check(
+    custody: aterm_db_core::peer_check::Custody,
     roster: Option<Option<aterm_secrets::swarm_roster::SwarmRoster>>,
     denied: Option<Vec<String>>,
 ) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
-    let Some(denied) = denied else {
-        return match roster {
-            None => Ok(None),
-            Some(_) => Err(Error::new("this device has not read its deny list yet")),
-        };
+    use aterm_db_core::peer_check::{Listing, RosterGate};
+    let roster_read = match &roster {
+        None => Listing::Unread,
+        Some(None) => Listing::Empty,
+        Some(Some(_)) => Listing::Names,
     };
-    let mut roster = match roster.flatten() {
-        Some(roster) => roster,
-        None if denied.is_empty() => return Ok(None),
-        None => aterm_secrets::swarm_roster::SwarmRoster::default(),
+    let deny_read = match &denied {
+        None => Listing::Unread,
+        Some(list) if list.is_empty() => Listing::Empty,
+        Some(_) => Listing::Names,
     };
-    roster.deny_nodes.extend(denied);
-    roster.canonicalize();
-    Ok(Some(roster))
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::BusyRosterIsNoRoster)
+        && roster_read == Listing::Unread
+        && deny_read == Listing::Empty
+    {
+        return Ok(None);
+    }
+    match aterm_db_core::peer_check::roster(custody, roster_read, deny_read) {
+        RosterGate::Nothing => Ok(None),
+        RosterGate::Check => {
+            let mut checked = roster.flatten().unwrap_or_default();
+            checked.deny_nodes.extend(denied.unwrap_or_default());
+            checked.canonicalize();
+            Ok(Some(checked))
+        }
+        RosterGate::Refuse if roster_read == Listing::Unread => {
+            Err(Error::new("this device could not read its roster"))
+        }
+        RosterGate::Refuse => Err(Error::new("this device has not read its deny list yet")),
+    }
 }
 
 /// What a peer check reads of this Mac's own membership records ([`Endpoint::custody`]).
@@ -2021,22 +2113,6 @@ pub(crate) enum Custody<'a> {
     /// The records of an endpoint built from its membership log ([`Endpoint::snapshot_log`]).
     /// They are what says a peer was removed, so while they do not read no peer passes.
     Log(&'a aterm_secrets::client::Paths),
-}
-
-impl Custody<'_> {
-    /// What a check does after this Mac's records failed to read with `error`: a log
-    /// endpoint refuses the peer, since the records it cannot read may remove it; a journal
-    /// endpoint leaves the peer to its journal (`Ok`).
-    fn unread(self, error: aterm_secrets::Error) -> Result<()> {
-        #[cfg(test)]
-        if mutants::on(mutants::Mutant::UnreadCustodyAdmits) {
-            return Ok(());
-        }
-        match self {
-            Self::Log(_) => Err(local_failure("records read for a peer check", error)),
-            Self::None | Self::Journal(_) => Ok(()),
-        }
-    }
 }
 
 impl Endpoint {
@@ -2061,116 +2137,25 @@ fn held_records(
 }
 
 /// Check the authenticated `peer_req` against this device's own membership records and
-/// roster. `peer_log` is the log its `ACX2` witness decoded to when [`authenticate`] checked it
-/// in this same round, so the witness is hashed and looked up once per round.
-///
-/// At a [`Custody::Log`] endpoint every record this Mac holds can take the peer out
-/// ([`removed_in`]), acknowledged or not: a `Remove` stands from the moment it is durable here,
-/// as admission holds out what records ahead of their acknowledgement hold out
-/// ([`aterm_secrets::client::load_acknowledged_and_ahead`]). The rest of the judgement reads the
-/// acknowledged log ([`aterm_secrets::client::trusted_commons_log`]).
+/// roster ([`peer_check::check`]): the pass a grant to it takes. `peer_log` is the log its
+/// evidence decoded to in this same round, so a witness is hashed and looked up once per round.
 ///
 /// # Errors
-/// The roster or the records remove the peer, its witness belongs to another log, or, for a
-/// [`Custody::Log`] endpoint, this Mac's records do not read.
+/// The kernel refused the peer ([`peer_check::check`]).
 fn verify_peer_against_local_log(
     custody: Custody<'_>,
     trust: Trust,
     peer_req: &Request,
     peer_log: Option<&aterm_secrets::membership_log::Log>,
-) -> Result<()> {
-    let actor = peer_req.binding().actor();
-    let paths = match custody {
-        Custody::None => return Ok(()),
-        Custody::Journal(paths) | Custody::Log(paths) => paths,
-    };
-    let recipient = peer_req.binding().recipient();
-    // A roster or deny list this device fails to read now is the last one it read
-    // (`roster_after`, `denied_after`); the deny list is checked even while no roster is.
-    let roster = roster_to_check(roster_or_last(paths), denied_or_last(paths))?;
-    if let Some(ref roster) = roster
-        && crate::table::binding_denied_in_roster(roster, peer_req.binding())
-    {
-        return Err(Error::new(
-            "Commons peer was removed from the membership log",
-        ));
-    }
-    #[cfg(test)]
-    let acknowledged_only = mutants::on(mutants::Mutant::AcknowledgedOnly);
-    #[cfg(not(test))]
-    let acknowledged_only = false;
-    if matches!(custody, Custody::Log(_)) && !acknowledged_only {
-        match held_records(paths) {
-            Ok(held) => {
-                if let Some(log) = held.log()
-                    && matches!(
-                        log.genesis().body(),
-                        aterm_secrets::membership_log::Body::Genesis { root, .. }
-                            if root.network == trust.network
-                                && root.authority == trust.authority
-                    )
-                    && removed_in(log, peer_req.binding())
-                {
-                    return Err(Error::new(
-                        "Commons peer was removed from the membership log",
-                    ));
-                }
-            }
-            Err(error) => return custody.unread(error),
-        }
-    }
-    #[cfg(test)]
-    let judged = faults::records_read()
-        .and_then(|()| aterm_secrets::client::trusted_commons_log(paths, trust));
-    #[cfg(not(test))]
-    let judged = aterm_secrets::client::trusted_commons_log(paths, trust);
-    let local_log = match judged {
-        Ok(Some((log, _))) => log,
-        Ok(None) => return Ok(()),
-        Err(error) => return custody.unread(error),
-    };
-    let denied_by = |log: &aterm_secrets::membership_log::Log| {
-        use aterm_secrets::membership_log::EpochAudience;
-        let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log(paths, log) else {
-            return true;
-        };
-        let log_roster = log_roster.or_else(|| roster.clone());
-        let membership = log.membership();
-        removed_in(log, peer_req.binding())
-            || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
-            || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
-            || log_roster
-                .as_ref()
-                .is_some_and(|r| crate::table::binding_denied_in_roster(r, peer_req.binding()))
-            || membership.members().iter().any(|(m_actor, m)| {
-                (*m_actor == actor || m.binding.recipient() == recipient)
-                    && (log.audience_left_out(&EpochAudience::Commons, m_actor)
-                        || log.audience_left_out(&EpochAudience::Everyone, m_actor)
-                        || log_roster
-                            .as_ref()
-                            .is_some_and(|r| aterm_secrets::client::member_denied_by_roster(r, m)))
-            })
-    };
-    if denied_by(&local_log) {
-        return Err(Error::new(
-            "Commons peer was removed from the membership log",
-        ));
-    }
-    if let Some(peer_log) = peer_log {
-        if local_log.network() != peer_log.network() {
-            return Err(Error::new("Commons peer belongs to another membership log"));
-        }
-        let mut combined = local_log;
-        for record in peer_log.records().skip(1) {
-            let _ = combined.insert(record.clone()).map_err(failure)?;
-        }
-        if denied_by(&combined) || !combined.has_historical_seat(peer_req.binding()) {
-            return Err(Error::new(
-                "Commons peer was removed from the membership log",
-            ));
-        }
-    }
-    Ok(())
+) -> Result<Pass> {
+    peer_check::check(
+        custody,
+        trust,
+        &peer_check::Judged::Peer {
+            request: peer_req,
+            log: peer_log,
+        },
+    )
 }
 
 fn check_witness(trust: Trust, request: &Request, wire: &[u8]) -> Result<()> {
@@ -2310,7 +2295,7 @@ fn authenticate_identity(
     let peer = proof.ok_or_else(|| Error::new("Commons requires a channel-bound node proof"))?;
     let actor = request.binding().actor();
     if peer.key.bytes().as_slice() != &actor[..32]
-        || peer.node != aterm_codec::hex::encode_lower(&actor[32..])
+        || !crate::database::decode_hex::<16>(&peer.node).is_ok_and(|node| node == actor[32..])
         || actor[..32] == own[..32]
     {
         return Err(Error::new(
@@ -2720,12 +2705,15 @@ fn exchange_membership_round(
     ))
 }
 
+/// Repair the control journal over `stream`, the grant `pass` clears.
 fn exchange(
+    pass: Pass,
     stream: &mut (impl Read + Write),
     store: &impl Store,
     side: Side,
     repair: &mut Repair,
 ) -> Result<Report> {
+    pass.spend();
     repair.phase = Phase::ControlInventory;
     let local = store.inventory()?;
     let remote = match side {
@@ -2775,14 +2763,15 @@ fn select(
     remote: &BTreeSet<Digest>,
     cursor: Option<Digest>,
 ) -> Vec<Digest> {
-    local
-        .iter()
-        .filter(|id| cursor.is_none_or(|cursor| **id > cursor))
-        .chain(
-            local
-                .iter()
-                .filter(|id| cursor.is_some_and(|cursor| **id <= cursor)),
-        )
+    use std::ops::Bound::{Excluded, Unbounded};
+    let tail = match cursor {
+        Some(cursor) => local.range((Excluded(cursor), Unbounded)),
+        None => local.range::<Digest, _>(..),
+    };
+    let head = cursor
+        .into_iter()
+        .flat_map(move |cursor| local.range(..=cursor));
+    tail.chain(head)
         .filter(|id| !remote.contains(*id))
         .take(RECORDS_PER_ROUND)
         .copied()
@@ -2841,12 +2830,15 @@ fn receive_batch<S: Store>(stream: &mut (impl Read + Write), store: &S) -> Resul
         return Err(Error::new("Commons batch exceeds its bound"));
     }
     let mut wires = Vec::with_capacity(n);
+    let mut digests = Vec::with_capacity(n);
     let mut ids = BTreeSet::new();
     for _ in 0..n {
         let wire = receive_frame(stream, S::MAX_WIRE)?;
-        if !ids.insert(Sha256::digest(&wire)) {
+        let digest = Sha256::digest(&wire);
+        if !ids.insert(digest) {
             return Err(Error::new("duplicate Commons batch record"));
         }
+        digests.push(digest);
         wires.push(wire);
     }
     // Acquire the local journal only after the entire bounded batch has arrived.
@@ -2855,9 +2847,11 @@ fn receive_batch<S: Store>(stream: &mut (impl Read + Write), store: &S) -> Resul
         return Err(Error::new("invalid local Commons receipt count"));
     }
     let mut retained = 0;
-    for (wire, durable) in wires.iter().zip(verdicts) {
-        stream.write_all(&Sha256::digest(wire))?;
-        stream.write_all(&[u8::from(durable)])?;
+    for (digest, durable) in digests.iter().zip(verdicts) {
+        let mut ack = [0u8; 33];
+        ack[..32].copy_from_slice(digest);
+        ack[32] = u8::from(durable);
+        stream.write_all(&ack)?;
         retained += usize::from(durable);
     }
     stream.flush()?;

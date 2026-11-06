@@ -253,7 +253,7 @@ pub fn self_check(
     };
     let actual = atpkg::tree::sha256_file(exe)
         .map_err(|e| Error::io(format!("hash {}", exe.display()), &e))?;
-    if actual != expected.to_ascii_lowercase() {
+    if !actual.eq_ignore_ascii_case(expected) {
         return Err(Error::refused(format!(
             "{} hashes to {actual}, but its unit names {expected} — the snapshot was replaced \
              in place; re-run `atpkg-publish lane install` from a reviewed checkout",

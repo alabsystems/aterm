@@ -182,13 +182,17 @@ fn nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+fn push_hex(s: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0xf) as usize] as char);
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    push_hex(&mut s, bytes);
     s
 }
 
@@ -457,10 +461,15 @@ pub fn host_word(name: &str) -> String {
 
 /// `text` cut to `max` bytes of `[A-Za-z0-9._+-]`, each other char `_`.
 pub(crate) fn word_of(text: &str, max: usize) -> String {
-    text.chars()
-        .map(|c| if word_char(c) { c } else { '_' })
-        .take(max)
-        .collect()
+    let mut out = String::with_capacity(text.len().min(max));
+    push_word_of(&mut out, text, max);
+    out
+}
+
+fn push_word_of(out: &mut String, text: &str, max: usize) {
+    for c in text.chars().take(max) {
+        out.push(if word_char(c) { c } else { '_' });
+    }
 }
 
 const fn word_char(c: char) -> bool {
@@ -471,18 +480,12 @@ pub(crate) fn is_word(w: &str) -> bool {
     !w.is_empty() && w.len() <= 64 && w.chars().all(word_char)
 }
 
-/// The checksum of a line's body: the first four bytes of its SHA-256, hex.
-pub(crate) fn sum_of(body: &str) -> String {
-    let d = aterm_digest::Sha256::digest(body.as_bytes());
-    hex(&d[..4])
-}
-
 /// `body` with its checksum and the line feed.
-pub(crate) fn seal(body: String) -> String {
-    let sum = sum_of(&body);
-    let mut line = body;
+pub(crate) fn seal(mut line: String) -> String {
+    let d = aterm_digest::Sha256::digest(line.as_bytes());
+    line.reserve(14);
     line.push_str(" sum=");
-    line.push_str(&sum);
+    push_hex(&mut line, &d[..4]);
     line.push('\n');
     line
 }
@@ -491,14 +494,31 @@ pub(crate) fn seal(body: String) -> String {
 pub(crate) fn unseal(line: &str) -> Option<&str> {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let (body, sum) = line.rsplit_once(" sum=")?;
-    (sum.len() == 8 && sum_of(body) == sum).then_some(body)
+    let bytes = sum.as_bytes();
+    if bytes.len() != 8 {
+        return None;
+    }
+    let d = aterm_digest::Sha256::digest(body.as_bytes());
+    for (i, &[hi, lo]) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let hi = nibble(hi)?;
+        let lo = nibble(lo)?;
+        if ((hi << 4) | lo) != d[i] {
+            return None;
+        }
+    }
+    Some(body)
 }
 
-fn fig_word<T: std::fmt::Display>(fig: &Fig<T>) -> String {
+fn push_fig_word<T: std::fmt::Display>(out: &mut String, fig: &Fig<T>) {
     match fig {
-        Fig::Known(v) => v.to_string(),
-        Fig::Na => "na".to_owned(),
-        Fig::Unknown(source) => format!("?{source}"),
+        Fig::Known(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Fig::Na => out.push_str("na"),
+        Fig::Unknown(source) => {
+            out.push('?');
+            out.push_str(source);
+        }
     }
 }
 
@@ -512,8 +532,20 @@ fn fig_parse<T: std::str::FromStr>(word: &str) -> Option<Fig<T>> {
     word.parse().ok().map(Fig::Known)
 }
 
-fn opt_word<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map_or_else(|| "-".to_owned(), |v| v.to_string())
+fn push_opt_word<T: std::fmt::Display>(out: &mut String, v: Option<T>) {
+    match v {
+        Some(v) => {
+            let _ = write!(out, "{v}");
+        }
+        None => out.push('-'),
+    }
+}
+
+fn push_opt_digest(out: &mut String, d: Option<Digest>) {
+    match d {
+        Some(d) => push_hex(out, &d.0),
+        None => out.push('-'),
+    }
 }
 
 impl Row {
@@ -521,33 +553,58 @@ impl Row {
         let mut b = String::with_capacity(360);
         let _ = write!(
             b,
-            "schema={SCHEMA} at={} kind={} key={} dir={} label={} sid={} host={} facts={} \
-             wall_ms={} cpu_ms={} peak_bytes={} wait_ms={} cache={} outcome={} stop={} code={} \
-             sig={} meter={}",
+            "schema={SCHEMA} at={} kind={} key=",
             self.at_ms,
-            self.kind.word(),
-            self.key.map_or_else(|| "-".to_owned(), Digest::hex),
-            self.dir.map_or_else(|| "-".to_owned(), Digest::hex),
-            label(&self.label),
-            self.sid
-                .as_deref()
-                .map_or_else(|| "-".to_owned(), |s| word_of(s, 64)),
-            host_word(&self.host),
-            self.facts.hex(),
-            fig_word(&self.wall_ms),
-            fig_word(&self.cpu_ms),
-            fig_word(&self.peak_bytes),
-            fig_word(&self.wait_ms),
-            match &self.cache {
-                Fig::Known(tier) => word_of(tier, 32),
-                other => fig_word(other),
-            },
-            self.outcome.word(),
-            self.stop.word(),
-            opt_word(self.code),
-            opt_word(self.sig),
-            self.meter.word(),
+            self.kind.word()
         );
+        push_opt_digest(&mut b, self.key);
+        b.push_str(" dir=");
+        push_opt_digest(&mut b, self.dir);
+        b.push_str(" label=");
+        let base = self.label.trim().rsplit('/').next().unwrap_or("");
+        if base.is_empty() {
+            b.push('-');
+        } else {
+            push_word_of(&mut b, base, LABEL_MAX);
+        }
+        b.push_str(" sid=");
+        match self.sid.as_deref() {
+            Some(s) if !s.is_empty() => push_word_of(&mut b, s, 64),
+            _ => b.push('-'),
+        }
+        b.push_str(" host=");
+        let first = self.host.trim().split('.').next().unwrap_or("");
+        if first.is_empty() {
+            b.push('-');
+        } else {
+            push_word_of(&mut b, first, 63);
+        }
+        b.push_str(" facts=");
+        push_hex(&mut b, &self.facts.0);
+        b.push_str(" wall_ms=");
+        push_fig_word(&mut b, &self.wall_ms);
+        b.push_str(" cpu_ms=");
+        push_fig_word(&mut b, &self.cpu_ms);
+        b.push_str(" peak_bytes=");
+        push_fig_word(&mut b, &self.peak_bytes);
+        b.push_str(" wait_ms=");
+        push_fig_word(&mut b, &self.wait_ms);
+        b.push_str(" cache=");
+        match &self.cache {
+            Fig::Known(tier) => push_word_of(&mut b, tier, 32),
+            other => push_fig_word(&mut b, other),
+        }
+        let _ = write!(
+            b,
+            " outcome={} stop={} code=",
+            self.outcome.word(),
+            self.stop.word()
+        );
+        push_opt_word(&mut b, self.code);
+        b.push_str(" sig=");
+        push_opt_word(&mut b, self.sig);
+        b.push_str(" meter=");
+        b.push_str(self.meter.word());
         b
     }
 
@@ -574,9 +631,20 @@ pub enum Line {
     },
 }
 
-/// The `key=value` words of a line's body, in order.
-pub(crate) fn words(body: &str) -> Vec<(&str, &str)> {
-    body.split(' ').filter_map(|w| w.split_once('=')).collect()
+/// The `key=value` words of a line's body, in order, into a stack buffer.
+pub(crate) fn words<'a>(body: &'a str, out: &mut [(&'a str, &'a str); 24]) -> Option<usize> {
+    let mut len = 0;
+    for w in body.split(' ') {
+        let Some(pair) = w.split_once('=') else {
+            continue;
+        };
+        if len >= out.len() {
+            return None;
+        }
+        out[len] = pair;
+        len += 1;
+    }
+    Some(len)
 }
 
 pub(crate) fn find<'a>(words: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
@@ -588,18 +656,20 @@ pub(crate) fn find<'a>(words: &[(&'a str, &'a str)], key: &str) -> Option<&'a st
 #[must_use]
 pub fn parse_line(line: &str) -> Option<Line> {
     let body = unseal(line)?;
-    let w = words(body);
-    if find(&w, "schema")? != "1" {
+    let mut buf = [("", ""); 24];
+    let len = words(body, &mut buf)?;
+    let w = &buf[..len];
+    if find(w, "schema")? != "1" {
         return None;
     }
-    let at_ms: u64 = find(&w, "at")?.parse().ok()?;
-    match find(&w, "kind")? {
-        "host" => crate::facts::HostLine::parse(at_ms, &w).map(Line::Host),
+    let at_ms: u64 = find(w, "at")?.parse().ok()?;
+    match find(w, "kind")? {
+        "host" => crate::facts::HostLine::parse(at_ms, w).map(Line::Host),
         "gap" => Some(Line::Gap {
             at_ms,
-            dropped: find(&w, "dropped")?.parse().ok()?,
+            dropped: find(w, "dropped")?.parse().ok()?,
         }),
-        kind => parse_row(at_ms, Kind::parse(kind)?, &w).map(Line::Row),
+        kind => parse_row(at_ms, Kind::parse(kind)?, w).map(Line::Row),
     }
 }
 

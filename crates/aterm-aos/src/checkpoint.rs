@@ -143,8 +143,8 @@ impl fmt::Display for RestoreRefusal {
             RestoreRefusal::StateDigest { stored, derived } => write!(
                 f,
                 "the stored state digest {} is not {}, the state's digest under the restoring schema",
-                stored.short(),
-                derived.short()
+                stored.short_display(),
+                derived.short_display()
             ),
             RestoreRefusal::Wire(w) => write!(f, "the stored state does not decode: {w}"),
         }

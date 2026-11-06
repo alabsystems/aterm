@@ -26,6 +26,14 @@ fn world(local: u64, phase: ImagePhase) -> World {
 }
 
 fn world_on(handle: crate::session_store::SessionHandle, phase: ImagePhase) -> World {
+    account_world(handle, phase, true)
+}
+
+fn account_world(
+    handle: crate::session_store::SessionHandle,
+    phase: ImagePhase,
+    stored_rollback: bool,
+) -> World {
     let (handle, facts, mut original, caller) = closed_restart::fixture_on(handle);
     let NativePlan::Restart {
         forward, rollback, ..
@@ -33,7 +41,13 @@ fn world_on(handle: crate::session_store::SessionHandle, phase: ImagePhase) -> W
     else {
         unreachable!()
     };
-    for command in [forward.as_mut(), rollback.as_deref_mut().unwrap()] {
+    for (index, command) in [forward.as_mut(), rollback.as_deref_mut().unwrap()]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 1 && !stored_rollback {
+            continue;
+        }
         command.account_intent = Some(Box::new(intent("/fixture/old")));
         command
             .env
@@ -623,4 +637,201 @@ fn treating_a_valid_account_recipe_as_authority_breaks_policy_law() {
     state.insert("accepted", i64::from(accepted));
     assert!(accepted);
     assert!(!model.check_invariant("OrdinaryPolicy", &state));
+}
+
+#[test]
+fn account_lineage_keeps_its_spare_through_three_full_history_handoffs() {
+    let mut world = world(8253, ImagePhase::Rollback);
+    let ctx = Arc::clone(&world.handle.ctx);
+    let mut other_slots = Vec::new();
+    for index in 0..MAX_COMPLETED - 2 {
+        other_slots.push(
+            PrepareSlot::reserve(
+                &ctx,
+                &format!("other-{index}"),
+                0,
+                false,
+                AccountSlot::Plain,
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        ctx.fenced_writes.native.lock().unwrap().slots(),
+        MAX_COMPLETED
+    );
+    assert!(PrepareSlot::reserve(&ctx, "extra", 0, false, AccountSlot::Plain).is_err());
+    for id in ["a1", "a2", "a3"] {
+        world
+            .facts
+            .clock
+            .store(world.original.deadline_us + 1, Ordering::SeqCst);
+        let retired = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .reclaim(world.original.deadline_us + 1);
+        assert!(
+            retired.is_empty(),
+            "waiting NoExec frontier must outlive its deadline"
+        );
+        let next = candidate(&world, id, ImagePhase::Rollback);
+        let binding = admitted_binding(&admit(&world, next.clone(), ImagePhase::Rollback));
+        assert_eq!(
+            ctx.fenced_writes.native.lock().unwrap().slots(),
+            MAX_COMPLETED
+        );
+        let retired = ctx.fenced_writes.native.lock().unwrap().reclaim(0);
+        assert_eq!(
+            retired.len(),
+            1,
+            "acknowledged child replaces its consumed parent before expiry"
+        );
+        drop(retired);
+        assert_eq!(
+            run(
+                &ctx,
+                &world.facts,
+                Request::Query(world.binding.clone()),
+                world.caller.clone()
+            ),
+            NOEXEC
+        );
+        assert_eq!(
+            run(
+                &ctx,
+                &world.facts,
+                Request::Reconcile(binding.clone()),
+                world.caller.clone()
+            ),
+            NOEXEC
+        );
+        world.original = next;
+        world.binding = binding;
+        let table = ctx.fenced_writes.native.lock().unwrap();
+        assert_eq!(table.by_id.len(), 1);
+        assert_eq!(table.slots(), MAX_COMPLETED);
+    }
+    assert_eq!(world.facts.signals.load(Ordering::SeqCst), 1);
+    drop(other_slots);
+    assert_eq!(ctx.fenced_writes.native.lock().unwrap().slots(), 2);
+}
+
+#[test]
+fn failed_child_append_and_active_receipt_prevent_parent_compaction() {
+    for (local, lost_ack) in [(8254, false), (8255, true)] {
+        check_retention_until_publication_and_drain(local, lost_ack);
+    }
+}
+
+#[test]
+fn a_non_stored_active_rollback_does_not_pin_the_lineage() {
+    let world = account_world(
+        crate::session_store::test_handle_on(8256, -1),
+        ImagePhase::Rollback,
+        false,
+    );
+    let ctx = &world.handle.ctx;
+    assert_eq!(ctx.fenced_writes.native.lock().unwrap().slots(), 2);
+    let retired = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap()
+        .reclaim(world.original.deadline_us + 1);
+    assert_eq!(retired.len(), 1);
+    drop(retired);
+    assert_eq!(ctx.fenced_writes.native.lock().unwrap().slots(), 0);
+}
+
+fn check_retention_until_publication_and_drain(local: u64, lost_ack: bool) {
+    let world = world(local, ImagePhase::Forward);
+    let ctx = &world.handle.ctx;
+    let next = candidate(&world, "b1", ImagePhase::Forward);
+    world
+        .facts
+        .prepare_journal_allowed
+        .store(lost_ack, Ordering::SeqCst);
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+    assert_eq!(
+        world.facts.journal.lock().unwrap().contains_key(&next.id),
+        lost_ack
+    );
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .reclaim(u64::MAX)
+            .is_empty()
+    );
+    assert_eq!(ctx.fenced_writes.native.lock().unwrap().by_id.len(), 2);
+    world
+        .facts
+        .prepare_journal_allowed
+        .store(true, Ordering::SeqCst);
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    let child = admitted_binding(&admit(&world, next.clone(), ImagePhase::Forward));
+    let flight = ReceiptFlight::begin(ctx, &Request::Query(world.binding.clone())).unwrap();
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .reclaim(u64::MAX)
+            .is_empty()
+    );
+    drop(flight);
+    let parent = lookup(ctx, &world.binding).unwrap();
+    let child_operation = lookup(ctx, &child).unwrap();
+    let pending = child_operation
+        .lock()
+        .unwrap()
+        .custody
+        .as_ref()
+        .unwrap()
+        .drain();
+    let old_drain = parent.lock().unwrap().completion_drain.replace(pending);
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .reclaim(0)
+            .is_empty(),
+        "an undrained completion still owns its parent evidence"
+    );
+    parent.lock().unwrap().completion_drain = old_drain;
+    drop(parent);
+    drop(child_operation);
+    let retired = ctx.fenced_writes.native.lock().unwrap().reclaim(0);
+    assert_eq!(retired.len(), 1);
+    drop(retired);
+    assert!(lookup(ctx, &world.binding).is_none());
+    assert!(lookup(ctx, &child).is_some());
+    let competing = candidate(&world, "b2", ImagePhase::Forward);
+    assert_eq!(
+        admit(&world, competing.clone(), ImagePhase::Forward),
+        UNKNOWN
+    );
+    assert!(
+        !world
+            .facts
+            .journal
+            .lock()
+            .unwrap()
+            .contains_key(&competing.id)
+    );
+    assert_eq!(
+        admitted_binding(&admit(&world, next, ImagePhase::Forward)),
+        child
+    );
 }

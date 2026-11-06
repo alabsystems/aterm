@@ -475,9 +475,9 @@ pub fn is_test_file(path: &Path) -> bool {
 /// test-only, stays in, and so do the modules it declares in turn. That other declaration is
 /// typically `#[cfg(not(test))] mod <name>;` beside the gated one.
 ///
-/// Only a declaration at the start of a line is read, with `#[path]` honoured. One inside an
-/// inline `mod { }` is not, and its files stay in, so a scan that drops these reads more,
-/// never less.
+/// Only a declaration at the start of a line is read, with a literal `#[path]` honoured.
+/// Inline and indented declarations are outside this textual scan; this is not a full Rust
+/// module-resolution or cfg analysis. Comments and literal contents cannot declare modules.
 pub fn test_gated_module_files(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
     // Each declaration: the file it is in, whether it is test-only, the module's own file, and
     // the folder its submodules sit in.
@@ -550,7 +550,9 @@ struct ModDecl {
 /// Each `mod <name>;` declaration that starts a line of `text`, with the attributes on the
 /// lines just above it (comment lines may stand between them) and on its own line.
 fn mod_decls(text: &str) -> Vec<ModDecl> {
-    let lines: Vec<&str> = text.lines().collect();
+    let lexed = lex::lex(text);
+    let lines: Vec<&str> = lexed.code.lines().collect();
+    let sources: Vec<&str> = lexed.text.lines().collect();
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.starts_with(char::is_whitespace) {
@@ -558,9 +560,11 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
         }
         let mut attrs: Vec<&str> = Vec::new();
         let mut item = *line;
+        let mut source = sources[i];
         while let Some(end) = item.strip_prefix("#[").and_then(|_| item.find(']')) {
-            attrs.push(&item[..=end]);
+            attrs.push(&source[..=end]);
             item = item[end + 1..].trim_start();
+            source = source[end + 1..].trim_start();
         }
         let item = item.split("//").next().unwrap_or_default().trim();
         let item = match item.strip_prefix("pub") {
@@ -580,11 +584,11 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
-        for above in lines[..i].iter().rev() {
+        for (j, above) in lines[..i].iter().enumerate().rev() {
             let above = above.trim_end();
             if above.starts_with("#[") {
-                attrs.push(above);
-            } else if !above.trim_start().starts_with("//") {
+                attrs.push(sources[j]);
+            } else if !above.trim().is_empty() {
                 break;
             }
         }
@@ -596,6 +600,10 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
                 .and_then(|a| a.strip_suffix('"'))
                 .map(str::to_string)
         });
+        if path.is_none() && attrs.iter().any(|attr| attr.contains("path")) {
+            // An unrecognized path spelling must not exclude a different, default-path file.
+            continue;
+        }
         out.push(ModDecl {
             name: name.to_string(),
             path,
@@ -1633,6 +1641,30 @@ mod tests {
         .map(|rel| root.join(rel))
         .collect();
         assert_eq!(gated, expected);
+    }
+
+    #[test]
+    fn quoted_or_commented_module_examples_cannot_remove_shipped_sources() {
+        let lib = r###"const EXAMPLE: &str = r#"
+#[cfg(test)]
+mod live;
+"#;
+/*
+#[cfg(test)]
+mod commented;
+*/
+include!("live.rs");
+include!("commented.rs");
+"###;
+        let files = [
+            ("crates/a/src/lib.rs".to_owned(), lib.to_owned()),
+            ("crates/a/src/live.rs".to_owned(), String::new()),
+            ("crates/a/src/commented.rs".to_owned(), String::new()),
+        ];
+        let root = synth_tree("aterm-census-quoted-mod", "quoted", &files);
+        let mut all = Vec::new();
+        collect_rs_files(&root.join("crates"), &mut all).expect("every entry reads");
+        assert!(test_gated_module_files(&all).is_empty());
     }
 
     fn empty_files(name: &str, files: &[&str]) -> crate::tree::memory::Tree {

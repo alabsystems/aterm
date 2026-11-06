@@ -359,6 +359,69 @@ fn a_completed_concurrent_commit_is_observed_without_rewriting_sync_source_metri
     assert_eq!(report.into_init(false).enrolled, 1);
 }
 
+/// A ROW A SESSION HERE RAN ON THIS WEEK, ITS LOGIN GONE SINCE, IS ONE aterm SIGNS IN BY ITSELF,
+/// once the sync has seen its directory empty, and the receipt says so where a route signs it in
+/// with nobody here (`lab claude-rotation-proof` R4). CONTROLS: with no route it names `accounts
+/// browser`; where nothing judged the routes it promises nothing; a week after that session it
+/// waits for `accounts renew`, and says why.
+#[test]
+fn a_used_row_whose_login_went_is_told_aterm_signs_it_in() {
+    let bed = Bed::new();
+    bed.seed();
+    let mut roster = Roster::load(&bed.path).unwrap();
+    roster.rows[0].dir = None;
+    fs::write(&bed.path, format_roster_toml(&roster).unwrap()).unwrap();
+    fs::rename(
+        bed.env.state.join("old/.credentials.json"),
+        bed.env.state.join("kept-credential"),
+    )
+    .unwrap();
+    bed.store
+        .transact(NOW, &mut None, |state| {
+            let events = accounts::note_session(state, "s-1", "m1", None, NOW - 3600);
+            state.sessions.clear();
+            Ok(events)
+        })
+        .unwrap();
+    // The sync's own observation: a login directory that holds no login is no working login.
+    bed.sync();
+    let (state, _) = bed.store.load(NOW).unwrap();
+    assert_eq!(state.account("m1").auth, accounts::Auth::SignedOut);
+    let said_with = |now: i64, no_route: Option<BTreeSet<String>>| {
+        let mut report =
+            read_sync_report(&bed.env, &bed.store, bed.publication(false), None).unwrap();
+        report.no_route = no_route;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            write_sync_report(&report, now, false, &mut out, &mut err),
+            ExitCode::SUCCESS
+        );
+        let out = String::from_utf8(out).unwrap();
+        out.lines()
+            .find(|line| line.starts_with("not signed in yet: m1"))
+            .unwrap_or_else(|| panic!("no line for m1: {out}"))
+            .to_owned()
+    };
+    let said = |now: i64| said_with(now, Some(BTreeSet::new()));
+    let used = said(NOW);
+    assert!(used.contains("aterm signs each in by itself"), "{used}");
+    let no_route = said_with(NOW, Some(BTreeSet::from(["m1".to_owned()])));
+    assert!(!no_route.contains("by itself"), "CONTROL: {no_route}");
+    assert!(
+        no_route.contains("no route signs each in"),
+        "CONTROL: {no_route}"
+    );
+    let unjudged = said_with(NOW, None);
+    assert!(!unjudged.contains("by itself"), "CONTROL: {unjudged}");
+    let week_on = said(NOW - 3600 + accounts::USED_WITHIN_S);
+    assert!(!week_on.contains("by itself"), "CONTROL: {week_on}");
+    assert!(
+        week_on.contains("each waits for")
+            && week_on.contains("no session here runs on it or ran on it within a week"),
+        "CONTROL: {week_on}"
+    );
+}
+
 /// A row a page stopped is told what a person runs, as the report tells it. CONTROL: a row with no
 /// stop on record is told it waits, and nothing promises it a sign-in by itself: no session here
 /// runs on it.

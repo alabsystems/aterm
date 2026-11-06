@@ -32,7 +32,7 @@ fn login_shell() -> Child {
         .any(|(p, _, n)| *p == child.id() && n == "kproc-fixture")
     {
         assert!(start.elapsed() < HANG, "bash's exec: not within {HANG:?}");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     child
 }

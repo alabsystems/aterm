@@ -92,7 +92,7 @@ fn await_revision(ctx: &crate::SessionCtx, old: u64) {
             since.elapsed() < PATIENCE,
             "hang: metadata transition never became visible"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
 }
 
@@ -1022,7 +1022,7 @@ fn actual_turn_seals_input_before_its_read_only_response_wait() {
             since.elapsed() < PATIENCE,
             "hang: turn never sealed its input"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     let response_still_waits = rx.try_recv().is_err();
     let drained = h
@@ -1280,7 +1280,7 @@ fn guarded_scope_ack_drains_its_real_pipe_prefix_without_waiting_for_later_termi
             since.elapsed() < PATIENCE,
             "hang: guarded write never admitted its partial pipe suffix"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert_eq!(
         h.ctx.sink.write_reply(&vec![b'R'; 512 * 1024]).unwrap(),
@@ -1315,7 +1315,7 @@ fn guarded_scope_ack_drains_its_real_pipe_prefix_without_waiting_for_later_termi
                     since.elapsed() < PATIENCE,
                     "hang: admitted command prefix never reached the pipe"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             other => panic!("read authority prefix: {other:?}"),
         }
@@ -1481,7 +1481,7 @@ fn guarded_scope_cancel_keeps_transition_ack_behind_its_started_native_write() {
                     since.elapsed() < PATIENCE,
                     "hang: direct pipe prefix never arrived"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             other => panic!("read direct cancellation prefix: {other:?}"),
         }
@@ -1514,7 +1514,7 @@ fn guarded_scope_cancel_keeps_transition_ack_behind_its_started_native_write() {
                     since.elapsed() < PATIENCE,
                     "hang: canceled native write never retired"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             other => panic!("read registered native write: {other:?}"),
         }

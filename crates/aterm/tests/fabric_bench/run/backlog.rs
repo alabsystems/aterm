@@ -120,7 +120,7 @@ pub fn fill(w: &World, producer: u64, n: usize) -> f64 {
 /// retry only refused sequences: later successes in the same window stay paid.
 /// A minute without a new acknowledgement is the hang detector, not a total
 /// fill budget; a large backlog may legitimately take longer under a quota.
-fn fill_records<S: Read + Write>(
+pub fn fill_records<S: Read + Write>(
     client: &mut astream_broker::Client<S>,
     producer: u64,
     subject: &str,

@@ -198,6 +198,7 @@ fn ready(stream: &TcpStream, budget: Duration) -> Result<(), Error> {
 
 fn request(stream: &mut TcpStream, end: Instant) -> Result<zeroize::Zeroizing<String>, Error> {
     let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(512));
+    let mut chunk = zeroize::Zeroizing::new([0u8; 512]);
     while bytes.len() < 16384 {
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -206,18 +207,23 @@ fn request(stream: &mut TcpStream, end: Instant) -> Result<zeroize::Zeroizing<St
         stream
             .set_read_timeout(Some(left))
             .map_err(|_| error(ErrorKind::Transport))?;
-        let mut byte = [0u8];
-        match stream.read(&mut byte) {
+        let max_read = (16384 - bytes.len()).min(chunk.len());
+        let read_len = match stream.read(&mut chunk[..max_read]) {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return Err(error(ErrorKind::InvalidResponse)),
-        }
-        bytes.push(byte[0]);
-        if bytes.ends_with(b"\r\n\r\n") {
-            return std::str::from_utf8(&bytes)
-                .map(|text| zeroize::Zeroizing::new(text.to_owned()))
-                .map_err(|_| error(ErrorKind::InvalidResponse));
+        };
+        let search_from = bytes.len().saturating_sub(3);
+        bytes.extend_from_slice(&chunk[..read_len]);
+        if let Some(rel) = bytes[search_from..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            bytes.truncate(search_from + rel + 4);
+            let text = String::from_utf8(std::mem::take(&mut *bytes))
+                .map_err(|_| error(ErrorKind::InvalidResponse))?;
+            return Ok(zeroize::Zeroizing::new(text));
         }
     }
     Err(error(ErrorKind::InvalidResponse))
@@ -357,7 +363,7 @@ mod tests {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 Err(e) => panic!("accept: {e}"),
             }

@@ -543,9 +543,8 @@ fn a_claim_worker_runs_out_of_its_time_by_its_record() {
     assert!(!ran_out(None, WORKER_FOR));
 }
 
-/// A CLAIM WORKER'S TIME COUNTS FROM ITS START: no later state moves it, an exit neither (a
-/// concluded worker's tab goes by its own linger, `crate::worker_reaper::over`), and a person's
-/// typing does.
+/// A claim worker's execution budget counts from its start or a person's typing. A later task
+/// state does not move that clock; a concluded task keeps its pane regardless of the clock.
 #[test]
 fn a_workers_time_counts_from_its_start_and_a_persons_typing() {
     use crate::task_record::TaskMark;
@@ -616,13 +615,11 @@ fn a_restored_claim_worker_has_a_limit_again() {
 /// worker's folder and whether its task was marked `exited`, so a restore gives an ended
 /// worker's tab an `exited` record, not a new worker's time, an agent on its leaf or not (the
 /// restore's own path: `app_restore_tests::a_restored_claim_worker_gets_a_task_record`), and a
-/// Claude Code found or brought back there is not signalled; the tab closes once that mark has
-/// stood its linger and that Claude Code was last seen running [`LINGER`] ago. CONTROL: the
+/// Claude Code found or brought back there is not signalled, and its pane stays. CONTROL: the
 /// layout of a running worker's tab names its folder and nothing ended; a tab with no worker and
 /// a task that ended in another folder name none.
 #[test]
 fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
-    use Ending::{ClosePane, Leave};
     let claim = claim_folder();
     let mut app = crate::App::headless_for_test();
     let front = 0;
@@ -731,7 +728,7 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
     in_front(&app, restored, "claude");
     assert_eq!(
         of(app.reap_workers(record.since + WORKER_FOR), restored),
-        [(restored, Leave)],
+        [],
         "a person's Claude Code in a tab whose worker had ended"
     );
     crate::feed_session_for_test(&app, restored, b"\x1b]133;D;0\x07");
@@ -741,13 +738,10 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
             app.reap_workers(seen + LINGER - Duration::from_secs(1)),
             restored
         ),
-        [(restored, Leave)],
+        [],
         "its output is still to be read"
     );
-    assert_eq!(
-        of(app.reap_workers(seen + LINGER), restored),
-        [(restored, ClosePane)]
-    );
+    assert_eq!(of(app.reap_workers(seen + LINGER), restored), []);
 }
 
 /// A running claim worker in session `session`.

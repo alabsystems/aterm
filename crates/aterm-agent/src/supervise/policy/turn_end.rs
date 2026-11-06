@@ -37,6 +37,11 @@ pub const FORWARD_RECOVERY: &str = concat!(
     If this work cannot proceed, defer it with the reason and advance another useful task. \
     Do not ask the person to unblock routine work. Keep moving."
 );
+/// Why Cruise waits before [`FORWARD_RECOVERY`] at a repeated report: the words ending its
+/// `WAITING` line. The wait is the short back-off ladder's step for the streak its point closed
+/// ([`TurnEndState::short_wait`]), which these words do not name, so a reader of the ladder counts
+/// it as the step after the one before.
+pub const REPEAT_RECOVERY_WAIT: &str = "repeated report; changing approach on the next turn";
 /// The [`DONE_CHECK`] typed under Cruise where the worker claims it is done.
 pub const RULE_DONE_CHECK: &str = "continue-done-check@v1";
 /// RETIRED: the open-items challenge older builds typed where a done report named open work ([`OPEN_ITEMS_HEAD`], [`OPEN_ITEMS_HEADS_BEFORE`]).
@@ -290,8 +295,7 @@ pub enum GaveUp {
     /// The same reply came back with no work and Land's stop for that took the point
     /// ([`TurnEndState::conclude_repeated`]).
     Repeated,
-    /// Its account met a usage limit that resets past [`MANAGED_WALL_HORIZON`] and no move off it
-    /// (another account, a fallback model) was made ([`TurnEndState::conclude_at_wall`]).
+    /// A usage-limit failure recorded by an earlier harness. New walls wait for quota.
     UsageLimit,
 }
 
@@ -337,15 +341,6 @@ impl GaveUp {
             .find(|ending| line.contains(ending.words()))
     }
 }
-
-/// HOW FAR OFF A MANAGED WORKER'S USAGE WALL MAY RESET AND STILL BE WAITED OUT
-/// ([`managed_wall_ends`]). A worker a manager waits on is a task-sized, ephemeral session, not a
-/// person's long-lived tab: a quarter of an hour (a five-hour window's last minutes, a reset the
-/// notice puts minutes away) costs its manager less than a relaunch, while anything longer is a
-/// tab that sits blocked for hours or days (the claim workers of 2026-11-04 waited on a weekly
-/// reset 30 h out). Past it the work ends `failed why=usage-limit` ([`GaveUp::UsageLimit`]), which
-/// is its manager's report and lets the manager run it again once quota returns.
-pub const MANAGED_WALL_HORIZON: Duration = Duration::from_secs(15 * 60);
 
 /// The decider's check that holds an act at the same reply ([`TurnEndState::repeats`]).
 pub const SAME_REPLY: &str = "same-reply";
@@ -590,9 +585,14 @@ pub fn screen_mark(rows: &[String]) -> u64 {
     aterm_hash::fnv1a_64(letters.as_bytes())
 }
 
-/// THE MARK OF A READING'S CONVERSATION ([`TurnEndReading::screen_mark`]).
+/// THE MARK OF A READING'S CONVERSATION ([`TurnEndReading::screen_mark`]): the letters of the rows
+/// above the composer's caret, each as the screen's transcript reads it
+/// ([`aterm_phase::ScreenReader::transcript`]: beside Claude Code's side panel, its words up to
+/// the panel's rule, so the panel's text moves no conversation).
 #[must_use]
 pub fn conversation_mark(reading: &aterm_phase::Reading, rows: &[String]) -> u64 {
+    let transcript = reading.program.reader().transcript(rows);
+    let rows = transcript.rows();
     screen_mark(
         reading
             .composer
@@ -12695,15 +12695,15 @@ struct LandEpisode {
     /// The land check was Land's last act: the next judged answer is the check's
     /// ([`super::land_check::land_check_answer`]), a wall's cut and its retry kept.
     check_pending: bool,
-    /// The reply marks of the defenses checked since the last real work, newest last: one check
-    /// per defense. A defense counts as checked once the check's answer is read
+    /// The reply marks of the defenses checked since the last real work or conclusion, newest
+    /// last: one check per defense. A defense counts as checked once the check's answer is read
     /// ([`Self::sent`]), never on the typing alone: a check the agent never took leaves its
     /// defense owed the check again.
     audited: [Option<u64>; 3],
     /// The defense the check typed last audits ([`Self::owed_mark`] as it was typed), checked
     /// ([`Self::audit`]) where that check's answer is read.
     sent: Option<u64>,
-    /// THE CHECK WAS ANSWERED WITH A LIST (or a need beside one), and no act or work came since:
+    /// THE CHECK WAS ANSWERED WITH A LIST (or a need beside one), and no act or turn came since:
     /// Land's next prompt quotes it ([`TurnEndState::land_listed`]). The answer is read literally,
     /// so the question reader never takes it for a choice put to the person
     /// ([`RULE_LAND_ANSWER`]'s "Nobody is here to choose", which talked an agent out of its own
@@ -12732,7 +12732,8 @@ struct LandEpisode {
     /// THE REPLY WHOSE YIELD THE LEFT LEG COUNTED AND NOTHING SETTLED YET ([`Self::left_holds`],
     /// its [`reply_mark`]): an act typed, or a turn run since the yield, settles it
     /// ([`TurnEndState::settle_left`]). Until then the same yield read again before its act takes
-    /// its hold back first ([`TurnEndState::uncount_left`]), and the books a loop that follows
+    /// its hold back first ([`TurnEndState::uncount_left`]), as does the work's conclusion, after
+    /// which no act is typed for it ([`TurnEndState::conclude`]), and the books a loop that follows
     /// seeds leave it out ([`TurnEndState::land_books`]): that loop counts it again where it judges
     /// the yield again and still holds, and never where it reads a turn run since, so each yield
     /// counts once, and only as it was last judged.
@@ -15572,7 +15573,8 @@ impl TurnEndState {
     /// reply that is not the check's answer, holds no `Nothing left:` defense and is not
     /// `LANDED` is the agent's newest answer, so its body, its needs taken out, becomes the list
     /// Land's next prompt quotes and the hold quotes: said again, Land holds on it, quoted. A
-    /// defense, `LANDED` or a reply of needs alone keeps the standing list.
+    /// defense, `LANDED`, a reply of needs alone or a question keeps the standing list: Land
+    /// answers a question, which says nothing of what is left.
     fn land_relisted(&mut self, reading: &TurnEndReading) {
         if self.land_listed.is_none() {
             return;
@@ -15580,7 +15582,10 @@ impl TurnEndState {
         let Some(tail) = reading.said_tail.as_deref() else {
             return;
         };
-        if needs::defense_line(tail).is_some() || land_check::landed_reply(Some(tail)) {
+        if needs::defense_line(tail).is_some()
+            || land_check::landed_reply(Some(tail))
+            || reading.asked().is_some()
+        {
             return;
         }
         let body = needs::without_needs(tail);
@@ -15935,8 +15940,11 @@ impl TurnEndState {
     }
 
     /// The work ends unfinished at the point judged last: Land's rest takes it, and what the books
-    /// owed a defense (the land check, its list) goes with it, since the check's words have no
-    /// answer to it.
+    /// owed a defense (the land check, its list, the defenses it read) goes with it, since the
+    /// check's words have no answer to it: once a turn lifts the conclusion, the same defense is
+    /// owed the check again, said in a turn of real work or not. So does a left hold nothing
+    /// settled yet ([`LandEpisode::left_counted`]): no act will be typed for it, so it held
+    /// nothing, and the episode's left holds ([`LEFT_HOLDS`]) are not spent on it.
     fn conclude(&mut self, ending: GaveUp) {
         self.gave_up = Some(ending);
         self.done = 2;
@@ -15952,7 +15960,11 @@ impl TurnEndState {
         self.land.check_pending = false;
         self.land.check_owed = false;
         self.land.sent = None;
+        self.land.audited = [None; 3];
         self.land_listed = None;
+        if self.land.left_counted.take().is_some() {
+            self.land.left_holds = self.land.left_holds.saturating_sub(1);
+        }
     }
 
     /// THE SAME REPLY ENDS A MANAGED WORKER'S WORK: at a Land point whose decision typed nothing
@@ -15978,35 +15990,6 @@ impl TurnEndState {
         self.conclude(GaveUp::Repeated);
     }
 
-    /// A MANAGED WORKER'S USAGE WALL ENDS ITS WORK ([`GaveUp::UsageLimit`]): at a Land point whose
-    /// decision (`decided`) typed nothing at the worker's own usage wall ([`managed_wall_ends`]),
-    /// shown or left on the screen and remembered (the wall the decider read, [`still_shown`]),
-    /// because its reset lies past [`MANAGED_WALL_HORIZON`], or no act lifts it, and no move off it
-    /// (another account, a fallback model) was made ([`managed_wall_act`]), the rest it would take
-    /// has no end its manager could wait for, so it is a conclusion: the record is marked `failed
-    /// why=usage-limit`, which is the manager's report and lets it run the work again once quota
-    /// returns. A decision that waits, moves or types concludes nothing, and a person's tab waits
-    /// for its reset as before.
-    pub fn conclude_at_wall(
-        &mut self,
-        reading: &TurnEndReading,
-        cfg: &SupervisorConfig,
-        decided: &TurnEndAction,
-    ) {
-        if *decided != TurnEndAction::Nothing {
-            return;
-        }
-        let left = self
-            .wall
-            .as_ref()
-            .filter(|t| reading.wall.is_none() && named_class(t.class))
-            .and_then(|t| still_shown(t, reading));
-        let at_wall = left.as_ref().map_or(reading, |(_, shown)| shown);
-        if managed_wall_ends(self, at_wall, cfg) {
-            self.conclude(GaveUp::UsageLimit);
-        }
-    }
-
     /// THE FAILED CONCLUSION A LOOP BEFORE THIS ONE JOURNALED: the rest a journal's landing seeds
     /// ([`Self::seed_landed`]), since a relaunch restores the session's Land and no task record. It
     /// takes this loop's first point where that point holds the same reply (`words`, where the
@@ -16026,19 +16009,19 @@ impl TurnEndState {
 
     /// THE RECORD SAYS THE WORK ENDED UNFINISHED: whether that stands here, as
     /// [`Self::seed_task_done`] asks of a landing. A turn that ran at the first point, an act in
-    /// flight or a wall means it no longer does, and the record is opened again; a usage or model
-    /// limit's wall is where a [`GaveUp::UsageLimit`] was concluded, so that one stands at it.
+    /// flight or a wall means it no longer does, and the record is opened again. A usage-limit
+    /// failure from an earlier harness never concludes the successor.
     pub fn seed_gave_up(&mut self, ending: GaveUp) -> bool {
         if self.gave_up.is_some() {
             return true;
         }
-        let its_wall = |t: &WallTrack| {
-            ending == GaveUp::UsageLimit && matches!(t.class, WallClass::Usage | WallClass::Model)
-        };
+        if ending == GaveUp::UsageLimit {
+            return false;
+        }
         if self.autopilot == Some(Autopilot::Cruise)
             || !self.point_turnless
             || self.task_done()
-            || self.wall.as_ref().is_some_and(|t| !its_wall(t))
+            || self.wall.is_some()
             || self.awaiting.is_some()
             || self.after.is_some()
         {
@@ -18623,6 +18606,12 @@ impl TurnEndState {
             self.land.answered = false;
             self.land.rest = false;
         }
+        // THE CHECK'S ANSWER STANDS ONLY AS THE REPLY IT WAS: a turn since that is no check's yield
+        // (a person's exchange, someone else's turn, a wall's) said something else, so a question
+        // in it is answered and a defense in it is contradicted by the list still standing.
+        if reading.worked.is_some() && !check_yield {
+            self.land.answered = false;
+        }
         if awaited.is_none() && (reading.worked.is_some() || typed || prompted) {
             self.land.rest = false;
         }
@@ -20981,9 +20970,11 @@ pub fn land_contradicted(
 }
 
 /// [`land_contradicted`] with the left suffix of `left` rows after the repository's ask
-/// ([`Suffix::Left`]): the processes the agent left running contradict no defense of their own,
-/// so they ride a contradiction git or the list makes and make none.
-fn land_contradicted_left(
+/// ([`left_suffix`] where it fits, else [`left_suffix_short`], else none): the processes
+/// the agent left running contradict no defense of their own, so they ride a contradiction git or
+/// the list makes and make none.
+#[must_use]
+pub fn land_contradicted_left(
     repo: &crate::harness::repo_work::RepoRead,
     listed: Option<&str>,
     left: u16,
@@ -21964,7 +21955,7 @@ fn act_past_walls(
                     SAME_REPLY,
                     TurnEndAction::WaitUntil {
                         until,
-                        why: "repeated report; changing approach on the next turn".to_string(),
+                        why: REPEAT_RECOVERY_WAIT.to_string(),
                         wait: WaitKind::Other,
                     },
                 );
@@ -23136,105 +23127,6 @@ fn account_first(
     }
 }
 
-/// A MANAGED WORKER'S OWN USAGE WALL, WHICH IT WAITS OUT NO FURTHER THAN [`MANAGED_WALL_HORIZON`]
-/// ([`managed_wall_act`], [`TurnEndState::conclude_at_wall`]): under Land, a session a manager
-/// waits on ([`TurnEndState::managed`]) whose work has not concluded, at a point whose reading
-/// shows its own usage wall (on the screen, or left there and remembered, [`still_shown`]), a
-/// session or weekly limit or a model's bucket (not one a moved login or a switched model left
-/// behind, and no `/login` dialog standing over it), with no resume owed past an account or login
-/// move or a reset claim. A person's tab, and a managed worker under Cruise (which never rests),
-/// waits for the reset as before.
-pub(super) fn managed_wall_ends(
-    state: &TurnEndState,
-    reading: &TurnEndReading,
-    cfg: &SupervisorConfig,
-) -> bool {
-    reading.autopilot == Autopilot::Land
-        && state.managed
-        && !state.task_done()
-        && !reading.taskless
-        && reading.at_point(state.stale_input)
-        && reading.login_screen.is_none()
-        && matches!(
-            reading.wall,
-            Some(WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. })
-        )
-        && !state.login_left(reading)
-        && !state.bucket_left(reading)
-        && !(cfg.resume_limits
-            && (state.account_resume || state.login_resume || state.reset_resume.is_some()))
-}
-
-/// What a managed worker's own usage wall ([`managed_wall_ends`]) does with `act`, what the wall's
-/// arm decided for any session. An act made now stands (a model's consent, the resume once the
-/// reset passed), and so does a move the roster advises onto another account or a fallback model:
-/// rotation comes first and wins, and where the move is not made its fallback waits at most the
-/// horizon before the point is decided again ([`managed_fallback`]); so does the roster's wait for
-/// another account that ends inside the horizon ([`within_managed_horizon`]). A wait that ends
-/// past [`MANAGED_WALL_HORIZON`] for a reset past it too (or one no reading names), or no act at
-/// all (an escalation, `resume_limits` off), types nothing: the loop concludes the work there
-/// ([`TurnEndState::conclude_at_wall`], `failed why=usage-limit`), its manager's report, and
-/// raises no limit notice for a person (`Session::limit_after`).
-fn managed_wall_act(act: TurnEndAction, reading: &TurnEndReading, now: Instant) -> TurnEndAction {
-    match act {
-        TurnEndAction::WaitUntil { until, .. } if !within_managed_horizon(until, reading, now) => {
-            TurnEndAction::Nothing
-        }
-        TurnEndAction::Nothing | TurnEndAction::Escalate { .. } => TurnEndAction::Nothing,
-        TurnEndAction::Restart {
-            why,
-            rule_id,
-            otherwise,
-        } => TurnEndAction::Restart {
-            why,
-            rule_id,
-            otherwise: Box::new(managed_fallback(*otherwise, reading, now)),
-        },
-        act => act,
-    }
-}
-
-/// THE FALLBACK OF A MOVE A MANAGED WORKER'S WALL MAKES FIRST ([`managed_wall_act`]): where the
-/// move is not made, a wait within the horizon stands, and anything that would wait longer or
-/// type nothing waits [`MANAGED_WALL_HORIZON`] instead, so the point is decided again and its
-/// wall concludes the work then.
-fn managed_fallback(act: TurnEndAction, reading: &TurnEndReading, now: Instant) -> TurnEndAction {
-    match act {
-        TurnEndAction::WaitUntil { until, .. } if within_managed_horizon(until, reading, now) => {
-            act
-        }
-        TurnEndAction::WaitUntil { .. }
-        | TurnEndAction::Nothing
-        | TurnEndAction::Escalate { .. } => TurnEndAction::WaitUntil {
-            until: later(now, MANAGED_WALL_HORIZON),
-            why: MANAGED_WALL_AGAIN.to_string(),
-            wait: WaitKind::Other,
-        },
-        TurnEndAction::Restart {
-            why,
-            rule_id,
-            otherwise,
-        } => TurnEndAction::Restart {
-            why,
-            rule_id,
-            otherwise: Box::new(managed_fallback(*otherwise, reading, now)),
-        },
-        act => act,
-    }
-}
-
-/// Why a managed worker's fallback waits ([`managed_fallback`]).
-pub const MANAGED_WALL_AGAIN: &str = "a managed worker's usage limit: the move off it was not made; decided again within the horizon";
-
-/// Whether a wait to `until` at a managed worker's wall stays within [`MANAGED_WALL_HORIZON`]: the
-/// wait itself ends within it (a move the roster advises once another account frees up, or once
-/// the hour's moves allow one, [`account_first`], whatever the wall's own reset), or the reset
-/// the reading names lies within it (the grace the resume waits past it rides along).
-fn within_managed_horizon(until: Instant, reading: &TurnEndReading, now: Instant) -> bool {
-    let horizon = later(now, MANAGED_WALL_HORIZON);
-    until <= horizon || reading.reset_at.is_some_and(|reset| reset <= horizon)
-}
-
 pub(super) fn login_wall_moves<'a>(
     state: &TurnEndState,
     reading: &'a TurnEndReading,
@@ -23483,12 +23375,7 @@ fn wall_action(
                 return act;
             }
             let attempts = state.wall_attempts(kind).unwrap_or(0);
-            let act = account_first(state, reading, cfg, now, attempts, today, continue_as);
-            if managed_wall_ends(state, reading, cfg) {
-                managed_wall_act(act, reading, now)
-            } else {
-                act
-            }
+            account_first(state, reading, cfg, now, attempts, today, continue_as)
         }
         WallKind::Auth if state.login_left(reading) => resume_limit(continue_as),
         WallKind::Auth => {

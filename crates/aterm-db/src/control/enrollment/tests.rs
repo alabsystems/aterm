@@ -87,6 +87,18 @@ impl Lab {
     pub(crate) fn pending(&self) -> Endpoint {
         Endpoint::pending_from_bootstrap(&self.bootstrap(1), self.paths[1].clone()).unwrap()
     }
+    /// Make Mac 1 log-backed: it signs the vault's membership genesis, and Mac 2 holds that
+    /// genesis's records, as the log enrollment tests here found theirs.
+    pub(crate) fn found_log(&self) {
+        client::test_sign_genesis(
+            &self.paths[0],
+            &self.root.path().join("membership.genesis"),
+            &self.signer,
+        )
+        .unwrap();
+        let seed = client::load_records(&self.paths[0]).unwrap().encode();
+        client::save_records(&self.paths[1], &seed).unwrap();
+    }
     pub(crate) fn exchange(&self, peer: &Endpoint) -> (Result<Report>, Result<Report>) {
         self.exchange_with(peer, &mut Repair::default())
     }
@@ -510,9 +522,18 @@ fn enrollment_serve_clears_cached_peer_round_before_checking_enrollment() {
         None,
         "a failed enrollment after a cached peer round must not report the cached round's authentication"
     );
-    assert_eq!(repair.phase(), Phase::Membership);
+    // PF4: the lease is a grant, so the enrollment check runs before it. A refused candidate is
+    // refused at peer admission and is handed nothing of the cached round, which stays cached.
+    assert_eq!(repair.phase(), Phase::PeerAdmission);
     assert!(repair.application().is_none());
-    assert_eq!(repair.cursor, Some([9; 32]));
+    assert_eq!(repair.cursor, None, "the refused enrollment leased nothing");
+    let mut next = Repair::default();
+    drop(owner.peers.acquire(peer_actor, &mut next).unwrap());
+    assert_eq!(
+        next.cursor,
+        Some([9; 32]),
+        "the cached round outlives a refused enrollment"
+    );
 }
 
 #[test]

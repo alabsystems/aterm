@@ -1278,13 +1278,15 @@ impl<M: Machine> Core<M> {
         if self.jobs.is_empty() {
             return "the agent said hello; no start job runs".into();
         }
-        let jobs = self
-            .jobs
-            .iter()
-            .map(|j| format!("{} {} ({} s)", j.unit, j.state, j.elapsed_ms / 1000))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("start jobs: {jobs}")
+        use std::fmt::Write as _;
+        let mut out = String::from("start jobs: ");
+        for (i, j) in self.jobs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{} {} ({} s)", j.unit, j.state, j.elapsed_ms / 1000);
+        }
+        out
     }
 
     #[cfg_attr(

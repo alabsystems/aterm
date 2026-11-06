@@ -4,6 +4,42 @@
 use super::*;
 use std::cell::RefCell;
 
+#[test]
+fn mesh_node_hosts_local_fabric_without_swarm_or_membership() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let config = tmp.path().join("aterm.toml");
+    std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+    assert!(
+        sync_gate_with_mesh(&state, Some(&config), false, true)
+            .unwrap()
+            .is_none()
+    );
+    // Negative controls: old policy refuses both swarm off and missing membership.
+    assert!(
+        sync_gate_with_mesh(&state, Some(&config), false, false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sync_gate_with_mesh(&state, None, false, false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sync_gate_with_mesh(&state, None, true, true)
+            .unwrap()
+            .is_some()
+    );
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    std::fs::write(state.join(NODE_OFF_FILE), "").unwrap();
+    assert!(
+        sync_gate_with_mesh(&state, None, false, true)
+            .unwrap()
+            .is_some()
+    );
+}
+
 type Release = (u64, u64, u64);
 
 struct FakeSupervisor {

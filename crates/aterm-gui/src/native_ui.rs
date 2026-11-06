@@ -1487,6 +1487,13 @@ pub(crate) struct TextViewportSpec {
     /// A table's grid face, drawn in place of `projection` (which is then `None`); boxed, as
     /// the face most viewports never draw.
     pub(crate) grid: Option<Box<crate::native_editor::GridProjection>>,
+    /// What the window's readers other than the person's eyes (its accessibility tree) get of
+    /// `grid`: each shown cell whole, a concealed one hidden (`amacs::editor::read_grid`).
+    pub(crate) grid_reading: Option<Box<crate::native_editor::GridReading>>,
+    /// The document conceals cells from every reader but the person's eyes
+    /// (`amacs::store::Concealed`, one-mesh design §4.8): no line of its text is read out, since
+    /// a line holds every column's cell.
+    pub(crate) concealed: bool,
     pub(crate) preedit: String,
     pub(crate) preedit_caret: Option<usize>,
     pub(crate) status: Option<String>,
@@ -4724,6 +4731,8 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
         selectable,
         projection,
         grid,
+        grid_reading,
+        concealed,
         preedit,
         preedit_caret,
         status,
@@ -4753,6 +4762,8 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
     focus_visible.hash(hash);
     action.hash(hash);
     grid.hash(hash);
+    grid_reading.hash(hash);
+    concealed.hash(hash);
     let Some(projection) = projection.as_ref() else {
         0_u8.hash(hash);
         return;
@@ -8090,7 +8101,7 @@ fn paint_text_viewport(
 
 /// The grid slot (body row) of each part of a grid face in `geometry`: the pinned header is
 /// slot 0, the data rows follow, then the panel's label and its lines.
-fn editor_grid_slots(
+pub(crate) fn editor_grid_slots(
     geometry: &TextViewportGeometry,
     grid: &crate::native_editor::GridProjection,
 ) -> (usize, usize) {
@@ -8227,25 +8238,6 @@ pub(crate) fn editor_grid_cell_at(
         .find(|shown| cells >= shown.x && cells < shown.x + shown.width + 2)?
         .index;
     Some((record, column))
-}
-
-/// What a screen reader hears for a grid's current cell: its row, its header and its value.
-pub(crate) fn editor_grid_cell_words(grid: &crate::native_editor::GridProjection) -> String {
-    let cursor = &grid.cursor;
-    let header = amacs::table::first_line(&cursor.header);
-    let column = if header.trim().is_empty() || cursor.record == 0 {
-        format!("column {}", cursor.column + 1)
-    } else {
-        header.to_string()
-    };
-    let value = if cursor.missing {
-        "no cell".to_string()
-    } else if cursor.value.is_empty() {
-        "empty".to_string()
-    } else {
-        cursor.value.clone()
-    };
-    format!("Row {}, {column}: {value}", cursor.record + 1)
 }
 
 /// Paint a table's grid face in the body of a viewport: the pinned header band, the rows with
@@ -11770,6 +11762,8 @@ pub(crate) mod tests {
                     ],
                 }),
                 grid: None,
+                grid_reading: None,
+                concealed: false,
                 preedit: "λ".to_string(),
                 preedit_caret: None,
                 status: Some("Saved".to_string()),
@@ -11811,6 +11805,8 @@ pub(crate) mod tests {
                 }],
             }),
             grid: None,
+            grid_reading: None,
+            concealed: false,
             preedit: String::new(),
             preedit_caret: None,
             status: None,
@@ -12077,10 +12073,14 @@ pub(crate) mod tests {
         assert_eq!(
             TextViewportSpec {
                 grid: None,
+                grid_reading: None,
+                concealed: false,
                 ..moved.clone()
             },
             TextViewportSpec {
                 grid: None,
+                grid_reading: None,
+                concealed: false,
                 ..spec.clone()
             },
             "premise: only the grid differs"

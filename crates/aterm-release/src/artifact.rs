@@ -49,6 +49,15 @@ pub struct SliceRecord {
     /// older records or on hosts without resource accounting, never inferred.
     #[serde(default)]
     pub cpu_ns: Option<u64>,
+    /// The units Cargo found fresh and built, and the bytes the built ones wrote
+    /// ([`crate::buildplan::Units`]); absent in older records or where the messages could not
+    /// be read, never inferred.
+    #[serde(default)]
+    pub units_fresh: Option<u64>,
+    #[serde(default)]
+    pub units_compiled: Option<u64>,
+    #[serde(default)]
+    pub output_bytes: Option<u64>,
 }
 
 /// A complete build: what it was built as, from and with, and the digests of what it made.
@@ -418,6 +427,9 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
                 secs: s.secs,
                 peak_bytes: s.peak_bytes,
                 cpu_ns: s.cpu_ns,
+                units_fresh: s.units.map(|u| u.fresh),
+                units_compiled: s.units.map(|u| u.compiled),
+                output_bytes: s.units.map(|u| u.output_bytes),
             })
             .collect(),
         index_hint,

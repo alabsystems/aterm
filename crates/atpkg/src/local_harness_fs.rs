@@ -69,7 +69,7 @@ pub(super) fn regular(parent: &File, name: &OsStr) -> io::Result<File> {
     regular_with_meta(parent, name).map(|(f, _)| f)
 }
 fn sync_dir(file: &File) -> io::Result<()> {
-    aterm_durable::refusal_accepted(aterm_dirfd::fsync(file).map_err(io::Error::from))
+    aterm_durable::refusal_accepted(aterm_durable::primitive::fsync(file))
 }
 
 /// The prefix chain, store and program are retained independently of their names.

@@ -736,7 +736,13 @@ fn gone_past(
     }
 }
 
-const CRUISE_AFTER_WALL_MS: i64 = 4 * 60_000 + PERSISTENCE_GRACE_MS + 60_000;
+/// How long after what went on past W8's wall Cruise's own act may come where the loop named no
+/// back-off for it: the ladder's step for `streak`, the short turns in a row the act the wall cut
+/// was typed on, which nothing past the wall adds to ([`sysmsg::streak_kept`]; the ladder's cap
+/// where that is unread), [`PERSISTENCE_GRACE_MS`], and a minute for the reply.
+fn cruise_after_wall_ms(streak: Option<u32>) -> i64 {
+    next_step_ms(streak.unwrap_or(u32::MAX), false) + PERSISTENCE_GRACE_MS + 60_000
+}
 
 /// The first short-turn back-off journaled after `tg`: its due (unix ms) and its line.
 pub(super) fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
@@ -750,13 +756,6 @@ pub(super) fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
             let due = crate::workers::iso_ms(rest.split_whitespace().next()?)?;
             Some((due, l.as_str()))
         })
-}
-
-/// Whether the back-off Cruise's act waits after W8's wall (`line`) is the chain's two short
-/// turns': the done claim's and the done check's the wall cut. What went on past the wall is the
-/// wall's, paced by its reset, and no short turn of the streak.
-fn wall_streak(line: &str) -> bool {
-    line.contains(" 2 short turn(s) in a row: ")
 }
 
 /// Returns the timestamp of Cruise's first act after the stub's wall was raised.
@@ -779,8 +778,12 @@ pub(super) fn cruise_went_on(seen: &Seen) -> Option<i64> {
         .map(|(t, _)| *t)
 }
 
-/// Judges `--mode wall-cruise`: a usage wall encountered and resumed under Cruise; Cruise's act
-/// after it waits the chain's two short turns' back-off ([`wall_streak`]).
+/// Judges `--mode wall-cruise`: a usage wall encountered and resumed under Cruise. Past what went
+/// on, the short streak stands at the one the act the wall cut was typed on: the cut act, the
+/// vendor's own continuation that delivers it and the loop's resume add nothing
+/// ([`sysmsg::streak_kept`], v6 §14.17.5.7). Cruise's act after it comes by the due of the
+/// back-off the loop named there and [`PERSISTENCE_GRACE_MS`] (none named: within
+/// [`cruise_after_wall_ms`]).
 pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict {
     let Some((raised, reset_s)) = seen.cover.wall else {
         return Verdict::Unobserved(
@@ -855,16 +858,25 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
         Err(v) => return v,
     };
     let said = format!("{said}; nothing typed into it; {gone}");
+    let cruise = seen
+        .all_acts()
+        .into_iter()
+        .find(|(t, l)| *t > tg && act_rule(l) != Some(turn_end::RULE_LIMIT_RESUME))
+        .map(|(t, l)| (*t, act_rule(l).unwrap_or("?")));
+    let next = cruise.map_or(i64::MAX, |(tc, _)| tc);
+    // A want it could not read is decided last, so it never hides another's fault.
+    let (said, unread) = match sysmsg::streak_kept(seen, t1, (tg, "the going on", next), t0) {
+        Ok(kept) => (format!("{said}{kept}"), None),
+        Err(sysmsg::LandOn::Fault(why)) => {
+            return Verdict::Fail(format!("{said}; THE STREAK AFTER THE WALL: {why}"));
+        }
+        Err(sysmsg::LandOn::Unwatched(why)) => (said, Some(why)),
+    };
     let backoff = named_backoff(seen, tg);
-    if let Some((_, line)) = backoff.filter(|(_, l)| !wall_streak(l)) {
-        return Verdict::Fail(format!(
-            "{said}; THE STREAK AFTER THE WALL is not the chain's two short turns (the done claim, the done check the wall cut): {}",
-            crate::util::one_line(line, 120)
-        ));
-    }
-    let deadline = backoff.map_or(tg + CRUISE_AFTER_WALL_MS, |(due, _)| {
-        due + PERSISTENCE_GRACE_MS
-    });
+    let deadline = backoff.map_or_else(
+        || tg + cruise_after_wall_ms(sysmsg::typed_on(seen, t1).map(|(_, n)| n)),
+        |(due, _)| due + PERSISTENCE_GRACE_MS,
+    );
     let named = backoff.map_or_else(
         || "no back-off named".to_string(),
         |(due, l)| {
@@ -877,11 +889,6 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
             )
         },
     );
-    let cruise = seen
-        .all_acts()
-        .into_iter()
-        .find(|(t, l)| *t > tg && act_rule(l) != Some(turn_end::RULE_LIMIT_RESUME))
-        .map(|(t, l)| (*t, act_rule(l).unwrap_or("?")));
     let Some((tc, rule)) = cruise else {
         if seen.end_ms >= deadline {
             return Verdict::Fail(format!(
@@ -910,11 +917,15 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
             at(t0, tc)
         ));
     }
-    Verdict::Pass(format!(
+    let said = format!(
         "{said}; Cruise went on: {rule} at +{} ({} after; {named}), ledgered; never DONE",
         at(t0, tc),
         at(tg, tc)
-    ))
+    );
+    match unread {
+        Some(why) => Verdict::Unobserved(format!("{said}; {why}")),
+        None => Verdict::Pass(said),
+    }
 }
 
 /// Judges `--mode wall-relaunch`: an agent relaunched in the same tab under a standing usage wall.

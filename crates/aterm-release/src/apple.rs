@@ -655,13 +655,12 @@ fn installed_leaf_pem(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
 
 /// The selection, pure over the captured stream so it is testable without a keychain.
 fn leaf_pem_by_sha1(text: &str, sha1: &str) -> Option<String> {
-    let want = sha1.to_ascii_lowercase();
-    let mut current: Option<String> = None;
+    let mut current: Option<&str> = None;
     let mut block = String::new();
     let mut in_block = false;
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("SHA-1 hash:") {
-            current = Some(rest.trim().to_ascii_lowercase());
+            current = Some(rest.trim());
             continue;
         }
         if line.starts_with("-----BEGIN CERTIFICATE-----") {
@@ -674,7 +673,7 @@ fn leaf_pem_by_sha1(text: &str, sha1: &str) -> Option<String> {
         }
         if line.starts_with("-----END CERTIFICATE-----") {
             in_block = false;
-            if current.as_deref() == Some(want.as_str()) {
+            if current.is_some_and(|cur| cur.eq_ignore_ascii_case(sha1)) {
                 return Some(std::mem::take(&mut block));
             }
         }

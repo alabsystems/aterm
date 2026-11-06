@@ -44,6 +44,7 @@ mod machines;
 mod manifest_out;
 mod service_qualification;
 
+mod profile_pilot;
 mod provision;
 mod publish;
 
@@ -51,6 +52,7 @@ mod release;
 mod release_keychain;
 mod release_status;
 mod release_steps;
+mod release_timeline;
 
 mod sign;
 mod source_signing;

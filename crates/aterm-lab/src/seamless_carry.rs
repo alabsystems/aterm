@@ -34,11 +34,12 @@ use std::path::Path;
 
 /// The sentinels (`QZP6SECRET<n>`, any case) `bytes` holds, by their digit.
 pub(crate) fn sentinels(bytes: &[u8]) -> Vec<u8> {
-    let low = bytes.to_ascii_lowercase();
     let needle = b"qzp6secret";
-    let mut out: Vec<u8> = low
+    let mut out: Vec<u8> = bytes
         .windows(needle.len() + 1)
-        .filter(|w| w.starts_with(needle) && w[needle.len()].is_ascii_digit())
+        .filter(|w| {
+            w[..needle.len()].eq_ignore_ascii_case(needle) && w[needle.len()].is_ascii_digit()
+        })
         .map(|w| w[needle.len()] - b'0')
         .collect();
     out.sort_unstable();

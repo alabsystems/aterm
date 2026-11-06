@@ -505,7 +505,9 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
         TallyRow::SetPostPin => "of the dir's: a post's reservation (`set_post_pin`)",
         TallyRow::SetInFlight => "of the dir's: a self-lane post's entry (`set_in_flight`)",
         TallyRow::ClearInFlight => "of the dir's: an entry's removal alone (`clear_in_flight`)",
-        TallyRow::ClearPostSeq => "of the dir's: posts settled (`settle_posts`, `clear_post_seq`)",
+        TallyRow::ClearPostSeq => {
+            "of the dir's: posts and owed receipts settled (`settle_posts`, `clear_post_seq`)"
+        }
         TallyRow::AppendSelfAcked => "of the dir's: the landed offset (`append_self_acked`)",
         TallyRow::LogpinFence => "of the dir's: the mirror pin's fence, once an open (`logpin`)",
         TallyRow::WakeEvent => "wake: an aterm event queued while the loop was parked",

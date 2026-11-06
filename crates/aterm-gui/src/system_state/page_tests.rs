@@ -151,6 +151,66 @@ fn a_wait_aterm_ends_by_itself_shows_its_dots_and_its_reason() {
 }
 
 #[test]
+fn incomplete_or_unread_repositories_never_give_developer_a_green_check() {
+    for standing in [Standing::Differs, Standing::Waiting, Standing::Unknown] {
+        let mut status = status_of("set-up");
+        let repositories = status
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Setting(Setting::Repositories))
+            .unwrap();
+        repositories.standing = standing;
+        repositories.now = (standing != Standing::Unknown).then(|| "0 of 3".to_owned());
+        repositories.wanted = "All 3".to_owned();
+        repositories.note = Some("Waiting for repository metadata from the Secrets vault".into());
+        let app = reading(&status);
+        let developer = line_of(&app, Line::Developer);
+        assert_ne!(developer.mark, Mark::Done, "{standing:?}: {developer:?}");
+        let (rows, _, hero) = drawn(&app);
+        assert!(hero.done < hero.total, "{standing:?}: {rows:?}");
+    }
+    // A fully read and completed inventory still earns the check.
+    assert_eq!(
+        line_of(&reading(&status_of("set-up")), Line::Developer).mark,
+        Mark::Done
+    );
+}
+
+#[test]
+fn required_dependency_fixture_keeps_zero_ready_visibly_unfinished_without_a_token_action() {
+    let status = status_of("required-dependencies@developer");
+    let app = reading(&status);
+    let developer = line_of(&app, Line::Developer);
+    assert_eq!(developer.mark, Mark::NeedsYou);
+    let row = row_view(
+        Subject::Setting(Setting::Repositories),
+        &status,
+        Selection::all(),
+    );
+    assert_eq!(
+        row.value,
+        RowValue::Change {
+            now: "0 of 1".into(),
+            wanted: "All 1".into()
+        }
+    );
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert!(!row.copy_command && !row.install_tools);
+    assert!(
+        row.note
+            .as_deref()
+            .is_some_and(|note| note.contains("~/project/vendor/library"))
+    );
+    assert!(!row.label.contains("Needs sign-in"));
+    let (_, _, hero) = drawn(&app);
+    assert!(hero.done < hero.total);
+    assert_eq!(
+        fixture_line("required-dependencies@developer"),
+        Some(Line::Developer)
+    );
+}
+
+#[test]
 fn what_needs_you_is_pinned_in_the_card_once_and_the_headline_says_so() {
     let app = reading(&status_of("needs-you"));
     let (lines, card, hero) = drawn(&app);

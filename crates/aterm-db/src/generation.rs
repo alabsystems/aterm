@@ -74,9 +74,10 @@ fn fail() -> Error {
 // custody. Neither it nor the child link is removed by recovery. Empty staging
 // directories do not fence an original writer whose reservation was refused.
 fn fenced(paths: &Paths) -> Result<bool> {
+    let root = root(paths);
     for path in [
-        root(paths).join(FENCE),
-        root(paths).join(STATE),
+        root.join(FENCE),
+        root.join(STATE),
         candidate(paths).dir.join(LINK),
     ] {
         if fsx::read_private(&path, MAX_STATE)
@@ -227,18 +228,14 @@ fn claims(paths: &Paths) -> Result<Vec<(Region, Digest, Vec<u8>)>> {
                 continue;
             };
             let id = crate::database::decode_hex(name)?;
-            if !name
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                || out.len() >= 128
-            {
+            if out.len() >= 128 {
                 return Err(fail());
             }
             let bytes = judged.read(file_name, 4096).map_err(|_| fail())?;
             out.push((region, id, bytes));
         }
     }
-    out.sort_by_key(|(region, id, _)| (*region == Region::Recovery, *id));
+    out.sort_unstable_by_key(|(region, id, _)| (*region == Region::Recovery, *id));
     Ok(out)
 }
 fn seal(paths: &Paths) -> Result<Digest> {
@@ -1085,13 +1082,12 @@ fn reserve_until(
     ] {
         aterm_journal::create_private_dir_durable(&path)?;
     }
-    let link = selection.bytes();
-    fsx::write_new(&next.dir.join(LINK), &link, 0o600).map_err(crate::table::failure)?;
+    fsx::write_new(&next.dir.join(LINK), &reservation, 0o600).map_err(crate::table::failure)?;
     if fsx::read_private(&next.dir.join(LINK), MAX_STATE)
         .map_err(crate::table::failure)?
         .as_ref()
         .map(|v| v.as_slice())
-        != Some(link.as_slice())
+        != Some(reservation.as_slice())
     {
         return Err(fail());
     }
@@ -1132,7 +1128,7 @@ fn import_until(
     let directory = Directory::new(&next, bootstrap.trust());
     let mut retained = claims(&selection.original)?;
     let catalog = directory.catalog_scope();
-    retained.sort_by_key(|(_, id, _)| (*id != catalog.digest(), *id));
+    retained.sort_unstable_by_key(|(_, id, _)| (*id != catalog.digest(), *id));
     if !retained
         .iter()
         .any(|(region, id, _)| *region == Region::Primary && *id == catalog.digest())

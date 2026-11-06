@@ -10,6 +10,9 @@ fn description(name: &str) -> String {
     match name {
         "gh_access_token" => Want::Gh(GhProfile::Dev).title(),
         "gh_access_token_alabsystems" => Want::Gh(GhProfile::Release).title(),
+        "github-repositories.json" => {
+            "Private development account and repository inventory for automatic setup".into()
+        }
         NOTARY_ENTRY => Want::Notary.title(),
         SITE_DEPLOYER_KEY_ENTRY => Want::SiteDeployerKey.title(),
         "~/.aterm/release-credentials.toml" | "~/.aterm/release-ring/release-credentials.toml" => {

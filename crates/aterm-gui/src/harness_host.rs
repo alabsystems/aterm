@@ -3143,7 +3143,7 @@ pub(crate) enum AccountsSaid {
         credits: Vec<String>,
         /// The week's line: accounts whose week is nearly used with no credits.
         window_full: Vec<(String, String)>,
-        /// The due line: renewable logins due or ended (`accounts::renew_due`), which the upkeep renews by itself.
+        /// The due line: renewable logins still on this Mac due or ended (`accounts::due_logins_here`), which the upkeep renews by itself.
         due: Vec<String>,
         /// The warning that no renewable login is left working within a day (`accounts::none_working_within`).
         none_soon: bool,
@@ -3210,7 +3210,9 @@ impl AccountsSaid {
             signed_out: open(accounts::signed_out(roster, state, &enrolled, now)),
             credits: accounts::credits_noted(roster, state, now),
             window_full: accounts::windows_full(roster, state, now),
-            due: open(accounts::renew_due(roster, logins, state, &enrolled, now)),
+            due: open(accounts::due_logins_here(
+                roster, logins, state, &enrolled, now,
+            )),
             none_soon: accounts::none_working_within(
                 roster,
                 logins,
@@ -3272,7 +3274,7 @@ impl From<&accounts::Clock> for ClockSaid {
 pub(crate) struct PoolSaid {
     /// The CLI.
     pub(crate) cli: accounts::Cli,
-    /// Its renewable logins due or ended (`accounts::renew_due`).
+    /// Its renewable logins still on this Mac due or ended (`accounts::due_logins_here`).
     pub(crate) due: Vec<String>,
     /// Its renewals that answered another account (`accounts::wrong_accounts`).
     pub(crate) wrong: Vec<String>,
@@ -21733,7 +21735,13 @@ fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
             let logins = records.logins;
             let said = PoolSaid {
                 cli: pool.cli,
-                due: accounts::renew_due(&roster, &logins, &pool.state, &pool.enrolled, seat.now),
+                due: accounts::due_logins_here(
+                    &roster,
+                    &logins,
+                    &pool.state,
+                    &pool.enrolled,
+                    seat.now,
+                ),
                 wrong: accounts::wrong_accounts(&roster, &logins),
                 sign_in: accounts::sign_in_tasks(&records.raw_roster, &logins),
                 asked: aterm_agent::ai::state::named(pool.cli.id(), &settings)

@@ -2163,19 +2163,12 @@ fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool, late: bool) -> S
     let quote = |word: &str| {
         aterm_agent::harness::upgrade::quote(aterm_agent::harness::upgrade::Dialect::Bash, word)
     };
-    // The native route's shell block names the owned physical helper, not the vendor
-    // command it obtains from the issuer. The actual resumed PID/argv were checked above.
-    // Physical: the image's canonical path (`Image::at`), which differs from the test's own
-    // spelling of it when the target directory is reached through a symlink (a release
-    // clone's `target -> target.noindex`).
-    let physical = std::fs::canonicalize(harness::aterm()).expect("the aterm under test");
+    // The native route's shell block names the owned physical helper (`Image::at`'s canonical
+    // path, which `harness::aterm()` is too), not the vendor command it obtains from the
+    // issuer. The actual resumed PID/argv were checked above.
     let helper = format!(
         "{} {} {} {}",
-        quote(
-            physical
-                .to_str()
-                .expect("the aterm under test at a UTF-8 path")
-        ),
+        quote(harness::aterm()),
         quote("harness"),
         quote("native-launch"),
         quote("contract=1")

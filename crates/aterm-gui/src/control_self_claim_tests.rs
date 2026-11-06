@@ -275,7 +275,7 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
             moved.elapsed() < std::time::Duration::from_secs(60),
             "hang: the claim never moved"
         );
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(FencedWrite::enter(&ctx, host, now).is_err());
     assert!(
@@ -4236,7 +4236,7 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
                     Instant::now() < deadline,
                     "hang: the claim was never cleared"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
         }
     }

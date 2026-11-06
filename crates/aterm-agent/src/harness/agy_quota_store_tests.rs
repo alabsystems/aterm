@@ -958,6 +958,7 @@ fn a_profile_with_its_grant_reads_as_before() {
     assert!(ran.exists(), "the read ran agy");
 }
 
+#[cfg(unix)]
 fn token_for(store: &Store) -> provider_read::Use {
     provider_read::Use::fixture(provider_read::Read::AgyUsage, Path::new(&store.key), None)
 }
@@ -985,6 +986,7 @@ fn model_rig(tag: &str) -> (aterm_tempfile::TempDir, Agy, Store, PathBuf) {
     (dir, agy, store, marker)
 }
 
+#[cfg(unix)]
 fn agy_probe(why: provider_read::InUse) -> provider_read::ProbeEvent {
     provider_read::ProbeEvent {
         at: NOW,

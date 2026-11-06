@@ -556,7 +556,7 @@ fn an_export_nobody_takes_leaves_nothing_on_disk() {
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !exited.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < deadline
     {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(
         exited.load(std::sync::atomic::Ordering::Acquire),

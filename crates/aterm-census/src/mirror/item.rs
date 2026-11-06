@@ -18,8 +18,6 @@
 //! item `#[cfg]`'d out or moved under another `impl` is not the item proved. An item inside test
 //! code (`#[cfg(test)]`, `mod tests`) or a `macro_rules!` is never the one a path names.
 
-use std::collections::BTreeMap;
-
 use crate::lex::{SpanKind, lex, spans};
 
 /// The keywords that open an item a path can name.
@@ -50,18 +48,24 @@ struct Tokens {
 impl Tokens {
     fn of(src: &str) -> Self {
         let text = lex(src).text;
-        let literals: BTreeMap<usize, usize> = spans(src)
+        let literals: Vec<(usize, usize)> = spans(src)
             .into_iter()
             .filter(|s| s.kind != SpanKind::Comment)
             .map(|s| (s.start, s.end))
             .collect();
         let b = text.as_bytes();
         let mut out = Vec::new();
+        let mut lit_at = 0;
         let mut i = 0;
         while i < b.len() {
-            if let Some(&end) = literals.get(&i) {
+            while lit_at < literals.len() && literals[lit_at].0 < i {
+                lit_at += 1;
+            }
+            if lit_at < literals.len() && literals[lit_at].0 == i {
+                let end = literals[lit_at].1;
                 out.push((i, end));
                 i = end;
+                lit_at += 1;
                 continue;
             }
             let c = b[i];
@@ -432,6 +436,67 @@ fn item_start(t: &Tokens, k: usize) -> usize {
     s
 }
 
+/// A Rust file tokenized and block-indexed once so multiple items can be extracted without
+/// re-lexing the file.
+pub struct ParsedFile {
+    t: Tokens,
+    blocks: Vec<Block>,
+}
+
+impl ParsedFile {
+    /// Tokenizes `src` and indexes its `{ … }` blocks.
+    #[must_use]
+    pub fn of(src: &str) -> Self {
+        let t = Tokens::of(src);
+        let blocks = blocks(&t);
+        Self { t, blocks }
+    }
+
+    /// The tokens of the item `path` names in this file.
+    ///
+    /// # Errors
+    /// As [`item_tokens`].
+    pub fn item_tokens(&self, path: &str) -> Result<String, String> {
+        let (quals, name) = split_path(path);
+        let t = &self.t;
+        let blocks = &self.blocks;
+        let mut found = Vec::new();
+        for k in 0..t.len() {
+            let kw = t.tok(k);
+            if !ITEM_KEYWORDS.contains(&kw) || t.tok(k + 1) != name {
+                continue;
+            }
+            let before = k.checked_sub(1).map_or("", |p| t.tok(p));
+            if matches!(kw, "const" | "static") && matches!(before, "<" | ",") {
+                continue;
+            }
+            let enclosing: Vec<&Block> = blocks
+                .iter()
+                .filter(|b| b.open < k && k < b.close)
+                .collect();
+            if enclosing.iter().any(|b| b.shut) || !qualifiers_hold(&quals, &enclosing) {
+                continue;
+            }
+            let Some(end) = item_end(t, kw, k) else {
+                continue;
+            };
+            let mut out: Vec<&str> = Vec::new();
+            for b in enclosing.iter().filter(|b| !b.names.is_empty()) {
+                out.extend(t.normal(b.head, b.open));
+            }
+            out.extend(t.normal(item_start(t, k), end));
+            found.push(out.join(" "));
+        }
+        match found.len() {
+            1 => Ok(found.remove(0)),
+            0 => Err(format!("no item `{name}` answers to `{path}`")),
+            n => Err(format!(
+                "{n} items answer to `{path}`: qualify it (`Type::{name}`, `module::{name}`)"
+            )),
+        }
+    }
+}
+
 /// The tokens of the item `path` names in `src` ([module docs](self)): the heads of the
 /// `impl`, `mod` and `trait` blocks around it, then the item, one space apart.
 ///
@@ -442,43 +507,7 @@ fn item_start(t: &Tokens, k: usize) -> usize {
 /// # Errors
 /// When no item, or more than one, answers to `path` outside test code and macros.
 pub fn item_tokens(src: &str, path: &str) -> Result<String, String> {
-    let (quals, name) = split_path(path);
-    let t = Tokens::of(src);
-    let blocks = blocks(&t);
-    let mut found = Vec::new();
-    for k in 0..t.len() {
-        let kw = t.tok(k);
-        if !ITEM_KEYWORDS.contains(&kw) || t.tok(k + 1) != name {
-            continue;
-        }
-        let before = k.checked_sub(1).map_or("", |p| t.tok(p));
-        if matches!(kw, "const" | "static") && matches!(before, "<" | ",") {
-            continue;
-        }
-        let enclosing: Vec<&Block> = blocks
-            .iter()
-            .filter(|b| b.open < k && k < b.close)
-            .collect();
-        if enclosing.iter().any(|b| b.shut) || !qualifiers_hold(&quals, &enclosing) {
-            continue;
-        }
-        let Some(end) = item_end(&t, kw, k) else {
-            continue;
-        };
-        let mut out: Vec<&str> = Vec::new();
-        for b in enclosing.iter().filter(|b| !b.names.is_empty()) {
-            out.extend(t.normal(b.head, b.open));
-        }
-        out.extend(t.normal(item_start(&t, k), end));
-        found.push(out.join(" "));
-    }
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(format!("no item `{name}` answers to `{path}`")),
-        n => Err(format!(
-            "{n} items answer to `{path}`: qualify it (`Type::{name}`, `module::{name}`)"
-        )),
-    }
+    ParsedFile::of(src).item_tokens(path)
 }
 
 /// The names of `src`'s items outside test code and macros, in file order, each once: what a

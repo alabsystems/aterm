@@ -180,30 +180,59 @@ impl Met {
     }
 }
 
-/// Writes `met` to the outcome file `path` names ([`OUTCOME_ENV`]), where `path` is absolute;
-/// a file that cannot be written is left, since the opener's exit still says it failed.
+/// Atomically publishes a terminal failed opener's `met` at absolute `path` ([`OUTCOME_ENV`]).
+/// A file that cannot be written is left, since the opener's exit still says it failed.
 pub fn write_outcome(path: &Path, met: &Met) {
+    write_outcome_phase(path, met, OutcomePhase::Failed);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutcomePhase {
+    Continuing,
+    Failed,
+}
+
+fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
     if !path.is_absolute() {
         return;
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    if let Ok(mut file) = opts.open(path)
-        && file.metadata().is_ok_and(|m| m.is_file())
-    {
-        let _ = writeln!(file, "{}", met.line());
-    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (met, phase);
+    #[cfg(any(unix, windows))]
+    let _ = aterm_uds::atomic_file::write_checked(
+        path,
+        format!(
+            "opener-outcome=1\nphase={}\nmet={}\n",
+            match phase {
+                OutcomePhase::Continuing => "continuing",
+                OutcomePhase::Failed => "failed",
+            },
+            met.line()
+        )
+        .as_bytes(),
+        0o600,
+        || match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(std::io::Error::other("outcome is not a regular file")),
+        },
+    );
 }
 
 /// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes).
 #[must_use]
 pub fn read_outcome(path: &Path) -> Option<Met> {
+    read_outcome_record(path).map(|(_, met)| met)
+}
+
+/// Only an explicit terminal opener failure can stop its still-running provider.
+#[cfg(unix)]
+pub(super) fn read_failed_outcome(path: &Path) -> Option<Met> {
+    read_outcome_record(path)
+        .and_then(|(phase, met)| (phase == OutcomePhase::Failed).then_some(met))
+}
+
+fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Met)> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -218,8 +247,43 @@ pub fn read_outcome(path: &Path) -> Option<Met> {
     }
     let cap = usize::try_from(meta.len().min(256).saturating_add(1)).unwrap_or(0);
     let mut text = String::with_capacity(cap);
-    file.take(256).read_to_string(&mut text).ok()?;
-    Met::parse(&text)
+    file.take(257).read_to_string(&mut text).ok()?;
+    if text.len() > 256 {
+        return None;
+    }
+    let mut lines = text.split('\n');
+    if lines.next()? != "opener-outcome=1" {
+        return None;
+    }
+    let phase = match lines.next()? {
+        "phase=continuing" => OutcomePhase::Continuing,
+        "phase=failed" => OutcomePhase::Failed,
+        _ => return None,
+    };
+    let line = lines.next()?.strip_prefix("met=")?;
+    let met = Met::parse(line)?;
+    if met.line() != line || !lines.next()?.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some((phase, met))
+}
+
+/// A failed headless attempt is diagnostic while the named-profile opener continues.
+fn profile_fallback_outcome(
+    path: Option<&Path>,
+    met: Option<&Met>,
+    open: impl FnOnce() -> (u8, Option<String>),
+) -> (u8, Option<String>) {
+    if let (Some(path), Some(met)) = (path, met) {
+        write_outcome_phase(path, met, OutcomePhase::Continuing);
+    }
+    let result = open();
+    if result.0 != 0
+        && let (Some(path), Some(met)) = (path, met)
+    {
+        write_outcome_phase(path, met, OutcomePhase::Failed);
+    }
+    result
 }
 
 /// The most bytes of Chrome's `Local State` that are read.
@@ -4532,14 +4596,14 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     // What the headless sign-in met, for the renewal that named an outcome file.
-    let note_outcome = || {
-        if let (Some(path), Some(met)) = (
-            std::env::var_os(OUTCOME_ENV).filter(|p| !p.is_empty()),
-            super::headless_oauth::take_met(),
-        ) {
-            write_outcome(Path::new(&path), &met);
+    let outcome_path = std::env::var_os(OUTCOME_ENV).filter(|p| !p.is_empty());
+    let note_outcome = |phase| {
+        let met = super::headless_oauth::take_met();
+        if let (Some(path), Some(met)) = (&outcome_path, &met) {
+            write_outcome_phase(Path::new(path), met, phase);
         }
     };
+    let mut continuing_met = None;
     if let Some(path) = std::env::var_os(INPUT_ENV) {
         let result = match args.as_slice() {
             [url] => with_approved_mailbox(
@@ -4562,7 +4626,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         return match result {
             Ok(()) => ExitCode::from(0),
             Err(why) => {
-                note_outcome();
+                note_outcome(OutcomePhase::Failed);
                 eprintln!("{OPENER}: approved mailbox was not authorized: {why}");
                 ExitCode::from(1)
             }
@@ -4598,11 +4662,12 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             ) {
                 Ok(()) => return ExitCode::from(0),
                 Err(why) => {
-                    note_outcome();
                     if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                        note_outcome(OutcomePhase::Failed);
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }
+                    continuing_met = super::headless_oauth::take_met();
                 }
             }
         } else if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
@@ -4623,7 +4688,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                 ) {
                     Ok(()) => return ExitCode::from(0),
                     Err(why) => {
-                        note_outcome();
+                        note_outcome(OutcomePhase::Failed);
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }
@@ -4644,7 +4709,11 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         Some(text)
     };
     let mut run = |mut cmd: aterm_uds::spawnfd::Command| cmd.status().is_ok_and(|s| s.success());
-    let (code, said) = open_with(&args, profile.as_deref(), &local_state, &mut run);
+    let (code, said) = profile_fallback_outcome(
+        outcome_path.as_deref().map(Path::new),
+        continuing_met.as_ref(),
+        || open_with(&args, profile.as_deref(), &local_state, &mut run),
+    );
     if let Some(said) = said {
         eprintln!("{said}");
     }

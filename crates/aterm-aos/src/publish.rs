@@ -274,8 +274,8 @@ impl fmt::Display for PublishRefusal {
             PublishRefusal::SchemaChanged { live, candidate } => write!(
                 f,
                 "the candidate's schema {} is not the live schema {}",
-                candidate.short(),
-                live.short()
+                candidate.short_display(),
+                live.short_display()
             ),
             PublishRefusal::NotCode { kind } => {
                 write!(f, "the candidate's artifact is of kind {kind:?}, not code")
@@ -283,8 +283,8 @@ impl fmt::Display for PublishRefusal {
             PublishRefusal::ContractMismatch { live, asked } => write!(
                 f,
                 "the boundary's contract {} is not the contract {} the task identity names",
-                asked.short(),
-                live.short()
+                asked.short_display(),
+                live.short_display()
             ),
             PublishRefusal::Entry(e) => write!(f, "the candidate refuses the ancestor state: {e}"),
             PublishRefusal::Restore(r) => write!(f, "the ancestor does not restore: {r}"),
@@ -314,10 +314,10 @@ impl fmt::Display for PublishRefusal {
                 "the live head moved since the candidate was prepared (revision {} cursor {} state {}, now revision {} cursor {} state {})",
                 expected.revision.0,
                 expected.input_cursor,
-                expected.state_digest.short(),
+                expected.state_digest.short_display(),
                 live.revision.0,
                 live.input_cursor,
-                live.state_digest.short()
+                live.state_digest.short_display()
             ),
             PublishRefusal::LineageMismatch => f.write_str(
                 "the live pair, its checkpoint and its log do not descend from one another",
@@ -325,8 +325,8 @@ impl fmt::Display for PublishRefusal {
             PublishRefusal::AncestorMismatch { checkpoint, log } => write!(
                 f,
                 "the log extends checkpoint {}, not the ancestor checkpoint {}",
-                log.short(),
-                checkpoint.short()
+                log.short_display(),
+                checkpoint.short_display()
             ),
             PublishRefusal::WitnessMismatch(part) => {
                 write!(f, "the witness's {part} is not this boundary's own")

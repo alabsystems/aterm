@@ -5,9 +5,13 @@
 //! kind read and applied through the library that owns it, here where `aterm` composes them.
 //!
 //! `sync.fabric` turns on a fabric the person never turned off with `aterm fabric on`'s own steps
-//! ([`aterm_link::enable::turn_on_by_default`]; never under CI), and renews a broker that runs a
-//! build an update replaced, or brings up the job `on` installed where it serves none, with
-//! `on`'s broker step alone ([`aterm_link::enable::renew_replaced_broker`]). `sync.peers` joins
+//! ([`aterm_link::enable::turn_on_by_default_with`]; never under CI), and renews a broker that
+//! runs a build an update replaced, or brings up the job `on` installed where it serves none, with
+//! `on`'s broker step alone ([`aterm_link::enable::renew_replaced_broker_with`]). With the mesh on
+//! (`aterm_types::mesh_switch::MESH`, read once into [`Live`]) it installs, renews and restarts no
+//! broker job: the node service (`systems.alab.aterm-node`) hosts `bus.log` and renews it, and
+//! retires the job an earlier build installed, so the turn-on's steps write no job and the
+//! renewal reads left as it is. `sync.peers` joins
 //! the open ALab vault from the window's pass with System State's own join
 //! ([`aterm_machines::sync::peers`]), on macOS, where System State runs. `sync.shared-data` founds
 //! an open vault's Commons on its only admin ([`aterm_secrets::client::commons_foundable`]).
@@ -37,7 +41,24 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// This Mac, as the converge pass reads and changes it.
-pub(crate) struct Live;
+pub(crate) struct Live {
+    /// Who keeps the fabric's broker (`sync.fabric`): [`aterm_link::enable::Service::Node`] with
+    /// the mesh on, where the node service hosts `bus.log` and the pass installs or renews no
+    /// broker job, else the platform's supervisor; read once ([`Live::here`]).
+    fabric_service: aterm_link::enable::Service,
+}
+
+impl Live {
+    /// The pass as this build runs it: the fabric's broker kept as
+    /// `aterm_types::mesh_switch::MESH` says ([`aterm_link::enable::Service::default_for`]).
+    pub(crate) const fn here() -> Self {
+        Self {
+            fabric_service: aterm_link::enable::Service::default_for(
+                aterm_types::mesh_switch::MESH,
+            ),
+        }
+    }
+}
 
 /// `sync.fabric` on a Mac with no fabric command, as the renewal reads it.
 const FABRIC_OFF: &str = "off: no [fabric] command (`aterm fabric on` turns it on)";
@@ -136,6 +157,65 @@ fn vault_config(
     paths: &aterm_secrets::client::Paths,
 ) -> Result<Option<aterm_secrets::client::Config>, String> {
     aterm_secrets::client::config(paths).map_err(|why| why.to_string())
+}
+
+const REPOSITORIES_SYNCING: &str = "the selected secrets vault changed or is still syncing; repositories wait for a complete version";
+
+/// Repository inputs belong to the current account even when its subscriber has no console.
+/// Capture needs no keyboard, desktop, host inventory or subprocess.
+fn repository_context(
+    sys: &dyn aterm_machines::port::System,
+) -> Result<aterm_machines::items::Ctx, String> {
+    let identity = sys.identity()?;
+    if identity.user.uid != sys.euid() || sys.euid() == 0 {
+        return Err("repository setup must run as its local user, without sudo".into());
+    }
+    Ok(aterm_machines::items::Ctx {
+        facts: aterm_machines::model::HostFacts::default(),
+        users: vec![identity.user],
+        console: None,
+        host_name: String::new(),
+        cache_dir: PathBuf::new(),
+        disrupt: false,
+    })
+}
+
+/// Explicit personal profiles keep their own source. A vault-managed inventory is read only
+/// when that configured vault has admitted and completely materialized this account.
+fn repository_vault(
+    paths: &aterm_secrets::client::Paths,
+    sys: &dyn aterm_machines::port::System,
+    ctx: &aterm_machines::items::Ctx,
+) -> Result<Option<aterm_secrets::client::Config>, String> {
+    if !aterm_machines::init_github::uses_vault_inventory(sys, ctx)? {
+        return Ok(None);
+    }
+    vault_config(paths)
+}
+
+/// A local decision may run git's read-only probes, so it runs outside the materialization
+/// lock. Publish its result only if the complete source version is still the one admitted.
+fn repository_read<T>(
+    paths: &aterm_secrets::client::Paths,
+    config: &aterm_secrets::client::Config,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let Some(captured) = aterm_secrets::client::with_materialization_ready_for_entries(
+        paths,
+        config,
+        &aterm_machines::init_github::VAULT_INPUT_ENTRIES,
+        || Ok(()),
+    )
+    .map_err(|why| why.to_string())?
+    else {
+        return Ok(None);
+    };
+    let value = read()?;
+    Ok(captured
+        .snapshot
+        .is_current(paths)
+        .map_err(|why| why.to_string())?
+        .then_some(value))
 }
 
 /// Local Network as aterm last heard it: a use of it raises no question once macOS asked aterm
@@ -377,8 +457,8 @@ fn own_names() -> OwnNames {
 /// `own`, then the LAN and kernel host names) when `aterm-swarm-roster` has not yet assigned a row
 /// for this Mac.
 fn local_hostnames(own: &OwnNames) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut push = |candidate: Option<String>| {
+    let mut out = Vec::with_capacity(4);
+    let mut push = |candidate: Option<&str>| {
         if let Some(name) = candidate {
             let trimmed = name.trim();
             if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
@@ -386,10 +466,10 @@ fn local_hostnames(own: &OwnNames) -> Vec<String> {
             }
         }
     };
-    push(own.local_host.clone());
-    push(own.computer.clone());
-    push(aterm_uds::process::lan_host_name());
-    push(aterm_uds::process::kernel_host_name());
+    push(own.local_host.as_deref());
+    push(own.computer.as_deref());
+    push(aterm_uds::process::lan_host_name().as_deref());
+    push(aterm_uds::process::kernel_host_name().as_deref());
     out
 }
 
@@ -790,6 +870,27 @@ pub(crate) fn mac_name_label() -> Option<String> {
     }
 }
 
+/// A Mac name still to set, with the repair path the existing naming-rule reading admits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MacNamePending {
+    /// The existing naming rule admits the next automatic repair attempt.
+    ThroughRule(String),
+    /// Setup still needs its one elevation to leave the naming rule.
+    Elevation(String),
+    /// Naming-rule metadata could not be read; no additional password is justified.
+    Unread(String),
+}
+
+impl MacNamePending {
+    fn with_rule(why: String, rule: Option<bool>) -> Self {
+        match rule {
+            Some(true) => Self::ThroughRule(why),
+            Some(false) => Self::Elevation(why),
+            None => Self::Unread(why),
+        }
+    }
+}
+
 /// This Mac's one name as `aterm status` reads it ([`mac_names`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MacName {
@@ -802,7 +903,7 @@ pub(crate) enum MacName {
     Named {
         target: String,
         fleet: aterm_agent::FleetName,
-        pending: Option<String>,
+        pending: Option<MacNamePending>,
     },
 }
 
@@ -831,8 +932,14 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
         roster_gives(roster.as_ref(), label.as_deref(), word)
     })?;
-    let pending =
-        own_name_pending(&target, label.as_deref(), &own).filter(|_| cfg!(target_os = "macos"));
+    let pending = own_name_pending(&target, label.as_deref(), &own)
+        .filter(|_| cfg!(target_os = "macos"))
+        .map(|why| {
+            MacNamePending::with_rule(
+                why,
+                aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new()),
+            )
+        });
     Ok(MacName::Named {
         target,
         fleet,
@@ -860,8 +967,7 @@ pub(crate) fn own_name_pending(
         .find(|(_, name)| *name != Some(label))?;
     let now = now.unwrap_or("unread");
     Some(format!(
-        "this Mac's own name is {now} ({which}), not {label}: only root sets it, so the next \
-         pass sets it through the rule setup's one Mac password leaves, or that password names it"
+        "this Mac's own name is {now} ({which}), not {label}"
     ))
 }
 
@@ -1532,6 +1638,8 @@ impl Ports for Live {
     }
 
     fn node(&self) -> Result<NodeRead, String> {
+        // The node service's mesh gate also covers local fabric hosting without a fleet key;
+        // read and apply share that policy, including CI and the person's explicit node off.
         use aterm_agent::node_service::{SyncNodeState, read_for_sync_with};
         Ok(
             match self.through_node_job(read_for_sync_with, SyncNodeState::NotApplicable)? {
@@ -1772,14 +1880,55 @@ impl Ports for Live {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
-        aterm_machines::init::owed_clone(&aterm_machines::port::Live::new(), &state, &setup_holds())
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        let paths = vault_paths()?;
+        let read = || aterm_machines::init::owed_clone(&sys, &state, &setup_holds());
+        match repository_vault(&paths, &sys, &ctx)? {
+            Some(config) => Ok(repository_read(&paths, &config, read)?.unwrap_or_else(|| {
+                aterm_machines::init::OwedClone::Waiting(REPOSITORIES_SYNCING.into())
+            })),
+            None => read(),
+        }
     }
 
     fn clone_owed(&self) -> Result<String, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
-        aterm_machines::init::clone_owed(&aterm_machines::port::Live::new(), &state)
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        let paths = vault_paths()?;
+        let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
+            return aterm_machines::init::clone_owed(&sys, &state);
+        };
+        let captured = aterm_secrets::client::with_materialization_ready_for_entries(
+            &paths,
+            &config,
+            &aterm_machines::init_github::VAULT_INPUT_ENTRIES,
+            || {
+                aterm_machines::init_github::InitialRepositoryInputs::capture(&sys, &ctx)
+                    .map_err(aterm_secrets::Error::new)
+            },
+        )
+        .map_err(|why| why.to_string())?
+        .ok_or(REPOSITORIES_SYNCING)?;
+        aterm_machines::init::clone_owed_captured(&sys, &state, captured.inputs, move || {
+            // A first clone may take a long time. The person's Stop, repository switch or
+            // profile change must hold every later effect, not just the next sync pass.
+            if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
+                || !aterm_machines::init_github::uses_vault_inventory(
+                    &aterm_machines::port::Live::new(),
+                    &ctx,
+                )?
+            {
+                return Ok(false);
+            }
+            captured
+                .snapshot
+                .is_current(&paths)
+                .map_err(|why| why.to_string())
+        })
     }
 
     fn forget_owed_clone(&self) -> Result<(), String> {
@@ -1827,7 +1976,8 @@ impl Ports for Live {
     fn fabric(&self) -> Result<FabricRead, String> {
         use aterm_link::enable::{BrokerRenewal, Renew};
         Ok(
-            match aterm_link::enable::renew_replaced_broker(Renew::Look)? {
+            match aterm_link::enable::renew_replaced_broker_with(Renew::Look, self.fabric_service)?
+            {
                 BrokerRenewal::Off => fabric_unset(
                     aterm_link::enable::unset_state()?,
                     under_ci(),
@@ -1847,7 +1997,8 @@ impl Ports for Live {
     fn renew_broker(&self) -> Result<String, String> {
         use aterm_link::enable::{BrokerRenewal, Renew};
         Ok(
-            match aterm_link::enable::renew_replaced_broker(Renew::Apply)? {
+            match aterm_link::enable::renew_replaced_broker_with(Renew::Apply, self.fabric_service)?
+            {
                 BrokerRenewal::Renewed(said) => format!("renewed the broker on this build: {said}"),
                 BrokerRenewal::Off => format!("nothing renewed: {FABRIC_OFF}"),
                 BrokerRenewal::Current(now) | BrokerRenewal::Due(now) => {
@@ -1900,11 +2051,13 @@ impl Ports for Live {
         if under_ci() {
             return Ok("nothing turned on: under CI no pass turns the fabric on".to_owned());
         }
-        Ok(match aterm_link::enable::turn_on_by_default()? {
-            ByDefault::TurnedOn(said) => format!("turned the fabric on: {said}"),
-            ByDefault::On => "nothing turned on: the fabric is on".to_owned(),
-            ByDefault::Left(why) => format!("left as it is: {why}"),
-        })
+        Ok(
+            match aterm_link::enable::turn_on_by_default_with(self.fabric_service)? {
+                ByDefault::TurnedOn(said) => format!("turned the fabric on: {said}"),
+                ByDefault::On => "nothing turned on: the fabric is on".to_owned(),
+                ByDefault::Left(why) => format!("left as it is: {why}"),
+            },
+        )
     }
 
     fn peers(&self, look: bool) -> Result<PeersRead, String> {
@@ -1955,6 +2108,75 @@ impl Ports for Live {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repository_read_rejects_incomplete_or_rotated_vault_materialization() {
+        use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        let paths = Paths::for_home(&scratch.path().join("home"));
+        aterm_uds::atomic_file::write(
+            &source,
+            b"gh_access_token=before\ngithub-repositories.json=fixture\nunrelated=before\n",
+            0o600,
+        )
+        .unwrap();
+        client::join(
+            &paths,
+            &JoinOptions {
+                source: source.to_string_lossy().into_owned(),
+                host: Some("fixture".into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        let config = client::config(&paths).unwrap().unwrap();
+        assert_eq!(repository_read(&paths, &config, || Ok(7)).unwrap(), Some(7));
+
+        let unrelated = repository_read(&paths, &config, || {
+            aterm_uds::atomic_file::write(
+                &source,
+                b"gh_access_token=before\ngithub-repositories.json=fixture\nunrelated=after\n",
+                0o600,
+            )
+            .map_err(|why| why.to_string())?;
+            client::sync(&paths, None).map_err(|why| why.to_string())?;
+            Ok(8)
+        })
+        .unwrap();
+        assert_eq!(unrelated, Some(8));
+
+        // This callback can finish a sync: no materialization lock spans read-only git work.
+        // Its earlier decision is discarded when that sync advances the captured version.
+        let rotated = repository_read(&paths, &config, || {
+            aterm_uds::atomic_file::write(
+                &source,
+                b"gh_access_token=after\ngithub-repositories.json=fixture\nunrelated=after\n",
+                0o600,
+            )
+            .map_err(|why| why.to_string())?;
+            client::sync(&paths, None).map_err(|why| why.to_string())?;
+            Ok(8)
+        })
+        .unwrap();
+        assert_eq!(rotated, None);
+        assert_eq!(repository_read(&paths, &config, || Ok(9)).unwrap(), Some(9));
+
+        std::fs::remove_file(paths.home.join(".secrets/gh_access_token")).unwrap();
+        assert_eq!(
+            repository_read(&paths, &config, || -> Result<(), String> {
+                panic!("incomplete materialization must not inspect repository inputs")
+            })
+            .unwrap(),
+            None
+        );
+    }
+
     /// `sync.identity` reads the fleet name beside the `aterm.toml` keys: a fleet name still due
     /// makes the row due even where the keys are current, and the Mac's own names that differ
     /// from the roster's label are recorded, made due only where the rule setup's one Mac
@@ -1978,7 +2200,7 @@ mod tests {
             IdentityRead::Due { from, to } => {
                 assert_eq!(from, "fleet name node-3fa2");
                 assert!(to.contains("fleet name m42"), "{to}");
-                assert!(to.contains("through the rule"), "{to}");
+                assert!(to.contains(own.local_host.as_deref().unwrap()), "{to}");
             }
             other => panic!("{other:?}"),
         }
@@ -2508,8 +2730,14 @@ mod tests {
     #[test]
     fn sync_node_leaves_the_job_alone_outside_the_accounts_own_shell() {
         let why = aterm_types::dirs::not_own_account().expect("a test binary's private root");
-        assert_eq!(Live.node(), Ok(NodeRead::NotApplicable(why.to_owned())));
-        assert_eq!(Live.ensure_node(), Ok(format!("left as it is: {why}")));
+        assert_eq!(
+            Live::here().node(),
+            Ok(NodeRead::NotApplicable(why.to_owned()))
+        );
+        assert_eq!(
+            Live::here().ensure_node(),
+            Ok(format!("left as it is: {why}"))
+        );
     }
 
     /// A window runs where the control socket folder holds a live instance's socket: not a dead

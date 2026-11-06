@@ -4425,9 +4425,68 @@ fn the_excerpts_ride_the_tail_read_and_its_appends() {
         .map(|p| p.text.clone())
         .collect();
     assert_eq!(prompts, ["now the client", "wire the survey"]);
+    let held = cache.excerpts().cloned();
+    let held_len = cache.transcript_len();
+    let mut control = TailCache::default();
+    control.read_since(&path, 4242, Some(start), start).unwrap();
+    let others: Vec<_> = (0..4)
+        .map(|_| {
+            let mut cache = TailCache::default();
+            cache.read_since(&path, 4242, Some(start), start).unwrap();
+            cache
+        })
+        .collect();
+    let unavailable = root.join("temporarily-unavailable.jsonl");
+    std::fs::rename(&path, &unavailable).unwrap();
+    assert!(cache.read_since(&path, 4242, Some(start), start).is_none());
+    assert_eq!(
+        cache.excerpts().cloned(),
+        held,
+        "one failed open keeps the excerpts"
+    );
+    assert_eq!(cache.transcript_len(), held_len);
+    control.clear();
+    assert!(
+        control
+            .read_since(&path, 4242, Some(start), start)
+            .is_none()
+    );
+    assert_ne!(
+        control.excerpts().cloned(),
+        held,
+        "control: discarding prior evidence blanks the row"
+    );
+    let elsewhere = root.join("another-session.jsonl");
+    for (mut other, (path, pid, started, since)) in others.into_iter().zip([
+        (elsewhere.as_path(), 4242, Some(start), start),
+        (path.as_path(), 4243, Some(start), start),
+        (path.as_path(), 4242, Some(start + 1), start),
+        (path.as_path(), 4242, Some(start), start + 1),
+    ]) {
+        assert!(other.read_since(path, pid, started, since).is_none());
+        assert!(
+            other.excerpts().is_none(),
+            "a changed source borrows nothing"
+        );
+        assert_eq!(other.transcript_len(), None);
+    }
+    std::fs::rename(&unavailable, &path).unwrap();
+    cache.read_since(&path, 4242, Some(start), start).unwrap();
+    assert_eq!(cache.excerpts().cloned(), held, "the next open recovers");
     std::fs::remove_file(&path).unwrap();
     assert!(cache.read_since(&path, 4242, Some(start), start).is_none());
-    assert!(cache.excerpts().is_none());
+    assert_eq!(cache.excerpts().cloned(), held);
+    std::fs::write(&path, []).unwrap();
+    cache.read_since(&path, 4242, Some(start), start).unwrap();
+    assert_eq!(
+        cache.excerpts(),
+        Some(&super::super::excerpt::Excerpts::default())
+    );
+    assert_eq!(
+        cache.transcript_len(),
+        Some(0),
+        "a successful empty read replaces old evidence"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

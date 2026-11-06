@@ -14,7 +14,7 @@ use crate::stats_plan::DeckForm;
 use aterm_vitals::Cell;
 use aterm_vitals::explain::{ActivityId, fixtures};
 use aterm_vitals::history::FREE_BUCKET_S;
-use aterm_vitals::model::{Hog, ProcScope, ScopeFig, TopProc, Writer};
+use aterm_vitals::model::{Hog, ProcScope, ScopeFig, TopProc, VolumeSample, Writer};
 
 const LOC: Locale = Locale {
     platform: Platform::MacOs,
@@ -969,8 +969,16 @@ fn each_lens_shows_its_sections() {
     assert!(!now.is_empty(), "{now}");
 }
 
+/// The lens's first line says used, available and total (`docs/DESIGN-stats-deck-flow-
+/// 2026-11-02.md` §4, "On demand"), which nothing in the deck says now that no row captions its
+/// capacity: Memory's Capacity and Disk's Space stay first however short the panel, the Disk's
+/// used figure is its size less what this user can still write with the blocks it keeps back
+/// said after it where they are 1 % of it or more, and the GPU's source line names the device,
+/// its cores and the memory it holds in use. Speech and ⌘C ([`lens_sentence`]) say the same
+/// figures. CONTROL: a volume keeping back under 1 % says no reserve, and a GPU whose in-use
+/// memory is unread names none.
 #[test]
-fn memory_capacity_stays_first_and_gpu_names_measured_allocations_without_a_vram_total() {
+fn the_lens_first_line_says_used_available_and_total() {
     let mut snap = lens_scene(Scene::Calm);
     let m = FaceMetrics::helvetica_neue();
     let memory = snap.mem.as_mut().expect("fixture memory");
@@ -980,14 +988,26 @@ fn memory_capacity_stays_first_and_gpu_names_measured_allocations_without_a_vram
     memory.sample.compressed = Some(4 * (1_u64 << 30));
     memory.sample.cached = 24 * (1_u64 << 30);
     memory.sample.free = 8 * (1_u64 << 30);
+    snap.volume = Some(VolumeSample {
+        total: 4_000_000_000_000,
+        free: 1_700_000_000_000,
+        available: 1_660_000_000_000,
+        mount: "/".into(),
+    });
+    let mem_line = "96.0 GiB used \u{b7} 32.0 GiB available \u{b7} 128 GiB total";
+    let disk_line =
+        "2.34 TB used \u{b7} 1.66 TB available \u{b7} 4.00 TB total \u{b7} 40 GB reserved";
+
     let doc = memory_doc(two_columns(&snap, &m));
     assert!(doc.keeps_first, "capacity must survive a short panel");
     let first = &doc.sections[0];
     assert_eq!(first.name, "Capacity");
-    let capacity = first.words.join(" ");
-    for fact in ["96.0 GiB used", "32.0 GiB available", "128 GiB total"] {
-        assert!(capacity.contains(fact), "missing {fact}: {capacity}");
-    }
+    assert_eq!(first.words.join(" "), mem_line);
+    drop(doc);
+    let doc = disk_doc(two_columns(&snap, &m));
+    assert!(doc.keeps_first, "space must survive a short panel");
+    assert_eq!(doc.sections[0].name, "Space now");
+    assert_eq!(doc.sections[0].words[0], disk_line);
     drop(doc);
 
     let gpu = snap.facts.gpu.as_mut().expect("fixture GPU");
@@ -996,10 +1016,10 @@ fn memory_capacity_stays_first_and_gpu_names_measured_allocations_without_a_vram
     gpu.in_use_bytes = Some(6 * (1_u64 << 30));
     gpu.alloc_bytes = Some(8 * (1_u64 << 30));
     let doc = text_well(two_columns(&snap, &m), Instrument::Gpu);
-    assert!(
-        doc.sources
-            .iter()
-            .any(|s| s.contains("Apple M5 Max") && s.contains("40 cores"))
+    let at = two_columns(&snap, &m).at();
+    assert_eq!(
+        doc.sources[0],
+        format!("Apple M5 Max \u{b7} 40 cores \u{b7} 6.0 GiB in use \u{b7} as of {at}")
     );
     let details = doc
         .sections
@@ -1020,6 +1040,41 @@ fn memory_capacity_stays_first_and_gpu_names_measured_allocations_without_a_vram
     assert!(
         !details.contains("128 GiB GPU"),
         "system RAM is not a dedicated VRAM total: {details}"
+    );
+    drop(doc);
+
+    for (focus, said) in [
+        (
+            Instrument::Memory,
+            "96.0 gibibytes used, 32.0 gibibytes available, 128 gibibytes total",
+        ),
+        (
+            Instrument::Disk,
+            "2.34 terabytes used, 1.66 terabytes available, 4.00 terabytes total, 40 gigabytes \
+             reserved",
+        ),
+        (
+            Instrument::Gpu,
+            "Apple M5 Max, 40 cores, 6.0 gibibytes in use.",
+        ),
+    ] {
+        let spoken = lens_sentence(&snap, focus, &[FRONT], &LOC);
+        assert!(spoken.contains(said), "{focus:?}: {spoken}");
+    }
+
+    // CONTROL: 39 GB kept back of 4 TB is under 1 %; an unread in-use figure goes unsaid.
+    snap.volume.as_mut().expect("volume").free = 1_699_000_000_000;
+    let doc = disk_doc(two_columns(&snap, &m));
+    assert_eq!(
+        doc.sections[0].words[0],
+        "2.34 TB used \u{b7} 1.66 TB available \u{b7} 4.00 TB total"
+    );
+    drop(doc);
+    snap.facts.gpu.as_mut().expect("fixture GPU").in_use_bytes = None;
+    let doc = text_well(two_columns(&snap, &m), Instrument::Gpu);
+    assert_eq!(
+        doc.sources[0],
+        format!("Apple M5 Max \u{b7} 40 cores \u{b7} as of {at}")
     );
 }
 

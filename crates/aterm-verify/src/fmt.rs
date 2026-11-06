@@ -83,7 +83,7 @@ fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
     if !found.unread.is_empty() {
         r.raw(found.unread.join("\n"));
         r.cannot_run(format!(
-            "trustfmt could not read {} file(s) (above)",
+            "trustfmt could not read every file: {} error(s) (above)",
             found.unread.len()
         ));
     }
@@ -337,14 +337,21 @@ fn sweep(ctx: &Ctx, bin: &Path, groups: &[(String, Vec<String>)], write: bool) -
     s
 }
 
-/// `trustfmt [--check] --edition <E> --unstable-features --skip-children <files>`, from the root.
+/// `trustfmt [--check] --edition <E> --unstable-features --skip-children --color never <files>`,
+/// from the root. Uncoloured, so each of its `error` lines starts with `error` and is read as one
+/// ([`read_run`]), its internal ones included.
 #[must_use]
 pub fn trustfmt_cmd(bin: &Path, edition: &str, files: &[String], write: bool) -> Cmd {
     let mut cmd = Cmd::new(bin);
     if !write {
         cmd = cmd.arg("--check");
     }
+    // `read_run` reads the child's lines by their first word (`error`, `Diff in `). Under
+    // verify trustfmt has written them in colour (`\e[1m\e[91merror\e[0m`), which hid every
+    // error behind "read none of N file(s)", so the child is told never to colour them.
     cmd.args([
+        "--color",
+        "never",
         "--edition",
         edition,
         "--unstable-features",
@@ -365,10 +372,22 @@ fn read_run(
         return s;
     }
     let text = out.output.as_str();
-    let errors: Vec<String> = text
-        .lines()
-        .filter(|l| l.starts_with("error"))
-        .map(|l| l.trim_end().to_string())
+    let lines: Vec<&str> = text.lines().collect();
+    // Each error with the `--> <path>:<line>` the formatter puts under it, which names the file.
+    let errors: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("error"))
+        .map(|(i, l)| {
+            let at = lines[i + 1..]
+                .iter()
+                .take(2)
+                .find_map(|next| next.trim_start().strip_prefix("--> "));
+            match at {
+                Some(at) => format!("{} ({})", l.trim_end(), at.trim_end()),
+                None => l.trim_end().to_string(),
+            }
+        })
         .collect();
     if !text.contains(DIFF_MARKER) && errors.is_empty() {
         let why = out
@@ -747,6 +766,8 @@ mod tests {
             [
                 "/s/trustfmt",
                 "--check",
+                "--color",
+                "never",
                 "--edition",
                 "2021",
                 "--unstable-features",
@@ -805,24 +826,86 @@ mod tests {
         );
         assert_eq!(mixed.drifted.len(), 1);
         assert_eq!(mixed.unread, ["error: expected item, found `≐`"]);
+        // An internal error (whitespace the formatter left behind in a `clean` block) names the
+        // file it is in, rather than the whole batch reading as unread.
+        let internal = read_run(
+            &run_of(
+                false,
+                "error[internal]: left behind trailing whitespace\n --> /r/island.rs:8:8:1\n  |\n",
+            ),
+            "2024",
+            3,
+            root,
+            None,
+        );
+        assert!(internal.drifted.is_empty());
+        assert_eq!(
+            internal.unread,
+            ["error[internal]: left behind trailing whitespace (/r/island.rs:8:8:1)"]
+        );
     }
 
-    #[test]
-    fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
-        use crate::ladder::{Outcome, Severity};
+    /// The toolchain this host's own drivers find, as `verify` would.
+    fn real_tools() -> crate::Toolchain {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let env = crate::EnvSnapshot::capture();
         // The host's own drivers must answer the discovery's probes, so they wait on the hang
         // detector, not the product's 5 s, which a loaded machine outlasts.
         crate::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
-        let mut tools = crate::run_toolchain(&env, &repo);
+        let tools = crate::run_toolchain(&env, &repo);
         if tools.trustfmt.is_none() && env.trust_stage2_bin.is_some() {
             let discovered = crate::EnvSnapshot {
                 trust_stage2_bin: None,
                 ..env
             };
-            tools = crate::run_toolchain(&discovered, &repo);
+            return crate::run_toolchain(&discovered, &repo);
         }
+        tools
+    }
+
+    /// A file the real formatter cannot parse is named by the formatter's own `error:` line, not
+    /// hidden behind "read none of N file(s)". `trustfmt_cmd` turns colour off once; with
+    /// `--color always` in its place, or the flag given twice, this test fails.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_file_the_real_formatter_cannot_parse_is_named_by_its_error_line() {
+        let tools = real_tools();
+        let Some(bin) = tools.trustfmt.clone() else {
+            aterm_uds::host::could_not_run(format!(
+                "{}, so this machine cannot show the check either way",
+                tools.missing_trustfmt_label()
+            ));
+        };
+        let t = tree(&[("src/bad.rs", "pub fn x( ) { let = ; }\n")]);
+        let root = t.path().to_path_buf();
+        let scratch = t.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let ctx = Ctx::new_with_tools(
+            root.clone(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::capture(),
+            scratch,
+            tools,
+        );
+        let files = [root.join("src/bad.rs").to_string_lossy().into_owned()];
+        let cmd = trustfmt_cmd(&bin, "2021", &files, false);
+        let read = read_run(&exec::run(&cmd, ctx.exec_env()), "2021", 1, &root, None);
+        assert!(
+            read.unread
+                .iter()
+                .any(|l| l.starts_with("error: expected pattern")),
+            "{read:?}"
+        );
+        assert!(
+            read.unread.iter().all(|l| !l.contains("read none of")),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
+        use crate::ladder::{Outcome, Severity};
+        let tools = real_tools();
         let untidy_lib =
             "pub struct E {\n    error: String,\n}\npub fn wrong(  ) ->usize{let x=1;x}\n";
         let t = tree(&[

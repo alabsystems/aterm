@@ -470,6 +470,20 @@ impl EditorCommand {
         }
     }
 
+    /// Whether this command takes text out of the document onto a kill ring (and so, for the
+    /// person's input, the clipboard).
+    #[must_use]
+    pub const fn kills(self) -> bool {
+        matches!(
+            self,
+            Self::KillRegion
+                | Self::KillLine
+                | Self::KillWord
+                | Self::BackwardKillWord
+                | Self::KillRingSave
+        )
+    }
+
     /// Returns the sequence of prompts required by this command.
     pub const fn prompts(self) -> &'static [Prompt] {
         match self {

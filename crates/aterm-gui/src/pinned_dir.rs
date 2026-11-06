@@ -759,8 +759,10 @@ mod imp {
             Ok(())
         }
 
+        /// The directory's entries, handed to the drive by a plain `fsync(2)` of the held
+        /// descriptor: aterm-durable's, which astream-sys counts `plain`.
         pub(crate) fn sync(&self) -> io::Result<()> {
-            aterm_dirfd::fsync(self.leaf()).map_err(Into::into)
+            aterm_durable::primitive::fsync(self.leaf())
         }
 
         /// Flush the directory's entries ordered ahead of every later write on the device.
@@ -3607,7 +3609,14 @@ mod tests {
 
     /// An artifact's bytes are only ordered ahead of what follows (aterm-durable's
     /// counting seam), never fully flushed: the requester is local and reads the
-    /// page cache, and no recovery reads them.
+    /// page cache, and no recovery reads them. Each entry published at once, and the
+    /// folder's own flush, take one plain `fsync(2)` of the held descriptor, aterm-durable's
+    /// (`primitive::fsync`), which astream-sys counts `plain`: the seam counts exactly this
+    /// thread's, a deferred entry takes none, and the process-wide `flush_tally` moves by at
+    /// least the folder's (this binary's other tests flush meanwhile, so only a bound reads
+    /// there; aterm-durable's `tests/flush_tally.rs` holds the two counts equal). A folder
+    /// flush that called the OS itself, as this one did through `aterm_dirfd::fsync`, moves
+    /// neither.
     #[test]
     fn an_artifacts_bytes_are_ordered_and_a_durable_write_stays_durable() {
         use aterm_durable::{Flush, seam::Recording};
@@ -3622,10 +3631,12 @@ mod tests {
             [Flush::Ordered],
             "a replaced artifact's bytes; its entry takes the plain fsync(2)"
         );
+        assert_eq!(recording.take_plain(), 1, "the replaced artifact's entry");
         let done = dir
             .write_new_private(OsStr::new("shot.done"), b"done")
             .unwrap();
         assert_eq!(recording.take(), [Flush::Ordered], "a new artifact's bytes");
+        assert_eq!(recording.take_plain(), 1, "the new artifact's entry");
         let frame = dir
             .write_new_private_deferred_dir_sync_authorized(OsStr::new("frame.png"), b"f", || true)
             .unwrap();
@@ -3633,6 +3644,11 @@ mod tests {
             recording.take(),
             [Flush::Ordered],
             "a video batch member's bytes"
+        );
+        assert_eq!(
+            recording.take_plain(),
+            0,
+            "a deferred entry waits for the batch"
         );
         let token = dir
             .write_new_private_with_hooks(
@@ -3644,8 +3660,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recording.take(), [Flush::Durable], "a durable write");
+        assert_eq!(recording.take_plain(), 1, "the durable write's entry");
+        let before = astream_sys::flush_tally();
         dir.sync().unwrap();
+        let after = astream_sys::flush_tally();
         assert_eq!(recording.take(), [], "the directory's plain fsync(2)");
+        assert_eq!(recording.take_plain(), 1, "the folder's own flush");
+        assert!(
+            after.plain > before.plain,
+            "astream-sys counted the folder's flush: {before:?} -> {after:?}"
+        );
         drop((shot, done, frame, token));
         let _ = std::fs::remove_dir_all(&root);
     }

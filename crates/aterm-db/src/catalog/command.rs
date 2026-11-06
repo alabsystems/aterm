@@ -341,24 +341,24 @@ impl RecordPage {
         let (records, next_after) = match inventories {
             None => (None, None),
             Some((known, eligible)) => {
-                let mut ids: Vec<_> = known
-                    .range((self.after.map_or(Unbounded, Excluded), Unbounded))
-                    .take(self.limit + 1)
-                    .copied()
-                    .collect();
-                let next_after = if ids.len() > self.limit {
-                    ids.truncate(self.limit);
-                    ids.last().map(|id| aterm_codec::hex::encode_lower(id))
-                } else {
-                    None
-                };
-                let records: Vec<_> = ids
-                    .iter()
+                let mut iter = known.range((self.after.map_or(Unbounded, Excluded), Unbounded));
+                let records: Vec<_> = iter
+                    .by_ref()
+                    .take(self.limit)
                     .map(|id| {
                         json!({"operation":aterm_codec::hex::encode_lower(id),
                             "eligible":eligible.contains(id)})
                     })
                     .collect();
+                let next_after = if iter.next().is_some() {
+                    records
+                        .last()
+                        .and_then(|r| r.get("operation"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 (Some(records), next_after)
             }
         };

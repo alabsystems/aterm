@@ -100,23 +100,25 @@ pub(super) fn cut(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter(|(name, _)| kept(name))
-        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .map(|(mut name, value)| {
+            name.make_ascii_lowercase();
+            (name, value)
+        })
         .collect()
 }
 
 /// Filters `headers` to [`KEPT_HEADERS`] with lowercased names, redacting the query of a `location` URL whose origin is an asset host or any origin but the API's (`signed_redacted`).
 #[must_use]
 pub fn keep(endpoints: &Endpoints, headers: Vec<(String, String)>) -> Vec<(String, String)> {
-    cut(headers)
-        .into_iter()
-        .map(|(name, value)| {
-            if name != "location" {
-                return (name, value);
-            }
-            let value = signed_redacted(endpoints, &value).unwrap_or(value);
-            (name, value)
-        })
-        .collect()
+    let mut out = cut(headers);
+    for (name, value) in &mut out {
+        if name == "location"
+            && let Some(redacted) = signed_redacted(endpoints, value)
+        {
+            *value = redacted;
+        }
+    }
+    out
 }
 
 /// Replaces `url`'s query with `signed=redacted` when its origin is an asset host, or any
@@ -146,6 +148,9 @@ const fn role_word(role: OriginRole) -> &'static str {
 
 /// Sorts `query`'s `&`-separated parameters by raw name and value bytes.
 fn sorted_query(query: &str) -> String {
+    if !query.contains('&') {
+        return query.to_owned();
+    }
     let mut pairs: Vec<(&str, Option<&str>, &str)> = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
@@ -158,11 +163,14 @@ fn sorted_query(query: &str) -> String {
             .cmp(b.0.as_bytes())
             .then_with(|| a.1.map(str::as_bytes).cmp(&b.1.map(str::as_bytes)))
     });
-    pairs
-        .iter()
-        .map(|(_, _, pair)| *pair)
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut out = String::with_capacity(query.len());
+    for (idx, (_, _, pair)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        out.push_str(pair);
+    }
+    out
 }
 
 /// The next of a request an anonymous tape cannot hold: every run of it would be refused the same.
@@ -234,8 +242,10 @@ fn head(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<String> {
     let mut headers: Vec<(String, &str)> = req
         .headers
         .iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("user-agent") && !door::is_authorization(name)
+        })
         .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
-        .filter(|(name, _)| name != "user-agent" && !door::is_authorization(name))
         .collect();
     headers.sort_by(|a, b| {
         a.0.as_bytes()

@@ -6,9 +6,10 @@
 //!
 //! The option table is Grok Build 1.0.70's own `grok --help` (measured 2026-10-24 on xAI's
 //! darwin-arm64 build with a scratch `HOME`; grok-alab's `src/lanes.rs` holds the same table for
-//! its relaunches), plus the hidden `--dangerously-skip-permissions` atpkg's vendor row knows.
-//! aterm has no Grok relaunch lane (`lanes.rs`: `Program::Grok => Lanes::NONE`): the table here
-//! reads a starter's argv and nothing more.
+//! its relaunches), plus the hidden `--dangerously-skip-permissions` atpkg's vendor row knows and
+//! the hidden `--yolo` its own guide names as `--always-approve`'s alias (1.0.70 takes both,
+//! measured 2026-11-05). aterm has no Grok relaunch lane (`lanes.rs`: `Program::Grok =>
+//! Lanes::NONE`): the table here reads a starter's argv and nothing more.
 
 use std::path::Path;
 
@@ -48,7 +49,10 @@ enum Arity {
 enum Fate {
     /// Rides onto the worker's line: it says how Grok Build reaches its provider (its leader).
     Ride,
-    /// Stays the starter's: its model, posture, folders, session and setup.
+    /// Says what the run may do unasked (its permission mode and sandbox): rides held to
+    /// [`WORKER_FLOOR`] ([`worker_flags`]).
+    Posture,
+    /// Stays the starter's: its model, permission rules, folders, session and setup.
     Stay,
     /// The starter answers and exits (help, version, a one-shot prompt): it lends nothing.
     OneShot,
@@ -62,11 +66,11 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--allow", Arity::One, Fate::Stay),
     ("--allowedTools", Arity::One, Fate::Stay),
     ("--allowed-tools", Arity::One, Fate::Stay),
-    ("--always-approve", Arity::None, Fate::Stay),
+    ("--always-approve", Arity::None, Fate::Posture),
     ("-c", Arity::None, Fate::Stay),
     ("--continue", Arity::None, Fate::Stay),
     ("--cwd", Arity::One, Fate::Stay),
-    ("--dangerously-skip-permissions", Arity::None, Fate::Stay),
+    ("--dangerously-skip-permissions", Arity::None, Fate::Posture),
     ("--debug", Arity::None, Fate::Stay),
     ("--debug-file", Arity::One, Fate::Stay),
     ("--deny", Arity::One, Fate::Stay),
@@ -91,7 +95,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--output-format", Arity::One, Fate::Stay),
     ("-p", Arity::One, Fate::OneShot),
     ("--single", Arity::One, Fate::OneShot),
-    ("--permission-mode", Arity::One, Fate::Stay),
+    ("--permission-mode", Arity::One, Fate::Posture),
     ("--prompt-file", Arity::One, Fate::OneShot),
     ("--prompt-json", Arity::One, Fate::OneShot),
     ("-r", Arity::Optional, Fate::Stay),
@@ -102,7 +106,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--rules", Arity::One, Fate::Stay),
     ("-s", Arity::One, Fate::Stay),
     ("--session-id", Arity::One, Fate::Stay),
-    ("--sandbox", Arity::One, Fate::Stay),
+    ("--sandbox", Arity::One, Fate::Posture),
     ("--system-prompt-override", Arity::One, Fate::Stay),
     ("--system-prompt", Arity::One, Fate::Stay),
     ("--tools", Arity::One, Fate::Stay),
@@ -113,6 +117,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--worktree", Arity::Optional, Fate::Stay),
     ("--worktree-ref", Arity::One, Fate::Stay),
     ("--ref", Arity::One, Fate::Stay),
+    ("--yolo", Arity::None, Fate::Posture),
 ];
 
 /// Grok Build 1.0.70's subcommands and their aliases, and the 1.0.67 words atpkg's vendor row
@@ -152,23 +157,74 @@ const COMMANDS: &[&str] = &[
     "wrap",
 ];
 
-fn flag(name: &str) -> Option<(Arity, Fate)> {
-    FLAGS
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, arity, fate)| (*arity, *fate))
-}
+/// GROK BUILD'S PERMISSION FLOOR (its worker row's, `worker::WorkerCli::unnamed_posture`):
+/// `--permission-mode auto`, which 1.0.70's own guide calls Auto-review, "a classifier approve[s]
+/// safe tool calls", a call it will not pass being blocked or escalated: Grok Build's counterpart
+/// of Claude Code's auto mode, its modes spelled as Claude Code's. Where its auto-mode gate is
+/// off (`GROK_AUTO_PERMISSION_MODE=0`, `[auto_mode] enabled = false`, an administrator's policy)
+/// Auto-review is not offered, and a worker of an `acceptEdits` starter then asks more than its
+/// starter did; Grok workers are refused as unsupervisable ([`super::WorkerCli::end_unseen`]), so
+/// no worker runs at this floor until a reader of Grok's turns lifts that, which then decides
+/// whether the gate is read first. Measured 2026-11-05 on 1.0.70: it takes `auto` and refuses
+/// `--permission-mode` given twice, so [`worker_flags`] drops a starter's first.
+pub const WORKER_FLOOR: [&str; 2] = ["--permission-mode", "auto"];
+
+/// The permission modes at or above [`WORKER_FLOOR`], which a starter lends as they are: none
+/// stops for a person's box on each edit or command (`dontAsk` refuses what it would ask).
+const FLOOR_KEEPS: [&str; 3] = [WORKER_FLOOR[1], "dontAsk", "bypassPermissions"];
 
 /// The flags of a Grok Build starter's `argv` (its `argv[0]` first) that ride onto its worker's
 /// line: `--leader-socket`, which names the leader (and so the login) its sessions reach xAI
-/// through. Its model, approval posture, sandbox, folders, session and prompt stay its own. A
-/// starter that runs a subcommand or a one-shot prompt lends none.
+/// through, then its posture held to [`WORKER_FLOOR`] (owner, 2026-11-04: workers are fully
+/// automated by default). A starter that always approves (`--always-approve`, its aliases
+/// `--yolo` and `--dangerously-skip-permissions`) or runs in a mode of [`FLOOR_KEEPS`] lends its
+/// posture as it is, with its `--sandbox`; any other mode, or none, lends the floor in place of
+/// its `--permission-mode`, beside its `--sandbox`. Its model, permission rules, folders, session
+/// and prompt stay its own. A starter that runs a subcommand or a one-shot prompt lends only the
+/// floor.
 ///
 /// # Errors
 ///
 /// An option 1.0.70's `--help` does not list, as typed: no table here knows what it moves.
-pub fn config_flags(argv: &[String]) -> Result<Vec<String>, String> {
+pub fn worker_flags(argv: &[String]) -> Result<Vec<String>, String> {
+    let (mut out, posture) = lent(argv)?;
+    let always = posture.iter().any(|(name, _)| {
+        matches!(
+            *name,
+            "--always-approve" | "--yolo" | "--dangerously-skip-permissions"
+        )
+    });
+    let mode = posture
+        .iter()
+        .rfind(|(name, _)| *name == WORKER_FLOOR[0])
+        .and_then(|(name, words)| match words.as_slice() {
+            [_, value] => Some(value.as_str()),
+            [attached] => attached.strip_prefix(*name)?.strip_prefix('='),
+            _ => None,
+        });
+    if always || mode.is_some_and(|mode| FLOOR_KEEPS.contains(&mode)) {
+        out.extend(posture.into_iter().flat_map(|(_, words)| words));
+        return Ok(out);
+    }
+    out.extend(
+        posture
+            .into_iter()
+            .filter(|(name, _)| *name != WORKER_FLOOR[0])
+            .flat_map(|(_, words)| words),
+    );
+    out.extend(WORKER_FLOOR.map(str::to_string));
+    Ok(out)
+}
+
+/// What a Grok Build starter's `argv` lends ([`worker_flags`]): the flags that ride, and its
+/// posture flags, each by its name with its words. A starter that runs a subcommand or a
+/// one-shot prompt lends neither.
+type Lent = (Vec<String>, Vec<(&'static str, Vec<String>)>);
+
+/// [`worker_flags`]' reading of `argv`.
+fn lent(argv: &[String]) -> Result<Lent, String> {
     let mut out = Vec::new();
+    let mut posture = Vec::new();
     let mut i = 1;
     while i < argv.len() {
         let tok = argv[i].as_str();
@@ -178,7 +234,7 @@ pub fn config_flags(argv: &[String]) -> Result<Vec<String>, String> {
         }
         if tok.len() < 2 || !tok.starts_with('-') {
             if COMMANDS.contains(&tok) {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             }
             continue;
         }
@@ -186,7 +242,7 @@ pub fn config_flags(argv: &[String]) -> Result<Vec<String>, String> {
             Some((name, value)) if name.starts_with("--") => (name, Some(value)),
             _ => (tok, None),
         };
-        let Some((arity, fate)) = flag(name) else {
+        let Some((name, arity, fate)) = FLAGS.iter().find(|(n, _, _)| *n == name).copied() else {
             return Err(name.to_string());
         };
         let value = match (arity, attached) {
@@ -208,15 +264,21 @@ pub fn config_flags(argv: &[String]) -> Result<Vec<String>, String> {
             },
         };
         match fate {
-            Fate::OneShot => return Ok(Vec::new()),
+            Fate::OneShot => return Ok((Vec::new(), Vec::new())),
             Fate::Stay => {}
             Fate::Ride => {
                 out.push(tok.to_string());
                 out.extend(value);
             }
+            Fate::Posture => {
+                posture.push((
+                    name,
+                    std::iter::once(tok.to_string()).chain(value).collect(),
+                ));
+            }
         }
     }
-    Ok(out)
+    Ok((out, posture))
 }
 
 /// The environment a Grok Build starter's worker carries: its own `GROK_HOME` and pooled

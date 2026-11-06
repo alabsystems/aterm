@@ -6960,8 +6960,7 @@ fn an_admins_approved_recipient_is_not_pending_while_enrollment_is_unfinished() 
 /// person's later write of a name wins whichever version is read first, as it does where two
 /// servers took different versions of one sequence: a later version that lands takes its names
 /// out of every earlier set. A version this publish builds on, or a parent of it, lands its set
-/// before the publish. The oldest past [`log_entries::MAX_PENDING_SETS`] is dropped, and a pending
-/// file that cannot be read never refuses a publish.
+/// before the publish. A refusal drops only its set.
 ///
 /// NEGATIVE CONTROL: `land_sets` without the `retain` that takes a landing set's names out of
 /// the earlier sets (restored with cp from a backup plus touch, confirmed with cmp): v1's set keeps
@@ -6973,7 +6972,7 @@ fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
     let m22 = &macs.m22;
     let identity = read_identity(m22).unwrap().unwrap();
     let state = || log_entries::waiting_and_pending(m22, &identity);
-    let values = |pairs: &[(&str, &[u8])]| -> BTreeMap<String, Vec<u8>> {
+    let values = |pairs: &[(&str, &[u8])]| -> log_entries::Values {
         pairs
             .iter()
             .map(|&(name, value)| (name.to_owned(), value.to_vec()))
@@ -6984,7 +6983,9 @@ fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
             m22,
             &identity,
             &log_entries::Waiting::of_puts(writes),
+            u64::from(version),
             &[version; 32],
+            &["https://one.example".to_owned()],
             stored,
             None,
         )
@@ -7031,23 +7032,410 @@ fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
     );
     assert_eq!(pending, vec![([4; 32], values(&[("y", b"4")]))]);
 
-    // Past the bound the oldest goes.
-    for version in 10..10 + log_entries::MAX_PENDING_SETS as u8 {
-        wait(&[("z", &[version])], version, &[]);
-    }
-    let (_, pending) = state();
-    assert_eq!(pending.len(), log_entries::MAX_PENDING_SETS);
-    assert!(
-        pending.iter().all(|(version, _)| *version != [4; 32]),
-        "the oldest set is dropped past the bound"
-    );
-
-    // A pending file that cannot be read is started again, and a refusal drops only its set.
-    std::fs::write(m22.dir.join("everyone.waiting.pending"), b"not sealed").unwrap();
+    // A refusal drops only its set.
     wait(&[("w", b"5")], 5, &[]);
     wait(&[("v", b"6")], 6, &[]);
-    log_entries::forget_waiting(m22, &identity, &[6; 32]);
+    log_entries::forget_waiting(m22, &[6; 32]);
     let (_, pending) = state();
-    assert_eq!(pending, vec![([5; 32], values(&[("w", b"5")]))]);
+    assert_eq!(
+        pending,
+        vec![
+            ([4; 32], values(&[("y", b"4")])),
+            ([5; 32], values(&[("w", b"5")]))
+        ]
+    );
     macs.server.stop();
+}
+
+/// What [`unread_set`] saw.
+struct UnreadSet {
+    macs: TwoMacs,
+    /// The pending set's file m22 cannot read.
+    file: PathBuf,
+    /// The files m22 named as unread before anything ran over them.
+    unread: (Option<String>, Vec<String>),
+    /// A publish's keep of a write, and one that keeps nothing, over the unread set.
+    keeps: crate::Result<()>,
+    keeps_nothing: crate::Result<()>,
+    /// A read of the unread set's version as stored.
+    landed: crate::Result<()>,
+    /// How many records a vault pass signed over it.
+    signed: crate::Result<usize>,
+    /// Whether the file is still there after all of that.
+    there: bool,
+}
+
+/// m22 lands v2's set, so `late` waits; then v3's pending set no longer opens with m22's key.
+/// Over it m22 keeps a publish's write, keeps one that has none, reads v3 as stored and runs a
+/// vault pass, `control` setting [`log_entries::UNREAD_AS_NONE`] for all of them.
+fn unread_set(control: bool) -> UnreadSet {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m22 = macs.m22.clone();
+    let identity = read_identity(&m22).unwrap().unwrap();
+    let wait = |writes: &log_entries::Waiting, version: u8| {
+        log_entries::wait_for_key(
+            &m22,
+            &identity,
+            writes,
+            u64::from(version),
+            &[version; 32],
+            &["https://one.example".to_owned()],
+            &[],
+            None,
+        )
+    };
+    wait(&log_entries::Waiting::of_puts(&[("late", b"2")]), 2).expect("pending");
+    log_entries::land_waiting(&m22, &identity, &[[2; 32]], None).expect("land v2");
+    wait(&log_entries::Waiting::of_puts(&[("other", b"3")]), 3).expect("pending");
+    let hex = aterm_codec::hex::encode_lower(&[3; 32]);
+    let file = std::fs::read_dir(m22.dir.join("everyone.pending"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(&hex))
+        .expect("CONTROL: v3's set has a file");
+    fsx::write_atomic(&file, b"not sealed", 0o600).unwrap();
+    let unread = log_entries::unread_waiting(&m22, &identity);
+
+    log_entries::UNREAD_AS_NONE.with(|cell| cell.set(control));
+    let keeps = wait(&log_entries::Waiting::of_puts(&[("new", b"4")]), 4);
+    let keeps_nothing = wait(&log_entries::Waiting::default(), 5);
+    let landed = log_entries::land_waiting(&m22, &identity, &[[3; 32]], None);
+    let signed = log_entries::sign_waiting_writes(&m22, aterm_time::unix_millis().unwrap_or(0))
+        .map(|records| records.len());
+    log_entries::UNREAD_AS_NONE.with(|cell| cell.set(false));
+    let there = file.exists();
+    UnreadSet {
+        macs,
+        file,
+        unread,
+        keeps,
+        keeps_nothing,
+        landed,
+        signed,
+        there,
+    }
+}
+
+/// One-mesh W3 ([`unread_set`]): a pending set this Mac cannot read is never read as none, since
+/// it may be the writes of a version a server stored. A publish that keeps a write refuses before
+/// its version goes out, naming why, and one that keeps nothing (a removal's, an approval's) goes.
+/// Nothing lands over it, and a vault pass signs nothing: any waiting write may be one of the
+/// names it writes. The file stays and is named as unread, and only every server's refusal of its
+/// version, found by the file's name, drops it.
+///
+/// NEGATIVE CONTROL: [`log_entries::UNREAD_AS_NONE`] (a set that does not open reads as none and
+/// its file is removed, as before W3), run in the test: the publish keeps its write, the file goes
+/// and the pass signs `late`, as the CONTROL asserts say; with the switch set for the first run
+/// too, the test fails "a publish that keeps a write refuses over a set that does not open".
+#[test]
+fn a_pending_set_that_does_not_open_is_never_read_as_none() {
+    let run = unread_set(false);
+    let m22 = &run.macs.m22;
+    let identity = read_identity(m22).unwrap().unwrap();
+    assert!(
+        run.keeps
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("does not open")),
+        "a publish that keeps a write refuses over a set that does not open: {:?}",
+        run.keeps
+    );
+    assert!(
+        run.keeps_nothing.is_ok(),
+        "a publish that keeps nothing goes: {:?}",
+        run.keeps_nothing
+    );
+    assert!(run.landed.is_err(), "nothing lands over it");
+    assert!(
+        matches!(run.signed, Ok(0)),
+        "nothing waiting is signed over it: {:?}",
+        run.signed
+    );
+    assert!(run.there, "the file stays");
+    assert_eq!(
+        run.unread,
+        (None, vec![run.file.display().to_string()]),
+        "the file is named as unread"
+    );
+    assert!(
+        log_entries::waiting_values(m22, &identity).contains_key("late"),
+        "the waiting write stays"
+    );
+    log_entries::forget_waiting(m22, &[3; 32]);
+    assert!(
+        !run.file.exists(),
+        "every server's refusal of its version drops it by its name"
+    );
+    run.macs.server.stop();
+
+    let control = unread_set(true);
+    assert!(
+        control.keeps.is_ok() && !control.there,
+        "CONTROL: a set read as none is dropped unseen"
+    );
+    assert!(
+        matches!(control.signed, Ok(1)),
+        "CONTROL: the pass signs over the set it could not read: {:?}",
+        control.signed
+    );
+    control.macs.server.stop();
+}
+
+/// One-mesh W3: an admin's draft over waiting writes this Mac cannot read (`everyone.waiting`
+/// does not open) refuses an edit that writes `[everyone]`, since any write it makes may be over
+/// one of them; an edit that writes nothing there goes, and the file is named as unread and stays.
+///
+/// NEGATIVE CONTROL: [`log_entries::UNREAD_AS_NONE`] (the waiting writes read as none, as before
+/// W3), run in the test: the `[everyone]` edit is published, as the CONTROL assert says; with the
+/// switch set for the first run too, the test fails "an [everyone] edit over waiting writes that
+/// do not read refuses".
+#[test]
+fn a_draft_over_waiting_writes_that_do_not_read_refuses_an_everyone_edit() {
+    for control in [false, true] {
+        let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+        let m22 = &macs.m22;
+        let identity = read_identity(m22).unwrap().unwrap();
+        fsx::write_atomic(&log_entries::waiting_file(m22), b"not sealed", 0o600).unwrap();
+        let admin = admin_open(m22).expect("an admin opens over it");
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "shared", b"v2")
+            .expect("edit");
+        log_entries::UNREAD_AS_NONE.with(|cell| cell.set(control));
+        let everyone = admin_publish(m22, &admin, &doc);
+        log_entries::UNREAD_AS_NONE.with(|cell| cell.set(false));
+        if control {
+            assert!(
+                everyone.is_ok(),
+                "CONTROL: read as none, the edit is published: {:?}",
+                everyone.err()
+            );
+            macs.server.stop();
+            continue;
+        }
+        assert!(
+            everyone
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("no [everyone] edit is drafted")),
+            "an [everyone] edit over waiting writes that do not read refuses: {:?}",
+            everyone.err()
+        );
+        assert_eq!(
+            log_entries::unread_waiting(m22, &identity),
+            (
+                Some(log_entries::waiting_file(m22).display().to_string()),
+                Vec::new()
+            ),
+            "the file is named as unread"
+        );
+        let admin = admin_open(m22).expect("an admin");
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Hosts(vec!["m7".to_owned()]), "only7", b"h")
+            .expect("edit");
+        admin_publish(m22, &admin, &doc).expect("an edit that writes nothing there goes");
+        assert!(
+            log_entries::waiting_file(m22).exists(),
+            "the waiting writes stay"
+        );
+        macs.server.stop();
+    }
+}
+
+/// One-mesh W3: a cached admin open, made under an author's own observation of the state (a
+/// removal's `vault_admin_named`, an enrollment's pre-F15 fallback), lands no pending set and so
+/// never takes the state lock: the open goes, and the set stays for a later open or sync.
+///
+/// NEGATIVE CONTROL: `admin_cached_unlocked` passing `land` to `admin_base` (restored with cp from
+/// a backup plus touch, confirmed with cmp): in this build with debug assertions the open panics
+/// "an exclusive take of … under this thread's own draft observation of it waits for good".
+#[test]
+fn a_cached_admin_open_under_an_authors_observation_lands_no_pending_set() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m22 = &macs.m22;
+    let identity = read_identity(m22).unwrap().unwrap();
+    let admin = admin_open(m22).expect("an admin");
+    log_entries::wait_for_key(
+        m22,
+        &identity,
+        &log_entries::Waiting::of_puts(&[("late", b"2")]),
+        admin.seq,
+        &admin.opened_heads[0],
+        &["https://one.example".to_owned()],
+        &[],
+        None,
+    )
+    .expect("pending");
+    assert!(
+        log_entries::waiting_pending(m22),
+        "CONTROL: a set is pending"
+    );
+    let (_, _, opened) = log_entries::author_and_commit_records(m22, |_store| {
+        Ok((Vec::new(), enrollment::admin_cached_unlocked(m22).is_ok()))
+    })
+    .expect("the author");
+    assert!(opened, "the cached open goes under the observation");
+    assert!(log_entries::waiting_pending(m22), "the set stays");
+    macs.server.stop();
+}
+
+/// One-mesh W3: a publish whose deadline ends before its first PUT drops the set it kept, so a
+/// set whose servers are the ALab name never stays for a version no server was sent; and a
+/// deadline that ended waits on nothing more: while another holds the state lock the set stays.
+///
+/// NEGATIVE CONTROL: `forget_unsent` with its body cut to `return` (restored with cp from a
+/// backup plus touch, confirmed with cmp): the test fails "an unsent version's set goes".
+#[test]
+fn an_unsent_versions_pending_set_goes_where_the_lock_is_free() {
+    let macs = two_macs(&[]);
+    let m22 = &macs.m22;
+    let identity = read_identity(m22).unwrap().unwrap();
+    let keep = |version: u8| {
+        log_entries::wait_for_key(
+            m22,
+            &identity,
+            &log_entries::Waiting::of_puts(&[("late", b"2")]),
+            u64::from(version),
+            &[version; 32],
+            &[crate::ALAB_DEFAULT_URL.to_owned()],
+            &[],
+            None,
+        )
+        .expect("pending");
+    };
+    keep(1);
+    let busy = StateLock::take(m22).expect("the state lock");
+    let lock_held = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                log_entries::forget_unsent(m22, &[1; 32]);
+                log_entries::waiting_pending(m22)
+            })
+            .join()
+            .expect("the thread")
+    });
+    drop(busy);
+    assert!(
+        lock_held,
+        "while another holds the state lock the set stays"
+    );
+    log_entries::forget_unsent(m22, &[1; 32]);
+    assert!(
+        !log_entries::waiting_pending(m22),
+        "an unsent version's set goes"
+    );
+    macs.server.stop();
+}
+
+/// The pending sets that twelve publishes leave, each `[everyone]` write on a version no answer
+/// settled, with A3's count bound where `by_count` ([`log_entries::PENDING_BY_COUNT`]).
+fn twelve_pending(by_count: bool) -> (TwoMacs, Identity, usize) {
+    let macs = two_macs(&[]);
+    let identity = read_identity(&macs.m22).unwrap().unwrap();
+    log_entries::PENDING_BY_COUNT.with(|cell| cell.set(by_count));
+    for version in 1..=12u8 {
+        let name = format!("n{version}");
+        log_entries::wait_for_key(
+            &macs.m22,
+            &identity,
+            &log_entries::Waiting::of_puts(&[(name.as_str(), &[version])]),
+            u64::from(version),
+            &[version; 32],
+            &["https://a.example".to_owned()],
+            &[],
+            None,
+        )
+        .expect("pending");
+    }
+    log_entries::PENDING_BY_COUNT.with(|cell| cell.set(false));
+    let kept = log_entries::waiting_and_pending(&macs.m22, &identity)
+        .1
+        .len();
+    (macs, identity, kept)
+}
+
+/// One-mesh W3: no pending set goes by count. A set goes only on proof, as a held draft does (W2):
+/// it lands once a server is seen to hold its version or a descendant; a landed publish of
+/// sequence `seq` takes from each set of sequence `seq` or below the servers that took it, which
+/// refuse that set's version as not newer for good, and drops a set left with none. A set of a
+/// higher sequence stays, and so do one whose servers are unknown and one that names the ALab
+/// name, which moves between the Macs that serve it; a set the landed version names as a parent
+/// lands.
+///
+/// NEGATIVE CONTROL: [`log_entries::PENDING_BY_COUNT`] (A3's bound of eight, the oldest dropped
+/// whatever its version), run in the test: the four oldest of twelve go, and the CONTROL assert
+/// says so; with the switch set for the first run too, the test fails "every set whose version
+/// may be stored stays".
+#[test]
+fn no_pending_set_goes_by_count_and_a_landed_publish_settles_them_by_its_servers() {
+    let (macs, identity, kept) = twelve_pending(false);
+    assert_eq!(kept, 12, "every set whose version may be stored stays");
+    let m22 = &macs.m22;
+    let a = "https://a.example".to_owned();
+    let b = "https://b.example".to_owned();
+    let alab = crate::ALAB_DEFAULT_URL.to_owned();
+    let wait = |name: &str, version: u8, seq: u64, reach: &[String]| {
+        log_entries::wait_for_key(
+            m22,
+            &identity,
+            &log_entries::Waiting::of_puts(&[(name, b"x")]),
+            seq,
+            &[version; 32],
+            reach,
+            &[],
+            None,
+        )
+        .expect("pending");
+    };
+    wait("only-a", 20, 5, std::slice::from_ref(&a));
+    wait("a-and-b", 21, 5, &[a.clone(), b.clone()]);
+    wait("higher", 22, 7, std::slice::from_ref(&a));
+    wait("unknown", 23, 5, &["*".to_owned()]);
+    wait("alab", 24, 5, std::slice::from_ref(&alab));
+    wait("parent", 25, 4, std::slice::from_ref(&b));
+
+    log_entries::land_published(
+        m22,
+        &identity,
+        6,
+        &[30; 32],
+        &[[25; 32]],
+        std::slice::from_ref(&a),
+        None,
+    );
+    let reach: BTreeMap<[u8; 32], Vec<String>> = log_entries::pending_reach(m22, &identity)
+        .into_iter()
+        .collect();
+    let (waiting, _) = log_entries::waiting_and_pending(m22, &identity);
+    assert!(
+        waiting.contains_key("parent"),
+        "the set the landed version names as a parent lands"
+    );
+    for version in 1..=6u8 {
+        assert!(
+            !reach.contains_key(&[version; 32]),
+            "a set of sequence {version} that reached only the server that took sequence 6 goes"
+        );
+    }
+    for version in 7..=12u8 {
+        assert!(
+            reach.contains_key(&[version; 32]),
+            "a set of a higher sequence, {version}, stays"
+        );
+    }
+    assert!(!reach.contains_key(&[20; 32]), "only-a goes");
+    assert_eq!(
+        reach.get(&[21; 32]),
+        Some(&vec![b.clone()]),
+        "a-and-b stays on the server that may still hold it"
+    );
+    assert!(reach.contains_key(&[22; 32]), "higher stays");
+    assert!(reach.contains_key(&[23; 32]), "unknown stays");
+    assert!(
+        reach.contains_key(&[24; 32]),
+        "the ALab name settles nothing"
+    );
+    assert!(!reach.contains_key(&[25; 32]), "parent landed");
+    macs.server.stop();
+
+    let (control, _, kept) = twelve_pending(true);
+    assert_eq!(kept, 8, "CONTROL: A3's bound drops the four oldest");
+    control.server.stop();
 }

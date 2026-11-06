@@ -87,19 +87,23 @@ pub enum Row {
     /// `StateDir::set_in_flight`.
     SetInFlight,
     /// `StateDir::clear_in_flight`: an in-flight entry ended alone. Every own record's but a
-    /// landed post's, whose entry ends with its group ([`Row::ClearPostSeq`]); and a landed
-    /// post's its group left standing: one a drain releases once aterm no longer lists the
-    /// post (left by the attach's replay, or by aterm gone before it answered), and one a
-    /// delivery ends after the disk refused its group's write or its self-lane offset.
+    /// landed post's or owed receipt's, whose entry ends with its group ([`Row::ClearPostSeq`]);
+    /// and a landed post's or receipt's its group left standing: one a drain releases once
+    /// aterm no longer lists the post or receipt (left by the attach's replay, or by aterm gone
+    /// before it answered), and one a delivery ends after the disk refused its group's write or
+    /// its self-lane offset.
     ClearInFlight,
     /// `StateDir::clear_post_seq`, and `StateDir::settle_posts`: an ack pass's landed posts in one
-    /// write, their entries' ends with their reservations' (critic item E07).
+    /// write, their entries' ends with their reservations' (critic item E07), and each landed
+    /// owed receipt's entry end, a group of one (critic item F15; a receipt's reservation is a
+    /// file of its own, whose end is an unlink, [`Row::DirUnlink`]).
     ClearPostSeq,
     /// `StateDir::append_self_acked`.
     AppendSelfAcked,
     /// The mirror pin's fence: the one write of `logpin` an open makes durable
     /// (`StateDir::ensure_logpin_durable`, or the first `StateDir::set_logpin`), its two full
-    /// flushes included (critic item D06).
+    /// flushes included (critic item D06), or orders for its broker's settle
+    /// (`StateDir::order_logpin`, its two barriers included, critic item F07).
     LogpinFence,
     /// Aterm's events queued while the loop was parked.
     WakeEvent,

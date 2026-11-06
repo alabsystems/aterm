@@ -380,11 +380,20 @@ fn hold_clock(at: Instant) {
     HELD_NOW.with(|n| n.set(Some(at)));
 }
 
-/// A reader with [`FAKE_HARDWARE`], reset.
+/// A reader with [`FAKE_HARDWARE`], reset, whose readings name no E or P cluster. Its whole
+/// readings still read this machine's live core counters and process sweep, and on a machine
+/// with E and P clusters, one loaded so its E cores are saturated, its P cores under a quarter
+/// busy and a core's worth runnable, a live reading is the E-busy, P-idle recorder's
+/// observation (`aterm_vitals::hardware`): the recorder then stands pending, and its demand puts
+/// CPU Stats on the next reading, a deck's or an unarmed pull's included, which a test here
+/// expects to take none. With every core in one `CPU` cluster, no live reading is ever that
+/// observation, so the recorder is pending only where a test hands the model its own E/P
+/// samples ([`attach_and_absorb`] with [`e_busy_p_idle`]), whatever the machine is doing.
 fn hardware_reader() -> Reader {
     fake_hardware_reset();
     let mut reader = Reader::new(Arc::default());
     reader.hardware_read = FAKE_HARDWARE;
+    reader.clusters = Vec::new();
     reader
 }
 
@@ -637,25 +646,32 @@ fn cpu_stats_read_only_for_the_cpu_lens_a_pull_or_the_recorder() {
     let mut reader = hardware_reader();
     reader.clock = held_clock;
     let t0 = Instant::now();
+    // Exercise the hardware demands without feeding live CPU counters to the recorder. A
+    // real E-busy, P-idle observation independently asks for hardware, whatever the open lens.
+    let hardware = |reader: &mut Reader, req: &Request| {
+        let mut sample = Sample::default();
+        reader.attach_hardware(&mut sample, req);
+        sample.hardware
+    };
     let lens = Request {
         lenses: vec![Resource::Cpu],
         cadence_ms: 500,
         ..base.clone()
     };
     hold_clock(t0);
-    let sampled = reader.read(&lens).hardware;
+    let sampled = hardware(&mut reader, &lens);
     hold_clock(t0 + half);
-    let carried = reader.read(&lens).hardware;
+    let carried = hardware(&mut reader, &lens);
     assert!(sampled.is_some() && carried == sampled, "the lens carries");
     assert_eq!(fake_hardware_gaps().len(), 1);
     hold_clock(t0 + half * 2);
-    assert!(reader.read(&lens).hardware.is_some());
+    assert!(hardware(&mut reader, &lens).is_some());
     assert_eq!(fake_hardware_gaps().len(), 2, "and samples a second on");
-    assert!(reader.read(&base).hardware.is_none(), "the deck's reading");
-    assert!(reader.read(&unarmed).hardware.is_none(), "an unarmed pull");
+    assert!(hardware(&mut reader, &base).is_none(), "the deck's reading");
+    assert!(hardware(&mut reader, &unarmed).is_none(), "an unarmed pull");
     assert_eq!(fake_hardware_gaps().len(), 2, "neither samples");
     assert!(
-        reader.read(&with(&[], true)).hardware.is_some(),
+        hardware(&mut reader, &with(&[], true)).is_some(),
         "an armed one"
     );
     assert_eq!(fake_hardware_gaps().len(), 3, "control: it samples");
@@ -1015,6 +1031,239 @@ fn readings_of_every_os_map_to_the_models_classes() {
     assert_eq!(gpu_sample(gpu(Some(37), None)).device_pct, Some(37));
 }
 
+/// This Mac's `vm_stat` (MacBook Air, macOS 27.0.1, 32 GiB, 16 KiB pages, 2026-11-05), mapped as
+/// `memory_detail_of` maps it (sysprobe's `this_macs_vm_classes_partition_what_its_queues_hold`).
+const PAGE: u64 = 16_384;
+const SPECULATIVE: u64 = 16_456 * PAGE;
+
+fn this_macs_memory() -> aterm_sysprobe::MemoryDetail {
+    aterm_sysprobe::MemoryDetail {
+        total: 34_359_738_368,
+        free: 8_603 * PAGE,
+        speculative: Some(SPECULATIVE),
+        active: Some(789_779 * PAGE),
+        inactive: Some(772_226 * PAGE),
+        wired: 205_446 * PAGE,
+        compressed: Some(251_323 * PAGE),
+        stored: Some(510_248 * PAGE),
+        purgeable: Some(35_622 * PAGE),
+        file_backed: 957_096 * PAGE,
+        app: (621_365 - 35_622) * PAGE,
+        swap_used: 311 << 20,
+        swap_total: 2 << 30,
+        exact: true,
+        counters: Some(aterm_sysprobe::VmCounters {
+            swapin_bytes: 572_488 * PAGE,
+            swapout_bytes: 1_301_612 * PAGE,
+            decompressions: 393_583_176,
+            compressions: 512_905_413,
+            pageins: 156_709_125,
+            page_bytes: PAGE,
+        }),
+        ..aterm_sysprobe::MemoryDetail::default()
+    }
+}
+
+#[test]
+fn mem_sample_keeps_every_class_and_its_ram_classes_sum_to_total() {
+    let m = mem_sample(this_macs_memory());
+    assert_eq!(
+        (m.wired, m.app, m.compressed, m.stored),
+        (
+            205_446 * PAGE,
+            585_743 * PAGE,
+            Some(251_323 * PAGE),
+            Some(510_248 * PAGE)
+        )
+    );
+    assert_eq!(
+        (m.cached, m.free, m.swap_used),
+        ((957_096 + 35_622) * PAGE, 8_603 * PAGE, 311 << 20)
+    );
+    assert!(m.exact);
+    assert_eq!(m.counters.map(|c| c.page_bytes), Some(PAGE));
+    // The RAM classes and not in VM are the whole of it, and not in VM is what no VM queue
+    // holds: total less wired, the compressor's, active, inactive, speculative and free pages.
+    assert_eq!(m.in_vm() + m.not_in_vm(), m.total);
+    assert_eq!(m.not_in_vm(), 53_319 * PAGE);
+
+    // Negative control: A1's first cache (file-backed + purgeable + speculative) counts the
+    // speculative pages twice, taking them out of not in VM.
+    let doubled = MemSample {
+        cached: m.cached + SPECULATIVE,
+        ..m
+    };
+    assert_eq!(doubled.not_in_vm(), m.not_in_vm() - SPECULATIVE);
+    // Classes that overlap past total are no partition: not in VM stops at zero.
+    let over = MemSample {
+        cached: m.total,
+        ..m
+    };
+    assert_eq!(over.not_in_vm(), 0);
+    assert!(over.in_vm() > over.total);
+
+    // Linux: zswap's pool and what it stores; not in VM is what its classes leave unnamed.
+    let linux = mem_sample(aterm_sysprobe::MemoryDetail {
+        total: 32 << 30,
+        free: 2 << 30,
+        app: 9 << 30,
+        shared: Some(1 << 30),
+        wired: 1 << 30,
+        compressed: Some(1 << 30),
+        stored: Some(3 << 30),
+        file_backed: 11 << 30,
+        ..aterm_sysprobe::MemoryDetail::default()
+    });
+    assert_eq!((linux.stored, linux.exact), (Some(3 << 30), false));
+    assert_eq!(linux.in_vm() + linux.not_in_vm(), linux.total);
+    assert_eq!(linux.not_in_vm(), 7 << 30);
+
+    // This machine, now.
+    #[cfg(target_os = "macos")]
+    {
+        let live = mem_sample(aterm_sysprobe::memory_detail().expect("macOS reads its VM"));
+        assert!(live.exact && live.stored.is_some(), "{live:?}");
+        assert!(live.in_vm() <= live.total, "{live:?}");
+        assert_eq!(live.in_vm() + live.not_in_vm(), live.total);
+    }
+}
+
+/// THE BLOCK READER IS ASKED FOR HOME'S MOUNT AND THE FRONT TAB'S, EACH ONCE: a front directory
+/// on another local mount is asked beside home's, one under home's mount (the usual case) is not
+/// asked again, and one on a mount a reading does not read (a share, the automounter's, an
+/// incomplete table's) is not asked. NEGATIVE CONTROL: drop the front directory, or the dedupe,
+/// and the first or second arm fails.
+#[test]
+#[cfg(unix)]
+fn the_block_reader_is_asked_for_homes_mount_and_the_front_tabs_each_once() {
+    use aterm_sysprobe::volumes::{Mount, Table};
+    let mount = |on: &str, from: &str, local, automounted| Mount {
+        on: PathBuf::from(on),
+        from: from.to_owned(),
+        fstype: "apfs".to_owned(),
+        local,
+        automounted,
+        removable: false,
+        read_only: false,
+        container: None,
+    };
+    let table = Table {
+        mounts: vec![
+            mount("/", "/dev/disk3s1s1", true, false),
+            mount("/System/Volumes/Data", "/dev/disk3s5", true, false),
+            mount("/Volumes/Work", "/dev/disk5s1", true, false),
+            mount("/Volumes/Share", "//me@nas/share", false, false),
+            mount("/auto", "map auto", true, true),
+        ],
+        complete: true,
+        firmlinks: vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )],
+    };
+    let home = Path::new("/Users//a");
+    let asked = |front: Option<&str>, table: &Table| -> Vec<PathBuf> {
+        block_mounts(home, front.map(Path::new), table)
+            .into_iter()
+            .map(|m| m.on.clone())
+            .collect()
+    };
+    let data = PathBuf::from("/System/Volumes/Data");
+    assert_eq!(asked(None, &table), std::slice::from_ref(&data));
+    assert_eq!(
+        asked(Some("/Volumes/Work/proj"), &table),
+        [data.clone(), PathBuf::from("/Volumes/Work")],
+        "another volume's mount, beside home's"
+    );
+    assert_eq!(
+        asked(Some("/usr/bin"), &table),
+        [data.clone(), PathBuf::from("/")],
+        "another volume of home's container is another mount; the reader reads its device once"
+    );
+    assert_eq!(
+        asked(Some("/Users//a/src/aterm"), &table),
+        std::slice::from_ref(&data),
+        "under home's mount: asked once"
+    );
+    for front in ["/Volumes/Share/x", "/auto/x", "relative"] {
+        assert_eq!(
+            asked(Some(front), &table),
+            std::slice::from_ref(&data),
+            "{front}"
+        );
+    }
+    let mut incomplete = table;
+    incomplete.complete = false;
+    assert!(asked(Some("/Volumes/Work/proj"), &incomplete).is_empty());
+}
+
+/// The same through `machine_volumes` and the live reader on this Mac: the reader is asked for
+/// what [`block_mounts`] gives, and reads a device once however its volumes are asked.
+/// NEGATIVE CONTROL: a front directory on devfs is asked and reads no device.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_front_tabs_device_reads_beside_homes_only_when_it_is_another() {
+    let mut reader = aterm_sysprobe::blockio::BlockReader::new();
+    let mut read = |front: Option<&str>| {
+        let mut asked = Vec::new();
+        let volumes = machine_volumes(Path::new("/Users"), false, front.map(Path::new), |m| {
+            asked = m.iter().map(|m| m.on.clone()).collect();
+            reader.read(m)
+        });
+        let ids: Vec<String> = volumes.block.iter().map(|b| b.id.clone()).collect();
+        (asked, ids, volumes.home.is_some())
+    };
+    let data = PathBuf::from("/System/Volumes/Data");
+    let (asked, alone, home_read) = read(None);
+    assert_eq!(asked, std::slice::from_ref(&data));
+    assert_eq!(alone.len(), 1, "home's device");
+    assert!(home_read);
+    // A front tab under home's volume: home's mount, once.
+    let (asked, ids, _) = read(Some("/private/var/tmp"));
+    assert_eq!((asked, ids), (vec![data.clone()], alone.clone()));
+    // A front tab on another volume of home's device: both mounts asked, one device read.
+    let (asked, ids, _) = read(Some("/usr/bin"));
+    assert_eq!(asked, [data.clone(), PathBuf::from("/")]);
+    assert_eq!(ids, alone);
+    // Negative control: devfs is a local mount with no block device: asked, and reads none.
+    let (asked, ids, _) = read(Some("/dev"));
+    assert_eq!(asked, [data, PathBuf::from("/dev")]);
+    assert_eq!(ids, alone);
+}
+
+/// THE FRONT TAB'S DIRECTORY IS ITS FOCUSED PANE'S REPORT, MADE ON THIS MACHINE: a report naming
+/// no host, `localhost` or this machine's name is the request's front directory; one a shell
+/// over ssh made on another host is none, since this machine's mount table does not hold it.
+/// NEGATIVE CONTROL: take the report whatever host made it, and the last arm fails.
+#[test]
+fn the_front_dir_is_the_front_tabs_report_made_on_this_machine() {
+    let app = crate::App::headless_for_test();
+    let front = |report: &str| {
+        let s = app.pool.get(0).expect("session 0");
+        crate::term_lock(&s.term).process(format!("\x1b]7;{report}\x07").as_bytes());
+        app.vitals_request(FOCUSED_PERIOD, false).front_dir
+    };
+    assert_eq!(
+        front("file:///Volumes/Work/a"),
+        Some(PathBuf::from("/Volumes/Work/a"))
+    );
+    assert_eq!(
+        front("file://localhost/Volumes/Work/b"),
+        Some(PathBuf::from("/Volumes/Work/b"))
+    );
+    if let Some(name) = aterm_uds::process::host_name().filter(|n| {
+        !n.is_empty()
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    }) {
+        assert_eq!(
+            front(&format!("file://{name}/Volumes/Work/c")),
+            Some(PathBuf::from("/Volumes/Work/c"))
+        );
+    }
+    assert_eq!(front("file://build-box.invalid/Volumes/Work/d"), None);
+}
+
 #[test]
 fn the_new_readings_reach_the_model() {
     let g = gpu_sample(aterm_sysprobe::GpuReading {
@@ -1222,7 +1471,7 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     };
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
-        Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) => 0,
+        Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) | Msg::Told(_) => 0,
     };
     assert!(host.offer(request(1)));
     assert!(
@@ -1380,15 +1629,26 @@ fn the_fullest_peaks_file_fits_its_bound() {
             .collect(),
         read_s: u32::MAX,
     };
+    // Every row the model keeps: the fixed ones and each kept device's write and read (A1 §9),
+    // each at its widest.
     let fullest = Peaks {
         net_rx: widest(),
         net_tx: widest(),
         tokens: widest(),
+        mem_churn: widest(),
+        disks: (0..aterm_vitals::units::DISK_DEVICES_KEPT as u64)
+            .map(|n| aterm_vitals::DiskPeaks {
+                id: format!("{:016x}", u64::MAX - n),
+                write: widest(),
+                read: widest(),
+            })
+            .collect(),
     };
     let text = peaks_json(&fullest).expect("text");
     assert!(
-        text.len() as u64 <= PEAKS_MAX_BYTES,
-        "{} bytes over the {PEAKS_MAX_BYTES}-byte bound reads as no peaks at all",
+        text.len() as u64 * 100 <= PEAKS_MAX_BYTES * 85,
+        "{} bytes over 85 % of the {PEAKS_MAX_BYTES}-byte bound, past which a file reads as no \
+         peaks at all",
         text.len()
     );
     let dir = aterm_tempfile::tempdir().expect("scratch state");
@@ -1574,6 +1834,62 @@ fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
     let now = unix_ms_now();
     let kept = FreeFile::open(Some(path), Instant::now(), now).1;
     assert_eq!(read_of(&kept, now), [9_000, 7_000], "an hour ago, then now");
+}
+
+/// A source that says what the thread handed it of the host's tellings: each `note_told`, and the
+/// stop's (`true`).
+struct Tells {
+    vitals: aterm_vitals::Vitals,
+    heard: std::sync::mpsc::Sender<(bool, Vec<u64>)>,
+}
+
+impl Source for Tells {
+    fn reading(&mut self, _req: &Request) -> Snapshot {
+        Snapshot::default()
+    }
+
+    fn model(&mut self) -> &mut aterm_vitals::Vitals {
+        &mut self.vitals
+    }
+
+    fn note_told(&mut self, told: &[u64]) {
+        let _ = self.heard.send((false, told.to_vec()));
+    }
+
+    fn at_stop(&mut self, told: &[u64]) {
+        let _ = self.heard.send((true, told.to_vec()));
+    }
+}
+
+/// THE PROBE THREAD HANDS THE PASS THE HOST'S TELLINGS: a `Told` the host sends reaches the pass at
+/// once, with no reading asked, and the stop gets the host's last tellings, sent as it hangs up,
+/// for its one write, with no write of their own before it. NEGATIVE CONTROL: send no tellings as
+/// the host hangs up, and the stop gets the earlier ones.
+#[test]
+fn the_probe_thread_hands_the_pass_the_hosts_tellings() {
+    let (heard, hears) = std::sync::mpsc::channel();
+    let mut host = VitalsHost::default();
+    host.start(
+        move || Tells {
+            vitals: aterm_vitals::Vitals::new(),
+            heard,
+        },
+        || true,
+        None,
+        None,
+    );
+    assert!(host.offer(Msg::Told(vec![7])));
+    assert_eq!(
+        hears.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok((false, vec![7])),
+        "at once"
+    );
+    host.left_told.extend([7, 9]);
+    assert!(
+        host.stop_at_exit(aterm_spec::wait::MUST_HAPPEN),
+        "the thread ended"
+    );
+    assert_eq!(hears.try_iter().collect::<Vec<_>>(), [(true, vec![7, 9])]);
 }
 
 struct Moves {
@@ -5509,6 +5825,51 @@ fn the_test_reader_never_reads_the_thermal_state() {
     }
 }
 
+/// The Neural Engine reader rides every reading, a whole one and a hidden one, beside the GPU,
+/// and its latest answer reaches the snapshot as it is, the self-check that retired it included
+/// (A2 §3.1). A unit test's reader reads no registry. NEGATIVE CONTROL: the reader's source
+/// switched off at the next reading reads off there.
+#[test]
+fn the_neural_engine_reading_rides_every_reading_into_the_snapshot() {
+    use aterm_sysprobe::neural_engine::{Entry, Power, Reader as AneReader, Source};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ON: AtomicBool = AtomicBool::new(true);
+    let mut reader = Reader::new(Arc::default());
+    let req = Request {
+        self_pid: std::process::id(),
+        ..Request::default()
+    };
+    assert!(reader.ane.is_none(), "a test's reader reads no registry");
+    assert_eq!(reader.read(&req).ane, None);
+    reader.ane = Some(AneReader::on(Source {
+        entry: || Some(Entry { cores: Some(16) }),
+        power: || Power {
+            current: Some(i64::from(ON.load(Ordering::Relaxed))),
+            max: Some(1),
+        },
+    }));
+    let on = Some(Ok(AneSample {
+        cores: 16,
+        powered: true,
+    }));
+    assert_eq!(reader.read(&req).ane, on, "a whole reading");
+    assert_eq!(reader.read_machine(&req).ane, on, "a hidden reading");
+    ON.store(false, Ordering::Relaxed);
+    assert_eq!(
+        reader.read_machine(&req).ane,
+        Some(Ok(AneSample {
+            cores: 16,
+            powered: false
+        })),
+        "CONTROL: off at the next reading"
+    );
+    reader.ane = Some(AneReader::on(Source {
+        entry: || None,
+        power: Power::default,
+    }));
+    assert_eq!(reader.read(&req).ane, Some(Err(AneCheck::Matched)));
+}
+
 /// The OS's exact thermal state, Low Power Mode with it, wins over the counter reader's
 /// estimate, which stands in only where the OS says nothing.
 #[test]
@@ -6557,7 +6918,7 @@ fn marks_after_an_unclean_strip(handed_off: bool) -> (Vec<GapKind>, usize) {
 
 /// [`STRIP_LOCK`] in `dir` held by another open description, as a live peer's probe thread holds it.
 fn a_peer_holds_the_strip_lock(dir: &Path) -> crate::native_document_host::HeldAdvisoryLock {
-    let file = open_strip_lock(&dir.join(STRIP_LOCK)).expect("the strip lock opens");
+    let file = open_lock_file(&dir.join(STRIP_LOCK)).expect("the strip lock opens");
     crate::native_document_host::HeldAdvisoryLock::try_lock(file).expect("the peer takes the lock")
 }
 
@@ -7375,6 +7736,8 @@ fn leftovers_view(gone_ms: u64) -> aterm_vitals::left::LeftView {
             closed_ms,
             agent_spans: Vec::new(),
             left: 6,
+            restored: false,
+            told: false,
         }],
         as_of_ms: closed_ms + gone_ms,
         ..LeftView::default()

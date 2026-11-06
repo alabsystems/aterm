@@ -5886,7 +5886,7 @@ pub mod trustd {
                 let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                 while !keeper.held() {
                     assert!(Instant::now() < deadline, "the keeper took no grant");
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 assert_eq!(keeper.lost(), 0, "a held grant is not lost");
                 if trustd_ends {
@@ -5901,7 +5901,7 @@ pub mod trustd {
                             Instant::now() < deadline,
                             "the grant trustd ended is not lost"
                         );
-                        std::thread::yield_now();
+                        aterm_uds::deadline::poll_yield();
                     }
                     trustd.join().unwrap();
                     drop(keeper);
@@ -5980,7 +5980,7 @@ pub mod trustd {
             let deadline = Instant::now() + Duration::from_secs(60);
             while !stop.load(Ordering::SeqCst) {
                 assert!(Instant::now() < deadline, "drop never stopped the worker");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             start_tx.send(()).unwrap();
             ended_rx
@@ -7660,7 +7660,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root never started its child"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(
             runs_from(under.pid, &readable("/bin/sleep")),
@@ -8500,7 +8500,7 @@ mod tests {
                 let _ = check.wait();
                 break None;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(ended.is_some(), "the stale check outlived its reap");
         for n in 1..=3 {
@@ -9661,7 +9661,7 @@ mod tests {
                 let _ = check.wait();
                 break None;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(ended.is_some(), "the orphan's check outlived its root");
         for kept in [
@@ -10173,7 +10173,7 @@ mod tests {
             if Instant::now() >= deadline {
                 return false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -10202,7 +10202,7 @@ mod tests {
                 "the root never left an orphan outside its tree ({})",
                 file.display()
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -10222,7 +10222,7 @@ mod tests {
                     .status();
                 return false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         true
     }
@@ -10307,7 +10307,7 @@ mod tests {
                 if Instant::now() >= deadline {
                     return false;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
         }
 
@@ -10320,7 +10320,7 @@ mod tests {
                 if Instant::now() >= deadline {
                     return false;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             true
         }
@@ -10379,7 +10379,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root never started its subshell"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         let left = Leftover::new(left);
         let quiet = child.stdin.take().unwrap();
@@ -11237,7 +11237,7 @@ mod tests {
                 let _ = cat.wait();
                 break false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         drop(input);
         assert!(killed, "the process listed was not signalled");
@@ -11563,7 +11563,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root never started its child"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         let left = Leftover::new(left);
         assert!(
@@ -11594,7 +11594,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the killed root was never reaped"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert_eq!(ended.code, 128 + proc_tree::SIGKILL);
         let held = held_slots(d.path());
@@ -11677,7 +11677,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root never started its member"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         reap_stale_checks(&root);
         assert!(
@@ -11825,7 +11825,7 @@ mod tests {
                 let _ = tab.wait();
                 panic!("the terminal's shell never exited");
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let pid =
             |file: &Path| -> u32 { fs::read_to_string(file).unwrap().trim().parse().unwrap() };
@@ -11914,7 +11914,7 @@ mod tests {
                 let _ = check.wait();
                 break false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(root_ended, "the live root outlived the reap");
         assert!(
@@ -11982,7 +11982,7 @@ mod tests {
                 break ended;
             }
             assert!(Instant::now() < deadline, "the root never exited");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert_eq!(ended.code, 0);
         assert!(
@@ -12137,7 +12137,7 @@ mod tests {
                 let _ = live.wait();
                 break false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(ended, "a reap that reads ends the check");
         reap_until_gone(
@@ -12320,7 +12320,7 @@ mod tests {
                 let _ = child.wait();
                 break false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(ended, "once its run is gone, the reap ends the check");
         reap_until_gone(
@@ -12499,7 +12499,7 @@ mod tests {
             != aterm_uds::process::ProcessPresence::Exited
         {
             assert!(Instant::now() < deadline, "the child never exited");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let mark = proc_tree::Mark {
             nonce: Some(nonce()),
@@ -12742,7 +12742,7 @@ mod tests {
                 break ended;
             }
             assert!(Instant::now() < deadline, "the check never ended");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert_eq!(ended.code, 0);
         reap_until_gone(
@@ -12878,7 +12878,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root outlived its lane by a minute: {state:?}"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(
             !d.path().join("ran").exists(),
@@ -12965,7 +12965,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the root never started its member"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(
             runs_from(member, Path::new("/bin/sleep")),
@@ -13367,7 +13367,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the grandchild never led a group of its own, or the orphan never left the tree"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(
             runs_from(orphan.pid, &readable("/bin/sleep")),
@@ -13443,7 +13443,7 @@ mod tests {
                 break ended;
             }
             assert!(Instant::now() < deadline, "true never exited");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         proc_tree::LISTED.with(|l| *l.borrow_mut() = None);
         assert_eq!((ended.code, exited.end()), (0, ended));
@@ -13492,7 +13492,7 @@ mod tests {
                 break ended;
             }
             assert!(Instant::now() < deadline, "the root never exited");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert_eq!(ended.code, 101);
         assert!(
@@ -13755,7 +13755,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !keeper.held() {
             assert!(Instant::now() < deadline, "the keeper took no grant");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert_eq!(fs::read_to_string(&grants).unwrap(), "1\n");
         drop(keeper);
@@ -13766,7 +13766,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the keeper said nothing of another build"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!other.held(), "no grant on another build's trustd");
         drop(other);

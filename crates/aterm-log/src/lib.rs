@@ -759,6 +759,10 @@ mod tests {
             let since = std::time::Instant::now();
             while PARKS.load(Ordering::SeqCst) < times {
                 assert!(since.elapsed() < hang, "the waiter never parked");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a test's poll for what must happen, bounded by its hang detector, which no deadline waits on; this crate's tests do not link aterm_uds::deadline::poll_yield"
+                )]
                 std::thread::yield_now();
             }
         };
@@ -766,6 +770,10 @@ mod tests {
             let since = std::time::Instant::now();
             while !waiter.is_finished() {
                 assert!(since.elapsed() < hang, "the wait never ended");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a test's poll for what must happen, bounded by its hang detector, which no deadline waits on; this crate's tests do not link aterm_uds::deadline::poll_yield"
+                )]
                 std::thread::yield_now();
             }
             waiter.join().expect("the waiter")

@@ -25,7 +25,7 @@ pub const MAX_WRITER_BYTES: usize = 8 * 1024 * 1024;
 
 /// One key change within a locally atomic transaction. `None` is a permanent stop
 /// in the private database and reversible absence in Commons account proposals.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Change {
     /// Named application collection.
     pub collection: String,
@@ -484,18 +484,30 @@ impl History {
     /// Signed author/time/causal metadata without decrypted application contents.
     /// Display names resolve through the machine registry rather than becoming identity.
     pub fn provenance(&self, id: &Digest) -> Option<Value> {
+        let projection = self.project(&BTreeSet::new());
+        self.provenance_with(id, &projection.quarantined, |id| {
+            projection.ordered.contains(id)
+        })
+    }
+
+    pub(crate) fn provenance_with(
+        &self,
+        id: &Digest,
+        quarantined: &BTreeSet<Actor>,
+        is_ordered: impl FnOnce(&Digest) -> bool,
+    ) -> Option<Value> {
         let opened = self
             .records
             .get(id)
             .map(|(o, _)| o)
             .or_else(|| self.refused.get(id).map(|(o, _)| o))?;
-        let projection = self.project(&BTreeSet::new());
-        let reverts = self.command(id).and_then(|(_, c)| match c {
+        let command = self.command(id).map(|(_, c)| c);
+        let reverts = command.and_then(|c| match c {
             Command::Revert { operation, .. } => Some(hex::encode_lower(operation)),
             _ => None,
         });
         Some(
-            json!({"operation":hex::encode_lower(id),"writer_key":hex::encode_lower(&opened.header.actor[..32]),"writer_incarnation":hex::encode_lower(&opened.header.actor[32..]),"sequence":opened.header.sequence,"previous":opened.header.previous.as_ref().map(|id|hex::encode_lower(id)),"parents":opened.header.parents.iter().map(|id|hex::encode_lower(id)).collect::<Vec<_>>(),"authored_at_unix_ms":opened.authored_at_unix_ms,"time_source":"signed-author-claim","request":self.command(id).map(|(_,c)|hex::encode_lower(&c.request())),"reverts":reverts,"refused":self.refused.get(id).map(|(_,why)|why.as_str()),"quarantined":projection.quarantined.contains(&opened.header.actor),"causally_ready":projection.ordered.contains(id)}),
+            json!({"operation":hex::encode_lower(id),"writer_key":hex::encode_lower(&opened.header.actor[..32]),"writer_incarnation":hex::encode_lower(&opened.header.actor[32..]),"sequence":opened.header.sequence,"previous":opened.header.previous.as_ref().map(|id|hex::encode_lower(id)),"parents":opened.header.parents.iter().map(|id|hex::encode_lower(id)).collect::<Vec<_>>(),"authored_at_unix_ms":opened.authored_at_unix_ms,"time_source":"signed-author-claim","request":command.map(|c|hex::encode_lower(&c.request())),"reverts":reverts,"refused":self.refused.get(id).map(|(_,why)|why.as_str()),"quarantined":quarantined.contains(&opened.header.actor),"causally_ready":is_ordered(id)}),
         )
     }
     /// Exact command and author, for typed budget and retry handling.
@@ -576,7 +588,7 @@ impl History {
     }
     /// The causal projection. Where every member can mint a writer, one member's fork must not
     /// withhold what the others wrote after seeing it.
-    fn project(&self, excluded: &BTreeSet<Digest>) -> Projection {
+    pub(crate) fn project(&self, excluded: &BTreeSet<Digest>) -> Projection {
         if self.no_authority {
             self.project_own_effects(excluded)
         } else {
@@ -715,11 +727,16 @@ impl History {
         let mut duplicate_effects = BTreeSet::new();
         let mut request_conflicts = BTreeSet::new();
         for ids in requests.values_mut() {
+            if ids.len() <= 1 {
+                continue;
+            }
             ids.sort_by_key(|id| self.index.get(id).map(|h| (h.sequence, h.id)));
             if let Some(first) = ids.first() {
-                if ids.iter().any(|id| {
-                    self.command(id).map(|(_, c)| c) != self.command(first).map(|(_, c)| c)
-                }) {
+                let first_cmd = self.command(first).map(|(_, c)| c);
+                if ids[1..]
+                    .iter()
+                    .any(|id| self.command(id).map(|(_, c)| c) != first_cmd)
+                {
                     request_conflicts.extend(ids.iter().copied());
                     authority_fault |= ids
                         .iter()
@@ -757,6 +774,7 @@ impl History {
             .collect();
         let causal = self.project(&excluded);
         let eligible: BTreeSet<_> = causal.ordered.iter().copied().collect();
+        let evidence_ordered: BTreeSet<_> = evidence.ordered.iter().copied().collect();
         let mut view = View {
             causal,
             revocations,
@@ -787,7 +805,7 @@ impl History {
                     *known = (*known).max(*cumulative);
                     let sum = debit_sums.entry(share).or_default();
                     *sum = sum.saturating_add(*cost);
-                    if !evidence.ordered.contains(id)
+                    if !evidence_ordered.contains(id)
                         || authority_fault
                         || view.invalid.contains(id)
                     {
@@ -811,7 +829,7 @@ impl History {
             if let Command::Budget { shares, .. } = command {
                 // Retaining an allocation reserves its name, but cannot authorize
                 // work before its required authority history is projected.
-                let grant_eligible = evidence.ordered.contains(grant);
+                let grant_eligible = evidence_ordered.contains(grant);
                 for actor in shares
                     .keys()
                     .filter(|actor| !grant_eligible || refused_actors.contains(*actor))
@@ -882,7 +900,7 @@ impl History {
                     let limit = match self.records.get(grant) {
                         Some((_, Command::Budget { name, shares, .. }))
                             if self.index.observes(id, grant)
-                                && evidence.ordered.contains(grant)
+                                && evidence_ordered.contains(grant)
                                 && view.budgets.get(name).is_some_and(|g| g.len() == 1) =>
                         {
                             shares.get(&opened.header.actor).copied()
@@ -940,18 +958,21 @@ fn keys(v: &Value, keys: &[&str]) -> Result<()> {
 }
 /// Decode a bounded, canonical lowercase hex identifier.
 pub fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
-    if text.len() != N * 2
-        || !text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if text.len() != N * 2 {
         return Err(Error::new("invalid database hex identifier"));
     }
+    let lower_nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
     let mut out = [0; N];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (hex::nibble(text.as_bytes()[i * 2]).ok_or_else(|| Error::new("invalid hex"))?
-            << 4)
-            | hex::nibble(text.as_bytes()[i * 2 + 1]).ok_or_else(|| Error::new("invalid hex"))?;
+    for (byte, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+        let high =
+            lower_nibble(pair[0]).ok_or_else(|| Error::new("invalid database hex identifier"))?;
+        let low =
+            lower_nibble(pair[1]).ok_or_else(|| Error::new("invalid database hex identifier"))?;
+        *byte = (high << 4) | low;
     }
     Ok(out)
 }

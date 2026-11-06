@@ -3,7 +3,7 @@
 
 //! Census guard ensuring `PromptGrant` is minted only from configured policy.
 
-use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
+use super::rules::{CENSUS_CRATE, PRODUCT};
 use super::{Bound, Finding, Rule, Tree, after_ws, calls, has, hits};
 
 const HOME: &str = "crates/aterm-agent/src/supervise/config.rs";
@@ -30,7 +30,7 @@ pub(super) const PROMPT_GRANT: Rule = Rule {
 fn prompt_grant(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
         if file.rel.starts_with(CENSUS_CRATE)
-            || test_path(&file.rel)
+            || tree.corpus.test_code().holds(&file.rel)
             || !file.mentions(&[GRANT, "grant("])
         {
             continue;
@@ -65,7 +65,11 @@ fn builds_the_type(code: &str) -> bool {
 
 fn asks_a_mode(code: &str) -> bool {
     calls_grant(code)
-        && (code.to_ascii_lowercase().contains("occupancy") || has(code, GRANT, Bound::Word))
+        && (code
+            .as_bytes()
+            .windows(b"occupancy".len())
+            .any(|w| w.eq_ignore_ascii_case(b"occupancy"))
+            || has(code, GRANT, Bound::Word))
 }
 
 fn calls_grant(code: &str) -> bool {

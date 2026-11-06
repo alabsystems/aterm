@@ -120,7 +120,9 @@ fn read_app_menu_bar(mtm: MainThread) -> Vec<String> {
             };
             out = match menu_items(main) {
                 None => vec!["menu (none)".to_string()],
-                Some(tops) => bar_lines(tops.into_iter().map(|top| {
+                // A hidden top menu (the machine title before its first read) is no menu the
+                // bar shows, so it gets no line.
+                Some(tops) => bar_lines(tops.into_iter().filter(|top| !top.unshown()).map(|top| {
                     let title = appkit::nsstring_to_rust(appkit::send_id(top.0, sel!(title)));
                     (title, top.submenu())
                 })),

@@ -66,12 +66,18 @@ fn refused_live_config_withdraws_existing_drive_grants() {
     }
 }
 
+#[path = "node_serve_tests/bus_log.rs"]
+mod bus_log;
 #[path = "node_serve_tests/fresh_enrollment.rs"]
 mod fresh_enrollment;
 #[path = "node_serve_tests/held_logs.rs"]
 mod held_logs;
 #[path = "node_serve_tests/mesh_links.rs"]
 mod mesh_links;
+#[path = "node_serve_tests/presence.rs"]
+mod presence;
+#[path = "node_serve_tests/vault_pass.rs"]
+mod vault_pass;
 
 struct MockWindowLauncher {
     logged_in: AtomicBool,
@@ -571,6 +577,78 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
 }
 
 /// A windowless node job over `state` on an ephemeral loopback port, admitting by `members`.
+/// The node job serves the drive grants of its fleet state only while that state was taken under
+/// the vault configured (`aterm_agent::fleet_vault`, ATERM-KI-1105-10): beside a record of another
+/// vault its listener serves no grant, `"*"` included, so no member drives this Mac by one; under
+/// the vault recorded, and in a job that reads no vault, it serves them as before.
+///
+/// NEGATIVE CONTROL (2026-11-05): `node_serving` serving `node_serving_now`'s grants unfiltered
+/// (`super::in_effect` dropped) fails "a fleet state taken under another vault serves no grant".
+#[cfg(unix)]
+#[test]
+fn the_node_job_serves_no_grant_beside_a_fleet_taken_under_another_vault() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let _ = seed_fleet_node(&state);
+    let vault = aterm_secrets::client::Paths::for_home(root.path());
+    let configure = |name: &str, signer: u8| {
+        aterm_secrets::fsx::ensure_private_dir(&vault.dir).unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &vault.dir.join("source.toml"),
+            format!(
+                "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = \"{}\"\n\
+                 host = \"m22\"\n",
+                aterm_secrets::b64::encode_padded(&[signer; 32])
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+    };
+    configure("alab", 1);
+    aterm_agent::fleet_vault::keep(&state, Some(&vault));
+    assert!(
+        aterm_net::fleet_member::read_vault(&state)
+            .unwrap()
+            .is_some(),
+        "PRECONDITION: the fleet state records the vault \"alab\""
+    );
+    let config = root.path().join("aterm.toml");
+    crate::test_scratch::write_config(
+        &config,
+        "[fleet]\nlisten = \"127.0.0.1:7999\"\nallow = \"drive\"\ndrive_from = [\"*\"]\n",
+    );
+    let running = super::default_node_wanted();
+    let serving = super::node_serving(
+        (Some(config.clone()), state.clone(), Some(vault.clone())),
+        running.clone(),
+        running.clone(),
+    );
+    assert_eq!(
+        serving().grants.len(),
+        1,
+        "PRECONDITION: the default grant, under the vault it was taken under"
+    );
+    configure("other", 9);
+    assert_eq!(
+        serving().grants,
+        Vec::new(),
+        "a fleet state taken under another vault serves no grant"
+    );
+    let unread = super::node_serving((Some(config), state, None), running.clone(), running);
+    assert_eq!(
+        unread().grants.len(),
+        1,
+        "a job that reads no vault serves its grants as before"
+    );
+    configure("alab", 1);
+    assert_eq!(
+        serving().grants.len(),
+        1,
+        "CONTROL: the vault recorded again"
+    );
+}
+
 fn serve_node(
     root: &Path,
     relay_dir: &Path,
@@ -1216,6 +1294,24 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
 }
 
+/// A loopback listener whose port no other socket can take once it is closed, so a test can
+/// bind that port again to show it was let go. Its port is below the range the kernel hands a
+/// bind of port 0 (49152 and up on macOS, 32768 and up on Linux), so another test's ephemeral
+/// bind never lands on it; and it is made under [`aterm_uds::kept_out`], as the node job's own
+/// sockets are, so no concurrent spawn's child holds a copy of it. A port another process holds
+/// is passed over, so the first free one from a start this process's id picks is taken.
+fn listener_no_port_zero_bind_takes() -> TcpListener {
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    let start = std::process::id() % SPAN;
+    (0..256)
+        .filter_map(|step| u16::try_from(FIRST + (start + step) % SPAN).ok())
+        .find_map(|port| {
+            aterm_uds::kept_out(|| TcpListener::bind((Ipv4Addr::LOCALHOST, port))).ok()
+        })
+        .expect("a free loopback port below the ephemeral range")
+}
+
 #[test]
 fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1223,7 +1319,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     let state_dir = root.path().join("state");
     let _ = seed_fleet_node(&state_dir);
 
-    let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let prebound = listener_no_port_zero_bind_takes();
     let addr = prebound.local_addr().unwrap();
     let config_path = root.path().join("aterm.toml");
     crate::test_scratch::write_config(
@@ -1300,7 +1396,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     stop.store(true, Ordering::Release);
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
     assert!(!node_job_holds_lock(&state_dir));
-    TcpListener::bind(addr).expect("GUI can bind port once node job stops");
+    aterm_uds::kept_out(|| TcpListener::bind(addr)).expect("GUI can bind port once node job stops");
 }
 
 #[test]
@@ -1835,6 +1931,129 @@ fn the_node_job_gives_up_the_account_claims_as_it_stops_only_while_no_window_run
 /// finds its relay directory, and where its `off` writes its marker.
 const OFF_RELAY: &str = "ATERM_TEST_NODE_CLAIMS_OFF_RELAY";
 const OFF_MARKER: &str = "ATERM_TEST_NODE_CLAIMS_OFF_MARKER";
+
+/// A real quit signal closes both weak-tier logs. The unarmed child is the negative control:
+/// reopening at an unknown boot must move its generation after an unclean stop.
+#[test]
+fn a_sigterm_closes_and_flushes_both_mesh_logs() {
+    use aterm_mesh::logs::{MeshConfig, MeshLog};
+    use std::os::unix::process::ExitStatusExt as _;
+    const STATE: &str = "ATERM_TEST_QUIT_MESH_STATE";
+    const ARMED: &str = "ATERM_TEST_QUIT_MESH_ARMED";
+    if let Some(state) = std::env::var_os(STATE) {
+        let state = std::path::PathBuf::from(state);
+        let mesh = aterm_mesh::Mesh::open(MeshConfig {
+            state_dir: state.clone(),
+            backups: aterm_uds::backup::Backups::INERT,
+            clock: aterm_net::fleet::link::ManualClock::new(),
+            wall: std::sync::Arc::new(std::time::SystemTime::now),
+            standings: std::sync::Arc::new(|| None),
+            changed: None,
+            watch_every: aterm_spec::wait::MUST_HAPPEN,
+            observe: None,
+        })
+        .expect("mesh opens");
+        let identity = aterm_net::fleet_member::read_node_identity(&state)
+            .unwrap()
+            .unwrap();
+        mesh.apply(aterm_mesh::logs::Standings {
+            current: [*identity.key().bytes()].into(),
+            ..Default::default()
+        });
+        for log in MeshLog::ALL {
+            let subject = match log {
+                MeshLog::Tables => format!("/t/quit/{}", mesh.principal()),
+                MeshLog::Metrics => format!("/m/{}/shared/quit", mesh.principal()),
+            };
+            mesh.publish(log, &subject, b"kept at quit")
+                .expect("published");
+            std::fs::write(
+                state.join(log.word()),
+                mesh.broker(log).log_identity().generation.to_string(),
+            )
+            .expect("generation recorded");
+            std::fs::write(
+                state.join(format!("{}-head", log.word())),
+                mesh.broker(log).head().to_string(),
+            )
+            .expect("acknowledged head recorded");
+            if mesh.broker(log).served_durability().served == astream_broker::Tier::Strict {
+                std::fs::write(state.join(format!("{}-strict", log.word())), b"")
+                    .expect("served tier");
+            }
+        }
+        if std::env::var_os(ARMED).is_some() {
+            arm_claims_off_on_quit(state.join("relay"), || {});
+        }
+        let pid = libc::pid_t::try_from(std::process::id()).expect("pid");
+        // SAFETY: signal this test's stand-in process itself.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        std::thread::sleep(aterm_spec::wait::MUST_HAPPEN);
+        panic!("quit did not end the child");
+    }
+    for (armed, long_path) in [(false, false), (true, false), (false, true), (true, true)] {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("mq")
+            .tempdir_in("/tmp")
+            .expect("short socket paths");
+        let state_path = scratch.path().join(if long_path {
+            "s".repeat(110)
+        } else {
+            "s".to_owned()
+        });
+        let state = state_path.as_path();
+        aterm_uds::private_file::ensure_private_dir(state).expect("scratch state");
+        aterm_uds::private_file::write_private(
+            state,
+            aterm_net::fleet_member::NODE_KEY_FILE,
+            format!("{}\n", "17".repeat(32)).as_bytes(),
+        )
+        .expect("test node key");
+        aterm_net::fleet_member::node_identity(state).expect("test node identity");
+        let mut child = crate::test_alone::StandIn::this_test();
+        child.command().env(STATE, state);
+        if armed {
+            child.command().env(ARMED, "1");
+        }
+        let ran = child.spawn().selected();
+        assert_eq!(
+            ran.status.expect("child exited").signal(),
+            Some(libc::SIGTERM),
+            "{}",
+            ran.stderr
+        );
+        for log in MeshLog::ALL {
+            let path = state.join("mesh").join(log.word()).join(log.file());
+            let prepared = aterm_link::at_rest::prepare(&path, aterm_uds::backup::Backups::INERT)
+                .expect("seal");
+            let mut opts = match log {
+                MeshLog::Tables => aterm_link::durability::Durability::Ordered.options(),
+                MeshLog::Metrics => aterm_link::durability::Durability::Relaxed.options(),
+            };
+            opts.at_rest_key = prepared.key.as_ref().map(aterm_link::at_rest::Key::bytes);
+            opts.require_bound_at_rest = true;
+            opts.boot = astream_broker::Boot::Unknown;
+            let broker = astream_broker::Broker::open_opts(&path, opts, || {
+                Ok(astream_broker::Prepared::Nothing)
+            })
+            .expect("reopen after quit");
+            let before: u64 = std::fs::read_to_string(state.join(log.word()))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                broker.log_identity().generation == before,
+                armed || state.join(format!("{}-strict", log.word())).exists(),
+                "{log:?}: clean close preserves generation; unclean weak-tier quit moves it"
+            );
+            let head: u64 = std::fs::read_to_string(state.join(format!("{}-head", log.word())))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(broker.head(), head, "the acknowledged records survived");
+        }
+    }
+}
 
 /// The stand-in's `off`: a marker that it ran.
 fn off_marks() {
@@ -2413,12 +2632,115 @@ impl Drop for WindowRelay {
 }
 
 /// Leave a relay file named for this live process that nothing listens on: its window crashed.
-fn stale_relay_file(relay_dir: &Path) {
+/// Its socket never listened, so it refuses a connect however many descriptors of it live: the
+/// one answered here, which the caller holds while it asks, any copy a child another test
+/// spawned took ([`a_relay_file_answers_while_a_copy_of_its_listener_lives`]), and a fork's,
+/// which outlives this one ([`a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork`]).
+fn stale_relay_file(relay_dir: &Path) -> std::os::fd::OwnedFd {
     let stale = relay_socket_path(relay_dir, std::process::id());
-    drop(std::os::unix::net::UnixListener::bind(&stale).expect("a relay socket"));
+    let socket = crate::test_socket::never_listening_socket(&stale);
     assert!(
         stale.exists(),
         "the stale relay's file went with its listener"
+    );
+    socket
+}
+
+/// A [`stale_relay_file`] whose descriptor lives only while `while_open` runs; its file outlasts it.
+#[cfg(target_vendor = "apple")]
+fn stale_relay_file_with<T>(relay_dir: &Path, while_open: impl FnOnce() -> T) -> T {
+    let socket = stale_relay_file(relay_dir);
+    let result = while_open();
+    drop(socket);
+    assert!(
+        relay_socket_path(relay_dir, std::process::id()).exists(),
+        "the stale relay's file went with its listener"
+    );
+    result
+}
+
+/// A parked fork retains an unmarked listener even after the parent closes it. This is the
+/// interference the parallel foreground-reader tests can cause in a stale-relay fixture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
+    struct Parked(Option<i32>);
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            let Some(pid) = self.0.take() else {
+                return;
+            };
+            // SAFETY: this is our exact child, which has not been reaped or reused.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the parked child is reaped",
+                || {
+                    let mut status = 0;
+                    // SAFETY: one exact child and a local output slot; never blocks.
+                    (unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid).then_some(())
+                },
+            );
+        }
+    }
+    fn park() -> Parked {
+        // SAFETY: the child calls only async-signal-safe raise and _exit, with no unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: the child parks until its parent's SIGKILL, without running Rust code.
+            unsafe {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "SIGSTOP parks the inheritance witness without a core signal; its parent ends it by SIGKILL"
+                )]
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(0);
+            }
+        }
+        Parked(Some(pid))
+    }
+    let answered = |fixture| {
+        let relay = crate::test_scratch::short_dir("stale-relay-fork");
+        let mut child = if fixture {
+            stale_relay_file_with(relay.path(), park)
+        } else {
+            let path = relay_socket_path(relay.path(), std::process::id());
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("a relay listener");
+            let child = park();
+            drop(listener);
+            child
+        };
+        let pid = child.0.expect("the fork is not yet reaped");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the fork is parked before exec",
+            || {
+                let mut status = 0;
+                // SAFETY: our unreaped child and a local output slot; never blocks.
+                let found =
+                    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+                if (found == pid && !libc::WIFSTOPPED(status))
+                    || (found < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    child.0 = None;
+                    panic!("the fork exited before parking: status={status}");
+                }
+                (found == pid && libc::WIFSTOPPED(status)).then_some(())
+            },
+        );
+        let answers = a_window_relay_answers(relay.path());
+        drop(child);
+        answers
+    };
+    assert!(
+        answered(false),
+        "control: an inherited listener still answers"
+    );
+    assert!(
+        !answered(true),
+        "the bound fixture never listens, even while a neighbour forks"
     );
 }
 
@@ -2450,7 +2772,7 @@ fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
     );
     updater.auto_apply.store(true, Ordering::Release);
 
-    stale_relay_file(relay.path());
+    let stale = stale_relay_file(relay.path());
     assert!(
         has_live_window_relay(relay.path()),
         "CONTROL: by its live pid alone, a relay file whose listener is gone reads as a window"
@@ -2464,6 +2786,7 @@ fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
         Some(2),
         "a relay file that does not answer is no window"
     );
+    drop(stale);
 
     let window = WindowRelay::open(relay.path());
     assert_eq!(
@@ -2509,6 +2832,32 @@ fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
         Some(3),
         "a build newer than the one the boot left goes at once"
     );
+}
+
+/// A RELAY FILE ANSWERS WHILE A COPY OF ITS LISTENER LIVES: a listener closed here still takes a
+/// connect through any other descriptor of it, as a child another test spawned while it was open
+/// holds (std's spawn takes no spawn lock, so it can copy a descriptor before its close-on-exec
+/// mark; a fork holds every one until its `exec`). A stale relay file whose socket never listened
+/// answers nothing however long its descriptor lives, so [`stale_relay_file`] leaves that one.
+#[test]
+fn a_relay_file_answers_while_a_copy_of_its_listener_lives() {
+    let relay = crate::test_scratch::short_dir("node-relay-copy");
+    let path = relay_socket_path(relay.path(), std::process::id());
+    let listener = aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&path))
+        .expect("a relay listener");
+    let copy = aterm_uds::kept_out(|| listener.try_clone()).expect("a copy of its descriptor");
+    drop(listener);
+    assert!(
+        a_window_relay_answers(relay.path()),
+        "CONTROL: a listener closed here answers through a copy of its descriptor"
+    );
+    drop(copy);
+    let held = stale_relay_file(relay.path());
+    assert!(
+        !a_window_relay_answers(relay.path()),
+        "a stale relay file answers nothing while its descriptor lives"
+    );
+    drop(held);
 }
 
 /// THE NODE BOOT APPLIES ONLY WITH NO WINDOW HERE (§4.13): a start runs the boot apply where no
@@ -2557,7 +2906,7 @@ fn the_node_boot_applies_only_with_no_window_here() {
         "auto-apply off: left for Install"
     );
     updater.auto_apply.store(true, Ordering::Release);
-    stale_relay_file(relay.path());
+    let _stale = stale_relay_file(relay.path());
     assert_eq!(
         boot_with(&updater),
         (1, Some(2)),
@@ -2951,13 +3300,7 @@ fn a_windowless_members_checkouts_are_read_again_with_no_survey() {
     let read = aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the node job's own read of the home",
-        || {
-            // A tick starts nothing while a read of any home runs, and a node job another test
-            // runs reads its own, so a tick that lost is taken again, as the job's next one is.
-            let mut last = None;
-            super::read_checkouts_when_due(Some(&home), &mut last, super::FACTS_HEARTBEAT_EVERY);
-            repo_home::latest(&home).filter(|read| read.read_ms > stale)
-        },
+        || repo_home::latest(&home).filter(|read| read.read_ms > stale),
     );
     let refresh_ms = u64::try_from(repo_home::REFRESH.as_millis()).expect("fits");
     let now_s = i64::try_from(now / 1000).expect("fits");

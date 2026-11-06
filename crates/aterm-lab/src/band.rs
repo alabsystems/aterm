@@ -127,6 +127,16 @@ impl Job {
             .map(|guard| guard::Offer::new(dir, guard))
             .transpose()
             .map_err(|error| format!("the app-band window guard: {error}"))?;
+        // A kept world reused (`instance --world`) holds what its last job left: its pid, no pid
+        // of the job this launch starts, which alone may write the file read below, and a
+        // lifeline no job opened when that launch failed before its job started.
+        for name in [PID_FILE, LIFELINE] {
+            match std::fs::remove_file(dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("the last job's {name}: {e}")),
+            }
+        }
         let fifo = dir.join(LIFELINE);
         crate::sys::make_fifo(&fifo).map_err(|e| format!("the lifeline FIFO: {e}"))?;
         let held: OwnedFd = OpenOptions::new()

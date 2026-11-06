@@ -71,8 +71,19 @@ pub struct WorkerCli {
     homes: fn(&ProcArgs, &Path) -> Vec<(String, String)>,
     /// The flags of the starter's argv a worker's line carries ([`Starter::args`]):
     /// the ones its relaunch lane carries that move its config or say how it
-    /// reaches its provider; Claude Code's permission mode, which [`starter`] holds to
-    /// the worker's floor ([`claude_starter_args`]).
+    /// reaches its provider, and its permission posture held to THE CLI'S PERMISSION FLOOR: the
+    /// least-asking posture the CLI's own flags spell that never stops a worker for a person's
+    /// box on an ordinary edit or command and keeps the CLI's own sandbox or safety classifier,
+    /// never one that skips them (owner, 2026-11-04: workers are fully automated by default;
+    /// `DESIGN-workers-subagents-2026-11-04.md` §2: "its CLI's most automated mode short of
+    /// bypass"). A starter at or above the floor lends its own posture; one below it, or naming
+    /// none, lends the floor, which is so what an argv naming nothing lends
+    /// ([`Self::unnamed_posture`]). Every CLI's floor is held here but Claude Code's, whose mode
+    /// [`starter`] holds to it once it has read the starter's route ([`claude_starter_args`]),
+    /// and codex-alab's, which [`starter_of`] judges beside its starter's own config
+    /// ([`codex_lent`]). Each floor's first word is a posture marker of atpkg's managed twin
+    /// ([`atpkg::yolo::decide`]), so a twin the line runs adds no yolo flag beside it: the floor
+    /// holds whether or not the line runs that twin.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
     /// Why a worker carrying this environment must not start, under the user's home: a CLI
     /// that, signed out, opens a sign-in page by itself and never reads its task
@@ -340,8 +351,9 @@ fn claude_starter_args(
 }
 
 /// The flags of a Codex starter's argv that move its config, say how it reaches its provider or
-/// say what it may do unasked; its model and folders stay its own, set by flag or by a `-c` of
-/// [`CODEX_OWN_KEYS`] ([`codex_flag_rides`]). A `--profile` rides whole, whatever it sets.
+/// say what it may do unasked, the last held to the worker's floor ([`codex_floored`]); its model
+/// and folders stay its own, set by flag or by a `-c` of [`CODEX_OWN_KEYS`]
+/// ([`codex_flag_rides`]). A `--profile` rides whole, whatever it sets.
 const CODEX_CONFIG_FLAGS: &[&str] = &[
     "-c",
     "--config",
@@ -369,27 +381,273 @@ const CODEX_OWN_KEYS: &[&str] = &["model"];
 /// Whether a Codex starter's flag `name`, as `tokens` spell it, rides onto its
 /// worker's line ([`CODEX_CONFIG_FLAGS`]).
 fn codex_flag_rides(name: &str, tokens: &[String]) -> bool {
-    if !CODEX_CONFIG_FLAGS.contains(&name) {
-        return false;
-    }
-    if name != "-c" && name != "--config" {
-        return true;
-    }
-    let value = match tokens {
+    CODEX_CONFIG_FLAGS.contains(&name)
+        && codex_config_set(name, tokens)
+            .is_none_or(|(key, _)| !CODEX_OWN_KEYS.contains(&key.first().copied().unwrap_or("")))
+}
+
+/// The value of Codex flag `name` as `tokens` spell it (the flag's own token, then its value's):
+/// the next token, or the rest of an attached one (`-anever`, `-a=never`, `--config=k=v`).
+fn codex_flag_value<'a>(name: &str, tokens: &'a [String]) -> &'a str {
+    match tokens {
         [_, value, ..] => value.as_str(),
         [attached] => attached
             .strip_prefix(name)
             .map_or("", |rest| rest.strip_prefix('=').unwrap_or(rest)),
         [] => "",
-    };
-    let key = value.split('=').next().unwrap_or("");
-    let root = key
+    }
+}
+
+/// What a Codex `-c`/`--config` named `name` sets, as `tokens` spell it: its dotted key, each
+/// segment trimmed of blanks and quotes, and its value as typed; `None` for any other flag.
+fn codex_config_set<'a>(name: &str, tokens: &'a [String]) -> Option<(Vec<&'a str>, &'a str)> {
+    if name != "-c" && name != "--config" {
+        return None;
+    }
+    let set = codex_flag_value(name, tokens);
+    let (key, value) = set.split_once('=').unwrap_or((set, ""));
+    let key = key
         .split('.')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches(['"', '\'']);
-    !CODEX_OWN_KEYS.contains(&root)
+        .map(|segment| segment.trim().trim_matches(['"', '\'']))
+        .collect();
+    Some((key, value))
+}
+
+/// CODEX-ALAB'S PERMISSION FLOOR (the row's, [`WorkerCli::unnamed_posture`]): `--approve-for-me`,
+/// "Route approval requests through automatic review using the workspace-write sandbox"
+/// (codex-alab 0.166.0's `codex --help`). It sets `approvals_reviewer = "auto_review"`,
+/// `approval_policy = "on-request"` and `sandbox_mode = "workspace-write"` as command-line
+/// overrides (codex-alab's `codex-rs/utils/cli/src/shared_options.rs`): Codex's own counterpart
+/// of Claude Code's auto mode, a reviewer agent answering each request to leave the sandbox,
+/// which stays. Those overrides sit above every config layer, codex-alab's packaged in-aterm
+/// defaults (`approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, the lowest
+/// layer) among them. codex-alab's own approval loop leaves a request whose reviewer is chosen in
+/// any layer but its packaged defaults to that reviewer (its `alab-autopilot/src/approval.rs`), so
+/// the reviewer, not that loop's one-shot yes, judges a floored worker's requests; edits and
+/// commands inside the sandbox ask no one. The reviewer does not answer every request: Guardian
+/// V2 hands one to a person where its model's catalog policy turns review off for that kind of
+/// request, or where its review returns no decision (codex-alab's
+/// `ext/guardian-v2/src/async_scorer/approval.rs`, `ext/guardian-reviewer/src/routing.rs`), and
+/// that box waits for a person, since codex-alab's loop has already left it to the reviewer and
+/// aterm answers no codex-alab box. Measured 2026-11-05 on that build: it refuses the flag beside
+/// `--sandbox` or `--ask-for-approval`, or twice, so [`codex_floored`] drops those.
+pub const CODEX_WORKER_FLOOR: [&str; 1] = ["--approve-for-me"];
+
+/// The config keys that set a Codex run's posture, which a `-c` of a starter below the floor
+/// sets in vain beside [`CODEX_WORKER_FLOOR`]'s overrides ([`codex_floored`]).
+const CODEX_POSTURE_KEYS: &[&str] = &["approval_policy", "sandbox_mode", "approvals_reviewer"];
+
+/// The `approvals_reviewer` values that leave a Codex run's requests to its reviewer agent, not
+/// a person: `auto_review` and its older spelling `guardian_subagent` (codex-alab's
+/// `codex-rs/protocol/src/config_types.rs`).
+const CODEX_REVIEWERS: &[&str] = &["auto_review", "guardian_subagent"];
+
+/// The posture key and value a Codex `-c` named `name` sets as `tokens` spell it
+/// ([`CODEX_POSTURE_KEYS`]), else `None`. The key is read as Codex reads it, and atpkg's twin
+/// with it: the text before the first `=`, trimmed of blanks (codex-alab's
+/// `codex-rs/utils/cli/src/config_override.rs`), so a quoted key sets no posture. The value is
+/// trimmed of blanks and quotes, as its TOML reading leaves it.
+fn codex_posture_set<'a>(name: &str, tokens: &'a [String]) -> Option<(&'a str, &'a str)> {
+    if name != "-c" && name != "--config" {
+        return None;
+    }
+    let (key, value) = codex_flag_value(name, tokens).split_once('=')?;
+    let key = key.trim();
+    CODEX_POSTURE_KEYS
+        .contains(&key)
+        .then(|| (key, value.trim().trim_matches(['"', '\''])))
+}
+
+/// The flags `kept` a Codex starter lends its worker ([`CODEX_CONFIG_FLAGS`]), one unit per flag:
+/// its name as Codex's parser reads it ([`super::codex_alab::option_name`]) and its tokens.
+fn codex_units(kept: &[String]) -> Vec<(String, &[String])> {
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < kept.len() {
+        let (name, attached) = super::codex_alab::option_name(&kept[i]);
+        let takes = !attached
+            && matches!(
+                super::codex_alab::flag(&name),
+                Some((super::codex_alab::Arity::One, _))
+            );
+        let end = if takes {
+            (i + 2).min(kept.len())
+        } else {
+            i + 1
+        };
+        units.push((name, &kept[i..end]));
+        i = end;
+    }
+    units
+}
+
+/// A Codex starter's own config, read beside its argv where that names no approval policy
+/// ([`codex_floored`]): its `config.toml` (an empty table where it has none), and whether it
+/// runs inside aterm, where codex-alab's packaged defaults set `approval_policy = "never"`
+/// beneath every layer (codex-alab's `alab-core/aterm-defaults.toml`, read only under
+/// `TERM_PROGRAM=aterm`).
+#[derive(Clone, Debug, PartialEq)]
+struct CodexConfig {
+    file: aterm_toml::Value,
+    in_aterm: bool,
+}
+
+impl CodexConfig {
+    /// What the file sets `key` to as Codex reads it: the table of `profile` (the starter's
+    /// `--profile`, else the file's own `profile` key) over the file's top level.
+    fn value(&self, profile: Option<&str>, key: &str) -> Option<&aterm_toml::Value> {
+        let profile = profile.or_else(|| self.file.get("profile")?.as_str());
+        profile
+            .and_then(|profile| self.file.get("profiles")?.get(profile)?.get(key))
+            .or_else(|| self.file.get(key))
+    }
+}
+
+/// THE CONFIG A CODEX STARTER `args` READS (`None`: not told), under the user's home `user`:
+/// `config.toml` in its `CODEX_HOME`, else in `.codex` under its `HOME`, else under `user`
+/// ([`super::codex_rollout::codex_home`]). A relative `CODEX_HOME`, whose folder is the
+/// starter's own working directory's, and a file that cannot be read or parsed tell nothing.
+/// The user layer alone is read: a trusted project's `.codex/config.toml`, the system's and a
+/// managed one are not, and the worker reads its own folder's.
+fn codex_config(args: &ProcArgs, user: &Path) -> Option<CodexConfig> {
+    let home = super::codex_rollout::codex_home(
+        args.env_var(super::codex_alab::HOME_ENV),
+        args.env_var("HOME").or_else(|| user.to_str()),
+        None,
+    )?;
+    let file = match super::accounts::read_bounded(&home.join("config.toml"), 256 * 1024) {
+        Ok(None) => aterm_toml::Value::Table(aterm_toml::Table::new()),
+        Ok(Some(text)) => aterm_toml::from_str(&text).ok()?,
+        Err(_) => return None,
+    };
+    Some(CodexConfig {
+        file,
+        in_aterm: args.env_var("TERM_PROGRAM") == Some("aterm"),
+    })
+}
+
+/// THE FLAGS A CODEX WORKER STARTS WITH, from the ones its starter lends it (`kept`), held to
+/// [`CODEX_WORKER_FLOOR`], beside the starter's own `config` (`None`: not told, as for a worker
+/// no starter lends one, [`WorkerCli::unnamed_posture`]). A starter at or above the floor lends
+/// its posture as it is: the floor itself (`--approve-for-me`, or its alias `--not-so-yolo`),
+/// bypass (`--dangerously-bypass-approvals-and-sandbox`, or its alias `--yolo`), an approval
+/// policy of `never`, by `-a`/`--ask-for-approval` or else by a `-c approval_policy`, which asks
+/// no one, or a policy named beside a `-c approvals_reviewer` of [`CODEX_REVIEWERS`], which
+/// leaves every request to the reviewer, not a person (the last `-c` of a key wins, as Codex
+/// reads them). Each of those holds a posture marker of atpkg's twin, so the twin adds no yolo
+/// flag beside it, or is the twin's own `--yolo`, which it spells as bypass once.
+///
+/// Where its argv names no policy, the policy its config gives stands (its `--profile`'s table,
+/// else the file's, else, inside aterm, codex-alab's packaged `never`), as Codex reads them: one
+/// at or above the floor by the same rule is lent spelled as `-a <policy>`, a twin marker, so the
+/// worker runs at its starter's posture and the twin's yolo never decides it. A starter so in
+/// codex-alab's packaged defaults lends `-a never` beside them, as the 2026-11-04 design has a
+/// bypass parent pass bypass on. A reviewer with no policy named anywhere lends the floor.
+///
+/// One below it (a person answering under any other policy, a sandbox alone with no policy
+/// given) or naming none lends the floor in place of every flag of its posture (`-a`, `-s`, and
+/// a `-c` of [`CODEX_POSTURE_KEYS`]), so no worker is started past the floor, nor with a flag
+/// Codex refuses beside it; the rest stays, the sandbox's own `sandbox_workspace_write`
+/// settings and a `--profile` among them (the floor's overrides sit above a profile).
+fn codex_floored(kept: Vec<String>, config: Option<&CodexConfig>) -> Vec<String> {
+    let at_floor = |policy: Option<&str>, reviewer: Option<&str>| {
+        policy == Some("never")
+            || (policy.is_some() && reviewer.is_some_and(|by| CODEX_REVIEWERS.contains(&by)))
+    };
+    let units = codex_units(&kept);
+    let mut lends_own = false;
+    let (mut by_flag, mut by_config, mut reviewer, mut profile) = (None, None, None, None);
+    for (name, tokens) in &units {
+        match name.as_str() {
+            "--approve-for-me"
+            | "--not-so-yolo"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--yolo" => lends_own = true,
+            "-a" | "--ask-for-approval" => by_flag = Some(codex_flag_value(name, tokens).trim()),
+            "-p" | "--profile" => profile = Some(codex_flag_value(name, tokens).trim()),
+            _ => match codex_posture_set(name, tokens) {
+                Some(("approval_policy", policy)) => by_config = Some(policy),
+                Some(("approvals_reviewer", by)) => reviewer = Some(by),
+                _ => {}
+            },
+        }
+    }
+    let named = by_flag.or(by_config);
+    if lends_own || at_floor(named, reviewer) {
+        return kept;
+    }
+    if named.is_none()
+        && let Some(config) = config
+    {
+        // A granular policy is a table, which no `-a` spells: it lends the floor.
+        let policy = config.value(profile, "approval_policy").map_or(
+            config.in_aterm.then_some("never"),
+            aterm_toml::Value::as_str,
+        );
+        let by = config
+            .value(profile, "approvals_reviewer")
+            .and_then(aterm_toml::Value::as_str);
+        if let Some(policy) = policy.filter(|policy| at_floor(Some(*policy), reviewer.or(by))) {
+            let mut own = kept.clone();
+            own.extend(["-a".to_string(), policy.to_string()]);
+            return own;
+        }
+    }
+    let mut floored: Vec<String> = units
+        .iter()
+        .filter(|(name, tokens)| {
+            !matches!(
+                name.as_str(),
+                "-a" | "--ask-for-approval" | "-s" | "--sandbox"
+            ) && codex_posture_set(name, tokens).is_none()
+        })
+        .flat_map(|(_, tokens)| tokens.iter().cloned())
+        .collect();
+    floored.extend(CODEX_WORKER_FLOOR.map(str::to_string));
+    floored
+}
+
+/// Whether a Codex flag `name`, as `tokens` spell it, says what the run may do unasked: its
+/// approval policy, sandbox, reviewer, or an alias of the floor or of bypass.
+fn codex_posture_rides(name: &str, tokens: &[String]) -> bool {
+    matches!(
+        name,
+        "-a" | "--ask-for-approval"
+            | "-s"
+            | "--sandbox"
+            | "--approve-for-me"
+            | "--not-so-yolo"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--yolo"
+    ) || codex_posture_set(name, tokens).is_some()
+}
+
+/// The posture flags the root of a Codex starter's `argv` names ahead of what no relaunch could
+/// resume (`exec`, `--remote`, …): those of the longest head of `argv` Codex's flag table reads.
+fn codex_root_posture(argv: &[String]) -> Vec<String> {
+    (1..argv.len())
+        .rev()
+        .find_map(|end| super::codex_alab::kept_flags(&argv[..end], codex_posture_rides).ok())
+        .unwrap_or_default()
+}
+
+/// What a Codex starter that ran `argv` lends its worker, beside its own `config`
+/// ([`codex_floored`]): its flags that ride ([`codex_flag_rides`]). One no relaunch could resume
+/// (`codex exec`, `--remote`, …) lends only the posture its root names ahead of that
+/// ([`codex_root_posture`]), held to the floor alike: its worker is a fresh interactive
+/// codex-alab.
+///
+/// # Errors
+///
+/// A flag no table here knows, as typed.
+fn codex_lent(argv: &[String], config: Option<&CodexConfig>) -> Result<Vec<String>, String> {
+    match super::codex_alab::kept_flags(argv, codex_flag_rides) {
+        Ok(kept) => Ok(codex_floored(kept, config)),
+        Err(upgrade::ArgvRefusal::NotResumable(_)) => {
+            Ok(codex_floored(codex_root_posture(argv), config))
+        }
+        Err(upgrade::ArgvRefusal::UnknownFlag(flag)) => Err(flag),
+    }
 }
 
 /// The `CODEX_HOME` and `CODEX_AUTH_PATH` a Codex starter's worker carries:
@@ -455,13 +713,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         ],
         launches: Launches::Alab,
         homes: codex_home_env,
-        flags: |argv| match super::codex_alab::kept_flags(argv, codex_flag_rides) {
-            Ok(kept) => Ok(kept),
-            // A starter no relaunch could resume (`codex exec`, `--remote`, …)
-            // lends no flags; its worker is a fresh interactive codex-alab.
-            Err(upgrade::ArgvRefusal::NotResumable(_)) => Ok(Vec::new()),
-            Err(upgrade::ArgvRefusal::UnknownFlag(flag)) => Err(flag),
-        },
+        // Its argv alone: [`starter_of`] reads a starter's config beside it.
+        flags: |argv| codex_lent(argv, None),
         login: None,
     },
     WorkerCli {
@@ -533,7 +786,7 @@ pub static WORKERS: [WorkerCli; 5] = [
             store_build: grok::store_build,
         },
         homes: |args, home| grok::relaunch_env(|n| args.env_var(n), home),
-        flags: grok::config_flags,
+        flags: grok::worker_flags,
         login: Some(grok::signed_out),
     },
 ];
@@ -674,9 +927,29 @@ impl WorkerCli {
         }
     }
 
-    /// The line's program where no starter of this kind was found: for
-    /// codex-alab, atpkg's managed twin where it execs ALab bytes; else
-    /// [`Self::plain`]'s word.
+    /// WHAT THIS ROW LENDS A WORKER WHOSE STARTER NAMES NO POSTURE, through its own
+    /// [`Self::flags`] read of an argv naming nothing: the CLI's permission floor. Claude Code's
+    /// lends none here: [`starter`] holds its mode to the floor once it has read the starter's
+    /// route ([`claude_route_kept`]), and with no starter no route is read.
+    ///
+    /// # Errors
+    ///
+    /// None for an argv naming nothing; the row's [`Self::flags`] says what it refuses.
+    pub fn unnamed_posture(&self) -> Result<Vec<String>, String> {
+        (self.flags)(&[self.word.to_string()])
+    }
+
+    /// The line where no starter of this kind was found (a worker a lead of another CLI spawns,
+    /// or one spawned from outside a session): for codex-alab, atpkg's managed twin where it
+    /// execs ALab bytes; else [`Self::plain`]'s word. No starter lends a posture, so the line
+    /// names the CLI's floor ([`Self::unnamed_posture`]): neither its own default, which asks a
+    /// person (agy's and Muse Code's lines hold words atpkg's twin does not know, and the twin
+    /// runs them as typed), nor the twin's yolo (codex-alab's bypass or packaged
+    /// danger-full-access, Grok Build's always-approve), which is past the floor. Two lines name
+    /// none: an unstarted Claude
+    /// Code's, whose route no starter could tell ([`claude_route_kept`]), so atpkg's twin, where
+    /// the line reaches it, starts it in bypass, as before the floor; and a bare `codex`, which
+    /// may be a vendor Codex that refuses codex-alab's floor flag and would not start.
     #[must_use]
     pub fn unstarted(&self) -> Starter {
         self.unstarted_by(|| super::upgrade_drive::managed_agent_twin(self.word))
@@ -685,12 +958,16 @@ impl WorkerCli {
     /// [`Self::unstarted`] with the managed twin read by `twin`.
     #[must_use]
     pub fn unstarted_by(&self, twin: impl FnOnce() -> Option<PathBuf>) -> Starter {
-        let exe = match self.launches {
-            Launches::Alab => twin().and_then(super::self_claimed::alab_twin),
-            _ => None,
+        let (exe, args) = match self.launches {
+            Launches::Alab => match twin().and_then(super::self_claimed::alab_twin) {
+                Some(twin) => (twin, self.unnamed_posture()),
+                None => (PathBuf::from(self.word), Ok(Vec::new())),
+            },
+            _ => (PathBuf::from(self.word), self.unnamed_posture()),
         };
         Starter {
-            exe: exe.unwrap_or_else(|| PathBuf::from(self.word)),
+            exe,
+            args,
             ..self.plain()
         }
     }
@@ -969,7 +1246,9 @@ pub fn starter(
     })
 }
 
-/// Resolve `image` and `args` as a [`Starter`] for `cli`, or `None`.
+/// Resolve `image` and `args` as a [`Starter`] for `cli`, or `None`, under the user's `home`: a
+/// codex-alab starter's posture is judged beside the config it reads ([`codex_config`],
+/// [`codex_lent`]), every other CLI's from its argv ([`WorkerCli::flags`]).
 pub(crate) fn starter_of(
     cli: &WorkerCli,
     image: Option<&Path>,
@@ -977,30 +1256,36 @@ pub(crate) fn starter_of(
     home: &Path,
     twin: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<Starter> {
-    let exe = match cli.launches {
+    let (exe, lent) = match cli.launches {
         Launches::Claude => return None,
         Launches::Image { store_build } => {
             let image =
                 image.filter(|i| i.file_name().and_then(|n| n.to_str()) == Some(cli.word))?;
-            if store_build(image) {
+            let exe = if store_build(image) {
                 twin().unwrap_or_else(|| PathBuf::from(cli.word))
             } else {
                 image.to_path_buf()
-            }
+            };
+            (exe, (cli.flags)(&args.argv))
         }
         Launches::Alab => {
             let image = image
                 .filter(|i| super::upgrade_drive::names_program(i, cli.word))
                 .filter(|i| super::codex_alab::alab_bytes(i))?;
-            twin()
+            let exe = twin()
                 .and_then(super::self_claimed::alab_twin)
-                .unwrap_or_else(|| image.to_path_buf())
+                .unwrap_or_else(|| image.to_path_buf());
+            // The posture codex-alab runs at is its argv's over its config's.
+            (
+                exe,
+                codex_lent(&args.argv, codex_config(args, home).as_ref()),
+            )
         }
     };
     Some(Starter {
         exe,
         env: (cli.homes)(args, home),
-        args: (cli.flags)(&args.argv),
+        args: lent,
         unset: Vec::new(),
     })
 }
@@ -1017,7 +1302,7 @@ pub struct Fresh<'a> {
     pub trusted_here: bool,
     /// `--permission-mode`: the mode the CLI starts in, one its [`WorkerCli::permission_flag`]
     /// takes, which no floor moves; `None` for the one its starter lends ([`Starter::args`],
-    /// held to a Claude Code worker's floor by [`starter`]), else the one its settings name.
+    /// held to its CLI's floor, [`WorkerCli::unnamed_posture`]), else the one its settings name.
     pub permission_mode: Option<&'a str>,
     /// Whether the run drives the person's own browser: the CLI's [`WorkerCli::chrome_flag`] (a claim
     /// worker's, [`super::credit_offers::claim_task`]).

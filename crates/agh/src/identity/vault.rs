@@ -1340,14 +1340,22 @@ impl Record {
         }
     }
 
+    fn is_valid_row(learned: &Learned) -> bool {
+        config::is_fingerprint(&learned.fingerprint) && config::is_owner_name(&learned.login)
+    }
+
+    fn is_valid(&self) -> bool {
+        Slot::ALL
+            .into_iter()
+            .all(|slot| self.get(slot).is_none_or(Self::is_valid_row))
+    }
+
     /// The record with every row that is not a fingerprint and an owner name dropped.
+    #[cfg(test)]
     fn checked(mut self) -> Record {
         for slot in Slot::ALL {
             let row = self.slot_mut(slot);
-            if row.as_ref().is_some_and(|learned| {
-                !config::is_fingerprint(&learned.fingerprint)
-                    || !config::is_owner_name(&learned.login)
-            }) {
+            if row.as_ref().is_some_and(|l| !Self::is_valid_row(l)) {
                 *row = None;
             }
         }
@@ -1356,18 +1364,21 @@ impl Record {
 
     /// The record's text: each row a fingerprint and an owner name, so none needs escaping.
     fn text(&self) -> String {
-        let mut text = String::from(
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(256);
+        text.push_str(
             "# agh's vault adoption record (design §6.10): the login GET /user answered for each\n\
              # vault token, by the token's fingerprint. agh writes it.\n",
         );
         for slot in Slot::ALL {
             if let Some(learned) = self.get(slot) {
-                text.push_str(&format!(
+                let _ = write!(
+                    text,
                     "\n[{}]\nfingerprint = \"{}\"\nlogin = \"{}\"\n",
                     slot.profile(),
                     learned.fingerprint,
                     learned.login
-                ));
+                );
             }
         }
         text
@@ -1397,11 +1408,11 @@ fn read_record(dirs: &Dirs) -> std::result::Result<Record, RecordFault> {
     use aterm_uds::private_file::{PrivateFileError, read_private};
     match read_private(&dirs.config, RECORD_FILE, RECORD_MAX) {
         Ok(bytes) => {
-            let parsed = String::from_utf8(bytes)
+            let parsed = std::str::from_utf8(&bytes)
                 .ok()
-                .and_then(|text| aterm_toml::from_str::<Record>(&text).ok());
+                .and_then(|text| aterm_toml::from_str::<Record>(text).ok());
             match parsed {
-                Some(record) if record.clone().checked() == record => Ok(record),
+                Some(record) if record.is_valid() => Ok(record),
                 _ => {
                     let shown = tilde(&dirs.config.join(RECORD_FILE), &dirs.home);
                     let why = format!(

@@ -191,6 +191,19 @@ pub fn held_words(pid: u32, waited: Duration, held: Option<bool>) -> Option<Stri
     })
 }
 
+/// A test's pause between two looks at what must happen, in a poll its own hang detector bounds:
+/// it gives the processor away (`std::thread::yield_now`). Nothing that waits for latency polls
+/// this way: on macOS a yield while other work is runnable sets the thread aside for a whole
+/// 10 ms scheduling quantum, so shipped code waits on a wake (clippy.toml: a wait that wakes).
+#[cfg(any(test, debug_assertions))]
+pub fn poll_yield() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test poll's one yield: its hang detector bounds it and no deadline waits on it"
+    )]
+    std::thread::yield_now();
+}
+
 #[cfg(any(test, debug_assertions))]
 mod silent;
 #[cfg(all(unix, test))]
@@ -1070,26 +1083,26 @@ impl Drain {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type DrainStartFailure = Box<dyn FnOnce() -> io::Error>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static DRAIN_START_FAILURE: std::cell::RefCell<Option<DrainStartFailure>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct DrainStartFailureGuard(Option<DrainStartFailure>);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for DrainStartFailureGuard {
     fn drop(&mut self) {
         DRAIN_START_FAILURE.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn fail_next_drain_start(failure: impl FnOnce() -> io::Error + 'static) -> DrainStartFailureGuard {
     let previous = DRAIN_START_FAILURE.with(|slot| slot.borrow_mut().replace(Box::new(failure)));
     DrainStartFailureGuard(previous)
@@ -1103,7 +1116,7 @@ fn drain(
     pipe: Option<PipeEnd>,
     which: &str,
 ) -> io::Result<Drain> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(failure) = DRAIN_START_FAILURE.with(|slot| slot.borrow_mut().take()) {
         return Err(failure());
     }

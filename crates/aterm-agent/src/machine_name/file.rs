@@ -202,13 +202,18 @@ impl MachineName {
         self.fleets.truncate(FLEETS_MAX);
     }
 
-    /// The title the menu bar shows: `m8 Heron`, or `m0 Otter` while unnumbered.
+    /// The NAME: `m8`, or `m0` while unnumbered.
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.num
+            .map_or_else(|| UNNUMBERED.to_owned(), |num| num.to_string())
+    }
+
+    /// The NAME and the whole nickname, `m8 Heron` (`m0 Otter` while unnumbered), as `aterm name`
+    /// prints it; the menu bar clips a long nickname (`aterm_gui::machine_title`).
     #[must_use]
     pub fn title(&self) -> String {
-        let number = self
-            .num
-            .map_or_else(|| UNNUMBERED.to_owned(), |num| num.to_string());
-        format!("{number} {}", self.nick.display())
+        format!("{} {}", self.name(), self.nick.display())
     }
 
     /// The file's text.
@@ -400,11 +405,31 @@ struct WireFleet {
     synced: bool,
 }
 
-const fn class_word(class: Class) -> &'static str {
+/// How the file spells `class`, as `aterm name` prints it.
+#[must_use]
+pub const fn class_word(class: Class) -> &'static str {
     match class {
         Class::Auto => "auto",
         Class::Chosen => "chosen",
         Class::Seeded => "seeded",
+    }
+}
+
+/// How the file spells a nickname's `class`.
+#[must_use]
+pub const fn nick_class_word(class: NickClass) -> &'static str {
+    match class {
+        NickClass::Auto => "auto",
+        NickClass::Chosen => "chosen",
+    }
+}
+
+/// How the file spells `migration`.
+#[must_use]
+pub const fn migration_word(migration: Migration) -> &'static str {
+    match migration {
+        Migration::Pending => "pending",
+        Migration::Waiting => "waiting",
     }
 }
 
@@ -466,18 +491,10 @@ impl Wire {
             sgen: name.sgen,
             act: name.act,
             nick: name.nick.as_str().to_owned(),
-            nick_class: match name.nick_class {
-                NickClass::Auto => "auto",
-                NickClass::Chosen => "chosen",
-            }
-            .to_owned(),
-            migration: name.migration.map(|migration| {
-                match migration {
-                    Migration::Pending => "pending",
-                    Migration::Waiting => "waiting",
-                }
-                .to_owned()
-            }),
+            nick_class: nick_class_word(name.nick_class).to_owned(),
+            migration: name
+                .migration
+                .map(|migration| migration_word(migration).to_owned()),
             cap: name.cap.map(|cap| WireCap {
                 value: cap.value,
                 since: cap.since,

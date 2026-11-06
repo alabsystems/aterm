@@ -48,6 +48,8 @@ pub mod durability;
 pub mod enable;
 pub mod fabric;
 pub mod fabric_brief;
+/// The fabric over the mesh: the fleet `alab`, key-named nodes, and mail one hop.
+pub mod federate;
 /// The bridge's doors: its clocks, park, broker dials and readers, verb lane,
 /// jitter and state-dir writes, in one place a simulation can stand in for.
 mod fx;

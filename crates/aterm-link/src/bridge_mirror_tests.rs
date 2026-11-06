@@ -38,6 +38,21 @@ struct World {
     pending: Option<Log>,
 }
 
+/// One take, as the loop's rounds make it: where the broker's log is on the state dir's device
+/// (a test's scratch directory holds both) an open's first take sends the pin's settle and waits,
+/// and the round that reads its answer takes (critic item F07, `Bridge::make_the_pin_fence`).
+fn take_fenced(bridge: &mut Bridge) {
+    bridge.mirror_take();
+    if bridge.pin_settle_owed() {
+        bridge.settle_acks();
+        assert!(
+            bridge.state.logpin_fence_held(),
+            "the settle's answer makes the pin's fence"
+        );
+        bridge.mirror_take();
+    }
+}
+
 impl World {
     /// A session whose log holds its open (`ms` 1, the model's first
     /// `Append`), mirrored one slot a batch.
@@ -301,7 +316,7 @@ impl World {
     }
 
     fn take(&mut self) {
-        self.bridge.mirror_take();
+        take_fenced(&mut self.bridge);
     }
 
     fn publish(&mut self) {
@@ -2059,7 +2074,7 @@ fn a_session_the_budget_refuses_waits_and_opens_with_no_hole() {
         .unwrap()
         .logs
         .insert(SID.to_string(), log);
-    bridge.mirror_take();
+    take_fenced(&mut bridge);
     bridge.mirror_send();
     bridge.settle_acks();
     assert!(
@@ -2095,7 +2110,7 @@ fn a_session_the_budget_refuses_waits_and_opens_with_no_hole() {
         &format!("/f/f/pub/{}/node/filler/0", bridge.node),
     )
     .expect("retired");
-    bridge.mirror_take();
+    take_fenced(&mut bridge);
     bridge.mirror_send();
     bridge.settle_acks();
     bridge.mirror_settle();
@@ -2145,7 +2160,7 @@ fn the_faces_one_pass_opens_are_counted_against_the_reserve_together() {
             .logs
             .insert(sid.to_string(), log);
     }
-    bridge.mirror_take();
+    take_fenced(&mut bridge);
     bridge.mirror_send();
     bridge.settle_acks();
     let (slots, outcomes) = bridge.mirror.as_deref().unwrap().batch();
@@ -2213,7 +2228,7 @@ fn a_retake_after_a_budget_refusal_owes_its_snapshot() {
         .unwrap()
         .logs
         .insert(SID.to_string(), log);
-    bridge.mirror_take();
+    take_fenced(&mut bridge);
     assert!(
         bridge
             .mirror
@@ -2257,7 +2272,7 @@ fn a_retake_after_a_budget_refusal_owes_its_snapshot() {
         &format!("/f/f/pub/{}/node/filler/0", bridge.node),
     )
     .expect("retired");
-    bridge.mirror_take();
+    take_fenced(&mut bridge);
     bridge.mirror_send();
     bridge.settle_acks();
     bridge.mirror_settle();
@@ -2858,7 +2873,7 @@ fn with_the_mirror_off_the_park_is_judged_before_the_rounds_settle() {
             if Instant::now() >= give_up {
                 return false;
             }
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         mailbox.push_event("EVENT".to_string());
         true

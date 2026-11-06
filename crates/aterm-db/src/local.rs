@@ -47,10 +47,15 @@ impl Credentials {
     pub fn load(dir: &Path) -> Result<Self> {
         let judged = private_file::JudgedDir::judge(dir)
             .map_err(|_| Error::new("database configuration missing or not private"))?;
-        let bytes = judged
-            .read(CONFIG, 4096)
-            .map_err(|_| Error::new("database configuration missing or not private"))?;
-        let v: Value = aterm_json::from_slice(&bytes)
+        let bytes = zeroize::Zeroizing::new(
+            judged
+                .read(CONFIG, 4096)
+                .map_err(|_| Error::new("database configuration missing or not private"))?,
+        );
+        Self::from_config_bytes(&judged, &bytes)
+    }
+    fn from_config_bytes(judged: &private_file::JudgedDir, bytes: &[u8]) -> Result<Self> {
+        let v: Value = aterm_json::from_slice(bytes)
             .map_err(|_| Error::new("invalid database configuration"))?;
         let manifest = Manifest::decode(&unhex(field(&v, "manifest")?, 256)?)?;
         let capability = Capability::decode(&manifest, &unhex(field(&v, "capability")?, 256)?)?;
@@ -59,7 +64,7 @@ impl Credentials {
                 "installation capability cannot be an administrative control certificate",
             ));
         }
-        let (seed, actor) = identity_in(&judged)?;
+        let (seed, actor) = identity_in(judged)?;
         if actor != capability.actor {
             return Err(Error::new(
                 "database admission belongs to another installation",
@@ -94,12 +99,16 @@ impl Credentials {
         })
     }
     fn save(&self, dir: &Path) -> Result<()> {
-        let v = json!({"manifest":hex::encode_lower(self.manifest.bytes()),"capability":hex::encode_lower(self.capability.bytes()),"key":hex::encode_lower(&self.key),"root_seed":self.root_seed.as_ref().map(|s|hex::encode_lower(s)),"no_authority":self.no_authority});
-        private_file::write_private(
-            dir,
-            CONFIG,
-            &aterm_json::to_vec(&v).map_err(|_| Error::new("configuration encoding failed"))?,
-        )?;
+        let key_hex = zeroize::Zeroizing::new(hex::encode_lower(&self.key));
+        let root_hex = self
+            .root_seed
+            .as_ref()
+            .map(|s| zeroize::Zeroizing::new(hex::encode_lower(s)));
+        let v = json!({"manifest":hex::encode_lower(self.manifest.bytes()),"capability":hex::encode_lower(self.capability.bytes()),"key":key_hex.as_str(),"root_seed":root_hex.as_deref(),"no_authority":self.no_authority});
+        let encoded = zeroize::Zeroizing::new(
+            aterm_json::to_vec(&v).map_err(|_| Error::new("configuration encoding failed"))?,
+        );
+        private_file::write_private(dir, CONFIG, &encoded)?;
         Ok(())
     }
     /// Certify a public installation request. The invitation contains a read key;
@@ -181,9 +190,14 @@ fn identity(dir: &Path) -> Result<([u8; 32], Actor)> {
     identity_in(&judged)
 }
 fn identity_in(judged: &private_file::JudgedDir) -> Result<([u8; 32], Actor)> {
-    let bytes = judged
-        .read(IDENTITY, 48)
-        .map_err(|_| Error::new("local database identity missing or not private"))?;
+    let bytes = zeroize::Zeroizing::new(
+        judged
+            .read(IDENTITY, 48)
+            .map_err(|_| Error::new("local database identity missing or not private"))?,
+    );
+    parse_identity(&bytes)
+}
+fn parse_identity(bytes: &[u8]) -> Result<([u8; 32], Actor)> {
     if bytes.len() != 48 {
         return Err(Error::new("invalid local database identity"));
     }
@@ -196,10 +210,23 @@ fn identity_in(judged: &private_file::JudgedDir) -> Result<([u8; 32], Actor)> {
     Ok((seed, actor))
 }
 fn ensure_identity(dir: &Path) -> Result<([u8; 32], Actor)> {
-    if missing(dir, IDENTITY)? {
-        private_file::write_private(dir, IDENTITY, &crypto::random::<48>()?)?;
+    match private_file::read_private(dir, IDENTITY, 4096) {
+        Ok(bytes) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            if bytes.len() > 48 {
+                return Err(Error::new("local database identity missing or not private"));
+            }
+            parse_identity(&bytes)
+        }
+        Err(PrivateFileError::Missing) => {
+            let generated = zeroize::Zeroizing::new(crypto::random::<48>()?);
+            private_file::write_private(dir, IDENTITY, &*generated)?;
+            identity(dir)
+        }
+        Err(_) => Err(Error::new(
+            "existing database state is not a private regular file",
+        )),
     }
-    identity(dir)
 }
 /// Create a private installation identity and return its PUBLIC admission request.
 pub fn request(dir: &Path) -> Result<Actor> {
@@ -213,7 +240,7 @@ pub fn init(dir: &Path, namespace: &str) -> Result<()> {
         return Err(Error::new("database already initialized"));
     }
     let (seed, actor) = ensure_identity(dir)?;
-    let root_seed = crypto::random()?;
+    let root_seed = zeroize::Zeroizing::new(crypto::random()?);
     let manifest = Manifest::create(&root_seed, namespace)?;
     let capability = Capability::issue(&manifest, &root_seed, actor)?;
     Credentials {
@@ -221,7 +248,7 @@ pub fn init(dir: &Path, namespace: &str) -> Result<()> {
         capability,
         seed,
         key: crypto::random()?,
-        root_seed: Some(root_seed),
+        root_seed: Some(*root_seed),
         no_authority: false,
     }
     .save(dir)
@@ -272,8 +299,18 @@ pub fn ensure_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<()> {
     }
     let keys = FleetKeys::derive(fleet_secret)?;
     let _lock = lock(dir)?;
-    if !missing(dir, CONFIG)? {
-        let mut existing = Credentials::load(dir)?;
+    let judged = private_file::JudgedDir::judge(dir)
+        .map_err(|_| Error::new("existing database state is not a private regular file"))?;
+    if let Some(config_bytes) = match judged.read(CONFIG, 4096) {
+        Ok(bytes) => Some(zeroize::Zeroizing::new(bytes)),
+        Err(PrivateFileError::Missing) => None,
+        Err(_) => {
+            return Err(Error::new(
+                "existing database state is not a private regular file",
+            ));
+        }
+    } {
+        let mut existing = Credentials::from_config_bytes(&judged, &config_bytes)?;
         if !keys.hold(&existing) {
             return Err(Error::new(
                 "this database belongs to another fleet key; `aterm db rekey` moves its rows onto the current one",
@@ -480,13 +517,34 @@ impl Database {
     /// The received time and append position are local observations, not global order.
     pub fn provenance(&self, id: &Digest) -> Option<Value> {
         let mut value = self.history.provenance(id)?;
+        self.attach_receipt(id, &mut value);
+        Some(value)
+    }
+
+    pub(crate) fn all_provenance(&self) -> Vec<Value> {
+        let projection = self.history.project(&std::collections::BTreeSet::new());
+        let ordered: std::collections::BTreeSet<Digest> =
+            projection.ordered.iter().copied().collect();
+        self.history
+            .index
+            .inventory()
+            .filter_map(|id| {
+                let mut value =
+                    self.history
+                        .provenance_with(id, &projection.quarantined, |id| ordered.contains(id))?;
+                self.attach_receipt(id, &mut value);
+                Some(value)
+            })
+            .collect()
+    }
+
+    fn attach_receipt(&self, id: &Digest, value: &mut Value) {
         if let Some((time, offset)) = self.receipts.get(id)
             && let Some(object) = value.as_object_mut()
         {
             object.insert("received_at_unix_ms".into(), Value::from(*time));
             object.insert("local_journal_offset".into(), Value::from(*offset));
         }
-        Some(value)
     }
     /// Authenticate and durably retain a peer operation. A missing dependency waits;
     /// a duplicate is inert. Acknowledgement follows astream's strict append.
@@ -522,7 +580,8 @@ impl Database {
             .ok_or_else(|| Error::new("journal sequence exhausted"))?;
         let received_at = aterm_time::unix_millis()
             .ok_or_else(|| Error::new("system clock cannot represent a receipt timestamp"))?;
-        let mut body = received_at.to_le_bytes().to_vec();
+        let mut body = Vec::with_capacity(8 + wire.len());
+        body.extend_from_slice(&received_at.to_le_bytes());
         body.extend_from_slice(wire);
         let appended = match self
             .log
@@ -596,7 +655,6 @@ impl Database {
                 ));
             }
             if let Some(changes) = command.changes() {
-                let view = self.view();
                 for change in changes {
                     if view
                         .cells
@@ -784,7 +842,7 @@ impl Database {
             }
         }
         let past = self.history.before(&operation)?;
-        let mut changes = Vec::new();
+        let mut changes = Vec::with_capacity(affected.len());
         for change in affected {
             let previous = past
                 .cells

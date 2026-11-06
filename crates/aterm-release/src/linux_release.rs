@@ -13,6 +13,24 @@ use aterm_update_core::linux::{LINUX_BINARY_MAX_BYTES, LinuxTarget};
 use aterm_update_core::{Manifest, sha256_file};
 use serde::{Deserialize, Serialize};
 
+/// Native Linux pilot builds use the same sealed release slice driver, without
+/// writing handoff receipts or executing a release product.
+pub(crate) fn pilot(
+    take: &super::Take,
+    arm: crate::profile_pilot::Arm,
+    root: &Path,
+    build: u64,
+    hint: Option<&str>,
+) -> Result<aterm_json::Value, String> {
+    if !matches!(
+        arm,
+        crate::profile_pilot::Arm::Fat1 | crate::profile_pilot::Arm::Fat1Lines
+    ) {
+        return Err("Linux profile pilot supports fat1 and fat1-lines".into());
+    }
+    super::pilot_build(take, arm, root, None, build, hint)
+}
+
 #[path = "pin_release.rs"]
 pub mod from_release;
 

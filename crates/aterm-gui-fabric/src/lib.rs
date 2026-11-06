@@ -3669,6 +3669,10 @@ pub fn bridge_lost(store: &impl AsStore, generation: BridgeGeneration) -> usize 
 
 /// [`bridge_lost`], calling `wake` with the id of each session whose log owes its readers a wake
 /// (the halt's `hold` mark), once its fabric lock is released.
+///
+/// A generation older than the link's owner is a dead one's late loss: its supervisor said its
+/// loss at its exit and relaunched, and the newer bridge serves the governed sessions. Its sweep
+/// sets no hold and no advisory, judged under each session's lock.
 #[cfg(any(unix, test, debug_assertions))]
 pub fn bridge_lost_waking(
     store: &impl AsStore,
@@ -3711,7 +3715,8 @@ pub fn bridge_lost_waking(
                 origin: "fleet".to_string(),
             };
             if halts {
-                apply_hold(&ctx, HoldAct::Set(lost), HoldIssuer::Bridge, None, &|| {
+                let act = HoldAct::Lost(lost, generation);
+                apply_hold(&ctx, act, HoldIssuer::Bridge, None, &|| {
                     wake(ctx.self_id());
                 });
             } else if advise(&ctx, lost, generation) {
@@ -3742,10 +3747,36 @@ pub fn holds_on_bridge_lost() -> bool {
     LINK.hold_on_loss.load(Ordering::Relaxed)
 }
 
+/// Whether a newer generation than `generation` owns the link: `generation`'s loss is a dead
+/// bridge's, said late.
+#[cfg(any(unix, test, debug_assertions))]
+fn superseded(generation: BridgeGeneration) -> bool {
+    generation.0 < *LINK.generation.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether the lane of bridge generation `generation` may still move a session's hold: no newer
+/// generation owns the link, and the owner's loss, when it is `generation`, has not been said
+/// ([`bridge_lost`] marks it before its sweep takes any session's lock). A generation newer than
+/// the owner, whose attach has not landed, is no lost one.
+fn lane_governs(generation: BridgeGeneration) -> bool {
+    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+    generation.0 > *owner
+        || (generation.0 == *owner && LINK.state.load(Ordering::Relaxed) != FABRIC_DISCONNECTED)
+}
+
+/// Advise `ctx` of `generation`'s loss: once, however many of that generation's lanes and its
+/// supervisor say it, and never past a newer attach ([`superseded`]).
 #[cfg(any(unix, test, debug_assertions))]
 fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> bool {
     let mut inbox = ctx.fabric().lock();
-    if inbox.holds.is_held() {
+    if inbox.holds.is_held() || superseded(generation) {
+        return false;
+    }
+    if inbox
+        .advisory
+        .as_ref()
+        .is_some_and(|(hold, under)| *under == generation.0 && *hold == lost)
+    {
         return false;
     }
     let fact = FabricFact::Advisory {
@@ -3965,6 +3996,10 @@ pub const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet 
 /// saw it neither land nor stand down.
 pub const HOLD_BUSY: &str = "ERR busy update-committing\n";
 
+/// The refusal of a `hold` from the lane of a lost bridge generation: its loss has been said, or a
+/// newer generation owns the link ([`lane_governs`]). Nothing moved.
+pub const HOLD_LANE_LOST: &str = "ERR bridge lost: a lost bridge's lane holds and frees nothing\n";
+
 #[cfg(any(test, debug_assertions))]
 fn note_fence_block(fabric: &SessionFabric, bound: Option<std::time::Duration>) {
     FENCE_BLOCKS.with(|n| n.set(n.get() + 1));
@@ -4033,6 +4068,11 @@ pub enum HoldIssuer {
 enum HoldAct<'a> {
     /// Set the slot of `hold.origin`, or move its reason.
     Set(Hold),
+    /// [`Self::Set`] for a lost bridge's sweep ([`bridge_lost_waking`]), unless a newer
+    /// generation owns the link once the session's lock is taken ([`superseded`]): that bridge
+    /// serves the session, and may already have freed it.
+    #[cfg(any(unix, test, debug_assertions))]
+    Lost(Hold, BridgeGeneration),
     /// Lift the slot of this origin, and only it.
     Lift(&'a str),
     /// Set the remote slot as its node ([`HoldIssuer::Remote`]).
@@ -4048,6 +4088,8 @@ impl HoldAct<'_> {
     const fn origin(&self) -> Option<&str> {
         match self {
             Self::Set(hold) => Some(hold.origin.as_str()),
+            #[cfg(any(unix, test, debug_assertions))]
+            Self::Lost(hold, _) => Some(hold.origin.as_str()),
             Self::Lift(origin) => Some(origin),
             Self::SetRemote(_) | Self::LiftRemote(_) => Some(REMOTE_ORIGIN),
             #[cfg(any(test, debug_assertions))]
@@ -4060,7 +4102,8 @@ impl HoldAct<'_> {
 enum Applied {
     /// A slot moved, and the event was recorded.
     Changed { held: bool },
-    /// The slot already stood as asked.
+    /// Nothing moved: the slot already stood as asked, or the act was a superseded generation's
+    /// loss ([`HoldAct::Lost`]).
     Unchanged { held: bool },
     /// An Owner's act named the fleet's slot, or an Owner `off` found only a fleet hold standing.
     FleetHeld,
@@ -4072,6 +4115,8 @@ enum Applied {
     /// A seamless update was committing the session for the whole wait the caller allowed
     /// ([`SessionFabric::fence_hold`]).
     Fenced,
+    /// The act came from the lane of a lost bridge generation ([`lane_governs`]).
+    LaneLost,
 }
 
 fn apply_hold(
@@ -4081,15 +4126,20 @@ fn apply_hold(
     fence_wait: Option<std::time::Duration>,
     wake: &dyn Fn(),
 ) -> Applied {
-    apply_hold_as(ctx, act, issuer, fence_wait, false, wake)
+    apply_hold_as(ctx, act, issuer, fence_wait, false, None, wake)
 }
 
+/// Apply `act` under the session's lock. `lane` is the bridge generation whose lane issued it, a
+/// lane's own `hold` verb ([`cmd_hold`]): it moves nothing once that generation is lost, judged
+/// under the lock, which [`bridge_lost`]'s sweep takes after marking the loss. So a lost
+/// generation's verb lands before its loss's sweep of the session, or moves nothing.
 fn apply_hold_as(
     ctx: &dyn FabricSession,
     act: HoldAct<'_>,
     issuer: HoldIssuer,
     fence_wait: Option<std::time::Duration>,
     carried: bool,
+    lane: Option<BridgeGeneration>,
     wake: &dyn Fn(),
 ) -> Applied {
     let mut inbox = ctx.fabric().lock();
@@ -4116,6 +4166,9 @@ fn apply_hold_as(
                     .0
             }
         };
+    }
+    if lane.is_some_and(|generation| !lane_governs(generation)) {
+        return Applied::LaneLost;
     }
     let remote_act = matches!(act, HoldAct::SetRemote(_) | HoldAct::LiftRemote(_));
     let its_slot = match issuer {
@@ -4154,6 +4207,16 @@ fn apply_hold_as(
             return Applied::FleetHeld;
         }
     }
+    // Read under the session's lock, which the newer bridge's own `hold off` takes after its
+    // attach: a loss judged current here lands before that lift, never over it.
+    #[cfg(any(unix, test, debug_assertions))]
+    if let HoldAct::Lost(_, generation) = &act
+        && superseded(*generation)
+    {
+        return Applied::Unchanged {
+            held: inbox.holds.is_held(),
+        };
+    }
     let before = inbox.holds.clone();
     match &act {
         HoldAct::Set(hold) => {
@@ -4162,6 +4225,8 @@ fn apply_hold_as(
                 inbox.holds.remote = None;
             }
         }
+        #[cfg(any(unix, test, debug_assertions))]
+        HoldAct::Lost(hold, _) => *inbox.holds.slot_mut(&hold.origin) = Some(hold.reason.clone()),
         HoldAct::Lift(origin) => *inbox.holds.slot_mut(origin) = None,
         HoldAct::SetRemote(hold) => inbox.holds.remote = Some(hold.clone()),
         HoldAct::LiftRemote(_) => inbox.holds.remote = None,
@@ -4307,10 +4372,15 @@ pub fn carry_hold_waking(ctx: &dyn FabricSession, hold: Hold, wake: &dyn Fn()) -
         HoldIssuer::Owner,
         Some(std::time::Duration::ZERO),
         true,
+        None,
         wake,
     ) {
         Applied::Changed { held } | Applied::Unchanged { held } => held,
-        Applied::FleetHeld | Applied::NotItsSlot | Applied::Taken | Applied::Fenced => false,
+        Applied::FleetHeld
+        | Applied::NotItsSlot
+        | Applied::Taken
+        | Applied::Fenced
+        | Applied::LaneLost => false,
     }
 }
 
@@ -4419,6 +4489,14 @@ pub fn cmd_hold_within_waking(
             None => return "ERR no such session\n".to_string(),
         }
     };
+    // A bridge lane's own verb speaks for that lane's generation; no other caller's does.
+    let lane = match issuer {
+        HoldIssuer::Bridge => lane_generation(),
+        HoldIssuer::Owner | HoldIssuer::Person | HoldIssuer::Remote => None,
+    };
+    if lane.is_some_and(|generation| !lane_governs(generation)) {
+        return HOLD_LANE_LOST.to_string();
+    }
     if issuer == HoldIssuer::Bridge {
         note_bridge_touched(store, sid);
     }
@@ -4446,7 +4524,11 @@ pub fn cmd_hold_within_waking(
         (None, false) => HoldAct::Lift(&origin),
     };
     let fence_wait = fence_wait.unwrap_or_else(|| ctx.fabric().fence_wait());
-    match apply_hold(&ctx, act, issuer, Some(fence_wait), &|| wake(ctx.self_id())) {
+    let applied = apply_hold_as(&ctx, act, issuer, Some(fence_wait), false, lane, &|| {
+        wake(ctx.self_id());
+    });
+    match applied {
+        Applied::LaneLost => HOLD_LANE_LOST.to_string(),
         Applied::FleetHeld => HOLD_DENIED.to_string(),
         Applied::NotItsSlot => HOLD_PERSON_USAGE.to_string(),
         Applied::Taken => {
@@ -4604,9 +4686,11 @@ pub fn person_hold(ctx: &dyn FabricSession, on: bool, wake: &dyn Fn()) -> Person
     match apply_hold(ctx, act, issuer, Some(std::time::Duration::ZERO), wake) {
         Applied::Changed { .. } => PersonHoldOutcome::Moved,
         Applied::Fenced => PersonHoldOutcome::Busy,
-        Applied::Unchanged { .. } | Applied::FleetHeld | Applied::NotItsSlot | Applied::Taken => {
-            PersonHoldOutcome::Unchanged
-        }
+        Applied::Unchanged { .. }
+        | Applied::FleetHeld
+        | Applied::NotItsSlot
+        | Applied::Taken
+        | Applied::LaneLost => PersonHoldOutcome::Unchanged,
     }
 }
 
@@ -9629,7 +9713,7 @@ mod inbox_hold {
                         std::time::Instant::now() < deadline,
                         "the post never reached the outbox"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 assert_eq!(
                     cmd_link(&store, "down reason=no-socket", Some(generation)),
@@ -9776,7 +9860,7 @@ mod inbox_hold {
 
     fn single_slot(standing: Option<Hold>, act: &HoldAct<'_>) -> Option<Hold> {
         match act {
-            HoldAct::Set(hold) => Some(hold.clone()),
+            HoldAct::Set(hold) | HoldAct::Lost(hold, _) => Some(hold.clone()),
             HoldAct::Lift(origin) => standing.filter(|hold| hold.origin != *origin),
             HoldAct::LiftAll => None,
             HoldAct::SetRemote(_) | HoldAct::LiftRemote(_) => standing,
@@ -9971,7 +10055,7 @@ mod inbox_hold {
             let arg = if on { "on reason=x" } else { "off" };
             bridge_hold(&store, &format!("{sid} {arg}"));
             on = !on;
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let latched = waiter.join().expect("the waiter finished");
         assert!(
@@ -10326,7 +10410,7 @@ mod inbox_hold {
                     break;
                 }
                 assert_eq!(reply, "ERR no such post\n");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 poster.join().expect("the poster finished"),
@@ -10561,7 +10645,7 @@ mod inbox_hold {
                 if cmd_deliver(&store, &format!("{sid} landed=1 off=42")) == "OK\n" {
                     break;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 cmd_deliver(
@@ -10587,7 +10671,7 @@ mod inbox_hold {
                 if cmd_deliver(&store, &format!("{sid} landed=2 off=43")) == "OK\n" {
                     break;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 cmd_deliver(
@@ -10612,7 +10696,7 @@ mod inbox_hold {
                 if cmd_deliver(&store, &format!("{sid} landed=3 off=44")) == "OK\n" {
                     break;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 poster.join().expect("the poster finished"),
@@ -10629,7 +10713,7 @@ mod inbox_hold {
                 if cmd_deliver(&store, &format!("{sid} landed=4 off=45")) == "OK\n" {
                     break;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
             assert_eq!(
@@ -10658,7 +10742,7 @@ mod inbox_hold {
                 if cmd_deliver(&store, &format!("{sid} landed=5 off=46")) == "OK\n" {
                     break;
                 }
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             let started = std::time::Instant::now();
             assert_eq!(
@@ -10794,7 +10878,7 @@ mod inbox_hold {
                         std::time::Instant::now() < deadline,
                         "no `fetch off={off}` on the outbox peek within a minute; drain:\n{peek}"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
             };
             let total = RING_CAP as u64 + 8;
@@ -11094,7 +11178,7 @@ mod inbox_hold {
                     std::time::Instant::now() < deadline,
                     "the read never parked"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
 
             assert_eq!(tell(&b), "OK forgot=1\n");
@@ -11657,7 +11741,7 @@ mod inbox_hold {
                 std::time::Instant::now() < deadline,
                 "no `fetch off={off}` on the outbox peek within a minute; drain:\n{peek}"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -12526,7 +12610,7 @@ mod inbox_hold {
                         std::time::Instant::now() < deadline,
                         "{case}: the two waits did not arm within a minute"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
 
                 let moved = if lineage {
@@ -12922,7 +13006,7 @@ mod inbox_hold {
                     std::time::Instant::now() < deadline,
                     "the waiter never woke"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 waiter.join().expect("the waiter thread"),
@@ -12985,7 +13069,7 @@ mod inbox_hold {
                     std::time::Instant::now() < deadline,
                     "the post never reached the outbox"
                 );
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             bridge_lost(&store, generation);
 
@@ -13143,7 +13227,7 @@ mod inbox_hold {
             assert_eq!(
                 bridge_lost(&store, first),
                 1,
-                "the hold sweep is unconditional"
+                "the governed set is counted, whichever generation's loss it is"
             );
             assert_eq!(
                 fabric_state(),
@@ -13153,6 +13237,211 @@ mod inbox_hold {
 
             assert_eq!(bridge_lost(&store, second), 1);
             assert_eq!(fabric_state(), "disconnected");
+        });
+    }
+
+    /// A DEAD GENERATION'S LATE LOSS HOLDS AND ADVISES NO SESSION: a newer bridge owns the link
+    /// and serves the sessions the dead one governed, and may already have freed them. The
+    /// owner's own loss still holds them, and so does the loss of a generation newer than the
+    /// owner (one that never attached). However many say one generation's loss, it advises a
+    /// session once.
+    ///
+    /// NEGATIVE CONTROL: without the `superseded` check on `HoldAct::Lost` in [`apply_hold_as`],
+    /// the first generation's late loss holds the session the second one freed (2026-11-05).
+    #[test]
+    fn a_dead_generations_late_loss_holds_and_advises_no_session() {
+        fn reason(ctx: &SessionCtx) -> Option<String> {
+            ctx.fabric.hold().map(|hold| hold.reason)
+        }
+        with_link(|| {
+            set_hold_on_bridge_lost(true);
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let first = next_bridge_generation();
+            bridge_attached(first);
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            let second = next_bridge_generation();
+            bridge_attached(second);
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+
+            assert_eq!(bridge_lost(&store, first), 1, "the governed set is counted");
+            assert_eq!(
+                reason(&ctx),
+                None,
+                "a dead generation's loss held the session"
+            );
+
+            assert_eq!(bridge_lost(&store, second), 1);
+            assert_eq!(
+                reason(&ctx).as_deref(),
+                Some(FABRIC_LOST),
+                "the owner's loss holds"
+            );
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            let never_attached = next_bridge_generation();
+            assert_eq!(bridge_lost(&store, never_attached), 1);
+            assert_eq!(
+                reason(&ctx).as_deref(),
+                Some(FABRIC_LOST),
+                "a generation newer than the owner is no dead one"
+            );
+        });
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let first = next_bridge_generation();
+            bridge_attached(first);
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            let second = next_bridge_generation();
+            bridge_attached(second);
+            assert_eq!(bridge_lost(&store, first), 1);
+            for _ in 0..3 {
+                assert_eq!(bridge_lost(&store, second), 1);
+            }
+            let facts = ctx.timeline.lock().unwrap().facts.clone();
+            let advised: Vec<_> = facts
+                .iter()
+                .filter(|f| f.starts_with("hold-advisory: "))
+                .collect();
+            assert_eq!(
+                advised,
+                [&format!(
+                    "hold-advisory: Advisory {{ origin: \"fleet\", reason: \"fabric-lost\", \
+                     generation: {} }}",
+                    second.0
+                )],
+                "one advisory, of the owner's loss alone: {facts:?}"
+            );
+            assert_eq!(
+                ctx.fabric
+                    .hold_advisory()
+                    .map(|hold| hold.reason)
+                    .as_deref(),
+                Some(FABRIC_LOST)
+            );
+        });
+    }
+
+    /// A LOST GENERATION'S LANE HOLDS AND FREES NOTHING: a `hold` its lane had already read when
+    /// its supervisor said the loss lands after the exit sweep, or after the next attach, and
+    /// moves no slot. Ahead of the next attach it cannot lift the sweep's `fabric-lost`; past it
+    /// the lane's own late loss is a dead generation's, which holds nothing again. Its `hold on`
+    /// cannot halt a session the next bridge freed, under either setting of the knob.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-05): without either lane check, [`cmd_hold_within_waking`]'s or
+    /// [`apply_hold_as`]'s, the late `hold off` lifts the exit sweep's hold and nothing holds the
+    /// session again; without the one under the lock alone, the verb parked on the fence before
+    /// its generation's loss halts the session once the fence lifts.
+    #[test]
+    fn a_lost_generations_lane_holds_and_frees_nothing() {
+        fn reason(ctx: &SessionCtx) -> Option<String> {
+            ctx.fabric.hold().map(|hold| hold.reason)
+        }
+        with_link(|| {
+            set_hold_on_bridge_lost(true);
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let off = format!("{sid} off");
+            let first = next_bridge_generation();
+            bridge_attached(first);
+            assert_eq!(on_lane(first, || bridge_hold(&store, &off)), "OK hold=0\n");
+            assert_eq!(bridge_lost(&store, first), 1, "the supervisor's exit sweep");
+            assert_eq!(reason(&ctx).as_deref(), Some(FABRIC_LOST));
+            assert_eq!(
+                on_lane(first, || bridge_hold(&store, &off)),
+                HOLD_LANE_LOST,
+                "the lost lane's last verb, landing after the exit sweep"
+            );
+            assert_eq!(
+                reason(&ctx).as_deref(),
+                Some(FABRIC_LOST),
+                "a lost lane lifted the exit sweep's hold"
+            );
+            let second = next_bridge_generation();
+            bridge_attached(second);
+            assert_eq!(bridge_lost(&store, first), 1, "the lost lane's own guard");
+            assert_eq!(
+                reason(&ctx).as_deref(),
+                Some(FABRIC_LOST),
+                "the session runs unheld beside a bridge that has not freed it"
+            );
+            assert_eq!(on_lane(second, || bridge_hold(&store, &off)), "OK hold=0\n");
+            assert_eq!(
+                on_lane(first, || bridge_hold(
+                    &store,
+                    &format!("{sid} on reason=stop")
+                )),
+                HOLD_LANE_LOST
+            );
+            assert_eq!(reason(&ctx), None, "a dead bridge halted a session");
+        });
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let first = next_bridge_generation();
+            bridge_attached(first);
+            let second = next_bridge_generation();
+            bridge_attached(second);
+            assert_eq!(
+                on_lane(first, || bridge_hold(
+                    &store,
+                    &format!("{sid} on reason=stop")
+                )),
+                HOLD_LANE_LOST,
+                "a superseded lane, its loss unsaid"
+            );
+            assert_eq!(reason(&ctx), None);
+            assert!(
+                !touched_contains(&sid),
+                "a lost lane's refused hold governs nothing"
+            );
+            assert_eq!(
+                on_lane(second, || bridge_hold(
+                    &store,
+                    &format!("{sid} on reason=stop")
+                )),
+                "OK hold=1\n",
+                "the owner's lane holds"
+            );
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} off")),
+                "OK hold=0\n",
+                "a hold no lane issued is judged by no lane's generation"
+            );
+        });
+        // The verb in flight: read while its generation governed, parked on a committing
+        // update's fence, then its generation's loss said before it takes the lock.
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            ctx.fabric.fence_hold(true);
+            let before = ctx.fabric.fence_waits();
+            let lane = {
+                let store = Arc::clone(&store);
+                let rest = format!("{sid} on reason=stop");
+                std::thread::spawn(move || {
+                    on_lane(generation, || {
+                        let wait = Some(aterm_spec::wait::MUST_HAPPEN);
+                        cmd_hold_within(&store, &rest, HoldIssuer::Bridge, wait)
+                    })
+                })
+            };
+            assert_parked_on_the_fence(
+                &ctx.fabric,
+                before,
+                || lane.is_finished(),
+                "a lane's hold, read before its bridge's loss",
+            );
+            assert_eq!(bridge_lost(&store, generation), 1);
+            ctx.fabric.lift_hold_fence();
+            assert_eq!(lane.join().expect("the lane's thread"), HOLD_LANE_LOST);
+            assert_eq!(
+                reason(&ctx),
+                None,
+                "a lost bridge's verb in flight halted a session"
+            );
         });
     }
 

@@ -6002,7 +6002,7 @@ fn at_once_holds_its_limit_and_its_order() {
                 Instant::now() < deadline,
                 "the walk never filled its places"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         inflight.fetch_sub(1, Ordering::SeqCst);
         n * 10
@@ -6635,7 +6635,7 @@ fn a_dial_takes_one_pass_however_long_its_budget() {
                         accepted.fetch_add(1, Ordering::SeqCst);
                         drop(connection);
                     }
-                    Err(_) => std::thread::yield_now(),
+                    Err(_) => aterm_uds::deadline::poll_yield(),
                 }
             }
         }
@@ -9508,6 +9508,21 @@ fn a_relayed_seed_is_adopted_only_under_the_key_this_book_binds_to_its_minter() 
         recorded().unwrap(),
         fleet_seed::conflict_line(&by_d, T + 20)
     );
+
+    // A rekey whose root could not sign its seed again: the held one verifies under no key of
+    // the new secret, so the seed its root holds now is taken over it.
+    let rekeyed = secret(8).mark();
+    let new_root_seed = FleetSeed::mint(&d, rekeyed, T + 30).unwrap();
+    assert_eq!(
+        adopt(&[new_root_seed], rekeyed, T + 30),
+        Some(new_root_seed),
+        "a seed nobody can sign for this secret is none"
+    );
+    assert_eq!(
+        adopt(&[by_c], rekeyed, T + 31),
+        None,
+        "control: the old one verifies under no key of it either"
+    );
 }
 
 #[test]
@@ -9553,6 +9568,197 @@ fn a_root_adopts_only_a_seed_it_minted() {
         Some(by_c),
         "control: a code holder whose book names an issuer is a member"
     );
+}
+
+#[test]
+fn a_root_holding_no_seed_mints_one_once_its_wait_is_over() {
+    use fleet_seed::{FleetSeed, UNHELD_FILE, read_unheld};
+    const T: u64 = 1_793_000_000_000;
+    const MINUTE: u64 = 60_000;
+    let state = State::new("unheld-root");
+    issue(state.dir());
+    let root = identity(&node_of(0x11), 0x11);
+    let mint_read = |now, read| {
+        hold_book(state.dir())
+            .unwrap()
+            .mint_unheld_seed(&root, secret(5).mark(), (now, read))
+            .unwrap()
+    };
+    let mint = |now| mint_read(now, true);
+    assert_eq!(mint_read(T, false), None);
+    assert_eq!(
+        read_unheld(state.dir()),
+        None,
+        "a round that read no member's book starts no wait"
+    );
+    assert_eq!(mint(T), None, "the wait starts");
+    assert_eq!(read_unheld(state.dir()), Some(T));
+    assert_eq!(mint(T + 10 * MINUTE - 1), None, "ten minutes");
+    assert_eq!(
+        read_unheld(state.dir()),
+        Some(T),
+        "the wait is not restarted"
+    );
+    assert_eq!(
+        mint_read(T + 60 * MINUTE, false),
+        None,
+        "nor does one end it"
+    );
+    let minted = mint(T + 10 * MINUTE).expect("minted once the wait is over");
+    assert!(minted.verifies(&root.key(), secret(5).mark()));
+    assert_eq!(
+        (minted.minter(), minted.minted_ms()),
+        (name_record::node_of(root.node()).unwrap(), T + 10 * MINUTE)
+    );
+    assert_eq!(seed_words(state.dir()), Some(minted.words()));
+    assert_eq!(
+        read_unheld(state.dir()),
+        None,
+        "the record goes with the wait"
+    );
+    assert_eq!(mint(T + 20 * MINUTE), None, "held: nothing more");
+    assert_eq!(read_unheld(state.dir()), None);
+
+    // A clock set back restarts the wait rather than holding it off.
+    hold_book(state.dir()).unwrap().keep_seed(None).unwrap();
+    write_private(
+        state.dir(),
+        UNHELD_FILE,
+        format!("{}\n", T + 500 * MINUTE).as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(mint(T), None);
+    assert_eq!(read_unheld(state.dir()), Some(T));
+    assert!(mint(T + 10 * MINUTE).is_some());
+
+    // A held seed drops a stale record.
+    write_private(state.dir(), UNHELD_FILE, b"1\n").unwrap();
+    assert_eq!(mint(T + 30 * MINUTE), None);
+    assert_eq!(read_unheld(state.dir()), None);
+
+    // A file of no seed, and its own seed signed for a secret the fleet no longer holds, are none.
+    for none in [
+        b"no seed\n".to_vec(),
+        format!(
+            "{}\n",
+            FleetSeed::mint(&root, secret(6).mark(), T).unwrap().words()
+        )
+        .into_bytes(),
+    ] {
+        write_private(state.dir(), fleet_seed::FILE, &none).unwrap();
+        assert_eq!(mint(T), None);
+        assert_eq!(read_unheld(state.dir()), Some(T));
+        assert!(mint(T + 10 * MINUTE).is_some());
+    }
+}
+
+#[test]
+fn a_member_holding_no_seed_never_mints_one() {
+    let c = identity(&node_of(0x13), 0x13);
+    let me = identity(&node_of(0x11), 0x11);
+    let issuer_entry = Peer {
+        via: Via::Issuer,
+        ..keyed(0x13, c.key(), [10, 0, 0, 3], 7100)
+    };
+    // A member as a join leaves it (a key, its issuer in its book, no code), one whose issuer's
+    // entry went (`peers rm`, the 90-day prune), and a code holder whose book names an issuer.
+    for (tag, code, book) in [
+        ("joined", false, vec![issuer_entry.clone()]),
+        ("pruned", false, Vec::new()),
+        ("code", true, vec![issuer_entry.clone()]),
+    ] {
+        let state = State::new(&format!("unheld-member-{tag}"));
+        if code {
+            issue(state.dir());
+        } else {
+            write_key(state.dir(), &[5; SECRET_LEN]).unwrap();
+        }
+        write_book(state.dir(), &book);
+        for now in [1, 1 + 1_000 * 60_000] {
+            assert_eq!(
+                hold_book(state.dir())
+                    .unwrap()
+                    .mint_unheld_seed(&me, secret(5).mark(), (now, true))
+                    .unwrap(),
+                None,
+                "{tag}"
+            );
+        }
+        assert_eq!(seed_words(state.dir()), None, "{tag}");
+        assert_eq!(
+            fleet_seed::read_unheld(state.dir()),
+            None,
+            "{tag}: nor waits to"
+        );
+    }
+}
+
+#[test]
+fn a_roots_heartbeat_mints_the_seed_it_holds_none_of_once_its_wait_is_over() {
+    let root_state = State::new("unheld-hb-root");
+    let a_state = State::new("unheld-hb-a");
+    issue(root_state.dir());
+    write_key(a_state.dir(), &[5; SECRET_LEN]).unwrap();
+    let root = identity(&node_of(0x21), 0x21);
+    let a = identity(&node_of(0x22), 0x22);
+    keep_identity(root_state.dir(), &root, 0x21);
+    write_book(a_state.dir(), &[]);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let a_port = listener.local_addr().unwrap().port();
+    let _a_at = Issuing::gated(
+        listener,
+        (secret(5), Some(a.clone())),
+        a_state.dir(),
+        Issuer {
+            node: a.node().to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: a_port,
+            version: "0.146.0".to_owned(),
+        },
+        None,
+    );
+    let now = unix_ms_now().unwrap();
+    write_book(
+        root_state.dir(),
+        &[Peer {
+            node: Some(a.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            seen_ms: Some(now),
+            ..keyed(0, a.key(), [127, 0, 0, 1], a_port)
+        }],
+    );
+    let reg = Registration {
+        node: root.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: 7324,
+        version: "0.146.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let round = || {
+        heartbeat_members(
+            root_state.dir(),
+            (&secret(5), &root),
+            &reg,
+            HANG,
+            (None, &Vec::new),
+        )
+        .expect("the round runs")
+    };
+    assert_eq!(round().len(), 1, "A answered");
+    assert_eq!(seed_words(root_state.dir()), None, "the wait starts");
+    let since = fleet_seed::read_unheld(root_state.dir()).expect("recorded");
+    write_private(
+        root_state.dir(),
+        fleet_seed::UNHELD_FILE,
+        format!("{}\n", since - fleet_seed::UNHELD_WAIT_MS).as_bytes(),
+    )
+    .unwrap();
+    round();
+    let minted = fleet_seed::read(root_state.dir())
+        .unwrap()
+        .expect("minted once its wait is over");
+    assert!(minted.verifies(&root.key(), secret(5).mark()));
 }
 
 #[test]
@@ -11320,7 +11526,7 @@ fn prune_pushed_facts_never_reads_a_fifo_key_sidecar() {
                     }
                     Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
                         assert!(Instant::now() < until, "FIFO producer hang detector");
-                        std::thread::yield_now();
+                        aterm_uds::deadline::poll_yield();
                     }
                     Err(error) => panic!("scratch FIFO writer: {error}"),
                 }
@@ -11476,7 +11682,7 @@ fn pushed_facts_fifo_payload(extension: &str) {
                     }
                     Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
                         assert!(Instant::now() < until, "FIFO producer hang detector");
-                        std::thread::yield_now();
+                        aterm_uds::deadline::poll_yield();
                     }
                     Err(error) => panic!("scratch FIFO writer: {error}"),
                 }

@@ -116,11 +116,18 @@ impl Key {
         match &self.crates {
             None => "the workspace".to_owned(),
             Some(c) if c.is_empty() => "no crate".to_owned(),
-            Some(c) => c
-                .iter()
-                .map(|n| format!("-p {n}"))
-                .collect::<Vec<_>>()
-                .join(" "),
+            Some(c) => {
+                let cap = c.iter().map(|n| n.len() + 4).sum::<usize>();
+                let mut out = String::with_capacity(cap);
+                for (i, n) in c.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str("-p ");
+                    out.push_str(n);
+                }
+                out
+            }
         }
     }
 
@@ -419,7 +426,16 @@ impl Records {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
-        options.open(&staged)?.write_all(encoded.as_bytes())?;
+        let mut file = options.open(&staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        file.write_all(encoded.as_bytes())?;
+        drop(file);
         std::fs::rename(&staged, path)
     }
 
@@ -602,32 +618,33 @@ pub fn need(
 
 impl fmt::Display for BuildNeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes = crate::size(self.bytes);
+        f.write_str(&crate::size(self.bytes))?;
         let Some(found) = &self.found else {
-            return write!(
-                f,
-                "{bytes} cold: no build of it is kept here or elsewhere, nor verify's run of it \
-                 (16 GiB, at most half of physical memory)"
+            return f.write_str(
+                " cold: no build of it is kept here or elsewhere, nor verify's run of it \
+                 (16 GiB, at most half of physical memory)",
             );
         };
-        let peak = crate::size(found.peak);
-        let from = match &found.via {
-            Via::Own => format!("the most its last {} build(s) used", found.runs),
-            Via::Wider(k) => format!(
-                "the most a build of a wider selection ({}) used",
+        match &found.via {
+            Via::Own => write!(f, ", the most its last {} build(s) used", found.runs)?,
+            Via::Wider(k) => write!(
+                f,
+                ", the most a build of a wider selection ({}) used",
                 k.selection()
-            ),
-            Via::Elsewhere(k) => format!("the most a build of it in {} used", k.checkout),
-            Via::Analogue(k) => format!(
-                "the most verify's {} of {} in {} used",
+            )?,
+            Via::Elsewhere(k) => write!(f, ", the most a build of it in {} used", k.checkout)?,
+            Via::Analogue(k) => write!(
+                f,
+                ", the most verify's {} of {} in {} used",
                 k.stage,
                 k.selection(),
                 k.checkout
-            ),
-        };
+            )?,
+        }
         write!(
             f,
-            "{bytes}, {from} ({peak}) and a fifth more, at least 1 GiB"
+            " ({}) and a fifth more, at least 1 GiB",
+            crate::size(found.peak)
         )
     }
 }

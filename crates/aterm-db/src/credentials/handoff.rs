@@ -95,7 +95,8 @@ impl Round<'_> {
                         && operation.header.actor == holder
                         && !book.inert.iter().any(|(id, _)| *id == offer)
                         && record_of(&command).is_ok_and(|record| {
-                            record.kind == "offer" && record.key == hex::encode_lower(&request)
+                            record.kind == "offer"
+                                && ids(&record.key).is_ok_and(|key| key == request)
                         })
                 });
                 if !offered {
@@ -137,18 +138,19 @@ impl Round<'_> {
                 let context = context(&facts, session, scope, now)?;
                 let log = Log::read_with(session, store, scope, decode)?;
                 let book = Book::read(&log, &context);
+                let inert_ids: BTreeSet<Digest> = book.inert.iter().map(|(id, _)| *id).collect();
                 let mut offers = Vec::new();
                 for (operation, command) in log.eligible() {
                     if operation.header.actor != self.peer
                         || self.owner.offered_before(&operation.header.id)
-                        || book.inert.iter().any(|(id, _)| *id == operation.header.id)
+                        || inert_ids.contains(&operation.header.id)
+                        || !command.changes().is_some_and(
+                            |changes| matches!(changes, [change] if change.collection == "offer"),
+                        )
                     {
                         continue;
                     }
                     let record = record_of(&command)?;
-                    if record.kind != "offer" {
-                        continue;
-                    }
                     let request = ids(&record.key)?;
                     if book.threads.get(&request).is_some_and(|thread| {
                         !thread.ended()
@@ -232,11 +234,12 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
     }
     let started = Instant::now();
     let nonce = crate::crypto::random::<32>()?;
-    let mut hello = b"ACQ1".to_vec();
-    hello.extend_from_slice(&round.network);
-    hello.extend_from_slice(&request);
-    hello.extend_from_slice(&offer);
-    hello.extend_from_slice(&nonce);
+    let mut hello = [0u8; 100];
+    hello[..4].copy_from_slice(b"ACQ1");
+    hello[4..20].copy_from_slice(&round.network);
+    hello[20..36].copy_from_slice(&request);
+    hello[36..68].copy_from_slice(&offer);
+    hello[68..100].copy_from_slice(&nonce);
     send(stream, &hello)?;
     let reply = receive(stream, 36)?;
     if reply == b"AQR1" {
@@ -256,9 +259,10 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
         holder: round.peer,
         recipient: admission.recipient,
     };
-    let mut proof = b"ACP1".to_vec();
-    proof.extend_from_slice(&exchange.recipient.0);
-    proof.extend_from_slice(
+    let mut proof = [0u8; 100];
+    proof[..4].copy_from_slice(b"ACP1");
+    proof[4..36].copy_from_slice(&exchange.recipient.0);
+    proof[36..100].copy_from_slice(
         &admin
             .prove_credential_custody(&exchange)
             .map_err(crate::table::failure)?,
@@ -289,8 +293,9 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
     );
     match published {
         Ok(seq) => {
-            let mut ok = b"AQOK".to_vec();
-            ok.extend_from_slice(&seq.to_be_bytes());
+            let mut ok = [0u8; 12];
+            ok[..4].copy_from_slice(b"AQOK");
+            ok[4..12].copy_from_slice(&seq.to_be_bytes());
             send(stream, &ok)?;
             Ok(1)
         }
@@ -312,8 +317,9 @@ fn give(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
         return refused(stream);
     };
     let nonce = crate::crypto::random::<32>()?;
-    let mut reply = b"AQN2".to_vec();
-    reply.extend_from_slice(&nonce);
+    let mut reply = [0u8; 36];
+    reply[..4].copy_from_slice(b"AQN2");
+    reply[4..36].copy_from_slice(&nonce);
     send(stream, &reply)?;
     let proof = receive(stream, 100)?;
     if proof.len() != 100 || &proof[..4] != b"ACP1" {

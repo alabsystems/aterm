@@ -103,6 +103,25 @@ impl Journal {
     }
 }
 
+pub(crate) fn record_reveal(
+    journal: &Journal,
+    cell: Cell<'_>,
+    surface: Surface,
+    when_ms: u64,
+) -> Result<()> {
+    if !crate::typed::pk_grammar(cell.row)
+        || !crate::typed::column_name(cell.column)
+        || !crate::typed::column_name(cell.collection)
+        || cell
+            .table
+            .split_once('/')
+            .is_none_or(|(app, role)| !crate::crypto::name(app) || !crate::crypto::name(role))
+    {
+        return Err(Error::new("invalid secret cell coordinates"));
+    }
+    journal.record(cell, surface, when_ms)
+}
+
 /// Open a cell with its epoch's audience key, journal once, then pass plaintext to its
 /// consuming surface. No plaintext leaves on authentication or journal failure.
 ///

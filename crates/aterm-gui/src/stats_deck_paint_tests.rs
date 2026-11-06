@@ -12,7 +12,7 @@ use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
     Hog, LinkKind, LinkSample, MemSample, MemView, NoFigure, PlanFact, Pressure, ProcLimits,
-    ProcScope, ScopeFig, Series, TabView, VolumeSample,
+    ProcScope, ScopeFig, Series, TabView, Thermal, Throttle, VolumeSample,
 };
 use aterm_vitals::{Cell, Filling, Rates, Reading, TrendView};
 
@@ -1002,16 +1002,6 @@ fn bar_tables(form: DeckForm, w: f64, m: &FaceMetrics) -> Vec<BarTable> {
     }
 }
 
-/// Capacity occupies the history/amount span only for RAM/Disk without an amount column.
-/// Those rows keep their scope bar under the percentage; GPU keeps its ordinary scope bar.
-fn capacity_under(form: DeckForm, w: f64, table: usize, res: Resource, m: &FaceMetrics) -> bool {
-    matches!(res, Resource::Memory | Resource::Disk)
-        && match form {
-            DeckForm::Full => plan::plan_full(w, m).meter.run.is_none(),
-            DeckForm::Folded => plan::plan_folded(w, m).blocks[table].meter.run.is_none(),
-        }
-}
-
 /// Where a row prints a % and draws no three-scope bar
 /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): in the column right of its strip where
 /// one fits, else under the figure, as drawn: the % column's width on whole device px, its top
@@ -1024,14 +1014,9 @@ fn bar_faults(d: &Swept<'_>) -> Vec<String> {
         let Some(pct) = pct else { continue };
         for r in 0..rows.count {
             let first = if d.form == DeckForm::Full { 0 } else { ti * 4 };
-            let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
+            if first + r as usize >= DECK_RESOURCES.len() {
                 continue;
-            };
-            let (bar, under) = if capacity_under(d.form, d.w, ti, res, d.m) {
-                (None, Some(pct))
-            } else {
-                (bar, under)
-            };
+            }
             let base = rows.top(r) + rows.baseline;
             let Some(figure) = boxes.iter().find(|b| {
                 b.kind == BoxKind::Text
@@ -1083,9 +1068,12 @@ fn bar_faults(d: &Swept<'_>) -> Vec<String> {
 
 /// Every row that prints a % draws its scope bar, in every form, on both faces at 1× and 2×: in
 /// its column right of the strip where it has one, else under the figure, inside the row's pitch
-/// (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2). The widths are [`sweep`]'s: every point at
-/// 1× and every seventh at 2× to [`EVERY_POINT_TO`], with 2× also at each width where the words
-/// change, and above it every 64th point, the only stride at which positions are guarded there.
+/// (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2), the GPU's and Memory's in the bar column
+/// like every other row's (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §3). The widths are
+/// [`sweep`]'s: every point at 1× and every seventh at 2× to [`EVERY_POINT_TO`], with 2× also at
+/// each width where the words change, and above it every 64th point, the only stride at which
+/// positions are guarded there. CONTROL: a row that prints no % (an unread GPU; the record's
+/// Latency row is not drawn yet) draws no bar.
 #[test]
 fn every_row_with_a_percent_draws_its_bar() {
     let failed = swept(Check::Bars);
@@ -1108,30 +1096,56 @@ fn every_row_with_a_percent_draws_its_bar() {
             pct.is_some(),
             "CONTROL {form:?} {w} pt: percentages present"
         );
-        for (r, &res) in DECK_RESOURCES.iter().take(rows.count as usize).enumerate() {
-            let r = r as u32;
-            let col = if capacity_under(form, w, 0, res, &m) {
-                pct
-            } else {
-                bar.or(bar_under)
-            }
-            .expect("CONTROL: the resource's bar column");
-            let bars = laid
-                .boxes
+        let col = bar.or(bar_under).expect("CONTROL: the table's bar column");
+        // Under-percent bars note the whole device-pixel rect they actually draw.
+        let bars_in = |laid: &Laid, r: u32| {
+            laid.boxes
                 .iter()
-                // Under-percent bars note the whole device-pixel rect they actually draw.
                 .filter(|b| {
                     b.kind == BoxKind::Bar
                         && (b.r[0] - col.x).abs() <= 0.25
                         && b.r[1] >= rows.top(r)
                         && b.r[1] < rows.top(r + 1)
                 })
-                .count();
+                .count()
+        };
+        for (r, &res) in DECK_RESOURCES.iter().take(rows.count as usize).enumerate() {
+            let bars = bars_in(&laid, r as u32);
             assert_eq!(
                 bars, 1,
                 "CONTROL {form:?} {w} pt {res:?}: its bar at {col:?}"
             );
         }
+        let gpu = DECK_RESOURCES
+            .iter()
+            .position(|&x| x == Resource::Gpu)
+            .expect("a GPU row") as u32;
+        let mut unread = scene(Scene::Calm);
+        unread.resources[Resource::Gpu.index()] = ResourceView::default();
+        unread.gpu = None;
+        if let Some(gpu) = unread.facts.gpu.as_mut() {
+            gpu.device_pct = None;
+        }
+        let input = scene_input(&unread, form);
+        let words = DeckWords::new(&input, &m);
+        let none = lay(&geom(w, 2.0, form), &input, &words, &m, false);
+        // Its row's words, in this table (Folded's block B stands on the same line).
+        let said: Vec<&str> = none
+            .boxes
+            .iter()
+            .filter(|b| {
+                b.kind == BoxKind::Text
+                    && b.r[0] < col.end()
+                    && b.r[3] > rows.top(gpu)
+                    && b.r[3] <= rows.top(gpu + 1)
+            })
+            .map(|b| b.text.as_str())
+            .collect();
+        assert!(
+            said.contains(&"GPU") && !said.iter().any(|t| t.ends_with('%')),
+            "CONTROL {form:?} {w} pt: an unread GPU prints no %: {said:?}"
+        );
+        assert_eq!(bars_in(&none, gpu), 0, "{form:?} {w} pt: no % and no bar");
     }
 }
 
@@ -1160,7 +1174,7 @@ fn panels_at(prims: &[DrawPrim], x: f32, (y0, y1): (f32, f32)) -> Vec<(Rect, [u8
 /// device px or more short of the next row's top and clear of its ink, so it never meets that
 /// row's cells or digits;
 /// every fill nested from its left edge, a scope above zero at
-/// least a device px; the column bar's own inks in both themes and under Increase Contrast; and
+/// least a device px where the fill around it has one to spare; the column bar's own inks in both themes and under Increase Contrast; and
 /// a click anywhere on it opens its row's lens, as the bar's column does, though its foot stands
 /// past the row's band.
 #[test]
@@ -1200,7 +1214,7 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                     let wide_tables = bar_tables(form, wide, &m);
                     for (ti, &(rows, _, _, under)) in tables.iter().enumerate() {
                         let col = under.unwrap_or_else(|| panic!("CONTROL {at}: bars under the %"));
-                        let (wide_rows, wide_pct, wide_bar, wide_under) = wide_tables[ti];
+                        let (wide_rows, _, wide_bar, wide_under) = wide_tables[ti];
                         let first = if form == DeckForm::Full { 0 } else { ti * 4 };
                         for r in 0..rows.count {
                             let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
@@ -1245,22 +1259,19 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                                 fills.push((fw, fill));
                             }
                             // Nested: each fill drawn after the track is no wider than the one
-                            // before it.
+                            // before it (a fill clamps to the one around it, A1 §4.6).
                             assert!(
                                 fills.windows(2).skip(1).all(|p| p[1].0 <= p[0].0),
                                 "{at}: {fills:?}"
                             );
                             nested += usize::from(fills.len() == 4);
-                            // The same inks in the wide layout, including a capacity row
-                            // whose wide layout also keeps its bar under the percentage.
-                            let wide_moved = capacity_under(form, wide, ti, res, &m);
-                            let wide_col = if wide_moved {
-                                wide_pct
-                            } else {
-                                wide_bar.or(wide_under)
-                            }
-                            .expect("CONTROL: the wide resource's bar");
-                            let band = if wide_moved || wide_bar.is_none() {
+                            // The column's inks: the same, but where a fill around one is a
+                            // px, the line's scope inside it gives way (A1 §4.6), the column's
+                            // rim showing it still.
+                            let wide_col = wide_bar
+                                .or(wide_under)
+                                .expect("CONTROL: the wide resource's bar");
+                            let band = if wide_bar.is_none() {
                                 (
                                     px(wide_rows.top(r) + wide_rows.baseline + plan::UNDER_GAP, s),
                                     px(wide_rows.top(r + 1), s),
@@ -1271,34 +1282,34 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                                     px(wide_rows.top(r) + wide_rows.cell, s),
                                 )
                             };
-                            let mut theirs: Vec<[u8; 4]> =
+                            let theirs: Vec<[u8; 4]> =
                                 panels_at(&column.prims, px(wide_col.x, s), band)
                                     .into_iter()
                                     .map(|(_, fill)| fill)
                                     .filter(|f| bar_inks.contains(f))
                                     .collect();
-                            let mut ours: Vec<[u8; 4]> = fills.iter().map(|f| f.1).collect();
-                            theirs.sort_unstable();
-                            ours.sort_unstable();
-                            assert_eq!(ours, theirs, "{at}: the column's inks");
+                            let ours: Vec<[u8; 4]> = fills.iter().map(|f| f.1).collect();
+                            assert!(
+                                ours.iter().all(|f| theirs.contains(f)),
+                                "{at}: {ours:?} are the column's inks {theirs:?}"
+                            );
+                            if ours.len() < theirs.len() {
+                                assert!(
+                                    fills.iter().skip(1).any(|f| f.0 <= 1.0),
+                                    "{at}: a scope gave way inside no 1 px fill: {fills:?}"
+                                );
+                            }
                             // A click anywhere on it, its foot past the row's band included,
                             // opens the row's lens; past it the next row's band takes over.
                             let mid = x + tw / 2.0;
                             for py in [y + 0.5, y + h - 0.5] {
                                 let hit =
                                     hit_at(&narrow.hits, f64::from(mid) / s, f64::from(py) / s, s);
-                                if capacity_under(form, w, ti, res, &m) {
-                                    assert!(
-                                        matches!(hit, Some(HitKind::Row(inst, _)) if inst == Instrument::of(res)),
-                                        "{at}: a click at {py} px names its resource: {hit:?}"
-                                    );
-                                } else {
-                                    assert_eq!(
-                                        hit,
-                                        row_hit(res, Bar::Global),
-                                        "{at}: a click at {py} px"
-                                    );
-                                }
+                                assert_eq!(
+                                    hit,
+                                    row_hit(res, Bar::Global),
+                                    "{at}: a click at {py} px"
+                                );
                             }
                         }
                     }
@@ -1943,8 +1954,8 @@ fn a_gap_is_never_drawn_as_step_zero() {
 /// gap before each band's first box marks every size's start): on each preset, at the narrowest
 /// width each form lays it, at 1× and 2×, one 1 px column in the grid ink stands in the gap
 /// before every band's first box past the live box, the live box's own edge included, at that
-/// box's left edge less the gap, down every history surface with caption holes left clear, and
-/// none stands elsewhere on the strip.
+/// box's left edge less the gap, down every history surface unbroken (no row captions its strip,
+/// `docs/DESIGN-stats-deck-flow-2026-11-02.md` §3), and none stands elsewhere on the strip.
 /// The bands come from the spec, so neighbouring bands whose boxes share a width keep theirs:
 /// the 6 h preset's 10 s and 1 min blocks, the 4 h one's 1 s, 10 s and 1 min blocks and its
 /// 10 min and 1 h ones, and the 6 min one's 1 s and 10 s blocks.
@@ -2002,9 +2013,8 @@ fn a_gridline_stands_before_every_bands_first_box() {
                         size(strip.spec.horizon_ms())
                     );
                     let (x0, x1) = (px(strip.x, s), px(strip.end(), s));
-                    // Read the rendered history surfaces, not the old full-height row boxes:
-                    // capacity captions retain a thin history below their words. An ordinary
-                    // strip's note can include an overflow cap above the row's history.
+                    // Read the rendered history surfaces: a strip's note can include an overflow
+                    // cap above the row's history.
                     let histories: Vec<_> = at
                         .iter()
                         .map(|&(r, res)| {
@@ -2035,27 +2045,7 @@ fn a_gridline_stands_before_every_bands_first_box() {
                         .collect();
                     let y0 = px(rows.top(0), s);
                     let y1 = px(histories.last().expect("resource rows").2, s);
-                    let mut coverage = vec![1_usize; (y1 - y0) as usize];
-                    // The caption clearance is half the planned gap in either form. Keep its
-                    // whole band clear, including space between words and the thin history.
-                    let clearance = (rows.pitch - rows.cell) / 2.0;
-                    for (i, &(r, top, _)) in histories.iter().enumerate() {
-                        if top > rows.top(r) {
-                            let previous_foot =
-                                i.checked_sub(1).map_or(y0, |i| px(histories[i].2, s));
-                            let a = px(rows.top(r) - clearance, s).max(previous_foot);
-                            let b = px(top, s);
-                            coverage[(a - y0) as usize..(b - y0) as usize].fill(0);
-                        }
-                    }
-                    for &(r, top, foot) in &histories {
-                        assert!(
-                            coverage[(px(top, s) - y0) as usize..(px(foot, s) - y0) as usize]
-                                .iter()
-                                .all(|&n| n == 1),
-                            "CONTROL {at_str}: row {r}'s history remains covered"
-                        );
-                    }
+                    let coverage = vec![1_usize; (y1 - y0) as usize];
                     let gap = px(1.0, s).max(1.0);
                     let rects = multi_scale_slot_rects(&strip, s, 0.0);
                     let slots = strip.spec.slots();
@@ -2140,8 +2130,8 @@ fn a_gridline_stands_before_every_bands_first_box() {
                         if actual != coverage {
                             failed.push(format!(
                                 "{at_str}: gridline at {gx} px does not cover every history \
-                                 exactly once while leaving caption holes clear: \
-                                 actual {actual:?}, wanted {coverage:?}, rows {y0}..{y1}"
+                                 exactly once: actual {actual:?}, wanted {coverage:?}, rows \
+                                 {y0}..{y1}"
                             ));
                         }
                     }
@@ -2219,10 +2209,7 @@ fn rule_s(
     };
     let run = meter.run.unwrap_or_else(|| panic!("{at}: a figure run"));
     let pt = rows.amount_pt;
-    let mut forms = words::monitor_amount(res, snap);
-    if forms.is_empty() {
-        forms = words::glance_run(res, &snap.resources[res.index()], snap, &MAC);
-    }
+    let forms = words::glance_run(res, &snap.resources[res.index()], snap, &MAC);
     let top = rows.top(r);
     let drawn = texts_in(laid, run, top - 1.0, top + rows.cell + 1.0);
     let mut says: Vec<&str> = st.clauses.iter().map(String::as_str).collect();
@@ -2343,6 +2330,194 @@ fn state_is_said_in_words_without_details() {
     assert!(said >= 10, "CONTROL: {said} states read");
 }
 
+/// The calm scene with the machine at the OS's thermal level `raw` (exact), the CPU row's state
+/// as the model derives it from that level.
+fn thermal_scene(raw: u8) -> Snapshot {
+    let level = [
+        Throttle::None,
+        Throttle::Light,
+        Throttle::Heavy,
+        Throttle::Severe,
+    ][usize::from(raw)];
+    let thermal = Thermal {
+        level,
+        raw,
+        low_power: Some(false),
+        exact: true,
+    };
+    let mut snap = scene(Scene::Calm);
+    snap.thermal = Some(thermal);
+    snap.resources[Resource::Cpu.index()].state = thermal.state();
+    snap
+}
+
+/// Where row `res` of `snap` says its state at every Folded and Full kind, as
+/// [`state_is_said_in_words_without_details`] reads it: its well's mark, then the first of its
+/// Details, else its figure run, else its block's header. Answers each mark drawn in its well
+/// and each header's state label, by kind.
+fn state_said(snap: &Snapshot, res: Resource, m: &FaceMetrics) -> Vec<(String, Vec<String>)> {
+    let st = words::state(res, snap, &MAC);
+    let i = DECK_RESOURCES
+        .iter()
+        .position(|&r| r == res)
+        .expect("a deck row");
+    let lay_at = |w: f64, form: DeckForm| {
+        let input = scene_input(snap, form);
+        let words = DeckWords::new(&input, m);
+        lay(&geom(w, 2.0, form), &input, &words, m, false)
+    };
+    let marks = |laid: &Laid, well: Col, rows: Rows, r: u32| -> Vec<String> {
+        let (top, bottom) = (rows.top(r), rows.top(r) + rows.cell);
+        laid.boxes
+            .iter()
+            .filter(|b| {
+                b.kind == BoxKind::Mark
+                    && b.r[0] >= well.x - EPS
+                    && b.r[2] <= well.end() + EPS
+                    && (b.r[1] + b.r[3]) / 2.0 > top
+                    && (b.r[1] + b.r[3]) / 2.0 < bottom
+            })
+            .map(|b| b.text.clone())
+            .collect()
+    };
+    let labels = |laid: &Laid, block: u8| -> Vec<String> {
+        laid.head
+            .iter()
+            .flat_map(|h| &h.labels)
+            .filter(|l| l.label == Label::State(block))
+            .map(|l| l.text.clone())
+            .collect()
+    };
+    let mut out = Vec::new();
+    let said = |laid: &Laid,
+                (details, meter, rows, r): (Option<Col>, plan::Meter, Rows, u32),
+                block: u8,
+                ours: &[Resource],
+                at: &str| {
+        let Some(st) = st.as_ref() else {
+            return;
+        };
+        match (details, meter.run) {
+            (Some(details), _) => {
+                let top = rows.top(r);
+                let drawn = texts_in(laid, details, top - 1.0, top + rows.cell + 1.0);
+                assert!(
+                    drawn.first().is_some_and(|d| st.clauses.contains(d)),
+                    "{at}: {res:?}'s Details draw {drawn:?}, its state says {:?}",
+                    st.clauses
+                );
+            }
+            (None, Some(_)) => rule_s(laid, m, snap, res, (meter, rows, r), at),
+            (None, None) => {
+                let head = laid
+                    .head
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{at}: a header"));
+                assert!(
+                    says_worst(head, snap, ours, block, at),
+                    "{at}: its header says it"
+                );
+            }
+        }
+    };
+    for kind in BlockKind::ALL {
+        let w = folded_width(kind, m);
+        let at = format!("Folded {kind:?} at {w} pt");
+        let p = plan::plan_folded(w, m);
+        let laid = lay_at(w, DeckForm::Folded);
+        let block = i / 4;
+        let b = &p.blocks[block];
+        let r = u32::try_from(i % 4).expect("a row");
+        let ours: Vec<Resource> = DECK_RESOURCES
+            .iter()
+            .copied()
+            .skip(block * 4)
+            .take(4)
+            .collect();
+        let block = u8::try_from(block).expect("two blocks");
+        said(&laid, (b.details, b.meter, b.rows, r), block, &ours, &at);
+        out.push((at.clone(), marks(&laid, b.well, b.rows, r)));
+        out.push((format!("{at}: header"), labels(&laid, block)));
+    }
+    for kind in FullKind::ALL {
+        let w = full_width(kind, m);
+        let at = format!("Full {kind:?} at {w} pt");
+        let p = plan::plan_full(w, m);
+        let laid = lay_at(w, DeckForm::Full);
+        let r = u32::try_from(i).expect("a row");
+        said(
+            &laid,
+            (p.details, p.meter, p.rows, r),
+            0,
+            &DECK_RESOURCES,
+            &at,
+        );
+        out.push((at.clone(), marks(&laid, p.well, p.rows, r)));
+        out.push((format!("{at}: header"), labels(&laid, 0)));
+    }
+    out
+}
+
+/// The CPU's thermal state (A2 §3.2) is said as Memory's pressure is, at every Folded and Full
+/// kind: its ● in its well, in `warn` at serious and `critical` at critical, and its words first
+/// in its Details, else after its figure run where they fit, else in its block's header, where
+/// they read "thermal serious": the machine's level, so they name no row. NEGATIVE CONTROL: at
+/// fair nothing is drawn in its well and no header says "thermal"; Memory under pressure draws
+/// its ● in its own well by the same reading.
+#[test]
+fn the_cpu_state_brings_its_header_word_as_memory_does() {
+    let m = FaceMetrics::helvetica_neue();
+    let calm = scene(Scene::Calm);
+    assert!(
+        [Resource::Cpu, Resource::Memory]
+            .iter()
+            .all(|&r| words::state(r, &calm, &MAC).is_none()),
+        "CONTROL: the calm scene says no CPU or Memory state"
+    );
+    let headed = |said: &[(String, Vec<String>)], word: &str| {
+        said.iter()
+            .filter(|(at, labels)| {
+                at.ends_with("header") && labels.iter().any(|l| says_state(l, word))
+            })
+            .count()
+    };
+    for (raw, ink) in [(2, InkKind::Warn), (3, InkKind::Critical)] {
+        let snap = thermal_scene(raw);
+        let st = words::state(Resource::Cpu, &snap, &MAC).expect("a CPU state");
+        assert_eq!(st.ink, ink);
+        let said = state_said(&snap, Resource::Cpu, &m);
+        for (at, marks) in said.iter().filter(|(at, _)| !at.ends_with("header")) {
+            assert_eq!(marks, &[WellMark::Dot.word()], "{at}: the CPU well's mark");
+        }
+        assert!(
+            headed(&said, &st.label) >= 1,
+            "some kind says {:?} in its header: {said:?}",
+            st.label
+        );
+    }
+    let fair = state_said(&thermal_scene(1), Resource::Cpu, &m);
+    assert!(
+        fair.iter().all(|(_, drawn)| drawn
+            .iter()
+            .all(|d| !d.contains("thermal") && d != WellMark::Dot.word())),
+        "CONTROL: fair draws no mark and says no thermal state: {fair:?}"
+    );
+    let mut pressed = scene(Scene::Calm);
+    pressed.resources[Resource::Memory.index()].state = Some(State::Warn);
+    if let Some(mem) = pressed.mem.as_mut() {
+        mem.sample.pressure = Pressure::Warn;
+    }
+    let memory = state_said(&pressed, Resource::Memory, &m);
+    for (at, marks) in memory.iter().filter(|(at, _)| !at.ends_with("header")) {
+        assert_eq!(
+            marks,
+            &[WellMark::Dot.word()],
+            "CONTROL: {at}: the Memory well's mark"
+        );
+    }
+    assert!(headed(&memory, "Memory warn") >= 1, "CONTROL: {memory:?}");
+}
+
 /// Whether `head` says the worst state of the table `block`, whose rows are `ours`, over its
 /// names (asserted where one is due); `false` where none is due.
 fn says_worst(
@@ -2364,8 +2539,13 @@ fn says_worst(
         assert!(label.is_none(), "{at}: {label:?}");
         return false;
     };
-    let name = words::resource_name(res);
-    let named = res == Resource::Processes || st.label.starts_with(name);
+    // A label names its row, but a job's names its jobs and the CPU's the machine's thermal
+    // level it says (A2 §3.2).
+    let named = match res {
+        Resource::Processes => true,
+        Resource::Cpu => st.label.starts_with("thermal "),
+        _ => st.label.starts_with(words::resource_name(res)),
+    };
     assert!(named, "{at}: {res:?} says {:?}", st.label);
     // Whole, or cut to the room it has.
     assert!(
@@ -2795,7 +2975,8 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
 /// aterm's inset in it and this tab's inset in that, from one left edge. Where a run stands at
 /// its end it says each row's reading with its maximum (the legend then names no totals), and
 /// the network's rates both ways; where none does (Folded at 1424 pt, whose strips keep the room)
-/// the legend names this Mac with its totals and no row says a figure past its strip. Full's
+/// the legend names this Mac with how much of its memory and disk is used of their totals, and
+/// no row says a figure past its strip. Full's
 /// Details say aterm's disk writes and the network's state and round trip; Folded's Cores row
 /// names the chip, and a hot core paints in the heat ramp's ink with no halo.
 #[test]
@@ -2871,7 +3052,7 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             .map(|b| b.text.as_str())
             .collect();
         let at = format!("{form:?} {w} pt");
-        let totals = "this Mac \u{b7} 18 cores \u{b7} 128 GiB \u{b7} 2 TB";
+        let totals = "this Mac \u{b7} 18 cores \u{b7} 42.1 of 128 GiB \u{b7} 1.11 of 2 TB";
         let legend = if run { "this Mac" } else { totals };
         assert_eq!(
             texts.iter().filter(|t| **t == legend).count(),
@@ -2886,10 +3067,13 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             );
         }
         if run {
-            for said in ["128 GiB used", "2.00 TB used"] {
+            for (long, compact) in [
+                ("42.1 of 128 GiB used", "42.1/128 GiB used"),
+                ("1.11 of 2.00 TB used", "1.11/2.00 TB used"),
+            ] {
                 assert!(
-                    texts.iter().any(|t| t.contains(said)),
-                    "{at}: physical used/total reading {said:?} in {texts:?}"
+                    texts.iter().any(|t| *t == long || *t == compact),
+                    "{at}: used of total {long:?} in {texts:?}"
                 );
             }
         }
@@ -2908,12 +3092,11 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             "{at}: Folded's Cores row names the chip, Full's dial none: {texts:?}"
         );
 
-        // As painted: all five resources keep three visible nested scopes, including
-        // capacity rows that move their bar under the percentage.
+        // As painted: all five resources keep three visible nested scopes in their bar.
         let [machine_c, aterm_c, tab_c] =
             [inks.machine, inks.aterm, inks.tab].map(|c| rgba(c, 0xFF));
         let mut nested = 0;
-        for (ti, (rows, pct, bar, under)) in bar_tables(form, w, &m).into_iter().enumerate() {
+        for (ti, (rows, _, bar, under)) in bar_tables(form, w, &m).into_iter().enumerate() {
             let first = if form == DeckForm::Full { 0 } else { ti * 4 };
             for r in 0..rows.count {
                 let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
@@ -2922,10 +3105,8 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
                 if res == Resource::Gpu {
                     continue;
                 }
-                let moved = capacity_under(form, w, ti, res, &m);
-                let horizontal = moved || bar.is_none();
-                let col =
-                    if moved { pct } else { bar.or(under) }.expect("CONTROL: scoped resource bar");
+                let horizontal = bar.is_none();
+                let col = bar.or(under).expect("CONTROL: scoped resource bar");
                 let band = if horizontal {
                     (
                         px(rows.top(r) + rows.baseline + plan::UNDER_GAP, s),

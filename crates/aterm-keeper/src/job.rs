@@ -377,7 +377,7 @@ mod tests {
                 break pid;
             }
             assert!(started.elapsed().as_secs() < 60, "the job never ran");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         };
         assert!(aterm_uds::process::pid_alive(pid));
         let started = std::time::Instant::now();
@@ -406,7 +406,7 @@ mod tests {
                 started.elapsed().as_secs() < 60,
                 "the job's process outlived it"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 }

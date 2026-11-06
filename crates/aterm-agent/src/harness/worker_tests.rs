@@ -255,11 +255,11 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             Program::Muse => super::super::upgrade_muse::rewrite_argv(&process(&["muse"]), None),
             Program::Codex => super::super::codex_alab::rewrite_argv(&process(&["codex"]), None),
             // aterm has no Grok Build relaunch lane (grok-alab carries its relaunches): a Grok
-            // worker's own argv, read as the starter of the next Grok worker, lends it nothing,
-            // neither its task nor its model.
-            Program::Grok => super::grok::config_flags(&process(&["grok"]))
+            // worker's own argv, read as the starter of the next Grok worker, lends it only the
+            // floor, neither its task nor its model.
+            Program::Grok => super::grok::worker_flags(&process(&["grok"]))
                 .map_err(super::super::upgrade::ArgvRefusal::UnknownFlag)
-                .inspect(|kept| assert!(kept.is_empty(), "{kept:?}")),
+                .inspect(|kept| assert_eq!(kept, &floor_of(Program::Grok), "{kept:?}")),
             Program::Kimi | Program::Generic => unreachable!(),
         }
         .unwrap_or_else(|e| panic!("{agent:?}: the lane refused the worker's argv: {e:?}"));
@@ -1154,49 +1154,53 @@ fn a_starters_settings_name_its_route() {
     assert!(why.contains("could not be read"), "{why}");
 }
 
+/// The image of a Codex package named `name` under `dir`, as atpkg lays a build's executable
+/// (`bin/codex.exe` on Windows): codex-alab's where `alab`, else a vendor Codex's.
+fn codex_package(dir: &Path, name: &str, alab: bool) -> PathBuf {
+    let entry = format!(
+        "bin/{}",
+        atpkg::store::ToolName::new("codex").unwrap().exe_file()
+    );
+    let root = dir.join(name);
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::write(root.join(&entry), "").expect("exe");
+    std::fs::write(
+        root.join(super::super::codex_alab::PACKAGE_JSON),
+        format!(r#"{{"layoutVersion": 1, "version": "0.165.0", "entrypoint": "{entry}"}}"#),
+    )
+    .expect("manifest");
+    if alab {
+        std::fs::write(root.join(super::super::codex_alab::ALAB_BUILD_JSON), "{}").expect("marker");
+    }
+    std::fs::canonicalize(root.join(&entry)).expect("the image")
+}
+
+/// atpkg's managed twin named `name` under `dir`, which execs `exe`.
+fn codex_twin(dir: &Path, name: &str, exe: &Path) -> PathBuf {
+    let twin = dir.join(name);
+    std::fs::write(&twin, super::super::codex_alab::twin_text(exe)).expect("twin");
+    twin
+}
+
 /// A CODEX STARTER IS codex-alab, its package's ALab bytes ([`super::super::codex_alab::alab_bytes`]):
 /// its worker types atpkg's managed twin where that twin execs ALab bytes too, else the
 /// starter's own image; it carries the starter's `CODEX_HOME` (an empty one is unset, a
 /// relative one refused; with none, another `HOME`'s `.codex`) and the flags that move its
 /// config, say how it reaches its provider or say what it may do unasked (its parent's permissions,
-/// owner ruling 2026-11-02), never its model or folders (by flag or `-c`); a vendor Codex image of the same name, which never
-/// carries itself, is no starter (the line is then the managed twin's, else the word's);
-/// a starter no relaunch could resume (`exec`, `--remote`) lends no flags, and one whose
-/// argv holds a flag no table knows starts no worker.
+/// owner ruling 2026-11-02, here bypass, above the floor), never its model or folders (by flag or
+/// `-c`); a vendor Codex image of the same name, which never carries itself, is no starter (the
+/// line is then the managed twin's, else the word's, the twin's at the floor); a starter no
+/// relaunch could resume (`exec`, `--remote`) lends only the posture its root names, here none,
+/// so the floor, and one whose argv holds a flag no table knows starts no worker.
 #[test]
 fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     let d = crate::supervise::ScratchDir::new("codex", "worker-starter");
     let (mine, other) = (abs("/Users//u"), abs("/Users//other"));
     let user = Path::new(&mine);
-    // The image as atpkg lays a build's executable (`bin/codex.exe` on Windows).
-    let entry = format!(
-        "bin/{}",
-        atpkg::store::ToolName::new("codex").unwrap().exe_file()
-    );
-    let package = |name: &str, alab: bool| -> PathBuf {
-        let root = d.join(name);
-        std::fs::create_dir_all(root.join("bin")).expect("bin");
-        std::fs::write(root.join(&entry), "").expect("exe");
-        std::fs::write(
-            root.join(super::super::codex_alab::PACKAGE_JSON),
-            format!(r#"{{"layoutVersion": 1, "version": "0.165.0", "entrypoint": "{entry}"}}"#),
-        )
-        .expect("manifest");
-        if alab {
-            std::fs::write(root.join(super::super::codex_alab::ALAB_BUILD_JSON), "{}")
-                .expect("marker");
-        }
-        std::fs::canonicalize(root.join(&entry)).expect("the image")
-    };
-    let alab = package("alab", true);
-    let vendor = package("vendor", false);
-    let twin_of = |name: &str, exe: &Path| -> PathBuf {
-        let twin = d.join(name);
-        std::fs::write(&twin, super::super::codex_alab::twin_text(exe)).expect("twin");
-        twin
-    };
-    let alab_twin = twin_of("twin-alab", &alab);
-    let vendor_twin = twin_of("twin-vendor", &vendor);
+    let alab = codex_package(&d, "alab", true);
+    let vendor = codex_package(&d, "vendor", false);
+    let alab_twin = codex_twin(&d, "twin-alab", &alab);
+    let vendor_twin = codex_twin(&d, "twin-vendor", &vendor);
     let cli = row(Program::Codex);
     let argv = [
         alab.to_str().expect("UTF-8"),
@@ -1300,6 +1304,13 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     })
     .expect("a codex-alab starter");
     assert_eq!(s.exe, alab_twin, "a twin that execs ALab bytes");
+    assert_eq!(
+        s.args,
+        starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || None)
+            .expect("a codex-alab starter")
+            .args,
+        "its posture is held to the floor alike, whether or not its line runs the twin"
+    );
     let s = starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || {
         Some(vendor_twin.clone())
     })
@@ -1344,7 +1355,13 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
         homes(&["HOME=rel"]).is_empty(),
         "a relative HOME names no home"
     );
-    assert_eq!(cli.unstarted_by(|| Some(alab_twin.clone())).exe, alab_twin);
+    let unstarted = cli.unstarted_by(|| Some(alab_twin.clone()));
+    assert_eq!(
+        (unstarted.exe, unstarted.args),
+        (alab_twin.clone(), Ok(strings(&CODEX_WORKER_FLOOR))),
+        "no starter lends a posture: the twin's codex-alab at the floor"
+    );
+    // CONTROL: a bare `codex` may be a vendor Codex, which refuses the floor's flag.
     for twin in [Some(vendor_twin.clone()), None] {
         let s = cli.unstarted_by(|| twin.clone());
         assert_eq!(
@@ -1385,7 +1402,11 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
             || None,
         )
         .expect("a starter");
-        assert_eq!(s.args, Ok(Vec::new()), "{flag}: it lends no flags");
+        assert_eq!(
+            s.args,
+            Ok(strings(&CODEX_WORKER_FLOOR)),
+            "{flag}: it lends no flags but the floor"
+        );
         let typed = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect("a fresh codex-alab");
         assert!(!typed.contains(flag), "{typed}");
     }
@@ -1503,5 +1524,663 @@ fn past_the_twin_reads_the_build_a_laid_twin_execs() {
     assert!(
         line.contains("DISABLE_AUTOUPDATER=1"),
         "past the twin, its updater stays off: {line}"
+    );
+}
+
+/// The permission floor each worker CLI's own module names, which its row's flags hold a
+/// starter's posture to.
+fn floor_of(agent: Program) -> Vec<String> {
+    match agent {
+        Program::Codex => strings(&CODEX_WORKER_FLOOR),
+        Program::Agy => strings(&super::super::upgrade_agy::WORKER_FLOOR),
+        Program::Muse => strings(&super::super::upgrade_muse::WORKER_FLOOR),
+        Program::Grok => strings(&super::grok::WORKER_FLOOR),
+        Program::Claude => claude_mode_flags(CLAUDE_WORKER_FLOOR),
+        Program::Kimi | Program::Generic => unreachable!("no worker row"),
+    }
+}
+
+/// What a worker of `agent` takes from a starter that ran `argv`, through its row's flags.
+fn lent(agent: Program, argv: &[&str]) -> Vec<String> {
+    (row(agent).flags)(&strings(argv)).unwrap_or_else(|e| panic!("{agent:?} {argv:?}: {e}"))
+}
+
+/// The twin's reading of a worker's `flags`: it adds no yolo beside them (no [`Default`]), and
+/// where they type the twin's own `--yolo` it spells it once, beside no other posture of the CLI
+/// that contradicts it.
+///
+/// [`Default`]: atpkg::yolo::Launch::Default
+fn the_twin_adds_nothing(agent: Program, flags: &[String]) {
+    use atpkg::yolo::{Launch, decide, flags_of};
+    let cli = row(agent);
+    match decide(cli.word, flags) {
+        Launch::AsTyped => assert!(!flags.iter().any(|f| f == "--yolo"), "{agent:?}: {flags:?}"),
+        Launch::Flag(spelled) => {
+            assert!(flags.iter().any(|f| f == "--yolo"), "{agent:?}: {flags:?}");
+            for yolo in flags_of(cli.word) {
+                assert_eq!(
+                    spelled.iter().filter(|f| f == yolo).count(),
+                    1,
+                    "{agent:?}: {spelled:?}"
+                );
+            }
+            assert!(
+                !spelled.iter().any(|f| floor_of(agent).contains(f)),
+                "{agent:?}: the twin's yolo beside the floor: {spelled:?}"
+            );
+        }
+        Launch::Default(yolo) => panic!("{agent:?}: the twin adds {yolo:?} to {flags:?}"),
+    }
+}
+
+/// A STARTER BELOW ITS CLI'S FLOOR, OR NAMING NO POSTURE, LENDS ITS WORKER THE FLOOR IN PLACE OF
+/// ITS OWN, and a CLI's own refusals beside the floor never reach the line: codex-alab's
+/// `--approve-for-me` stands beside no `-a`, `-s` or posture `-c`, and Muse Code's and Grok
+/// Build's floor mode flag appears once. What a starter lends beside its posture stays, its
+/// sandbox's settings among them; a flag that turns its sandbox off does not. CONTROL: each
+/// starter's own argv holds no floor, so the floor is the rule's, and the floor's line, which
+/// the twin runs as typed, gets no yolo from it.
+#[test]
+fn a_starter_below_its_clis_floor_lends_the_floor() {
+    let cases: &[(Program, &[&str], &[&str])] = &[
+        (Program::Codex, &["codex"], &[]),
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
+                "-c",
+                "model_reasoning_effort=high",
+            ],
+            &["-c", "model_reasoning_effort=high"],
+        ),
+        (Program::Codex, &["codex", "-s", "danger-full-access"], &[]),
+        (
+            Program::Codex,
+            &["codex", "-aon-request", "--sandbox=read-only"],
+            &[],
+        ),
+        (
+            Program::Codex,
+            &["codex", "--ask-for-approval=untrusted"],
+            &[],
+        ),
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "-c",
+                "approval_policy=\"on-request\"",
+                "--config=sandbox_mode = \"danger-full-access\"",
+                "-c",
+                "approvals_reviewer=\"user\"",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "--profile",
+                "work",
+            ],
+            &[
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "--profile",
+                "work",
+            ],
+        ),
+        // A reviewer with no policy named holds no twin marker, and the floor names one.
+        (
+            Program::Codex,
+            &["codex", "-c", "approvals_reviewer=\"auto_review\""],
+            &[],
+        ),
+        // The last `-c` of a key wins, as Codex reads them.
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "-a",
+                "on-request",
+                "-c",
+                "approvals_reviewer=auto_review",
+                "-c",
+                "approvals_reviewer=user",
+            ],
+            &[],
+        ),
+        // The flag's policy wins over a `-c`'s, as Codex reads them.
+        (
+            Program::Codex,
+            &["codex", "-c", "approval_policy=never", "-a", "on-request"],
+            &[],
+        ),
+        // Codex reads a quoted key as no posture, and so does the twin.
+        (
+            Program::Codex,
+            &["codex", "-c", "\"approval_policy\"=\"never\""],
+            &["-c", "\"approval_policy\"=\"never\""],
+        ),
+        (Program::Codex, &["codex", "exec", "a task"], &[]),
+        // What no relaunch could resume lends its root's posture alone, held alike.
+        (
+            Program::Codex,
+            &["codex", "-a", "on-request", "-c", "x=1", "exec", "a task"],
+            &[],
+        ),
+        (Program::Agy, &["agy"], &[]),
+        (Program::Agy, &["agy", "--mode", "accept-edits"], &[]),
+        (
+            Program::Agy,
+            &["agy", "--mode=plan", "--sandbox"],
+            &["--sandbox"],
+        ),
+        (Program::Agy, &["agy", "-mode", "accept-edits"], &[]),
+        (
+            Program::Agy,
+            &["agy", "--dangerously-skip-permissions=false"],
+            &[],
+        ),
+        (Program::Muse, &["muse"], &[]),
+        (
+            Program::Muse,
+            &["muse", "--approval-mode", "on-request"],
+            &[],
+        ),
+        (
+            Program::Muse,
+            &[
+                "muse",
+                "--approval-mode=untrusted",
+                "--approval-judge",
+                "on",
+                "--disable-sandbox",
+                "--sandbox-network",
+                "restricted",
+            ],
+            &["--sandbox-network", "restricted"],
+        ),
+        (Program::Grok, &["grok"], &[]),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode", "default"],
+            &[],
+        ),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode=plan", "--sandbox", "strict"],
+            &["--sandbox", "strict"],
+        ),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode", "acceptEdits"],
+            &[],
+        ),
+    ];
+    for (agent, argv, stays) in cases {
+        let floor = floor_of(*agent);
+        assert!(
+            !strings(argv).windows(floor.len()).any(|w| w == floor),
+            "{agent:?} {argv:?}: control: the starter holds no floor"
+        );
+        let mut want = strings(stays);
+        want.extend(floor.iter().cloned());
+        let got = lent(*agent, argv);
+        assert_eq!(got, want, "{agent:?} {argv:?}");
+        assert_eq!(
+            got.iter().filter(|f| **f == floor[0]).count(),
+            1,
+            "{agent:?}: {got:?}"
+        );
+        the_twin_adds_nothing(*agent, &got);
+    }
+}
+
+/// A STARTER AT OR ABOVE ITS CLI'S FLOOR LENDS ITS WORKER ITS OWN POSTURE, so aterm never lowers
+/// one, nor raises one past the floor to a CLI's skip-every-check mode by itself: the floor
+/// itself in any spelling, a mode the floor sits under, or one that asks no one. Each holds a
+/// posture marker of the twin, which adds no yolo beside it, or the twin's own `--yolo`, which it
+/// spells once. CONTROL: the starter's posture spelled one step below is held to the floor.
+#[test]
+fn a_starter_at_or_above_its_clis_floor_lends_its_own() {
+    let cases: &[(Program, &[&str], &[&str])] = &[
+        (
+            Program::Codex,
+            &["codex", "--approve-for-me"],
+            &["codex", "-a", "on-request"],
+        ),
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "--not-so-yolo",
+                "-c",
+                "model_reasoning_effort=high",
+            ],
+            &["codex", "-c", "model_reasoning_effort=high"],
+        ),
+        (Program::Codex, &["codex", "--yolo"], &["codex"]),
+        (
+            Program::Codex,
+            &["codex", "--dangerously-bypass-approvals-and-sandbox"],
+            &["codex", "-s", "danger-full-access"],
+        ),
+        (
+            Program::Codex,
+            &["codex", "-a", "never", "-s", "read-only"],
+            &["codex", "-a", "on-request", "-s", "read-only"],
+        ),
+        (
+            Program::Codex,
+            &["codex", "-anever"],
+            &["codex", "-aon-request"],
+        ),
+        (
+            Program::Codex,
+            &["codex", "--ask-for-approval=never"],
+            &["codex", "--ask-for-approval=on-request"],
+        ),
+        (
+            Program::Codex,
+            &["codex", "-c", "approval_policy=\"never\""],
+            &["codex", "-c", "approval_policy=\"on-request\""],
+        ),
+        (
+            Program::Codex,
+            &["codex", "--config=approval_policy = 'never'"],
+            &["codex", "--config=approval_policy = 'on-request'"],
+        ),
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "-a",
+                "on-request",
+                "-c",
+                "approvals_reviewer=\"auto_review\"",
+            ],
+            &[
+                "codex",
+                "-a",
+                "on-request",
+                "-c",
+                "approvals_reviewer=\"user\"",
+            ],
+        ),
+        (
+            Program::Codex,
+            &[
+                "codex",
+                "-c",
+                "approval_policy=on-request",
+                "-c",
+                "approvals_reviewer=guardian_subagent",
+                "-s",
+                "danger-full-access",
+            ],
+            &[
+                "codex",
+                "-c",
+                "approval_policy=on-request",
+                "-s",
+                "danger-full-access",
+            ],
+        ),
+        (
+            Program::Agy,
+            &["agy", "--mode", "auto"],
+            &["agy", "--mode", "accept-edits"],
+        ),
+        (
+            Program::Agy,
+            &["agy", "--mode=auto", "--sandbox"],
+            &["agy", "--mode=plan", "--sandbox"],
+        ),
+        (
+            Program::Agy,
+            &["agy", "--dangerously-skip-permissions"],
+            &["agy", "--dangerously-skip-permissions=false"],
+        ),
+        // Go reads the last of several, and the single dash as the double.
+        (
+            Program::Agy,
+            &["agy", "--mode", "plan", "-mode", "auto"],
+            &["agy", "--mode", "auto", "-mode", "plan"],
+        ),
+        (
+            Program::Agy,
+            &["agy", "-mode", "auto"],
+            &["agy", "-mode", "plan"],
+        ),
+        (
+            Program::Muse,
+            &["muse", "--approval-mode", "never"],
+            &["muse", "--approval-mode", "on-request"],
+        ),
+        (
+            Program::Muse,
+            &["muse", "--approval-mode=never", "--disable-sandbox"],
+            &["muse", "--approval-mode=on-request", "--disable-sandbox"],
+        ),
+        (
+            Program::Muse,
+            &["muse", "--disable-approval"],
+            &["muse", "--approval-judge", "off"],
+        ),
+        (Program::Muse, &["muse", "--yolo"], &["muse"]),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode", "auto"],
+            &["grok", "--permission-mode", "acceptEdits"],
+        ),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode=dontAsk", "--sandbox", "strict"],
+            &["grok", "--permission-mode=default", "--sandbox", "strict"],
+        ),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode", "bypassPermissions"],
+            &["grok", "--permission-mode", "plan"],
+        ),
+        (Program::Grok, &["grok", "--always-approve"], &["grok"]),
+        (Program::Grok, &["grok", "--yolo"], &["grok"]),
+        (
+            Program::Grok,
+            &["grok", "--dangerously-skip-permissions"],
+            &["grok"],
+        ),
+    ];
+    for (agent, argv, below) in cases {
+        let got = lent(*agent, argv);
+        assert_eq!(got, strings(&argv[1..]), "{agent:?} {argv:?}");
+        the_twin_adds_nothing(*agent, &got);
+        let held = lent(*agent, below);
+        assert!(
+            held.ends_with(&floor_of(*agent)) && held != strings(&below[1..]),
+            "{agent:?} {below:?}: control: {held:?}"
+        );
+        the_twin_adds_nothing(*agent, &held);
+    }
+    // What no relaunch could resume lends the posture its root names ahead of it, and no more.
+    // CONTROL: the same root below the floor is held to it (the test above).
+    assert_eq!(
+        lent(
+            Program::Codex,
+            &["codex", "-a", "never", "-c", "x=1", "exec", "a task"]
+        ),
+        strings(&["-a", "never"])
+    );
+}
+
+/// A WORKER'S TYPED LINE HOLDS ITS CLI'S FLOOR, WHICH ATPKG'S TWIN RUNS AS TYPED, whether its
+/// starter was below the floor or no starter was found ([`WorkerCli::unstarted`], a lead of
+/// another CLI's worker): the program the line starts, a stand-in named as the CLI, records the
+/// words a shell hands it, which hold the floor once, and the twin's own reading of those words
+/// ([`atpkg::yolo::decide`]) adds no yolo beside them, so the floor holds whichever program the
+/// line runs. CONTROL: the line of a starter that lends nothing names no posture, and is one the
+/// twin raises to its yolo, past the floor (codex-alab's bypass, Grok Build's always-approve), or
+/// runs as typed in the CLI's own default, which asks (agy's and Muse Code's lines hold words the
+/// twin does not know); a starter above the floor types its own posture and no floor; and the
+/// two unstarted lines that name none, Claude Code's and a bare `codex`'s, name none.
+#[cfg(unix)]
+#[test]
+fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
+    use atpkg::yolo::{Launch, decide, policy_of};
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-worker-floor")
+        .tempdir()
+        .expect("scratch dir");
+    let file = tmp.path().join("task.txt");
+    std::fs::write(&file, "the task").expect("write the task");
+    let argv_out = tmp.path().join("argv");
+    let alab_twin = codex_twin(
+        tmp.path(),
+        "twin-alab",
+        &codex_package(tmp.path(), "alab", true),
+    );
+    // The words `starter`'s line hands the program it starts, after the program's own.
+    let typed = |cli: &WorkerCli, starter: &Starter| -> Vec<String> {
+        let exe = tmp.path().join(cli.word);
+        if !exe.exists() {
+            std::fs::write(
+                &exe,
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$ARGV_OUT\"\n",
+            )
+            .expect("write the stand-in");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            aterm_spec::wait::first_exec(&exe, &[]);
+        }
+        let starter = Starter {
+            exe,
+            ..starter.clone()
+        };
+        let line = line(cli, Dialect::Zsh, &starter, &Fresh::default())
+            .unwrap_or_else(|e| panic!("{:?}: {e}", cli.agent));
+        let _ = std::fs::remove_file(&argv_out);
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(crate::test_program::kept("/bin/zsh"))
+                .args(["-f", "-c", &line])
+                .env("ATERM_TASK_FILE", &file)
+                .env("ARGV_OUT", &argv_out),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("zsh within the hang detector: {e}"));
+        assert!(
+            out.status.success(),
+            "{line}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let words = std::fs::read(&argv_out).expect("the stand-in ran");
+        let mut words: Vec<String> = words
+            .split(|b| *b == 0)
+            .map(|w| String::from_utf8_lossy(w).into_owned())
+            .collect();
+        assert_eq!(words.pop().as_deref(), Some(""), "NUL-ended");
+        words
+    };
+    let names_posture = |cli: &WorkerCli, words: &[String]| {
+        let markers = policy_of(cli.word).markers;
+        words.iter().any(|w| {
+            markers.iter().any(|m| match m.strip_suffix('=') {
+                Some(long) => w.starts_with(&format!("{long}=")),
+                None => w == m,
+            })
+        })
+    };
+    // Each CLI, a starter below its floor and one above it, and whether the twin raises a line
+    // naming no posture to its yolo.
+    let cases: [(Program, &[&str], &[&str], bool); 4] = [
+        (
+            Program::Codex,
+            &["codex", "-a", "on-request"],
+            &["codex", "-a", "never"],
+            true,
+        ),
+        (
+            Program::Agy,
+            &["agy", "--mode", "plan"],
+            &["agy", "--dangerously-skip-permissions"],
+            false,
+        ),
+        (
+            Program::Muse,
+            &["muse", "--approval-mode", "on-request"],
+            &["muse", "--disable-approval"],
+            false,
+        ),
+        (
+            Program::Grok,
+            &["grok", "--permission-mode", "default"],
+            &["grok", "--permission-mode", "dontAsk"],
+            true,
+        ),
+    ];
+    for (agent, below, above, raised) in cases {
+        let cli = row(agent);
+        let floor = floor_of(agent);
+        let lent = |argv: &[&str]| Starter {
+            args: (cli.flags)(&strings(argv)),
+            ..cli.plain()
+        };
+        let unstarted = cli.unstarted_by(|| Some(alab_twin.clone()));
+        for (how, starter) in [("below the floor", lent(below)), ("unstarted", unstarted)] {
+            let words = typed(cli, &starter);
+            assert_eq!(
+                words.windows(floor.len()).filter(|w| *w == floor).count(),
+                1,
+                "{agent:?} {how}: {words:?}"
+            );
+            assert_eq!(
+                decide(cli.word, &words),
+                Launch::AsTyped,
+                "{agent:?} {how}: {words:?}"
+            );
+        }
+        let bare = typed(cli, &cli.plain());
+        assert!(!names_posture(cli, &bare), "{agent:?}: control: {bare:?}");
+        match decide(cli.word, &bare) {
+            Launch::Default(yolo) if raised => {
+                assert!(!yolo.windows(floor.len()).any(|w| w == floor), "{yolo:?}");
+            }
+            Launch::AsTyped if !raised => {}
+            other => panic!("{agent:?}: control: {bare:?} {other:?}"),
+        }
+        let own = typed(cli, &lent(above));
+        assert!(
+            !own.windows(floor.len()).any(|w| w == floor),
+            "{agent:?}: control: {own:?}"
+        );
+        assert!(own.starts_with(&strings(&above[1..])), "{agent:?}: {own:?}");
+        assert_eq!(
+            decide(cli.word, &own),
+            Launch::AsTyped,
+            "{agent:?}: {own:?}"
+        );
+    }
+    let claude = row(Program::Claude);
+    assert_eq!(claude.unstarted().args, Ok(Vec::new()), "no route read");
+    let codex = row(Program::Codex);
+    assert_eq!(
+        codex.unstarted_by(|| None).args,
+        Ok(Vec::new()),
+        "a bare `codex`"
+    );
+}
+
+/// A CODEX STARTER WHOSE ARGV NAMES NO APPROVAL POLICY IS JUDGED BY THE ONE ITS OWN CONFIG GIVES,
+/// as codex-alab reads its layers ([`codex_floored`]): its `--profile`'s table over its
+/// `config.toml`'s top level, else, inside aterm, codex-alab's packaged `never`. A policy at or
+/// above the floor is lent spelled as `-a <policy>`, which the twin runs as typed, so a plain
+/// codex-alab in aterm lends its worker `-a never` beside its packaged danger-full-access, as the
+/// 2026-11-04 design has a bypass parent pass bypass on; one below it, or a config that cannot
+/// be read, lends the floor; a policy the argv names wins over the file's. CONTROL: the same
+/// starter outside aterm (no packaged `never`), and a worker no starter lends a config to
+/// ([`WorkerCli::unnamed_posture`]), lend the floor.
+#[test]
+fn a_codex_starters_own_config_decides_a_posture_its_argv_leaves_unnamed() {
+    let d = crate::supervise::ScratchDir::new("codex", "worker-config");
+    let alab = codex_package(&d, "alab", true);
+    let home = d.join("codex-home");
+    std::fs::create_dir_all(&home).expect("codex home");
+    let home_var = format!("CODEX_HOME={}", home.to_str().expect("UTF-8"));
+    let cli = row(Program::Codex);
+    let user = d.join("user");
+    let floor = strings(&CODEX_WORKER_FLOOR);
+    let lent = |config: Option<&str>, argv: &[&str], env: &[&str]| -> Vec<String> {
+        match config {
+            Some(text) => std::fs::write(home.join("config.toml"), text).expect("config"),
+            None => {
+                let _ = std::fs::remove_file(home.join("config.toml"));
+            }
+        }
+        let image = alab.to_str().expect("UTF-8");
+        let argv: Vec<&str> = std::iter::once(image).chain(argv.iter().copied()).collect();
+        let got = starter_of(cli, Some(&alab), &proc_args(&argv, env), &user, || None)
+            .expect("a codex-alab starter")
+            .args
+            .expect("its flags read");
+        the_twin_adds_nothing(Program::Codex, &got);
+        got
+    };
+    let aterm = [home_var.as_str(), "TERM_PROGRAM=aterm"];
+    let never = strings(&["-a", "never"]);
+    assert_eq!(
+        lent(None, &[], &aterm),
+        never,
+        "codex-alab's packaged posture"
+    );
+    assert_eq!(
+        lent(None, &[], &aterm[..1]),
+        floor,
+        "control: outside aterm"
+    );
+    assert_eq!(
+        cli.unnamed_posture(),
+        Ok(floor.clone()),
+        "control: no starter"
+    );
+    let on_request = "approval_policy = \"on-request\"\n";
+    assert_eq!(lent(Some(on_request), &[], &aterm), floor);
+    assert_eq!(
+        lent(
+            Some("approval_policy = \"on-request\"\napprovals_reviewer = \"auto_review\"\n"),
+            &[],
+            &aterm
+        ),
+        strings(&["-a", "on-request"]),
+        "its reviewer answers"
+    );
+    let profiles = "approval_policy = \"on-request\"\nprofile = \"w\"\n\
+                    [profiles.w]\napproval_policy = \"never\"\n\
+                    [profiles.q]\napproval_policy = \"untrusted\"\n";
+    assert_eq!(
+        lent(Some(profiles), &[], &aterm),
+        never,
+        "the file's profile"
+    );
+    assert_eq!(
+        lent(Some(profiles), &["--profile", "q"], &aterm),
+        strings(&["--profile", "q", "--approve-for-me"]),
+        "the starter's profile"
+    );
+    assert_eq!(
+        lent(
+            Some("approval_policy = { granular = { sandbox_approval = true } }\n"),
+            &[],
+            &aterm
+        ),
+        floor,
+        "a granular policy no `-a` spells"
+    );
+    assert_eq!(
+        lent(Some("approval_policy = \n"), &[], &aterm),
+        floor,
+        "unparsed"
+    );
+    assert_eq!(
+        lent(None, &[], &["CODEX_HOME=rel", "TERM_PROGRAM=aterm"]),
+        floor,
+        "a relative CODEX_HOME tells nothing"
+    );
+    assert_eq!(
+        lent(
+            Some("approval_policy = \"never\"\n"),
+            &["-a", "on-request"],
+            &aterm
+        ),
+        floor,
+        "the argv's policy wins"
+    );
+    assert_eq!(
+        lent(None, &["-s", "workspace-write"], &aterm),
+        strings(&["-s", "workspace-write", "-a", "never"]),
+        "a sandbox beside the packaged policy"
+    );
+    assert_eq!(
+        lent(None, &["-c", "x=1", "exec", "a task"], &aterm),
+        never,
+        "what no relaunch could resume lends its config's posture alone"
     );
 }

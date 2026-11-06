@@ -1,0 +1,27 @@
+# claude-code 2.1.318 · MEASURED 2026-11-05, `aterm ctl text` of a private headless aterm (144x50, aterm 0.155.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · 
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ Say hello
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Brewed for 0s · done Saturday 5:00 PM
+
+❯ sh /private/tmp/at.lab/run/claude.sh
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Sautéed for 0s · done Saturday 5:00 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Resume this conversation?
+
+  This conversation has been inactive for 4d 21h 50m and is 100k tokens long. Resuming it will use all of your 5-hour usage limit.
+
+  ❯ 1. Resume
+    2. Start a new conversation  Claude can look this one up if you refer to it later
+
+  Enter to confirm · Esc to resume

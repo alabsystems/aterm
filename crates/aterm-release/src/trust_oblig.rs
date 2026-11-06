@@ -670,47 +670,61 @@ fn sysroot_tail(raw: &str) -> Option<&str> {
 
 /// The characters `a..b` of `s`.
 fn chars(s: &str, a: u32, b: u32) -> Option<String> {
-    let n = s.chars().count();
     let (a, b) = (a as usize, b as usize);
+    if s.is_ascii() {
+        return s.get(a..b).map(str::to_owned);
+    }
+    let n = s.chars().count();
     (a <= b && b <= n).then(|| s.chars().skip(a).take(b - a).collect())
 }
 
 /// Whitespace collapsed to single spaces.
 fn collapse(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 /// A description as [`Obligation::key`] compares it: whitespace collapsed, a MIR local
 /// (`` `_7` ``) as `` `_` ``, an interned hash (`@` and 8 or more hex) as `@#`.
 #[must_use]
 pub fn norm_desc(d: &str) -> String {
-    let d = collapse(d);
-    let b = d.as_bytes();
     let mut out = String::with_capacity(d.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'`' && b.get(i + 1) == Some(&b'_') {
-            let digits = b[i + 2..].iter().take_while(|c| c.is_ascii_digit()).count();
-            if digits > 0 && b.get(i + 2 + digits) == Some(&b'`') {
-                out.push_str("`_`");
-                i += 3 + digits;
-                continue;
-            }
+    for word in d.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
         }
-        if b[i] == b'@' {
-            let run = b[i + 1..]
-                .iter()
-                .take_while(|c| c.is_ascii_hexdigit())
-                .count();
-            if run >= 8 {
-                out.push_str("@#");
-                i += 1 + run;
-                continue;
+        let b = word.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'`' && b.get(i + 1) == Some(&b'_') {
+                let digits = b[i + 2..].iter().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 && b.get(i + 2 + digits) == Some(&b'`') {
+                    out.push_str("`_`");
+                    i += 3 + digits;
+                    continue;
+                }
             }
+            if b[i] == b'@' {
+                let run = b[i + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                if run >= 8 {
+                    out.push_str("@#");
+                    i += 1 + run;
+                    continue;
+                }
+            }
+            let ch = word[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
         }
-        let ch = d[i..].chars().next().unwrap_or(' ');
-        out.push(ch);
-        i += ch.len_utf8();
     }
     out
 }
@@ -752,8 +766,8 @@ pub fn anchor_of(lines: &[String], s: Span) -> std::result::Result<String, Strin
     }
     if text.chars().count() > 100 {
         let head: String = text.chars().take(80).collect();
-        let digest = hex(&Sha256::digest(text.as_bytes()));
-        return Ok(format!("{head}…#{}", &digest[..12]));
+        let digest = hex(&Sha256::digest(text.as_bytes())[..6]);
+        return Ok(format!("{head}…#{digest}"));
     }
     Ok(text)
 }

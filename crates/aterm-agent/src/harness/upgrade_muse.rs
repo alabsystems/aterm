@@ -245,7 +245,7 @@ fn read(argv: &[String]) -> Result<Read, ArgvRefusal> {
 const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", "--config"];
 
 /// The root options that say what a Muse Code run may do unasked: its worker's are its parent's
-/// (owner ruling 2026-11-02).
+/// (owner ruling 2026-11-02), held to [`WORKER_FLOOR`] ([`worker_flags`]).
 const PERMISSION_FLAGS: &[&str] = &[
     "--approval-judge",
     "--approval-mode",
@@ -263,8 +263,23 @@ pub fn provider_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
     flags_named(argv, PROVIDER_FLAGS)
 }
 
+/// MUSE CODE'S PERMISSION FLOOR (its worker row's, `worker::WorkerCli::unnamed_posture`):
+/// `--approval-mode never`, which 1.4.14's own session words read as "prompts are off by launch
+/// policy … tool calls will not ask the user", its shell sandbox on. Its other way to ask no one,
+/// `--disable-approval`, it names a bypass ("Approval: bypassed at launch"); its LLM approval
+/// judge, on by default, escalates a call it will not pass to a person, so no posture keeps the
+/// judge and asks no one, and the floor keeps the sandbox. Measured on 1.4.14 (`muse exec
+/// --provider echo`): it refuses `--approval-mode` given twice, so [`worker_flags`] drops a
+/// starter's first.
+pub const WORKER_FLOOR: [&str; 2] = ["--approval-mode", "never"];
+
 /// The flags of `argv` a worker of this Muse Code starts with: [`provider_flags`] and its
-/// permissions ([`PERMISSION_FLAGS`]), in `argv`'s order.
+/// permissions ([`PERMISSION_FLAGS`]), in `argv`'s order, held to [`WORKER_FLOOR`] (owner,
+/// 2026-11-04: workers are fully automated by default). A starter that asks no one
+/// (`--approval-mode never`, `--disable-approval`, `--yolo`) lends its permissions as they are;
+/// any other, or none, lends the floor in place of its approval flags (`--approval-mode`,
+/// `--approval-judge`) and of `--disable-sandbox`, so no worker starts unsandboxed by a floor,
+/// and its `--sandbox-network` stays.
 ///
 /// # Errors
 /// Returns [`ArgvRefusal::UnknownFlag`] if `argv` contains an unrecognized flag before `--`.
@@ -274,7 +289,47 @@ pub fn worker_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
         .chain(PERMISSION_FLAGS)
         .copied()
         .collect();
-    flags_named(argv, &both)
+    let lent = flags_named(argv, &both)?;
+    let mut units: Vec<(&str, &[String])> = Vec::new();
+    let mut i = 0;
+    while i < lent.len() {
+        let (name, attached) = option_name(&lent[i]);
+        let takes = !attached && matches!(flag(name), Some((Arity::One, _)));
+        let end = if takes {
+            (i + 2).min(lent.len())
+        } else {
+            i + 1
+        };
+        units.push((name, &lent[i..end]));
+        i = end;
+    }
+    let policy = units
+        .iter()
+        .rfind(|(name, _)| *name == WORKER_FLOOR[0])
+        .and_then(|(name, words)| match words {
+            [_, value] => Some(value.as_str()),
+            [attached] => attached.strip_prefix(*name)?.strip_prefix('='),
+            _ => None,
+        });
+    let asks_no_one = policy == Some(WORKER_FLOOR[1])
+        || units
+            .iter()
+            .any(|(name, _)| matches!(*name, "--disable-approval" | "--yolo"));
+    if asks_no_one {
+        return Ok(lent);
+    }
+    let mut out: Vec<String> = units
+        .into_iter()
+        .filter(|(name, _)| {
+            !matches!(
+                *name,
+                "--approval-mode" | "--approval-judge" | "--disable-sandbox"
+            )
+        })
+        .flat_map(|(_, words)| words.iter().cloned())
+        .collect();
+    out.extend(WORKER_FLOOR.map(str::to_string));
+    Ok(out)
 }
 
 fn flags_named(argv: &[String], named: &[&str]) -> Result<Vec<String>, ArgvRefusal> {

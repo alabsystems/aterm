@@ -137,8 +137,8 @@ impl fmt::Display for EffectDivergence {
             } => write!(
                 f,
                 "effect {position} carries payload {} where payload {} was recorded",
-                asked.short(),
-                recorded.short()
+                asked.short_display(),
+                recorded.short_display()
             ),
             EffectDivergence::Unreached {
                 position,

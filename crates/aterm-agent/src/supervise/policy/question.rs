@@ -920,12 +920,14 @@ fn recommended_instead(
     })
 }
 
-/// A TEXT PRIORITY LEAVES NO DIALOG THE RECOMMENDED ANSWER WOULD TAKE. A refusal
-/// of the text path (its text gone or not drawn, an option
-/// checked, its row read unticked, a review with a question unanswered) takes the recommended
-/// answer instead, ledgered under that priority's rule, and stays a person's only where that answer
-/// refuses too. Two refusals stand, fail-closed: a latch moved mid-dialog (`own` another word's)
-/// and a person's input since the loop's first text on the dialog (`person`).
+/// A TEXT PRIORITY LEAVES NO DIALOG THE RECOMMENDED ANSWER WOULD TAKE. A refusal of the text path
+/// (its text gone or not drawn, its row too far from the focus, the recommended option alone
+/// checked, a review with a question unanswered) takes the recommended answer instead, ledgered
+/// under that priority's rule, and stays a person's only where that answer refuses too: where the
+/// loop's text still stands in the free-text row (its row read unticked, an option checked beside
+/// it) or an option it does not recommend reads checked. Two refusals stand, fail-closed: a latch
+/// moved mid-dialog (`own` another word's) and a person's input since the loop's first text on the
+/// dialog (`person`).
 fn text_instead(
     dialog: &QuestionDialog,
     priority: QuestionPriority,

@@ -12,7 +12,8 @@
 //! ([`super::HeldBook::keep_seed`]); a leave removes it and keeps its digest in
 //! [`DIGEST_FILE`] beside the node key ([`super::Leaving::keep_seed_digest`]), for Floor. A seed
 //! a member's book reply relays is adopted under the same lock ([`super::HeldBook::adopt_relayed_seed`]),
-//! and the last one refused as another minter's is recorded in [`CONFLICT_FILE`].
+//! and the last one refused as another minter's is recorded in [`CONFLICT_FILE`]. A root that
+//! holds none mints after [`UNHELD_WAIT_MS`] ([`super::HeldBook::mint_unheld_seed`]).
 
 use std::io;
 use std::path::Path;
@@ -32,6 +33,15 @@ pub const DIGEST_FILE: &str = "fleet-seed-digest";
 /// on a root, than itself (`seed-conflict`, [`Judged::Conflict`]): its digest, minter and mint time and when it was
 /// refused, never the seed, kept for a reader to ask about, not raised.
 pub const CONFLICT_FILE: &str = "fleet-seed-conflict";
+
+/// When a root first found it held no seed (ms, one line), which it mints once
+/// [`UNHELD_WAIT_MS`] has passed since ([`super::HeldBook::mint_unheld_seed`]).
+pub const UNHELD_FILE: &str = "fleet-seed-unheld";
+
+/// How long a root holding no seed reads its members' books, which relay the one it minted
+/// before if any member holds it, before it mints: §3.3's ten 60-second reconcile ticks, which its
+/// heartbeat rounds (every 3 minutes) stand in for until `reconcile` is built.
+pub const UNHELD_WAIT_MS: u64 = 10 * 60_000;
 
 /// What the minter's signature is made under.
 pub const DOMAIN: &str = "aterm/fleet-seed/1";
@@ -310,6 +320,17 @@ fn conflict_head(refused: &FleetSeed) -> String {
         "digest={}",
         aterm_codec::hex::encode_lower(&refused.digest())
     )
+}
+
+/// When [`UNHELD_FILE`] says this root first found it held no seed, `None` when it records none
+/// or is no time.
+#[must_use]
+pub fn read_unheld(dir: &Path) -> Option<u64> {
+    let text = read_text(dir, UNHELD_FILE).ok()??;
+    let ms = text.strip_suffix('\n').unwrap_or(&text);
+    (!ms.is_empty() && ms.len() <= 20 && ms.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| ms.parse().ok())
+        .flatten()
 }
 
 /// [`DIGEST_FILE`]'s text for `digest`: 16 lowercase hex digits and a newline.

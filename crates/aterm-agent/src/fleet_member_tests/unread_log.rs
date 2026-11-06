@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::fleet_log::{LocalLog, ensure_local_node_key_in_log};
+use crate::fleet_vault::Vault;
 use aterm_secrets::client::{self, Paths};
 use aterm_secrets::membership_log::RecordBudgets;
 
@@ -35,6 +36,30 @@ impl Drop for Lab {
             running.stop();
         }
     }
+}
+
+/// Let the Mac `label` (its home under `root`) into the log of the vault `admin` writes, its node
+/// `node` (`aterm members add` by its phrase), and post the records: its vault paths.
+fn admit(admin: &Paths, root: &Path, label: &str, node: &NodeIdentity) -> Paths {
+    let member_paths = Paths::for_home(&root.join(format!("{label}-home")));
+    let _ = client::machine_identity(&member_paths).unwrap();
+    let device = aterm_secrets::commons::bootstrap::Device::open(&member_paths)
+        .unwrap()
+        .unwrap();
+    let store = client::load_records(admin).unwrap();
+    let aterm_secrets::membership_log::Body::Genesis { root: log_root, .. } =
+        store.log().unwrap().genesis().body()
+    else {
+        panic!("expected Genesis");
+    };
+    let request = device
+        .request(log_root.network, log_root.authority)
+        .unwrap();
+    let admitted =
+        client::admit_by_phrase(admin, &request, *node.key().bytes(), label, 1_000).unwrap();
+    assert!(matches!(admitted, client::ByLog::Admitted(_)));
+    client::post_records_to_servers(admin).unwrap();
+    member_paths
 }
 
 /// This Mac's own node: the founder's, bound by the log once [`Lab::new`] returns.
@@ -84,34 +109,12 @@ impl Lab {
         ));
         assert_eq!(vault_paths_for(&places).unwrap().dir, paths.dir);
 
-        let admit = |label: &str, node: &NodeIdentity| {
-            let member_paths = Paths::for_home(&root.path().join(format!("{label}-home")));
-            let _ = client::machine_identity(&member_paths).unwrap();
-            let device = aterm_secrets::commons::bootstrap::Device::open(&member_paths)
-                .unwrap()
-                .unwrap();
-            let store = client::load_records(&paths).unwrap();
-            let aterm_secrets::membership_log::Body::Genesis { root: log_root, .. } =
-                store.log().unwrap().genesis().body()
-            else {
-                panic!("expected Genesis");
-            };
-            let request = device
-                .request(log_root.network, log_root.authority)
-                .unwrap();
-            let admitted =
-                client::admit_by_phrase(&paths, &request, *node.key().bytes(), label, 1_000)
-                    .unwrap();
-            assert!(matches!(admitted, client::ByLog::Admitted(_)));
-            client::post_records_to_servers(&paths).unwrap();
-            member_paths
-        };
         let m7 = NodeIdentity::from_seed(&"b2".repeat(16), &[0x33; 32]).unwrap();
         let m8 = NodeIdentity::from_seed(&"d4".repeat(16), &[0x66; 32]).unwrap();
         let m9 = NodeIdentity::from_seed(&"e6".repeat(16), &[0x99; 32]).unwrap();
-        let _ = admit("m7", &m7);
-        let _ = admit("m8", &m8);
-        let m9_paths = admit("m9", &m9);
+        let _ = admit(&paths, root.path(), "m7", &m7);
+        let _ = admit(&paths, root.path(), "m8", &m8);
+        let m9_paths = admit(&paths, root.path(), "m9", &m9);
         client::configure_log_member(&m9_paths, &format!("{url}#{}", created.signer), "m9")
             .unwrap();
         assert!(
@@ -1112,4 +1115,202 @@ fn a_join_elsewhere_admits_no_node_by_the_book_until_the_vault_joineds_log_is_he
         keys.unread().is_none(),
         "CONTROL: the vault joined's log reads"
     );
+}
+
+/// ATERM-KI-1105-10's steady state. This Mac's fleet was taken under vault "test" (its key, its
+/// book binding m7, m8 and m9, and a drive grant of each, the join's take recording that vault),
+/// and this Mac then moves to vault "other" (`aterm secrets join`, [`join_other`]) and takes its
+/// records. The log of "other" reads and binds none of the three, so F17 judges each by the book
+/// as with no log; the grants were made under the vault left, so none admits: not m7, which
+/// "test" revoked, not m8, which its roster denies, and not the control m9. The grants stay in
+/// aterm.toml as the person made them, and `aterm fleet peers` says why none admits now.
+///
+/// NEGATIVE CONTROL (2026-11-05): let every grant admit whichever vault it was made under
+/// (`fleet_vault::grants_in_effect` returning `grants`, as before the fix): fails "m7, m8 and m9
+/// drive this Mac by the book and the grants made under the vault it left" with
+/// `[Some(true), Some(true), Some(true)]`.
+#[test]
+fn after_a_move_to_another_vault_no_mac_of_the_vault_left_drives_by_its_grants() {
+    let lab = Lab::new("moved");
+    {
+        let book = member::hold_book(&lab.places.state).unwrap();
+        book.write_key(&[0x44; 24]).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+    }
+    assert_eq!(
+        crate::fleet_vault::tenure(&lab.places.state, Some(&lab.paths)),
+        crate::fleet_vault::Tenure::Here,
+        "PRECONDITION: the fleet was taken under the vault this Mac is in"
+    );
+    assert_eq!(
+        lab.members().map(|id| drives_here(&lab.places, id.node())),
+        [Some(false), Some(false), Some(true)],
+        "PRECONDITION: the vault this Mac is in holds m7 and m8 out, and the control drives"
+    );
+
+    let (_other, source) = other_vault(&lab);
+    join_other(&lab, &source);
+    assert!(client::sync_records(&lab.paths, None).unwrap() > 0);
+    let keys = LocalLog::of(&lab.paths)
+        .keys()
+        .expect("PRECONDITION: the log of the vault joined reads");
+    assert!(keys.unread().is_none(), "PRECONDITION: it reads");
+    for id in lab.members() {
+        assert!(
+            keys.standing(&id.key()).is_none(),
+            "PRECONDITION: the log of the vault joined binds no key of {}, so F17 judges it by \
+             the book",
+            id.node()
+        );
+    }
+    let (denied, log) = denied_and_log(&lab.places);
+    assert!(
+        denied.is_some() && log.is_some(),
+        "PRECONDITION: the deny list and the log of the vault joined read"
+    );
+
+    assert_eq!(
+        lab.members().map(|id| drives_here(&lab.places, id.node())),
+        [Some(false); 3],
+        "m7, m8 and m9 drive this Mac by the book and the grants made under the vault it left"
+    );
+    assert_eq!(driving(&lab.places), Some(Vec::new()));
+    assert!(granted_here(&lab.places).is_empty());
+    assert_eq!(
+        configured_grants(&lab.places).len(),
+        3,
+        "a person's grants stay in aterm.toml as they made them"
+    );
+    let proof = |id: &NodeIdentity| aterm_net::fleet::NodeProof {
+        node: id.node().to_owned(),
+        key: id.key(),
+    };
+    for id in lab.members() {
+        assert!(
+            matches!(
+                member::recheck_driver(
+                    &proof(id),
+                    &lab.places.state,
+                    &granted_here(&lab.places),
+                    Some(&keys)
+                ),
+                Err(member::Undriven::Unlisted(_))
+            ),
+            "{} drives by the grants in effect",
+            id.node()
+        );
+        assert!(
+            member::recheck_driver(
+                &proof(id),
+                &lab.places.state,
+                &configured_grants(&lab.places),
+                Some(&keys)
+            )
+            .is_ok(),
+            "CONTROL: the book and the grants made under the vault left would admit {} under the \
+             log of the vault joined",
+            id.node()
+        );
+    }
+    let said = void_grants(&lab.places).expect("`aterm fleet peers` says why no grant admits");
+    assert!(
+        said.contains("taken under vault \"test\"")
+            && said.contains("this Mac is in vault \"other\" now")
+            && said.contains("drive_from keeps 3 grants as they are")
+            && said.contains("`aterm fleet sync`"),
+        "{said}"
+    );
+}
+
+/// The fleet taken again under the vault joined drives by the grants made under it exactly as
+/// before. A grant written beside the fleet still taken under the vault left admits no Mac; the
+/// take again goes in a join's order (the grants made under the vault left out of aterm.toml, as
+/// its `Ungrant::OtherVault` takes them, then the vault joined recorded), and the person grants
+/// under it after: m31, which the log of "other" seats, drives by its grant through that log, and
+/// m9, which no log binds, by its grant and the book (F17), as the person granted it under
+/// "other"; m7 and m8, granted nothing under "other", drive nothing.
+///
+/// NEGATIVE CONTROL (2026-11-05): a fleet taken under any vault but the one it records read as
+/// taken elsewhere (`fleet_vault::tenure` answering `Elsewhere` where the vaults match) fails
+/// "m31, which the vault joined seats, drives by its grant made under it".
+#[test]
+fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before() {
+    let lab = Lab::new("taken-again");
+    {
+        let book = member::hold_book(&lab.places.state).unwrap();
+        book.write_key(&[0x44; 24]).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+    }
+    let (other, source) = other_vault(&lab);
+    join_other(&lab, &source);
+    let m31 = NodeIdentity::from_seed(&"c3".repeat(16), &[0x31; 32]).unwrap();
+    let _ = admit(&other, lab.root.path(), "m31", &m31);
+    assert!(client::sync_records(&lab.paths, None).unwrap() > 0);
+    let keys = LocalLog::of(&lab.paths)
+        .keys()
+        .expect("PRECONDITION: the log of the vault joined reads");
+    assert!(
+        keys.admits(&m31.key()) && keys.standing(&lab.m9.key()).is_none(),
+        "PRECONDITION: the vault joined seats m31 and binds no key of m9"
+    );
+    let mut book = std::fs::read_to_string(lab.places.state.join(PEERS_FILE)).unwrap();
+    book.push_str(&format!(
+        "{}\n",
+        Peer::own(&m31, ("m31.local", 7100, "0.146.0"), NOW_MS).line()
+    ));
+    write_private(&lab.places.state, PEERS_FILE, book.as_bytes()).unwrap();
+    let grant_m31 = format!(
+        "[fleet]\nallow = \"drive\"\ndrive_from = [\"{}:{}\"]\n",
+        m31.node(),
+        m31.key().hex()
+    );
+    std::fs::write(&lab.places.config, &grant_m31).unwrap();
+    assert_eq!(
+        drives_here(&lab.places, m31.node()),
+        Some(false),
+        "PRECONDITION: a grant beside a fleet taken under the vault left admits no Mac"
+    );
+
+    // The take again, in a join's order: the grants made beside the vault left out (the join's
+    // `Ungrant::OtherVault` lowers drive to content), then the vault joined recorded.
+    std::fs::write(&lab.places.config, "[fleet]\nallow = \"content\"\n").unwrap();
+    {
+        let book = member::hold_book(&lab.places.state).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+    }
+    assert_eq!(
+        (driving(&lab.places), drives_here(&lab.places, m31.node())),
+        (Some(Vec::new()), Some(false)),
+        "PRECONDITION: the take again keeps no grant"
+    );
+    // The person's grant, made under the vault joined.
+    std::fs::write(&lab.places.config, &grant_m31).unwrap();
+    assert_eq!(
+        drives_here(&lab.places, m31.node()),
+        Some(true),
+        "m31, which the vault joined seats, drives by its grant made under it"
+    );
+    std::fs::write(
+        &lab.places.config,
+        format!(
+            "[fleet]\nallow = \"drive\"\ndrive_from = [\"{}:{}\", \"{}:{}\"]\n",
+            m31.node(),
+            m31.key().hex(),
+            lab.m9.node(),
+            lab.m9.key().hex()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        [&m31, &lab.m7, &lab.m8, &lab.m9].map(|id| drives_here(&lab.places, id.node())),
+        [Some(true), Some(false), Some(false), Some(true)],
+        "m31 through the log, m9 by the book (F17) as granted under the vault joined, m7 and m8 \
+         granted nothing there"
+    );
+    let mut seated = driving(&lab.places).unwrap();
+    seated.sort();
+    let mut expected = vec![m31.node().to_owned(), lab.m9.node().to_owned()];
+    expected.sort();
+    assert_eq!(seated, expected);
+    assert_eq!(void_grants(&lab.places), None);
 }

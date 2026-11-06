@@ -278,8 +278,19 @@ impl Procs {
     /// The processes `pid` descends from, its parent first, as far as the sweep holds them.
     #[must_use]
     pub fn ancestors(&self, pid: u32) -> Vec<u32> {
-        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
         let mut out = Vec::new();
+        if self.procs.len() <= 64 {
+            let mut at = pid;
+            while let Some(up) = self.procs.iter().find(|p| p.pid == at).map(|p| p.ppid) {
+                if up == at || up == pid || out.contains(&up) {
+                    break;
+                }
+                out.push(up);
+                at = up;
+            }
+            return out;
+        }
+        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
         let mut at = pid;
         while let Some(&up) = parent.get(&at) {
             if up == at || up == pid || out.contains(&up) {
@@ -465,7 +476,7 @@ impl Machine for Live {
     /// sweep: a build's admission reads it on every call.
     #[cfg(target_os = "macos")]
     fn lineage(&self, pid: u32) -> Option<Procs> {
-        let mut line = Vec::new();
+        let mut line = Vec::with_capacity(16);
         let mut at = pid;
         while line.len() < LINEAGE_MAX {
             let Some(r) = aterm_sysprobe::kproc::record(at) else {

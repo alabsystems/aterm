@@ -217,6 +217,7 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert_eq!(ctx.question_priority, QuestionPriority::LongTerm);
     assert_eq!(ctx.question_own, Some(QuestionPriority::ShortTerm));
     assert!(ctx.question_fell_back);
+    assert!(ctx.question_person);
     assert_eq!(ctx.python_allow, vec!["x*.py".to_string()]);
     assert_eq!(ctx.box_call.as_deref(), Some("Bash"));
     assert_eq!(ctx.shell_cwds, facts.shell_cwds);
@@ -325,4 +326,53 @@ fn facts_under_land_read_back_as_written() {
     let roots = roots();
     let bad = text.replacen("\"priority\":\"land\"", "\"priority\":\"landing\"", 1);
     assert!(BoxFacts::from_json(&bad, &|raw| roots.decode(raw)).is_err());
+}
+
+/// A PERSON'S INPUT IN THE FACTS REACHES LAND'S DECISION: a box's facts under Land whose loop
+/// text is gone from the free-text row build a context that hands the dialog to a person where
+/// the facts say a person keyed since the text, and presses the recommended option under
+/// `answer-land@v1` where they say none did. MUTANT: `ApprovalCtx::from` leaving
+/// `question_person` unset, which the live loop's decider then never sees.
+#[test]
+fn a_persons_input_in_the_facts_keeps_a_land_dialog_theirs() {
+    use crate::supervise::policy::approval::{Decision, RULE_ANSWER_LAND, decide};
+    use aterm_phase::prompt::fixtures as f;
+    let rows = f::screen(f::QUESTION_283_FREE_TEXT_FOCUSED);
+    let reading = aterm_phase::read(Some("claude"), &rows, None);
+    let env = ApprovalEnv {
+        home: Some(PathBuf::from("/Users//owner")),
+        uid: 501,
+        tmpdir: None,
+        worker: WorkerSource::Session,
+    };
+    let decided = |person: bool| {
+        let facts = BoxFacts {
+            question: Some(QuestionFacts {
+                answer: true,
+                priority: QuestionPriority::Land,
+                own: Some(QuestionPriority::Land),
+                fell_back: false,
+                person,
+            }),
+            ..BoxFacts::default()
+        };
+        let ctx = ApprovalCtx::from(
+            &SupervisorConfig::default(),
+            &env,
+            &[],
+            &facts,
+            Arc::new(LiveProbe),
+        );
+        decide(&reading, &rows, &ctx)
+    };
+    let d = decided(false);
+    assert!(
+        matches!(&d, Decision::Approve { rule_id, .. } if *rule_id == RULE_ANSWER_LAND),
+        "the control, no person's input: {d:?}"
+    );
+    let d = decided(true);
+    assert!(
+        matches!(d, Decision::Escalate { .. }),
+        "a person's input since the text: {d:?}"
+    );
 }

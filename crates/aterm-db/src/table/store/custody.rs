@@ -226,8 +226,8 @@ impl WitnessedPrefix {
         // Positive evidence precedes certificates, as in ordinary salvage.
         for conflict in [false, true] {
             for entry in &missing {
-                current()?;
                 if entry.conflict == conflict {
+                    current()?;
                     if conflict {
                         store.ingest_conflict(session, &entry.wire)?;
                     } else {
@@ -262,7 +262,7 @@ pub(crate) fn witnessed_prefix(
 ) -> Result<WitnessedPrefix> {
     session.context(crate::catalog::scope(session.bootstrap.trust()))?;
     let claims = region.claims(session)?;
-    let name = format!("{}.claim", aterm_codec::hex::encode_lower(&table));
+    let name = super::claim_name_for(&table);
     let claim = private_file::read_private(&claims, &name, CLAIM_LEN)
         .map_err(|_| Error::new("writer succession claim is unavailable"))?;
     if claim.len() != CLAIM_LEN {
@@ -329,7 +329,7 @@ fn inspect_parts(
 ) -> Result<Inspection> {
     session.context(crate::catalog::scope(session.bootstrap.trust()))?;
     let claim_dir = claim_dir(session)?;
-    let claim_name = format!("{}.claim", aterm_codec::hex::encode_lower(&table));
+    let claim_name = super::claim_name_for(&table);
     let claim = match private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN) {
         Ok(claim) => claim,
         Err(PrivateFileError::Missing) => {
@@ -369,7 +369,7 @@ fn inspect_parts(
     let dir = Directory::new(session.bootstrap.paths(), scope.trust()).path(scope)?;
     let identity = directory::read(&dir)?;
     let volume = directory::witness(&claim_dir, &claim_name)?;
-    let binding_error = directory::check(&dir, &claim_dir, &claim_name, &claim)
+    let binding_error = directory::check_observed(&identity, volume.as_deref(), &claim)
         .err()
         .map(reason);
     let stored = &claim[ANCHOR_LEN..WITNESS_AT];

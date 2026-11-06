@@ -3422,7 +3422,7 @@ mod tests {
                             std::time::Instant::now() < retry_deadline,
                             "journal lock remained busy past the bounded retry window"
                         );
-                        std::thread::yield_now();
+                        aterm_uds::deadline::poll_yield();
                     }
                     JournalAppendResult::Failed { message, .. } => {
                         assert!(message.contains("image changed"), "{message}");

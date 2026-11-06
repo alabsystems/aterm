@@ -1,0 +1,245 @@
+00000000000000000000000001000004
+schema = 1
+next_turn_id = 4103
+outgoing_build = 1793907602
+roster_seq = 7
+machine_names = ["devhost", "devhost-2.local"]
+
+[[sessions]]
+local_id = 0
+sid = "s-00000000010000000000"
+state = "alive"
+title = "zsh"
+control = "940 1a8d4d25298a5b60931e45aa8128e75fe068e0a55ffbc16af6df2d4f89b05a50"
+fg_holder = 40000
+claim_known = true
+timeline_id = 65560
+log_ids = "1793908059 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":22,\"cols\":83,\"history_lines\":39,\"cursor\":{\"cursor_row\":21,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":21,\"margin_left\":0,\"margin_right\":82,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":61,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s0.grid"
+
+[[sessions]]
+local_id = 1
+sid = "s-00000000010000010101"
+state = "alive"
+title = "zsh"
+control = "940 d9048c0edd9d5d38c43bb8c56a54d4a83c22094514c29b1dab09554073ed305b"
+fg_holder = 40001
+claim_known = true
+timeline_id = 65563
+log_ids = "1793908060 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":23,\"cols\":83,\"history_lines\":75,\"cursor\":{\"cursor_row\":22,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":22,\"margin_left\":0,\"margin_right\":82,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":98,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s1.grid"
+
+[[sessions]]
+local_id = 2
+sid = "s-00000000010000020202"
+state = "alive"
+title = "vim"
+control = "940 91953f9ee79c3aec8daf57bab8901ba603dc670dc9f075b81512d9090c1226a8"
+fg_holder = 41002
+claim_known = true
+timeline_id = 65566
+log_ids = "1793908061 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":22,\"cols\":84,\"history_lines\":0,\"cursor\":{\"cursor_row\":1,\"cursor_col\":0,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":21,\"margin_left\":0,\"margin_right\":83,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":{\"cursor_row\":21,\"cursor_col\":0,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":21,\"margin_left\":0,\"margin_right\":83,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"saved_cursor_main\":{\"cursor_row\":21,\"cursor_col\":0,\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"origin_mode\":false,\"auto_wrap\":true,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"pending_wrap\":false,\"underline_color\":null},\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":true,\"alternate_screen\":true,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":true,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":0,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src\",\"absolute_row_counter\":22,\"alt_absolute_row_counter\":42,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s2.grid"
+alt_grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s2.altgrid"
+
+[[sessions]]
+local_id = 3
+sid = "s-00000000010000030303"
+state = "alive"
+title = "zsh"
+user_title = "build"
+role = "worker"
+control = "940 8f3fabe099e06cdb91810a295e1975716eaa837cf4f172ceba91972e9ee11833"
+fg_holder = 40003
+claim_known = true
+timeline_id = 65569
+log_ids = "1793908062 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":23,\"cols\":84,\"history_lines\":149,\"cursor\":{\"cursor_row\":22,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":22,\"margin_left\":0,\"margin_right\":83,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":172,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s3.grid"
+
+[[sessions]]
+local_id = 4
+sid = "s-00000000010000040404"
+state = "alive"
+title = "zsh"
+control = "940 9ae667f79b6dc772409afba1e61a32777fb22d245aa03ccecaab70a30eadb042"
+fg_holder = 40004
+claim_known = true
+timeline_id = 65572
+log_ids = "1793908063 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":46,\"cols\":55,\"history_lines\":163,\"cursor\":{\"cursor_row\":45,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":45,\"margin_left\":0,\"margin_right\":54,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":209,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s4.grid"
+
+[[sessions]]
+local_id = 5
+sid = "s-00000000010000050505"
+state = "alive"
+title = "claude"
+control = "3916 8e007ece9adc4d0f9f87ed5e005a15cc83ed83d384399931490ac0b6187b51f4"
+fg_holder = 41005
+claim_known = true
+timeline_id = 65575
+log_ids = "1793908064 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":46,\"cols\":56,\"history_lines\":0,\"cursor\":{\"cursor_row\":45,\"cursor_col\":17,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":45,\"margin_left\":0,\"margin_right\":55,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":{\"cursor_row\":30,\"cursor_col\":8,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":45,\"margin_left\":0,\"margin_right\":55,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"saved_cursor_main\":{\"cursor_row\":30,\"cursor_col\":8,\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"origin_mode\":false,\"auto_wrap\":true,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"pending_wrap\":false,\"underline_color\":null},\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":true,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":true,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":1,\"main_saved_flags\":0,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":1},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":null,\"absolute_row_counter\":46,\"alt_absolute_row_counter\":46,\"title\":{},\"output_state\":{\"rep\":\"s\"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s5.grid"
+alt_grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s5.altgrid"
+
+[[sessions]]
+local_id = 6
+sid = "s-00000000010000060606"
+state = "alive"
+title = "zsh"
+control = "940 50924604cf5a7c67eeb0846e0813a6c85c263531f2c54c482e0ace3f2962f9a8"
+fg_holder = 40006
+claim_known = true
+timeline_id = 65578
+log_ids = "1793908065 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":46,\"cols\":55,\"history_lines\":237,\"cursor\":{\"cursor_row\":45,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":45,\"margin_left\":0,\"margin_right\":54,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":283,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s6.grid"
+
+[[sessions]]
+local_id = 7
+sid = "s-00000000010000070707"
+state = "alive"
+title = "zsh"
+description = "release notes"
+control = "940 dba7247e8f3fee966e5ada15dc749d636b124abdd020f763c849a3570a691940"
+fg_holder = 40007
+history = "22014 bee5ca253bbbeef2d067451e74d64bf72e664379f43b6a278dd0db8dec5d1036 18"
+claim_known = true
+timeline_id = 65581
+log_ids = "1793908066 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":46,\"cols\":168,\"history_lines\":256,\"cursor\":{\"cursor_row\":45,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":45,\"margin_left\":0,\"margin_right\":167,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":320,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s7.grid"
+
+[[sessions]]
+local_id = 8
+sid = "s-00000000010000080808"
+state = "alive"
+title = "zsh"
+control = "940 edcd67cb1db44433b114cdca4469e3cf3249ffccaf4d162b3e5fa2bf410cd1fe"
+fg_holder = 40008
+history = "25571 0ff38bf85c6402e67422e5c51c4e29d663a24c96bac67039d2ff2fc4d61133d3 61"
+claim_known = true
+timeline_id = 65584
+log_ids = "1793908067 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":40,\"cols\":70,\"history_lines\":256,\"cursor\":{\"cursor_row\":39,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":39,\"margin_left\":0,\"margin_right\":69,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":357,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s8.grid"
+
+[[sessions]]
+local_id = 9
+sid = "s-00000000010000090909"
+state = "alive"
+title = "vim"
+control = "940 ae95f8c5a5cd74c495e74c19ed664b2d022471bb57b8b240b338b49895faf856"
+fg_holder = 41009
+claim_known = true
+timeline_id = 65587
+log_ids = "1793908068 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":19,\"cols\":69,\"history_lines\":0,\"cursor\":{\"cursor_row\":1,\"cursor_col\":0,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":18,\"margin_left\":0,\"margin_right\":68,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":{\"cursor_row\":18,\"cursor_col\":0,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":18,\"margin_left\":0,\"margin_right\":68,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false],\"tab_defaults_suppressed\":false},\"saved_cursor_main\":{\"cursor_row\":18,\"cursor_col\":0,\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"origin_mode\":false,\"auto_wrap\":true,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"pending_wrap\":false,\"underline_color\":null},\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":true,\"alternate_screen\":true,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":true,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":0,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src\",\"absolute_row_counter\":19,\"alt_absolute_row_counter\":42,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s9.grid"
+alt_grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s9.altgrid"
+
+[[sessions]]
+local_id = 10
+sid = "s-000000000100000a0a0a"
+state = "alive"
+title = "zsh"
+control = "940 489182a81753fb2a172ca43218db304390e87f7a75531510f6db97153be0ac55"
+fg_holder = 40010
+history = "33145 2867a775198fd41ec4959c70481631b138510be8dfbdfceae9d8e070c98f7522 155"
+claim_known = true
+timeline_id = 65590
+log_ids = "1793908069 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":20,\"cols\":69,\"history_lines\":256,\"cursor\":{\"cursor_row\":19,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":19,\"margin_left\":0,\"margin_right\":68,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":431,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s10.grid"
+
+[[sessions]]
+local_id = 11
+sid = "s-000000000100000b0b0b"
+state = "alive"
+title = "zsh"
+control = "940 252c01bf92706c417608082bad5143998a2a7e0a22a4cf755ffb13b57b58c10a"
+fg_holder = 40011
+history = "34605 3531ffc001c990e9a23b96c8548d3acb41d4b6a2ecd3fa519146250c2084d3cf 172"
+claim_known = true
+timeline_id = 65593
+log_ids = "1793908070 4096 4096 4096"
+log_seq = 65537
+
+[sessions.screen]
+schema = 1
+meta = "{\"rows\":40,\"cols\":140,\"history_lines\":256,\"cursor\":{\"cursor_row\":39,\"cursor_col\":34,\"pending_wrap\":false,\"scroll_top\":0,\"scroll_bottom\":39,\"margin_left\":0,\"margin_right\":139,\"tab_stops\":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false],\"tab_defaults_suppressed\":false},\"alt_cursor\":null,\"saved_cursor_main\":null,\"saved_cursor_alt\":null,\"modes\":{\"cursor_visible\":true,\"cursor_style\":\"BlinkingBlock\",\"application_cursor_keys\":false,\"alternate_screen\":false,\"auto_wrap\":true,\"origin_mode\":false,\"insert_mode\":false,\"new_line_mode\":false,\"bracketed_paste\":false,\"allow_osc52_query\":false,\"allow_osc52_set\":false,\"mouse_mode\":\"None\",\"mouse_encoding\":\"X10\",\"focus_reporting\":false,\"synchronized_output\":false,\"reverse_video\":false,\"cursor_blink\":true,\"application_keypad\":false,\"column_mode_132\":false,\"reverse_wraparound\":false,\"left_right_margin_mode\":false,\"vt52_mode\":false,\"grapheme_cluster_mode\":false,\"vt_level\":\"VT420\",\"color_scheme\":\"Dark\",\"report_color_scheme\":false,\"backarrow_sends_bs\":false,\"special_modifiers\":true,\"meta_send_escape\":false,\"alt_send_escape\":true,\"mode_1045\":false,\"win32_input_mode\":false,\"win32_input_enabled\":false,\"win32_input_openconsole\":false,\"in_band_size_reports\":false,\"bidi_mode\":\"Implicit\",\"bidi_direction\":\"Auto\",\"bidi_box_mirroring\":false,\"bidi_autodetection\":false,\"alternate_scroll\":false,\"bidi_arrow_swap\":true,\"sixel_display_mode\":false,\"stream_attribute_extent\":true,\"allow_window_ops\":false,\"allow_notifications\":false,\"allow_session_memory\":false,\"allow_palette_reconfigure\":false,\"require_shell_integration_nonce\":false,\"kitty_keyboard_enabled\":true,\"deccolm_enable\":false,\"decncsm\":false,\"ambiguous_width_double\":false},\"style_fg_bits\":4294967295,\"style_bg_bits\":4278190080,\"style_flag_bits\":0,\"style_protected\":false,\"charset\":{\"g0\":\"Ascii\",\"g1\":\"Ascii\",\"g2\":\"Ascii\",\"g3\":\"Ascii\",\"gl\":\"G0\",\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"kitty_keyboard\":{\"flags\":0,\"main_saved_flags\":null,\"alt_saved_flags\":null,\"main_stack\":[0,0,0,0,0,0,0,0],\"alt_stack\":[0,0,0,0,0,0,0,0],\"main_sp\":0,\"alt_sp\":0},\"xterm_keyboard\":{\"modify_other_keys\":0,\"format_other_keys\":0},\"taskbar_progress\":null,\"secure_keyboard_entry\":false,\"current_working_directory\":\"/home/dev/src/aterm\",\"absolute_row_counter\":468,\"title\":{\"window\":\"zsh\",\"icon\":\"zsh\"},\"output_state\":{\"rep\":\" \"}}"
+grid_file = "@HANDOFF_DIR@/seamless-63862-00000000000000000000000001000004.s11.grid"
+
+[window]
+rows = 46
+cols = 168
+outer_x = 96
+outer_y = 48
+inner_px = [1176, 644]
+status_bar_rows = 0
+next_message_id = 1
+messages_captured_unix_ms = 1793908043793
+
+[[connections]]
+src = "s-00000000010000030303"
+dst = "s-00000000010000050505"
+op = "read-screen"
+
+[[connections]]
+src = "s-00000000010000030303"
+dst = "s-00000000010000050505"
+op = "signal"
+
+[[connections]]
+src = "s-00000000010000030303"
+dst = "s-00000000010000050505"
+op = "write-input"

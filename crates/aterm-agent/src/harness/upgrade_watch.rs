@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use super::upgrade::{self, Candidate, Phase, Source, Step, Version};
 use super::{
-    AT_POINT, Opts, Proc, Report, St, TAIL_BYTES, at_second, due_by, ledger, load, now_s,
+    AT_POINT, Opts, Proc, Report, St, TAIL_BYTES, at_second, due_by, ledger, load_record, now_s,
     read_upgrade_dir, rearm, rounds_step, save_at, step, sweep_lock, tail_to_end, watch_at,
 };
 
@@ -200,7 +200,7 @@ fn look_at(
     };
     let mut moved = false;
     for (name, before) in owed {
-        let Some(mut st) = load(opts, &name) else {
+        let Ok(Some(mut st)) = load_record(opts, &name) else {
             continue;
         };
         let ours = session.as_deref() == Some(name.as_str());
@@ -296,7 +296,7 @@ fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
                 return None;
             }
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            let st = load(opts, &name).filter(|st| {
+            let st = load_record(opts, &name).ok().flatten().filter(|st| {
                 (st.tab == tab || st.tab.is_empty()) && st.is_upgrade() && due_by(st).is_some()
             })?;
             Some((name, st))

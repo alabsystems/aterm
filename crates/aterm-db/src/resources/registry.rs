@@ -203,11 +203,12 @@ impl RequestRegistry {
                         fresh: false,
                     });
                 }
-                let mut bytes = b"ARRQ1".to_vec();
-                bytes.extend_from_slice(&key.producer);
-                bytes.extend_from_slice(&key.logical);
-                bytes.extend_from_slice(&allocation.id());
-                bytes.extend_from_slice(&operation);
+                let mut bytes = [0u8; 117];
+                bytes[..5].copy_from_slice(b"ARRQ1");
+                bytes[5..37].copy_from_slice(&key.producer);
+                bytes[37..53].copy_from_slice(&key.logical);
+                bytes[53..85].copy_from_slice(&allocation.id());
+                bytes[85..117].copy_from_slice(&operation);
                 if let Pin::Pending(nonce) = pinned {
                     finish_pending(session.paths(), scope.digest(), nonce, custody)?;
                 }
@@ -283,9 +284,10 @@ fn write_pending(paths: &Paths, scope: Digest) -> Result<()> {
     let path = pin_path(paths);
     let parent = path.parent().unwrap();
     aterm_journal::create_private_dir_durable(parent)?;
-    let mut bytes = b"ARRP0".to_vec();
-    bytes.extend_from_slice(&scope);
-    bytes.extend_from_slice(&crate::crypto::random::<32>()?);
+    let mut bytes = [0u8; 69];
+    bytes[..5].copy_from_slice(b"ARRP0");
+    bytes[5..37].copy_from_slice(&scope);
+    bytes[37..69].copy_from_slice(&crate::crypto::random::<32>()?);
     aterm_secrets::fsx::write_new(&path, &bytes, 0o600).map_err(crate::table::failure)?;
     aterm_durable::durable_dir(parent)?;
     Ok(())
@@ -296,9 +298,10 @@ fn finish_pending(paths: &Paths, scope: Digest, nonce: Digest, custody: Digest) 
         return Err(Error::new("request registry initialization changed"));
     }
     let path = pin_path(paths);
-    let mut bytes = b"ARRP1".to_vec();
-    bytes.extend_from_slice(&scope);
-    bytes.extend_from_slice(&custody);
+    let mut bytes = [0u8; 69];
+    bytes[..5].copy_from_slice(b"ARRP1");
+    bytes[5..37].copy_from_slice(&scope);
+    bytes[37..69].copy_from_slice(&custody);
     aterm_secrets::fsx::write_atomic(&path, &bytes, 0o600).map_err(crate::table::failure)?;
     aterm_durable::durable_dir(path.parent().unwrap())?;
     Ok(())

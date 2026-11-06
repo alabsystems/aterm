@@ -49,28 +49,33 @@ impl Fired {
                  for {secs} s; VM stopped"
             ),
             Self::BootAfterAgent { jobs } => {
-                let named = if jobs.is_empty() {
-                    "no start job (systemd called the boot over, and the agent waits on the \
-                     lane user's manager)"
-                        .to_string()
-                } else {
-                    jobs.iter()
-                        .map(|j| {
-                            format!(
-                                "{} {} {} ({} s)",
-                                j.unit,
-                                j.kind,
-                                j.state,
-                                j.elapsed_ms / 1000
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                format!(
+                use std::fmt::Write as _;
+                let mut out = format!(
                     "NOT RUN — the boot hung after the agent: the same start jobs for {secs} s \
-                     with no Ready: {named}; VM stopped"
-                )
+                     with no Ready: "
+                );
+                if jobs.is_empty() {
+                    out.push_str(
+                        "no start job (systemd called the boot over, and the agent waits on the \
+                         lane user's manager)",
+                    );
+                } else {
+                    for (i, j) in jobs.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        let _ = write!(
+                            out,
+                            "{} {} {} ({} s)",
+                            j.unit,
+                            j.kind,
+                            j.state,
+                            j.elapsed_ms / 1000
+                        );
+                    }
+                }
+                out.push_str("; VM stopped");
+                out
             }
             Self::Heartbeat => {
                 format!("the guest stopped answering (no heartbeat for {secs} s); VM stopped")

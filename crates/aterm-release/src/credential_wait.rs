@@ -181,7 +181,9 @@ fn interpreter(program: &str) -> bool {
         program,
         "sh" | "bash" | "dash" | "zsh" | "ksh" | "env" | "ruby" | "node"
     ) || program.starts_with("perl")
-        || program.to_ascii_lowercase().starts_with("python")
+        || program
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case("python"))
 }
 
 /// When each helper in a child's tree was first seen, by identity and name.

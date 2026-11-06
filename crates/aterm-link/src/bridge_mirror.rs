@@ -63,8 +63,10 @@ pub(super) const FIRST_PASS_HOLD: Duration = Duration::from_millis(5);
 
 /// THE FIRST PASS OF AN OPEN AFTER AN ATTACH (critic item D06): whether the loop holds it back
 /// for the deliveries the attach owes while this open has yet to make the pin's fence durable
-/// ([`StateDir::ensure_logpin_durable`], two full flushes), so the first delivery after an
-/// attach or a handoff does not wait behind the fence ([`Bridge::mirror_yields`]).
+/// ([`Bridge::make_the_pin_fence`]: two full flushes of the bridge's own, or, where the broker's
+/// log is on the state dir's device, two barriers and the broker's settle, critic item F07), so
+/// the first delivery after an attach or a handoff does not wait behind the fence
+/// ([`Bridge::mirror_yields`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FirstPass {
     /// Nothing holds a pass back.
@@ -811,9 +813,9 @@ impl Bridge {
         }
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]), nor, for a take inside the endpoint's rate hold that only wakes of the sessions it holds owe, than the owed commit's write ([`Bridge::mirror_behind_the_commit`]).
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing, and for nothing while the pin's settle is owed its answer, which the round that reads it makes the fence of ([`Bridge::make_the_pin_fence`], critic item F07); no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]), nor, for a take inside the endpoint's rate hold that only wakes of the sessions it holds owe, than the owed commit's write ([`Bridge::mirror_behind_the_commit`]).
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
-        if !self.mirror_engaged() || self.conn.is_none() {
+        if !self.mirror_engaged() || self.conn.is_none() || self.pin_settle_owed() {
             return None;
         }
         let m = self.mirror.as_deref()?;
@@ -1346,28 +1348,21 @@ impl Bridge {
             return false;
         }
         self.commit_ahead_of_the_fence();
+        match self.make_the_pin_fence() {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                stderr_line!(
+                    "aterm-link: mirror: the pin's version fence could not be made durable \
+                     ({e}); nothing taken or sent, tried again"
+                );
+                self.mirror_retry_in(DEADLINE_RETRY);
+                return false;
+            }
+        }
         let Some(m) = self.mirror.as_deref() else {
             return false;
         };
-        #[cfg(test)]
-        let fenced = if self
-            .fx
-            .mutant(crate::sim::world::Mutant::TakeAheadOfTheFence)
-        {
-            Ok(())
-        } else {
-            self.state.ensure_logpin_durable(|| m.pin.render())
-        };
-        #[cfg(not(test))]
-        let fenced = self.state.ensure_logpin_durable(|| m.pin.render());
-        if let Err(e) = fenced {
-            stderr_line!(
-                "aterm-link: mirror: the pin's version fence could not be made durable \
-                 ({e}); nothing taken or sent, tried again"
-            );
-            self.mirror_retry_in(DEADLINE_RETRY);
-            return false;
-        }
         if m.key_durable {
             return true;
         }
@@ -1395,6 +1390,152 @@ impl Bridge {
                 false
             }
         }
+    }
+
+    /// THE PIN'S FENCE (critic items D06 and F07): whether this open holds it, made now where
+    /// it can be, ahead of any take or send. Where this link's broker settles the state dir's
+    /// device ([`Bridge::broker_settles_the_pin`]), the pin goes by barriers alone
+    /// ([`StateDir::order_logpin`]: the temp's, the rename, the directory's) and, once they
+    /// returned, a settle goes pipelined ([`Bridge::send_pin_settle`]); the fence is held once
+    /// the broker answers it ([`Bridge::pin_settled`]), and until then every take and send waits
+    /// (`Ok(false)`) while the loop goes on with its deliveries ([`Bridge::mirror_due`]). The
+    /// answer is the proof, not a durable head read off the bus: it comes after a full flush the
+    /// broker's writer issued once it took the request, which follows the barriers, so it
+    /// drained them whatever a flush before it covered. Anywhere else (a log on another device
+    /// or another volume, a broker that names no device or cannot settle) the bridge flushes the
+    /// pin in full itself ([`StateDir::ensure_logpin_durable`]).
+    ///
+    /// # Errors
+    /// The pin's write, the barrier's or the full flush's, or the settle's send.
+    pub(super) fn make_the_pin_fence(&mut self) -> io::Result<bool> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TakeAheadOfTheFence)
+        {
+            return Ok(true);
+        }
+        if self.state.logpin_fence_held() {
+            return Ok(true);
+        }
+        if self.pin_settle_owed() {
+            #[cfg(test)]
+            if self
+                .fx
+                .mutant(crate::sim::world::Mutant::FenceBeforeTheSettle)
+            {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let Some(m) = self.mirror.as_deref() else {
+            return Ok(false);
+        };
+        if !self.broker_settles_the_pin() {
+            self.state.ensure_logpin_durable(|| m.pin.render())?;
+            return Ok(true);
+        }
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::SettleAheadOfTheBarrier)
+        {
+            let text = m.pin.render();
+            self.send_pin_settle()?;
+            self.state.order_logpin(|| text)?;
+            return Ok(false);
+        }
+        if self.state.order_logpin(|| m.pin.render())? {
+            return Ok(true);
+        }
+        self.send_pin_settle()?;
+        // Held from the answer, never the send: the broker's writer may still be flushing.
+        #[cfg(test)]
+        let held = self
+            .fx
+            .mutant(crate::sim::world::Mutant::FenceBeforeTheSettle);
+        #[cfg(not(test))]
+        let held = false;
+        Ok(held)
+    }
+
+    /// WHETHER THIS LINK'S BROKER SETTLES THE PIN (critic item F07): its `Hello` offers the settle
+    /// and names the device its log is on, the state dir's own ([`StateDir::device`]), whose
+    /// every write it drains with its full flush (astream's `LogDevice::settles`: `F_FULLFSYNC`,
+    /// on Apple), and it has not refused one on this link. A device number is a volume's, not a
+    /// drive's: a log on another volume of the state dir's drive is judged another device, and
+    /// the bridge flushes for itself there.
+    pub(super) fn broker_settles_the_pin(&self) -> bool {
+        if self.settle_refused {
+            return false;
+        }
+        let Some(link) = self.conn.as_ref() else {
+            return false;
+        };
+        let Some(device) = link.log_device().filter(|_| link.supports_settle()) else {
+            return false;
+        };
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TrustAnotherDevicesFlush)
+        {
+            return device.flush_drains_device;
+        }
+        self.state.device().is_some_and(|dev| device.settles(dev))
+    }
+
+    /// Whether this link owes the pin's settle its answer ([`Then::Settle`]).
+    pub(super) fn pin_settle_owed(&self) -> bool {
+        self.conn
+            .as_ref()
+            .is_some_and(|link| link.owed().any(Then::is_settle))
+    }
+
+    /// The settle the pin's fence waits on (critic item F07), sent pipelined behind what the link
+    /// owes, past the barriers [`StateDir::order_logpin`] returned from: the broker answers it in
+    /// send order once its full flush returned ([`Bridge::settled_now`]).
+    ///
+    /// # Errors
+    /// The send's; a link it could not write is judged down.
+    fn send_pin_settle(&mut self) -> io::Result<()> {
+        let waiting = self.fx.now();
+        while self
+            .conn
+            .as_ref()
+            .is_some_and(|link| link.unacked() >= PIPELINE_WINDOW)
+            && self.settle_one(waiting)
+        {}
+        let started = self.fx.now();
+        let Some(link) = self.conn.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no broker link to settle the pin's fence on",
+            ));
+        };
+        if let Err((e, _)) = link.send_settle(Then::Settle, started) {
+            self.judge(started, Err(&e), Some("read"));
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// THE BROKER SETTLED THE PIN (critic item F07): the pin ordered for it is this open's fence
+    /// ([`StateDir::logpin_settled`]) where the name still holds it, and the mirror's pass, which
+    /// waited on the answer ([`Bridge::mirror_due`]), is due. One the name no longer holds is
+    /// fenced again by the next pass.
+    pub(super) fn pin_settled(&mut self) {
+        let _ = self.state.logpin_settled();
+    }
+
+    /// This link's broker refused the settle (critic item F07): its next fence is the bridge's own
+    /// full flush ([`Bridge::broker_settles_the_pin`]), until the next attach asks again.
+    pub(super) fn pin_settle_refused(&mut self, e: &io::Error) {
+        stderr_line!(
+            "aterm-link: mirror: the broker refused to settle the pin's fence ({e}); the \
+             bridge flushes the pin itself on this link"
+        );
+        self.settle_refused = true;
     }
 
     /// whether `logfloor` covers the batch — the node's total plus every slot's body bytes — raised now, durably, [`mirror::FLOOR_LEASE_BYTES`] past it if it does not, before any slot is sent.

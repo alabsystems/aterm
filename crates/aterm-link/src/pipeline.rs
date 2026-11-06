@@ -268,6 +268,31 @@ impl<T> Link<T> {
         }
     }
 
+    /// Ask the broker to SETTLE its log's device WITHOUT waiting for the answer (astream's
+    /// `Client::send_settle`, critic item F07), and queue `tag` for it: a full flush its writer
+    /// issues once it took the request, answered in send order with the durable head after it.
+    /// # Errors
+    /// The send's, with the tag.
+    pub fn send_settle(&mut self, tag: T, now: Instant) -> Result<(), (io::Error, T)> {
+        match self.client.send_settle() {
+            Ok(()) => {
+                #[cfg(test)]
+                if let Some(tap) = self.tap.as_mut() {
+                    tap(&[(&tag, None)]);
+                }
+                self.owe(Unacked {
+                    seq: 0,
+                    first: false,
+                    sent: now,
+                    tag,
+                    rider: None,
+                });
+                Ok(())
+            }
+            Err(e) => Err((e, tag)),
+        }
+    }
+
     /// Write a consumer group's COMMIT to `commit.upto`, when one rides, AND every publish of
     /// `publishes` in ONE write, the commit first, WITHOUT waiting for any ack (astream's
     /// `Client::send_pipelined`), and queue the commit's tag, then each publish's in order,

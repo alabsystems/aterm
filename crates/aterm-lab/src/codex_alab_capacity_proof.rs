@@ -2,22 +2,32 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CAPACITY LANE (`codex-alab-proof --capacity-only`, and the full proof's last leg):
-//! codex-alab's headless capacity recovery (its `alab/CAPACITY_RECOVERY.md`) on the REAL
-//! package's `codex exec`, in the proof's jail ([`super::policy`]: one loopback port, the
-//! owner's homes fenced), against a loopback model of this lane's own. What codex-alab's
-//! `alab/smoke/capacity_exec.py` proves, which runs `codex exec` with the Internet open:
+//! codex-alab's headless capacity and account-quota recovery (its `alab/CAPACITY_RECOVERY.md`,
+//! and its `alab-core` glue `responses_quota_retry.rs`) on the REAL package's `codex exec`, in
+//! the proof's jail ([`super::policy`]: one loopback port, the owner's homes fenced), against a
+//! loopback model of this lane's own. Every case of codex-alab's `alab/smoke/capacity_exec.py`
+//! (its default run, `--quota`, `--quota-no-reset` and `--quota-terminals`), which runs
+//! `codex exec` with the Internet open, by its name ([`CASES`]):
 //!
 //! - the package's records agree (version, target, an exact source commit, `bin/codex` inside
 //!   the package), `codex exec --help` names the flags this lane passes, and `codex --version`
 //!   says the package's version;
-//! - CAPACITY RECOVERY: the model answers the first request with an `update_plan` call, the
-//!   second (carrying that call's output) with `503 server_is_overloaded` and `Retry-After: 2`,
-//!   the third with the reply. One native turn, three requests, the model and the person's
-//!   prompt unchanged in each, the retry's input exactly the overloaded request's (the plan's
-//!   output kept), the plan run once and completed, the reply completed, exit 0, and the retry
-//!   asked no sooner than `Retry-After` after the overloaded answer's headers began (their
-//!   emission bracketed within [`HEADER_EMISSION_LIMIT_S`], or the timing is inconclusive);
-//! - PERMANENT REFUSAL: a `403` is asked once, fails the turn, and exits non-zero (no signal).
+//! - RECOVERY (`capacity-recovery`, `quota-reset-recovery`, `quota-no-reset-recovery`): the
+//!   model answers the first request with an `update_plan` call, the second (carrying that
+//!   call's output) with the case's wall and `Retry-After: 2`, the third with the reply. One
+//!   native turn, three requests, the model and the person's prompt unchanged in each, the
+//!   retry's input exactly the walled request's (the plan's output kept), the plan run once and
+//!   completed, the reply completed, exit 0, and the retry asked no sooner than `Retry-After`
+//!   after the wall's headers began (their emission bracketed within
+//!   [`HEADER_EMISSION_LIMIT_S`], or the timing is inconclusive). The wall is `503
+//!   server_is_overloaded`; or `429 usage_limit_reached` naming a reset 2 s on (rounded up to the
+//!   second), which the retry may not precede; or that `429` with no reset, after which codex-alab
+//!   polls no sooner than [`QUOTA_POLL_S`] later;
+//! - REFUSAL (`permanent-refusal`, `quota-permanent-refusal`, `quota-no-reset-refusal`,
+//!   `quota-terminal-<kind>`): a `403` with the overloaded or the quota body (with or without its
+//!   reset), or a `429` with the quota body, its reset and `x-codex-rate-limit-reached-type` one of
+//!   the four credit-depletion and spending-cap [`TERMINAL_KINDS`], is asked once, fails the
+//!   turn, and exits non-zero (no signal).
 //!
 //! EGRESS, as the lab's other proofs check it: before each case a jailed `nc` reaches the
 //! lane's model port and is refused a loopback canary port the jail does not name (whose
@@ -53,12 +63,140 @@ pub(super) const CALL_ID: &str = "capacity-smoke-plan";
 pub(super) const PLAN: &str = "Completed work survives a capacity retry";
 /// The reply after the retry.
 pub(super) const ANSWER: &str = "Headless capacity recovery succeeded.";
-/// `Retry-After` on the overloaded answer, in seconds.
-const RETRY_AFTER_S: f64 = 2.0;
-/// The most the overloaded answer's headers may take to write and still time the retry.
+/// `Retry-After` on the wall's answer, in seconds; a quota wall's reset is as far on.
+const RETRY_AFTER_S: u64 = 2;
+/// The most the wall's headers may take to write and still time the retry.
 const HEADER_EMISSION_LIMIT_S: f64 = 0.050;
-/// The most one `codex` run may take: a hang bound.
+/// How long codex-alab waits before it asks again past a quota wall that names no reset
+/// (`responses_quota_retry.rs`, `UNKNOWN_RESET_WAIT`), in seconds.
+const QUOTA_POLL_S: u64 = 30;
+/// The most one `codex` run may take beyond what its case waits by design: a hang bound.
 const RUN_LIMIT: Duration = Duration::from_secs(60);
+/// The `x-codex-rate-limit-reached-type`s codex-alab keeps terminal however the reset reads:
+/// `capacity_exec.py --quota-terminals`' four credit-depletion and spending-cap types.
+pub(super) const TERMINAL_KINDS: [&str; 4] = [
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+];
+
+/// One case of the lane, each one of `capacity_exec.py`'s, by its name ([`Case::name`]): the wall
+/// the model answers with, and whether the turn must recover from it or fail at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Case {
+    /// `503 server_is_overloaded`, recovered after `Retry-After`.
+    CapacityRecovery,
+    /// `403` with the overloaded body: terminal.
+    PermanentRefusal,
+    /// `429 usage_limit_reached` naming its reset, recovered no sooner than the reset.
+    QuotaResetRecovery,
+    /// `403` with the quota body and its reset: terminal.
+    QuotaPermanentRefusal,
+    /// `429 usage_limit_reached` naming no reset, recovered by a poll [`QUOTA_POLL_S`] on.
+    QuotaNoResetRecovery,
+    /// `403` with the quota body and no reset: terminal.
+    QuotaNoResetRefusal,
+    /// `429` with the quota body, its reset and `x-codex-rate-limit-reached-type` this kind (one
+    /// of [`TERMINAL_KINDS`]): terminal.
+    QuotaTerminal(&'static str),
+}
+
+/// Every case the lane runs, in `capacity_exec.py`'s order.
+pub(super) const CASES: [Case; 10] = [
+    Case::CapacityRecovery,
+    Case::PermanentRefusal,
+    Case::QuotaResetRecovery,
+    Case::QuotaPermanentRefusal,
+    Case::QuotaNoResetRecovery,
+    Case::QuotaNoResetRefusal,
+    Case::QuotaTerminal(TERMINAL_KINDS[0]),
+    Case::QuotaTerminal(TERMINAL_KINDS[1]),
+    Case::QuotaTerminal(TERMINAL_KINDS[2]),
+    Case::QuotaTerminal(TERMINAL_KINDS[3]),
+];
+
+impl Case {
+    /// Its name, `capacity_exec.py`'s: its output folder and its verdict's `case`.
+    pub(super) fn name(self) -> String {
+        match self {
+            Self::CapacityRecovery => "capacity-recovery".into(),
+            Self::PermanentRefusal => "permanent-refusal".into(),
+            Self::QuotaResetRecovery => "quota-reset-recovery".into(),
+            Self::QuotaPermanentRefusal => "quota-permanent-refusal".into(),
+            Self::QuotaNoResetRecovery => "quota-no-reset-recovery".into(),
+            Self::QuotaNoResetRefusal => "quota-no-reset-refusal".into(),
+            Self::QuotaTerminal(kind) => format!("quota-terminal-{kind}"),
+        }
+    }
+
+    /// Whether the turn must fail at the wall, asked once (else it must recover from it).
+    pub(super) fn refused(self) -> bool {
+        !matches!(
+            self,
+            Self::CapacityRecovery | Self::QuotaResetRecovery | Self::QuotaNoResetRecovery
+        )
+    }
+
+    /// The wall's status.
+    fn status(self) -> u16 {
+        match self {
+            Self::CapacityRecovery => 503,
+            Self::QuotaResetRecovery | Self::QuotaNoResetRecovery | Self::QuotaTerminal(_) => 429,
+            Self::PermanentRefusal | Self::QuotaPermanentRefusal | Self::QuotaNoResetRefusal => 403,
+        }
+    }
+
+    /// Whether the wall is the account quota's (`usage_limit_reached`), not the model's capacity.
+    fn quota(self) -> bool {
+        !matches!(self, Self::CapacityRecovery | Self::PermanentRefusal)
+    }
+
+    /// Whether the quota wall names its reset (`resets_at`).
+    fn names_reset(self) -> bool {
+        matches!(
+            self,
+            Self::QuotaResetRecovery | Self::QuotaPermanentRefusal | Self::QuotaTerminal(_)
+        )
+    }
+
+    /// How long its run waits by design, which its hang bound ([`RUN_LIMIT`]) comes on top of.
+    fn waits(self) -> Duration {
+        match self {
+            Self::QuotaNoResetRecovery => Duration::from_secs(QUOTA_POLL_S),
+            // The reset is up to a second past `Retry-After`: rounded up to the second.
+            Self::CapacityRecovery | Self::QuotaResetRecovery => {
+                Duration::from_secs(RETRY_AFTER_S + 1)
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// What its passing verdict says.
+    fn promise(self) -> String {
+        match self {
+            Self::CapacityRecovery => {
+                "one turn recovers from the capacity answer after Retry-After, the plan kept".into()
+            }
+            Self::QuotaResetRecovery => {
+                "one turn recovers from the account quota answer no sooner \
+                                         than its reset and Retry-After, the plan kept"
+                    .into()
+            }
+            Self::QuotaNoResetRecovery => format!(
+                "one turn recovers from a quota answer that names no reset, asked again no sooner \
+                 than {QUOTA_POLL_S} s after it, the plan kept"
+            ),
+            Self::QuotaTerminal(kind) => format!(
+                "a 429 typed {kind} is asked once, fails the turn and exits non-zero, its reset \
+                 notwithstanding"
+            ),
+            Self::PermanentRefusal | Self::QuotaPermanentRefusal | Self::QuotaNoResetRefusal => {
+                "a 403 is asked once, fails the turn and exits non-zero".into()
+            }
+        }
+    }
+}
 /// How often the running `codex exec`'s sockets are sampled.
 const SAMPLE_EVERY: Duration = Duration::from_millis(200);
 /// The flags of `codex exec` each case passes, which its `--help` must name.
@@ -70,7 +208,7 @@ const EXEC_FLAGS: [&str; 5] = [
     "--sandbox",
 ];
 
-/// Why a jailed run ([`jailed`]) gave no exit.
+/// Why a jailed run ([`Jail::run`]) gave no exit.
 #[derive(Debug)]
 enum Cut {
     /// It could not be run or reaped: the lane's check of it fails.
@@ -89,14 +227,15 @@ impl From<std::io::Error> for Cut {
 /// reaped while it is held here.
 static RUNNING: Mutex<Option<i32>> = Mutex::new(None);
 
-/// Hold `group` as the run going now ([`RUNNING`]), and make killing it the lab's act at a second
-/// interrupt ([`stop::at_hard_exit`], which replaces any act registered before it: the
-/// codex-alab proof, which runs this lane, registers none). `codex` leads a group of its own,
+/// Hold `group` as the run going now ([`RUNNING`]), and make killing it one of the lab's acts at
+/// a second interrupt ([`stop::at_hard_exit`], which holds every act registered beside it),
+/// registered once a process however many runs it holds. `codex` leads a group of its own,
 /// which a terminal's `^C` never reaches, so without that act a second interrupt would end the
 /// lab and leave the group running.
 fn hold(group: Option<i32>) {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
     *RUNNING.lock().unwrap_or_else(PoisonError::into_inner) = group;
-    stop::at_hard_exit(end_running_group);
+    REGISTERED.call_once(|| stop::at_hard_exit(end_running_group));
 }
 
 /// Kill the held group ([`hold`]) until it is empty, and hold none. The lock is kept while it is
@@ -116,16 +255,20 @@ fn end_running_group() {
 pub(super) struct Taken {
     /// When its first byte arrived: no later than the server read it.
     pub arrived: f64,
+    /// The same moment on the wall clock (seconds since the epoch), which a quota reset names.
+    pub arrived_unix: f64,
     pub body: Option<J>,
     /// Just before its answer's headers were written.
     pub header_started: Option<f64>,
     /// Once they were written and flushed, before the body.
     pub header_sent: Option<f64>,
+    /// The reset its answer named (`resets_at`, seconds since the epoch).
+    pub resets_at: Option<i64>,
 }
 
 /// The lane's model: one case's answers and what it took.
 struct Model {
-    negative: bool,
+    case: Case,
     clock: Instant,
     taken: Mutex<Vec<Taken>>,
     /// Sampled at each request it takes, before its answer: the client is waiting on its
@@ -225,19 +368,63 @@ impl Model {
     }
 }
 
-/// What the model answers the `number`th request (from 1) of a case: `(status, content type,
-/// body, Retry-After seconds)`.
-pub(super) fn answer(negative: bool, number: usize) -> (u16, &'static str, String, Option<u64>) {
-    let overloaded = J::obj([(
-        "error",
-        J::obj([
-            ("code", J::s("server_is_overloaded")),
-            ("message", J::s("Model is at capacity.")),
-        ]),
-    )])
-    .dump(PY);
-    if negative {
-        return (403, "application/json", overloaded, Some(2));
+/// One answer of the lane's model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Answer {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: String,
+    /// `Retry-After`, in seconds.
+    pub retry_after: Option<u64>,
+    /// `x-codex-rate-limit-reached-type`.
+    pub reached_type: Option<&'static str>,
+    /// The reset its body names (`resets_at`, seconds since the epoch).
+    pub resets_at: Option<i64>,
+}
+
+/// What the model answers the `number`th request (from 1) of `case`, asked at `now` (seconds
+/// since the epoch), as `capacity_exec.py`'s model does: the plan call, the case's wall with
+/// `Retry-After`, the reply, then a refusal of any extra request; a refused case meets its wall
+/// at every request. A quota wall that names its reset names `now` rounded up to the second,
+/// [`RETRY_AFTER_S`] on.
+pub(super) fn answer(case: Case, number: usize, now: f64) -> Answer {
+    let ok = |body| Answer {
+        status: 200,
+        content_type: "text/event-stream",
+        body,
+        retry_after: None,
+        reached_type: None,
+        resets_at: None,
+    };
+    if case.refused() || number == 2 {
+        let resets_at =
+            (case.quota() && case.names_reset()).then(|| now.ceil() as i64 + RETRY_AFTER_S as i64);
+        let error = if case.quota() {
+            let mut error = J::obj([
+                ("type", J::s("usage_limit_reached")),
+                ("message", J::s("Fixture account quota exhausted")),
+            ]);
+            if let Some(reset) = resets_at {
+                error.set("resets_at", J::Int(reset));
+            }
+            error
+        } else {
+            J::obj([
+                ("code", J::s("server_is_overloaded")),
+                ("message", J::s("Model is at capacity.")),
+            ])
+        };
+        return Answer {
+            status: case.status(),
+            content_type: "application/json",
+            body: J::obj([("error", error)]).dump(PY),
+            retry_after: Some(RETRY_AFTER_S),
+            reached_type: match case {
+                Case::QuotaTerminal(kind) => Some(kind),
+                _ => None,
+            },
+            resets_at,
+        };
     }
     match number {
         1 => {
@@ -256,26 +443,19 @@ pub(super) fn answer(negative: bool, number: usize) -> (u16, &'static str, Strin
                 ("status", J::s("completed")),
                 ("arguments", J::s(args.py())),
             ]);
-            (
-                200,
-                "text/event-stream",
-                crate::codex_rig::sse(vec![call]),
-                None,
-            )
+            ok(crate::codex_rig::sse(vec![call]))
         }
-        2 => (503, "application/json", overloaded, Some(2)),
-        3 => (
-            200,
-            "text/event-stream",
-            crate::codex_rig::sse(vec![crate::codex_rig::message_item(ANSWER)]),
-            None,
-        ),
-        _ => (
-            400,
-            "application/json",
-            r#"{"error":{"message":"Unexpected extra request"}}"#.to_string(),
-            None,
-        ),
+        3 => ok(crate::codex_rig::sse(vec![crate::codex_rig::message_item(
+            ANSWER,
+        )])),
+        _ => Answer {
+            status: 400,
+            content_type: "application/json",
+            body: r#"{"error":{"message":"Unexpected extra request"}}"#.to_string(),
+            retry_after: None,
+            reached_type: None,
+            resets_at: None,
+        },
     }
 }
 
@@ -302,7 +482,7 @@ fn serve_one(conn: TcpStream, model: &Model) {
             Ok([]) | Err(_) => return,
             Ok(_) => {}
         }
-        let arrived = model.now();
+        let (arrived, arrived_unix) = (model.now(), crate::util::now());
         let Ok(Some(req)) = crate::stub::read_request(&mut r) else {
             return;
         };
@@ -328,22 +508,34 @@ fn serve_one(conn: TcpStream, model: &Model) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             taken.push(Taken {
                 arrived,
+                arrived_unix,
                 body: J::parse_bytes(&req.body).ok(),
                 ..Taken::default()
             });
             taken.len()
         };
         model.witness.sample(true);
-        let (status, kind, body, retry_after) = answer(model.negative, number);
+        let Answer {
+            status,
+            content_type,
+            body,
+            retry_after,
+            reached_type,
+            resets_at,
+        } = answer(model.case, number, crate::util::now());
         let reason = match status {
             200 => "OK",
             403 => "Forbidden",
+            429 => "Too Many Requests",
             503 => "Service Unavailable",
             _ => "Error",
         };
         let retry = retry_after.map_or_else(String::new, |s| format!("Retry-After: {s}\r\n"));
+        let typed = reached_type.map_or_else(String::new, |k| {
+            format!("x-codex-rate-limit-reached-type: {k}\r\n")
+        });
         let head = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\n{retry}\r\n",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n{retry}{typed}\r\n",
             body.len()
         );
         let header_started = model.now();
@@ -364,6 +556,7 @@ fn serve_one(conn: TcpStream, model: &Model) {
         {
             t.header_started = Some(header_started);
             t.header_sent = Some(header_sent);
+            t.resets_at = resets_at;
         }
         if w.write_all(body.as_bytes())
             .and_then(|()| w.flush())
@@ -374,7 +567,7 @@ fn serve_one(conn: TcpStream, model: &Model) {
     }
 }
 
-/// HOW LONG AFTER THE OVERLOADED ANSWER'S HEADERS THE RETRY CAME, measured from its headers
+/// HOW LONG AFTER THE WALL'S HEADERS THE RETRY CAME (the overloaded or quota answer's), measured from its headers
 /// and not from the request's handling before them: the client may have read them anywhere
 /// between their two stamps, so only that bracket is used, and a bracket wider than
 /// [`HEADER_EMISSION_LIMIT_S`] is inconclusive. The retry's arrival is its first byte.
@@ -395,10 +588,51 @@ pub(super) fn retry_after_delay(overload: &Taken, retry: &Taken) -> Result<f64, 
         ));
     }
     let delay = retry.arrived - header;
-    if retry.arrived < (start + RETRY_AFTER_S).next_down() {
+    if retry.arrived < (start + RETRY_AFTER_S as f64).next_down() {
         return Err(format!("Retry-After bypassed: {delay:.6}s after headers"));
     }
     Ok(delay)
+}
+
+/// THE QUOTA'S RESET KEPT: the walled request's answer named its reset (`resets_at`, seconds
+/// since the epoch), and the retry's first byte came on the wall clock no sooner. The reset.
+/// # Errors
+/// No reset named, a retry stamp not finite, or a retry before the reset.
+pub(super) fn quota_reset_kept(walled: &Taken, retry: &Taken) -> Result<i64, String> {
+    let Some(reset) = walled.resets_at else {
+        return Err("the quota answer named no reset".into());
+    };
+    if !retry.arrived_unix.is_finite() {
+        return Err("missing or invalid quota retry time".into());
+    }
+    if retry.arrived_unix < reset as f64 {
+        return Err(format!(
+            "account quota was retried before its reset ({:.6}s early)",
+            reset as f64 - retry.arrived_unix
+        ));
+    }
+    Ok(reset)
+}
+
+/// THE POLL PAST A QUOTA WALL THAT NAMES NO RESET: the retry's first byte came no sooner than
+/// [`QUOTA_POLL_S`] after the walled answer's headers were written (codex-alab could read its
+/// body, which says it is the quota's, only after them). How long after.
+/// # Errors
+/// A stamp missing or not finite, or a retry sooner.
+pub(super) fn quota_poll_kept(walled: &Taken, retry: &Taken) -> Result<f64, String> {
+    let Some(header) = walled.header_sent.filter(|h| h.is_finite()) else {
+        return Err("missing or invalid quota poll timing".into());
+    };
+    if !retry.arrived.is_finite() {
+        return Err("missing or invalid quota poll timing".into());
+    }
+    let poll = retry.arrived - header;
+    if poll < QUOTA_POLL_S as f64 {
+        return Err(format!(
+            "unknown account quota reset bypassed its polling backoff ({poll:.6}s after headers)"
+        ));
+    }
+    Ok(poll)
 }
 
 /// JSON equality with objects compared as key sets: a parsed object's keys come back in
@@ -433,16 +667,12 @@ fn user_texts(body: &J) -> Vec<String> {
 /// # Errors
 /// The first thing the case did not do, in `capacity_exec.py`'s words.
 pub(super) fn judge(
-    negative: bool,
+    case: Case,
     exit: Option<i32>,
     taken: &[Taken],
     events: &[J],
 ) -> Result<J, String> {
-    let name = if negative {
-        "permanent-refusal"
-    } else {
-        "capacity-recovery"
-    };
+    let name = case.name();
     let types: Vec<&str> = events
         .iter()
         .map(|e| e.get("type").and_then(J::as_str).unwrap_or(""))
@@ -469,7 +699,7 @@ pub(super) fn judge(
         }
     }
     let mut result = J::obj([
-        ("case", J::s(name)),
+        ("case", J::s(name.as_str())),
         ("exit", exit.map_or(J::Null, |c| J::Int(i64::from(c)))),
         (
             "requestCount",
@@ -477,20 +707,18 @@ pub(super) fn judge(
         ),
         ("events", J::Arr(types.iter().map(|t| J::s(*t)).collect())),
     ]);
-    if negative {
+    if case.refused() {
         if !exit.is_some_and(|c| c > 0) || taken.len() != 1 {
             return Err(format!(
-                "{name}: 403 was retried, signaled or reported success"
+                "{name}: the refusal was retried, signaled or reported success"
             ));
         }
         if count("turn.failed") != 1 || count("turn.completed") != 0 {
-            return Err(format!("{name}: 403 did not fail the native turn"));
+            return Err(format!("{name}: the refusal did not fail the native turn"));
         }
     } else {
         if exit != Some(0) || taken.len() != 3 {
-            return Err(format!(
-                "{name}: capacity did not recover in three requests"
-            ));
+            return Err(format!("{name}: did not recover in three requests"));
         }
         if count("turn.completed") != 1 || count("turn.failed") != 0 {
             return Err(format!("{name}: turn did not recover"));
@@ -567,6 +795,20 @@ pub(super) fn judge(
         }
         let delay = retry_after_delay(&taken[1], &taken[2]).map_err(|e| format!("{name}: {e}"))?;
         let emission = taken[1].header_sent.unwrap_or(0.0) - taken[1].header_started.unwrap_or(0.0);
+        match case {
+            Case::QuotaResetRecovery => {
+                let reset =
+                    quota_reset_kept(&taken[1], &taken[2]).map_err(|e| format!("{name}: {e}"))?;
+                result.set("quotaResetUnix", J::Int(reset));
+                result.set("retryUnix", J::Float(taken[2].arrived_unix));
+            }
+            Case::QuotaNoResetRecovery => {
+                let poll =
+                    quota_poll_kept(&taken[1], &taken[2]).map_err(|e| format!("{name}: {e}"))?;
+                result.set("pollDelaySeconds", J::Float(poll));
+            }
+            _ => {}
+        }
         result.set("retryDelaySeconds", J::Float(delay));
         result.set("retryHeaderEmissionSeconds", J::Float(emission));
         result.set(
@@ -645,57 +887,71 @@ fn fresh_environment(root: &Path) -> std::io::Result<Vec<(String, String)>> {
     .to_vec())
 }
 
-/// Run `exe args` under the jail `profile` in `root/work` with `env`, its stdout and stderr
-/// kept as `root/<label>-stdout.jsonl` and `root/<label>-stderr.txt` and its command as
-/// `root/<label>-command.json`, its process tree's sockets sampled into `witness` while it
-/// runs. Its exit (`None`: a signal or the hang bound).
-///
-/// THE RUN'S GROUP ENDS WITH IT: `exe` leads a process group of its own (`sandbox-exec` execs
-/// it in place), which [`end_with_group`] kills once `exe` exits, at the hang bound, or at an
-/// interrupt of the lab.
-/// # Errors
-/// [`Cut::Failed`]: its files could not be made, or it could not be spawned or reaped;
-/// [`Cut::Stopped`]: an interrupt ended it.
-fn jailed(
-    exe: &Path,
-    args: &[&str],
-    root: &Path,
-    env: &[(String, String)],
-    profile: &str,
-    label: &str,
-    witness: &Witness,
-) -> Result<Option<i32>, Cut> {
-    let mut command = vec![J::s(exe.to_string_lossy())];
-    command.extend(args.iter().map(|a| J::s(*a)));
-    crate::util::write_fresh(
-        &root.join(format!("{label}-command.json")),
-        format!("{}\n", J::Arr(command).dump(PY)),
-    )?;
-    let stdout = crate::util::create_stdio_file(&root.join(format!("{label}-stdout.jsonl")))?;
-    let stderr = crate::util::create_stdio_file(&root.join(format!("{label}-stderr.txt")))?;
-    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
-    cmd.arg("-p")
-        .arg(profile)
-        .arg(exe)
-        .args(args)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .current_dir(root.join("work"))
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    let mut child = cmd.spawn()?;
-    *witness
-        .root
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = i32::try_from(child.id()).ok();
-    let exit = end_with_group(&mut child, witness, RUN_LIMIT);
-    *witness
-        .root
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    exit
+/// A scratch jail's execution environment and socket witness.
+struct Jail<'a> {
+    root: &'a Path,
+    env: &'a [(String, String)],
+    profile: &'a str,
+    witness: &'a Witness,
+}
+
+impl Jail<'_> {
+    /// Run `exe args` under the jail `profile` in `root/work` with `env`, its stdout and stderr
+    /// kept as `root/<label>-stdout.jsonl` and `root/<label>-stderr.txt` and its command as
+    /// `root/<label>-command.json`, its process tree's sockets sampled into `witness` while it
+    /// runs, for at most `limit` (a hang bound). Its exit (`None`: a signal or the hang bound).
+    ///
+    /// THE RUN'S GROUP ENDS WITH IT: `exe` leads a process group of its own (`sandbox-exec` execs
+    /// it in place), which [`end_with_group`] kills once `exe` exits, at the hang bound, or at an
+    /// interrupt of the lab.
+    /// # Errors
+    /// [`Cut::Failed`]: its files could not be made, or it could not be spawned or reaped;
+    /// [`Cut::Stopped`]: an interrupt ended it.
+    fn run(
+        &self,
+        exe: &Path,
+        args: &[&str],
+        label: &str,
+        limit: Duration,
+    ) -> Result<Option<i32>, Cut> {
+        let Self {
+            root,
+            env,
+            profile,
+            witness,
+        } = *self;
+        let mut command = vec![J::s(exe.to_string_lossy())];
+        command.extend(args.iter().map(|a| J::s(*a)));
+        crate::util::write_fresh(
+            &root.join(format!("{label}-command.json")),
+            format!("{}\n", J::Arr(command).dump(PY)),
+        )?;
+        let stdout = crate::util::create_stdio_file(&root.join(format!("{label}-stdout.jsonl")))?;
+        let stderr = crate::util::create_stdio_file(&root.join(format!("{label}-stderr.txt")))?;
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+        cmd.arg("-p")
+            .arg(profile)
+            .arg(exe)
+            .args(args)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(root.join("work"))
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        let mut child = cmd.spawn()?;
+        *witness
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = i32::try_from(child.id()).ok();
+        let exit = end_with_group(&mut child, witness, limit);
+        *witness
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        exit
+    }
 }
 
 /// Wait for `child`, the leader of a process group of its own, for at most `limit` (a hang
@@ -799,21 +1055,18 @@ fn case_config(port: u16) -> String {
     )
 }
 
-/// Run one case in `out`; the checks it made, `(label, held)`.
+/// Run `case` in `out/<its name>`, its run bound by what it waits by design and [`RUN_LIMIT`]
+/// on top; the checks it made, `(label, held)`.
 /// # Errors
 /// An interrupt of the lab, which ended the case's run (its group killed) or came before it.
-fn case(
+fn run_case(
     exe: &Path,
     out: &Path,
-    negative: bool,
+    case: Case,
     profile_for: &dyn Fn(u16) -> Result<String, String>,
 ) -> Result<Vec<(String, bool)>, Stopped> {
     stop::check()?;
-    let name = if negative {
-        "permanent-refusal"
-    } else {
-        "capacity-recovery"
-    };
+    let name = case.name();
     let mut checks = Vec::new();
     let mut check = |label: String, held: bool| {
         println!(
@@ -822,7 +1075,7 @@ fn case(
         );
         checks.push((label, held));
     };
-    let root = out.join(name);
+    let root = out.join(&name);
     let laid = (|| -> Result<_, String> {
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let env = fresh_environment(&root).map_err(|e| e.to_string())?;
@@ -847,7 +1100,7 @@ fn case(
     };
     let witness = Arc::new(Witness::default());
     let model = Arc::new(Model {
-        negative,
+        case,
         clock: Instant::now(),
         taken: Mutex::new(Vec::new()),
         witness: Arc::clone(&witness),
@@ -864,7 +1117,13 @@ fn case(
     );
     stop::check()?;
     let work = root.join("work").to_string_lossy().into_owned();
-    let ran = jailed(
+    let ran = Jail {
+        root: &root,
+        env: &env,
+        profile: &profile,
+        witness: &witness,
+    }
+    .run(
         exe,
         &[
             "exec",
@@ -878,11 +1137,8 @@ fn case(
             "read-only",
             PROMPT,
         ],
-        &root,
-        &env,
-        &profile,
         "exec",
-        &witness,
+        RUN_LIMIT + case.waits(),
     );
     let exit = match ran {
         Ok(exit) => exit,
@@ -903,11 +1159,13 @@ fn case(
             .map(|t| {
                 J::obj([
                     ("arrivedAt", J::Float(t.arrived)),
+                    ("arrivedUnix", J::Float(t.arrived_unix)),
                     (
                         "headerStartedAt",
                         t.header_started.map_or(J::Null, J::Float),
                     ),
                     ("headerAt", t.header_sent.map_or(J::Null, J::Float)),
+                    ("resetsAt", t.resets_at.map_or(J::Null, J::Int)),
                     ("body", t.body.clone().unwrap_or(J::Null)),
                 ])
             })
@@ -944,28 +1202,32 @@ fn case(
         .lines()
         .filter_map(|l| J::parse(l).ok())
         .collect();
-    match judge(negative, exit, &taken, &events) {
+    match judge(case, exit, &taken, &events) {
         Ok(result) => {
             let _ = crate::util::write_fresh(
                 &root.join("result.json"),
                 format!("{}\n", result.dump(PY)),
             );
+            let secs = |key: &str| result.get(key).and_then(J::as_f64);
+            let mut timing = String::new();
+            if let Some(d) = secs("retryDelaySeconds") {
+                timing.push_str(&format!(", retried {d:.3}s after the headers"));
+            }
+            if let Some(d) = secs("pollDelaySeconds") {
+                timing.push_str(&format!(" (the poll {d:.3}s)"));
+            }
+            if let (Some(reset), Some(at)) = (
+                result.get("quotaResetUnix").and_then(J::as_i64),
+                secs("retryUnix"),
+            ) {
+                timing.push_str(&format!(", {:.3}s past the reset", at - reset as f64));
+            }
             check(
                 format!(
-                    "{} ({} request(s), exit {:?}{})",
-                    if negative {
-                        "a 403 is asked once, fails the turn and exits non-zero"
-                    } else {
-                        "one turn recovers from the capacity answer after Retry-After, the plan kept"
-                    },
+                    "{} ({} request(s), exit {:?}{timing})",
+                    case.promise(),
                     taken.len(),
                     exit,
-                    result
-                        .get("retryDelaySeconds")
-                        .and_then(J::as_f64)
-                        .map_or_else(String::new, |d| format!(
-                            ", retried {d:.3}s after the headers"
-                        ))
                 ),
                 true,
             );
@@ -975,7 +1237,7 @@ fn case(
     Ok(checks)
 }
 
-/// THE LANE: the package's records and CLI, then both cases, each under the jail
+/// THE LANE: the package's records and CLI, then every case ([`CASES`]), each under the jail
 /// `profile_for(port)` makes for its model's port, every output kept in `out`. The checks it
 /// made, `(label, held)`.
 /// # Errors
@@ -1023,26 +1285,16 @@ pub(super) fn lane(
         // No model here: a port nothing listens on.
         let profile = profile_for(9).map_err(Cut::Failed)?;
         let witness = Witness::default();
-        let help = jailed(
-            &exe,
-            &["exec", "--help"],
-            &cli,
-            &env,
-            &profile,
-            "help",
-            &witness,
-        )?;
+        let jail = Jail {
+            root: &cli,
+            env: &env,
+            profile: &profile,
+            witness: &witness,
+        };
+        let help = jail.run(&exe, &["exec", "--help"], "help", RUN_LIMIT)?;
         let text =
             crate::util::read_regular_text(&cli.join("help-stdout.jsonl")).unwrap_or_default();
-        let said = jailed(
-            &exe,
-            &["--version"],
-            &cli,
-            &env,
-            &profile,
-            "version",
-            &witness,
-        )?;
+        let said = jail.run(&exe, &["--version"], "version", RUN_LIMIT)?;
         let version_text =
             crate::util::read_regular_text(&cli.join("version-stdout.jsonl")).unwrap_or_default();
         Ok((
@@ -1073,8 +1325,8 @@ pub(super) fn lane(
         println!("  {} {label}", if held { "ok  " } else { "FAIL" });
         checks.push((label, held));
     }
-    for negative in [false, true] {
-        checks.extend(case(&exe, out, negative, profile_for)?);
+    for case in CASES {
+        checks.extend(run_case(&exe, out, case, profile_for)?);
     }
     Ok(checks)
 }
@@ -1084,6 +1336,9 @@ mod tests {
     use aterm_spec::wait::{MUST_HAPPEN, PARKED_SECS, until_within, within};
 
     use super::*;
+
+    /// The wall clock at a case's first request in these tests (seconds since the epoch).
+    const UNIX_AT: f64 = 1_800_000_000.25;
 
     fn request(input: Vec<J>) -> Option<J> {
         Some(J::obj([("model", J::s(MODEL)), ("input", J::Arr(input))]))
@@ -1117,21 +1372,27 @@ mod tests {
         vec![
             Taken {
                 arrived: 0.0,
+                arrived_unix: UNIX_AT,
                 body: request(vec![user()]),
                 header_started: Some(0.01),
                 header_sent: Some(0.011),
+                resets_at: None,
             },
             Taken {
                 arrived: 10.0,
+                arrived_unix: UNIX_AT + 10.0,
                 body: request(vec![user(), output()]),
                 header_started: Some(header_start),
                 header_sent: Some(header_at),
+                resets_at: None,
             },
             Taken {
                 arrived: retry_at,
+                arrived_unix: UNIX_AT + retry_at,
                 body: request(vec![user(), output()]),
                 header_started: None,
                 header_sent: None,
+                resets_at: None,
             },
         ]
     }
@@ -1164,7 +1425,7 @@ mod tests {
 
     fn recovered(header_start: f64, header_at: f64, retry_at: f64) -> Result<J, String> {
         judge(
-            false,
+            Case::CapacityRecovery,
             Some(0),
             &taken(header_start, header_at, retry_at),
             &events("agent_message", "item.completed"),
@@ -1213,7 +1474,7 @@ mod tests {
         let mut missing = taken(13.0, 13.001, 20.0);
         missing[1].header_sent = None;
         let refused = judge(
-            false,
+            Case::CapacityRecovery,
             Some(0),
             &missing,
             &events("agent_message", "item.completed"),
@@ -1229,13 +1490,21 @@ mod tests {
     #[test]
     fn the_verdict_holds_the_smokes_rows() {
         let good = events("agent_message", "item.completed");
-        assert!(judge(false, Some(0), &taken(13.0, 13.001, 15.001), &good).is_ok());
+        assert!(
+            judge(
+                Case::CapacityRecovery,
+                Some(0),
+                &taken(13.0, 13.001, 15.001),
+                &good
+            )
+            .is_ok()
+        );
         for (kind, event) in [
             ("reasoning", "item.completed"),
             ("agent_message", "item.started"),
         ] {
             let refused = judge(
-                false,
+                Case::CapacityRecovery,
                 Some(0),
                 &taken(13.0, 13.001, 15.001),
                 &events(kind, event),
@@ -1263,32 +1532,50 @@ mod tests {
         .iter()
         .map(|l| J::parse(l).unwrap())
         .collect();
-        assert!(judge(false, Some(0), &taken(13.0, 13.001, 15.001), &parsed).is_ok());
+        assert!(
+            judge(
+                Case::CapacityRecovery,
+                Some(0),
+                &taken(13.0, 13.001, 15.001),
+                &parsed
+            )
+            .is_ok()
+        );
         let mut twice = good.clone();
         twice.insert(3, good[2].clone());
         assert!(
-            judge(false, Some(0), &taken(13.0, 13.001, 15.001), &twice)
-                .unwrap_err()
-                .contains("executed more than once")
+            judge(
+                Case::CapacityRecovery,
+                Some(0),
+                &taken(13.0, 13.001, 15.001),
+                &twice
+            )
+            .unwrap_err()
+            .contains("executed more than once")
         );
         let mut changed = taken(13.0, 13.001, 15.001);
         changed[2].body = request(vec![user()]);
         assert!(
-            judge(false, Some(0), &changed, &good)
+            judge(Case::CapacityRecovery, Some(0), &changed, &good)
                 .unwrap_err()
                 .contains("retry changed")
         );
         let mut lost = taken(13.0, 13.001, 15.001);
         lost[0].body = request(Vec::new());
         assert!(
-            judge(false, Some(0), &lost, &good)
+            judge(Case::CapacityRecovery, Some(0), &lost, &good)
                 .unwrap_err()
                 .contains("lost or duplicated")
         );
         assert!(
-            judge(false, Some(1), &taken(13.0, 13.001, 15.001), &good)
-                .unwrap_err()
-                .contains("three requests")
+            judge(
+                Case::CapacityRecovery,
+                Some(1),
+                &taken(13.0, 13.001, 15.001),
+                &good
+            )
+            .unwrap_err()
+            .contains("three requests")
         );
 
         let refusal = vec![
@@ -1296,20 +1583,25 @@ mod tests {
             J::obj([("type", J::s("turn.failed"))]),
         ];
         let one = &taken(13.0, 13.001, 15.001)[..1];
-        let passed = judge(true, Some(1), one, &refusal).expect("a refusal");
+        let passed = judge(Case::PermanentRefusal, Some(1), one, &refusal).expect("a refusal");
         assert_eq!(passed.get("exit"), Some(&J::Int(1)));
         for exit in [None, Some(0)] {
             assert!(
-                judge(true, exit, one, &refusal)
+                judge(Case::PermanentRefusal, exit, one, &refusal)
                     .unwrap_err()
-                    .contains("403 was retried"),
+                    .contains("the refusal was retried"),
                 "{exit:?}"
             );
         }
         assert!(
-            judge(true, Some(1), &taken(13.0, 13.001, 15.001)[..2], &refusal)
-                .unwrap_err()
-                .contains("403 was retried")
+            judge(
+                Case::PermanentRefusal,
+                Some(1),
+                &taken(13.0, 13.001, 15.001)[..2],
+                &refusal
+            )
+            .unwrap_err()
+            .contains("the refusal was retried")
         );
     }
 
@@ -1325,11 +1617,19 @@ mod tests {
             ("input", J::Arr(vec![user(), output()])),
         ]));
         assert!(
-            judge(false, Some(0), &other, &good)
+            judge(Case::CapacityRecovery, Some(0), &other, &good)
                 .unwrap_err()
                 .contains("model changed")
         );
-        assert!(judge(false, Some(0), &taken(13.0, 13.001, 15.001), &good).is_ok());
+        assert!(
+            judge(
+                Case::CapacityRecovery,
+                Some(0),
+                &taken(13.0, 13.001, 15.001),
+                &good
+            )
+            .is_ok()
+        );
 
         let one = &taken(13.0, 13.001, 15.001)[..1];
         let turn = |t: &str| J::obj([("type", J::s(t))]);
@@ -1345,15 +1645,15 @@ mod tests {
             let mut refusal = vec![turn("turn.started")];
             refusal.extend(ends.into_iter().map(turn));
             assert!(
-                judge(true, Some(1), one, &refusal)
+                judge(Case::PermanentRefusal, Some(1), one, &refusal)
                     .unwrap_err()
-                    .contains("403 did not fail the native turn"),
+                    .contains("the refusal did not fail the native turn"),
                 "{said}"
             );
         }
         assert!(
             judge(
-                true,
+                Case::PermanentRefusal,
                 Some(1),
                 one,
                 &[turn("turn.started"), turn("turn.failed")]
@@ -1387,38 +1687,49 @@ mod tests {
                 ),
             ]);
             assert!(
-                judge(false, Some(0), &taken(13.0, 13.001, 15.001), &changed)
-                    .unwrap_err()
-                    .contains("plan changed"),
+                judge(
+                    Case::CapacityRecovery,
+                    Some(0),
+                    &taken(13.0, 13.001, 15.001),
+                    &changed
+                )
+                .unwrap_err()
+                .contains("plan changed"),
                 "{said}"
             );
         }
     }
 
-    /// The model's answers: the plan call, the overloaded answer with Retry-After, the reply,
-    /// then a refusal of any extra request; a negative case is refused with 403 every time.
+    /// The model's answers, as `capacity_exec.py`'s model gives them: the plan call, the
+    /// overloaded answer with Retry-After, the reply, then a refusal of any extra request; a
+    /// refused case meets its wall at every request.
     #[test]
     fn the_lanes_model_answers_as_the_smokes_did() {
-        let (status, kind, body, retry) = answer(false, 1);
-        assert_eq!((status, kind, retry), (200, "text/event-stream", None));
-        assert!(body.contains(CALL_ID) && body.contains("update_plan"));
-        assert_eq!(answer(false, 2).0, 503);
-        assert_eq!(answer(false, 2).3, Some(2));
-        assert!(answer(false, 2).2.contains("server_is_overloaded"));
-        assert!(answer(false, 3).2.contains(ANSWER));
-        assert_eq!(answer(false, 4).0, 400);
-        assert_eq!(answer(true, 1).0, 403);
-        assert_eq!(answer(true, 2).0, 403);
+        let first = answer(Case::CapacityRecovery, 1, UNIX_AT);
+        assert_eq!(
+            (first.status, first.content_type, first.retry_after),
+            (200, "text/event-stream", None)
+        );
+        assert!(first.body.contains(CALL_ID) && first.body.contains("update_plan"));
+        let wall = answer(Case::CapacityRecovery, 2, UNIX_AT);
+        assert_eq!((wall.status, wall.retry_after), (503, Some(2)));
+        assert!(wall.body.contains("server_is_overloaded"));
+        assert!(
+            answer(Case::CapacityRecovery, 3, UNIX_AT)
+                .body
+                .contains(ANSWER)
+        );
+        assert_eq!(answer(Case::CapacityRecovery, 4, UNIX_AT).status, 400);
+        assert_eq!(answer(Case::PermanentRefusal, 1, UNIX_AT).status, 403);
+        assert_eq!(answer(Case::PermanentRefusal, 2, UNIX_AT).status, 403);
     }
 
-    /// The model stamps each answer's headers on that answer, between its request's arrival
-    /// and its body, over a real loopback connection.
-    #[test]
-    fn the_model_stamps_each_answers_headers_before_its_body() {
+    /// The lane's model for `case` on a loopback port of its own: the model, and a connection to it.
+    fn model_on_loopback(case: Case) -> (Arc<Model>, TcpStream) {
         let listener = aterm_uds::kept_out(|| TcpListener::bind("127.0.0.1:0")).unwrap();
         let port = listener.local_addr().unwrap().port();
         let model = Arc::new(Model {
-            negative: false,
+            case,
             clock: Instant::now(),
             taken: Mutex::new(Vec::new()),
             witness: Arc::new(Witness::default()),
@@ -1427,32 +1738,49 @@ mod tests {
             let model = Arc::clone(&model);
             std::thread::spawn(move || serve(listener, model));
         }
-        let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
         conn.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+        (model, conn)
+    }
+
+    /// One request to the model on `conn`, as codex asks: its answer's head and body.
+    fn exchange(conn: &mut TcpStream) -> (String, String) {
         let body = J::obj([("model", J::s(MODEL))]).dump(PY);
-        for _ in 0..2 {
-            write!(
-                conn,
-                "POST /v1/responses HTTP/1.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            let mut r = std::io::BufReader::new(conn.try_clone().unwrap());
-            let mut head = String::new();
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                r.read_line(&mut line).unwrap();
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap();
-                }
-                head.push_str(&line);
-                if line == "\r\n" {
-                    break;
-                }
+        write!(
+            conn,
+            "POST /v1/responses HTTP/1.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut r = std::io::BufReader::new(conn.try_clone().unwrap());
+        let mut head = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line
+                .get(..15)
+                .is_some_and(|p| p.eq_ignore_ascii_case("content-length:"))
+            {
+                length = line[15..].trim().parse().unwrap();
             }
-            let mut rest = vec![0; length];
-            std::io::Read::read_exact(&mut r, &mut rest).unwrap();
+            head.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut rest = vec![0; length];
+        std::io::Read::read_exact(&mut r, &mut rest).unwrap();
+        (head, String::from_utf8(rest).unwrap())
+    }
+
+    /// The model stamps each answer's headers on that answer, between its request's arrival
+    /// and its body, over a real loopback connection.
+    #[test]
+    fn the_model_stamps_each_answers_headers_before_its_body() {
+        let (model, mut conn) = model_on_loopback(Case::CapacityRecovery);
+        for _ in 0..2 {
+            exchange(&mut conn);
         }
         let taken = model.taken.lock().unwrap().clone();
         assert_eq!(taken.len(), 2);
@@ -1462,7 +1790,313 @@ mod tests {
         }
     }
 
-    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.
+    /// EACH WALL AS THE MODEL WRITES IT, over a real loopback connection: a terminal quota case's
+    /// answer is a `429 Too Many Requests` with `Retry-After` and its
+    /// `x-codex-rate-limit-reached-type`, and its body names the reset the model records on that
+    /// request, stamped on the wall clock no later than the reset's base; a reset case's `429`
+    /// names its reset and no type; a capacity wall names neither. CONTROL: the plan's answer
+    /// carries no wall header.
+    #[test]
+    fn the_model_writes_each_walls_headers_and_records_the_reset_it_named() {
+        for (case, number) in [
+            (Case::QuotaTerminal(TERMINAL_KINDS[2]), 1),
+            (Case::QuotaResetRecovery, 2),
+            (Case::CapacityRecovery, 2),
+            (Case::QuotaResetRecovery, 1),
+        ] {
+            let (model, mut conn) = model_on_loopback(case);
+            let mut said = (String::new(), String::new());
+            for _ in 0..number {
+                said = exchange(&mut conn);
+            }
+            let (head, body) = said;
+            let taken = model.taken.lock().unwrap().clone();
+            let last = taken.last().expect("the request taken");
+            let named = J::parse(&body)
+                .ok()
+                .and_then(|j| j.get("error")?.get("resets_at")?.as_i64());
+            let label = format!("{case:?} request {number}: {head}{body}");
+            assert_eq!(last.resets_at, named, "{label}");
+            assert!(
+                last.arrived_unix.is_finite()
+                    && named.is_none_or(|reset| last.arrived_unix <= reset as f64),
+                "{label}"
+            );
+            let has = |line: &str| head.lines().any(|l| l.eq_ignore_ascii_case(line));
+            match (case, number) {
+                (Case::QuotaTerminal(kind), _) => {
+                    assert!(
+                        head.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+                        "{label}"
+                    );
+                    assert!(has("Retry-After: 2"), "{label}");
+                    assert!(
+                        has(&format!("x-codex-rate-limit-reached-type: {kind}")),
+                        "{label}"
+                    );
+                    assert!(named.is_some(), "{label}");
+                }
+                (Case::QuotaResetRecovery, 2) => {
+                    assert!(head.starts_with("HTTP/1.1 429 "), "{label}");
+                    assert!(has("Retry-After: 2"), "{label}");
+                    assert!(named.is_some(), "{label}");
+                    assert!(!head.contains("x-codex-rate-limit-reached-type"), "{label}");
+                }
+                (Case::CapacityRecovery, _) => {
+                    assert!(head.starts_with("HTTP/1.1 503 "), "{label}");
+                    assert!(has("Retry-After: 2"), "{label}");
+                    assert!(named.is_none(), "{label}");
+                    assert!(!head.contains("x-codex-rate-limit-reached-type"), "{label}");
+                }
+                _ => {
+                    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{label}");
+                    assert!(
+                        !head.to_ascii_lowercase().contains("retry-after"),
+                        "{label}"
+                    );
+                    assert!(!head.contains("x-codex-rate-limit-reached-type"), "{label}");
+                }
+            }
+        }
+    }
+
+    /// EACH QUOTA WALL AS `capacity_exec.py`'s MODEL ANSWERS IT: `usage_limit_reached`, with
+    /// `Retry-After: 2`; a reset case names the moment it was asked, rounded up to the second,
+    /// 2 s on, and no type; a no-reset case names no reset; a `403` case meets its wall at every
+    /// request, with or without its reset; a terminal case meets a `429` typed with its kind at
+    /// every request, naming its reset. The case table holds ten cases of distinct names, every
+    /// terminal kind once among them, and seven refusals.
+    #[test]
+    fn the_lanes_model_answers_each_quota_wall_as_the_smokes_did() {
+        let error = |a: &Answer| J::parse(&a.body).expect("JSON").get("error").cloned();
+        let reset_of = |a: &Answer| error(a).and_then(|e| e.get("resets_at")?.as_i64());
+        let typed = |a: &Answer| {
+            error(a)
+                .and_then(|e| e.get("type")?.as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+
+        let wall = answer(Case::QuotaResetRecovery, 2, UNIX_AT);
+        assert_eq!((wall.status, wall.retry_after), (429, Some(2)));
+        assert_eq!(typed(&wall), "usage_limit_reached");
+        assert_eq!(wall.resets_at, Some(1_800_000_003), "rounded up, 2 s on");
+        assert_eq!(reset_of(&wall), wall.resets_at, "the body names it");
+        assert_eq!(wall.reached_type, None);
+        let on_the_second = answer(Case::QuotaResetRecovery, 2, 1_800_000_000.0);
+        assert_eq!(on_the_second.resets_at, Some(1_800_000_002));
+        assert_eq!(answer(Case::QuotaResetRecovery, 1, UNIX_AT).status, 200);
+        assert!(
+            answer(Case::QuotaResetRecovery, 3, UNIX_AT)
+                .body
+                .contains(ANSWER)
+        );
+
+        let unnamed = answer(Case::QuotaNoResetRecovery, 2, UNIX_AT);
+        assert_eq!((unnamed.status, unnamed.retry_after), (429, Some(2)));
+        assert_eq!(typed(&unnamed), "usage_limit_reached");
+        assert_eq!((unnamed.resets_at, reset_of(&unnamed)), (None, None));
+        assert_eq!(answer(Case::QuotaNoResetRecovery, 3, UNIX_AT).status, 200);
+
+        for (case, reset) in [
+            (Case::QuotaPermanentRefusal, Some(1_800_000_003)),
+            (Case::QuotaNoResetRefusal, None),
+        ] {
+            for number in [1, 2] {
+                let a = answer(case, number, UNIX_AT);
+                assert_eq!((a.status, a.retry_after), (403, Some(2)), "{case:?}");
+                assert_eq!(typed(&a), "usage_limit_reached", "{case:?}");
+                assert_eq!((a.resets_at, reset_of(&a)), (reset, reset), "{case:?}");
+                assert_eq!(a.reached_type, None, "{case:?}");
+            }
+        }
+        for kind in TERMINAL_KINDS {
+            for number in [1, 2] {
+                let a = answer(Case::QuotaTerminal(kind), number, UNIX_AT);
+                assert_eq!((a.status, a.retry_after), (429, Some(2)), "{kind}");
+                assert_eq!(typed(&a), "usage_limit_reached", "{kind}");
+                assert_eq!(a.reached_type, Some(kind));
+                assert_eq!(reset_of(&a), Some(1_800_000_003), "{kind}: its reset");
+            }
+        }
+        for case in [Case::CapacityRecovery, Case::PermanentRefusal] {
+            let a = answer(case, 2, UNIX_AT);
+            assert_eq!((a.resets_at, a.reached_type), (None, None), "{case:?}");
+            assert!(a.body.contains("server_is_overloaded"), "{case:?}");
+        }
+
+        let names: std::collections::BTreeSet<String> = CASES.iter().map(|c| c.name()).collect();
+        assert_eq!(names.len(), CASES.len(), "{names:?}");
+        for kind in TERMINAL_KINDS {
+            assert_eq!(
+                CASES
+                    .iter()
+                    .filter(|c| **c == Case::QuotaTerminal(kind))
+                    .count(),
+                1,
+                "{kind}"
+            );
+        }
+        assert_eq!(CASES.iter().filter(|c| c.refused()).count(), 7);
+    }
+
+    /// The requests of a recovered quota case: the wall's headers at `13.0..13.001` on the
+    /// lane's clock, its answer naming `reset`, the retry's first byte at `retry_at` (lane clock)
+    /// and `retry_unix` (wall clock).
+    fn quota_taken(reset: Option<i64>, retry_at: f64, retry_unix: f64) -> Vec<Taken> {
+        let mut t = taken(13.0, 13.001, retry_at);
+        t[1].resets_at = reset;
+        t[2].arrived_unix = retry_unix;
+        t
+    }
+
+    fn judged(case: Case, t: &[Taken]) -> Result<J, String> {
+        judge(case, Some(0), t, &events("agent_message", "item.completed"))
+    }
+
+    /// THE QUOTA'S RESET (`capacity_exec.py --quota`): a reset case's retry on the wall clock at
+    /// or past the reset its wall named passes, and records both; one before it fails though
+    /// `Retry-After` was kept, and so does a wall that named none, or a retry stamp that is not
+    /// finite. CONTROL: a capacity case of the same requests passes, the reset not its row.
+    #[test]
+    fn the_quota_verdict_holds_the_reset() {
+        const RESET: i64 = 1_800_000_016;
+        let reset = RESET as f64;
+        let kept = judged(
+            Case::QuotaResetRecovery,
+            &quota_taken(Some(RESET), 16.0, reset + 0.001),
+        )
+        .expect("a retry past the reset");
+        assert_eq!(kept.get("quotaResetUnix"), Some(&J::Int(RESET)));
+        assert_eq!(
+            kept.get("retryUnix").and_then(J::as_f64),
+            Some(reset + 0.001)
+        );
+        assert!(
+            judged(
+                Case::QuotaResetRecovery,
+                &quota_taken(Some(RESET), 16.0, reset)
+            )
+            .is_ok(),
+            "exactly at the reset"
+        );
+        let early = quota_taken(Some(RESET), 16.0, reset - 0.5);
+        let refused = judged(Case::QuotaResetRecovery, &early).unwrap_err();
+        assert!(refused.contains("retried before its reset"), "{refused}");
+        assert!(judged(Case::CapacityRecovery, &early).is_ok(), "control");
+        let refused = judged(
+            Case::QuotaResetRecovery,
+            &quota_taken(None, 16.0, reset + 1.0),
+        )
+        .unwrap_err();
+        assert!(refused.contains("named no reset"), "{refused}");
+        for unix in [f64::NAN, f64::INFINITY] {
+            let refused = judged(
+                Case::QuotaResetRecovery,
+                &quota_taken(Some(RESET), 16.0, unix),
+            )
+            .unwrap_err();
+            assert!(refused.contains("missing or invalid"), "{unix}: {refused}");
+        }
+    }
+
+    /// THE POLL PAST A QUOTA WALL WITH NO RESET (`capacity_exec.py --quota-no-reset`): a retry 30 s
+    /// or more after the wall's headers were written passes, and records the poll; one sooner
+    /// fails though `Retry-After` was kept, and so do missing or non-finite stamps. CONTROL: a
+    /// capacity case of the same requests passes, the poll not its row.
+    #[test]
+    fn the_quota_verdict_holds_the_poll() {
+        let polled = judged(
+            Case::QuotaNoResetRecovery,
+            &quota_taken(None, 43.001, UNIX_AT + 43.001),
+        )
+        .expect("a poll 30 s on");
+        let poll = polled.get("pollDelaySeconds").and_then(J::as_f64).unwrap();
+        assert!((poll - 30.0).abs() < 1e-9, "{poll}");
+        for retry_at in [15.001, 43.0] {
+            let soon = quota_taken(None, retry_at, UNIX_AT + retry_at);
+            let refused = judged(Case::QuotaNoResetRecovery, &soon).unwrap_err();
+            assert!(
+                refused.contains("bypassed its polling backoff"),
+                "{retry_at}: {refused}"
+            );
+            assert!(judged(Case::CapacityRecovery, &soon).is_ok(), "control");
+        }
+        let mut unstamped = quota_taken(None, 50.0, UNIX_AT + 50.0);
+        unstamped[1].header_sent = None;
+        assert!(
+            quota_poll_kept(&unstamped[1], &unstamped[2])
+                .unwrap_err()
+                .contains("missing or invalid")
+        );
+        for at in [f64::NAN, f64::INFINITY] {
+            let mut t = quota_taken(None, 50.0, UNIX_AT + 50.0);
+            t[2].arrived = at;
+            assert!(
+                quota_poll_kept(&t[1], &t[2])
+                    .unwrap_err()
+                    .contains("missing or invalid"),
+                "{at}"
+            );
+        }
+    }
+
+    /// EVERY REFUSAL'S ROWS AND EVERY RECOVERY'S, case by case: a refused case passes with one
+    /// request, one failed turn and a non-zero exit, and fails retried, signaled, exiting 0, or
+    /// with its turn completed or never failed; a recovering case fails a non-zero exit or a
+    /// request short. CONTROL: each recovering case passes the rows its wall does not add.
+    #[test]
+    fn every_case_holds_its_refusal_or_recovery_rows() {
+        let turn = |t: &str| J::obj([("type", J::s(t))]);
+        let failed = [turn("turn.started"), turn("turn.failed")];
+        let ok = taken(13.0, 13.001, 15.001);
+        for case in CASES.into_iter().filter(|c| c.refused()) {
+            let one = &ok[..1];
+            let passed = judge(case, Some(1), one, &failed).expect("a refusal");
+            assert_eq!(passed.get("case"), Some(&J::s(case.name())));
+            for exit in [None, Some(0)] {
+                assert!(
+                    judge(case, exit, one, &failed)
+                        .unwrap_err()
+                        .contains("the refusal was retried"),
+                    "{case:?} {exit:?}"
+                );
+            }
+            assert!(
+                judge(case, Some(1), &ok[..2], &failed)
+                    .unwrap_err()
+                    .contains("the refusal was retried"),
+                "{case:?}"
+            );
+            for ends in [vec!["turn.completed"], Vec::new()] {
+                let mut events = vec![turn("turn.started")];
+                events.extend(ends.into_iter().map(turn));
+                assert!(
+                    judge(case, Some(1), one, &events)
+                        .unwrap_err()
+                        .contains("the refusal did not fail the native turn"),
+                    "{case:?}"
+                );
+            }
+        }
+        let good = events("agent_message", "item.completed");
+        for case in CASES.into_iter().filter(|c| !c.refused()) {
+            assert!(
+                judge(case, Some(1), &ok, &good)
+                    .unwrap_err()
+                    .contains("did not recover in three requests"),
+                "{case:?}"
+            );
+            assert!(
+                judge(case, Some(0), &ok[..2], &good)
+                    .unwrap_err()
+                    .contains("did not recover in three requests"),
+                "{case:?}"
+            );
+        }
+        assert!(judge(Case::CapacityRecovery, Some(0), &ok, &good).is_ok());
+    }
+
+    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.
     fn left(root: &Path) -> i32 {
         crate::util::read_regular_text(&root.join("left.pid"))
             .expect("the run wrote its sleep's pid")
@@ -1511,7 +2145,7 @@ mod tests {
     }
 
     /// THE RUN'S GROUP ENDS WITH IT: a `sleep` a run left in its group is killed once the run
-    /// exits (through [`jailed`] itself: `sandbox-exec`, a profile that fences nothing), and
+    /// exits (through [`Jail::run`] itself: `sandbox-exec`, a profile that fences nothing), and
     /// once a run that waits on it reaches its bound (through [`end_with_group`], called with
     /// the bound already past once the `sleep` has started), which reads as no exit. CONTROL:
     /// with only the leader killed at the bound, as before, the `sleep` outlives the run in
@@ -1523,14 +2157,18 @@ mod tests {
         let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
         let root = tmp.path();
         let env = fresh_environment(root).expect("the run's scratch");
-        let ran = jailed(
+        let witness = Witness::default();
+        let ran = Jail {
+            root,
+            env: &env,
+            profile: "(version 1)(allow default)",
+            witness: &witness,
+        }
+        .run(
             Path::new("/bin/sh"),
             &["-c", &format!("{sleep} & echo $! > ../left.pid")],
-            root,
-            &env,
-            "(version 1)(allow default)",
             "group",
-            &Witness::default(),
+            RUN_LIMIT,
         )
         .expect("the run starts");
         assert_eq!(ran, Some(0), "the run's own exit");
@@ -1731,7 +2369,9 @@ mod tests {
         let open = format!("{jail}(allow network-outbound (remote ip \"localhost:*\"))");
         let (canary, _) = listen();
         assert!(!jail_holds(&open, port, &canary), "a jail open to loopback");
-        assert!(canary_touched(&canary), "the open jail's probe reached it");
+        until_within(MUST_HAPPEN, "the open jail's probe reached it", || {
+            canary_touched(&canary).then_some(())
+        });
         let (canary, _) = listen();
         assert!(
             !jail_holds("(version 1)(allow default)(deny network*)", port, &canary),
@@ -1742,7 +2382,11 @@ mod tests {
         assert!(!canary_touched(&canary));
         let _conn = aterm_uds::kept_out(|| TcpStream::connect(("127.0.0.1", canary_port)))
             .expect("a connection");
-        assert!(canary_touched(&canary), "a connection to it");
+        // A loopback connect can return before the listener's queue holds the connection: the
+        // accept that finds it is waited for, as a hang detector.
+        until_within(MUST_HAPPEN, "a connection to it", || {
+            canary_touched(&canary).then_some(())
+        });
     }
 
     /// THE CLI CHECKS (review F1): `exec --help` holds only on exit 0 with every flag the cases
@@ -1817,7 +2461,7 @@ mod tests {
         let none: Vec<J> = good[1..].to_vec();
         for (said, events) in [("two", &two), ("none", &none)] {
             assert!(
-                judge(false, Some(0), &ok, events)
+                judge(Case::CapacityRecovery, Some(0), &ok, events)
                     .unwrap_err()
                     .contains("expected one native turn"),
                 "{said}"
@@ -1829,7 +2473,7 @@ mod tests {
             turn("turn.failed"),
         ];
         assert!(
-            judge(true, Some(1), &ok[..1], &refusal)
+            judge(Case::PermanentRefusal, Some(1), &ok[..1], &refusal)
                 .unwrap_err()
                 .contains("expected one native turn")
         );
@@ -1846,7 +2490,7 @@ mod tests {
             ("completed twice", &twice),
         ] {
             assert!(
-                judge(false, Some(0), &ok, events)
+                judge(Case::CapacityRecovery, Some(0), &ok, events)
                     .unwrap_err()
                     .contains("turn did not recover"),
                 "{said}"
@@ -1872,7 +2516,7 @@ mod tests {
             ("kept twice", vec![output(), output()]),
         ] {
             assert!(
-                judge(false, Some(0), &with(outputs), &good)
+                judge(Case::CapacityRecovery, Some(0), &with(outputs), &good)
                     .unwrap_err()
                     .contains("completed tool output lost"),
                 "{said}"
@@ -1892,7 +2536,7 @@ mod tests {
             J::obj([("ok", J::Bool(false))]),
         ] {
             assert!(
-                judge(false, Some(0), &said(out.clone()), &good)
+                judge(Case::CapacityRecovery, Some(0), &said(out.clone()), &good)
                     .unwrap_err()
                     .contains("plan tool did not complete"),
                 "{out:?}"
@@ -1900,7 +2544,7 @@ mod tests {
         }
         assert!(
             judge(
-                false,
+                Case::CapacityRecovery,
                 Some(0),
                 &said(J::obj([("content", J::s("Plan updated"))])),
                 &good
@@ -1912,13 +2556,20 @@ mod tests {
     const STOP_PROBE: &str = "ATERM_LAB_CAPACITY_STOP_PROBE";
     const STOP_DIR: &str = "ATERM_LAB_CAPACITY_STOP_DIR";
 
+    /// An act of the lab's registered before the run's ([`stop::at_hard_exit`]).
+    fn act_registered_before() {
+        let _ = crate::sys::write_all(1, b"PROBE the act registered before the run's ran\n");
+    }
+
     /// AN INTERRUPT OF THE LAB ENDS THE RUN GOING AND WHAT IT LEFT IN ITS GROUP (review F4), each
     /// probed in a copy of this test binary, since an interrupt is the whole process's: a first
     /// ([`stop::note`], as the handler [`stop::install`] sets notes one) ends the wait at once
     /// with [`Cut::Stopped`], its bound a minute off, the `sleep` the run left killed; a second
-    /// real `SIGINT`, which ends the lab at once (128 + 2), kills the held group first.
-    /// CONTROL: with the wait a plain sleep, the first runs to its bound and reads as no exit;
-    /// with no act at a second interrupt, the `sleep` outlives the lab.
+    /// real `SIGINT`, which ends the lab at once (128 + 2), kills the held group first, and runs
+    /// the act the lab registered before the run's too. CONTROL: with the wait a plain sleep, the
+    /// first runs to its bound and reads as no exit; with no act at a second interrupt, the
+    /// `sleep` outlives the lab; with the run's act replacing the one before it, as
+    /// `stop::at_hard_exit` held one, that act never runs.
     #[test]
     fn an_interrupt_ends_the_run_and_what_it_left_in_its_group() {
         const TEST: &str = "codex_alab_proof::capacity_proof::tests::an_interrupt_ends_the_run_and_what_it_left_in_its_group";
@@ -1937,6 +2588,7 @@ mod tests {
             }
             crate::sys::start_signal(libc::SIGINT, false);
             stop::install();
+            stop::at_hard_exit(act_registered_before);
             hold(i32::try_from(child.id()).ok());
             let me = i32::try_from(std::process::id()).expect("pid");
             crate::sys::kill(me, libc::SIGINT).expect("the first interrupt");
@@ -1952,7 +2604,11 @@ mod tests {
         }
         for (mode, code, said) in [
             ("first", 0, "PROBE the first interrupt ended the run"),
-            ("second", 128 + libc::SIGINT, ""),
+            (
+                "second",
+                128 + libc::SIGINT,
+                "PROBE the act registered before the run's ran",
+            ),
         ] {
             let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
             let mut cmd =

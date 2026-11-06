@@ -283,7 +283,7 @@ pub(crate) fn placements(view: &LabView, places: &Places) -> Placements {
 /// `view` as the harness reads it, each address the lab places in a mailbox `logins` names
 /// given that mailbox's login ([`Lab::mailboxes`]).
 pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<String, String>) -> Lab {
-    let mut accounts = Vec::new();
+    let mut accounts = Vec::with_capacity(view.accounts.len());
     for account in view.accounts.values() {
         let (Some(realm), Some(label), Some(email)) =
             (account.realm.as_deref(), &account.label, &account.login)

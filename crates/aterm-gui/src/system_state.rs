@@ -2497,6 +2497,9 @@ pub(crate) struct Headline {
     /// It says the Mac is set up (§3.2: nothing differs in a managed group), which `setup=`
     /// reads as done ([`crate::system_state_access::setup_field`]).
     pub(crate) set_up: bool,
+    /// The readable plan manages no rows. This is the person's explicit opt-out, rather than
+    /// evidence that the Mac's settings were applied.
+    pub(crate) left_as_is: bool,
 }
 
 impl Headline {
@@ -2509,6 +2512,7 @@ impl Headline {
             go_to_tab: false,
             check: false,
             set_up: false,
+            left_as_is: false,
         }
     }
 
@@ -2768,7 +2772,10 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if managed == 0 {
         // Every group left as is, by the person or by a Cancel an older aterm recorded (§3.3):
         // each turns back on by its own switch, so nothing more is offered here.
-        return Headline::line(EVERYTHING_LEFT_AS_IS);
+        return Headline {
+            left_as_is: true,
+            ..Headline::line(EVERYTHING_LEFT_AS_IS)
+        };
     }
     // A reading that ended without an answer (its reader unwound) says so in
     // its note: no check is under way for it, so the headline names it and
@@ -4666,7 +4673,7 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_T
 /// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const FIXTURES: [&str; 66] = [
+pub(crate) const FIXTURES: [&str; 67] = [
     "checking",
     "account-provisioning",
     "plan-unread",
@@ -4687,6 +4694,7 @@ pub(crate) const FIXTURES: [&str; 66] = [
     "widen-stopped",
     "failed",
     "github-sign-in",
+    "required-dependencies@developer",
     "named-result-failed",
     "named-results-failed",
     "restore-at-login",
@@ -5160,6 +5168,18 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 status: "error".into(),
                 detail: GITHUB_UNREACHED.into(),
             }];
+        }
+        "required-dependencies" => {
+            // The parent checkout exists and credentials are ready, but selected dependency
+            // work is preserved at another pin. Neither the count nor the line is complete.
+            let mut repositories = setting(Setting::Repositories, NeedsYou, Some("0 of 1"));
+            repositories.wanted = "All 1".to_owned();
+            repositories.detail = Some(
+                "~/project/vendor/library is on its own branch at another commit; its work \
+                 stays untouched. The required dependency keeps this repository unfinished."
+                    .to_owned(),
+            );
+            status.observed = with(in_place(), vec![repositories]);
         }
         "github-sign-in" => {
             // GitHub refuses the token the vault syncs, as `init_observe` reads the

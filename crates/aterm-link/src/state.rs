@@ -695,6 +695,10 @@ pub struct StateDir {
     adopts_legacy: bool,
     unflushed: std::sync::Mutex<std::collections::BTreeSet<String>>,
     logpin_fence: std::sync::Mutex<Option<std::fs::File>>,
+    /// The pin [`StateDir::order_logpin`] wrote by barriers, held open, while its broker's settle
+    /// is owed (critic item F07): [`StateDir::logpin_settled`] makes it the fence. Locked after
+    /// `logpin_fence`, never before.
+    logpin_ordered: std::sync::Mutex<Option<std::fs::File>>,
     run_fence: std::sync::Mutex<Option<std::fs::File>>,
     undurable: std::sync::Mutex<std::collections::BTreeSet<String>>,
     floor_admitted: std::sync::atomic::AtomicBool,
@@ -1068,11 +1072,21 @@ impl InFlight {
 pub(crate) struct AckedLog {
     /// Every offset the file holds whole.
     pub offsets: std::collections::BTreeSet<u64>,
-    /// How many entries the file holds, repeats included.
+    /// The forged-self window's floor the file names, its `floor=<n>` entry (critic item F17's
+    /// review): the lowest offset the window accuses, kept apart from the offsets it holds.
+    /// Every file this build writes names one (each replace, and the first append into a file
+    /// that names none); `None` for no file, or for one an older build wrote, whose reader took
+    /// the oldest offset it holds for the floor.
+    pub floor: Option<u64>,
+    /// How many offset entries the file holds, repeats included.
     pub entries: usize,
     /// Whether the file ends at a terminator (or is absent), so an append may go on after its last byte.
     pub appendable: bool,
 }
+
+/// The prefix of the `acked` log's floor entry ([`AckedLog::floor`]): no offset, so a build
+/// before it reads past it, as it reads past every piece that is not one.
+const ACKED_FLOOR: &str = "floor=";
 
 impl AckedLog {
     fn parse(text: &str) -> Self {
@@ -1083,6 +1097,12 @@ impl AckedLog {
         let mut pieces: Vec<&str> = text.split(',').collect();
         let tail = pieces.pop().unwrap_or_default();
         for piece in pieces {
+            if let Some(floor) = piece.trim().strip_prefix(ACKED_FLOOR) {
+                if let Some(floor) = crate::parse_uint::<u64>(floor) {
+                    log.floor = Some(log.floor.map_or(floor, |had| had.max(floor)));
+                }
+                continue;
+            }
             log.entries += 1;
             if let Some(off) = crate::parse_uint(piece.trim()) {
                 log.offsets.insert(off);
@@ -1097,8 +1117,14 @@ impl AckedLog {
         log
     }
 
-    fn render(offsets: impl Iterator<Item = u64>) -> String {
+    /// `offsets`, each ended by its comma, after the floor entry where `floor` names one.
+    fn render(floor: Option<u64>, offsets: impl Iterator<Item = u64>) -> String {
         let mut text = String::new();
+        if let Some(floor) = floor {
+            text.push_str(ACKED_FLOOR);
+            text.push_str(&floor.to_string());
+            text.push(',');
+        }
         for off in offsets {
             text.push_str(&off.to_string());
             text.push(',');
@@ -1551,6 +1577,7 @@ impl StateDir {
             adopts_legacy,
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
+            logpin_ordered: std::sync::Mutex::default(),
             run_fence: std::sync::Mutex::default(),
             undurable: std::sync::Mutex::default(),
             floor_admitted: std::sync::atomic::AtomicBool::new(false),
@@ -1933,13 +1960,93 @@ impl StateDir {
         self.replace_logpin(text, &mut known, durable)
     }
 
-    /// Establish the current pin's v=2 fence before a copy, take or send.
+    /// Establish the current pin's v=2 fence before a copy, take or send, by two full flushes of
+    /// the bridge's own: where no broker's flush settles the state dir's device
+    /// ([`StateDir::order_logpin`], critic item F07).
     pub(crate) fn ensure_logpin_durable(&self, text: impl FnOnce() -> String) -> io::Result<()> {
         let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
         if self.logpin_fence_known(&mut known) {
             return Ok(());
         }
         self.replace_logpin(&text(), &mut known, true)
+    }
+
+    /// THE PIN'S FENCE BY BARRIERS, FOR A BROKER'S FULL FLUSH TO SETTLE (critic item F07): `logpin`
+    /// replaced with its temp's bytes ordered by a barrier ahead of the rename, then a barrier of
+    /// the state dir over the rename, and no full flush of the bridge's own. Apple's fcntl(2):
+    /// `F_BARRIERFSYNC` "does the same thing as fsync(2) then issues a barrier command to the
+    /// drive", and `F_FULLFSYNC` "drains the entire queue of the device and acts as a barrier,
+    /// data that had been fsync'd on the same device before is guaranteed to be persisted when
+    /// this call returns". So a full flush of any file of this device issued after this returns
+    /// puts the pin and its entry on the media. The caller asks its broker for one (astream's
+    /// `Client::send_settle`) only where the broker's `Hello` names the state dir's device
+    /// ([`StateDir::device`]) and says its flush drains it, and holds the fence only once the
+    /// broker answered it ([`StateDir::logpin_settled`]); a pin ordered here is no fence before.
+    ///
+    /// Answers whether this open holds the fence already, so that nothing waits on a settle. A
+    /// pin this ordered that the name still holds is not written again: its barriers returned.
+    ///
+    /// # Errors
+    /// The replace's, or the directory barrier's other than one the file system cannot make
+    /// (`astream_sys::dir_flush_unavailable`, as a durable replace takes it).
+    pub(crate) fn order_logpin(&self, text: impl FnOnce() -> String) -> io::Result<bool> {
+        use aterm_durable::Flush;
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        if self.logpin_fence_known(&mut known) {
+            return Ok(true);
+        }
+        let mut ordered = self
+            .logpin_ordered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ordered
+            .as_ref()
+            .is_some_and(|held| self.names_this_builds_pin(held))
+        {
+            return Ok(false);
+        }
+        let previous = ordered.take();
+        let text = text();
+        let _fence = self.timed(crate::wait_tally::Row::LogpinFence);
+        self.replace_bytes_as(LOGPIN, text.as_bytes(), Some(Flush::Ordered), 0o600)?;
+        self.flush_dir_with(&self.root, Flush::Ordered, tolerate_dir_flush)?;
+        if crate::mirror::Pin::by_this_build(text.as_bytes()) {
+            *ordered = self.retained_logpin();
+        }
+        drop(previous);
+        Ok(false)
+    }
+
+    /// THE BROKER SETTLED THE PIN (critic item F07): its answer to a settle sent after
+    /// [`StateDir::order_logpin`] returned, so its full flush, issued after the broker read the
+    /// request, drained the device after the pin's barriers and put the pin on the media whole.
+    /// Where the name still holds that pin, it is this open's fence. Answers whether this open
+    /// holds the fence now.
+    pub(crate) fn logpin_settled(&self) -> bool {
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ordered = self
+            .logpin_ordered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let held = ordered.take();
+        if self.logpin_fence_known(&mut known) {
+            return true;
+        }
+        match held {
+            Some(held) if self.names_this_builds_pin(&held) => {
+                *known = Some(held);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The device the state dir is on (`st_dev`), which holds every file the pin's fence
+    /// writes, to compare with the one its broker's `Hello` names (critic item F07, astream's
+    /// `LogDevice::settles`).
+    pub(crate) fn device(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(&self.root).ok().map(|meta| meta.dev())
     }
 
     /// Whether this open holds the current pin's v=2 fence, so the next
@@ -1953,24 +2060,29 @@ impl StateDir {
     }
 
     fn logpin_fence_known(&self, known: &mut Option<std::fs::File>) -> bool {
-        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
-        let matches = known.as_ref().is_some_and(|held| {
-            let Ok(meta) = held.metadata() else {
-                return false;
-            };
-            let mut head = [0u8; crate::mirror::PIN_HEADER.len() + 1];
-            meta.is_file()
-                && Some((meta.dev(), meta.ino())) == self.logpin_identity()
-                && held
-                    .read_at(&mut head, 0)
-                    .ok()
-                    .is_some_and(|n| crate::mirror::Pin::by_this_build(&head[..n]))
-        });
-        if matches {
+        if known
+            .as_ref()
+            .is_some_and(|held| self.names_this_builds_pin(held))
+        {
             return true;
         }
         *known = None;
         false
+    }
+
+    /// Whether `held` is the file `logpin` names now, and begins as a pin of this build.
+    fn names_this_builds_pin(&self, held: &std::fs::File) -> bool {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+        let Ok(meta) = held.metadata() else {
+            return false;
+        };
+        let mut head = [0u8; crate::mirror::PIN_HEADER.len() + 1];
+        meta.is_file()
+            && Some((meta.dev(), meta.ino())) == self.logpin_identity()
+            && held
+                .read_at(&mut head, 0)
+                .ok()
+                .is_some_and(|n| crate::mirror::Pin::by_this_build(&head[..n]))
     }
 
     fn logpin_identity(&self) -> Option<(u64, u64)> {
@@ -2001,6 +2113,13 @@ impl StateDir {
         if crate::mirror::Pin::by_this_build(text.as_bytes()) {
             *known = self.retained_logpin();
         }
+        // A pin ordered for a settle is replaced: no settle makes it a fence.
+        drop(
+            self.logpin_ordered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         drop(previous);
         Ok(())
     }
@@ -3564,6 +3683,37 @@ impl StateDir {
         Ok((id, aside))
     }
 
+    /// Record `id`, which this Mac's node key names with the mesh on (§11 C3), as this dir's node,
+    /// durably, and answer the node it recorded before when that was another: the key rotated, or
+    /// this dir last served before the mesh. A `node` file that held anything but a node id is kept
+    /// aside first, as [`StateDir::provision_node`] keeps it.
+    ///
+    /// # Errors
+    /// The file cannot be kept aside, written or synced.
+    pub fn name_node(&self, id: &str) -> io::Result<Option<String>> {
+        let held = self.node();
+        if held.as_deref() == Some(id) {
+            return Ok(None);
+        }
+        let path = self.path("node");
+        let aside = match std::fs::symlink_metadata(&path) {
+            Ok(meta)
+                if meta.len() > 0 && !held.as_deref().is_some_and(crate::enable::is_node_id) =>
+            {
+                Some(keep_aside(&path)?)
+            }
+            _ => None,
+        };
+        if let Err(e) = self.write_durable("node", id) {
+            if let Some(aside) = &aside {
+                take_back_aside(&path, aside);
+            }
+            return Err(e);
+        }
+        sync_dir(self.root.parent().unwrap_or(Path::new("")))?;
+        Ok(held.filter(|old| crate::enable::is_node_id(old)))
+    }
+
     /// The node id this dir records, if it records one.
     #[must_use]
     pub fn node(&self) -> Option<String> {
@@ -3800,12 +3950,14 @@ impl StateDir {
         }
     }
 
-    /// Replace the acked self-lane set with the newest `keep` of `set`. The descriptor the appends
-    /// held goes first, under its lock, so no append lands in the file the rename unlinks: the
-    /// next one opens the file this puts at the name.
+    /// Replace the acked self-lane set with the newest `keep` of `set`, under the window floor
+    /// `floor` ([`AckedLog::floor`]), raised to the oldest kept where `keep` drops any. The
+    /// descriptor the appends held goes first, under its lock, so no append lands in the file
+    /// the rename unlinks: the next one opens the file this puts at the name.
     pub fn set_self_acked(
         &self,
         set: &std::collections::BTreeSet<u64>,
+        floor: u64,
         keep: usize,
     ) -> io::Result<()> {
         let mut held = self.acked.lock().unwrap_or_else(|e| e.into_inner());
@@ -3819,9 +3971,14 @@ impl StateDir {
             *held = None;
         }
         let over = set.len().saturating_sub(keep);
+        let kept = set.iter().skip(over).copied();
+        let floor = match set.iter().nth(over) {
+            Some(&oldest) if over > 0 => floor.max(oldest),
+            _ => floor,
+        };
         self.replace_bytes(
             "acked",
-            AckedLog::render(set.iter().skip(over).copied()).as_bytes(),
+            AckedLog::render(Some(floor), kept).as_bytes(),
             false,
             STATE_FILE_MODE,
         )
@@ -3832,12 +3989,14 @@ impl StateDir {
     /// (critic item E07). It is opened at the first append, after a
     /// replace ([`StateDir::set_self_acked`]) and after an append whose write failed (refused
     /// before it was made, made and failed, or cut short), and refused there unless it is an
-    /// owned regular single-link file ([`StateDir::open_for_appends`]).
-    pub(crate) fn append_self_acked(&self, offs: &[u64]) -> io::Result<()> {
+    /// owned regular single-link file ([`StateDir::open_for_appends`]). `floor`, where it names
+    /// one, goes ahead of them: the window floor of a file that names none and holds no offset
+    /// ([`AckedLog::floor`]).
+    pub(crate) fn append_self_acked(&self, floor: Option<u64>, offs: &[u64]) -> io::Result<()> {
         let _call = self.timed(crate::wait_tally::Row::AppendSelfAcked);
         self.count(|ops| ops.appends += 1);
         let path = self.path("acked");
-        let line = AckedLog::render(offs.iter().copied());
+        let line = AckedLog::render(floor, offs.iter().copied());
         let w = crate::fx::Write::Append {
             path: &path,
             bytes: line.as_bytes(),
@@ -5252,7 +5411,10 @@ impl StateDir {
         for (sid, id, pin) in post_resets {
             self.set_post_pin(&sid, id, &pin)?;
         }
-        self.set_self_acked(&head.checked_sub(1).into_iter().collect(), 1)?;
+        // The forged-self window starts again at this log's head: empty, its floor the head, so
+        // no record below the head is accused, and none above it is vouched for until it lands
+        // (`Bridge::remember_self_acks`).
+        self.set_self_acked(&std::collections::BTreeSet::new(), head, 1)?;
         self.clear_halt_acked()?;
         if !owed.is_some_and(kept) {
             self.clear_inbox_owed()?;
@@ -6071,9 +6233,9 @@ mod tests {
         st.set_seen_off("s-x", 9).expect("seen");
         st.set_halt_acked(4).expect("halt-acked");
         st.set_inbox_owed(5).expect("inbox-owed");
-        st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 8)
+        st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 0, 8)
             .expect("acked");
-        st.append_self_acked(&[3]).expect("acked, appended");
+        st.append_self_acked(None, &[3]).expect("acked, appended");
         st.raise_logfloor(11).expect("logfloor");
         let mut seen = Vec::new();
         let mut stack = vec![dir.clone()];
@@ -6172,7 +6334,7 @@ mod tests {
         let mut set = std::collections::BTreeSet::new();
         for off in [10u64, 30, 20] {
             set.insert(off);
-            st.set_self_acked(&set, 3).expect("write");
+            st.set_self_acked(&set, 0, 3).expect("write");
         }
         assert_eq!(st.self_acked(), [10, 20, 30].into_iter().collect());
         assert_eq!(st.halt_acked(), None);
@@ -6182,11 +6344,16 @@ mod tests {
         st.set_halt_acked(92).expect("write");
         assert_eq!(st.halt_acked(), Some(92));
         set.insert(40);
-        st.set_self_acked(&set, 3).expect("write");
+        st.set_self_acked(&set, 0, 3).expect("write");
         assert_eq!(
             st.self_acked(),
             [20, 30, 40].into_iter().collect(),
             "the oldest is dropped, and 10 is now unknown rather than proven ours"
+        );
+        assert_eq!(
+            st.self_acked_log().floor,
+            Some(20),
+            "and the floor rises to the oldest kept, so 10 is not accused either"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7572,17 +7739,19 @@ mod tests {
             },
             "no file is the empty log, appendable"
         );
-        for off in [5, 7, 9, 7] {
-            st.append_self_acked(&[off]).unwrap();
+        for (i, off) in [5, 7, 9, 7].into_iter().enumerate() {
+            st.append_self_acked((i == 0).then_some(0), &[off]).unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(dir.join("acked")).unwrap(),
-            "5,7,9,7,"
+            "floor=0,5,7,9,7,",
+            "the first append into a file that names no floor names it"
         );
         assert_eq!(
             st.self_acked_log(),
             AckedLog {
                 offsets: set(&[5, 7, 9]),
+                floor: Some(0),
                 entries: 4,
                 appendable: true,
             }
@@ -7595,6 +7764,7 @@ mod tests {
             older("1,2,3\n"),
             AckedLog {
                 offsets: set(&[1, 2, 3]),
+                floor: None,
                 entries: 3,
                 appendable: false,
             },
@@ -7604,15 +7774,29 @@ mod tests {
             older("5,7,45"),
             AckedLog {
                 offsets: set(&[5, 7]),
+                floor: None,
                 entries: 2,
                 appendable: false,
             },
             "45 may be the torn head of 456: it is no offset of ours"
         );
         assert_eq!(older("").offsets, set(&[]));
-        st.set_self_acked(&set(&[20, 30, 40]), 2).unwrap();
+        assert_eq!(
+            older("4,floor=3,5,"),
+            AckedLog {
+                offsets: set(&[4, 5]),
+                floor: Some(3),
+                entries: 2,
+                appendable: true,
+            },
+            "the floor entry is no offset and no entry"
+        );
+        st.set_self_acked(&set(&[20, 30, 40]), 10, 2).unwrap();
         let text = std::fs::read_to_string(dir.join("acked")).unwrap();
-        assert_eq!(text, "30,40,", "the newest two, each ended by its comma");
+        assert_eq!(
+            text, "floor=30,30,40,",
+            "the newest two, each ended by its comma, under a floor raised to the oldest kept"
+        );
         let older_reader: std::collections::BTreeSet<u64> = text
             .trim()
             .split(',')
@@ -7629,7 +7813,7 @@ mod tests {
         std::fs::write(&elsewhere, "").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.join("acked")).unwrap();
         assert!(
-            st.append_self_acked(&[1]).is_err(),
+            st.append_self_acked(None, &[1]).is_err(),
             "a planted link is refused"
         );
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "");
@@ -7642,10 +7826,10 @@ mod tests {
         let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
         let ordinary = StateDir::open(root.join("ordinary")).expect("ordinary state");
         ordinary
-            .append_self_acked(&[5])
+            .append_self_acked(None, &[5])
             .expect("first ordinary append");
         ordinary
-            .append_self_acked(&[7])
+            .append_self_acked(None, &[7])
             .expect("second ordinary append");
         assert_eq!(
             std::fs::read(ordinary.path("acked")).expect("ordinary log"),
@@ -7658,7 +7842,7 @@ mod tests {
         const SENTINEL: &[u8] = b"the other file owns these bytes\n";
         std::fs::write(&other, SENTINEL).expect("owned sentinel");
         std::fs::hard_link(&other, linked.path("acked")).expect("owned hardlink");
-        let result = linked.append_self_acked(&[42]);
+        let result = linked.append_self_acked(None, &[42]);
         let other_bytes = std::fs::read(&other).expect("other file remains readable");
         let state_bytes = std::fs::read(linked.path("acked")).expect("state name remains readable");
         assert!(
@@ -7687,7 +7871,7 @@ mod tests {
             let st = StateDir::open(root.join(format!("keeps-{keeps}"))).expect("state");
             let before = st.ops();
             for off in [1, 2, 3] {
-                st.append_self_acked(&[off]).expect("append");
+                st.append_self_acked(None, &[off]).expect("append");
             }
             assert_eq!(
                 (st.ops() - before).opens,
@@ -7695,9 +7879,9 @@ mod tests {
                 "keeps={keeps}: three appends, one open"
             );
             st.keep_acked_across_its_replace(keeps);
-            st.set_self_acked(&set(&[2, 3]), 8).expect("replace");
+            st.set_self_acked(&set(&[2, 3]), 0, 8).expect("replace");
             let before = st.ops();
-            st.append_self_acked(&[4])
+            st.append_self_acked(None, &[4])
                 .expect("the append after the replace");
             let (opens, read) = ((st.ops() - before).opens, st.self_acked_log().offsets);
             if keeps {
@@ -7715,16 +7899,17 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read_to_string(st.path("acked")).expect("acked"),
-                "2,3,4,"
+                "floor=0,2,3,4,"
             );
 
-            st.set_self_acked(&set(&[4]), 8).expect("a second replace");
+            st.set_self_acked(&set(&[4]), 0, 8)
+                .expect("a second replace");
             let other = root.join("other-owned-file");
             const SENTINEL: &[u8] = b"the other file owns these bytes\n";
             std::fs::write(&other, SENTINEL).expect("owned sentinel");
             std::fs::remove_file(st.path("acked")).expect("unlink the replaced log");
             std::fs::hard_link(&other, st.path("acked")).expect("owned hardlink");
-            let result = st.append_self_acked(&[5]);
+            let result = st.append_self_acked(None, &[5]);
             assert!(
                 result.is_err() && std::fs::read(&other).expect("other") == SENTINEL,
                 "the open after a replace refuses a hard link: {result:?}"
@@ -7749,15 +7934,15 @@ mod tests {
             ("its write is refused", "refused"),
         ] {
             let st = StateDir::open(root.join(dir)).expect("state");
-            st.append_self_acked(&[1])
+            st.append_self_acked(None, &[1])
                 .expect("the first append, which opens the log");
             let failed = if dir == "fails" {
                 let read_only = std::fs::File::open(st.path("acked")).expect("acked, read-only");
                 *st.acked.lock().unwrap_or_else(|e| e.into_inner()) = Some(read_only);
-                st.append_self_acked(&[2])
+                st.append_self_acked(None, &[2])
             } else {
                 st.refuse_writes_of(Some("acked"));
-                let failed = st.append_self_acked(&[2]);
+                let failed = st.append_self_acked(None, &[2]);
                 st.refuse_writes_of(None);
                 failed
             };
@@ -7765,7 +7950,7 @@ mod tests {
             std::fs::write(&swap, "7,").expect("a file for the name");
             std::fs::rename(&swap, st.path("acked")).expect("put it at the name");
             let before = st.ops();
-            let next = st.append_self_acked(&[3]);
+            let next = st.append_self_acked(None, &[3]);
             seen.push((
                 fails,
                 failed.is_err(),
@@ -7944,7 +8129,8 @@ mod tests {
             st.set_key_pin("s-x", "high", &pin(Some(6))).unwrap();
             st.set_in_flight(&in_flight(1, 2)).unwrap();
             st.set_in_flight(&in_flight(2, 7)).unwrap();
-            st.set_self_acked(&[1, 6].into_iter().collect(), 8).unwrap();
+            st.set_self_acked(&[1, 6].into_iter().collect(), 0, 8)
+                .unwrap();
         };
         let answer = |seq: u64| (seq, "/f/f/in/n-a/s-b/n-a/answer".to_string());
 
@@ -7990,10 +8176,11 @@ mod tests {
                 "the reply below the fork is kept, RE-WITNESSED onto the new generation: the \
                  attach replays a reference only on the log its witness names"
             );
+            let acked = st.self_acked_log();
             assert_eq!(
-                st.self_acked_log().offsets,
-                [11].into_iter().collect(),
-                "the window re-bases at the head"
+                (acked.offsets, acked.floor),
+                (std::collections::BTreeSet::new(), Some(12)),
+                "the window re-bases at the head: empty, its floor the head"
             );
         };
         clamped(&st);
@@ -11904,6 +12091,69 @@ mod tests {
             2,
             "any write error revokes admission"
         );
+    }
+
+    /// THE PIN'S FENCE BY BARRIERS AND A SETTLE (critic item F07): `order_logpin` writes the pin by
+    /// two barriers (the temp's and the directory's) and no full flush, and is no fence until
+    /// `logpin_settled` makes it one; asked again before then it writes nothing, and once it is the
+    /// fence it is held, with no render, as `ensure_logpin_durable`'s. The controls: a pin
+    /// replaced between the order and the settle (by the open's own durable write, or by
+    /// another file renamed over the name) is not made the fence by the settle, and a settle with
+    /// nothing ordered fences nothing.
+    #[test]
+    fn an_ordered_pin_is_the_fence_once_its_settle_is_answered() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("logpin-ordered")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let pin = mirror_pin([7; 16], 40).render();
+        let st = StateDir::open(root).expect("open");
+        assert!(!st.logpin_settled(), "nothing ordered, nothing settled");
+        let ops = st.ops();
+        assert!(!st.order_logpin(|| pin.clone()).expect("ordered"));
+        let made = st.ops() - ops;
+        assert_eq!(
+            (made.replaces, made.barriers, made.fsyncs),
+            (1, 2, 0),
+            "the temp's barrier and the directory's, no full flush"
+        );
+        assert!(!st.logpin_fence_held(), "no fence before the settle");
+        let ops = st.ops();
+        assert!(!st
+            .order_logpin(|| panic!("an ordered pin is not written again"))
+            .expect("still ordered"));
+        assert_eq!((st.ops() - ops).replaces, 0);
+        assert!(st.logpin_settled(), "the settle makes the fence");
+        assert!(st.logpin_fence_held());
+        assert!(st
+            .order_logpin(|| panic!("a held fence needs no render"))
+            .expect("held"));
+        let ops = st.ops();
+        st.set_logpin(&mirror_pin([7; 16], 50).render())
+            .expect("the next");
+        assert_eq!((st.ops() - ops).fsyncs, 0, "the next pin is atomic");
+
+        // The controls, each on a fresh open of the dir.
+        for change in ["durable", "renamed over"] {
+            let st = StateDir::open(root).expect("reopen");
+            assert!(!st.order_logpin(|| pin.clone()).expect(change));
+            match change {
+                "durable" => st.ensure_logpin_durable(|| pin.clone()).expect(change),
+                _ => {
+                    let staged = root.join("other-pin");
+                    std::fs::write(&staged, &pin).unwrap();
+                    std::fs::rename(staged, root.join(LOGPIN)).unwrap();
+                }
+            }
+            let held = st.logpin_settled();
+            assert_eq!(
+                held,
+                change == "durable",
+                "{change}: only the open's own fence stands, never a pin it did not order"
+            );
+            assert_eq!(st.logpin_fence_held(), held, "{change}");
+        }
     }
 
     #[test]

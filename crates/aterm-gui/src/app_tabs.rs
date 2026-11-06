@@ -4142,7 +4142,7 @@ impl App {
         self.install_tab_session_at(owner, session, parent, Some(kept), false);
     }
 
-    /// [`Self::install_tab_session`] for a worker: its tab lands parked and ephemeral (it goes once its task concluded, `App::reap_workers`), behind what the window shows, and the sync that follows opens the window's Workers tab when this is its first.
+    /// [`Self::install_tab_session`] for a worker: its tab lands parked and task-owned, behind what the window shows, and the sync that follows opens the window's Workers tab when this is its first. The pane remains after its task concludes.
     pub(crate) fn install_tab_session_parked(
         &mut self,
         owner: WindowId,
@@ -4566,9 +4566,12 @@ impl App {
                 },
             );
         }
+        // What the strip was given: one tip per shown tab, never a parked worker's.
         #[cfg(any(test, debug_assertions))]
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.tooltips_pushed = tooltips;
+            let mut pushed = tooltips;
+            pushed.truncate(shown);
+            ws.tooltips_pushed = pushed;
         }
         self.mark_status_dirty();
         (titles, metadata)

@@ -4,15 +4,30 @@
 
 //! Engine host-mutation journal ([`HostOp`], [`HostReport`]) for the temporal spine.
 
+use std::sync::Arc;
+
 use super::{ClockReading, HolderCut, Terminal};
+use crate::config::TerminalConfig;
 
 /// How many host mutations the journal keeps ([`Terminal::host_journal_since`]).
 pub const HOST_JOURNAL_CAP: usize = 32;
 
 const CAP_U64: u64 = HOST_JOURNAL_CAP as u64;
 
+/// A config the host installed ([`HostOp::Config`]), shared with the host: equal to another when it is the same allocation or encodes to the same canonical bytes ([`TerminalConfig::canonical`]), which is an equivalence over its `f32` fields too.
+#[derive(Clone)]
+pub struct HostConfig(pub Arc<TerminalConfig>);
+
+impl PartialEq for HostConfig {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.canonical() == other.0.canonical()
+    }
+}
+
+impl Eq for HostConfig {}
+
 /// One post-seed host-side mutation applied to [`Terminal`] outside `process_at` (plus a `program_probe` foreground transition observed during an unsigned OSC 7).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HostOp {
     /// Foreground-job / probed-job state changed, optionally restoring `cwd_before_job`.
     ForegroundJob {
@@ -47,6 +62,13 @@ pub enum HostOp {
     SettleShellRekey([u8; 32]),
     /// Autonomous Kitty animation frame step ([`Terminal::advance_kitty_animations`]).
     AdvanceKittyAnimations,
+    /// The host installed a config, the person's theme among it ([`Terminal::apply_config_shared`]).
+    Config {
+        /// The config installed.
+        config: HostConfig,
+        /// Whether it moved what the screen draws: the cursor colour, another colour or the style policy.
+        recolored: bool,
+    },
 }
 
 impl core::fmt::Debug for HostOp {
@@ -74,6 +96,7 @@ impl core::fmt::Debug for HostOp {
             Self::WithdrawShellRekey(_) => f.write_str("WithdrawShellRekey(..)"),
             Self::SettleShellRekey(_) => f.write_str("SettleShellRekey(..)"),
             Self::AdvanceKittyAnimations => f.write_str("AdvanceKittyAnimations"),
+            Self::Config { recolored, .. } => write!(f, "Config(recolored={recolored})"),
         }
     }
 }
@@ -100,12 +123,16 @@ impl HostOp {
                 | Self::ClearScrollback
                 | Self::Reset
                 | Self::AdvanceKittyAnimations
+                | Self::Config {
+                    recolored: true,
+                    ..
+                }
         )
     }
 }
 
 /// One host mutation stamped with its 1-based ordinal in this engine's lifetime.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostReport {
     /// 1-based position in this engine's host-mutation sequence.
     pub ordinal: u64,
@@ -128,7 +155,7 @@ impl Default for HostJournal {
     fn default() -> Self {
         Self {
             ordinal: 0,
-            ring: [HostReport::default(); HOST_JOURNAL_CAP],
+            ring: std::array::from_fn(|_| HostReport::default()),
         }
     }
 }
@@ -145,18 +172,18 @@ const fn slot(ordinal: u64) -> usize {
 impl HostJournal {
     /// Record `op` as the next host mutation and stamp its ordinal.
     #[inline]
-    pub(super) const fn push(&mut self, op: HostOp) {
+    pub(super) fn push(&mut self, op: HostOp) {
         self.push_inner(op, None);
     }
 
     /// Record time-sensitive `op` with `clock` as the next host mutation and stamp its ordinal.
     #[inline]
-    pub(super) const fn push_at(&mut self, op: HostOp, clock: ClockReading) {
+    pub(super) fn push_at(&mut self, op: HostOp, clock: ClockReading) {
         self.push_inner(op, Some(clock));
     }
 
     #[inline]
-    const fn push_inner(&mut self, op: HostOp, clock: Option<ClockReading>) {
+    fn push_inner(&mut self, op: HostOp, clock: Option<ClockReading>) {
         self.ordinal = self.ordinal.wrapping_add(1);
         self.ring[slot(self.ordinal)] = HostReport {
             ordinal: self.ordinal,
@@ -171,7 +198,7 @@ impl HostJournal {
         let pending = self.ordinal - since;
         let kept = pending.min(CAP_U64);
         let reports = (self.ordinal - kept + 1..=self.ordinal)
-            .filter_map(|o| self.ring.get(slot(o)).copied())
+            .filter_map(|o| self.ring.get(slot(o)).cloned())
             .collect();
         (reports, pending - kept)
     }
@@ -244,6 +271,15 @@ impl Terminal {
             }
             HostOp::AdvanceKittyAnimations => {
                 let _ = self.advance_kitty_animations(clock.monotonic);
+            }
+            HostOp::Config { config, .. } => {
+                let changes = self.apply_config_shared(config.0);
+                // The live host drained what the engine owed when the install queued a scheme push (aterm-gui writes it as a UI report), so the replay drains the same.
+                if changes.contains(&crate::config::ConfigChange::ColorScheme)
+                    && self.report_color_scheme_enabled()
+                {
+                    let _ = self.take_response();
+                }
             }
         }
     }

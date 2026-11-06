@@ -914,6 +914,14 @@ fn line_state(
     if managed.iter().any(|row| unread(row)) {
         return with_lead(LineState::checking(line));
     }
+    // A reading that ended without an answer carries a note, so it is no longer `unread`,
+    // but it has established no completed state either. Only settled rows earn the check.
+    if managed
+        .iter()
+        .any(|row| !row.settled() && !row.changed_by_you)
+    {
+        return with_lead(LineState::checking(line));
+    }
     let pending_grants = managed
         .iter()
         .filter(|row| matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD))

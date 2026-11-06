@@ -1,0 +1,754 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Cut-shaped profile experiments. No path here executes the release product.
+
+use crate::{buildplan, snapshot};
+use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Arm {
+    Fat1,
+    Fat1Lines,
+    Fat16,
+    Fat16Lines,
+    Thin16Lines,
+}
+
+impl Arm {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Fat1 => "fat1",
+            Self::Fat1Lines => "fat1-lines",
+            Self::Fat16 => "fat16",
+            Self::Fat16Lines => "fat16-lines",
+            Self::Thin16Lines => "thin16-lines",
+        }
+    }
+    pub(crate) fn environment(self) -> [(&'static str, &'static str); 3] {
+        [
+            (
+                "CARGO_PROFILE_RELEASE_LTO",
+                if self == Self::Thin16Lines {
+                    "thin"
+                } else {
+                    "fat"
+                },
+            ),
+            (
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+                if matches!(self, Self::Fat1 | Self::Fat1Lines) {
+                    "1"
+                } else {
+                    "16"
+                },
+            ),
+            (
+                "CARGO_PROFILE_RELEASE_DEBUG",
+                if matches!(self, Self::Fat1 | Self::Fat16) {
+                    "1"
+                } else {
+                    "line-tables-only"
+                },
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct Options {
+    arms: Vec<Arm>,
+    takes: usize,
+    inspect: Option<std::path::PathBuf>,
+}
+
+pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let mut args = args;
+    let mut opts = Options {
+        arms: Vec::new(),
+        takes: 2,
+        inspect: None,
+    };
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--arm" => {
+                let arm = match value.as_str() {
+                    "fat1" => Arm::Fat1,
+                    "fat1-lines" => Arm::Fat1Lines,
+                    "fat16" => Arm::Fat16,
+                    "fat16-lines" => Arm::Fat16Lines,
+                    "thin16-lines" => Arm::Thin16Lines,
+                    _ => return Err(format!("unknown pilot arm {value}")),
+                };
+                if opts.arms.contains(&arm) {
+                    return Err(format!("duplicate arm {value}"));
+                }
+                opts.arms.push(arm);
+            }
+            "--takes" => opts.takes = value.parse().map_err(|_| "invalid --takes")?,
+            "--inspect" => opts.inspect = Some(value.into()),
+            _ => return Err(format!("unknown profile-pilot flag {flag}")),
+        }
+    }
+    if opts.inspect.is_some() && !opts.arms.is_empty() {
+        return Err("--inspect takes no --arm".into());
+    }
+    if (opts.inspect.is_none() && opts.arms.is_empty()) || opts.takes != 2 {
+        return Err(
+            "profile-pilot requires --arm and exactly two takes for reproducibility".into(),
+        );
+    }
+    Ok(opts)
+}
+
+fn order(opts: &Options) -> Vec<(usize, Arm)> {
+    (0..opts.takes)
+        .flat_map(|take| {
+            let mut arms = opts.arms.clone();
+            if take % 2 == 1 {
+                arms.reverse();
+            }
+            arms.into_iter().map(move |arm| (take, arm))
+        })
+        .collect()
+}
+
+/// Cargo's artifact path is authoritative across both traditional deps folders
+/// and Trust's per-unit output layout.
+pub(crate) fn gui_rlib(log: &str) -> Option<std::path::PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        if row["reason"].as_str() != Some("compiler-artifact")
+            || row["target"]["name"].as_str() != Some("aterm_gui")
+        {
+            continue;
+        }
+        if let Some(files) = row["filenames"].as_array() {
+            for file in files {
+                if let Some(path) = file.as_str().map(std::path::PathBuf::from)
+                    && path.is_absolute()
+                    && path.extension().is_some_and(|ext| ext == "rlib")
+                {
+                    found.insert(path);
+                }
+            }
+        }
+    }
+    if found.len() == 1 {
+        found.pop_first()
+    } else {
+        None
+    }
+}
+
+/// The interval from the artifact Cargo actually emitted to the final image.
+pub(crate) fn gui_link_interval(log: &Path, binary: &Path) -> Result<Option<f64>, String> {
+    let messages = crate::durable::read_text(&log.with_extension("messages.jsonl"))
+        .map_err(|e| e.to_string())?;
+    let Some(rlib) = gui_rlib(&messages) else {
+        return Ok(None);
+    };
+    let from = std::fs::metadata(&rlib)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("pilot GUI artifact {}: {e}", rlib.display()))?;
+    let to = std::fs::metadata(binary)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("pilot executable {}: {e}", binary.display()))?;
+    Ok(to.duration_since(from).ok().map(|span| span.as_secs_f64()))
+}
+
+/// Observe load while work runs; never wait for a quiet host.
+pub(crate) fn with_load<T>(work: impl FnOnce() -> T) -> (T, Option<f64>) {
+    std::thread::scope(|scope| {
+        let (done, receiver) = std::sync::mpsc::channel::<()>();
+        let sampler = scope.spawn(move || {
+            let mut maximum: Option<f64> = None;
+            loop {
+                if let Some(load) = aterm_sysprobe::load_average() {
+                    maximum = Some(maximum.map_or(load[0], |old| old.max(load[0])));
+                }
+                if !matches!(
+                    receiver.recv_timeout(std::time::Duration::from_secs(1)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+            maximum
+        });
+        let result = work();
+        drop(done);
+        (result, sampler.join().unwrap_or(None))
+    })
+}
+
+pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err("profile-pilot requires macOS or native Linux".into());
+    }
+    let git = crate::ledger::GitCli::new(repo);
+    let release = crate::release::release_dir(&git)?;
+    let pid = std::process::id();
+    let start =
+        crate::release_steps::started_of(pid).ok_or("cannot establish pilot process identity")?;
+    // The same claim as a cut closes the check/start race in both directions.
+    let _claim = crate::release::RunClaim::take(
+        &release.join(crate::release::RUNNING_FILE),
+        (pid, &start),
+        &release,
+        &mut crate::release_steps::started_of,
+        &[],
+    )
+    .map_err(|e| format!("profile-pilot cannot run beside a release claim: {e:?}"))?;
+    if let Some(dir) = &opts.inspect {
+        let cache = snapshot::CacheRoot::for_repo(repo)?;
+        let root = retained_root(&cache.path().join(".ubd/pilot"), dir)?;
+        let image = root.join("aterm");
+        let out = root.join(format!("inspection-{}.noindex", std::process::id()));
+        snapshot::private_dir(&out, "pilot retained inspection")?;
+        let copied = out.join("aterm");
+        crate::durable::copy_regular_fresh(&image, &copied).map_err(|e| e.to_string())?;
+        let inspection = inspect_symbols(&copied, &root, false)?;
+        let (sha256, bytes) = crate::dmg::sha256_and_size(&copied)?;
+        let report = aterm_json::json!({"binary":copied,"binary_bytes":bytes,"sha256":sha256,"inspection":inspection});
+        std::fs::write(out.join("inspection.json"), report.to_string())
+            .map_err(|e| e.to_string())?;
+        println!("profile-pilot-inspection: {report}");
+        return Ok(());
+    }
+    let commit = snapshot::git_text(repo, &["rev-parse", "HEAD"])?;
+    let take = buildplan::Take::prepare(repo, commit.trim())?;
+    let inputs = if cfg!(target_os = "macos") {
+        Some(crate::build_inputs::current()?)
+    } else {
+        None
+    };
+    let cache = snapshot::CacheRoot::for_repo(repo)?;
+    let root = cache
+        .path()
+        .join(".ubd/pilot")
+        .join(format!("{}-{pid}", commit.trim()));
+    std::fs::create_dir_all(root.parent().ok_or("pilot root has no parent")?)
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir(&root)
+        .map_err(|e| format!("create unique pilot run (existing evidence is retained): {e}"))?;
+    // Identity and network-derived metadata are frozen once, across every arm.
+    let build = snapshot::git_text(repo, &["show", "-s", "--format=%ct", commit.trim()])?
+        .trim()
+        .parse()
+        .map_err(|_| "commit has no timestamp")?;
+    let hint = buildplan::index_hint_now();
+    let mut rows = Vec::new();
+    for (n, arm) in order(opts) {
+        let targets = if cfg!(target_os = "macos") {
+            vec![None, Some("x86_64-apple-darwin")]
+        } else {
+            vec![None]
+        };
+        for target in targets {
+            let dir = root
+                .join(arm.name())
+                .join(format!("take{}", n + 1))
+                .join(target.unwrap_or("native"));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            println!("profile-pilot: {} take {} {:?}", arm.name(), n + 1, target);
+            let row = if cfg!(target_os = "linux") {
+                buildplan::linux::pilot(&take, arm, &dir, build, hint.as_deref())?
+            } else {
+                buildplan::pilot_build(&take, arm, &dir, target, build, hint.as_deref())?
+            };
+            let inspection_error = row["inspection"]["error"].as_str().map(str::to_owned);
+            println!("profile-pilot-row: {row}");
+            rows.push(row);
+            let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
+                "vm_rows": "not run: Q4 profile runtime qualification is not integrated", "linux_rows": "not run",
+                "library_benches": "pending", "wasm_ceilings": "pending"});
+            std::fs::write(root.join("report.json"), report.to_string())
+                .map_err(|e| e.to_string())?;
+            if let Some(error) = inspection_error {
+                return Err(format!(
+                    "pilot inspection failed (build evidence retained): {error}"
+                ));
+            }
+        }
+    }
+    if let Some(before) = &inputs
+        && crate::build_inputs::current()? != *before
+    {
+        return Err("pilot compiler or SDK inputs changed during the comparison".into());
+    }
+    validate(&rows)?;
+    // Keep build ABBA uninterrupted by instruments that compete for the CPU.
+    for (n, arm) in order(opts) {
+        let dir = root.join(arm.name()).join(format!("host-checks-{}", n + 1));
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        buildplan::pilot_host_checks(&take, arm, &dir, build, hint.as_deref())?;
+    }
+    std::fs::write(
+        root.join("host-checks-completed"),
+        b"vte-engine vte-marks wasm\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
+        "vm_rows": "not run: Q4 profile runtime qualification is not integrated",
+        "linux_rows": if cfg!(target_os = "linux") { "recorded" } else { "not run: invoke on native Linux" },
+        "library_benches": "commands completed with exit 0; judgments in per-arm host-checks-{1,2}/vte-engine.log and vte-marks.log",
+        "wasm_ceilings": "commands completed with exit 0; judgments in per-arm host-checks-{1,2}/wasm.log"});
+    std::fs::write(root.join("report.json"), report.to_string()).map_err(|e| e.to_string())?;
+    println!(
+        "profile-pilot: reproducible host artifacts; report {}",
+        root.join("report.json").display()
+    );
+    Ok(())
+}
+
+fn validate(rows: &[aterm_json::Value]) -> Result<(), String> {
+    for row in rows {
+        let peers: Vec<_> = rows
+            .iter()
+            .filter(|r| r["arm"] == row["arm"] && r["slice"] == row["slice"])
+            .collect();
+        if peers.len() != 2
+            || peers.iter().any(|r| {
+                r["sha256"] != row["sha256"]
+                    || r["inspection"]["dsym_dwarf_sha256"]
+                        != row["inspection"]["dsym_dwarf_sha256"]
+            })
+        {
+            return Err(format!(
+                "non-reproducible arm {} slice {}",
+                row["arm"], row["slice"]
+            ));
+        }
+        let twin = match row["arm"].as_str() {
+            Some("fat1-lines") => "fat1",
+            Some("fat16-lines") => "fat16",
+            _ => continue,
+        };
+        if let Some(base) = rows
+            .iter()
+            .find(|r| r["arm"].as_str() == Some(twin) && r["slice"] == row["slice"])
+        {
+            for field in ["sections", "symbols"] {
+                if row["inspection"][field] != base["inspection"][field] {
+                    return Err(format!("{field} differ between {twin} and {}", row["arm"]));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tool(name: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
+    run_tool(name, args, false)
+}
+
+fn retained_root(cache: &Path, requested: &Path) -> Result<std::path::PathBuf, String> {
+    let cache = std::fs::canonicalize(cache).map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(requested).map_err(|e| e.to_string())?;
+    if root == cache || !root.starts_with(&cache) {
+        return Err(
+            "--inspect accepts a retained take inside this clone's private pilot cache".into(),
+        );
+    }
+    Ok(root)
+}
+
+fn run_tool(name: &str, args: &[&std::ffi::OsStr], lookup: bool) -> Result<String, String> {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("pilot-tool-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("xcrun"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TMPDIR", scratch.path())
+        .current_dir("/")
+        .arg(name)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{name}: {e}"))?;
+    tool_answer(name, out.status.code(), out.stdout, &out.stderr, lookup)
+}
+
+fn tool_answer(
+    name: &str,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: &[u8],
+    lookup: bool,
+) -> Result<String, String> {
+    // dwarfdump's lookup returns 1 with no diagnostic when an address has no
+    // DWARF entry. A malformed image or an interrupted tool remains an error.
+    if code != Some(0) && !(lookup && code == Some(1) && stderr.is_empty()) {
+        return Err(format!(
+            "{name} exited {code:?}: {}",
+            String::from_utf8_lossy(stderr)
+        ));
+    }
+    String::from_utf8(stdout).map_err(|e| e.to_string())
+}
+
+fn demangle_symbol(symbol: &str) -> Result<String, String> {
+    if symbol.starts_with("_R") || symbol.starts_with("_Z") {
+        tool("llvm-cxxfilt", &[symbol.as_ref()]).map(|text| text.trim().to_owned())
+    } else {
+        Ok(symbol.to_owned())
+    }
+}
+
+fn canonical_symbolication(
+    text: &str,
+    mut demangle: impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("symbolicator gave no function name".into());
+    }
+    text.lines()
+        .map(|line| {
+            let (function, location) = line
+                .split_once(" (in ")
+                .ok_or("symbolicator gave no image and location")?;
+            let (symbol, offset) = function
+                .split_once(" + ")
+                .map_or((function, None), |(name, offset)| (name, Some(offset)));
+            let name = demangle(symbol)?;
+            if name.is_empty() {
+                return Err("symbolicator gave no function name".into());
+            }
+            let offset = offset.map_or(String::new(), |offset| format!(" + {offset}"));
+            Ok(format!("{name}{offset} (in {location}"))
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(|lines| lines.join("\n"))
+}
+
+pub(crate) fn inspect(binary: &Path, root: &Path) -> Result<aterm_json::Value, String> {
+    inspect_symbols(binary, root, true)
+}
+
+fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_json::Value, String> {
+    if cfg!(target_os = "linux") {
+        return Ok(
+            aterm_json::json!({"sections": null, "symbols": null, "dsym": "not applicable on Linux"}),
+        );
+    }
+    let dsym = root.join("aterm.dSYM");
+    if extract {
+        tool(
+            "dsymutil",
+            &[binary.as_os_str(), "-o".as_ref(), dsym.as_os_str()],
+        )?;
+    }
+    let dwarf = dsym.join("Contents/Resources/DWARF/aterm");
+    let (dsym_sha256, dsym_bytes) = crate::dmg::sha256_and_size(&dwarf)?;
+    let image = std::fs::read(binary).map_err(|e| e.to_string())?;
+    let sections = sections(&image)?;
+    let cpu = image.get(4..8).ok_or("Mach-O CPU type is absent")?;
+    let arch = match u32::from_le_bytes(cpu.try_into().map_err(|_| "Mach-O CPU type")?) {
+        0x0100_000c => "arm64",
+        0x0100_0007 => "x86_64",
+        _ => return Err("unsupported pilot Mach-O architecture".into()),
+    };
+    let names = tool("nm", &["-n".as_ref(), binary.as_os_str()])?;
+    let addresses: Vec<_> = names
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = fields.next()?;
+            let kind = fields.next()?;
+            let name = fields.next()?;
+            matches!(kind, "T" | "t").then_some((address, name))
+        })
+        .take(128)
+        .collect();
+    if addresses.is_empty() {
+        return Err("no text addresses to symbolicate".into());
+    }
+    // Capture addresses before the cut's -x strip removes local symbol names.
+    // The dSYM keeps those names; code/data must survive the strip unchanged.
+    tool("strip", &["-x".as_ref(), binary.as_os_str()])?;
+    let stripped = std::fs::read(binary).map_err(|e| e.to_string())?;
+    if self::sections(&stripped)? != sections {
+        return Err("release strip changed code/data sections".into());
+    }
+    let mut symbols = Vec::new();
+    for (address, name) in addresses {
+        let lookup_address = format!("0x{address}");
+        let lookup = run_tool(
+            "dwarfdump",
+            &[
+                "--lookup".as_ref(),
+                lookup_address.as_ref(),
+                dwarf.as_os_str(),
+            ],
+            true,
+        )?;
+        // dSYM paths and UUIDs differ; retain the resolved function and source location.
+        let resolved: Vec<_> = lookup
+            .lines()
+            .filter(|line| line.contains("Line info:"))
+            .map(str::trim)
+            .collect();
+        if !resolved.iter().any(|line| line.contains("Line info:")) {
+            continue;
+        }
+        let symbolicated = tool(
+            "atos",
+            &[
+                "-o".as_ref(),
+                dwarf.as_os_str(),
+                "-arch".as_ref(),
+                arch.as_ref(),
+                lookup_address.as_ref(),
+            ],
+        )?;
+        if symbolicated.trim().is_empty() || symbolicated.trim().starts_with("0x") {
+            return Err(format!("dSYM did not resolve function at {lookup_address}"));
+        }
+        // Mach-O adds an underscore to the Rust linkage name. Compare semantic
+        // names, not the compiler's per-profile crate disambiguator.
+        let function = demangle_symbol(name.strip_prefix('_').unwrap_or(name))?;
+        let symbolicated = canonical_symbolication(symbolicated.trim(), demangle_symbol)?;
+        symbols.push(aterm_json::json!({"address": address, "function": function, "resolved": resolved, "dsym_symbolication": symbolicated}));
+        if symbols.len() == 16 {
+            break;
+        }
+    }
+    if symbols.len() != 16 {
+        return Err("fewer than 16 symbolicated text addresses".into());
+    }
+    Ok(
+        aterm_json::json!({"sections": sections, "symbols": symbols, "dsym_dwarf_bytes": dsym_bytes, "dsym_dwarf_sha256": dsym_sha256}),
+    )
+}
+
+// Read file-backed section bytes, excluding UUIDs and link-edit metadata. Bounds
+// checks reject a truncated Mach-O before any indexing can panic.
+fn sections(bytes: &[u8]) -> Result<aterm_json::Value, String> {
+    let u32_at = |at: usize| -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            bytes
+                .get(at..at + 4)
+                .ok_or("truncated Mach-O")?
+                .try_into()
+                .map_err(|_| "Mach-O word")?,
+        ))
+    };
+    let u64_at = |at: usize| -> Result<u64, String> {
+        Ok(u64::from_le_bytes(
+            bytes
+                .get(at..at + 8)
+                .ok_or("truncated Mach-O")?
+                .try_into()
+                .map_err(|_| "Mach-O word")?,
+        ))
+    };
+    if u32_at(0)? != 0xfeed_facf {
+        return Err("expected thin little-endian Mach-O 64".into());
+    }
+    let mut at = 32usize;
+    let mut rows = Vec::new();
+    for _ in 0..u32_at(16)? {
+        let size = u32_at(at + 4)? as usize;
+        let end = at
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or("Mach-O load command bounds")?;
+        if size < 8 {
+            return Err("short Mach-O load command".into());
+        }
+        if u32_at(at)? == 0x19 {
+            if size < 72 {
+                return Err("short Mach-O segment".into());
+            }
+            let segment = bytes.get(at + 8..at + 24).ok_or("segment name")?;
+            if segment.starts_with(b"__TEXT\0") || segment.starts_with(b"__DATA") {
+                for n in 0..u32_at(at + 64)? as usize {
+                    let section = at + 72 + n * 80;
+                    if section + 80 > end {
+                        return Err("Mach-O section bounds".into());
+                    }
+                    let length =
+                        usize::try_from(u64_at(section + 40)?).map_err(|_| "section size")?;
+                    let offset = u32_at(section + 48)? as usize;
+                    let kind = u32_at(section + 64)? & 0xff;
+                    let digest = if [1, 0xc, 0x12].contains(&kind) {
+                        None
+                    } else {
+                        let data = bytes
+                            .get(offset..offset.checked_add(length).ok_or("section overflow")?)
+                            .ok_or("section data bounds")?;
+                        Some(aterm_codec::hex::encode_lower(
+                            &aterm_digest::Sha256::digest(data),
+                        ))
+                    };
+                    rows.push(aterm_json::json!({"name": String::from_utf8_lossy(&bytes[section..section+16]).trim_end_matches('\0'), "segment": String::from_utf8_lossy(segment).trim_end_matches('\0'), "size": length, "sha256": digest}));
+                }
+            }
+        }
+        at = end;
+    }
+    if rows.is_empty() {
+        return Err("no code/data sections".into());
+    }
+    Ok(aterm_json::json!(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn symbol_identity_preserves_function_offsets_and_source_locations() {
+        let demangle = |_: &str| Ok("module::function".to_owned());
+        let a = canonical_symbolication("_Rfirst + 4 (in aterm) (source.rs:7)", demangle).unwrap();
+        let b = canonical_symbolication("_Rsecond + 4 (in aterm) (source.rs:7)", demangle).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            canonical_symbolication("_Rsecond + 4 (in aterm) (source.rs:8)", demangle).unwrap()
+        );
+        assert_ne!(
+            a,
+            canonical_symbolication("_Rsecond + 8 (in aterm) (source.rs:7)", demangle).unwrap()
+        );
+        assert_ne!(
+            a,
+            canonical_symbolication("_Rsecond + 4 (in aterm) (source.rs:7)", |_| Ok(
+                "module::other".to_owned()
+            ))
+            .unwrap()
+        );
+        assert!(canonical_symbolication("0x1000", demangle).is_err());
+        assert!(canonical_symbolication("", demangle).is_err());
+    }
+    #[test]
+    fn retained_inspection_cannot_write_outside_the_pilot_cache() {
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let outside = aterm_tempfile::tempdir().unwrap();
+        let take = cache.path().join("take");
+        std::fs::create_dir(&take).unwrap();
+        assert_eq!(
+            retained_root(cache.path(), &take).unwrap(),
+            std::fs::canonicalize(&take).unwrap()
+        );
+        assert!(retained_root(cache.path(), outside.path()).is_err());
+        assert!(retained_root(cache.path(), cache.path()).is_err());
+        assert!(
+            parse(
+                ["--inspect", "take", "--arm", "fat1"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn lookup_misses_are_skipped_but_tool_failures_are_not() {
+        assert!(tool_answer("dwarfdump", Some(1), b"image header".to_vec(), b"", true).is_ok());
+        assert!(tool_answer("dwarfdump", Some(1), vec![], b"malformed DWARF", true).is_err());
+        assert!(tool_answer("dwarfdump", None, vec![], b"", true).is_err());
+        assert!(tool_answer("dsymutil", Some(1), vec![], b"", false).is_err());
+    }
+    #[test]
+    fn retained_artifact_messages_determine_the_link_interval() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let library = dir.path().join("relocated.rlib");
+        let binary = dir.path().join("image");
+        for (path, seconds) in [(&library, 100), (&binary, 107)] {
+            File::create(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+                .unwrap();
+        }
+        let log = dir.path().join("build.log");
+        std::fs::write(&log, "compiler diagnostics, not artifacts\n").unwrap();
+        let row = aterm_json::json!({"reason":"compiler-artifact", "target":{"name":"aterm_gui"}, "filenames":[library]}).to_string();
+        std::fs::write(log.with_extension("messages.jsonl"), &row).unwrap();
+        assert_eq!(gui_link_interval(&log, &binary).unwrap(), Some(7.0));
+        std::fs::write(
+            log.with_extension("messages.jsonl"),
+            row.replace("compiler-artifact", "compiler-message"),
+        )
+        .unwrap();
+        assert_eq!(gui_link_interval(&log, &binary).unwrap(), None);
+    }
+    #[test]
+    fn artifact_messages_find_relocated_rlibs_and_reject_diagnostics() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("fresh/release/build/gui/unit/out/libaterm_gui.rlib");
+        let row = aterm_json::json!({"reason":"compiler-artifact","target":{"name":"aterm_gui"},"filenames":[path]}).to_string();
+        assert_eq!(gui_rlib(&row).unwrap(), path);
+        assert!(gui_rlib(&row.replace("compiler-artifact", "compiler-message")).is_none());
+        assert!(gui_rlib(&row.replace("aterm_gui", "other")).is_none());
+    }
+    #[test]
+    fn section_identity_ignores_metadata_but_detects_changed_machine_code() {
+        let mut image = vec![0u8; 188];
+        image[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        image[16..20].copy_from_slice(&1u32.to_le_bytes());
+        image[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+        image[36..40].copy_from_slice(&152u32.to_le_bytes());
+        image[40..46].copy_from_slice(b"__TEXT");
+        image[96..100].copy_from_slice(&1u32.to_le_bytes());
+        image[104..110].copy_from_slice(b"__text");
+        image[144..152].copy_from_slice(&4u64.to_le_bytes());
+        image[152..156].copy_from_slice(&184u32.to_le_bytes());
+        image[184..188].copy_from_slice(&[1, 2, 3, 4]);
+        let before = sections(&image).unwrap();
+        image[8] = 3;
+        assert_eq!(sections(&image).unwrap(), before);
+        image[187] = 9;
+        assert_ne!(sections(&image).unwrap(), before);
+        image.truncate(187);
+        assert!(sections(&image).is_err());
+    }
+    #[test]
+    fn arms_and_interleaving_are_exact() {
+        let opts = parse(
+            ["--arm", "fat1", "--arm", "fat1-lines"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            order(&opts),
+            vec![
+                (0, Arm::Fat1),
+                (0, Arm::Fat1Lines),
+                (1, Arm::Fat1Lines),
+                (1, Arm::Fat1)
+            ]
+        );
+        assert_ne!(Arm::Fat1.environment(), Arm::Fat1Lines.environment());
+        assert_eq!(Arm::Fat1Lines.environment()[2].1, "line-tables-only");
+        assert!(parse(["--arm", "unknown"].into_iter().map(str::to_owned)).is_err());
+    }
+    #[test]
+    fn identity_rejects_mutated_code_and_nonreproducible_binary() {
+        let make = |arm: &str, hash: &str, sections: &str| aterm_json::json!({"arm":arm,"slice":"native","sha256":hash,"inspection":{"sections":sections,"symbols":"same"}});
+        let row = make("fat1", "a", "same");
+        let mut rows = vec![row.clone(), row.clone()];
+        assert!(validate(&rows).is_ok());
+        rows[1] = make("fat1", "mutated", "same");
+        assert!(validate(&rows).is_err());
+        rows[1] = row;
+        let lines = make("fat1-lines", "b", "same");
+        rows.extend([lines.clone(), lines]);
+        assert!(validate(&rows).is_ok());
+        rows[2] = make("fat1-lines", "b", "changed");
+        assert!(validate(&rows).is_err());
+        rows[2] = aterm_json::json!({"arm":"fat1-lines","slice":"native","sha256":"b","inspection":{"sections":"same","symbols":"changed"}});
+        assert!(validate(&rows).is_err());
+        assert!(sections(&[0; 32]).is_err());
+    }
+}

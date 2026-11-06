@@ -520,6 +520,10 @@ impl<C: Ctl> Session<'_, C> {
         }
         let typed_at = self.fx.mono();
         self.cruise_carry.typed(typed_at, screen);
+        // The act's answer is a new yield, as `Session::turn_end_write`'s is: the host's
+        // repository and left reads of the one before it are spent.
+        self.repo_seen = None;
+        self.left_seen = None;
         if let Some(act) = act {
             let reading = self
                 .reader(&screen.rows)

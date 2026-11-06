@@ -1212,10 +1212,28 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         bg.is_some() && woke,
         &format!(
             "the manager's await ran as a background Bash, and its <task-notification> (completed) opened a turn{}",
-            wake.map_or_else(String::new, |(_, r)| format!(
-                ": {}",
-                r.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>()
-            ))
+            wake.map_or_else(String::new, |(_, r)| {
+                let mut out = String::with_capacity(162);
+                out.push_str(": ");
+                let mut chars = 0usize;
+                for word in r.text.split_whitespace() {
+                    if chars > 0 {
+                        if chars >= 160 {
+                            break;
+                        }
+                        out.push(' ');
+                        chars += 1;
+                    }
+                    for ch in word.chars() {
+                        if chars >= 160 {
+                            break;
+                        }
+                        out.push(ch);
+                        chars += 1;
+                    }
+                }
+                out
+            })
         ),
     );
     let wake_text = wake.map_or("", |(_, r)| r.text.as_str());

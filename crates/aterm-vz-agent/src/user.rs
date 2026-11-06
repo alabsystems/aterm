@@ -29,7 +29,7 @@ fn parse_u32(s: &str) -> Option<u32> {
 }
 
 /// Every well-formed account in `passwd`'s text (`name:x:uid:gid:gecos:home:shell`).
-fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
+fn accounts(passwd: &str) -> impl Iterator<Item = (&str, u32, u32, &str)> + '_ {
     passwd.lines().filter_map(|line| {
         let mut f = [""; 7];
         let mut count = 0;
@@ -43,12 +43,7 @@ fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
         if count != 7 || f[0].is_empty() || f[0].starts_with('#') {
             return None;
         }
-        Some(User {
-            name: f[0].to_string(),
-            uid: parse_u32(f[2])?,
-            gid: parse_u32(f[3])?,
-            home: f[5].to_string(),
-        })
+        Some((f[0], parse_u32(f[2])?, parse_u32(f[3])?, f[5]))
     })
 }
 
@@ -58,12 +53,18 @@ fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
 /// None is, or more than one is, or its uid or gid is 0: which.
 pub fn lane_user(passwd: &str) -> Result<User, String> {
     let mut found: Vec<User> = accounts(passwd)
-        .filter(|u| {
-            !u.name.contains('/')
-                && u.home
+        .filter(|(name, _, _, home)| {
+            !name.contains('/')
+                && home
                     .strip_prefix("/home/")
                     .and_then(|s| s.strip_suffix(".guest"))
-                    == Some(u.name.as_str())
+                    == Some(*name)
+        })
+        .map(|(name, uid, gid, home)| User {
+            name: name.to_string(),
+            uid,
+            gid,
+            home: home.to_string(),
         })
         .collect();
     match found.len() {

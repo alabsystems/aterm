@@ -1062,48 +1062,53 @@ pub(crate) fn lan_ask(interfaces: &[LanInterface], ipv6_network: bool) -> Option
 
 /// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
 /// published (its progress record and its prompt-free readings), so a `status` costs no probe.
-/// `pending:<row,...>` names each managed row that needs a person, waits, failed or, while the
-/// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]), then `;needs:<row,...>`
+/// `pending:<row,...>` names each managed row that needs a person, waits, failed, is unread or
+/// still differs without a recorded personal change (`fda`, `devtools`, `vault`, … [`setup_word`]), then `;needs:<row,...>`
 /// for those of them that wait on a person's press (their reading is Needs you), so a reader
-/// tells a press from a wait without the page; `done` once the plan
-/// finished or a person cancelled it with none of those left, or once System State's headline
-/// says this Mac is set up ([`crate::system_state::Headline::set_up`]) before its run finished,
+/// tells a press from a wait without the page; `done` once System State's current headline
+/// says this Mac is set up ([`crate::system_state::Headline::set_up`]), including before its run finished,
 /// nothing left for anyone to do now; then `;asking:<row,...>` names each stage the run's last
 /// pass parked to ask again by itself (an ALab vault that did not answer or is absent off the
 /// ALab LAN, `vault`; a step an engine put off), so `done` is never read as a finished record;
 /// `pending` while a run goes with none read; `-` before the worker said anything (no setup in
-/// this process). `done` ends in `;offered:<row,...>` while macOS's grants are on offer, which
-/// hold nothing back ([`crate::system_state::offered_access`]).
+/// this process). Grants still on offer remain named as pending personal steps
+/// ([`crate::system_state::offered_access`]); their stage record alone claims no grant.
 pub(crate) fn setup_field(status: &SetupStatus) -> String {
     let selection = status
         .plan
         .as_ref()
         .map_or_else(Selection::none, |plan| plan.selection);
-    let ended = status.finished || status.cancelled;
+    let rows = crate::system_state::rows(status, selection);
     let mut pending: Vec<&str> = Vec::new();
     let mut needs: Vec<&str> = Vec::new();
-    for access in crate::system_state::offered_access(status) {
-        let word = setup_word(Subject::Access(access));
+    let offered_access: Vec<_> = crate::system_state::offered_access(status)
+        .into_iter()
+        .filter(|access| crate::system_state::manages(selection, Subject::Access(*access)))
+        .collect();
+    for access in &offered_access {
+        let word = setup_word(Subject::Access(*access));
         if !pending.contains(&word) {
             pending.push(word);
             needs.push(word);
         }
     }
-    for observation in
-        status.observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
-    {
-        let left = match observation.standing {
-            Standing::NeedsYou | Standing::Waiting | Standing::Failed => true,
-            // A row a finished setup set once and a person changed since is theirs.
-            Standing::Differs => !ended,
+    for row in rows.iter().filter(|row| row.managed) {
+        let left = match row.standing {
+            None
+            | Some(Standing::Unknown | Standing::NeedsYou | Standing::Waiting | Standing::Failed) => {
+                true
+            }
+            // The probe's personal-change record is evidence of a choice; a finished stage
+            // alone says nothing about why a current reading differs.
+            Some(Standing::Differs) => !row.changed_by_you,
             _ => false,
         };
-        let word = setup_word(observation.subject);
-        if left && crate::system_state::manages(selection, observation.subject) {
+        let word = setup_word(row.subject);
+        if left {
             if !pending.contains(&word) {
                 pending.push(word);
             }
-            if observation.standing == Standing::NeedsYou && !needs.contains(&word) {
+            if row.standing == Some(Standing::NeedsYou) && !needs.contains(&word) {
                 needs.push(word);
             }
         }
@@ -1112,18 +1117,26 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
     // its headline off set up.
     let set_up = || {
         status.plan.as_ref().is_some_and(|plan| {
-            let rows = crate::system_state::rows(status, plan.selection);
-            crate::system_state::headline(status, &rows, Some(plan)).set_up
+            let headline = crate::system_state::headline(status, &rows, Some(plan));
+            headline.set_up
+                // A completed explicit opt-out has no managed work to prove. Keep the
+                // readable idle terminal case without reviving finished-only success.
+                || (plan.selection.is_empty()
+                    && (status.finished || status.cancelled)
+                    && !status.busy
+                    && !status.changing
+                    && !status.queued
+                    && status.running.is_empty()
+                    && headline.left_as_is)
         })
     };
     let offered = || {
-        let offered = crate::system_state::offered_access(status);
-        if offered.is_empty() {
+        if offered_access.is_empty() {
             String::new()
         } else {
-            let words: Vec<&str> = offered
-                .into_iter()
-                .map(|access| setup_word(Subject::Access(access)))
+            let words: Vec<&str> = offered_access
+                .iter()
+                .map(|access| setup_word(Subject::Access(*access)))
                 .collect();
             format!(";offered:{}", words.join(","))
         }
@@ -1135,8 +1148,6 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
             format!(";needs:{}", needs.join(","))
         };
         format!("pending:{}{needs}", pending.join(","))
-    } else if ended {
-        format!("done{}", offered())
     } else if set_up() {
         // The stages the run's last pass parked to ask again by itself, in the rows' words: a
         // vault nobody answered (`unreached`) or none here (`waiting`), a step put off.

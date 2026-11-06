@@ -89,7 +89,7 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !child.exited().unwrap() {
         assert!(Instant::now() < deadline, "the child never exited");
-        std::thread::yield_now();
+        crate::deadline::poll_yield();
     }
     let pid = i32::try_from(child.id()).unwrap();
     // SAFETY: two integers; the pid is this test's own unreaped child.

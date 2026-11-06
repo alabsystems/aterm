@@ -901,6 +901,49 @@ fn a_rotation_off_line_says_an_invalid_aterm_toml_is_not_valid_toml() {
     assert!(!off.contains("not valid TOML"), "CONTROL: {off}");
 }
 
+/// AN `aterm.toml` ITS READER REFUSES TURNS THE HARNESS OFF WHATEVER IT SAYS, AND THE
+/// `rotation off:` LINE SAYS SO, WITH THE REFUSAL, NOT A SETTING IN IT: a file other users may
+/// write that says `[harness] accounts = "off"` is not named by that setting, and the line offers
+/// no `"early"`, which would change nothing while the file is refused. The JSON's `off` is the
+/// line. NEGATIVE CONTROL: the rule that read the file again without the reader's checks named
+/// `[harness] accounts = "off"` and said `"early"` there turns rotation back on. CONTROL: the
+/// same file, written for its owner alone, is named.
+#[cfg(unix)]
+#[test]
+fn a_rotation_off_line_says_a_refused_aterm_toml_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let toml = "[harness]\naccounts = \"off\"\n";
+    let pool = Pool::new("off-refused");
+    pool.config(toml);
+    let path = pool.env.config.clone().expect("aterm.toml");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    assert_eq!(
+        pool.seat().mode_for(pool.cli),
+        accounts::Mode::Off,
+        "a refused aterm.toml turns the harness off"
+    );
+    let (text, doc) = pool.report(None);
+    let off = off_line(&text).unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        off.starts_with(
+            "aterm.toml cannot be read (config refused: mode 664 lets other users write it"
+        ),
+        "{off}"
+    );
+    assert!(off.contains("which turns the harness off"), "{off}");
+    assert!(!off.contains("`[harness] accounts"), "{off}");
+    assert!(!off.contains("`\"early\"`"), "{off}");
+    assert_eq!(doc["next"]["off"].as_str(), Some(off), "{doc}");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (text, _) = pool.report(None);
+    let off = off_line(&text).expect("a rotation off line");
+    assert!(
+        off.starts_with("`[harness] accounts = \"off\"` in aterm.toml")
+            && off.contains("`\"early\"`"),
+        "CONTROL: {off}"
+    );
+}
+
 /// A LOGIN CODEX KEEPS IN THE OS KEYRING TAKES NO ROW IN ANY MODE, AND THE REPORT SAYS SO: with no
 /// `aterm.toml`, under `early`, `wall` and `off`, on every program (none known, one that keeps no
 /// row's login its own, one that keeps it), with no pin and with the pin on `work` or `main`, a
@@ -4557,8 +4600,8 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
 /// there). A Kimi Code CLI row says it only while its ledger's last word on its browser is a window
 /// a person signed in: not on a profile directory a stopped attempt made, another row's window, or
 /// after a later attempt stopped for a person, where it names the step that gives it a route.
-/// Nothing here promises a sign-in by itself: `claudes_report_says_by_itself_only_where_a_session_runs_on_it`
-/// holds that promise to a session. CONTROL: with neither switch nor absence, Kimi Code CLI's row
+/// Nothing here promises a sign-in by itself: `claudes_report_says_by_itself_only_where_this_mac_uses_the_row`
+/// holds that promise to this Mac's use of the row. CONTROL: with neither switch nor absence, Kimi Code CLI's row
 /// with that window and Codex's say it, the sign-in they name there too.
 #[test]
 fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
@@ -4698,12 +4741,14 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
     }
 }
 
-/// CLAUDE CODE'S REPORT SAYS aterm SIGNS A ROW IN BY ITSELF ONLY WHERE A SESSION HERE RUNS ON IT AND A
+/// CLAUDE CODE'S REPORT SAYS aterm SIGNS A ROW IN BY ITSELF ONLY WHERE THIS MAC USES IT AND A
 /// ROUTE DOES IT WITH NOBODY AT THIS MAC (`DESIGN-alab-one-mesh-2026-11-05` §4.15): a row signed out,
 /// with no mailbox and no profile, names the browser step that gives it one; with a mailbox and no
-/// session on it, it waits for its sign-in, a person's. CONTROL: with a session on it, it says it.
+/// session here on it, ever, it waits for its sign-in, a person's; once a session here ran on it,
+/// aterm signs it in by itself for a week, and it waits again after. CONTROL: with a session on
+/// it, it says it.
 #[test]
-fn claudes_report_says_by_itself_only_where_a_session_runs_on_it() {
+fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
     let tmp = tmp_dir("claude-route");
     let mut env = env_at(&tmp);
     env.sock = None;
@@ -4746,8 +4791,40 @@ fn claudes_report_says_by_itself_only_where_a_session_runs_on_it() {
     let said = not_next(&env);
     assert!(!said.contains("by itself"), "no session on it: {said}");
     assert!(
-        said.contains("waits for `aterm harness accounts renew work`"),
+        said.contains("no login made yet"),
         "no session on it: {said}"
+    );
+    assert!(
+        said.contains(
+            "no session here runs on it or ran on it within a week, so it waits for `aterm \
+             harness accounts renew work`"
+        ),
+        "no session on it: {said}"
+    );
+    store
+        .transact(env.now, &mut None, |state| {
+            let ran = accounts::note_session(state, "s-ran", "work", None, env.now);
+            state.sessions.clear();
+            Ok(ran)
+        })
+        .expect("a session that ran on the row and ended");
+    let said = not_next(&env);
+    assert!(said.contains("by itself"), "a session ran on it: {said}");
+    assert!(!said.contains("waits for"), "a session ran on it: {said}");
+    let week_on = Env {
+        now: env.now + accounts::USED_WITHIN_S,
+        ..env.clone()
+    };
+    let said = not_next(&week_on);
+    assert!(!said.contains("by itself"), "a week on: {said}");
+    assert!(
+        said.contains("within a week, so it waits for"),
+        "a week on: {said}"
+    );
+    // A login made here once stays one that went, however long ago its session ran.
+    assert!(
+        said.contains("its login here has gone"),
+        "a week on: {said}"
     );
     store
         .transact(env.now, &mut None, |state| {

@@ -15,6 +15,13 @@ pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --li
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
+  targo --unverified ship profile-pilot --arm ARM [--arm ARM]... [--takes 2]
+      Build cut-shaped profile arms in fresh roots, without executing the product.
+      ARM: fat1, fat1-lines, fat16, fat16-lines, thin16-lines.
+      Two takes run in forward/reverse order (ABBA for two arms).
+  targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
+      Recheck a retained take's dSYM and a stripped private copy, without rebuilding.
+
   targo --unverified ship release status [--json]
       Read this clone's current or latest release, unfinished verification stages,
       first reported failure, log paths and validation timing without starting,
@@ -445,6 +452,7 @@ pub enum Cmd {
     },
     /// `dev-app`: this checkout as `aterm (dev).app` ([`crate::dev_app`]).
     DevApp(crate::dev_app::Cmd),
+    ProfilePilot(crate::profile_pilot::Options),
     /// `harness-bump`: the harness versions the release gate asks for ([`crate::harness_versions`]).
     HarnessBump,
     /// `trust run|judge`: the Trust lane and the judge of its stored facts ([`crate::trust_facts`]).
@@ -859,6 +867,9 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )),
         },
         "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
+        "profile-pilot" => {
+            crate::profile_pilot::parse(it.map(str::to_owned)).map(Cmd::ProfilePilot)
+        }
         "dev-app" => crate::dev_app::parse(&mut it).map(Cmd::DevApp),
         "site" => Ok(Cmd::Site(it.map(str::to_string).collect())),
         "hook" => Ok(Cmd::Hook(it.map(str::to_string).collect())),
@@ -1127,6 +1138,9 @@ fn normalize_version(v: &str) -> std::result::Result<String, String> {
 
 fn dispatch(cmd: Cmd) -> ledger::Result<()> {
     match cmd {
+        Cmd::ProfilePilot(opts) => {
+            crate::profile_pilot::run(&repo_root()?, &opts).map_err(Error::new)
+        }
         Cmd::Help => {
             print!("{USAGE}{}", crate::dev_app::USAGE);
             Ok(())

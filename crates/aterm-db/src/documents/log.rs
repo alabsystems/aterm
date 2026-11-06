@@ -159,12 +159,13 @@ impl Log {
             }
         }
         for ids in requests.values_mut() {
-            ids.sort_by_key(|id| (log.records[id].0.header.sequence, *id));
+            if ids.len() <= 1 {
+                continue;
+            }
+            ids.sort_unstable_by_key(|id| (log.records[id].0.header.sequence, *id));
             let first = ids[0];
-            if ids
-                .iter()
-                .any(|id| log.records[id].1 != log.records[&first].1)
-            {
+            let first_cmd = &log.records[&first].1;
+            if ids[1..].iter().any(|id| &log.records[id].1 != first_cmd) {
                 for id in ids.iter() {
                     log.conflicts.insert(*id);
                     log.records.get_mut(id).unwrap().0.refusal =
@@ -183,6 +184,7 @@ impl Log {
         &self,
         before: Option<Digest>,
         skip: &BTreeSet<Digest>,
+        build_cells: bool,
     ) -> (Cells, BTreeMap<Digest, String>, BTreeSet<Digest>) {
         let mut cells = Cells::new();
         let mut refusals = BTreeMap::new();
@@ -237,7 +239,7 @@ impl Log {
             {
                 continue;
             }
-            if !matches!(command, Command::Merge { .. }) {
+            if build_cells && !matches!(command, Command::Merge { .. }) {
                 crate::documents::apply(
                     &self.index,
                     &mut cells,
@@ -254,7 +256,7 @@ impl Log {
     /// ATT/1 reader passes the automatic records past their writer's quota
     /// (`typed::owned::quota`), which stay in history and dependencies but never project.
     pub(crate) fn cells_without(&self, skip: &BTreeSet<Digest>) -> Cells {
-        self.project(None, skip).0
+        self.project(None, skip, true).0
     }
     /// Every eligible business record with its decoded command, in record-id order.
     /// Causal-only merges remain in snapshots and dependencies, not this list. An application
@@ -267,7 +269,7 @@ impl Log {
     /// joins `application::append` writes before a record on a wide frontier, which a typed
     /// reader charges to that record's writer (`typed::owned::quota`).
     pub(crate) fn eligible_and_merges(&self) -> (Vec<(Operation, Command)>, Merges) {
-        let (_, _, eligible) = self.project(None, &BTreeSet::new());
+        let (_, _, eligible) = self.project(None, &BTreeSet::new(), false);
         let mut records = Vec::new();
         let mut merges = Vec::new();
         for (operation, command) in self
@@ -287,7 +289,7 @@ impl Log {
         (records, merges)
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let (cells, refusals, eligible) = self.project(None, &BTreeSet::new());
+        let (cells, refusals, eligible) = self.project(None, &BTreeSet::new(), true);
         let operations = self
             .records
             .iter()
@@ -359,7 +361,7 @@ impl Log {
                 "local proposal writer has withheld, unavailable or refused history; recovery required",
             ));
         }
-        let (_, refusals, _) = self.project(None, &BTreeSet::new());
+        let (_, refusals, _) = self.project(None, &BTreeSet::new(), false);
         if refusals.keys().any(|id| {
             self.records
                 .get(id)
@@ -406,7 +408,7 @@ impl Log {
             }
         }
         if let Some((_, id)) = first {
-            if !self.project(None, &BTreeSet::new()).2.contains(&id) {
+            if !self.project(None, &BTreeSet::new(), false).2.contains(&id) {
                 return Err(Error::new(
                     "the prior proposal receipt is not currently eligible",
                 ));
@@ -452,30 +454,32 @@ impl Log {
             .changes()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| Error::new("target proposal has no value changes to revert"))?;
-        let (current, _, eligible) = self.project(None, excluded);
+        let (current, _, eligible) = self.project(None, excluded, true);
         if !eligible.contains(&target) {
             return Err(Error::new("target proposal is not eligible"));
         }
+        let mut keys = Vec::with_capacity(changes.len());
         for change in changes {
-            if !current
-                .get(&(change.collection.clone(), change.key.clone()))
-                .is_some_and(|cell| {
-                    !cell.stopped
-                        && cell.candidates.len() == 1
-                        && cell.candidates[0].operation == target
-                })
-            {
+            let key = (change.collection.clone(), change.key.clone());
+            if !current.get(&key).is_some_and(|cell| {
+                !cell.stopped
+                    && cell.candidates.len() == 1
+                    && cell.candidates[0].operation == target
+            }) {
                 return Err(Error::new(
                     "an affected proposal changed; resolve it before reverting",
                 ));
             }
+            keys.push(key);
         }
-        let (past, _, _) = self.project(Some(target), excluded);
-        let mut restored = Vec::with_capacity(changes.len());
-        for change in changes {
-            let key = (change.collection.clone(), change.key.clone());
-            let old = past.get(&key);
-            if old.is_some_and(|cell| cell.stopped || cell.candidates.len() > 1) {
+        let (mut past, _, _) = self.project(Some(target), excluded, true);
+        let mut restored = Vec::with_capacity(keys.len());
+        for key in keys {
+            let old = past.remove(&key);
+            if old
+                .as_ref()
+                .is_some_and(|cell| cell.stopped || cell.candidates.len() > 1)
+            {
                 return Err(Error::new(
                     "previous proposal is stopped or conflicted; resolve it explicitly",
                 ));
@@ -484,8 +488,7 @@ impl Log {
                 collection: key.0,
                 key: key.1,
                 value: old
-                    .and_then(|cell| cell.candidates.first())
-                    .map(|c| c.value.clone())
+                    .and_then(|mut cell| cell.candidates.pop().map(|c| c.value))
                     .filter(|v| !v.is_null()),
             });
         }

@@ -258,13 +258,15 @@ fn fingerprints(
         // Only the selected account's display label is known to be inert here.
         // Keep every other field, including source details and machine routing,
         // until a provider adapter defines a narrower authenticated schema.
-        let mut value = candidate.value.clone();
         if key == root {
+            let mut value = candidate.value.clone();
             value.as_object_mut().unwrap().remove("label");
+            let bytes = aterm_json::to_vec(&value)
+                .map_err(|_| Error::new("account configuration cannot be encoded"))?;
+            frame(&mut configuration, &bytes);
+        } else {
+            frame(&mut configuration, &bytes);
         }
-        let bytes = aterm_json::to_vec(&value)
-            .map_err(|_| Error::new("account configuration cannot be encoded"))?;
-        frame(&mut configuration, &bytes);
     }
     Ok(Some((proposal.finalize(), configuration.finalize())))
 }

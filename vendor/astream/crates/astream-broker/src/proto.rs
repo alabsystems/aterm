@@ -24,10 +24,11 @@
 //! | 10   | [`ERR_SUBJECT_BOUND`]  | lands only once the subject enters the index   |
 //! | 11   | [`ERR_RETIRE_REFUSED`] | lands once the retire guard condition lifts    |
 //! | 12   | [`ERR_RATE_LIMITED`]   | lands once the producer's token bucket refills |
-//! | 13   | [`ERR_ORIGIN_REFUSED`] | a relayed record's origin is revoked or unknown, or its signature is bad |
+//! | 13   | [`ERR_ORIGIN_REFUSED`] | is refused again: the relayed record is not its origin's |
 //! | 14   | [`ERR_RELAY_NOT_READY`] | lands once this broker has been given origin keys |
+//! | 15   | [`ERR_ORIGIN_UNKNOWN`] | lands once this broker takes the record's origin |
 //!
-//! Codes 2, 3, 7, 8 and 9 are PERMANENT for the request that drew them: sent again,
+//! Codes 2, 3, 7, 8, 9 and 13 are PERMANENT for the request that drew them: sent again,
 //! unchanged, on the same connection, it is refused again, so a retry is a loop.
 //! Code 5 is the fail-safe reading. A broker older than codes 7 and 8 answered every
 //! refusal but 2, 3 and 6 with 5, permanent ones included, so a client reads 5 as
@@ -43,6 +44,16 @@
 //! one that is the only writer of its subjects (its own lanes) may drop the record
 //! for good, while one that shares a subject may wait for it. A broker older than
 //! code 10 answers it with 5.
+//!
+//! Code 15 is NOT permanent either, and it is the same kind of answer: the broker
+//! names one condition, a relayed record whose origin it does not take now (it holds
+//! no key for it, or that key stands revoked), and the carrier decides. The broker
+//! cannot know whether its embedder will give it the key or lift the revocation (a
+//! node seated, or its removal voided, after the record set out), but the carrier
+//! often can: its own standings say whether it still seats the origin. A relay bridge
+//! holds such a record while its embedder says so
+//! ([`FederationBridge::hold_while`](crate::federation::FederationBridge::hold_while)).
+//! A broker older than code 15 answers it with 13.
 //!
 //! One code-8 refusal is told apart by its WORDS, not by a code of its own: an
 //! expired capability's message starts [`CAP_EXPIRED_PREFIX`], and
@@ -98,6 +109,14 @@
 //!   delivered batch, every batch being flushed in full — because a subscriber that was
 //!   told Ordered may be holding back what it was delivered until a durable mark covers
 //!   it, and nothing on its stream says the tier changed.
+//!
+//! And one thing more for a writer OUTSIDE the log, which spends a request tag: the log's
+//! DEVICE, tag 0x06 of the `Hello` answer's extension block ([`NonceExt::device`],
+//! [`LogDevice`]) — its `st_dev` and whether its full flush drains the device — and
+//! [`Request::Settle`] (`0x19`, [`REQUEST_SETTLE`]), a full flush issued after the broker
+//! read it, never skipped. A writer whose own file is on that device orders its writes by a
+//! barrier, sends the settle, and knows them on stable media once it is answered: one drain
+//! of the device, the broker's, where its own full flush would be another.
 //!
 //! An escalated record (the broker's escalation table; see
 //! [`Escalation`](crate::Escalation)) never needs any of these to be safe: the broker
@@ -267,16 +286,29 @@ pub const RETIRE_CUT_PREFIX: &str = "cut: ";
 /// older client that does not know code 12 reads it as non-permanent (`!is_permanent()`).
 pub const ERR_RATE_LIMITED: u8 = 12;
 
-/// A relayed record was refused for what it is, not for who carried it: its subject names no
-/// owner or another producer's, its origin is revoked or not among the broker's origin keys, or
-/// its signature does not verify. Nothing was appended. A bridge counts it and carries on: the
-/// next record is not this one's fault, and one forged record must not stop an edge.
+/// A relayed record was refused for what it is, not for who carried it or whose it is: its
+/// sequence is in the reserved ack half, its subject names no owner or another producer's, or its
+/// signature does not verify against its origin's key. Nothing was appended. PERMANENT: the
+/// record will never be its origin's. A bridge counts it and carries on: the next record is not
+/// this one's fault, and one forged record must not stop an edge.
 pub const ERR_ORIGIN_REFUSED: u8 = 13;
 
 /// A relayed record was refused because of this broker, not the record: it holds no origin keys
 /// yet, or was built without the `relay` feature. A bridge stops and commits nothing, so what it
 /// was carrying is still there when the keys come.
 pub const ERR_RELAY_NOT_READY: u8 = 14;
+
+/// A relayed record's origin is not one this broker takes now: it holds no key for it among its
+/// origin keys, or that key (or the principal it derives) stands revoked. Nothing was appended,
+/// and the record was not judged. NOT permanent: the embedder may yet give the broker the key, or
+/// lift the revocation (a node seated, or its removal voided, after the record set out). Whether
+/// to wait is the carrier's question
+/// ([`BrokerRefusal::is_origin_unknown`](crate::client::BrokerRefusal::is_origin_unknown)): a relay
+/// bridge holds such a record back while its embedder says the origin is still seated, offering it
+/// again and committing its group below it, so an edge whose destination was only behind passes
+/// nothing ([`FederationBridge::hold_while`](crate::federation::FederationBridge::hold_while)). A
+/// broker that predates this code sends [`ERR_ORIGIN_REFUSED`].
+pub const ERR_ORIGIN_UNKNOWN: u8 = 15;
 
 /// Fixed prefix for every [`ERR_RATE_LIMITED`] refusal, followed immediately by the
 /// minimum millisecond wait `<ms>` (`>= 1`) before the bucket refills enough to admit
@@ -323,6 +355,7 @@ const TAG_FENCE_GAPS: u8 = 0x15;
 const TAG_BURST_MARKS: u8 = 0x16;
 const TAG_RELAY: u8 = 0x17;
 const TAG_ORIGIN_STAMPS: u8 = 0x18;
+const TAG_SETTLE: u8 = 0x19;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
@@ -380,6 +413,12 @@ pub const REQUEST_BURST_MARKS: u64 = 1 << 6;
 /// Bit 7 of [`NonceExt::requests`]: the broker accepts [`Request::Relay`] (`0x17`) and
 /// [`Request::OriginStamps`] (`0x18`).
 pub const REQUEST_RELAY: u64 = 1 << 7;
+
+/// Bit 8 of [`NonceExt::requests`]: the broker accepts [`Request::Settle`] (`0x19`): a full
+/// flush of its log issued after it read the request, never skipped, answered in send order
+/// with the durable head after it. Read beside the log's device ([`NonceExt::device`],
+/// [`LogDevice`]), it is what settles a writer's own barriered writes on that device.
+pub const REQUEST_SETTLE: u64 = 1 << 8;
 
 const STATS_MAX_ITEMS: usize = 65_536;
 
@@ -806,6 +845,24 @@ pub enum Request {
     /// without the option, and one that predates the verb, answer `Error 5` and keep the
     /// connection, which stays unfenced.
     FenceGaps,
+    /// SETTLE THE LOG'S DEVICE ([`REQUEST_SETTLE`]): a full flush of the log that the writer
+    /// issues AFTER the broker read this request, in the batch the request rides, and issues
+    /// even when one already covers the head (where [`Broker::flush_durable`] skips it):
+    /// the flush is the point, not what it covers. A writer outside the log that ordered its
+    /// own writes on the log's device ahead of this request by a barrier
+    /// (`astream_sys::barrier_sync`) knows them on stable media once the answer comes, when
+    /// the `Hello` block says the log is on that device and its full flush drains it
+    /// ([`LogDevice`]); with no such word, the answer says nothing of any write but the
+    /// log's. Pipelined: answered in send order through the ack stream, as a publish is,
+    /// with a `PublishAck` whose offset is the log's DURABLE head after the flush and whose
+    /// dedup flag is false; a flush that fails is the refusal every write of the batch
+    /// gets (the log is then poisoned until it is reopened), and a poisoned log refuses
+    /// it in the poison's words. Appends nothing. On a guarded broker it needs a genuine,
+    /// unexpired read-write grant of any filter: it spends the device's time, as a write
+    /// does. A broker that predates the verb answers `Error 5` and keeps the connection.
+    ///
+    /// [`Broker::flush_durable`]: crate::Broker::flush_durable
+    Settle,
 }
 
 /// Per-connection attached producer row in [`WireStats`] (`REQUIREMENTS` R5).
@@ -1348,9 +1405,10 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`], bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`]) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`], bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`], bit 6 = [`REQUEST_BURST_MARKS`], bit 7 = [`REQUEST_RELAY`], bit 8 = [`REQUEST_SETTLE`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 /// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
+/// | 0x06 | device     | `dev u64 LE` (the log file's `st_dev`), `flags u8` (bit 0: its full flush drains the device); bytes after it are a later build's, skipped ([`LogDevice`]) |
 ///
 /// No request tag, no protocol version and no error code are spent on it: a broker
 /// that predates the block sends a frame that ends at the identity, which reads here
@@ -1366,7 +1424,8 @@ pub struct NonceExt {
     pub lineage: Option<Lineage>,
     /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`],
     /// bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`],
-    /// bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`]).
+    /// bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`], bit 6 = [`REQUEST_BURST_MARKS`],
+    /// bit 7 = [`REQUEST_RELAY`], bit 8 = [`REQUEST_SETTLE`]).
     pub requests: Option<u64>,
     /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
     pub health: Option<HelloHealth>,
@@ -1375,6 +1434,9 @@ pub struct NonceExt {
     /// the `retention` feature; `NonceExt::retention_rules` (that feature's) reads them. `None`: no rules, or a
     /// broker that predates them.
     pub retention: Option<Vec<u8>>,
+    /// Tag 0x06: the device the log is on, and whether its full flush drains it ([`LogDevice`]).
+    /// `None`: a broker that predates it, or one that could not read its file's device.
+    pub device: Option<LogDevice>,
 }
 
 /// What a broker says about its log's health in the answer to every `Hello` — the
@@ -1411,12 +1473,73 @@ pub const HELLO_REASON_MAX: usize = 1024;
 /// The fixed part of the health entry: flags, four counts, the reason's length.
 const HEALTH_FIXED_LEN: usize = 1 + 4 * 8 + 2;
 
+/// THE LOG'S DEVICE, as a broker says it in the answer to every `Hello` — the extension
+/// block's tag 0x06: the device its log file is on (`st_dev`, from `fstat` on the descriptor
+/// the log is written through, never its directory's: a link can point the name elsewhere),
+/// and whether the log's FULL FLUSH DRAINS THAT DEVICE, every write any process issued to it
+/// before the flush reaching stable media by the time it returns.
+///
+/// On Apple the full flush is `F_FULLFSYNC` (`astream_sys::full_sync_data`), and fcntl(2) says
+/// what that settles: it "drains the entire queue of the device and acts as a barrier, data
+/// that had been fsync'd on the same device before is guaranteed to be persisted when this
+/// call returns"; `F_BARRIERFSYNC` (`astream_sys::barrier_sync`) "does the same thing as
+/// fsync(2) then issues a barrier command to the drive". So a write another process made on
+/// the same device and ordered by a barrier that returned before the broker READ a
+/// [`Request::Settle`] is on stable media once the settle is answered. Elsewhere it is `fdatasync(2)`, which promises the log's own
+/// writes only, and the flag is clear. In a test's process tree on Apple a full flush is the
+/// plain `fsync(2)` astream_sys substitutes for it (`TEST_PLAIN_FSYNC_ENV`), which no power
+/// loss tells apart in a test, so the flag says what the build's flush is, as every full flush
+/// there stands for it.
+///
+/// What it names is the DEVICE NUMBER, not the drive: two APFS volumes of one container
+/// have different numbers and one drive. A reader that compares its own file's `st_dev` with
+/// it and trusts the drain only on equality is right when they match and pays a flush of its
+/// own when they do not, which is the safe direction. A PUBLIC FACT, like the tier served
+/// beside it: a device number names no file and no record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogDevice {
+    /// The log file's `st_dev`.
+    pub dev: u64,
+    /// The log's full flush drains the whole device (`F_FULLFSYNC` on Apple).
+    pub flush_drains_device: bool,
+}
+
+impl LogDevice {
+    /// The entry's body: `dev u64 LE`, then `flags u8` (bit 0: the full flush drains the
+    /// device).
+    fn put(self, b: &mut Vec<u8>) {
+        b.extend_from_slice(&encode_u64_le_bytes(self.dev));
+        b.push(u8::from(self.flush_drains_device));
+    }
+
+    /// The entry's body; `None` for one cut short. Flag bits other than bit 0, and bytes after
+    /// the flags, are a later build's: ignored.
+    fn from_wire(body: &[u8]) -> Option<LogDevice> {
+        let mut r = Reader { b: body };
+        let dev = r.u64()?;
+        let flags = r.u8()?;
+        Some(LogDevice {
+            dev,
+            flush_drains_device: flags & 1 == 1,
+        })
+    }
+
+    /// Whether a writer's barriered writes to a file on device `dev` are on stable media once
+    /// a [`Request::Settle`] sent after them is answered: the log is on that device and its
+    /// full flush drains it.
+    #[must_use]
+    pub const fn settles(self, dev: u64) -> bool {
+        self.flush_drains_device && self.dev == dev
+    }
+}
+
 /// The extension-block tags ([`NonceExt`]).
 const EXT_DURABILITY: u8 = 0x01;
 const EXT_LINEAGE: u8 = 0x02;
 const EXT_REQUESTS: u8 = 0x03;
 const EXT_HEALTH: u8 = 0x04;
 const EXT_RETENTION: u8 = 0x05;
+const EXT_DEVICE: u8 = 0x06;
 
 fn put_ext_entry(p: &mut Vec<u8>, tag: u8, body: &[u8]) {
     p.push(tag);
@@ -1543,6 +1666,17 @@ impl NonceExt {
         }
     }
 
+    /// Whether this `Hello` extension block announces [`Request::Settle`] (`0x19`,
+    /// [`REQUEST_SETTLE`]): a full flush issued after the broker read the request, never
+    /// skipped, answered with the durable head after it.
+    #[must_use]
+    pub const fn supports_settle(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_SETTLE) != 0,
+            None => false,
+        }
+    }
+
     fn put(&self, p: &mut Vec<u8>) {
         if let Some(d) = &self.durability {
             let b = encode_served_info_bytes(d);
@@ -1560,6 +1694,11 @@ impl NonceExt {
             let mut b = Vec::with_capacity(HEALTH_FIXED_LEN);
             h.put(&mut b);
             put_ext_entry(p, EXT_HEALTH, &b);
+        }
+        if let Some(d) = self.device {
+            let mut b = Vec::with_capacity(9);
+            d.put(&mut b);
+            put_ext_entry(p, EXT_DEVICE, &b);
         }
         // An entry's length is a u16: rules that do not fit are not advertised
         // (`Retention::new` refuses them, so none are).
@@ -1607,6 +1746,7 @@ impl NonceExt {
                     }
                     ext.retention = Some(body.to_vec());
                 }
+                EXT_DEVICE => ext.device = Some(LogDevice::from_wire(body)?),
                 // Unknown tags: skipped by their length.
                 _ => {}
             }
@@ -1995,6 +2135,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         }
         Request::ClearGapFences => p[1] = TAG_CLEAR_GAP_FENCES,
         Request::FenceGaps => p[1] = TAG_FENCE_GAPS,
+        Request::Settle => p[1] = TAG_SETTLE,
         Request::Stats { filter } => {
             p[1] = TAG_STATS;
             put_str(&mut p, filter);
@@ -2200,6 +2341,7 @@ pub(crate) fn decode_request_with_bt(p: &[u8]) -> Option<(Request, Option<u64>)>
         },
         TAG_CLEAR_GAP_FENCES => Request::ClearGapFences,
         TAG_FENCE_GAPS => Request::FenceGaps,
+        TAG_SETTLE => Request::Settle,
         TAG_STATS => Request::Stats {
             filter: r.string()?,
         },
@@ -3137,14 +3279,16 @@ mod tests {
     /// exactly-once inbox, request/reply, barriers, presence, negotiated liveness and a
     /// producer's view of its own subject budget, a conditional retire, a tail told what
     /// retention gave up, broker-stamped wall times (`bt=`), read-grant-gated operator
-    /// `Stats`, and a gap fence a connection asks for and its producer lifts once it read
-    /// its answers — rides on TWENTY-ONE request tags and EIGHT response tags. This test is
+    /// `Stats`, a gap fence a connection asks for and its producer lifts once it read its
+    /// answers, burst marks, relayed records and their origin stamps, and a settle of the
+    /// log's device — rides on TWENTY-FIVE request tags and EIGHT response tags. This test is
     /// the budget: it enumerates every byte and fails if an undeclared request tag or a
     /// ninth response tag ever decodes, and it pins each tag's NUMBER, so a renumbering that
     /// would silently re-interpret an old client's frames breaks the build instead.
     /// `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire` at 0x10,
     /// `GapNotices` at 0x11, `BrokerTimes` at 0x12, `Stats` at 0x13, `ClearGapFences` at
-    /// 0x14, `FenceGaps` at 0x15, `Budget`'s reply at 0x86, `Gap` at 0x87 and `Stats` reply
+    /// 0x14, `FenceGaps` at 0x15, `BurstMarks` at 0x16, `Relay` at 0x17, `OriginStamps` at 0x18,
+    /// `Settle` at 0x19, `Budget`'s reply at 0x86, `Gap` at 0x87 and `Stats` reply
     /// at 0x88 took numbers no earlier version
     /// decoded: an older broker refuses each request as malformed and keeps the connection,
     /// and never sends the reply. Additions, not reinterpretations; no version change.
@@ -3194,7 +3338,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 24] = [
+        let request_tags: [(u8, Request); 25] = [
             (
                 0x01,
                 Request::Publish {
@@ -3326,6 +3470,7 @@ mod tests {
                 },
             ),
             (0x18, Request::OriginStamps),
+            (0x19, Request::Settle),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -3808,6 +3953,10 @@ mod tests {
             retention: None,
             requests: Some(REQUEST_RETIRE),
             health: None,
+            device: Some(LogDevice {
+                dev: 0x0102_0304_0506_0708,
+                flush_drains_device: true,
+            }),
         };
         let nonce = |log, ext| Response::Nonce {
             nonce: vec![2; 32],
@@ -3847,9 +3996,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // An unknown tag (0x06) is skipped.
+        // An unknown tag (0x7f) is skipped.
         let mut unknown = full.clone();
-        unknown.extend_from_slice(&[0x06, 1, 0, 0xff]);
+        unknown.extend_from_slice(&[0x7f, 1, 0, 0xff]);
         assert_eq!(
             decode_response(&unknown),
             Some(nonce(Some(ident), ext.clone()))
@@ -3903,6 +4052,105 @@ mod tests {
         r.b
     }
 
+    /// THE DEVICE ENTRY (0x06) IS ADDITIVE AND EXACT: it round-trips with its flag set and
+    /// clear and at the extremes of `st_dev`; flag bits past bit 0 and bytes after the flags
+    /// are a later build's, read as this build's entry; one cut inside its eight-byte device
+    /// or before its flags is malformed. A client that predates it (the frozen reader of the
+    /// release before the health entry) reads the block carrying it as the same tier and
+    /// lineage, the entry skipped by its length, and refuses one whose length runs past the
+    /// frame (the negative control: it walks the header). `LogDevice::settles` trusts the drain
+    /// only for the log's own device, and only where the flush drains it; `supports_settle`
+    /// reads bit 8 of the request set alone.
+    #[test]
+    fn the_device_entry_round_trips_and_is_skipped_by_a_decoder_that_predates_it() {
+        let ident = LogIdentity {
+            id: [0xab; 16],
+            generation: 4,
+        };
+        let served = ServedInfo {
+            requested: Tier::Ordered,
+            served: Tier::Ordered,
+            reason: ServedReason::None,
+            horizon_ms: Some(100),
+            rules: 4,
+        };
+        let lineage = crate::logid::step(&Lineage::default(), 4, 17);
+        let frame_of = |ext: NonceExt| {
+            encode_response(&Response::Nonce {
+                nonce: vec![7; 32],
+                log: Some(ident),
+                ext,
+            })
+        };
+        for (dev, drains) in [(0, false), (1 << 24 | 3, true), (u64::MAX, true)] {
+            let device = LogDevice {
+                dev,
+                flush_drains_device: drains,
+            };
+            let ext = NonceExt {
+                durability: Some(served),
+                lineage: Some(lineage.clone()),
+                requests: Some(REQUEST_SETTLE),
+                device: Some(device),
+                ..NonceExt::default()
+            };
+            let frame = frame_of(ext.clone());
+            match decode_response(&frame) {
+                Some(Response::Nonce { ext: read, .. }) => assert_eq!(read, ext),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                older_client_ext(ext_block(&frame)),
+                Some((Some(served), Some(lineage.clone()))),
+                "an older client reads the tier and the lineage past the device"
+            );
+            assert_eq!(device.settles(dev), drains);
+            assert!(!device.settles(dev ^ 1), "another device is never settled");
+        }
+        // A later build's flag bits and trailing bytes: read as this entry.
+        let plain = frame_of(NonceExt::default());
+        let mut later = plain.clone();
+        later.extend_from_slice(&[0x06, 10, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0b1111_0001, 0xee]);
+        match decode_response(&later) {
+            Some(Response::Nonce { ext, .. }) => assert_eq!(
+                ext.device,
+                Some(LogDevice {
+                    dev: 9,
+                    flush_drains_device: true,
+                })
+            ),
+            other => panic!("{other:?}"),
+        }
+        // Cut inside the device, or before the flags: malformed.
+        for cut in [0usize, 4, 8] {
+            let mut short = plain.clone();
+            short.extend_from_slice(&[0x06, u8::try_from(cut).unwrap(), 0]);
+            short.extend_from_slice(&[0u8; 8][..cut]);
+            assert_eq!(
+                decode_response(&short),
+                None,
+                "a device entry of {cut} bytes"
+            );
+        }
+        // The negative control: an entry whose length runs past the frame is refused by the
+        // older reader too.
+        let mut past = plain.clone();
+        past.extend_from_slice(&[0x06, 9, 0, 1, 2, 3]);
+        assert_eq!(older_client_ext(ext_block(&past)), None);
+        // The settle bit is bit 8 alone.
+        let settle = NonceExt {
+            requests: Some(REQUEST_SETTLE),
+            ..NonceExt::default()
+        };
+        assert!(settle.supports_settle());
+        let others = NonceExt {
+            requests: Some(!REQUEST_SETTLE),
+            ..NonceExt::default()
+        };
+        assert!(!others.supports_settle());
+        assert!(!NonceExt::default().supports_settle());
+    }
+
     /// THE HEALTH ENTRY (0x04) IS ADDITIVE: a client that predates it reads a block
     /// carrying it exactly as it read the block before — the tier and the lineage, the
     /// entry skipped by its length — whether the log is healthy or poisoned; this build
@@ -3938,6 +4186,7 @@ mod tests {
                         failed: 1,
                     },
                 }),
+                device: None,
             };
             let frame = encode_response(&Response::Nonce {
                 nonce: vec![7; 32],
@@ -4068,6 +4317,7 @@ mod tests {
                 retention: None,
                 requests: None,
                 health: None,
+                device: None,
             };
             let frame = encode_response(&Response::Nonce {
                 nonce: vec![2; 32],

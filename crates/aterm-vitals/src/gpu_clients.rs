@@ -3,7 +3,8 @@
 
 //! GPU time per process: the host's reads of the GPU's user clients (cumulative GPU time per
 //! client, macOS's `AppUsage`), turned into each process's share of the device over the window
-//! between two reads.
+//! between two reads, and the factor κ that attributes the device's busy time to them in
+//! proportion where their queues overlap (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §3).
 
 use std::collections::{HashMap, HashSet};
 
@@ -75,18 +76,34 @@ pub(crate) struct GpuShares {
     rates: HashMap<u32, (String, f32)>,
     /// When the read that made [`Self::rates`] was taken; `None` while none is held.
     at: Option<u64>,
+    /// The device's busy fractions read since the last client read, summed, and how many: the
+    /// window's mean busy, ū.
+    busy: (f64, u32),
+    /// κ for the held rates ([`Self::kappa`]).
+    kappa: f32,
 }
 
 impl GpuShares {
-    /// Take one sample's client read, if it carries one, and drop held shares once stale at
-    /// `now_ns`.
+    /// Take one sample's device busy fraction, where read, and its client read, if it carries
+    /// one, and drop held shares once stale at `now_ns`.
     ///
     /// Over the window between this read and the last: an entry in both contributes its delta, an
     /// entry absent from a complete last enumeration all its time (it was created inside the
     /// window), an entry present without a counter or missed by an incomplete read nothing
     /// (it may be old), and an entry that is gone nothing. The first read, or one more than
-    /// [`WINDOW_MAX_NS`] after the last, is a baseline and gives no shares.
-    pub(crate) fn absorb(&mut self, read: Option<&GpuClientsSample>, now_ns: u64) {
+    /// [`WINDOW_MAX_NS`] after the last, is a baseline and gives no shares. The device readings
+    /// taken since the last client read, this one's included, are the window's mean busy ū, and
+    /// with the clients' summed shares R they set [`Self::kappa`].
+    pub(crate) fn absorb(
+        &mut self,
+        read: Option<&GpuClientsSample>,
+        busy: Option<f32>,
+        now_ns: u64,
+    ) {
+        if let Some(b) = busy.filter(|b| b.is_finite()) {
+            self.busy.0 += f64::from(b.clamp(0.0, 1.0));
+            self.busy.1 += 1;
+        }
         if let Some(read) = read {
             let now: HashMap<u64, u64> = read.rows.iter().map(|r| (r.entry, r.gpu_ns)).collect();
             if let Some(then) = self.last.take()
@@ -112,7 +129,10 @@ impl GpuShares {
                     })
                     .collect();
                 self.at = Some(read.at_ns);
+                let mean = (self.busy.1 > 0).then(|| (self.busy.0 / f64::from(self.busy.1)) as f32);
+                self.kappa = kappa(mean, self.rates.values().map(|(_, s)| *s).sum());
             }
+            self.busy = (0.0, 0);
             self.last = Some(Baseline {
                 at_ns: read.at_ns,
                 ns: now,
@@ -150,6 +170,24 @@ impl GpuShares {
         self.held()
             .then(|| self.rates.values().map(|(_, s)| *s).sum())
     }
+
+    /// κ, the factor that turns a scope's summed client time into its share of the device's busy
+    /// time ([`kappa`]), while shares are held.
+    pub(crate) fn kappa(&self) -> Option<f32> {
+        self.held().then_some(self.kappa)
+    }
+}
+
+/// κ for clients whose shares sum to `clients` (R) over a window in which the device was busy
+/// `busy` (ū) of the time: ū / R where the clients ran more than the device was busy, their
+/// queues overlapping (and ū read, R > 0), else 1. A scope's share of the device is then
+/// κ · Σ r_p over its processes, so the shares of every scope sum to no more than ū and each
+/// keeps its proportion: aterm cannot take the whole bar while WindowServer vanishes.
+fn kappa(busy: Option<f32>, clients: f32) -> f32 {
+    match busy {
+        Some(u) if clients > u && clients > 0.0 && u.is_finite() => (u / clients).clamp(0.0, 1.0),
+        _ => 1.0,
+    }
 }
 
 #[cfg(test)]
@@ -182,7 +220,7 @@ mod tests {
     #[test]
     fn the_first_read_is_a_baseline() {
         let mut g = GpuShares::default();
-        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), 10 * S);
+        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), None, 10 * S);
         assert!(!g.held());
         assert_eq!(g.share(7, "mtl"), None);
         assert_eq!(g.clients(), None);
@@ -191,18 +229,66 @@ mod tests {
     #[test]
     fn a_delta_over_the_window_is_its_share() {
         let mut g = GpuShares::default();
-        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), 10 * S);
-        g.absorb(Some(&read(14, &[(1, 7, "mtl", 6 * S)])), 14 * S);
+        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), None, 10 * S);
+        g.absorb(Some(&read(14, &[(1, 7, "mtl", 6 * S)])), None, 14 * S);
         assert!(close(g.share(7, "mtl"), 0.25), "{g:?}");
         assert!(close(g.clients(), 0.25));
+    }
+
+    /// κ is the device's mean busy over the client window, ū, against the clients' summed
+    /// shares, R, where their queues overlap (R > ū), and 1 where they do not, where ū is unread
+    /// and where no client ran. ū is the mean of the device readings since the last client read,
+    /// this one's included, and starts afresh at each client read.
+    #[test]
+    fn kappa_turns_overlapping_client_time_into_shares_of_the_devices_busy_time() {
+        let near = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-6);
+        let mut g = GpuShares::default();
+        assert_eq!(g.kappa(), None, "no shares held");
+        g.absorb(
+            Some(&read(10, &[(1, 7, "a", 0), (2, 8, "w", 0)])),
+            Some(0.9),
+            10 * S,
+        );
+        g.absorb(None, Some(0.04), 12 * S);
+        // The clients ran 58 % of the window (53 % and 5 %) while the device was busy 4 % and
+        // 6 %, a mean of 5 %: the 0.9 before the window's start is the baseline's.
+        g.absorb(
+            Some(&read(20, &[(1, 7, "a", 53 * S / 10), (2, 8, "w", S / 2)])),
+            Some(0.06),
+            20 * S,
+        );
+        assert!(near(g.clients(), 0.58), "{g:?}");
+        assert!(near(g.kappa(), 0.05 / 0.58), "{g:?}");
+        assert!(
+            near(g.share(7, "a"), 0.53),
+            "the shares stay raw client time"
+        );
+        // A window whose clients ran less than the device was busy keeps their time: κ is 1.
+        g.absorb(
+            Some(&read(30, &[(1, 7, "a", 63 * S / 10), (2, 8, "w", S / 2)])),
+            Some(0.5),
+            30 * S,
+        );
+        assert!(near(g.kappa(), 1.0), "{g:?}");
+        // With no device reading in the window, ū is unread: κ is 1.
+        g.absorb(
+            Some(&read(40, &[(1, 7, "a", 163 * S / 10), (2, 8, "w", S / 2)])),
+            None,
+            40 * S,
+        );
+        assert!(near(g.clients(), 1.0) && near(g.kappa(), 1.0), "{g:?}");
+        assert_eq!(super::kappa(Some(0.0), 0.0), 1.0, "no client ran");
+        assert_eq!(super::kappa(Some(0.2), 0.4), 0.5);
+        assert_eq!(super::kappa(None, 0.4), 1.0);
     }
 
     #[test]
     fn a_client_born_inside_the_window_counts_all_its_time() {
         let mut g = GpuShares::default();
-        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), 10 * S);
+        g.absorb(Some(&read(10, &[(1, 7, "mtl", 5 * S)])), None, 10 * S);
         g.absorb(
             Some(&read(14, &[(1, 7, "mtl", 5 * S), (2, 8, "new", S)])),
+            None,
             14 * S,
         );
         assert!(close(g.share(8, "new"), 0.25), "{g:?}");
@@ -216,7 +302,7 @@ mod tests {
         let mut g = GpuShares::default();
         let mut first = read(10, &[(1, 7, "mtl", 5 * S)]);
         first.entries.extend([2, 4]); // Unread client and ordinary non-GPU child.
-        g.absorb(Some(&first), 10 * S);
+        g.absorb(Some(&first), None, 10 * S);
         let next = read(
             14,
             &[
@@ -225,7 +311,7 @@ mod tests {
                 (3, 9, "new", 2 * S),
             ],
         );
-        g.absorb(Some(&next), 14 * S);
+        g.absorb(Some(&next), None, 14 * S);
         assert!(close(g.share(88, "WindowServer"), 0.0), "{g:?}");
         assert!(close(g.share(7, "mtl"), 0.25));
         assert!(close(g.share(9, "new"), 0.5), "a genuinely new entry");
@@ -240,6 +326,7 @@ mod tests {
                     (3, 9, "new", 2 * S),
                 ],
             )),
+            None,
             18 * S,
         );
         assert!(close(g.share(88, "WindowServer"), 0.25));
@@ -254,12 +341,13 @@ mod tests {
         let mut g = GpuShares::default();
         let mut cut = read(10, &[(1, 7, "mtl", 5 * S)]);
         cut.complete = false;
-        g.absorb(Some(&cut), 10 * S);
+        g.absorb(Some(&cut), None, 10 * S);
         g.absorb(
             Some(&read(
                 14,
                 &[(1, 7, "mtl", 6 * S), (2, 88, "WindowServer", 900 * S)],
             )),
+            None,
             14 * S,
         );
         assert!(close(g.share(88, "WindowServer"), 0.0), "{g:?}");
@@ -275,6 +363,7 @@ mod tests {
                     (3, 9, "new", 2 * S),
                 ],
             )),
+            None,
             18 * S,
         );
         assert!(close(g.share(88, "WindowServer"), 0.25), "{g:?}");
@@ -286,14 +375,15 @@ mod tests {
         let mut g = GpuShares::default();
         g.absorb(
             Some(&read(10, &[(1, 7, "mtl", 5 * S), (2, 8, "gone", 9 * S)])),
+            None,
             10 * S,
         );
-        g.absorb(Some(&read(14, &[(1, 7, "mtl", 7 * S)])), 14 * S);
+        g.absorb(Some(&read(14, &[(1, 7, "mtl", 7 * S)])), None, 14 * S);
         assert!(close(g.share(7, "mtl"), 0.5));
         assert!(close(g.share(8, "gone"), 0.0));
         assert!(close(g.clients(), 0.5));
         // A counter that went back reads 0, never a wrap.
-        g.absorb(Some(&read(18, &[(1, 7, "mtl", S)])), 18 * S);
+        g.absorb(Some(&read(18, &[(1, 7, "mtl", S)])), None, 18 * S);
         assert!(close(g.share(7, "mtl"), 0.0));
     }
 
@@ -301,9 +391,9 @@ mod tests {
     fn two_clients_of_one_process_sum_and_clamp_at_the_whole_gpu() {
         let mut g = GpuShares::default();
         let zero = [(1, 7, "mtl", 0), (2, 7, "mtl", 0), (3, 9, "x", 0)];
-        g.absorb(Some(&read(10, &zero)), 10 * S);
+        g.absorb(Some(&read(10, &zero)), None, 10 * S);
         let half = [(1, 7, "mtl", S), (2, 7, "mtl", S), (3, 9, "x", 3 * S)];
-        g.absorb(Some(&read(14, &half)), 14 * S);
+        g.absorb(Some(&read(14, &half)), None, 14 * S);
         assert!(close(g.share(7, "mtl"), 0.5), "{g:?}");
         assert!(close(g.share(9, "x"), 0.75));
         let over = [
@@ -311,7 +401,7 @@ mod tests {
             (2, 7, "mtl", 4 * S),
             (3, 9, "x", 3 * S),
         ];
-        g.absorb(Some(&read(18, &over)), 18 * S);
+        g.absorb(Some(&read(18, &over)), None, 18 * S);
         assert!(close(g.share(7, "mtl"), 1.0), "{g:?}");
         assert!(close(g.clients(), 1.0));
     }
@@ -319,13 +409,13 @@ mod tests {
     #[test]
     fn a_name_that_is_not_the_clients_takes_no_gpu_time() {
         let mut g = GpuShares::default();
-        g.absorb(Some(&read(10, &[(1, 7, "mtl", 0)])), 10 * S);
-        g.absorb(Some(&read(14, &[(1, 7, "mtl", 2 * S)])), 14 * S);
+        g.absorb(Some(&read(10, &[(1, 7, "mtl", 0)])), None, 10 * S);
+        g.absorb(Some(&read(14, &[(1, 7, "mtl", 2 * S)])), None, 14 * S);
         assert!(close(g.share(7, "zsh"), 0.0));
         assert!(close(g.share(7, "mtl"), 0.5));
         assert!(close(g.share(99, "mtl"), 0.0));
         let long = "com.apple.WebKit.GPU";
-        g.absorb(Some(&read(18, &[(1, 7, &long[..16], 4 * S)])), 18 * S);
+        g.absorb(Some(&read(18, &[(1, 7, &long[..16], 4 * S)])), None, 18 * S);
         assert!(close(g.share(7, long), 0.5), "a cut p_comm is its name");
         assert!(
             close(g.share(7, "com.apple.WebKi\u{2026}"), 0.5),
@@ -336,16 +426,17 @@ mod tests {
     #[test]
     fn held_shares_expire_and_a_stale_baseline_gives_none() {
         let mut g = GpuShares::default();
-        g.absorb(Some(&read(10, &[(1, 7, "mtl", 0)])), 10 * S);
-        g.absorb(Some(&read(14, &[(1, 7, "mtl", 2 * S)])), 14 * S);
+        g.absorb(Some(&read(10, &[(1, 7, "mtl", 0)])), None, 10 * S);
+        g.absorb(Some(&read(14, &[(1, 7, "mtl", 2 * S)])), None, 14 * S);
         let max_s = WINDOW_MAX_NS / S;
-        g.absorb(None, (14 + max_s) * S);
+        g.absorb(None, None, (14 + max_s) * S);
         assert!(g.held(), "held through the window");
-        g.absorb(None, (15 + max_s) * S);
+        g.absorb(None, None, (15 + max_s) * S);
         assert!(!g.held());
         assert_eq!(g.share(7, "mtl"), None);
         g.absorb(
             Some(&read(16 + 2 * max_s, &[(1, 7, "mtl", 9 * S)])),
+            None,
             (16 + 2 * max_s) * S,
         );
         assert!(

@@ -83,6 +83,8 @@ mod protected_spawn;
 mod quit_signal_live_headless;
 #[cfg(target_os = "macos")]
 mod render_desync_live_headless;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod renewal_child_live;
 #[cfg(unix)]
 mod reply_grammar_live_headless;
 #[cfg(unix)]

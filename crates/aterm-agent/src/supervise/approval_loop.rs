@@ -99,6 +99,7 @@ impl Dialog {
             | PromptKind::ModelSwitch
             | PromptKind::AutocompactOffer
             | PromptKind::AutoModeSetup
+            | PromptKind::ConversationResume
             | PromptKind::ChromeIntro => Self::Choice,
             PromptKind::Bash
             | PromptKind::Edit

@@ -15,6 +15,7 @@ fn repo() -> Repo {
         size_kib: 0,
         fork: false,
         archived: false,
+        required_submodules: Vec::new(),
     }
 }
 

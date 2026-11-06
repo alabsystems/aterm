@@ -125,15 +125,16 @@ impl Metadata {
         })
     }
 
-    pub(super) fn encode(&self, trust: Trust) -> Vec<u8> {
-        let mut wire = Vec::with_capacity(META_LEN);
-        wire.extend_from_slice(b"ACX4");
-        wire.extend_from_slice(&trust.network);
-        wire.extend_from_slice(&trust.authority);
-        wire.extend_from_slice(&trust.genesis);
-        wire.extend_from_slice(self.request.bytes());
-        put_bound(&mut wire, self.bound);
-        wire.push(self.flags);
+    pub(super) fn encode(&self, trust: Trust) -> [u8; META_LEN] {
+        let mut wire = [0u8; META_LEN];
+        wire[..4].copy_from_slice(b"ACX4");
+        wire[4..20].copy_from_slice(&trust.network);
+        wire[20..52].copy_from_slice(&trust.authority);
+        wire[52..84].copy_from_slice(&trust.genesis);
+        wire[84..HELLO_FIXED].copy_from_slice(self.request.bytes());
+        wire[HELLO_FIXED..HELLO_FIXED + 4].copy_from_slice(&self.bound.held.to_be_bytes());
+        wire[HELLO_FIXED + 4] = u8::from(self.bound.crossed);
+        wire[META_LEN - 1] = self.flags;
         wire
     }
 
@@ -234,30 +235,51 @@ impl View {
     /// Nothing held: what an `atdb/4` session, which states nothing, judges in.
     pub(super) const NONE: Self = Self(None);
 
+    /// The kernel decides what the read gives ([`aterm_db_core::peer_check::view`]).
+    ///
     /// # Errors
     /// The records of an endpoint built from its membership log ([`super::Custody::Log`]) do
-    /// not read: a push judged from its own genesis would pass a Mac those records remove.
+    /// not read, hold no log, or are another root's or lineage's: a push judged from its own
+    /// genesis would pass a Mac those records remove.
     pub(super) fn of(endpoint: &Endpoint) -> Result<Self> {
+        use aterm_db_core::peer_check::{Read, View as Held};
         let custody = endpoint.custody();
-        let (super::Custody::Log(paths) | super::Custody::Journal(paths)) = custody else {
-            return Ok(Self(None));
+        let (outcome, held, why) = match custody {
+            super::Custody::None => (Read::Absent, None, None),
+            super::Custody::Log(paths) | super::Custody::Journal(paths) => {
+                match super::held_records(paths) {
+                    Err(error) => (
+                        Read::Unread,
+                        None,
+                        Some(local_failure("records read for a peer check", error)),
+                    ),
+                    Ok(store) => match store.log() {
+                        None => (Read::Absent, None, None),
+                        Some(log)
+                            if matches!(
+                                log.genesis().body(),
+                                Body::Genesis { root, .. }
+                                    if root.network == endpoint.trust.network
+                                        && root.authority == endpoint.trust.authority
+                            ) && endpoint
+                                .snapshot_log
+                                .as_ref()
+                                .is_none_or(|own| own.network() == log.network()) =>
+                        {
+                            (Read::Clear, Some(store), None)
+                        }
+                        Some(_) => (Read::Foreign, None, None),
+                    },
+                }
+            }
         };
-        let store = match super::held_records(paths) {
-            Ok(store) => store,
-            Err(error) => return custody.unread(error).map(|()| Self(None)),
-        };
-        let ours = store.log().is_some_and(|log| {
-            matches!(
-                log.genesis().body(),
-                Body::Genesis { root, .. }
-                    if root.network == endpoint.trust.network
-                        && root.authority == endpoint.trust.authority
-            ) && endpoint
-                .snapshot_log
-                .as_ref()
-                .is_none_or(|own| own.network() == log.network())
-        });
-        Ok(Self(ours.then_some(store)))
+        match super::peer_check::view(custody.code(), outcome) {
+            Held::Held => Ok(Self(held)),
+            Held::None => Ok(Self(None)),
+            Held::Refuse => Err(why.unwrap_or_else(|| {
+                Error::new("this Mac's membership records cannot judge a Commons peer's push")
+            })),
+        }
     }
 
     pub(super) fn have(&self) -> Vec<Digest> {
@@ -302,7 +324,10 @@ fn lacked<'a>(
     held: Option<&Log>,
     records: impl IntoIterator<Item = &'a Record>,
     have: &[Digest],
-) -> Vec<Record> {
+) -> Vec<&'a Record> {
+    if have.is_empty() {
+        return records.into_iter().collect();
+    }
     let mut known = BTreeSet::new();
     let custody = endpoint
         .paths
@@ -317,7 +342,6 @@ fn lacked<'a>(
     records
         .into_iter()
         .filter(|record| !known.contains(record.id()))
-        .cloned()
         .collect()
 }
 
@@ -383,21 +407,20 @@ pub(super) fn send_evidence(
     session: &Session,
 ) -> Result<()> {
     let wire = session.wire;
-    let records = match evidence {
+    let wires: Vec<&[u8]> = match evidence {
         Evidence::Log(log) => {
             // Bootstrap already selected the evidence needed for the seat,
             // restored node keys and audience access. Taking only the seat's
             // ancestors again can discard those later proofs.
             admit_by_log_witness(log, target.binding())?;
             match wire {
-                Wire::Whole => log.records().cloned().collect(),
-                Wire::Delta => lacked(endpoint, Some(log), log.records(), session.have),
+                Wire::Whole => log.records().map(Record::bytes).collect(),
+                Wire::Delta => lacked(endpoint, Some(log), log.records(), session.have)
+                    .into_iter()
+                    .map(Record::bytes)
+                    .collect(),
             }
         }
-        Evidence::Node(_) => Vec::new(),
-    };
-    let wires: Vec<&[u8]> = match evidence {
-        Evidence::Log(_) => records.iter().map(Record::bytes).collect(),
         Evidence::Node(node) => vec![node],
     };
     send_evidence_wires(
@@ -440,11 +463,13 @@ fn send_evidence_wires(
     {
         return Err(Error::new("Commons evidence exceeds its bound"));
     }
-    let mut header = b"AEV4".to_vec();
-    put_bound(&mut header, bound);
-    header.push(u8::from(log));
-    header.extend_from_slice(&(wires.len() as u32).to_be_bytes());
-    header.extend_from_slice(&(bytes as u64).to_be_bytes());
+    let mut header = [0u8; EVIDENCE_HEADER];
+    header[..4].copy_from_slice(b"AEV4");
+    header[4..8].copy_from_slice(&bound.held.to_be_bytes());
+    header[8] = u8::from(bound.crossed);
+    header[9] = u8::from(log);
+    header[10..14].copy_from_slice(&(wires.len() as u32).to_be_bytes());
+    header[14..22].copy_from_slice(&(bytes as u64).to_be_bytes());
     send_frame(stream, &header)?;
     for frame in wires {
         compatible(endpoint, remote)?;
@@ -635,7 +660,9 @@ fn overlay(endpoint: &Endpoint, view: &View, pushed: Vec<Record>) -> Result<(Log
     Ok((log.clone(), taken))
 }
 
-fn verify_evidence(endpoint: &Endpoint, peer: &Metadata, evidence: &Received) -> Result<()> {
+/// Check `peer` on its `evidence` ([`verify_peer_against_local_log`]): the pass the next grant
+/// to it takes.
+fn verify_evidence(endpoint: &Endpoint, peer: &Metadata, evidence: &Received) -> Result<Pass> {
     verify_peer_against_local_log(
         endpoint.custody(),
         endpoint.trust,
@@ -708,8 +735,8 @@ pub(super) fn connected(
                 &session,
                 wire.evidence_bytes(),
             )?;
-            verify_evidence(endpoint, &peer, &theirs)?;
-            let lease = lease_after_evidence(endpoint, repair, actor, side, until)?;
+            let pass = verify_evidence(endpoint, &peer, &theirs)?;
+            let lease = lease_after_evidence(pass, endpoint, repair, actor, side, until)?;
             (theirs, lease)
         }
         Side::Responder => {
@@ -722,10 +749,11 @@ pub(super) fn connected(
                 &session,
                 wire.evidence_bytes(),
             )?;
-            verify_evidence(endpoint, &peer, &theirs)?;
-            let lease = lease_after_evidence(endpoint, repair, actor, side, until)?;
+            let pass = verify_evidence(endpoint, &peer, &theirs)?;
+            let lease = lease_after_evidence(pass, endpoint, repair, actor, side, until)?;
             compatible(endpoint, peer.bound)?;
-            verify_evidence(endpoint, &peer, &theirs)?;
+            // The responder sends its own evidence only to a peer a check passed after its lease.
+            verify_evidence(endpoint, &peer, &theirs)?.spend();
             send_evidence(
                 endpoint,
                 stream,
@@ -739,8 +767,9 @@ pub(super) fn connected(
     };
     drop(view);
     compatible(endpoint, peer.bound)?;
-    verify_evidence(endpoint, &peer, &theirs)?;
+    let pass = verify_evidence(endpoint, &peer, &theirs)?;
     let control = exchange(
+        pass,
         stream,
         &Disk {
             dir: &endpoint.dir,
@@ -751,7 +780,9 @@ pub(super) fn connected(
     )?;
     if own.flags & peer.flags & RECORDS != 0 {
         lease.phase = Phase::MembershipRecords;
+        let pass = verify_evidence(endpoint, &peer, &theirs)?;
         match repair_records(
+            pass,
             endpoint,
             stream,
             side,
@@ -791,43 +822,37 @@ pub(super) fn connected(
         }
     }
     compatible(endpoint, peer.bound)?;
-    verify_evidence(endpoint, &peer, &theirs)?;
+    let pass = verify_evidence(endpoint, &peer, &theirs)?;
     if own.flags & peer.flags & APPLICATION != 0 {
-        endpoint.repair_application(stream, actor, side, &mut lease, Protocol::Frontier(wire));
+        endpoint.repair_application(
+            pass,
+            stream,
+            actor,
+            side,
+            &mut lease,
+            Protocol::Frontier(wire),
+        );
         if lease.application_error.is_none() {
             lease.phase = Phase::VersionReport;
             lease.said = endpoint.trade_reports(stream, actor, side);
             if own.flags & peer.flags & CREDENTIALS != 0 {
                 compatible(endpoint, peer.bound)?;
-                verify_evidence(endpoint, &peer, &theirs)?;
+                let pass = verify_evidence(endpoint, &peer, &theirs)?;
                 lease.phase = Phase::Credentials;
-                if let (Some(paths), Some((owner, config))) =
-                    (&endpoint.paths, &endpoint.credentials)
-                {
-                    lease.handoff = Some(
-                        crate::credentials::handoff::exchange(
-                            paths,
-                            config,
-                            owner,
-                            endpoint.trust.network,
-                            endpoint.actor,
-                            actor,
-                            side,
-                            stream,
-                        )
-                        .map_err(|_| "credential handoff failed".to_owned()),
-                    );
-                }
+                lease.handoff = endpoint.hand_off_credentials(pass, actor, side, stream);
             }
             lease.phase = Phase::Complete;
         }
     } else {
+        pass.waive();
         lease.phase = Phase::ControlComplete;
     }
     Ok(control)
 }
 
+/// The lease on `actor`'s channel once its evidence passed, the grant `pass` clears.
 fn lease_after_evidence<'a>(
+    pass: Pass,
     endpoint: &'a Endpoint,
     repair: &'a mut Repair,
     actor: Actor,
@@ -839,7 +864,7 @@ fn lease_after_evidence<'a>(
     repair.authenticated = Some(authenticated);
     repair.phase = Phase::PeerAdmission;
     let preferred = (endpoint.actor < actor) == (side == Side::Initiator);
-    let mut lease = endpoint.peers.acquire_on(actor, repair, preferred, until)?;
+    let mut lease = endpoint.lease_on(pass, actor, repair, preferred, until)?;
     #[cfg(test)]
     tests::peer_cache_stage(tests::PeerCacheStage::Acquired(side));
     lease.prepare(endpoint.trust, actor);
@@ -871,7 +896,8 @@ fn load_records(endpoint: &Endpoint) -> Result<(Records, RecordsBound)> {
 }
 
 pub(super) fn encode_frontier(bound: RecordsBound, ids: &[Digest]) -> Vec<u8> {
-    let mut wire = b"AFR4".to_vec();
+    let mut wire = Vec::with_capacity(13 + ids.len() * 32);
+    wire.extend_from_slice(b"AFR4");
     put_bound(&mut wire, bound);
     wire.extend_from_slice(&(ids.len() as u32).to_be_bytes());
     for id in ids {
@@ -904,7 +930,8 @@ fn decode_frontier(endpoint: &Endpoint, peer: &mut Metadata, wire: &[u8]) -> Res
         return Err(Error::new("Commons frontier exceeds its bound"));
     }
     let ids: Vec<Digest> = wire[13..].as_chunks::<32>().0.to_vec();
-    if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+    let mut seen = BTreeSet::new();
+    if !ids.iter().all(|id| seen.insert(id)) {
         return Err(Error::new("Commons frontier repeats an id"));
     }
     peer.bound = bound;
@@ -920,10 +947,12 @@ fn send_batch(
 ) -> Result<Report> {
     let bound = compatible(endpoint, peer)?;
     let bytes: usize = records.iter().map(|record| record.bytes().len()).sum();
-    let mut header = b"ABT4".to_vec();
-    put_bound(&mut header, bound);
-    header.extend_from_slice(&(records.len() as u32).to_be_bytes());
-    header.extend_from_slice(&(bytes as u64).to_be_bytes());
+    let mut header = [0u8; 21];
+    header[..4].copy_from_slice(b"ABT4");
+    header[4..8].copy_from_slice(&bound.held.to_be_bytes());
+    header[8] = u8::from(bound.crossed);
+    header[9..13].copy_from_slice(&(records.len() as u32).to_be_bytes());
+    header[13..21].copy_from_slice(&(bytes as u64).to_be_bytes());
     send_frame(stream, &header)?;
     for record in records {
         compatible(endpoint, peer)?;
@@ -999,7 +1028,8 @@ fn receive_batch(
         &wires,
     )
     .map_err(|e| local_failure("frontier retain", e))?;
-    let mut ack = b"ACK4".to_vec();
+    let mut ack = Vec::with_capacity(8 + held.len());
+    ack.extend_from_slice(b"ACK4");
     ack.extend_from_slice(&(held.len() as u32).to_be_bytes());
     ack.extend(held.iter().map(|held| u8::from(*held)));
     send_frame(stream, &ack)?;
@@ -1077,7 +1107,13 @@ enum Ending {
     Interrupted,
 }
 
+/// Repair membership records with the peer in bounded rounds, the grant `pass` clears.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a grant takes the pass its check minted by value, beside the session's seven"
+)]
 fn repair_records(
+    pass: Pass,
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
     side: Side,
@@ -1086,6 +1122,7 @@ fn repair_records(
     until: Instant,
     wire: Wire,
 ) -> Result<(Report, Ending)> {
+    pass.spend();
     let mut total = Report::default();
     let capacity = own_bound(endpoint)?.held.max(peer.bound.held) as usize;
     for _ in 0..wire.round_cap(capacity) {
@@ -1199,8 +1236,10 @@ fn enroll(
             session,
             session.wire.evidence_bytes(),
         )?;
-        verify_evidence(endpoint, peer, &evidence)?;
+        let pass = verify_evidence(endpoint, peer, &evidence)?;
         let challenge = receive_frame(stream, MAX_CHALLENGE)?;
+        // Answering commits this device to the member its check passed.
+        pass.spend();
         let response = bootstrap
             .device()
             .answer(&own.request, &challenge)
@@ -1250,18 +1289,11 @@ fn enroll(
         }
         let evidence = own_evidence(endpoint, &own.request)?;
         let log_backed = matches!(evidence, Evidence::Log(_));
-        if log_backed {
-            client::check_log_commons_enrollment(paths, endpoint.trust, peer.request.binding())
-                .map_err(failure)?;
-        } else {
-            let (admin, bootstrap) = enrollment::local_authority(endpoint, paths)?;
-            let journal = Journal::read_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
-            admin
-                .check_commons_enrollment(&bootstrap, &journal, peer.request.binding())
-                .map_err(failure)?;
-        }
-        let actor = peer.request.binding().actor();
-        let mut lease = endpoint.peers.acquire(actor, repair)?;
+        let request = peer.request.clone();
+        let check = || enrollment::check(endpoint, paths, &request, log_backed);
+        let pass = check()?;
+        let actor = request.binding().actor();
+        let mut lease = endpoint.lease(pass, actor, repair)?;
         lease.begin_round();
         lease.phase = Phase::Membership;
         send_evidence(
@@ -1283,6 +1315,10 @@ fn enroll(
         let possession = pending.verify(&response).map_err(failure)?;
         compatible(endpoint, peer.bound)?;
         check_local_bootstrap(endpoint, paths, own)?;
+        // The member authors the device's seat only on a fresh check: a `Remove` made durable
+        // here during the challenge refuses it.
+        let pass = check()?;
+        pass.spend();
         let sent = if log_backed {
             let chain = client::enroll_commons_member_in_log(
                 paths,
@@ -1291,11 +1327,13 @@ fn enroll(
                 possession,
             )
             .map_err(failure)?;
-            let push = match session.wire {
-                Wire::Whole => chain,
-                Wire::Delta => lacked(endpoint, None, &chain, session.have),
+            let wires: Vec<_> = match session.wire {
+                Wire::Whole => chain.iter().map(Record::bytes).collect(),
+                Wire::Delta => lacked(endpoint, None, &chain, session.have)
+                    .into_iter()
+                    .map(Record::bytes)
+                    .collect(),
             };
-            let wires: Vec<_> = push.iter().map(Record::bytes).collect();
             send_evidence_wires(
                 endpoint,
                 stream,
@@ -1305,7 +1343,7 @@ fn enroll(
                 &wires,
                 MAX_RECORDS_STREAM,
             )?;
-            push.len()
+            wires.len()
         } else {
             let (admin, bootstrap) = enrollment::local_authority(endpoint, paths)?;
             let node = {

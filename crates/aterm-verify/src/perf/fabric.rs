@@ -114,7 +114,9 @@ pub(crate) struct Args {
     pub asks: Option<u32>,
     /// One person-lane post every this many messages in the ask scenario's mix (`--mix-every`).
     pub mix_every: Option<u32>,
-    /// Records behind every session's refill watermark in the attach world (`--attach-backlog`).
+    /// The attach world's backlog (`--attach-backlog`): in the bench's process, records behind
+    /// every session's refill watermark; with an outside broker, records for each population
+    /// seeded into its log before it starts (`bench_spec::Spec::backlog`).
     pub backlog: Option<u32>,
     /// Rows the ask world's asked table is pre-filled to (`--asked-prefill`).
     pub asked_prefill: Option<u32>,
@@ -1015,6 +1017,40 @@ mod tests {
                 .unwrap_err()
                 .contains("the fabric bench refuses this run"),
             "the bench's own refusal comes before the build"
+        );
+        // F09: the attach world's backlog seeds the shipped broker's log; its log is sealed, as
+        // every fabric root's broker serves it, so a plaintext arm is refused before the build.
+        let mut o = BTreeMap::new();
+        o.insert("--broker-process", "background".to_string());
+        o.insert("--scenario", "attach".to_string());
+        o.insert("--attach-sessions", "8,32".to_string());
+        o.insert("--attach-backlog", "510000".to_string());
+        let a = Args::from_options(&o).expect("the seeded arm parses");
+        let arm = a.plan()[0];
+        assert!(
+            a.command_line(arm).contains(" --attach-backlog 510000")
+                && a.bench_words(arm).contains("backlog=510000"),
+            "{}",
+            a.command_line(arm)
+        );
+        o.insert("--at-rest", "off".to_string());
+        assert!(
+            Args::from_options(&o)
+                .unwrap_err()
+                .contains("the fabric bench refuses this run")
+        );
+        o.remove("--at-rest");
+        // A seed short of the cold reads' records is refused before the build, not after the
+        // timed world: 40,000 for each of two populations seeds 80,000.
+        o.insert("--attach-backlog", "40000".to_string());
+        let why = Args::from_options(&o).expect_err("a seed short of the cold reads");
+        assert!(
+            why.contains("the fabric bench refuses this run")
+                && why.contains(&format!(
+                    "at least {}",
+                    bench_spec::COLD_RECORDS.div_ceil(2)
+                )),
+            "{why}"
         );
     }
 

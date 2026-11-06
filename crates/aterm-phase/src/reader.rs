@@ -443,6 +443,13 @@ pub trait ScreenReader: Sync {
             .rposition(|r| !crate::text::trim(r).is_empty())
             .map_or(0, |i| i + 1)
     }
+    /// The screen's rows as this program's transcript readers read them
+    /// ([`crate::phase::Transcript`]): Claude Code's, each row above its composer's top rule cut
+    /// at its side panel's rule; the default, `rows` whole, for a program whose side panel no
+    /// reader here reads.
+    fn transcript<'a>(&self, rows: &'a [String]) -> crate::phase::Transcript<'a> {
+        crate::phase::Transcript::whole(rows)
+    }
     /// Usage-credits notice shown on `rows`, if any.
     fn credits(&self, _rows: &[String]) -> Option<crate::credits::Credits> {
         None
@@ -692,6 +699,9 @@ impl ScreenReader for ClaudeReader {
     }
     fn transcript_end(&self, rows: &[String]) -> usize {
         crate::phase::transcript_end(rows)
+    }
+    fn transcript<'a>(&self, rows: &'a [String]) -> crate::phase::Transcript<'a> {
+        crate::phase::Transcript::of(rows)
     }
     fn credits(&self, rows: &[String]) -> Option<crate::credits::Credits> {
         crate::credits::in_use(rows)

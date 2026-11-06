@@ -162,8 +162,8 @@ pub fn bar(f: &Facts) -> Option<Bar> {
     let off = f
         .accounts
         .as_ref()
-        .and_then(|a| a.off)
-        .or_else(|| f.login_pool().and_then(|p| p.off));
+        .and_then(|a| a.off.as_deref())
+        .or_else(|| f.login_pool().and_then(|p| p.off.as_deref()));
     if let Some(switch) = off {
         return Some(Bar {
             why: format!("{switch} keeps aterm's unattended sign-ins off here"),

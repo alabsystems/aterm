@@ -31,13 +31,14 @@ fn grok() -> &'static super::super::WorkerCli {
     worker_cli(Program::Grok).expect("a Grok Build worker row")
 }
 
-/// A GROK BUILD STARTER LENDS ITS WORKER ONLY ITS LEADER SOCKET (how its sessions reach xAI),
-/// spelled either way, with its value; its model, posture, session, folders and prompt stay its
-/// own, and an option value that looks like a flag or a subcommand word is read as the value.
-/// A starter running a subcommand or a one-shot prompt lends nothing; an option 1.0.70's
-/// `--help` does not list, or a switch given a value, is refused as typed.
+/// A GROK BUILD STARTER LENDS ITS WORKER ITS LEADER SOCKET (how its sessions reach xAI), spelled
+/// either way, with its value, then its posture held to the floor ([`WORKER_FLOOR`]: one that
+/// always approves keeps its own, with its sandbox); its model, permission rules, session, folders
+/// and prompt stay its own, and an option value that looks like a flag or a subcommand word is
+/// read as the value. A starter running a subcommand or a one-shot prompt lends only the floor;
+/// an option 1.0.70's `--help` does not list, or a switch given a value, is refused as typed.
 #[test]
-fn a_grok_starter_lends_its_worker_only_its_leader_socket() {
+fn a_grok_starter_lends_its_worker_its_leader_socket_and_its_posture() {
     let argv = words(&[
         "/p/agents/grok",
         "--model",
@@ -49,6 +50,8 @@ fn a_grok_starter_lends_its_worker_only_its_leader_socket() {
         "0b5c6c33-1f7e-4a59-9d2a-6f1e2d3c4b5a",
         "--resume",
         "--sandbox=strict",
+        "--allow",
+        "Bash(ls)",
         "--cwd",
         "update",
         "the first prompt",
@@ -57,58 +60,65 @@ fn a_grok_starter_lends_its_worker_only_its_leader_socket() {
         "/not/an/option",
     ]);
     assert_eq!(
-        config_flags(&argv),
+        worker_flags(&argv),
         Ok(words(&[
             "--leader-socket",
-            "/Users//u/.grok/leader-work-0123abcd.sock"
+            "/Users//u/.grok/leader-work-0123abcd.sock",
+            "--always-approve",
+            "--sandbox=strict",
         ]))
     );
     assert_eq!(
-        config_flags(&words(&[
+        worker_flags(&words(&[
             "grok",
             "--leader-socket=/s/leader-a.sock",
             "-m",
             "x"
         ])),
-        Ok(words(&["--leader-socket=/s/leader-a.sock"]))
+        Ok(words(&[
+            "--leader-socket=/s/leader-a.sock",
+            "--permission-mode",
+            "auto"
+        ]))
     );
-    for lends_nothing in [
+    for lends_the_floor in [
         &["grok", "--leader-socket", "/s", "sessions", "list"][..],
         &["grok", "--leader-socket", "/s", "-p", "hi"],
         &["grok", "--leader-socket", "/s", "--prompt-file", "/t"],
         &["grok", "--leader-socket", "/s", "--version"],
+        &["grok", "--always-approve", "-p", "hi"],
         &["grok", "a prompt", "update"],
+        &["grok"],
     ] {
         assert_eq!(
-            config_flags(&words(lends_nothing)),
-            Ok(Vec::new()),
-            "{lends_nothing:?}"
+            worker_flags(&words(lends_the_floor)),
+            Ok(words(&WORKER_FLOOR)),
+            "{lends_the_floor:?}"
         );
     }
     assert_eq!(
-        config_flags(&words(&["grok", "--brand-new", "--leader-socket", "/s"])),
+        worker_flags(&words(&["grok", "--brand-new", "--leader-socket", "/s"])),
         Err("--brand-new".to_string())
     );
     assert_eq!(
-        config_flags(&words(&["grok", "--always-approve=yes"])),
+        worker_flags(&words(&["grok", "--always-approve=yes"])),
         Err("--always-approve=yes".to_string())
     );
     assert_eq!(
-        config_flags(&words(&["grok", "-mx"])),
+        worker_flags(&words(&["grok", "-mx"])),
         Err("-mx".to_string()),
         "a short option is never read attached"
     );
     assert_eq!(
-        config_flags(&words(&["grok", "--leader-socket"])),
+        worker_flags(&words(&["grok", "--leader-socket"])),
         Err("--leader-socket".to_string()),
         "a value-taking flag with no value"
     );
     assert_eq!(
-        config_flags(&words(&["grok", "--model", "--", "--unknown"])),
+        worker_flags(&words(&["grok", "--model", "--", "--unknown"])),
         Err("--model".to_string()),
         "a value-taking flag before `--` with no value"
     );
-    assert_eq!(config_flags(&words(&["grok"])), Ok(Vec::new()));
 }
 
 /// A GROK BUILD STARTER'S HOMES RIDE ITS WORKER: its own `GROK_HOME` and pooled

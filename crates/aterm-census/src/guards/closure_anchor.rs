@@ -287,4 +287,33 @@ mod tests {
         // machines (`AnotherCase` in three Codex models).
         assert!(found[0].detail.contains("`M`") && found[0].detail.contains("`Bench`"));
     }
+
+    /// A module its parent declares test-only stays out of the library though a test target, a
+    /// bench or an example mounts it too: what a dev target loads ships nothing
+    /// (`Corpus::shipped_loads`). A shipped line's mount links it.
+    #[test]
+    fn a_test_module_a_dev_target_also_mounts_stays_unlinked() {
+        let rig = waiver("M", "Rig");
+        let mount = "#[path = \"../src/rig.rs\"]\nmod rig;\n";
+        let found = |lib: &str, mounter: Option<&str>| {
+            let mut files = vec![("crates/x/src/lib.rs", lib), ("crates/x/src/rig.rs", &rig)];
+            files.extend(mounter.map(|rel| (rel, mount)));
+            spots(&run(&CLOSURE_ANCHOR, &files))
+        };
+        let declared = "#[cfg(test)]\nmod rig;\n";
+        for mounter in [
+            None,
+            Some("crates/x/tests/mount.rs"),
+            Some("crates/x/benches/mount.rs"),
+            Some("crates/x/examples/mount.rs"),
+        ] {
+            assert_eq!(
+                found(declared, mounter),
+                ["crates/x/src/rig.rs:3"],
+                "{mounter:?}"
+            );
+        }
+        let shipped = "#[cfg(test)]\nmod rig;\n#[path = \"rig.rs\"]\nmod again;\n";
+        assert!(found(shipped, None).is_empty());
+    }
 }

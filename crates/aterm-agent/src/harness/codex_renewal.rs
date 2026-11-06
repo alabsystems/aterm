@@ -167,7 +167,7 @@ fn renewal_policy_on(config: &Path) -> bool {
     warnings.is_empty()
         && policy.relaunch
         && policy.resume_limits
-        && accounts_sync::sign_ins_off_for(config, accounts::Cli::Codex).is_none()
+        && accounts_sync::sign_ins_on(config, accounts::Cli::Codex)
 }
 
 /// Read the same bound account's successor. `old_auth` comes only from a
@@ -833,26 +833,28 @@ pub fn prepare_restart(
     else {
         return Err("restart-plan");
     };
-    let mut state = upgrade_drive::load(opts, &key).unwrap_or_else(|| upgrade_drive::St {
-        pid: process.pid,
-        shell: shell.pid,
-        tab: sid.into(),
-        phase: super::upgrade::Phase::Exiting {
-            at_s: upgrade_drive::now_s(),
-        },
-        source: upgrade_drive::SAME_PROGRAM.into(),
-        to: "same".into(),
-        line: forward.legacy_line().unwrap_or_default(),
-        back_line: rollback
-            .as_ref()
-            .and_then(|back| back.legacy_line())
-            .unwrap_or_default(),
-        native_prepare: native_act::Request::prepare(prepare.clone())
-            .encode()
-            .unwrap_or_default(),
-        native_coordination: true,
-        ..Default::default()
-    });
+    let mut state = upgrade_drive::load_record(opts, &key)
+        .map_err(|_| "restart-record-unreadable")?
+        .unwrap_or_else(|| upgrade_drive::St {
+            pid: process.pid,
+            shell: shell.pid,
+            tab: sid.into(),
+            phase: super::upgrade::Phase::Exiting {
+                at_s: upgrade_drive::now_s(),
+            },
+            source: upgrade_drive::SAME_PROGRAM.into(),
+            to: "same".into(),
+            line: forward.legacy_line().unwrap_or_default(),
+            back_line: rollback
+                .as_ref()
+                .and_then(|back| back.legacy_line())
+                .unwrap_or_default(),
+            native_prepare: native_act::Request::prepare(prepare.clone())
+                .encode()
+                .unwrap_or_default(),
+            native_coordination: true,
+            ..Default::default()
+        });
     upgrade_drive::save_checked(opts, &key, &state).map_err(|_| "restart-record")?;
     let mut client = upgrade_drive::connect(opts, sid).map_err(|_| "private-client")?;
     let recovery = super::native_restart::recover(opts, &key, &mut client, sid, &mut state);
@@ -899,7 +901,7 @@ pub fn reconcile_restart(
 ) {
     use super::{native_restart, upgrade_drive};
     let key = format!("renewal-{}", prepare.id);
-    let Some(mut state) = upgrade_drive::load(opts, &key) else {
+    let Ok(Some(mut state)) = upgrade_drive::load_record(opts, &key) else {
         return;
     };
     let Ok(mut client) = upgrade_drive::connect(opts, sid) else {
@@ -937,7 +939,7 @@ fn drive_admitted(
 ) -> Option<RestartCompletion> {
     use super::{native_restart, upgrade_drive};
     let key = format!("renewal-{}", prepare.id);
-    let mut state = upgrade_drive::load(opts, &key)?;
+    let mut state = upgrade_drive::load_record(opts, &key).ok()??;
     let mut client = upgrade_drive::connect(opts, sid).ok()?;
     native_restart::recover(opts, &key, &mut client, sid, &mut state).ok()?;
     drive_connection(opts, sid, prepare, state, client, signal_original)
@@ -1144,7 +1146,7 @@ pub fn completed_restart(
     opts: &super::upgrade_drive::Opts,
     id: &str,
 ) -> Option<(bool, super::native_observe::SavedObservation)> {
-    let state = super::upgrade_drive::load(opts, &format!("renewal-{id}"))?;
+    let state = super::upgrade_drive::load_record(opts, &format!("renewal-{id}")).ok()??;
     let prepare = state.native_completed_prepare.as_ref()?;
     if prepare.id != id {
         return None;
@@ -1175,7 +1177,7 @@ pub fn authorized_descendant(
     let Some(key) = super::upgrade::Agent::Codex.record_key(&receipt.sid) else {
         return false;
     };
-    let Some(state) = super::upgrade_drive::load(opts, &key) else {
+    let Ok(Some(state)) = super::upgrade_drive::load_record(opts, &key) else {
         return false;
     };
     if !state.native_coordination

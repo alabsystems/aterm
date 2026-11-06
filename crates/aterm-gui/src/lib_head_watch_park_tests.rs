@@ -462,7 +462,7 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         .is_some_and(|pending| pending.worker.is_finished())
         && Instant::now() < deadline
     {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert!(model.fire("FinishPublished", &mut state));
     assert_eq!(modeled_index_owner(&watch), 1, "ready still owned");

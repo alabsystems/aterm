@@ -331,12 +331,15 @@ impl StripTab {
         )
     }
 
-    /// Extracts the `driven by aterm (…)` line from the tab's tooltip.
+    /// Extracts the who-drives line naming an Autopilot from the tab's tooltip: `driven by aterm
+    /// (…)`, or `codex-alab autopilot (…)` on a tab whose codex-alab proved its own claim (the
+    /// Overview's `Driver::CodexAlab`, since `79cdc2c3d8`), read by the heads the window writes
+    /// it with (`acts::is_driver_line`).
     #[must_use]
     pub fn driven(&self) -> Option<String> {
         self.tip.as_deref().and_then(|tip| {
             tip.lines()
-                .find(|l| l.starts_with("driven by "))
+                .find(|l| aterm_agent::harness::acts::is_driver_line(l))
                 .map(str::to_string)
         })
     }
@@ -3008,6 +3011,9 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
         Err(v) => return v,
     };
     let w = &seen.window;
+    if let Some(v) = n_unglanced(w, cx.t0, k, (from, until)) {
+        return v;
+    }
     let mut bad = Vec::new();
     let chips = chips_in(seen, from, until);
     if !w.front_tab {
@@ -3078,15 +3084,41 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     told(said, &bad, &unread)
 }
 
+/// UNOBSERVED where no window read fell in N`k+1`'s span (`(from, until)`): no glance's Harness
+/// page or tooltip read, nor a chip, menu or page change, between its reply and its next act. The
+/// menu and page the span settles on are then a read from before its reply or none, which say
+/// nothing of the step (Muse Code's N1, 2026-11-05: the watch's first read of cruise-n came at
+/// +129.3 s, after its first need's 2 min back-off had closed the span, and the judges failed it
+/// on rows nobody read).
+fn n_unglanced(w: &Window, t0: i64, k: usize, (from, until): (i64, i64)) -> Option<Verdict> {
+    let inside = |t: &i64| *t > from && *t < until;
+    let read = w.page_reads.iter().chain(&w.hover_reads).any(inside)
+        || [&w.chip, &w.menu, &w.page]
+            .into_iter()
+            .flatten()
+            .any(|(t, _)| inside(t));
+    (!read).then(|| {
+        Verdict::Unobserved(format!(
+            "no window read in N{}'s span (+{} to +{})",
+            k + 1,
+            at(t0, from),
+            at(t0, until)
+        ))
+    })
+}
+
 /// N1–N4's further needs, each on a row of its own one level in under the tab's row (`indent=1`).
 const N_OTHERS: [&[&str]; 4] = [&[NEED_B], &[], &[], &[NEED_C]];
 
 /// N1–N4's rows one level in.
 fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
-    let until = match n_span(seen, cx.t0, k) {
-        Ok((_, until)) => until,
+    let (from, until) = match n_span(seen, cx.t0, k) {
+        Ok(s) => s,
         Err(v) => return v,
     };
+    if let Some(v) = n_unglanced(&seen.window, cx.t0, k, (from, until)) {
+        return v;
+    }
     let menu = settled(&seen.window.menu, until);
     let under: Vec<&str> = menu
         .map(|(_, m)| rows_in(m, "needs"))

@@ -321,18 +321,18 @@ fn false_or_duplicate_observations_and_duplicate_intents_fail_closed() {
             4 => {}
             _ => unreachable!(),
         }
-        let bytes = if fault == 4 {
-            ledger::Debit {
+        if fault == 4 {
+            let bytes = ledger::Debit {
                 allocation: allocation.id(),
                 request: REQUEST,
                 cost: 1,
                 cumulative: 1,
             }
-            .encode_attempt(OPERATION)
+            .encode_attempt(OPERATION);
+            raw_payload(&lab, &allocation, 0, &bytes);
         } else {
-            completion.encode()
-        };
-        raw_payload(&lab, &allocation, 0, &bytes);
+            raw_payload(&lab, &allocation, 0, &completion.encode());
+        }
         assert!(db.snapshot().is_err());
         assert!(
             db.dispatch_once([73; 16], 1, OPERATION, || panic!(

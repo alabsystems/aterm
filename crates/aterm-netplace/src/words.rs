@@ -54,17 +54,16 @@ impl Words<'_> {
         let local = at.saturating_add(offset.unwrap_or(0));
         let minute = local.rem_euclid(86_400) / 60;
         let ago_days = self.now_ms.saturating_sub(ms) / 86_400_000;
-        format!(
-            "{:02}:{:02}{}{}",
-            minute / 60,
-            minute % 60,
-            if offset.is_some() { "" } else { " UTC" },
-            if ago_days > 0 {
-                format!(" ({ago_days}d ago)")
-            } else {
-                String::new()
-            }
-        )
+        let zone = if offset.is_some() { "" } else { " UTC" };
+        if ago_days > 0 {
+            format!(
+                "{:02}:{:02}{zone} ({ago_days}d ago)",
+                minute / 60,
+                minute % 60
+            )
+        } else {
+            format!("{:02}:{:02}{zone}", minute / 60, minute % 60)
+        }
     }
 }
 
@@ -195,6 +194,7 @@ pub fn header(place: &Place, words: &Words<'_>) -> String {
 /// [`header`] without its label: the menu bar's first Fleet row and the doctor's row.
 #[must_use]
 pub fn summary(place: &Place, words: &Words<'_>) -> String {
+    use std::fmt::Write as _;
     let since = if place.at == Where::AlabLan {
         String::new()
     } else {
@@ -207,43 +207,42 @@ pub fn summary(place: &Place, words: &Words<'_>) -> String {
         alab_short(place, words)
     );
     if matches!(place.alab, Alab::Away { .. }) && place.reachable > 0 {
-        out.push_str(&format!(
-            " · {} of {} members here",
-            place.reachable,
-            known_or_q(place)
-        ));
+        match place.known {
+            Some(known) => {
+                let _ = write!(out, " · {} of {known} members here", place.reachable);
+            }
+            None => {
+                let _ = write!(out, " · {} of ? members here", place.reachable);
+            }
+        }
     }
     out
-}
-
-fn known_or_q(place: &Place) -> String {
-    place
-        .known
-        .map_or_else(|| "?".to_owned(), |known| known.to_string())
 }
 
 /// THE `sys net` LINE: where and since, the interface, address, subnet and gateway, the
 /// expensive and Low Data flags, the internet with its source, and the ALab LAN.
 #[must_use]
 pub fn line(place: &Place, words: &Words<'_>) -> String {
+    use std::fmt::Write as _;
     let mut parts = vec![format!(
         "{}{}",
         where_words(place),
         since_words(place, words)
     )];
     if place.at == Where::AlabLan {
-        let why = match place.recognised {
-            Some(Recognised::Members) => "members answered here".to_owned(),
-            Some(Recognised::Remembered) => format!(
-                "network {}",
-                place.network.as_ref().map_or("?", |id| id.short())
-            ),
-            Some(Recognised::Seeded) => {
-                "the fleet book's members answered on this subnet".to_owned()
+        parts[0].push_str(" (recognised: ");
+        match place.recognised {
+            Some(Recognised::Members) => parts[0].push_str("members answered here"),
+            Some(Recognised::Remembered) => {
+                parts[0].push_str("network ");
+                parts[0].push_str(place.network.as_ref().map_or("?", |id| id.short()));
             }
-            None => String::new(),
-        };
-        parts[0].push_str(&format!(" (recognised: {why})"));
+            Some(Recognised::Seeded) => {
+                parts[0].push_str("the fleet book's members answered on this subnet");
+            }
+            None => {}
+        }
+        parts[0].push(')');
     }
     if let Some(route) = &place.route {
         let link = place.path.map_or("", |path| path.link.word());
@@ -276,7 +275,7 @@ pub fn line(place: &Place, words: &Words<'_>) -> String {
     if !matches!(place.alab, Alab::Here)
         && let Some(last) = last_answer_words(place, words)
     {
-        alab.push_str(&format!(" ({last})"));
+        let _ = write!(alab, " ({last})");
     }
     parts.push(alab);
     if !matches!(place.alab, Alab::Here) {
@@ -290,24 +289,40 @@ pub fn line(place: &Place, words: &Words<'_>) -> String {
 /// members=<reachable>/<known>|- away_since_ms=<unix ms|->`, in this order.
 #[must_use]
 pub fn status_fields(place: &Place) -> String {
-    let opt = |ms: Option<u64>| ms.map_or_else(|| "-".to_owned(), |ms| ms.to_string());
-    let away = match place.alab {
-        Alab::Away { since_ms } => opt(since_ms),
-        _ => "-".to_owned(),
+    use std::fmt::Write as _;
+    let push_opt = |out: &mut String, ms: Option<u64>| match ms {
+        Some(ms) => {
+            let _ = write!(out, "{ms}");
+        }
+        None => out.push('-'),
     };
-    let members = match (place.at, place.known) {
-        (Where::Offline, _) | (_, None) => "-".to_owned(),
-        (_, Some(known)) => format!("{}/{known}", place.reachable),
-    };
-    format!(
-        "net={} net_kind={} net_since_ms={} internet={} internet_ms={} members={members} \
-         away_since_ms={away}",
+    let mut out = String::with_capacity(96);
+    let _ = write!(
+        out,
+        "net={} net_kind={} net_since_ms=",
         place.at.word(),
         place.kind.map_or("-", Kind::word),
-        opt(place.since_ms),
-        place.internet.state.word(),
-        opt(place.internet.at_ms),
-    )
+    );
+    push_opt(&mut out, place.since_ms);
+    let _ = write!(
+        out,
+        " internet={} internet_ms=",
+        place.internet.state.word()
+    );
+    push_opt(&mut out, place.internet.at_ms);
+    out.push_str(" members=");
+    match (place.at, place.known) {
+        (Where::Offline, _) | (_, None) => out.push('-'),
+        (_, Some(known)) => {
+            let _ = write!(out, "{}/{known}", place.reachable);
+        }
+    }
+    out.push_str(" away_since_ms=");
+    match place.alab {
+        Alab::Away { since_ms } => push_opt(&mut out, since_ms),
+        _ => out.push('-'),
+    }
+    out
 }
 
 /// `status`'s fields when no place could be read: every value `-`.

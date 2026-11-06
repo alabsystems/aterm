@@ -3,6 +3,7 @@
 
 //! Overview card (`⌘⇧O` / `Ctrl+Shift+O`): session chips, fabric needs, and manager lines.
 
+use aterm_agent::harness::acts;
 #[cfg(test)]
 use aterm_render::Theme;
 use aterm_session::SessionId;
@@ -84,8 +85,8 @@ impl Driver {
             Self::You => "you have it".to_string(),
             Self::WorkerOf(manager) => format!("worker of {manager}"),
             Self::WorkerOfElsewhere(sid) => format!("worker of {sid} (not here)"),
-            Self::Aterm(autopilot) => format!("driven by aterm ({autopilot})"),
-            Self::CodexAlab(autopilot) => format!("codex-alab autopilot ({autopilot})"),
+            Self::Aterm(autopilot) => acts::driver_line(acts::ATERM_DRIVES, autopilot),
+            Self::CodexAlab(autopilot) => acts::driver_line(acts::CODEX_ALAB_DRIVES, autopilot),
         }
     }
 

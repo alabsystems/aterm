@@ -40,23 +40,24 @@ impl Secret {
             return Err(Error::new("secret cell exceeds its size limit"));
         }
         let nonce = crate::crypto::random::<12>()?;
-        let mut body = Zeroizing::new(Vec::with_capacity(self.0.len() + 16));
-        body.extend_from_slice(self.0.as_bytes());
-        cipher(key)?
-            .seal_in_place_append_tag(
+        let mut wire = Zeroizing::new(Vec::with_capacity(12 + self.0.len() + 16));
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(self.0.as_bytes());
+        let tag = cipher(key)?
+            .seal_in_place_separate_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
                 aead::Aad::from(cell.aad(epoch)),
-                &mut *body,
+                &mut wire[12..],
             )
             .map_err(|_| Error::new("secret cell could not be sealed"))?;
-        let mut wire = Vec::with_capacity(12 + body.len());
-        wire.extend_from_slice(&nonce);
-        wire.extend_from_slice(&body);
-        Ok(format!(
-            "sec1:{}:{}",
-            aterm_codec::hex::encode_lower(epoch),
-            aterm_secrets::b64::encode_padded(&wire)
-        ))
+        wire.extend_from_slice(tag.as_ref());
+        let b64 = aterm_secrets::b64::encode_padded(&wire);
+        let mut out = String::with_capacity(5 + 64 + 1 + b64.len());
+        out.push_str("sec1:");
+        aterm_codec::hex::push_lower(&mut out, epoch);
+        out.push(':');
+        out.push_str(&b64);
+        Ok(out)
     }
 }
 
@@ -376,15 +377,23 @@ pub(crate) fn open(token: &str, key: &[u8; 32], cell: Cell<'_>) -> Result<Secret
     let nonce: [u8; 12] = wire[..12]
         .try_into()
         .map_err(|_| Error::new("invalid secret nonce"))?;
-    let plain = cipher(key)?
+    let plain_len = cipher(key)?
         .open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(cell.aad(&epoch)),
             &mut wire[12..],
         )
-        .map_err(|_| Error::new("secret cell authentication failed"))?;
-    let text = std::str::from_utf8(plain).map_err(|_| Error::new("secret cell is not UTF-8"))?;
-    Ok(Secret::new(text.to_owned()))
+        .map_err(|_| Error::new("secret cell authentication failed"))?
+        .len();
+    wire.copy_within(12..12 + plain_len, 0);
+    wire[plain_len..].fill(0);
+    wire.truncate(plain_len);
+    let bytes = std::mem::take(&mut *wire);
+    let text = String::from_utf8(bytes).map_err(|err| {
+        let _ = Zeroizing::new(err.into_bytes());
+        Error::new("secret cell is not UTF-8")
+    })?;
+    Ok(Secret::new(text))
 }
 
 #[cfg(test)]

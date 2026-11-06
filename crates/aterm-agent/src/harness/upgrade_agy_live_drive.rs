@@ -10,8 +10,9 @@ use super::super::super::upgrade_agy_live::{self as live, Look, Message, Open};
 use super::super::build_start;
 use super::super::upgrade::{Agent, Phase, same_build};
 use super::super::{
-    Client, Due, Hand, LiveTab, Opts, Report, SAME_PROGRAM, St, Terminated, connect, held, load,
-    managed_agent_twin, now_s, restore, said, save, save_checked, screen, store_version, terminate,
+    Client, Due, Hand, LiveTab, Opts, Report, SAME_PROGRAM, St, Terminated, connect, held,
+    load_record, managed_agent_twin, now_s, restore, said, save, save_checked, screen,
+    store_version, terminate,
 };
 use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_held};
 
@@ -274,8 +275,9 @@ pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>)
     tabs.iter()
         .filter(|t| {
             leader(tabs, &t.sid, &super::super::Live).is_some()
-                || load(opts, &key(&t.sid))
-                    .is_some_and(|st| st.agent == Agent::Agy && st.in_flight())
+                || load_record(opts, &key(&t.sid)).map_or(true, |record| {
+                    record.is_some_and(|st| st.agent == Agent::Agy && st.in_flight())
+                })
         })
         .filter_map(|t| {
             let mut single = opts.clone();
@@ -619,7 +621,15 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    let prior = load(opts, &session_key);
+    let prior = match load_record(opts, &session_key) {
+        Ok(prior) => prior,
+        Err(_) => {
+            return Some(said(
+                report(leader(tabs, &tab, k).unwrap_or(0)),
+                format!("wait:{}", super::super::UNREAD_SAVED_RECORD),
+            ));
+        }
+    };
     if let Some(st) = prior
         .as_ref()
         .filter(|st| st.agent == Agent::Agy && st.in_flight())

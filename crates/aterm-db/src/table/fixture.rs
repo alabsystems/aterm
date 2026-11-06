@@ -33,7 +33,15 @@ pub const NETWORK: [u8; 16] = [9; 16];
 /// `rounds` repair passes in which the first Mac exchanges with every other, as a runtime does.
 pub fn repair_commons(lab: &Lab, rounds: usize) {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    repair_commons_with(lab, rounds, &members, None, None);
+    repair_commons_with(lab, rounds, &members, None, None, false);
+}
+
+/// [`repair_commons`] for a test whose setup requires every application round to complete.
+/// A cut fails at that exchange, including its diagnostic, before any later state assertion.
+#[cfg(test)]
+pub fn repair_commons_complete(lab: &Lab, rounds: usize) {
+    let members: Vec<usize> = (0..lab.paths.len()).collect();
+    repair_commons_with(lab, rounds, &members, None, None, true);
 }
 
 /// [`repair_commons`] with each round repairing `table` first, as a push names it
@@ -45,7 +53,7 @@ pub fn repair_commons(lab: &Lab, rounds: usize) {
 #[cfg(test)]
 pub fn repair_commons_first(lab: &Lab, rounds: usize, table: [u8; 32]) {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    let reports = repair_commons_with(lab, rounds, &members, None, Some(table));
+    let reports = repair_commons_with(lab, rounds, &members, None, Some(table), true);
     assert_repaired(&reports[0], rounds, members.len() - 1, table);
 }
 
@@ -59,7 +67,7 @@ pub fn repair_commons_among_first(
     table: [u8; 32],
 ) {
     assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
-    let reports = repair_commons_with(lab, rounds, members, Some(now), Some(table));
+    let reports = repair_commons_with(lab, rounds, members, Some(now), Some(table), true);
     assert_repaired(&reports[0], rounds, members.len() - 1, table);
 }
 
@@ -99,13 +107,13 @@ pub fn repair_commons_at(lab: &Lab, rounds: usize, now: &[u64]) {
 #[cfg(test)]
 pub fn repair_commons_among(lab: &Lab, rounds: usize, members: &[usize], now: &[u64]) {
     assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
-    repair_commons_with(lab, rounds, members, Some(now), None);
+    repair_commons_with(lab, rounds, members, Some(now), None, false);
 }
 
 /// [`repair_commons`], handing back each Mac's application report of every exchange, in order.
 pub fn repair_commons_reports(lab: &Lab, rounds: usize) -> Vec<Vec<crate::replica::Report>> {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    repair_commons_with(lab, rounds, &members, None, None)
+    repair_commons_with(lab, rounds, &members, None, None, false)
 }
 
 fn repair_commons_with(
@@ -114,6 +122,7 @@ fn repair_commons_with(
     members: &[usize],
     now: Option<&[u64]>,
     first: Option<[u8; 32]>,
+    require_complete: bool,
 ) -> Vec<Vec<crate::replica::Report>> {
     use crate::control::{Endpoint, Repair, Side};
     use aterm_net::lan::{Connection, Scope as LinkScope};
@@ -166,6 +175,19 @@ fn repair_commons_with(
                     .unwrap();
                 incoming.join().unwrap().unwrap();
             });
+            if require_complete {
+                for repair in [&*left, &*right] {
+                    assert!(
+                        repair.membership_error().is_none()
+                            && repair.application_error().is_none()
+                            && repair.application().is_some(),
+                        "Commons application round did not complete: membership={:?}, application={:?}, phase={:?}",
+                        repair.membership_error(),
+                        repair.application_error(),
+                        repair.phase()
+                    );
+                }
+            }
             reports[0].extend(left.application());
             reports[peer].extend(right.application());
         }

@@ -238,6 +238,49 @@ impl Thermal {
                 Throttle::Light
             }
     }
+
+    /// The CPU row's state, its well's ● (`docs/DESIGN-stats-deck-resources-2026-11-04.md`
+    /// §3.2): [`State::Warn`] at the OS's exact serious, [`State::Critical`] at its exact
+    /// critical. Nominal and fair draw none, nor does Low Power Mode alone, nor any level the
+    /// counter heuristic estimates: a deck mark comes only from a documented OS level.
+    #[must_use]
+    pub fn state(self) -> Option<State> {
+        if !self.exact {
+            return None;
+        }
+        match self.level {
+            Throttle::Heavy => Some(State::Warn),
+            Throttle::Severe => Some(State::Critical),
+            Throttle::None | Throttle::Light => None,
+        }
+    }
+}
+
+/// The Neural Engine as its reader last read it
+/// (`docs/DESIGN-stats-deck-resources-2026-11-04.md` §3.1). macOS reports no busy share, so it
+/// says only whether the engine is powered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AneSample {
+    /// Its cores, read once.
+    pub cores: u16,
+    /// Whether macOS keeps it powered now. Powered is not busy: it stays on for a while after
+    /// its work ends.
+    pub powered: bool,
+}
+
+/// The Neural Engine reader's self-check that failed (A2 §3.1). The reader reads no more for
+/// the process, and the snapshot carries the check in place of a reading. Nothing reads it yet:
+/// A2 §3.1 has the deck draw no tile for it and keep no space (S6), and `sys` name it (S9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AneCheck {
+    /// No registry entry of the engine's class matched (an Intel Mac).
+    Matched,
+    /// Its core count read no positive integer.
+    Cores,
+    /// Its power state read no integer from 0 to its maximum.
+    PowerState,
+    /// Its reads cost over 0.2 ms at p95 over the first 60.
+    Cost,
 }
 
 /// The kernel's memory pressure.
@@ -310,6 +353,8 @@ pub struct MemCounters {
     pub compressions: u64,
     /// Pages read in from files.
     pub pageins: u64,
+    /// The VM page size the page counts are in, bytes.
+    pub page_bytes: u64,
 }
 
 /// Paging per second over the memory reading's window.
@@ -325,6 +370,9 @@ pub struct MemRates {
     pub compress_ps: f64,
     /// Pages read in per second.
     pub pagein_ps: f64,
+    /// Compressor churn: bytes compressed plus bytes decompressed per second (the pages × the
+    /// page size), the waffle's compressed tile's heat (A1 §4.3).
+    pub churn_bps: f64,
     /// The window, ns.
     pub window_ns: u64,
 }
@@ -352,7 +400,11 @@ pub struct MemSample {
     pub wired: u64,
     /// Physical memory holding compressed pages (macOS compressor or Linux zswap), if reported.
     pub compressed: Option<u64>,
-    /// Reclaimable file cache in bytes.
+    /// The uncompressed bytes the compressor or zswap holds in [`Self::compressed`], if reported.
+    pub stored: Option<u64>,
+    /// Reclaimable file cache in bytes (macOS file-backed pages, the speculative ones among
+    /// them, plus purgeable; Linux page cache and buffers less shared memory, plus reclaimable
+    /// slab).
     pub cached: u64,
     /// Free memory in bytes (speculative pages excluded on macOS).
     pub free: u64,
@@ -368,6 +420,9 @@ pub struct MemSample {
     pub kernel_available_pct: Option<u8>,
     /// The commit charge against its limit, where the OS keeps one.
     pub commit: Option<CommitSample>,
+    /// The classes partition the memory the VM manages (macOS), so [`Self::not_in_vm`] is the
+    /// memory the OS keeps outside it rather than what the classes leave unnamed.
+    pub exact: bool,
 }
 
 /// Virtual memory promised against the system commit limit (enforced on Windows, advisory on
@@ -403,6 +458,27 @@ impl CommitSample {
 }
 
 impl MemSample {
+    /// The VM classes' sum: wired, app, compressed, cache and free.
+    #[must_use]
+    pub fn in_vm(&self) -> u64 {
+        [
+            self.wired,
+            self.app,
+            self.compressed.unwrap_or(0),
+            self.cached,
+            self.free,
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
+
+    /// Physical memory in no VM class (A1 §4.3's "not in VM"): `total` less [`Self::in_vm`], so
+    /// the classes and it sum to `total` wherever the classes do not overlap past it (then 0).
+    #[must_use]
+    pub fn not_in_vm(&self) -> u64 {
+        self.total.saturating_sub(self.in_vm())
+    }
+
     /// Memory in use (`app + wired + compressed`), capped at `total`.
     #[must_use]
     pub fn used(&self) -> u64 {
@@ -462,13 +538,8 @@ pub struct VolumeSample {
 }
 
 impl VolumeSample {
-    /// Bytes in occupied blocks, excluding free blocks reserved from this user.
-    #[must_use]
-    pub fn occupied(&self) -> u64 {
-        self.total.saturating_sub(self.free)
-    }
-
-    /// Bytes unavailable to this user's writes: capacity less writable available blocks.
+    /// Bytes used: capacity less what this user could still write, so free blocks the volume
+    /// reserves from this user count as used, as the Disk row's % does.
     #[must_use]
     pub fn used(&self) -> u64 {
         self.total.saturating_sub(self.available)
@@ -965,6 +1036,9 @@ pub struct Sample {
     pub plan: Option<PlanFact>,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
+    /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
+    /// where no reader runs (every OS but macOS).
+    pub ane: Option<Result<AneSample, AneCheck>>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
     /// Whether the process sweep stopped at its cap.
@@ -989,6 +1063,9 @@ pub struct Sample {
     pub note_events: Vec<StripEvent>,
     /// Explicit wall-clock discontinuities recorded by the host on this sample.
     pub note_gaps: Vec<TimeGap>,
+    /// The physical devices home's volume and the front tab's are stored on, home's first, and
+    /// their I/O counters ([`crate::units::BlockSample`]).
+    pub block: Vec<crate::units::BlockSample>,
 }
 
 /// One core's load.
@@ -1526,9 +1603,9 @@ pub enum State {
     Zombies,
     /// A stuck job (⊘).
     Stuck,
-    /// Warn (◢ disk, ● memory or GPU).
+    /// Warn (◢ disk, ● memory, GPU or CPU).
     Warn,
-    /// Critical (◢ disk, ● memory).
+    /// Critical (◢ disk, ● memory or CPU).
     Critical,
 }
 
@@ -2098,6 +2175,9 @@ pub struct Snapshot {
     pub procs_truncated: bool,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
+    /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
+    /// where no reader runs (every OS but macOS).
+    pub ane: Option<Result<AneSample, AneCheck>>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
     /// Immediately available memory in bytes (free + inactive + purgeable), set by the host.
@@ -2130,6 +2210,8 @@ pub struct Snapshot {
     /// Vertical event markers (crashes, restarts, sleep/wake, pressure spikes) in the last six
     /// hours ([`STRIP_HORIZON_MS`]).
     pub strip_events: Vec<StripEvent>,
+    /// What the deck's mechanism tiles draw ([`crate::units`]).
+    pub units: crate::units::Units,
 }
 
 /// aterm's own process rows kept per snapshot, busiest first.
@@ -2680,6 +2762,8 @@ struct Rows {
     gpu_rose_at: Option<i64>,
     /// Each process's GPU share from the client reads.
     gpu_clients: crate::gpu_clients::GpuShares,
+    /// The units' 10 s readings and rates ([`crate::units`]).
+    units: crate::units::UnitRings,
 }
 
 /// One scope's hour rings in [`Resource::ALL`] order; a row's ring exists once the scope read it.
@@ -3091,9 +3175,14 @@ impl Vitals {
     /// Absorb one sample and return the snapshot it makes.
     pub fn absorb(&mut self, s: &Sample) -> Snapshot {
         self.seq += 1;
+        let busy = s
+            .gpu
+            .as_ref()
+            .and_then(|g| g.device_pct)
+            .map(|p| f32::from(p.min(100)) / 100.0);
         self.rows
             .gpu_clients
-            .absorb(s.gpu_clients.as_ref(), s.at_ns);
+            .absorb(s.gpu_clients.as_ref(), busy, s.at_ns);
         let stamp = Stamp::of(s);
         for &gap in &s.note_gaps {
             self.record_time_gap(gap);
@@ -3272,13 +3361,36 @@ impl Vitals {
                 ProcPass::default()
             }
         };
-        let busy = cpu
+        // Each core's fraction this reading, every core measured: the CPU row's reading is their
+        // sum and each core's unit their own, so the tiles' mean is the row's %.
+        let core_fracs: Option<Vec<f64>> = cpu
             .as_ref()
-            .filter(|_| cores_dt.is_some())
-            .and_then(CpuView::current_busy)
-            .map(f64::from);
+            .filter(|c| cores_dt.is_some() && !c.cores.is_empty())
+            .and_then(|c| {
+                c.cores
+                    .iter()
+                    .map(|core| core.current().map(f64::from))
+                    .collect()
+            });
+        let busy = core_fracs.as_ref().map(|f| f.iter().sum::<f64>());
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        let units = self.rows.units.absorb(
+            &crate::units::UnitReading {
+                now: s.at_unix_ms,
+                at_ns: s.at_ns,
+                cores: core_fracs.as_deref(),
+                n_cores: s.cores.as_ref().map(Vec::len).filter(|&n| n > 0),
+                clusters: cpu.as_ref().map_or(&[], |c| c.clusters.as_slice()),
+                load1: s.load1,
+                churn_bps: mem.as_ref().and_then(|m| m.rates).map(|r| r.churn_bps),
+                churn_read: mem.as_ref().is_some_and(|m| m.sample.counters.is_some()),
+                swap_bps: facts.swap_rate,
+                swap_used: mem.as_ref().map(|m| m.sample.swap_used),
+                block: &s.block,
+            },
+            &mut self.rows.peaks,
+        );
         if let Some((resets, _)) = facts.gpu_resets
             && resets > self.last_gpu_resets
         {
@@ -3356,6 +3468,7 @@ impl Vitals {
             programs: pass.programs,
             procs_truncated: s.procs_truncated,
             thermal: s.thermal,
+            ane: s.ane,
             load: s.load,
             avail: None,
             slots: None,
@@ -3369,6 +3482,7 @@ impl Vitals {
             services_filed: Vec::new(),
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
+            units,
         };
         let attribution = pass
             .attribution
@@ -3814,12 +3928,15 @@ fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemR
     }
     let d = |a: u64, b: u64| b.checked_sub(a);
     let per_s = |v: u64| v as f64 * 1e9 / window_ns as f64;
+    let decompress_ps = per_s(d(then.decompressions, now.decompressions)?);
+    let compress_ps = per_s(d(then.compressions, now.compressions)?);
     Some(MemRates {
         swapin_bps: per_s(d(then.swapin_bytes, now.swapin_bytes)?),
         swapout_bps: per_s(d(then.swapout_bytes, now.swapout_bytes)?),
-        decompress_ps: per_s(d(then.decompressions, now.decompressions)?),
-        compress_ps: per_s(d(then.compressions, now.compressions)?),
+        decompress_ps,
+        compress_ps,
         pagein_ps: per_s(d(then.pageins, now.pageins)?),
+        churn_bps: (decompress_ps + compress_ps) * now.page_bytes as f64,
         window_ns,
     })
 }
@@ -3904,10 +4021,7 @@ impl Rows {
         if let Some(n) = n_cores {
             self.caps[Cpu.index()] = Some(n as f64);
         }
-        let cpu_over = match (busy, n_cores, s.load1) {
-            (Some(b), Some(n), Some(load)) => load > n as f64 && b >= CPU_OVER_BUSY * n as f64,
-            _ => false,
-        };
+        let cpu_over = crate::units::cpu_over(busy, n_cores, s.load1);
         self.rings[Cpu.index()].push(now, busy, cpu_over);
 
         let gpu_pct = s
@@ -4018,13 +4132,17 @@ impl Rows {
         facts.hour_writers = self.write_hour.top();
         facts.writes_covered_s = self.write_hour.covered_s();
         if let Some(f) = figs {
+            let kappa = self.gpu_clients.kappa().unwrap_or(1.0);
             let vals =
                 |acc: &ScopeAcc, tokens: Option<f64>, sockets: Option<u32>| -> [Option<f64>; 7] {
                     let mut v = [None; 7];
                     v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
-                    // Held at the device's reading so each 10 s cell keeps tab <= all tabs <= Mac.
+                    // The scope's client time times κ, its share of the device's busy time over
+                    // the client window (`gpu_clients::kappa`), held at this reading's device
+                    // busy so each 10 s cell keeps tab <= all tabs <= Mac.
                     v[Gpu.index()] = acc.gpu.map(|g| {
-                        gpu_pct.map_or(f64::from(g) * 100.0, |mac| (f64::from(g) * 100.0).min(mac))
+                        let share = f64::from(g * kappa) * 100.0;
+                        gpu_pct.map_or(share, |mac| share.min(mac))
                     });
                     v[Memory.index()] = acc.footprint.map(|b| b as f64);
                     v[Disk.index()] = sweep_dt.and(acc.writes);
@@ -4091,6 +4209,7 @@ impl Rows {
             _ => None,
         };
         let gpu_state = facts.gpu_resets.map(|_| State::Warn);
+        let cpu_state = s.thermal.and_then(Thermal::state);
         let resources = Resource::ALL.map(|res| {
             let i = res.index();
             let ring = &self.rings[i];
@@ -4119,6 +4238,7 @@ impl Rows {
             );
             view.long_k = ring.long_k().unwrap_or(0);
             view.state = match res {
+                Cpu => cpu_state,
                 Gpu => gpu_state,
                 Memory => mem_state,
                 Disk => disk_state,
@@ -4409,7 +4529,8 @@ fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) ->
     }
 }
 
-fn note_peak(ring: &BucketRing, closed: Option<i64>, peak: &mut DailyMax) {
+/// Notes in `peak` the sustained-30 s value ending at bucket `closed` of `ring`.
+pub(crate) fn note_peak(ring: &BucketRing, closed: Option<i64>, peak: &mut DailyMax) {
     if let Some(k) = closed
         && let Some(v) = ring.sustained(k)
     {
@@ -4452,7 +4573,8 @@ fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<St
     states.into_iter().max()
 }
 
-fn day_of(unix_ms: i64) -> u32 {
+/// The UTC Unix day of `unix_ms`.
+pub(crate) fn day_of(unix_ms: i64) -> u32 {
     u32::try_from(unix_ms.div_euclid(86_400_000)).unwrap_or(0)
 }
 
@@ -5818,6 +5940,7 @@ mod tests {
             net_rx: learned(50e6, NET_LEARN_S),
             net_tx: learned(1e6, NET_LEARN_S),
             tokens: learned(72_000.0, TOKENS_LEARN_S),
+            ..Peaks::default()
         });
         let mut s = Snapshot::default();
         for t in 0..6 {
@@ -6091,7 +6214,9 @@ mod tests {
 
     /// GPU per scope from two client reads: each client counts in its process's scope, a reused
     /// pid's time stays with services as unclaimed, the rows hold this tab ≤ all tabs ≤ the Mac's
-    /// (a device reading of 0 included), and "not per app" shows only while no client read is held.
+    /// (a device reading of 0 included), each scope's row is its client time times κ (here the
+    /// clients ran 67 % against a device 12 % or 0 % busy), while the sweep's figures stay raw
+    /// client time, and "not per app" shows only while no client read is held.
     #[test]
     fn gpu_time_per_scope_comes_from_the_client_reads() {
         use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
@@ -6153,8 +6278,10 @@ mod tests {
             let (mac, all, tab) = (r.now.expect("Mac"), r.aterm.now.expect("all"), r.tab.now);
             let tab = tab.expect("tab");
             assert!(tab <= all && all <= mac, "{tab} ≤ {all} ≤ {mac}");
-            assert!(close(Some(all), f64::from(device).min(15.0)), "{all}");
-            assert!(close(Some(tab), f64::from(device).min(5.0)), "{tab}");
+            // ū is the device's mean over the window's readings (2000 and 3000 ms), R 0.67.
+            let kappa = f64::from(device) / 67.0;
+            assert!((all - 15.0 * kappa).abs() < 1e-4, "{all}");
+            assert!((tab - 5.0 * kappa).abs() < 1e-4, "{tab}");
 
             let last = |run: &[Cell]| run.last().and_then(|c| c.mean).expect("a cell");
             let (mac_run, all_run) = (last(&r.ring), last(&r.aterm.run));
@@ -6169,6 +6296,78 @@ mod tests {
             let r = later.resource(Gpu, &[7]);
             assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp), "expired");
             assert_eq!(later.aterm.as_ref().and_then(|a| a.gpu), None);
+        }
+    }
+
+    /// The owner's case, read live (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §3): the device
+    /// 5 % busy while the clients ran 5.8 % between them, aterm's 5.3 % and WindowServer's
+    /// 0.5 %. Each scope's share is its client time times κ = ū / R, so aterm keeps its
+    /// proportion of the busy time (4.57 %) and the rest of the device (0.43 %) is WindowServer's.
+    /// Where the clients ran less than the device was busy, κ is 1 and aterm's share is its
+    /// client time. CONTROL: holding the raw client time at the device's busy alone, as before,
+    /// gives aterm the whole 5 % and leaves WindowServer none.
+    #[test]
+    fn gpu_scopes_share_busy_time_in_proportion_when_clients_overlap() {
+        use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
+        const MS: u64 = 1_000_000;
+        let reading = |t_ms: u64, device: u8, ran: Option<u64>| {
+            let mut s = at(t_ms, 1000);
+            s.gpu.as_mut().expect("GPU").device_pct = Some(device);
+            s.procs.as_mut().expect("sweep").push(ProcSample {
+                uid: Some(88),
+                ..proc(601, 1, 0, 400, "WindowServer")
+            });
+            // Over the 2 s window: aterm 106 ms (5.3 %), WindowServer 10 ms (0.5 %).
+            s.gpu_clients = ran.map(|k| GpuClientsSample {
+                at_ns: s.at_ns,
+                complete: true,
+                entries: vec![1, 3],
+                rows: vec![
+                    GpuClientRow {
+                        entry: 1,
+                        pid: 100,
+                        name: "aterm".into(),
+                        gpu_ns: 106 * k * MS,
+                    },
+                    GpuClientRow {
+                        entry: 3,
+                        pid: 601,
+                        name: "WindowServer".into(),
+                        gpu_ns: 10 * k * MS,
+                    },
+                ],
+            });
+            s
+        };
+        for (device, want) in [(5_u8, 5.3 * 5.0 / 5.8), (50, 5.3)] {
+            let mut v = Vitals::new();
+            let _ = v.absorb(&reading(1000, device, Some(0)));
+            let _ = v.absorb(&reading(2000, device, None));
+            let s = v.absorb(&reading(3000, device, Some(1)));
+            let r = s.resource(Gpu, &[7]);
+            let (mac, all) = (r.now.expect("Mac"), r.aterm.now.expect("aterm"));
+            assert!(
+                (all - want).abs() < 1e-4,
+                "device {device}%: aterm {all}, want {want}"
+            );
+            assert!(all <= mac, "{all} ≤ {mac}");
+            let aterm_raw = s.aterm.as_ref().and_then(|a| a.gpu).expect("raw");
+            assert!(
+                (aterm_raw - 0.053).abs() < 1e-6,
+                "sys keeps the raw client time: {aterm_raw}"
+            );
+            if device == 5 {
+                let rest = mac - all;
+                assert!(
+                    (rest - 0.5 * 5.0 / 5.8).abs() < 1e-4,
+                    "WindowServer keeps its proportion: {rest}"
+                );
+                let held_alone = (f64::from(aterm_raw) * 100.0).min(mac);
+                assert!(
+                    (held_alone - mac).abs() < 1e-9,
+                    "CONTROL: without κ aterm takes the whole device ({held_alone} of {mac})"
+                );
+            }
         }
     }
 
@@ -6523,9 +6722,11 @@ mod tests {
         let _ = v.absorb(&reading(1000, Some(0)));
         let _ = v.absorb(&reading(2000, None));
         let s = v.absorb(&reading(3000, Some(1)));
+        // Each client ran 10 % of the window, together 20 % of a device busy 12 %: each tab's
+        // share is its 10 % scaled by 12/20.
         for pane in [7, 8] {
             let fig = s.resource(Gpu, &[pane]).tab;
-            assert!(close(fig.now, 10.0), "pane {pane}: {:?}", fig.now);
+            assert!(close(fig.now, 6.0), "pane {pane}: {:?}", fig.now);
         }
         let r = s.resource(Gpu, &[7, 8]);
         let (mac, all) = (r.now.expect("Mac"), r.aterm.now.expect("all tabs"));
@@ -6956,6 +7157,139 @@ mod tests {
         assert_eq!(run(2.5, true, 0), (false, false), "1.5 of 2 cores busy");
         assert_eq!(run(0.5, true, 4 * 1024), (false, true));
         assert_eq!(run(0.5, true, 3 * 1024), (false, false));
+    }
+
+    /// The CPU row's well at each reading's thermal state (A2 §3.2), through the model and the
+    /// well's words, as the deck draws it: the mark and its ink, or none.
+    fn cpu_well(
+        v: &mut Vitals,
+        t_s: u64,
+        thermal: Option<Thermal>,
+    ) -> Option<(crate::words::Mark, crate::words::InkKind)> {
+        let s = v.absorb(&Sample {
+            thermal,
+            ..at(t_s * 1000, 1000)
+        });
+        crate::words::well(Cpu, &s.resources[Cpu.index()])
+    }
+
+    fn os_level(raw: u8, low_power: Option<bool>) -> Thermal {
+        let level = [
+            Throttle::None,
+            Throttle::Light,
+            Throttle::Heavy,
+            Throttle::Severe,
+        ][usize::from(raw)];
+        Thermal {
+            level,
+            raw,
+            low_power,
+            exact: true,
+        }
+    }
+
+    /// The CPU well draws the existing ● at the OS's exact serious (in `warn`) and critical (in
+    /// `critical`), and nothing at nominal or fair, with or without Low Power Mode, or where no
+    /// level was read; it follows the latest reading both ways. NEGATIVE CONTROL: the same row at
+    /// fair, one reading before serious and one after it, draws none.
+    #[test]
+    fn the_cpu_well_draws_a_dot_only_at_an_exact_serious_or_critical_thermal_state() {
+        use crate::words::{InkKind, Mark};
+        let mut v = Vitals::new();
+        let mut t = 0;
+        let mut well = |thermal| {
+            t += 1;
+            cpu_well(&mut v, t, thermal)
+        };
+        assert_eq!(well(None), None, "no level read");
+        for low_power in [None, Some(false), Some(true)] {
+            assert_eq!(well(Some(os_level(0, low_power))), None, "nominal");
+            assert_eq!(well(Some(os_level(1, low_power))), None, "fair");
+        }
+        assert_eq!(
+            well(Some(os_level(2, None))),
+            Some((Mark::Dot, InkKind::Warn)),
+            "serious"
+        );
+        assert_eq!(well(Some(os_level(1, None))), None, "back to fair");
+        assert_eq!(
+            well(Some(os_level(3, Some(true)))),
+            Some((Mark::Dot, InkKind::Critical)),
+            "critical"
+        );
+        assert_eq!(
+            well(Some(os_level(2, Some(false)))),
+            Some((Mark::Dot, InkKind::Warn)),
+            "down to serious"
+        );
+        assert_eq!(well(None), None, "unread again");
+        let s = v.absorb(&Sample {
+            thermal: Some(os_level(3, None)),
+            ..at(1_000_000, 1000)
+        });
+        assert_eq!(s.resources[Cpu.index()].state, Some(State::Critical));
+        for res in [Gpu, Memory, Network, Tokens] {
+            assert_eq!(s.resources[res.index()].state, None, "{res:?}");
+        }
+    }
+
+    /// A level the counter heuristic estimates (Linux's thermal zones and throttle counters,
+    /// `exact: false`) draws no ●, at any rank. NEGATIVE CONTROL: the same ranks reported exactly
+    /// by the OS draw one at heavy (serious) and severe (critical).
+    #[test]
+    fn a_heuristic_thermal_level_draws_no_cpu_dot() {
+        let mut v = Vitals::new();
+        let mut t = 0;
+        for level in [
+            Throttle::None,
+            Throttle::Light,
+            Throttle::Heavy,
+            Throttle::Severe,
+        ] {
+            let heuristic = Thermal {
+                level,
+                raw: 0,
+                low_power: None,
+                exact: false,
+            };
+            t += 1;
+            assert_eq!(cpu_well(&mut v, t, Some(heuristic)), None, "{level:?}");
+            assert_eq!(heuristic.state(), None, "{level:?}");
+            let exact = Thermal {
+                exact: true,
+                raw: u8::try_from(level.rank()).expect("a rank"),
+                ..heuristic
+            };
+            t += 1;
+            let drawn = cpu_well(&mut v, t, Some(exact));
+            assert_eq!(
+                drawn.is_some(),
+                level >= Throttle::Heavy,
+                "CONTROL: exact {level:?} draws {drawn:?}"
+            );
+        }
+    }
+
+    /// The snapshot carries the Neural Engine reader's latest reading as it is, never a level
+    /// over a window (A2 §3.1: the tile draws now only), and the check that retired it.
+    #[test]
+    fn the_snapshot_carries_the_neural_engines_latest_reading() {
+        let mut v = Vitals::new();
+        let reading = |powered| Some(Ok(AneSample { cores: 16, powered }));
+        let mut t = 0;
+        let mut ane = |ane| {
+            t += 1;
+            v.absorb(&Sample {
+                ane,
+                ..at(t * 1000, 1000)
+            })
+            .ane
+        };
+        assert_eq!(ane(None), None, "no reader");
+        assert_eq!(ane(reading(true)), reading(true));
+        assert_eq!(ane(reading(false)), reading(false), "off at once");
+        assert_eq!(ane(reading(true)), reading(true));
+        assert_eq!(ane(Some(Err(AneCheck::Cost))), Some(Err(AneCheck::Cost)));
     }
 
     #[test]

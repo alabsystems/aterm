@@ -833,7 +833,7 @@ mod tests {
         let began = Instant::now();
         while latch.waiting.load(std::sync::atomic::Ordering::SeqCst) < n {
             assert!(began.elapsed() < HANG, "no caller ever waited on the warm");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -1187,7 +1187,7 @@ mod tests {
         let began = Instant::now();
         while !gone.is_finished() {
             assert!(began.elapsed() < HANG, "the armless worker never stopped");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert_eq!(
             gone.join().expect("the worker"),

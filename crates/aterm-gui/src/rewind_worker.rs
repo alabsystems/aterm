@@ -9,7 +9,6 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 
 use aterm_buffer::{Seq, Ticks};
 use aterm_control::replay::ReplayEngine;
-use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{RenderCell, Terminal};
 
 use crate::temporal::{
@@ -32,7 +31,7 @@ pub(crate) struct FoldToken {
     pub(crate) serial: u64,
 }
 
-/// One fold of a view's instant: its plan, the plan of the witness that covers it when unjudged, the chains to keep forks along, and the colours and scrollback to draw it with.
+/// One fold of a view's instant: its plan, the plan of the witness that covers it when unjudged, and the chains to keep forks along. The fold draws in the colours its recording put in force at the instant.
 pub(crate) struct Show {
     pub(crate) session: u64,
     pub(crate) token: FoldToken,
@@ -40,7 +39,6 @@ pub(crate) struct Show {
     pub(crate) judge: Option<ReplayPlan>,
     /// The whole chain the instant is on and the replayable one before it ([`crate::temporal::TemporalRecorder::warm_plans`]).
     pub(crate) around: Vec<ReplayPlan>,
-    pub(crate) colors: Option<Arc<TerminalConfig>>,
 }
 
 /// A search for the last instant at or before `at` whose screen changed cell `cell` ([`crate::App::rewind_changed`]).
@@ -431,7 +429,6 @@ impl Cache {
             plan,
             judge,
             around,
-            colors,
         } = show;
         let (mut replay, from) = self.start(&plan);
         let mut folded = 0usize;
@@ -439,12 +436,11 @@ impl Cache {
             folded = folded.saturating_add(passed.bytes.map_or(0, <[u8]>::len));
             true
         });
+        // The scrollback limit in force at the instant, where a restore installed the keyframe's own.
+        let limit = replay.config().and_then(|config| config.scrollback_limit);
         let mut term = replay.into_terminal();
-        if let Some(colors) = colors.as_deref() {
-            term.apply_config_colors(colors);
-            if colors.scrollback_limit.is_some() {
-                term.set_scrollback_line_limit(colors.scrollback_limit);
-            }
+        if limit.is_some() {
+            term.set_scrollback_line_limit(limit);
         }
         let mid_frame = term.end_synchronized_output();
         let folded = Folded {

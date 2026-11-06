@@ -335,8 +335,10 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
         "not its last scenario: {v:?}"
     );
     let v = with_held(Scenario::C2, &main, &cx(Chain::Cruise, "claude"), pass());
-    assert!(matches!(v, Verdict::Fail(_)), "{v:?}");
-    assert!(v.why().contains("HELD, NOT SAID"), "{v:?}");
+    assert!(
+        matches!(v, Verdict::Pass(_)),
+        "Cruise's hold is its records' fault (stall_fault), no want of its saying: {v:?}"
+    );
     let v = with_held(Scenario::L1, &main, &cx(Chain::LandA, "claude"), pass());
     assert!(matches!(v, Verdict::Pass(_)), "no same-reply chain: {v:?}");
     let mut unheld = main.clone();
@@ -513,8 +515,9 @@ fn the_holds_words_are_read_past_the_stop() {
     assert_eq!(unstopped(&spoken, StopForm::Spoken), "Not landed yet.");
 }
 
-/// A hold in a chain whose script makes none fails it; a same-reply chain's and another mode's
-/// chain's do not.
+/// A hold in a chain whose script makes none fails it, and so does a hold in Cruise's same-reply
+/// chains (continuous forward: Cruise holds no repeated report); a Land same-reply chain's,
+/// `same-cruise`'s (HC's own) and another mode's chain's do not.
 #[test]
 fn a_hold_fails_a_chain_that_scripts_no_same_reply() {
     let main = held(Chain::LandA, MAIN_LINE, MAIN_HOVER);
@@ -528,8 +531,20 @@ fn a_hold_fails_a_chain_that_scripts_no_same_reply() {
     ] {
         assert!(stall_fault(c, &main, T0).is_some(), "{c:?}");
     }
-    for c in [Chain::LandB, Chain::LandC, Chain::Cruise, Chain::SameLand] {
+    for c in [
+        Chain::LandB,
+        Chain::LandC,
+        Chain::SameLand,
+        Chain::SameCruise,
+    ] {
         assert_eq!(stall_fault(c, &main, T0), None, "{c:?}");
+    }
+    for c in [Chain::Cruise, Chain::WroteC] {
+        let f = stall_fault(c, &main, T0).expect("Cruise holds no repeated report");
+        assert!(
+            f.contains("STOPPED FOR GOOD") && f.contains("+372.0 s"),
+            "{c:?}: {f}"
+        );
     }
     assert_eq!(stall_fault(Chain::Ladder, &main, T0), None);
     assert_eq!(stall_fault(Chain::LandA, &main, T0 + HELD_AT + 1), None);
@@ -572,7 +587,7 @@ fn the_watch_runs_a_minute_past_the_last_acts_point() {
 #[test]
 fn hl_passes_on_the_hold_at_the_second_answer() {
     let main = held(Chain::SameLand, MAIN_LINE, MAIN_HOVER);
-    let v = judge_hold(Chain::SameLand, &main, T0);
+    let v = judge_hold(&main, T0);
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
     assert!(
         v.why().contains("land@v1 answered") && v.why().contains("held at +372.0 s"),
@@ -584,7 +599,7 @@ fn hl_passes_on_the_hold_at_the_second_answer() {
         HELD_AT,
         "WAITING seq=2681 until=2026-10-24T18:54:29Z 3 short turn(s) in a row: 8 min back-off",
     ));
-    let v = judge_hold(Chain::SameLand, &unheld, T0);
+    let v = judge_hold(&unheld, T0);
     assert!(
         matches!(v, Verdict::Fail(_)) && v.why().starts_with("NOT HELD"),
         "{v:?}"
@@ -592,7 +607,7 @@ fn hl_passes_on_the_hold_at_the_second_answer() {
     let mut soon = main.clone();
     soon.journal.drain(5..7);
     soon.journal.insert(4, j(127_800, STALL));
-    let v = judge_hold(Chain::SameLand, &soon, T0);
+    let v = judge_hold(&soon, T0);
     assert!(
         matches!(v, Verdict::Fail(_)),
         "held at the first answer: {v:?}"
@@ -602,27 +617,16 @@ fn hl_passes_on_the_hold_at_the_second_answer() {
         420_000,
         "CONTINUED seq=2681 rule=land-nudge@v1 [aterm harness] Still landing:",
     ));
-    let v = judge_hold(Chain::SameLand, &again, T0);
+    let v = judge_hold(&again, T0);
     assert!(matches!(v, Verdict::Fail(_)), "typed past its hold: {v:?}");
     let mut landed = main.clone();
     landed
         .journal
         .push(j(373_000, "DONE seq=2681 rule=land@v1 x"));
-    assert!(matches!(
-        judge_hold(Chain::SameLand, &landed, T0),
-        Verdict::Fail(_)
-    ));
-    let v = judge_hold(Chain::SameCruise, &main, T0);
-    assert!(
-        matches!(v, Verdict::Fail(_)) && v.why().contains("not continue-done-check@v1"),
-        "{v:?}"
-    );
+    assert!(matches!(judge_hold(&landed, T0), Verdict::Fail(_)));
     let mut cold = main;
     cold.journal.truncate(2);
-    assert!(matches!(
-        judge_hold(Chain::SameLand, &cold, T0),
-        Verdict::Fail(_)
-    ));
+    assert!(matches!(judge_hold(&cold, T0), Verdict::Fail(_)));
 }
 
 /// The lift as land-d journaled it on `b42ae72fc3` (the review's `--mode both` run,
@@ -890,7 +894,7 @@ fn hl_fails_where_the_two_answers_differ() {
         127_800,
         "EVENT idle seq=1791 ⏺ Wrote the last checks for the parser.",
     );
-    let v = judge_hold(Chain::SameLand, &differ, T0);
+    let v = judge_hold(&differ, T0);
     assert!(
         matches!(v, Verdict::Fail(_)) && v.why().contains("the two answers differ"),
         "{v:?}"

@@ -140,10 +140,10 @@ pub fn mac_for(name: &str) -> [u8; 6] {
 /// `mac` as `VZMACAddress` reads it: six lowercase hex pairs joined by `:`.
 #[must_use]
 pub fn mac_text(mac: &[u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 impl Plan {
@@ -198,16 +198,14 @@ impl Plan {
             crate::seed::BOOT_TAG,
             self.boot_share.display()
         );
-        let entries = self
-            .shares
-            .iter()
-            .map(|e| format!("{}={}", e.name, e.path.display()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = writeln!(
-            out,
-            "share {ATERM_TAG}: VZMultipleDirectoryShare [{entries}] read-only"
-        );
+        let _ = write!(out, "share {ATERM_TAG}: VZMultipleDirectoryShare [");
+        for (i, e) in self.shares.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let _ = write!(out, "{}={}", e.name, e.path.display());
+        }
+        out.push_str("] read-only\n");
         if self.rosetta {
             let _ = writeln!(
                 out,

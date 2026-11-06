@@ -29,8 +29,9 @@ pub const RESIDENT_BUDGET: usize = 16 * 1024 * 1024;
 /// retained record resident). The fabric ledger's D10d set ran its no-budget arm under `none`.
 /// No test sets it: a test that needs records cold holds its own broker to a budget (astream's
 /// `OpenOptions::resident_budget` or `Broker::set_resident_budget`), as the sealed cold read
-/// (`at_rest_tests`) and fabric world's cold refill (`bridge_recovery`) do at 0, which keeps
-/// the newest record alone so every read below the head is a cold one.
+/// (`at_rest_tests`), fabric world's cold refill (`bridge_recovery`) and the broker
+/// differential's cold arm (`sim::conform_broker`, over [`Durability::options`]) do at 0, which
+/// keeps the newest record alone so every read below the head is a cold one.
 pub const RESIDENT_BUDGET_SEAM: &str = "ATERM_LINK_RESIDENT_BUDGET";
 
 /// The residency budget [`Durability::options`] sets: [`RESIDENT_BUDGET`], or what
@@ -552,7 +553,6 @@ pub fn open_escalating(
     at_rest: Option<[u8; 32]>,
 ) -> io::Result<Opened> {
     let mut opts = durability.options();
-    opts.boot = boot.map_or(astream_broker::Boot::Unknown, astream_broker::Boot::Known);
     opts.guard = secret;
     opts.require_bound_at_rest = at_rest.is_some();
     opts.at_rest_key = at_rest;
@@ -563,6 +563,22 @@ pub fn open_escalating(
         let rules = opts.escalation.rules().to_vec();
         opts.escalation = astream_broker::Escalation::new(rules.into_iter().chain(extra));
     }
+    open_with(log, opts, boot)
+}
+
+/// Open the broker over `log` under `opts` in `boot`, folding any legacy mark into astream's open
+/// verdict: [`open_escalating`] with options its caller built (the guard, the tier, the seal),
+/// which the node service's host of `bus.log` (`aterm_mesh::logs::open_bus`) and a test's broker
+/// share. `opts.boot` is set from `boot`.
+/// # Errors
+///
+/// As [`open`], and astream's own refusal of `opts`.
+pub fn open_with(
+    log: &Path,
+    mut opts: astream_broker::OpenOptions,
+    boot: Option<[u8; 16]>,
+) -> io::Result<Opened> {
+    opts.boot = boot.map_or(astream_broker::Boot::Unknown, astream_broker::Boot::Known);
     let mut decided: Option<(Mark, Option<Renewed>)> = None;
     let prepare = || -> io::Result<astream_broker::Prepared> {
         let mark = read_mark(log);

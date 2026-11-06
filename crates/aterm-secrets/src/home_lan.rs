@@ -20,6 +20,17 @@
 //! included), or whose path could not be read, is never home. No evidence is no home: a Mac that
 //! proves itself to this one then waits for a person's Allow.
 //!
+//! A HOME IS A NETWORK THE LAB HAS LIVED ON (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.2 M2,
+//! §11 B6): under the 7-day condition ([`Rule::days`], on with the mesh), the network must also
+//! have been home on this Mac on [`HOME_DAYS`] distinct days, as the network place's home-day
+//! ledger counts them ([`aterm_netplace::heard::HomeDays`]): each earlier day on which
+//! [`MEMBERS`] members were heard on it, today (on which its fresh evidence makes it home now),
+//! and the days the one-time seed credited it with ([`seed_at`]). Three member laptops at a hotel
+//! or a conference never make its Wi-Fi home in a weekend; a lab that moves waits a week on the
+//! new network, using Allow plus phrase meanwhile. The seed credits each network this Mac already
+//! remembers as the ALab LAN with [`HOME_DAYS`], once, at the first start of a build with the
+//! condition, so automatic admission never stops across that start.
+//!
 //! WHERE THIS MAC IS HAS ONE SOURCE, the network place (`aterm_netplace`): the route, gateway,
 //! subnet, path and the members' node-proven answers are its facts and its evidence file, read
 //! through [`aterm_netplace::proof`], so admission never reads another place than every other
@@ -28,9 +39,13 @@
 //! This Mac's member desk reads it through [`home_net`], and marks a proof from another host on
 //! that network as from the home ALab LAN (`crate::members::desk`).
 
+use aterm_netplace::facts::Here;
+use aterm_netplace::heard::{DAY_MS, HomeDays, Seeding};
 use aterm_netplace::proof::Now;
 use aterm_netplace::{Answer, Lane, Link, NetworkId, RouteFacts};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 use std::time::Duration;
 
 /// How long a member's proven answer counts: past three heartbeat rounds (each every three
@@ -41,6 +56,29 @@ pub const FRESH: Duration = Duration::from_secs(10 * 60);
 /// How many distinct members must have answered on a network for it to be home: two Macs on one
 /// hotspot or café network never make it so.
 pub const MEMBERS: usize = 3;
+/// How many distinct days a network must have been home on this Mac before a proof from it lets
+/// a Mac in by itself, under the 7-day condition ([`Rule::days`]); the days the one-time seed
+/// credits each network already remembered as the ALab LAN with ([`seed_at`]).
+pub const HOME_DAYS: u32 = 7;
+
+/// What the home rule holds a network to beside its fresh evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rule {
+    /// The 7-day condition: the network has been home here on [`HOME_DAYS`] distinct days
+    /// ([the module](self)). Off, a network is home on its fresh evidence alone, as before R2.
+    pub days: bool,
+}
+
+impl Rule {
+    /// This build's rule: the 7-day condition is on with the mesh
+    /// (`aterm_types::mesh_switch::MESH`), read once here; a test sets the field either way.
+    #[must_use]
+    pub const fn live() -> Self {
+        Self {
+            days: aterm_types::mesh_switch::MESH,
+        }
+    }
+}
 /// How far past this Mac's clock an answer may be dated and still count (a clock step back).
 const AHEAD_MS: u64 = 60_000;
 /// Apple's Personal Hotspot hands out addresses from this network.
@@ -66,6 +104,12 @@ pub enum Away {
         /// How many did.
         heard: usize,
     },
+    /// The network is home by its fresh evidence, but has been home here on fewer than
+    /// [`HOME_DAYS`] distinct days ([`Rule::days`]).
+    NewNetwork {
+        /// On how many it has, today and the seed's credit included.
+        days: u32,
+    },
 }
 
 impl std::fmt::Display for Away {
@@ -82,6 +126,11 @@ impl std::fmt::Display for Away {
                 "{heard} of the {MEMBERS} members needed answered on this network in the last \
                  {} minutes",
                 FRESH.as_secs() / 60
+            ),
+            Self::NewNetwork { days } => write!(
+                f,
+                "this network has been the lab's home on {days} of the {HOME_DAYS} days a home \
+                 ALab LAN needs"
             ),
         }
     }
@@ -148,9 +197,22 @@ fn ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
-/// The home-capable network ([`home_route`]) now (`now.at_ms`), when it is home: this Mac's
-/// address and mask there.
-fn home_at(now: &Now) -> Result<HomeNet, Away> {
+/// The distinct days `network` has been home on this Mac, in the home-day ledger `days`, where
+/// its fresh evidence makes it home today (`today`, a [`DAY_MS`] day): the seed's credit, each
+/// other day on which [`MEMBERS`] members were heard on it, and today.
+fn home_days(days: &HomeDays, network: &NetworkId, today: u64) -> u32 {
+    days.of(network).map_or(1, |entry| {
+        let others = entry.heard_by(MEMBERS).filter(|day| *day != today).count();
+        entry
+            .credited
+            .saturating_add(u32::try_from(others).unwrap_or(u32::MAX))
+            .saturating_add(1)
+    })
+}
+
+/// The home-capable network ([`home_route`]) now (`now.at_ms`), when it is home under `rule`
+/// (its home days read from `days`): this Mac's address and mask there.
+fn home_at(now: &Now, days: &HomeDays, rule: Rule) -> Result<HomeNet, Away> {
     let Some(route) = home_route(now) else {
         return Err(Away::Interface);
     };
@@ -215,11 +277,16 @@ fn home_at(now: &Now) -> Result<HomeNet, Away> {
         .collect();
     nodes.sort_unstable();
     nodes.dedup();
-    if nodes.len() >= MEMBERS {
-        Ok(HomeNet { own, mask })
-    } else {
-        Err(Away::TooFew { heard: nodes.len() })
+    if nodes.len() < MEMBERS {
+        return Err(Away::TooFew { heard: nodes.len() });
     }
+    if rule.days {
+        let had = home_days(days, &network, at / DAY_MS);
+        if had < HOME_DAYS {
+            return Err(Away::NewNetwork { days: had });
+        }
+    }
+    Ok(HomeNet { own, mask })
 }
 
 /// This Mac's home ALab LAN, as its address and mask there ([`home_net_at`]): what a member's
@@ -256,22 +323,100 @@ impl HomeNet {
     }
 }
 
-/// This Mac's home ALab LAN (`now`), as its address and mask there.
+/// This Mac's home ALab LAN (`now`) under `rule`, its home days read from the home-day ledger
+/// `days`, as its address and mask there.
 ///
 /// # Errors
 /// [`Away`] names why the network the default route takes is not the home ALab LAN now.
-pub fn home_net_at(now: &Now) -> Result<HomeNet, Away> {
-    home_at(now)
+pub fn home_net_at(now: &Now, days: &HomeDays, rule: Rule) -> Result<HomeNet, Away> {
+    home_at(now, days, rule)
 }
 
-/// This Mac's home ALab LAN now, from the network place under this process's state root
-/// (`aterm_types::dirs::state_dir`, where its fleet heartbeat notes the answers,
-/// [`aterm_netplace::proof::read`]); `None` where it is on none, or with no state root. It reads
-/// the network (Network.framework's path among it), so never on a window's main thread.
+/// THE ONE-TIME SEED of this Mac's home-day ledger under the state root `state`
+/// ([`aterm_netplace::heard::seed_days`]): the first call credits each network the network place
+/// remembers as the ALab LAN there ([`aterm_netplace::Record::remembered`]) with [`HOME_DAYS`],
+/// at `at_ms`; every later call credits nothing ([`Seeding::Before`]). The node service calls it
+/// as it starts with the mesh on, and [`home_net_seeding`] before it judges under the 7-day condition,
+/// so it holds before any admission does, whichever process starts first. A place with no record
+/// yet remembers nothing, and seeds so.
+///
+/// # Errors
+/// The place's record is there and cannot be read (the seed waits for a call that can), or
+/// [`aterm_netplace::heard::seed_days`]'s.
+pub fn seed_at(state: &Path, at_ms: u64) -> io::Result<Seeding> {
+    let dir = aterm_netplace::record::dir(state);
+    let remembered = match aterm_netplace::record::read(&dir) {
+        Some(written) => written.record.remembered,
+        None if matches!(
+            std::fs::symlink_metadata(dir.join(aterm_netplace::record::FILE)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ) =>
+        {
+            Vec::new()
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the network place's record cannot be read, so the home-day seed waits",
+            ));
+        }
+    };
+    aterm_netplace::heard::seed_days(&dir, &remembered, HOME_DAYS, at_ms)
+}
+
+/// This Mac's home ALab LAN under `rule` at `at_ms`, from the network place under the state root
+/// `state` and what this Mac reads of its network (`here`, [`aterm_netplace::proof::read_with`]),
+/// writing nothing. Under the 7-day condition it reads the home-day ledger there; one with a line
+/// this build cannot read counts no day, so a damaged ledger admits nothing it did not prove.
+///
+/// # Errors
+/// [`Away`] names why the network the default route takes is not the home ALab LAN now.
+pub fn home_net_with(state: &Path, here: Here, at_ms: u64, rule: Rule) -> Result<HomeNet, Away> {
+    let days = if rule.days {
+        match aterm_netplace::heard::read_days(&aterm_netplace::record::dir(state)) {
+            (days, 0) => days,
+            _ => HomeDays::default(),
+        }
+    } else {
+        HomeDays::default()
+    };
+    home_net_at(
+        &aterm_netplace::proof::read_with(state, here, at_ms),
+        &days,
+        rule,
+    )
+}
+
+/// This Mac's home ALab LAN under `rule` at `at_ms`, as [`home_net`] judges it, from the network
+/// place under the state root `state` and what this Mac reads of its network (`here`): under the
+/// 7-day condition it first makes sure the one-time seed ran ([`seed_at`]; one that cannot run
+/// now, a held lock or a record unread, runs at a later call), then judges as [`home_net_with`].
+/// With the condition off it writes nothing.
+///
+/// # Errors
+/// [`Away`] names why the network the default route takes is not the home ALab LAN now.
+pub fn home_net_seeding(state: &Path, here: Here, at_ms: u64, rule: Rule) -> Result<HomeNet, Away> {
+    if rule.days {
+        let _ = seed_at(state, at_ms);
+    }
+    home_net_with(state, here, at_ms, rule)
+}
+
+/// This Mac's home ALab LAN now, under this build's rule ([`Rule::live`]), from the network place
+/// under this process's state root (`aterm_types::dirs::state_dir`, where its fleet heartbeat and
+/// its mesh connections note the answers, [`home_net_seeding`]); `None` where it is on none, or
+/// with no state root. It reads the network (Network.framework's path among it), so never on a
+/// window's main thread.
 #[must_use]
 pub fn home_net() -> Option<HomeNet> {
     let state = aterm_types::dirs::state_dir()?;
-    home_net_at(&aterm_netplace::proof::read(&state)).ok()
+    home_net_seeding(
+        &state,
+        aterm_netplace::facts::here_now(),
+        aterm_netplace::unix_ms_now(),
+        Rule::live(),
+    )
+    .ok()
 }
 
 #[cfg(test)]

@@ -628,9 +628,23 @@ fn stale(held: Option<Held>) -> (Option<Held>, Freshness) {
     }
 }
 
-fn cwd_of(term: &Arc<Mutex<Terminal>>) -> Option<String> {
+/// The working directory `term` last reported (OSC 7), without waiting on its lock.
+pub(crate) fn cwd_of(term: &Arc<Mutex<Terminal>>) -> Option<String> {
+    reported_cwd(term, false)
+}
+
+/// [`cwd_of`] where this machine made the report: a directory this machine's mount table holds,
+/// not one a shell over ssh named on its own host.
+pub(crate) fn local_cwd_of(term: &Arc<Mutex<Terminal>>) -> Option<String> {
+    reported_cwd(term, true)
+}
+
+fn reported_cwd(term: &Arc<Mutex<Terminal>>, here_only: bool) -> Option<String> {
     use crate::cwd_native::ReportedCwd as _;
     let read = |t: &Terminal| {
+        if here_only && !t.reported_cwd_here() {
+            return None;
+        }
         t.native_working_directory()
             .map(std::borrow::Cow::into_owned)
             .filter(|p| !p.is_empty())

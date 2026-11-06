@@ -70,6 +70,10 @@ pub(crate) const PERSON: &str = "h-alice";
 pub(crate) enum Mutant {
     /// The attach reads no lineage.
     IgnoreLineage,
+    /// The attach takes its incarnation without the newest one its node's presence names on the
+    /// bus: a state dir that lost its incarnation, its node kept by the node key (§11 C3),
+    /// numbers its records from the start again.
+    IgnoreBusIncarnation,
     /// A post left queued by a kill takes a fresh sequence on its retry instead of the one pinned.
     FreshSeqOnRetry,
     /// A receipt left owed by a kill takes a fresh sequence on its retry.
@@ -168,6 +172,18 @@ pub(crate) enum Mutant {
     /// (`Bridge::mirror_key_on_the_media`): the control of the fence's law (critic item D06),
     /// under which an open's first take can be answered with no pin of this build on the media.
     TakeAheadOfTheFence,
+    /// The pin's fence is held once its settle is SENT, not answered
+    /// (`Bridge::make_the_pin_fence`, critic item F07): a take goes while the broker's writer
+    /// may still be flushing, the pin's barriers not yet drained.
+    FenceBeforeTheSettle,
+    /// The settle goes ahead of the pin's barriers (`Bridge::make_the_pin_fence`, critic item
+    /// F07): the broker's flush may drain the device before the pin is written, and its answer
+    /// then vouches for a pin no flush covered.
+    SettleAheadOfTheBarrier,
+    /// The bridge trusts a broker's full flush whatever device its log is on
+    /// (`Bridge::broker_settles_the_pin`, critic item F07): a flush of another device settles
+    /// nothing of the state dir's.
+    TrustAnotherDevicesFlush,
     /// A drain peeks the outbox with a post still in flight, its answer not read first, and
     /// sends what it lists.
     PeekPastOwedPost,
@@ -231,8 +247,6 @@ pub(crate) enum Mutant {
     TotalInThePinAlone,
     /// A bridge tells aterm what its start moved into the quarantine in place of what the quarantine holds (`Bridge::tell_quarantine`).
     TellMovedNotHeld,
-    /// An offset of ours below the self-lane window's oldest is added to it.
-    RememberBelowTheWindow,
     /// A recovery step stopped by a write error still writes `run` after it (`Bridge::recover`).
     BeginRunPastAFailedRecovery,
     /// The mirror judges its pin at the hello before recovery completes (`Bridge::mirror_hello_answered`).
@@ -372,24 +386,44 @@ pub(crate) enum Mutant {
     /// the next one no deadline to sweep, and the ask never expires.
     RetireOverAnUnwrittenDeadline,
     /// A landed post's in-flight entry ends ahead of its offset in the self-lane log
-    /// (`Bridge::land_group`, critic item E07): a bridge killed between leaves the next one an
-    /// own record neither in flight nor known as its own, which it refuses as forged.
+    /// (`Bridge::land_group`, critic item E07; a landed receipt's too, since F15 settles it
+    /// there): a bridge killed between leaves the next one an own record neither in flight nor
+    /// known as its own, which it refuses as forged.
     LandedBeforeAcked,
+    /// Every landed post's offset goes into the self-lane log, one onto another node's lane or a
+    /// person's too, as every build before critic item F17 wrote it (`Bridge::land_group`,
+    /// `Landing::remembers`): each takes a slot of the forged-self window, so a full window
+    /// drops an own offset for it and its floor rises past a forged own record, unaccused.
+    WideAckedSet,
+    /// The forged-self window's floor is read off its oldest offset, as every build before
+    /// critic item F17's review read it (`Bridge::window_accuses`, `self_window`): a fresh
+    /// window's first own record raises it past a forged own record below, unaccused.
+    FloorOffTheOldest,
     /// A landed post's reservation is forgotten ahead of aterm's `outbox sent`
-    /// (`Bridge::land_group`, critic item E07): a bridge killed between leaves the next one a
-    /// post aterm still lists and no pin holds, which goes out again at a fresh sequence.
+    /// (`Bridge::land_group`, critic item E07; a landed receipt's ahead of its `deliver
+    /// receipt=`, since F15): a bridge killed between leaves the next one a post aterm still
+    /// lists and no pin holds, which goes out again at a fresh sequence.
     RetireBeforeOutboxSent,
     /// A landed post's in-flight entry ends at its ack, ahead of aterm's `outbox sent`, as every
-    /// build before critic item E07 ended it (`Bridge::land_group`): a bridge killed between
-    /// leaves the next one its own record to deliver while the post stands queued, and the
-    /// drain's retry at the pin, past a cut that gave the record up, appends a second copy.
+    /// build before critic item E07 ended it (`Bridge::land_group`; a landed receipt's too, as
+    /// every build before F15 ended it): a bridge killed between leaves the next one its own
+    /// record to deliver while the post stands queued, and the drain's retry at the pin, past a
+    /// cut that gave the record up, appends a second copy.
     LandedBeforeOutboxSent,
     /// A landed post's in-flight entry ends at any answer to its `outbox sent` and at a hold,
-    /// as critic item E07's first cut ended it (`Bridge::land_group`): an answer that leaves
-    /// the post queued (aterm's `ERR busy update-committing`), or a key or a deadline the disk
-    /// refused, lets the record be delivered while the post stands queued, and the drain's
-    /// retry at the pin, past a cut that gave the record up, appends a second copy.
+    /// as critic item E07's first cut ended it (`Bridge::land_group`; a landed receipt's at any
+    /// answer, since F15): an answer that leaves the post queued (aterm's `ERR busy
+    /// update-committing`), or a key or a deadline the disk refused, lets the record be
+    /// delivered while the post stands queued, and the drain's retry at the pin, past a cut that
+    /// gave the record up, appends a second copy.
     LandedWhileThePostStaysQueued,
+    /// A landed receipt's in-flight entry ends at its ack, ahead of aterm's `deliver <sid>
+    /// receipt=<rid>`, as every build before critic item F15 ended it (`Bridge::send_receipt`,
+    /// the old order: `Bridge::publish_journaled` settles the entry as the record lands): a
+    /// bridge killed between leaves the next one the receipt's own record to deliver while aterm
+    /// still owes the receipt, and the drain's retry at the pin, past a cut that gave the record
+    /// up, lands the answer a second time.
+    ReceiptRetiredAtAck,
     /// A post's deadline is armed again over the settle the asks journal remembers, as before
     /// item C04 (`Bridge::note_deadline`): a held ask's retry, by the bridge that held it or by
     /// the next after a kill, arms the deadline its answer or `expired` settled while it was
@@ -519,6 +553,11 @@ pub(crate) struct Opts {
     /// (`broker_rules::rate_limit`), which the worlds' traffic never reaches, or one low enough
     /// to bind ([`BINDING_RATE`]); `None`: none.
     pub(crate) rate_limit: Option<astream_broker::RateLimit>,
+    /// THE LOG IS ON THE STATE DIR'S DEVICE (critic item F07): each full flush of the broker's
+    /// drains it ([`bus::OnDevice`]), and its `Hello` names it, so the bridge fences its pin by
+    /// barriers and the broker's settle. Every committed world's log is on another device,
+    /// where the bridge flushes the pin itself.
+    pub(crate) same_device: bool,
 }
 
 /// The deadlines an ask draws ([`Opts::deadlines`]), in ms: from one that passes before its
@@ -561,7 +600,9 @@ pub(crate) const SCALED_WINDOW: u64 = 1024;
 /// retry at the pin found no copy and appended a second (`dup delivery`), the limit's hold
 /// delaying that drain past a kill. Critic item E07 closed it (the entry stands until the post
 /// left aterm's outbox, `Bridge::land_group`), and seed 78 is among the committed
-/// seeds here (`Mutant::LandedBeforeOutboxSent` brings the hole back).
+/// seeds here (`Mutant::LandedBeforeOutboxSent` brings the hole back). Critic item F15 closed
+/// the same hole for receipts, which settle through the same steps: `Mutant::ReceiptRetiredAtAck`
+/// brings it back at seed 515, which answers one decision twice.
 pub(crate) fn binding_rate() -> astream_broker::RateLimit {
     astream_broker::RateLimit::records(10, 4)
         .unwrap_or_else(|| unreachable!("astream takes ten records a second, a burst of four"))
@@ -650,6 +691,7 @@ impl Opts {
             handoffs: false,
             off_boot_volume: false,
             rate_limit: Some(crate::broker_rules::rate_limit()),
+            same_device: false,
         }
     }
 
@@ -801,6 +843,11 @@ pub(crate) struct Stats {
     pub(crate) fences_lifted: u64,
     /// Publishes the broker's rate limit refused in every open ([`bus::Broker::rate_limited_total`]).
     pub(crate) rate_limited: u64,
+    /// The `Settle`s the broker answered ([`bus::Broker::settles`], critic item F07): the pin's
+    /// fences that went by the broker's flush.
+    pub(crate) settles: u64,
+    /// The durable replaces of `logpin` the device made ([`Device::pin_durable_replaces`]).
+    pub(crate) pin_durable_replaces: u64,
     /// WRITE errors the device injected ([`Opts::write_errors`], [`super::device::WriteErrors`]).
     pub(crate) writes_failed: u64,
     pub(crate) unlinks_failed: u64,
@@ -1189,6 +1236,23 @@ impl World {
         for p in [NODE, PEER, PERSON] {
             broker.name_producer(producer(p), p);
         }
+        // WHERE THE LOG IS (critic item F07): on the state dir's device, each full flush of the
+        // broker's draining it, or on another (a device number one past the state dir's).
+        let state_dev = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&state_dir).expect("the state dir").dev()
+        };
+        broker.on_device(if opts.same_device {
+            bus::OnDevice {
+                dev: state_dev,
+                drain: Some(device.drain()),
+            }
+        } else {
+            bus::OnDevice {
+                dev: state_dev.wrapping_add(1),
+                drain: None,
+            }
+        });
         let core = Core::new(opts.seed, broker, device);
         *lock(&core.mutants) = opts.mutants.clone();
         if opts.write_errors {
@@ -1220,6 +1284,7 @@ impl World {
             } else {
                 crate::mirror::LogMode::Off
             },
+            mesh: None,
         };
         let mut w = World {
             opts,
@@ -3932,6 +3997,8 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     (w.stats.commits_corked, w.stats.commits_alone) = w.core.broker.commit_writes();
     (w.stats.gap_fenced, w.stats.fences_lifted) = w.core.broker.fence_counts();
     w.stats.rate_limited = w.core.broker.rate_limited_total();
+    w.stats.settles = w.core.broker.settles();
+    w.stats.pin_durable_replaces = w.core.device.pin_durable_replaces();
     // THE LAW OF THE LIMIT'S WAIT (critic item E06, `bus::State::rate_laws`): judged at the door,
     // where a bridge that retried a refusal for the rate at once meets it.
     w.violations.extend(w.core.broker.take_rate_laws());

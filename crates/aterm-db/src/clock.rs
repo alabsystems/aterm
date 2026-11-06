@@ -483,25 +483,27 @@ pub fn standing(
         match last {
             Standing::Off { ahead } if peers().next().is_some() => {
                 // What it last stood on, however old: the figures the refusal says.
-                let stood: Vec<&Reading> = peers().filter_map(|m| readings.get(m)).collect();
                 let class = if ahead { Class::Ahead } else { Class::Behind };
-                let with: Vec<i64> = stood
-                    .iter()
-                    .filter(|r| r.class(last) == class)
-                    .map(|r| {
-                        if ahead {
+                let mut against = 0usize;
+                let mut of = 0usize;
+                let mut by: Option<u64> = None;
+                for r in peers().filter_map(|m| readings.get(m)) {
+                    let c = r.class(last);
+                    if c != Class::Undecided {
+                        of += 1;
+                    }
+                    if c == class {
+                        against += 1;
+                        let o = if ahead {
                             r.lo_ms
                         } else {
                             r.hi_ms.saturating_neg()
-                        }
-                    })
-                    .collect();
-                let of = stood
-                    .iter()
-                    .filter(|r| r.class(last) != Class::Undecided)
-                    .count();
-                let by = with.iter().map(|o| (*o).max(0).unsigned_abs()).min();
-                (last, by.unwrap_or(0), with.len(), of, true)
+                        };
+                        let abs = o.max(0).unsigned_abs();
+                        by = Some(by.map_or(abs, |prev| prev.min(abs)));
+                    }
+                }
+                (last, by.unwrap_or(0), against, of, true)
             }
             _ => (Standing::Unknown, 0, 0, 0, false),
         }

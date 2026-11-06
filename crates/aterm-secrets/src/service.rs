@@ -49,6 +49,11 @@ pub enum State {
     },
 }
 
+/// The node service's launchd label and systemd unit stem, which `aterm secrets status` reads:
+/// its vault pass runs there from R2 (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13). aterm-agent
+/// installs it.
+pub const NODE_LABEL: &str = "systems.alab.aterm-node";
+
 /// The launchctl binary.
 pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
@@ -2481,17 +2486,32 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
 /// # Errors
 /// The home, unit, service manager, or deadline cannot be read.
 pub fn state_until(home: &Path, job: Job, until: Instant) -> crate::Result<State> {
+    label_state_until(home, job.label(), until)
+}
+
+/// The node service's state ([`NODE_LABEL`]).
+/// # Errors
+/// As [`state`].
+pub fn node_state(home: &Path) -> crate::Result<State> {
+    label_state_until(home, NODE_LABEL, Instant::now() + CHILD_HANG)
+}
+
+/// [`state_until`] of the job labelled `label`.
+fn label_state_until(home: &Path, label: &str, until: Instant) -> crate::Result<State> {
     // The login's job is not this home's: a scratch `HOME` has none.
     if check_own_home(home).is_err() {
         return Ok(State::Absent);
     }
     #[cfg(target_os = "macos")]
     {
-        let unit = plist_path(home, job);
+        let unit = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{label}.plist"));
         let on_disk = crate::fsx::kind(&unit)? != crate::fsx::Kind::Missing;
         let mut loaded = None;
         for domain in [Domain::Gui, Domain::User] {
-            if let Some(pid) = launchd_job_with(domain, job.label(), &mut |call| {
+            if let Some(pid) = launchd_job_with(domain, label, &mut |call| {
                 run_until(
                     Path::new(LAUNCHCTL),
                     &launchctl_argv(aterm_uds::peer::our_uid(), call),
@@ -2510,7 +2530,12 @@ pub fn state_until(home: &Path, job: Job, until: Instant) -> crate::Result<State
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let unit = unit_path(home, job);
+        let name = format!("{label}.service");
+        let unit = home
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join(&name);
         if crate::fsx::kind(&unit)? == crate::fsx::Kind::Missing {
             return Ok(State::Absent);
         }
@@ -2518,7 +2543,7 @@ pub fn state_until(home: &Path, job: Job, until: Instant) -> crate::Result<State
             Ok(systemctl) => {
                 let out = run_until(
                     &systemctl,
-                    &systemctl_argv(&["show", "-p", "MainPID", "--value", &unit_name(job)]),
+                    &systemctl_argv(&["show", "-p", "MainPID", "--value", &name]),
                     until,
                 )?;
                 if out.status.success() {
@@ -5070,7 +5095,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(60);
             while boundary.waiting() == 0 {
                 assert!(Instant::now() < deadline, "the install never waited");
-                std::thread::yield_now();
+                aterm_uds::deadline::poll_yield();
             }
             assert_eq!(
                 launchd.lock().unwrap().calls,
@@ -5135,7 +5160,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(60);
                 while boundary.waiting() == 0 {
                     assert!(Instant::now() < deadline, "the bootstrap never waited");
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
                 // While the handoff is pending, the person turns the subscriber's policy off, or
                 // another install loads its job; then the handoff is refused.

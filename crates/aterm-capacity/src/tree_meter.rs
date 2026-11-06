@@ -231,8 +231,8 @@ impl Tally {
     #[must_use]
     pub fn left(&mut self, now: &[Alive]) -> Vec<u32> {
         self.left_identities(now)
-            .iter()
-            .map(|&(pid, _)| pid)
+            .into_iter()
+            .map(|(pid, _)| pid)
             .collect()
     }
 
@@ -250,22 +250,22 @@ impl Tally {
             .map(|a| (a.pid, a.start))
             .collect();
         loop {
-            let more: Vec<(u32, u64)> = now
-                .iter()
-                .filter(|a| {
-                    !self.seen.contains_key(&(a.pid, a.start))
-                        && left.iter().any(|&(pid, _)| pid == a.ppid)
-                        && !left.contains(&(a.pid, a.start))
-                })
-                .map(|a| (a.pid, a.start))
-                .collect();
-            if more.is_empty() {
+            let before = left.len();
+            for a in now {
+                let identity = (a.pid, a.start);
+                if !self.seen.contains_key(&identity)
+                    && left[..before].iter().any(|&(pid, _)| pid == a.ppid)
+                    && !left.contains(&identity)
+                {
+                    left.push(identity);
+                }
+            }
+            if left.len() == before {
                 return left;
             }
-            for &identity in &more {
+            for &identity in &left[before..] {
                 self.seen.insert(identity, true);
             }
-            left.extend(more);
         }
     }
 

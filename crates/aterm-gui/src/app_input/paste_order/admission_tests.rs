@@ -371,7 +371,7 @@ fn stalled_sink_case(hidden: bool) {
     );
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while sink.ordered_egress_count() != 0 && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     assert_eq!(sink.ordered_egress_count(), 0);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);

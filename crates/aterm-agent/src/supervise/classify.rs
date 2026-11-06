@@ -2608,6 +2608,25 @@ pub(crate) fn path_operands_except(
     Ok(out)
 }
 
+/// Every word [`path_operands_except`] may read off the segments of `line` (nested ones among
+/// them) whose program `of` holds (`None` for a segment whose program the walk finds none of),
+/// each read as a segment whose command reads every word: for the secret check, which meets a
+/// glob such a program takes by that program's own rules.
+pub(crate) fn path_operands_of(
+    line: &str,
+    of: &dyn Fn(Option<&str>) -> bool,
+) -> Result<Vec<String>, String> {
+    let segments = program_words_nested(&strip_alarm_idiom(&prelex(line)?));
+    let mut out = Vec::new();
+    for (seg, _) in &segments {
+        let head = runs(seg).ok().flatten().map(|r| program(&seg[r.at]));
+        if of(head) {
+            segment_paths(seg, false, &mut out);
+        }
+    }
+    Ok(out)
+}
+
 fn redirect_word(w: &str) -> Option<(&str, bool)> {
     let op = w.trim_start_matches(|c: char| c.is_ascii_digit());
     let op = op

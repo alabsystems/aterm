@@ -14,6 +14,11 @@
 //! own text, blocks and session log hold no value; and closing the Editor tab ends the command and
 //! removes its folder. The file the Editor shows holds the values: the positive control.
 //!
+//! A17b: the window's accessibility tree, read as any process the person granted Accessibility
+//! reads it (the AX API, every string attribute of every element and each text element's
+//! characters), carries the grid (a `hidden value` cell) and every login, and no value. Where
+//! this process holds no Accessibility grant, those checks are a named skip, never a pass.
+//!
 //! Nothing reads or writes this Mac's vault, registry or journal: every process runs in the
 //! world's environment, its home the fixture's, and the world goes when the run ends. The report
 //! names checks only, never a value.
@@ -75,6 +80,21 @@ pub struct Evidence {
     pub folder_removed: bool,
     /// The caller's tab, read again after the close, holds no value.
     pub after_close_clean: bool,
+    /// The Editor tab's accessibility tree as a process with Accessibility reads it; `None`
+    /// where this process holds no Accessibility grant.
+    pub ax: Option<AxEvidence>,
+}
+
+/// What the window's accessibility tree held while the Editor tab was in front.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AxEvidence {
+    /// The grid's nodes were published: a concealed cell's `hidden value` was read.
+    pub grid_read: bool,
+    /// Every cell not secret that the caller named as on the first screen (a login) was read:
+    /// the columns not secret are there.
+    pub logins_read: bool,
+    /// No revealed value was read.
+    pub clean: bool,
 }
 
 fn fail(error: impl std::fmt::Display) -> Fail {
@@ -96,7 +116,7 @@ fn within<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> Result<T, Fail
 }
 
 /// The world's environment with zsh as its shell.
-fn zsh_env(world: &World) -> Vec<(String, String)> {
+pub(crate) fn zsh_env(world: &World) -> Vec<(String, String)> {
     let mut env = world.env();
     for (key, value) in &mut env {
         if key == "SHELL" {
@@ -108,7 +128,7 @@ fn zsh_env(world: &World) -> Vec<(String, String)> {
 
 /// A zsh rc that queues `line` and accepts it once, at the first prompt: the command starts as
 /// the person's own typing would, with no control client typing it.
-fn zshrc(line: &str) -> String {
+pub(crate) fn zshrc(line: &str) -> String {
     format!(
         "typeset -gi __a17_go=1\n\
          __a17_accept() {{ if (( __a17_go )); then __a17_go=0; zle accept-line; fi }}\n\
@@ -136,15 +156,23 @@ fn scratch_folders(world: &World) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Whether any file directly in `folder` holds `needle`.
-fn folder_holds(folder: &Path, needle: &str) -> bool {
+/// Whether `text` holds any of `needles`.
+fn holds(text: &str, needles: &[String]) -> bool {
+    needles.iter().any(|needle| text.contains(needle.as_str()))
+}
+
+/// Whether any file directly in `folder` holds any of `needles`.
+fn folder_holds(folder: &Path, needles: &[String]) -> bool {
     std::fs::read_dir(folder).is_ok_and(|listing| {
         listing.flatten().any(|entry| {
-            std::fs::read(entry.path()).is_ok_and(|bytes| {
-                bytes
-                    .windows(needle.len())
-                    .any(|window| window == needle.as_bytes())
-            })
+            entry.file_type().is_ok_and(|t| t.is_file())
+                && crate::util::read_regular_file(&entry.path()).is_ok_and(|bytes| {
+                    needles.iter().any(|needle| {
+                        bytes
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                    })
+                })
         })
     })
 }
@@ -166,16 +194,18 @@ fn private_doc(inst: &Instance) -> Option<String> {
 /// `text` with each line that holds a value withheld and each other cut to 160 bytes: what the
 /// report may say of a run.
 fn scrub(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if line.contains(NEEDLE) {
-                "[a line with a value, withheld]".to_owned()
-            } else {
-                line.chars().take(160).collect()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(text.len().min(4096));
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.contains(NEEDLE) {
+            out.push_str("[a line with a value, withheld]");
+        } else {
+            out.extend(line.chars().take(160));
+        }
+    }
+    out
 }
 
 /// A reply's whole text, both streams.
@@ -208,8 +238,8 @@ fn outside(world: &World, aterm: &Path) -> Result<(bool, String), Fail> {
     let job = Job::start(&dir, &line, &world.env(), &world.home, &log).map_err(fail)?;
     let ended = within("the outside job", || (!job.running()).then_some(()));
     crate::instance::after_stop(ended, job.remove().map_err(|why| why.to_string()))?;
-    let printed = std::fs::read_to_string(&typescript).unwrap_or_default();
-    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    let printed = crate::util::read_regular_text(&typescript).unwrap_or_default();
+    let logged = crate::util::read_regular_text(&log).unwrap_or_default();
     Ok((
         printed.contains(NEEDLE),
         scrub(&format!("{printed}{logged}")),
@@ -284,19 +314,34 @@ pub fn run(aterm: &Path) -> Result<Evidence, Fail> {
         },
     )
     .map_err(fail)?;
-    let observed = observe(&mut inst, &world, &mut ev);
+    let logins: Vec<String> = (1..=ROWS)
+        .map(|i| format!("box{i:02}@proton.example"))
+        .collect();
+    let observed = observe(&mut inst, &world, &[NEEDLE.to_owned()], &logins, &mut ev);
     crate::instance::after_stop(observed, inst.stop())?;
     drop(lab);
     Ok(ev)
 }
 
-/// Everything read of the running instance.
-fn observe(inst: &mut Instance, world: &World, ev: &mut Evidence) -> Result<(), Fail> {
+/// Everything read of the running instance, `needles` being the values its command reveals and
+/// `shown` the cells not secret that the grid's first screen shows, which its accessibility tree
+/// must still carry.
+///
+/// # Errors
+/// The Editor tab did not open, or could not be closed.
+pub(crate) fn observe(
+    inst: &mut Instance,
+    world: &World,
+    needles: &[String],
+    shown: &[String],
+    ev: &mut Evidence,
+) -> Result<(), Fail> {
     inst.await_socket(HANG)?;
     let doc = within("the Editor tab", || private_doc(inst))?;
     ev.editor_opened = true;
     let folders = scratch_folders(world);
-    ev.file_holds_values = folders.iter().any(|folder| folder_holds(folder, NEEDLE));
+    ev.file_holds_values = folders.iter().any(|folder| folder_holds(folder, needles));
+    ev.ax = ax_tree(inst, needles, shown)?;
 
     for verb in [
         &["text"][..],
@@ -314,17 +359,17 @@ fn observe(inst: &mut Instance, world: &World, ev: &mut Evidence) -> Result<(), 
 
     let tab = said(&terminal_request(|args| inst.ctl(args), &["text"]));
     ev.tab_names_editor = tab.contains(OPENED);
-    ev.tab_text_clean = !tab.contains(NEEDLE);
+    ev.tab_text_clean = !holds(&tab, needles);
     let blocks = said(&terminal_request(|args| inst.ctl(args), &["blocks"]));
     ev.blocks_hold_command = blocks.contains("--show-passwords");
-    ev.blocks_clean = !blocks.contains(NEEDLE);
+    ev.blocks_clean = !holds(&blocks, needles);
     // The log keeps a command's program, never its output or arguments: a run is there, and no
     // value, the in-memory content tier included.
     let log = said(&terminal_request(
         |args| inst.ctl(args),
         &["log", "tier=content"],
     ));
-    ev.log_clean = log.contains("open r") && !log.contains(NEEDLE);
+    ev.log_clean = log.contains("open r") && !holds(&log, needles);
 
     let closed = inst.ctl(&["tab", "close", "2"]);
     if closed.code != 0 {
@@ -347,8 +392,269 @@ fn observe(inst: &mut Instance, world: &World, ev: &mut Evidence) -> Result<(), 
             &["log", "tier=content"],
         )),
     ];
-    ev.after_close_clean = after.iter().all(|read| !read.contains(NEEDLE));
+    ev.after_close_clean = after.iter().all(|read| !holds(read, needles));
     Ok(())
+}
+
+/// What a concealed grid cell reads as (`amacs::editor::HIDDEN_VALUE`).
+const HIDDEN_VALUE: &str = "hidden value";
+
+/// The Editor tab's accessibility tree as a process with Accessibility reads it ([`AxEvidence`]),
+/// read until the grid's nodes are there (an adapter publishes once a reader attaches) or the
+/// hang detector ends the wait; `None` where this process holds no Accessibility grant.
+/// `needles` are the revealed values it must not carry, `shown` the cells it must.
+fn ax_tree(
+    inst: &Instance,
+    needles: &[String],
+    shown: &[String],
+) -> Result<Option<AxEvidence>, Fail> {
+    if !ax::trusted() {
+        return Ok(None);
+    }
+    let pid = inst
+        .aterm_pid()
+        .ok_or_else(|| fail("the instance's aterm has no pid"))?;
+    let end = Instant::now() + HANG;
+    loop {
+        let texts = ax::texts(pid);
+        let holds = |needle: &str| texts.iter().any(|text| text.contains(needle));
+        let seen = AxEvidence {
+            grid_read: holds(HIDDEN_VALUE),
+            logins_read: shown.iter().all(|cell| holds(cell)),
+            clean: !needles.iter().any(|needle| holds(needle)),
+        };
+        if (seen.grid_read && seen.logins_read) || !seen.clean || Instant::now() >= end {
+            return Ok(Some(seen));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every string a running app's windows carry, read through the Accessibility API as any
+/// process the person granted Accessibility reads them.
+#[expect(
+    unsafe_code,
+    reason = "the Accessibility API: reading the tree another process can read"
+)]
+mod ax {
+    use std::ffi::c_void;
+
+    type CfRef = *const c_void;
+
+    #[repr(C)]
+    struct CfRange {
+        location: isize,
+        length: isize,
+    }
+
+    /// How deep a window's tree is read.
+    const DEPTH: usize = 32;
+    /// The most elements read in a pass.
+    const MOST: usize = 50_000;
+    /// The most characters read of one text element.
+    const CHARACTERS: i64 = 1 << 16;
+    /// `kAXValueCFRangeType`.
+    const RANGE: u32 = 4;
+    /// `kCFNumberSInt64Type`.
+    const SINT64: isize = 4;
+    const UTF8: u32 = 0x0800_0100;
+    /// Each element's string attributes read.
+    const STRINGS: [&str; 7] = [
+        "AXTitle",
+        "AXDescription",
+        "AXValue",
+        "AXHelp",
+        "AXSelectedText",
+        "AXPlaceholderValue",
+        "AXRoleDescription",
+    ];
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CfRef);
+        fn CFGetTypeID(cf: CfRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFArrayGetCount(array: CfRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
+        fn CFStringGetLength(string: CfRef) -> isize;
+        fn CFStringGetCharacters(string: CfRef, range: CfRange, buffer: *mut u16);
+        fn CFNumberGetValue(number: CfRef, kind: isize, out: *mut c_void) -> u8;
+        fn CFStringCreateWithBytes(
+            alloc: CfRef,
+            bytes: *const u8,
+            len: isize,
+            encoding: u32,
+            external: u8,
+        ) -> CfRef;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+        fn AXUIElementCreateApplication(pid: i32) -> CfRef;
+        fn AXUIElementCopyAttributeValue(el: CfRef, attr: CfRef, out: *mut CfRef) -> i32;
+        fn AXUIElementCopyParameterizedAttributeValue(
+            el: CfRef,
+            attr: CfRef,
+            param: CfRef,
+            out: *mut CfRef,
+        ) -> i32;
+        fn AXUIElementSetMessagingTimeout(el: CfRef, secs: f32) -> i32;
+        fn AXValueCreate(kind: u32, value: *const c_void) -> CfRef;
+    }
+
+    /// A CF object this code owns one reference to (null: none).
+    struct Owned(CfRef);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: non-null, and this value owns one reference to it.
+                unsafe { CFRelease(self.0) }
+            }
+        }
+    }
+
+    /// Whether this process (its responsible app) holds Accessibility, with no prompt.
+    pub(super) fn trusted() -> bool {
+        // SAFETY: a plain query.
+        unsafe { AXIsProcessTrusted() }
+    }
+
+    fn cf_string(text: &str) -> Owned {
+        // SAFETY: the bytes and length of a live UTF-8 string; the result is owned.
+        Owned(unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                text.as_ptr(),
+                isize::try_from(text.len()).unwrap_or(0),
+                UTF8,
+                0,
+            )
+        })
+    }
+
+    fn text(cf: CfRef) -> Option<String> {
+        if cf.is_null() {
+            return None;
+        }
+        // SAFETY: `CFGetTypeID` reads any live CF object; a non-string is refused before it is
+        // read as one, and the buffer holds the string's whole length.
+        unsafe {
+            if CFGetTypeID(cf) != CFStringGetTypeID() {
+                return None;
+            }
+            let length = CFStringGetLength(cf);
+            let mut units = vec![0u16; usize::try_from(length).ok()?];
+            CFStringGetCharacters(
+                cf,
+                CfRange {
+                    location: 0,
+                    length,
+                },
+                units.as_mut_ptr(),
+            );
+            Some(String::from_utf16_lossy(&units))
+        }
+    }
+
+    fn number(cf: CfRef) -> Option<i64> {
+        if cf.is_null() {
+            return None;
+        }
+        let mut out = 0i64;
+        // SAFETY: a live CF object, read as a number only when it is one, into an i64.
+        unsafe {
+            (CFGetTypeID(cf) == CFNumberGetTypeID()
+                && CFNumberGetValue(cf, SINT64, (&raw mut out).cast()) != 0)
+                .then_some(out)
+        }
+    }
+
+    fn items(array: CfRef) -> Vec<CfRef> {
+        if array.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: a live CF object, read as an array only when it is one; its items are
+        // borrowed while the array lives.
+        unsafe {
+            if CFGetTypeID(array) != CFArrayGetTypeID() {
+                return Vec::new();
+            }
+            (0..CFArrayGetCount(array))
+                .map(|index| CFArrayGetValueAtIndex(array, index))
+                .collect()
+        }
+    }
+
+    fn attr(el: CfRef, name: &str) -> Owned {
+        let key = cf_string(name);
+        let mut out: CfRef = std::ptr::null();
+        // SAFETY: an AX element, an attribute name and an out pointer; the value is owned.
+        let err = unsafe { AXUIElementCopyAttributeValue(el, key.0, &raw mut out) };
+        Owned(if err == 0 { out } else { std::ptr::null() })
+    }
+
+    /// A text element's first [`CHARACTERS`] characters (`AXStringForRange`), as a reader asks
+    /// for the text it does not hold as a value.
+    fn characters(el: CfRef) -> Option<String> {
+        let count = number(attr(el, "AXNumberOfCharacters").0)?.min(CHARACTERS);
+        if count <= 0 {
+            return None;
+        }
+        let range = CfRange {
+            location: 0,
+            length: isize::try_from(count).ok()?,
+        };
+        // SAFETY: a CFRange of the kind named, copied into an owned AXValue.
+        let param = Owned(unsafe { AXValueCreate(RANGE, (&raw const range).cast()) });
+        if param.0.is_null() {
+            return None;
+        }
+        let key = cf_string("AXStringForRange");
+        let mut out: CfRef = std::ptr::null();
+        // SAFETY: an AX element, an attribute name, its parameter and an out pointer; the value
+        // is owned.
+        let err =
+            unsafe { AXUIElementCopyParameterizedAttributeValue(el, key.0, param.0, &raw mut out) };
+        let out = Owned(if err == 0 { out } else { std::ptr::null() });
+        text(out.0)
+    }
+
+    /// Every string `pid`'s windows' elements carry, depth first.
+    pub(super) fn texts(pid: i32) -> Vec<String> {
+        // SAFETY: an app element for a pid, owned.
+        let app = Owned(unsafe { AXUIElementCreateApplication(pid) });
+        if app.0.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the element this code created; a busy app answers within the timeout or not.
+        unsafe { AXUIElementSetMessagingTimeout(app.0, 2.0) };
+        let windows = attr(app.0, "AXWindows");
+        let mut out = Vec::new();
+        let mut read = 0usize;
+        for window in items(windows.0) {
+            walk(window, 0, &mut read, &mut out);
+        }
+        out
+    }
+
+    fn walk(el: CfRef, depth: usize, read: &mut usize, out: &mut Vec<String>) {
+        if depth > DEPTH || *read >= MOST {
+            return;
+        }
+        *read += 1;
+        for name in STRINGS {
+            out.extend(text(attr(el, name).0).filter(|text| !text.is_empty()));
+        }
+        out.extend(characters(el));
+        let children = attr(el, "AXChildren");
+        for child in items(children.0) {
+            walk(child, depth + 1, read, out);
+        }
+    }
 }
 
 /// Whether a verb's first line is the private-view refusal: `ERR refused private view: …`, or
@@ -384,6 +690,15 @@ pub fn judge(ev: &Evidence) -> Vec<(String, bool)> {
             "outside aterm the command prints the values".to_owned(),
             ev.outside_printed,
         ),
+    ];
+    checks.extend(judge_tab(ev));
+    checks
+}
+
+/// The checks of the Editor tab and the caller's tab ([`observe`]'s), and whether each held.
+#[must_use]
+pub fn judge_tab(ev: &Evidence) -> Vec<(String, bool)> {
+    let mut checks = vec![
         (
             "in a tab the Editor tab opens on a private document".to_owned(),
             ev.editor_opened,
@@ -431,7 +746,29 @@ pub fn judge(ev: &Evidence) -> Vec<(String, bool)> {
             ev.after_close_clean,
         ),
     ]);
+    if let Some(ax) = &ev.ax {
+        checks.extend([
+            (
+                "the window's accessibility tree carries the grid".to_owned(),
+                ax.grid_read,
+            ),
+            ("and every login".to_owned(), ax.logins_read),
+            ("and no value".to_owned(), ax.clean),
+        ]);
+    }
     checks
+}
+
+/// The checks this run could not make, and why.
+pub(crate) fn skipped(ev: &Evidence) -> Vec<&'static str> {
+    if ev.ax.is_none() {
+        vec![
+            "the window's accessibility tree: this process holds no Accessibility grant \
+             (System Settings > Privacy & Security > Accessibility, for the app it runs under)",
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// `lab reveal-tab [--json] [<aterm>]`.
@@ -452,6 +789,7 @@ pub fn cmd(args: &[String]) -> Res {
         "lane": "reveal-tab",
         "pass": pass,
         "checks": checks.iter().map(|(name, held)| json!({"check": name, "pass": held})).collect::<Vec<_>>(),
+        "skipped": skipped(&ev).into_iter().map(|why| json!(why)).collect::<Vec<_>>(),
     });
     let text = if as_json {
         format!("{}\n", aterm_json::to_string(&report).map_err(fail)?)
@@ -462,6 +800,9 @@ pub fn cmd(args: &[String]) -> Res {
                 "  {}  {name}\n",
                 if *held { "PASS" } else { "FAIL" }
             ));
+        }
+        for why in skipped(&ev) {
+            text.push_str(&format!("  SKIP  {why}\n"));
         }
         if !pass {
             for (verb, first) in ev
@@ -507,6 +848,11 @@ mod tests {
             closed_ends_command: true,
             folder_removed: true,
             after_close_clean: true,
+            ax: Some(AxEvidence {
+                grid_read: true,
+                logins_read: true,
+                clean: true,
+            }),
         }
     }
 
@@ -521,9 +867,35 @@ mod tests {
         leaked.tab_text_clean = false;
         let mut read = passing();
         read.doc_read = "OK 120 doc=1".to_owned();
-        for ev in [served, leaked, read] {
+        let mut spoken = passing();
+        spoken.ax = Some(AxEvidence {
+            clean: false,
+            ..AxEvidence::default()
+        });
+        let mut unpublished = passing();
+        unpublished.ax = Some(AxEvidence {
+            grid_read: false,
+            ..passing().ax.unwrap()
+        });
+        for ev in [served, leaked, read, unpublished] {
             assert_eq!(judge(&ev).iter().filter(|(_, held)| !*held).count(), 1);
         }
+        assert_eq!(judge(&spoken).iter().filter(|(_, held)| !*held).count(), 3);
+        assert!(skipped(&passing()).is_empty());
+    }
+
+    /// Without an Accessibility grant the tree's checks are a named skip, never a pass.
+    #[test]
+    fn an_unread_tree_is_a_skip_not_a_pass() {
+        let mut unread = passing();
+        unread.ax = None;
+        let checks = judge(&unread);
+        assert!(
+            checks
+                .iter()
+                .all(|(name, _)| !name.contains("accessibility"))
+        );
+        assert_eq!(skipped(&unread).len(), 1);
     }
 
     #[test]

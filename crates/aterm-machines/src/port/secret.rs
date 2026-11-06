@@ -378,7 +378,7 @@ mod tests {
                 std::time::Instant::now() < by,
                 "the line never reached the reader"
             );
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         let fd = typing.as_raw_fd();
         // SAFETY: `fd` is open; F_GETFL and F_SETFL take and return plain flags.

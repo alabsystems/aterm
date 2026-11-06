@@ -99,10 +99,9 @@ pub(super) const SLOG_INERT: Rule = Rule {
     check: slog_inert,
 };
 
-/// Whether `rel` is a scoped file's shipped source.
+/// Whether `rel` is one of the rule's scoped files, test code or not.
 fn scoped(rel: &str) -> bool {
-    (rel.starts_with(SLOG_ENGINE) || rel.starts_with(GUI_SLOG) || rel == AGENT_STEPS)
-        && !super::rules::test_path(rel)
+    rel.starts_with(SLOG_ENGINE) || rel.starts_with(GUI_SLOG) || rel == AGENT_STEPS
 }
 
 /// `.sink` as a field or method (`ctx.sink`, `x.sink(`), never `.sink_…`.
@@ -130,7 +129,7 @@ fn slog_inert(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let files = tree
         .corpus
         .under(&[SLOG_ENGINE, "crates/aterm-gui/src/", AGENT_STEPS])
-        .filter(|f| scoped(&f.rel));
+        .filter(|f| scoped(&f.rel) && !tree.corpus.test_code().holds(&f.rel));
     for file in files {
         out.extend(pty_path_findings(file, &verbs));
     }
@@ -157,7 +156,7 @@ fn dead_needles(tree: &Tree<'_>) -> Vec<Finding> {
     let files = tree
         .corpus
         .under(&home)
-        .filter(|f| !scoped(&f.rel) && !super::rules::test_path(&f.rel));
+        .filter(|f| !scoped(&f.rel) && !tree.corpus.test_code().holds(&f.rel));
     for file in files {
         if unseen.is_empty() {
             break;
@@ -528,6 +527,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What keeps a needle alive is shipped code (`TestCode::holds`): a module the GUI's root
+    /// declares test-only (`rig.rs`, whose name says nothing) keeps none alive, and a shipped
+    /// module whose name opens with `test` does.
+    #[test]
+    fn a_needle_lives_only_in_shipped_code() {
+        let needle = "cmd_key";
+        let (line, rest) = (plant(needle), home_without(&[needle]));
+        let lib = "#[cfg(test)]\nmod rig;\npub mod test_binary;\n".to_string();
+        let with = |rel: &str| {
+            tree_with(&[
+                (HOME, rest.clone()),
+                ("crates/aterm-gui/src/lib.rs", lib.clone()),
+                (rel, format!("{HEADER}{line}")),
+            ])
+        };
+        let dead = with("crates/aterm-gui/src/rig.rs");
+        assert_eq!(spots(&dead), [format!("{THIS_RULE}:0")], "{dead:?}");
+        let alive = with("crates/aterm-gui/src/test_binary.rs");
+        assert!(alive.is_empty(), "{alive:?}");
     }
 
     /// PHASE 3B'S FILES: a PTY-path symbol planted in the

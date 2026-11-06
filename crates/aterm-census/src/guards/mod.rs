@@ -300,6 +300,8 @@ pub(crate) struct Corpus {
     /// Every Cargo manifest under [`CORPUS_DIRS`] ([`is_manifest`]), root-relative, with its
     /// text.
     pub(crate) manifests: Vec<(String, String)>,
+    /// Which files are test code that nothing ships ([`Corpus::test_code`]), read once.
+    test_code: OnceLock<rules::TestCode>,
 }
 
 /// The directories whose `.rs` files make the corpus.
@@ -344,6 +346,7 @@ impl Corpus {
             scripts,
             paths,
             manifests,
+            test_code: OnceLock::new(),
         })
     }
 
@@ -354,11 +357,13 @@ impl Corpus {
         let (rs, other): (Vec<_>, Vec<_>) = files.iter().partition(|(rel, _)| rel.ends_with(".rs"));
         let (manifests, other): (Vec<_>, Vec<_>) =
             other.into_iter().partition(|(rel, _)| is_manifest(rel));
+        let mut rs_files: Vec<SourceFile> = rs
+            .iter()
+            .map(|(rel, raw)| SourceFile::new((*rel).to_string(), (*raw).to_string()))
+            .collect();
+        rs_files.sort_by(|a, b| a.rel.cmp(&b.rel));
         Self {
-            files: rs
-                .iter()
-                .map(|(rel, raw)| SourceFile::new((*rel).to_string(), (*raw).to_string()))
-                .collect(),
+            files: rs_files,
             scripts: other
                 .iter()
                 .map(|(rel, raw)| Script {
@@ -371,7 +376,14 @@ impl Corpus {
                 .iter()
                 .map(|(rel, text)| ((*rel).to_string(), (*text).to_string()))
                 .collect(),
+            test_code: OnceLock::new(),
         }
+    }
+
+    /// Which files are test code that nothing ships ([`rules::TestCode::read`]), read once for
+    /// every guard: a guard asks it whether a file ships, never a path test of its own.
+    fn test_code(&self) -> &rules::TestCode {
+        self.test_code.get_or_init(|| rules::TestCode::read(self))
     }
 
     /// Every file whose path starts with one of `prefixes`.
@@ -379,9 +391,16 @@ impl Corpus {
         &'a self,
         prefixes: &'a [&'a str],
     ) -> impl Iterator<Item = &'a SourceFile> + 'a {
-        self.files
+        let slice = if let [p] = prefixes {
+            let start = self.files.partition_point(|f| f.rel.as_str() < *p);
+            let end = start + self.files[start..].partition_point(|f| f.rel.starts_with(p));
+            &self.files[start..end]
+        } else {
+            &self.files[..]
+        };
+        slice
             .iter()
-            .filter(move |f| prefixes.iter().any(|p| f.rel.starts_with(p)))
+            .filter(move |f| prefixes.len() == 1 || prefixes.iter().any(|p| f.rel.starts_with(p)))
     }
 
     /// The file at `rel`, if the corpus holds it.
@@ -390,7 +409,6 @@ impl Corpus {
             .binary_search_by(|f| f.rel.as_str().cmp(rel))
             .ok()
             .map(|i| &self.files[i])
-            .or_else(|| self.files.iter().find(|f| f.rel == rel))
     }
 
     /// The files under `prefix` that compile only under `test`: each file a test-gated `mod`
@@ -424,8 +442,10 @@ impl Corpus {
 
     /// The files a shipped line of a shipped file under `prefixes` loads
     /// ([`SourceFile::loads`]), where `test` says which files are test code
-    /// by their parents' say: a file it names ships too once a shipped file
-    /// loads it, and so does what that one loads.
+    /// by their parents' say. Such a file, one [`named_for_tests`] and one
+    /// [`in_dev_target`] ship nothing they load until a shipped file loads
+    /// them, and then so does what they load: a test target's, a bench's or
+    /// an example's `mod` or `#[path]` ships nothing.
     pub(crate) fn shipped_loads(
         &self,
         prefixes: &[&str],
@@ -439,7 +459,8 @@ impl Corpus {
         loop {
             let before = shipped.len();
             for (rel, loads) in &loads {
-                if test(rel) && !shipped.contains(*rel) {
+                let unshipped = test(rel) || named_for_tests(rel) || in_dev_target(rel);
+                if unshipped && !shipped.contains(*rel) {
                     continue;
                 }
                 for load in loads.iter().filter(|l| !l.gated) {
@@ -453,6 +474,25 @@ impl Corpus {
             }
         }
     }
+}
+
+/// Does `rel`'s path name test code: a file in a `tests` directory (a test target's, or a
+/// `tests` module's), a `tests.rs` or a `<name>_tests.rs`? Such a file is test code unless a
+/// shipped line loads it ([`rules::TestCode::holds`]). A name that only opens with `test` says
+/// nothing: `testrun.rs` and `test_binary.rs` can ship.
+fn named_for_tests(rel: &str) -> bool {
+    let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    dirs.split('/').any(|dir| dir == "tests") || name == "tests.rs" || name.ends_with("_tests.rs")
+}
+
+/// Is `rel` in a `benches` or `examples` directory: a dev target's, which only `cargo bench` or
+/// `cargo run --example` builds? What it loads ships only once a shipped line loads the file
+/// itself ([`Corpus::shipped_loads`]); the file is no test code, so a rule that reads dev targets
+/// still reads it.
+fn in_dev_target(rel: &str) -> bool {
+    let dirs = rel.rsplit_once('/').map_or("", |(dirs, _)| dirs);
+    dirs.split('/')
+        .any(|dir| dir == "benches" || dir == "examples")
 }
 
 /// How a [`Load`] brings its files into the crate.
@@ -614,21 +654,36 @@ impl Script {
             return Ok(None);
         }
         let unreadable = |e: std::io::Error| format!("cannot read {rel}: {e}");
-        if by_name.is_none() {
+        let bytes = if by_name.is_none() {
             use std::io::Read as _;
             let mut head = [0u8; 2];
-            let (mut file, _) = crate::tree::open_regular(&path).map_err(unreadable)?;
+            let (mut file, cap) = crate::tree::open_regular(&path).map_err(unreadable)?;
             if file.read_exact(&mut head).is_err() || head != *b"#!" {
                 return Ok(None);
             }
-        }
-        let bytes = crate::tree::read_bytes(&path).map_err(unreadable)?;
+            let mut buf = Vec::with_capacity(cap.saturating_add(1));
+            buf.extend_from_slice(&head);
+            file.take(crate::tree::MAX_FILE_BYTES.saturating_sub(1))
+                .read_to_end(&mut buf)
+                .map_err(unreadable)?;
+            if u64::try_from(buf.len()).unwrap_or(u64::MAX) > crate::tree::MAX_FILE_BYTES {
+                return Err(format!(
+                    "cannot read {rel}: file exceeds {} bytes",
+                    crate::tree::MAX_FILE_BYTES
+                ));
+            }
+            buf
+        } else {
+            crate::tree::read_bytes(&path).map_err(unreadable)?
+        };
         if bytes.contains(&0) {
             return Ok(None);
         }
+        let raw = String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         Ok(Some(Self {
             rel: rel.to_string(),
-            raw: String::from_utf8_lossy(&bytes).into_owned(),
+            raw,
         }))
     }
 
@@ -760,23 +815,10 @@ impl SourceFile {
     /// (a crate root such as `tests/suite.rs`, `mod.rs`, or a `#[path]`-mounted module) and
     /// `manifest_dir` naming the compiling package's `CARGO_MANIFEST_DIR`.
     pub(crate) fn loads_in(&self, dir_owner: bool, manifest_dir: Option<&str>) -> Vec<Load> {
+        if !self.mentions(&["mod", "include"]) {
+            return Vec::new();
+        }
         let Lexed { code, text } = self.lexed();
-        let shipped = self
-            .shipped
-            .get_or_init(|| crate::shipped_lines(&self.lexed().code));
-        let starts: Vec<usize> = std::iter::once(0)
-            .chain(code.match_indices('\n').map(|(at, _)| at + 1))
-            .collect();
-        let gated = |at: usize| {
-            let line = starts.partition_point(|&start| start <= at) - 1;
-            !shipped.get(line).copied().unwrap_or(true)
-        };
-        let dir = self.rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let own = if dir_owner || self.name() == "mod.rs" {
-            dir.to_string()
-        } else {
-            format!("{dir}/{}", self.name().trim_end_matches(".rs"))
-        };
         // Every `mod <name>`: a declaration, or an inline module's body (its
         // braces, and the directory its children resolve in).
         let mut decls: Vec<(usize, &str, Vec<&str>)> = Vec::new();
@@ -800,6 +842,25 @@ impl SourceFile {
                 }
             }
         }
+        if decls.is_empty() && !code.contains("include") {
+            return Vec::new();
+        }
+        let shipped = self
+            .shipped
+            .get_or_init(|| crate::shipped_lines(&self.lexed().code));
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        let gated = |at: usize| {
+            let line = starts.partition_point(|&start| start <= at) - 1;
+            !shipped.get(line).copied().unwrap_or(true)
+        };
+        let dir = self.rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let own = if dir_owner || self.name() == "mod.rs" {
+            dir.to_string()
+        } else {
+            format!("{dir}/{}", self.name().trim_end_matches(".rs"))
+        };
         let depth = depths_at(code, decls.iter().map(|d| d.0));
         let mut out = Vec::new();
         for ((at, name, paths), depth) in decls.iter().zip(depth) {

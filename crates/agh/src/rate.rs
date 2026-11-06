@@ -34,13 +34,16 @@ const MAX_RESOURCES: usize = 64;
 
 /// Normalizes a rate-limit resource name to lowercase `[a-z0-9_-]{1,64}`.
 fn normalize_resource(raw: &str) -> Option<String> {
-    let lower = raw.trim().to_ascii_lowercase();
-    (!lower.is_empty()
-        && lower.len() <= RESOURCE_MAX_LEN
-        && lower
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.len() > RESOURCE_MAX_LEN
+        || !raw
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'))
-    .then_some(lower)
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(raw.to_ascii_lowercase())
 }
 
 impl RateSnapshot {

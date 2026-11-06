@@ -324,6 +324,7 @@ pub fn stage_event(
             "event": "stage-finished",
             "stage_index": index,
             "stage": report.title,
+            "ended_at_unix_ms": aterm_time::unix_millis(),
             "waiting_s": waiting.as_secs_f64(),
             "execution_s": execution.as_secs_f64(),
             "child_cpu": cpu.map(|cpu| aterm_json::json!({
@@ -1070,6 +1071,11 @@ mod tests {
         assert_eq!(event["waiting_s"].as_f64(), Some(12.0));
         assert_eq!(event["stage_index"].as_u64(), Some(7));
         assert_eq!(event["execution_s"].as_f64(), Some(3.0));
+        // When it ended, so a release's timeline dates a stage's red where it happened.
+        assert!(
+            event["ended_at_unix_ms"].as_u64().is_some_and(|ms| ms > 0),
+            "{event}"
+        );
         assert!(event["child_cpu"].is_null());
         assert_eq!(event["decisions"][0]["outcome"].as_str(), Some("FAIL"));
         assert_eq!(event["decisions"][1]["outcome"].as_str(), Some("NOT RUN"));

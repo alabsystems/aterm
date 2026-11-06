@@ -41,7 +41,7 @@ pub(super) fn read(log: &mut Log, acknowledged: Witness, pending: bool) -> Resul
             break;
         }
         for entry in batch {
-            offset = replay.push(&entry)?;
+            offset = replay.push(std::sync::Arc::unwrap_or_clone(entry))?;
         }
     }
     replay.finish()
@@ -55,7 +55,7 @@ pub(super) fn read_observed(
 ) -> Result<Replay> {
     let mut builder = Builder::new(acknowledged, false);
     for record in records {
-        builder.push(&record)?;
+        builder.push(record)?;
     }
     let mut replay = builder.finish()?;
     let count = usize::try_from(acknowledged.count)
@@ -74,16 +74,19 @@ struct Builder {
 }
 impl Builder {
     fn new(acknowledged: Witness, pending: bool) -> Self {
+        let cap = usize::try_from(acknowledged.count)
+            .unwrap_or(0)
+            .min(super::JOURNAL_RECORDS);
         Self {
             acknowledged,
             pending,
             witness: Witness::default(),
             prefix_checked: acknowledged == Witness::default(),
-            entries: Vec::new(),
+            entries: Vec::with_capacity(cap),
         }
     }
 
-    fn push(&mut self, entry: &astream_broker::BrokerRecord) -> Result<Offset> {
+    fn push(&mut self, entry: astream_broker::BrokerRecord) -> Result<Offset> {
         if self.pending {
             return Err(Error::new("unfinished table enrollment contains records"));
         }
@@ -91,8 +94,7 @@ impl Builder {
             return Err(Error::new("foreign table journal record"));
         }
         let received_ms = u64::from_le_bytes(entry.body[..8].try_into().unwrap());
-        let wire = entry.body[8..].to_vec();
-        let id = Sha256::digest(&wire);
+        let id = Sha256::digest(&entry.body[8..]);
         self.witness = self.witness.advance(entry.seq.0, id, received_ms)?;
         if self.witness.count > self.acknowledged.count + 1 {
             return Err(Error::new(
@@ -107,6 +109,8 @@ impl Builder {
             }
             self.prefix_checked = true;
         }
+        let mut wire = entry.body;
+        wire.drain(..8);
         self.entries.push(Entry {
             receipt: Receipt {
                 id,

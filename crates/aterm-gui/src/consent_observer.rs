@@ -2181,7 +2181,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.availability() == ObserverAvailability::Off && Instant::now() < deadline {
             observer.drain(Instant::now());
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert_eq!(
             observer.availability(),
@@ -2220,7 +2220,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.is_live() && Instant::now() < deadline {
             observer.drain(Instant::now());
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!observer.is_live(), "the inert worker ended by itself");
         assert_eq!(
@@ -2266,7 +2266,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.is_live() && Instant::now() < deadline {
             observer.drain(Instant::now());
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
         assert!(!observer.is_live());
         assert_eq!(observer.running(), ObserverMode::Off, "the end clears it");

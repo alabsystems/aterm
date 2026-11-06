@@ -30,6 +30,8 @@ fn step(app: &mut App) -> Option<ToolsInstall> {
 
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+#[path = "stop_tests.rs"]
+mod stop_tests;
 
 thread_local! {
     static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };

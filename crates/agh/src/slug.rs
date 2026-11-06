@@ -95,7 +95,12 @@ impl Slug {
     #[inline]
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}/{}", self.owner, self.repo).to_ascii_lowercase()
+        let mut s = String::with_capacity(self.owner.len() + 1 + self.repo.len());
+        s.push_str(&self.owner);
+        s.push('/');
+        s.push_str(&self.repo);
+        s.make_ascii_lowercase();
+        s
     }
 }
 

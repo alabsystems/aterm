@@ -254,21 +254,23 @@ pub fn apply_to(doc: &mut Document, planned: &Planned) -> Result<()> {
 /// # Errors
 /// The registry cannot be read.
 fn lab_now(paths: &Paths) -> Result<Option<(LabView, OwnedRead)>> {
-    let view = match super::Registry::at(paths.clone()).view() {
+    let mut view = match super::Registry::at(paths.clone()).view() {
         Ok(view) => view,
         Err(_) => return Ok(None),
     };
     if !view.complete {
         return Ok(None);
     }
-    let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
-    let facts = owned(super::registry::MACHINE_FACTS.name);
-    let lab = LabView::read(
-        &view.cells,
-        &facts,
-        &owned(super::registry::MAILBOX_OBS.name),
-        None,
-    );
+    let facts = view
+        .owned
+        .remove(super::registry::MACHINE_FACTS.name)
+        .unwrap_or_default();
+    let empty = OwnedRead::default();
+    let obs = view
+        .owned
+        .get(super::registry::MAILBOX_OBS.name)
+        .unwrap_or(&empty);
+    let lab = LabView::read(&view.cells, &facts, obs, None);
     Ok(Some((lab, facts)))
 }
 

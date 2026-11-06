@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reaper of workers' tabs ([`super`]): a tab a task opened for itself goes once its task
-//! concluded and nobody holds it, a claim worker whose task never concludes is ended at its time,
-//! and a person's tab never goes. The helpers here serve the claim act's tests too.
+//! Worker programs are bounded at their claim deadline; quota walls and concluded tasks keep
+//! their panes. The helpers here serve the claim act's tests too.
 
 use std::path::Path;
 use std::sync::PoisonError;
@@ -97,26 +96,6 @@ pub(crate) fn record(app: &crate::App, session: u64) -> (TaskState, Instant) {
     (task.state, task.since)
 }
 
-/// Who the session log says closed `session`.
-fn closed_by(app: &crate::App, session: u64) -> String {
-    use aterm_slog::{Node, Op};
-    let source = app
-        .store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .closed_logs()
-        .by_local(session)
-        .expect("its closed log")
-        .source();
-    let log = source.into_log().expect("its log");
-    let close = log
-        .window()
-        .rev()
-        .find(|r| r.op == Op::Close && r.node == Node::SESSION)
-        .expect("its close");
-    close.by.word().to_string()
-}
-
 /// A person's new stub tab in the window: no mark, whatever task it runs.
 pub(crate) fn new_tab(app: &mut crate::App) -> u64 {
     let session = app.next_session_id;
@@ -154,16 +133,6 @@ fn parked_worker(app: &mut crate::App) -> u64 {
     session
 }
 
-/// The retired row the reaper kept for `session`.
-fn retired(app: &crate::App, session: u64) -> Option<crate::retired_workers::Retired> {
-    app.store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .retired_workers()
-        .by_local(session)
-        .cloned()
-}
-
 fn autopilot(app: &crate::App, session: u64) -> Option<Autopilot> {
     live(app, session)
         .ctx
@@ -173,119 +142,38 @@ fn autopilot(app: &crate::App, session: u64) -> Option<Autopilot> {
         .autopilot_word()
 }
 
-/// A CONCLUDED TASK IS OVER ONCE ITS END STOOD ITS LINGER, OR AT ONCE WHERE ITS PROGRAM WAS ASKED
-/// TO END: done, failed and exited alike, a failure at a usage limit too (nothing types into it
-/// again, so its tab would only stand blocked), unless a person typed in its tab since that end.
-/// An open claim worker's runs out at its time. CONTROL: a moment short of the linger; typing
-/// older than the end; a stall, which may move on; an open task of another folder, which never
-/// runs out.
+/// Concluded tasks are never scheduled for retirement. An unfinished claim task alone expires.
 #[test]
-fn a_concluded_task_is_over_after_its_linger_unless_a_person_took_it_up() {
-    assert_eq!(LINGER, Duration::from_secs(3 * 60));
-    let t0 = Instant::now();
-    let of_state = |state: TaskState, why: Option<&'static str>, folder: Option<String>| {
-        let mut mark = TaskMark::new(state);
-        mark.why = why;
-        let (mut record, _) = mark.apply(None, false, t0, 1_000);
-        record.trusted_cwd = folder;
-        record
-    };
+fn concluded_tasks_never_expire() {
+    let t = Instant::now();
     for state in [TaskState::Done, TaskState::Failed, TaskState::Exited] {
-        let record = of_state(state, None, None);
-        assert!(settled(&record), "{state:?}");
-        assert_eq!(
-            over(&record, t0 + LINGER - MOMENT, None, false),
-            None,
-            "{state:?}"
-        );
-        assert_eq!(
-            over(&record, t0 + LINGER, None, false),
-            Some(Over::Concluded),
-            "{state:?}"
-        );
-        assert_eq!(
-            over(&record, t0 + MOMENT, None, true),
-            Some(Over::Concluded),
-            "{state:?}: its program was asked to end"
-        );
-        assert_eq!(
-            over(&record, t0 + LINGER, Some(LINGER - MOMENT), false),
-            None,
-            "{state:?}: typed since its end"
-        );
-        assert_eq!(
-            over(&record, t0 + LINGER, Some(LINGER - MOMENT), true),
-            None,
-            "{state:?}: typed since its end, its program asked to end or not"
-        );
-        assert_eq!(
-            over(&record, t0 + LINGER, Some(LINGER + MOMENT), false),
-            Some(Over::Concluded),
-            "{state:?}: CONTROL: typed before its end"
-        );
+        for why in [Some(WHY_LANDED), Some(WHY_USAGE_LIMIT), None] {
+            let mut mark = TaskMark::new(state);
+            mark.why = why;
+            let (record, _) = mark.apply(None, false, t, 1_000);
+            assert!(settled(&record));
+            assert_eq!(over(&record, t + LINGER * 100, None), None);
+        }
     }
-    let a_day = Duration::from_secs(24 * 3600);
-    let stalled = of_state(TaskState::Stalled, Some("held"), None);
-    assert!(!settled(&stalled));
-    assert_eq!(over(&stalled, t0 + a_day, None, false), None, "a stall");
-    let limited = of_state(TaskState::Failed, Some(WHY_USAGE_LIMIT), None);
-    assert!(settled(&limited), "a usage limit's failure is a conclusion");
-    assert_eq!(
-        over(&limited, t0 + LINGER - MOMENT, None, false),
-        None,
-        "a usage limit, a moment short of its linger"
-    );
-    assert_eq!(
-        over(&limited, t0 + LINGER, None, false),
-        Some(Over::Concluded),
-        "a usage limit's failure goes after its linger, as any failure does"
-    );
-    let working = of_state(TaskState::Working, None, Some("/Users//me/project".into()));
-    assert_eq!(
-        over(&working, t0 + a_day, None, false),
-        None,
-        "another folder"
-    );
-    let claim = of_state(TaskState::Working, None, Some(claim_folder()));
-    assert_eq!(over(&claim, t0 + WORKER_FOR - MOMENT, None, false), None);
-    assert_eq!(
-        over(&claim, t0 + WORKER_FOR, None, false),
-        Some(Over::RanOut)
-    );
-    let limited_claim = of_state(
-        TaskState::Failed,
-        Some(WHY_USAGE_LIMIT),
-        Some(claim_folder()),
-    );
-    assert_eq!(
-        over(&limited_claim, t0 + LINGER, None, false),
-        Some(Over::Concluded),
-        "a claim worker failed at a usage limit concluded: it waits no WORKER_FOR"
-    );
+    let (mut record, _) = TaskMark::new(TaskState::Working).apply(None, false, t, 1_000);
+    record.trusted_cwd = Some(claim_folder());
+    assert_eq!(over(&record, t + WORKER_FOR - MOMENT, None), None);
+    assert_eq!(over(&record, t + WORKER_FOR, None), Some(Over::RanOut));
 }
 
-/// A WORKER'S END TAKES NOTHING FROM ANYONE AND ASKS NOTHING OF A PERSON: a tab in someone's hand
-/// and a job that is not the worker's are left, a running program is asked to end and then made
-/// to before its pane closes (a job in a closing pane raises a confirmation), an open task is
-/// marked `exited` once its program is gone, a concluded one's pane closes, and a window's last
-/// tab, a program someone ran there since and a seamless update under way keep it.
+/// Updates and concluded tasks protect a worker before signals. An unfinished claim worker
+/// still ends at its budget, with its pane preserved.
 #[test]
 fn a_worker_ends_without_raising_a_confirmation() {
-    use Ending::{ClosePane, Kill, Leave, MarkExited, Term};
+    use Ending::{Kill, Leave, MarkExited, Term};
     let running = Stand {
         in_hand: false,
         concluded: false,
         exited: false,
         job: true,
         worker: true,
-        ends_window: false,
         updating: false,
         deaf: false,
-        reading: false,
-    };
-    let last = Stand {
-        ends_window: true,
-        ..running
     };
     let deaf = Stand {
         deaf: true,
@@ -296,15 +184,24 @@ fn a_worker_ends_without_raising_a_confirmation() {
         ..running
     };
     assert_eq!(ending(running), Term);
-    assert_eq!(ending(last), Term, "even its last tab");
     assert_eq!(ending(deaf), Kill);
+    for stand in [running, deaf, ended] {
+        assert_eq!(
+            ending(Stand {
+                updating: true,
+                ..stand
+            }),
+            Leave,
+            "an update protects the worker before any signal or mark"
+        );
+    }
     assert_eq!(
         ending(Stand {
             concluded: true,
             ..running
         }),
-        Term,
-        "a done worker's program still running is asked to end first"
+        Leave,
+        "a concluded worker keeps its program"
     );
     assert_eq!(
         ending(Stand {
@@ -330,27 +227,19 @@ fn a_worker_ends_without_raising_a_confirmation() {
         "another program's job"
     );
     assert_eq!(ending(ended), MarkExited, "an open task is concluded first");
-    assert_eq!(
-        ending(Stand {
-            ends_window: true,
-            ..ended
-        }),
-        MarkExited,
-        "a mark closes nothing"
-    );
     let read = Stand {
         concluded: true,
         exited: true,
         ..ended
     };
-    assert_eq!(ending(read), ClosePane);
+    assert_eq!(ending(read), Leave);
     assert_eq!(
         ending(Stand {
             exited: false,
             ..read
         }),
-        ClosePane,
-        "a done task's tab goes with no exit mark"
+        Leave,
+        "a done task keeps its pane"
     );
     for (stand, why) in [
         (
@@ -366,20 +255,6 @@ fn a_worker_ends_without_raising_a_confirmation() {
                 ..read
             },
             "someone has it",
-        ),
-        (
-            Stand {
-                ends_window: true,
-                ..read
-            },
-            "a last tab asks",
-        ),
-        (
-            Stand {
-                reading: true,
-                ..read
-            },
-            "the output of a program someone ran there is still to be read",
         ),
         (
             Stand {
@@ -400,172 +275,43 @@ fn a_worker_ends_without_raising_a_confirmation() {
     }
 }
 
-/// A CONCLUDED WORKER'S TAB GOES AFTER ITS LINGER, PARKED OR NOT, AND WHAT IT LEFT STAYS: a parked
-/// worker that landed and a worker's tab in the strip that failed each close in the harness's
-/// name once their ends have stood [`LINGER`], each leaving a retired row with its end, which the
-/// Workers page lists under Finished and which keeps the Workers tab while it stands. CONTROL: a
-/// moment short of the linger; a person's tab with the same end; a worker stalled, whose tab
-/// stays.
+/// A worker pane survives a concluded task, including a carried usage-limit failure.
+/// Negative control: an unfinished claim worker still has its bounded execution time.
 #[test]
-fn a_concluded_workers_tab_goes_after_its_linger_parked_or_not() {
-    use Ending::ClosePane;
+fn concluded_workers_keep_their_panes_and_programs() {
     let mut app = crate::App::headless_for_test();
-    let parked = parked_worker(&mut app);
-    let shown = worker_tab(&mut app);
-    let persons = new_tab(&mut app);
-    let limited = worker_tab(&mut app);
-    let stalled = worker_tab(&mut app);
-    let ends = [
-        conclude(&app, parked, TaskState::Done, Some(WHY_LANDED)),
-        conclude(&app, shown, TaskState::Failed, Some(WHY_REPEATED)),
-        conclude(&app, persons, TaskState::Done, Some(WHY_LANDED)),
-        conclude(&app, limited, TaskState::Failed, Some(WHY_USAGE_LIMIT)),
-        conclude(&app, stalled, TaskState::Stalled, Some("held")),
-    ];
-    let first = ends.into_iter().min().expect("ends");
-    let last = ends.into_iter().max().expect("ends");
-    assert_eq!(app.reap_workers(first + LINGER - MOMENT), []);
-    assert!(app.pool.get(parked).is_some() && app.pool.get(shown).is_some());
-
-    let mut steps = app.reap_workers(last + LINGER);
-    steps.sort_unstable_by_key(|(session, _)| *session);
-    let mut closed = vec![
-        (parked, ClosePane),
-        (shown, ClosePane),
-        (limited, ClosePane),
-    ];
-    closed.sort_unstable_by_key(|(session, _)| *session);
-    assert_eq!(steps, closed);
-    for (session, state) in [
-        (parked, TaskState::Done),
-        (shown, TaskState::Failed),
-        (limited, TaskState::Failed),
+    for (state, why) in [
+        (TaskState::Done, WHY_LANDED),
+        (TaskState::Failed, WHY_USAGE_LIMIT),
+        (TaskState::Failed, WHY_REPEATED),
+        (TaskState::Exited, "exit"),
     ] {
-        assert!(app.pool.get(session).is_none(), "its tab went");
-        assert_eq!(closed_by(&app, session), "harness");
-        let row = retired(&app, session).expect("its retired row");
-        assert_eq!((row.window, row.record.state), (Some(WID), state));
+        let worker = parked_worker(&mut app);
+        set_task(&app, worker, "/workspace");
+        let ended = conclude(&app, worker, state, Some(why));
+        in_front(&app, worker, "claude");
+        crate::feed_session_for_test(
+            &app,
+            worker,
+            b"\x1b]133;A\x07PS> \x1b]133;B\x07claude\n\x1b]133;C\x07",
+        );
+        assert_eq!(of(app.reap_workers(ended + LINGER * 100), worker), []);
+        assert!(app.pool.get(worker).is_some());
+        assert!(app.worker_termed.is_empty());
+        crate::feed_session_for_test(&app, worker, b"\x1b]133;D;0\x07");
+        assert_eq!(of(app.reap_workers(ended + LINGER * 100), worker), []);
+        assert!(app.pool.get(worker).is_some());
     }
-    for session in [persons, stalled] {
-        assert!(app.pool.get(session).is_some(), "CONTROL: {session} stays");
-        assert!(retired(&app, session).is_none());
-    }
-    let rows = app.worker_rows(WID);
+    let worker = worker_tab(&mut app);
+    let began = set_task(&app, worker, &claim_folder());
     assert_eq!(
-        rows.iter()
-            .filter(|row| row.finished)
-            .map(|row| row.session)
-            .collect::<Vec<_>>(),
-        [parked, shown, limited],
-        "its Finished rows, oldest first"
+        of(app.reap_workers(began + WORKER_FOR), worker),
+        [(worker, Ending::MarkExited)]
     );
-    assert!(
-        app.windows[&WID].tab_set.home().is_some(),
-        "the Workers tab stays while a Finished row does"
-    );
-    assert_eq!(
-        app.reap_workers(last + LINGER * 100),
-        [],
-        "a person's tab never goes, nor a stalled worker's"
-    );
+    assert!(app.pool.get(worker).is_some());
 }
 
-/// A CONCLUDED WORKER SOMEONE HAS STAYS: on screen in a focused window, typed in since its end,
-/// driven, or its window's last tab, it is left; a person's typed turn reopens its task, so its
-/// next end counts anew. CONTROL: the same worker in front of a window nobody focuses goes, and
-/// so does one typed in only before its end.
-#[test]
-fn a_concluded_worker_someone_has_stays() {
-    use Ending::{ClosePane, Leave};
-    let mut app = crate::App::headless_for_test();
-    let ws = app.windows.get_mut(&WID).expect("its window");
-    ws.focused = true;
-    ws.os_window_for_test = true;
-    let watched = worker_tab(&mut app);
-    let ended = conclude(&app, watched, TaskState::Done, Some(WHY_LANDED));
-    assert_eq!(app.focused_session_id(WID), Some(watched), "PRECONDITION");
-    assert_eq!(app.reap_workers(ended + LINGER), [(watched, Leave)]);
-    app.windows.get_mut(&WID).expect("its window").focused = false;
-    assert_eq!(
-        app.reap_workers(ended + LINGER),
-        [(watched, ClosePane)],
-        "CONTROL: nobody looks at it"
-    );
-
-    let typed = worker_tab(&mut app);
-    let ended = conclude(&app, typed, TaskState::Done, Some(WHY_LANDED));
-    live(&app, typed)
-        .ctx
-        .human_input
-        .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
-    assert_eq!(
-        app.reap_workers(ended + LINGER * 10),
-        [],
-        "typed since its end"
-    );
-    let reopened = conclude(&app, typed, TaskState::Working, Some("turn"));
-    assert_eq!(
-        app.reap_workers(reopened + LINGER * 10),
-        [],
-        "its turn reopened the task"
-    );
-    let ended = conclude(&app, typed, TaskState::Done, Some(WHY_LANDED));
-    assert_eq!(
-        app.reap_workers(ended + LINGER - MOMENT),
-        [],
-        "its next end counts anew"
-    );
-
-    let before = worker_tab(&mut app);
-    let ended = conclude(&app, before, TaskState::Done, Some(WHY_LANDED));
-    let linger_ms = u64::try_from(LINGER.as_millis()).expect("small");
-    live(&app, before)
-        .ctx
-        .human_input
-        .carry_typed_awake(linger_ms + 60_000, crate::metrics::now_us());
-    assert_eq!(
-        of(app.reap_workers(ended + LINGER), before),
-        [(before, ClosePane)],
-        "CONTROL: typed only before its end"
-    );
-
-    let driven = worker_tab(&mut app);
-    let ended = conclude(&app, driven, TaskState::Done, Some(WHY_LANDED));
-    *live(&app, driven)
-        .ctx
-        .turn_lease
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(crate::Lease::Drive {
-        holder: crate::harness_host::holder(),
-        expires_us: u64::MAX,
-        conn: None,
-        hard: true,
-        here: false,
-        holder_pid: None,
-    });
-    assert_eq!(
-        of(app.reap_workers(ended + LINGER), driven),
-        [(driven, Leave)]
-    );
-
-    let front = 0;
-    mark_ephemeral(&mut app, front);
-    assert!(app.close_session_tab_for_test(typed));
-    assert!(app.close_session_tab_for_test(driven));
-    let ended = conclude(&app, front, TaskState::Done, Some(WHY_LANDED));
-    assert_eq!(
-        app.reap_workers(ended + LINGER),
-        [(front, Leave)],
-        "a window's last tab asks before it goes"
-    );
-    assert!(app.pool.get(front).is_some());
-}
-
-/// KEEP AS TAB MAKES A WORKER'S TAB A PERSON'S: it leaves the parked tabs and loses its mark, so
-/// its task's end never closes it, nor does the mark come back with a later record. CONTROL:
-/// before it, the same end closes a worker's tab
-/// (`a_concluded_workers_tab_goes_after_its_linger_parked_or_not`); a person's tab has no Keep
-/// as Tab.
+/// Keep as Tab removes the task-owned mark and the claim execution budget.
 #[test]
 fn a_kept_tab_is_a_persons_and_never_goes_for_its_tasks_end() {
     let mut app = crate::App::headless_for_test();
@@ -598,16 +344,11 @@ fn a_kept_tab_is_a_persons_and_never_goes_for_its_tasks_end() {
     assert!(app.pool.get(parked).is_some() && app.pool.get(shown).is_some());
 }
 
-/// THE LOOK ENDS A WORKER WHOSE PROCESS NEVER KNEW IT: once a claim worker's open record has stood
-/// its time the worker's program is asked to end (`SIGTERM` first, however long a hand held it
-/// past its time; `SIGKILL` follows only one that reached it, which a stub tab's never does);
-/// with its program gone and no hand having marked its task, its task is marked `exited`, which
-/// concludes it, and its tab goes in the harness's name once that end has stood [`LINGER`].
-/// CONTROL: a moment before each; a tab a driver has; a `SIGTERM` the verb refused; a tab of
-/// another folder; a window's last tab.
+/// A claim worker that exhausts its execution budget is ended and marked exited. Its pane stays.
+/// Negative controls: an occupied tab, another program, and a refused signal.
 #[test]
-fn the_look_closes_a_claim_workers_tab_once_its_job_ended() {
-    use Ending::{ClosePane, Leave, MarkExited, Term};
+fn the_look_preserves_a_claim_workers_pane_once_its_job_ended() {
+    use Ending::{Leave, MarkExited, Term};
     let claim = claim_folder();
     let (time, deaf) = (WORKER_FOR, DEAF_FOR);
     let mut app = crate::App::headless_for_test();
@@ -677,12 +418,11 @@ fn the_look_closes_a_claim_workers_tab_once_its_job_ended() {
         "its tab stays to be read"
     );
     assert!(app.pool.get(worker).is_some());
-    assert_eq!(app.reap_workers(exited + LINGER), [(worker, ClosePane)]);
+    assert_eq!(app.reap_workers(exited + LINGER), []);
     assert!(
-        app.pool.get(worker).is_none(),
-        "its job ended, its tab went"
+        app.pool.get(worker).is_some(),
+        "its job ended, its pane stays"
     );
-    assert_eq!(closed_by(&app, worker), "harness");
 
     assert_eq!(app.reap_workers(project + time), []);
     assert!(app.pool.get(other).is_some(), "a tab of another folder");
@@ -690,11 +430,11 @@ fn the_look_closes_a_claim_workers_tab_once_its_job_ended() {
     let second = set_task(&app, other, &claim);
     assert_eq!(app.reap_workers(second + time), [(other, MarkExited)]);
     let (_, exited) = record(&app, other);
-    assert_eq!(app.reap_workers(exited + LINGER), [(other, ClosePane)]);
+    assert_eq!(app.reap_workers(exited + LINGER), []);
     let last = set_task(&app, front, &claim);
     assert_eq!(app.reap_workers(last + time), [(front, MarkExited)]);
     let (_, exited) = record(&app, front);
-    assert_eq!(app.reap_workers(exited + LINGER), [(front, Leave)]);
+    assert_eq!(app.reap_workers(exited + LINGER), []);
     assert!(app.pool.get(front).is_some(), "a window's last tab asks");
 }
 
@@ -702,7 +442,7 @@ fn the_look_closes_a_claim_workers_tab_once_its_job_ended() {
 /// a claim worker that ran out has its Autopilot Off even with its tab left in front, and a job in
 /// the tab of a worker whose program exited is theirs and never signalled, nor is another
 /// program's job in a worker's tab that nothing marked exited. CONTROL: a concluded worker whose
-/// tab stays keeps its Autopilot; it goes Off only as its program is asked to end.
+/// tab stays keeps its Autopilot.
 #[test]
 fn the_look_leaves_what_a_person_has_in_a_workers_tab() {
     use Ending::Leave;
@@ -724,7 +464,7 @@ fn the_look_leaves_what_a_person_has_in_a_workers_tab() {
         exited,
         b"\x1b]133;A\x07PS> \x1b]133;B\x07make\n\x1b]133;C\x07",
     );
-    assert_eq!(app.reap_workers(at + LINGER), [(exited, Leave)]);
+    assert_eq!(app.reap_workers(at + LINGER), []);
     assert_ne!(
         autopilot(&app, exited),
         Some(Autopilot::Off),
@@ -775,8 +515,8 @@ fn the_look_leaves_what_a_person_has_in_a_workers_tab() {
 
 /// A CLAIM WORKER'S EXIT MARK TAKES DOWN A HELD ASK, AND A CONCLUDED WORKER GETS NONE: the mark
 /// takes down the held ask a program that ended no longer owes; a worker failed at a usage limit
-/// concluded already, so its end stands, its reply and its `why=` with it, and its tab goes as
-/// concluded; a landed worker likewise. CONTROL: a record that moved since the look read it is not
+/// concluded already, so its end stands, its reply and its `why=` with it, and its pane stays;
+/// a landed worker likewise. CONTROL: a record that moved since the look read it is not
 /// marked.
 #[test]
 fn the_looks_exit_mark_takes_down_a_held_ask_and_spares_a_concluded_end() {
@@ -792,10 +532,17 @@ fn the_looks_exit_mark_takes_down_a_held_ask_and_spares_a_concluded_end() {
     crate::task_record::mark_session_task(&h.ctx, limited, &limit).expect("unfenced");
     assert_eq!(
         of(app.reap_workers(began + WORKER_FOR), limited),
-        [(limited, Ending::ClosePane)],
-        "concluded at its wall: no exit mark, its tab goes"
+        [],
+        "a carried wall failure keeps its pane and record"
     );
-    let kept = retired(&app, limited).expect("its retired row").record;
+    let kept = live(&app, limited)
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .task()
+        .cloned()
+        .unwrap();
     assert_eq!(
         (kept.state, kept.why, kept.result_bytes),
         (TaskState::Failed, Some(WHY_USAGE_LIMIT), 23)
@@ -810,13 +557,10 @@ fn the_looks_exit_mark_takes_down_a_held_ask_and_spares_a_concluded_end() {
     conclude(&app, landed, TaskState::Done, Some(WHY_LANDED));
     assert_eq!(
         of(app.reap_workers(began + WORKER_FOR), landed),
-        [(landed, Ending::ClosePane)],
-        "a landed worker's tab goes as it landed"
+        [],
+        "a landed worker keeps its pane"
     );
-    assert_eq!(
-        retired(&app, landed).map(|row| row.record.state),
-        Some(TaskState::Done)
-    );
+    assert_eq!(Some(record(&app, landed).0), Some(TaskState::Done));
 
     let held = worker_tab(&mut app);
     let began = set_task(&app, held, &claim);
@@ -910,55 +654,6 @@ fn a_claim_worker_in_a_visible_split_is_left_alone() {
     assert_eq!(
         of(app.reap_workers(began + WORKER_FOR), behind),
         [(behind, Ending::MarkExited)]
-    );
-}
-
-/// A PROGRAM SOMEONE RUNS IN AN ENDED WORKER'S TAB KEEPS ITS OUTPUT TO BE READ: every look sees it
-/// running, its tab's linger out or not, and the tab closes only [`LINGER`] after the last look
-/// that saw it, not as soon as it ends. CONTROL: a tab with nothing run there closes once its
-/// exit mark has stood its linger.
-#[test]
-fn a_program_run_in_an_ended_workers_tab_keeps_its_output_to_be_read() {
-    use Ending::{ClosePane, Leave, MarkExited};
-    let claim = claim_folder();
-    let minute = Duration::from_secs(60);
-    let mut app = crate::App::headless_for_test();
-    let used = worker_tab(&mut app);
-    let idle = worker_tab(&mut app);
-    let began = set_task(&app, used, &claim);
-    let idle_began = set_task(&app, idle, &claim);
-    let marked = app.reap_workers(began.max(idle_began) + WORKER_FOR);
-    for tab in [used, idle] {
-        assert_eq!(of(marked.clone(), tab), [(tab, MarkExited)], "PRECONDITION");
-    }
-    let exited = record(&app, used).1;
-    let idle_exited = record(&app, idle).1;
-    crate::feed_session_for_test(
-        &app,
-        used,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07make\n\x1b]133;C\x07",
-    );
-    let seen = exited + LINGER - minute;
-    assert_eq!(
-        of(app.reap_workers(seen), used),
-        [],
-        "its linger is not out, and the look sees the program"
-    );
-    crate::feed_session_for_test(&app, used, b"\x1b]133;D;0\x07");
-    let steps = app.reap_workers(exited.max(idle_exited) + LINGER);
-    assert_eq!(
-        of(steps.clone(), used),
-        [(used, Leave)],
-        "ended within its linger: its output is still to be read"
-    );
-    assert_eq!(
-        of(steps, idle),
-        [(idle, ClosePane)],
-        "CONTROL: nothing run there"
-    );
-    assert_eq!(
-        of(app.reap_workers(seen + LINGER), used),
-        [(used, ClosePane)]
     );
 }
 
@@ -1197,4 +892,54 @@ fn the_looks_delivered_sigterm_starts_the_time_its_sigkill_waits_for() {
         libc::close(slave);
         libc::close(master);
     }
+}
+
+/// A quota wall protects even a claim worker past its execution budget. Negative control:
+/// a worker running after that budget is still ended, and its pane stays when the program exits.
+#[test]
+fn a_claim_workers_quota_wall_is_waited_out() {
+    let mut app = crate::App::headless_for_test();
+    let worker = worker_tab(&mut app);
+    let began = set_task(&app, worker, &claim_folder());
+    in_front(&app, worker, "claude");
+    crate::feed_session_for_test(
+        &app,
+        worker,
+        b"\x1b]133;A\x07PS> \x1b]133;B\x07claude\n\x1b]133;C\x07",
+    );
+    let h = live(&app, worker);
+    for word in [
+        "wall:usage-session",
+        "wall:usage-weekly",
+        "wall:model-bucket",
+    ] {
+        h.ctx.timeline.lock().unwrap().publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+        assert_eq!(app.reap_workers(began + WORKER_FOR * 100), []);
+        assert!(app.pool.get(worker).is_some());
+        assert!(app.worker_termed.is_empty());
+        assert_ne!(autopilot(&app, worker), Some(Autopilot::Off));
+    }
+    h.ctx.timeline.lock().unwrap().publish_agent(
+        "busy",
+        None,
+        None,
+        Some(aterm_phase::Program::Claude),
+        crate::session_timeline::AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 2 },
+            fp: 2,
+        },
+    );
+    assert_eq!(
+        app.reap_workers(began + WORKER_FOR * 100),
+        [(worker, Ending::Term)]
+    );
 }

@@ -51,7 +51,7 @@ mod measuring {
                 chain_bytes: CHAIN,
             }),
         ),
-        // Design §14.5 R4 exit rows, declared before the candidate was measured: parse throughput with recording on at least 0.97x off, ABBA over fresh instances. Judged on the adjacent takes' off/on ratios: their median's 95% sign interval at or above 0.97 passes, wholly below fails, and one holding 0.97 is unproved (`rewind_cost::throughput_disposition`), since a load that comes and goes slows whole takes (ATERM-KI-1102-7) and the arms' pooled medians followed it. Ten blocks give twenty ratios, so the interval is their 6th to 15th (95.9%).
+        // Design §14.5 R4 exit rows, declared before the candidate was measured: parse throughput with recording on at least 0.97x off, ABBA over fresh instances. Judged on the adjacent takes' off/on ratios: their median's 95% sign interval at or above 0.97 passes, wholly below fails, and one holding 0.97 is unproved (`rewind_cost::throughput_disposition`), since a load that comes and goes slows whole takes (`docs/measured/temporal-reader-rekey-2026-11-05.md`) and the arms' pooled medians followed it. Ten blocks give twenty ratios, so the interval is their 6th to 15th (95.9%).
         (
             "recording_keeps_parse_throughput_at_or_above_0_97x",
             Row::Cost(CostRow::Throughput {

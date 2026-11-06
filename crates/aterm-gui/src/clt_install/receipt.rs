@@ -23,6 +23,9 @@ pub(super) struct Receipt {
     /// The build whose line the tab's own claim (its landing's, or a later adoption's) added to
     /// the account's record, if one added a line.
     claimed: Option<String>,
+    sid: String,
+    pid: i32,
+    birth: u64,
 }
 
 /// A receipt's last line: `claimed <build>` for the build whose line the tab's own claim added,
@@ -69,6 +72,9 @@ impl Receipt {
             directory,
             text,
             claimed: claimed.map(str::to_owned),
+            sid: sid.to_owned(),
+            pid,
+            birth,
         })
     }
 
@@ -237,6 +243,11 @@ impl Receipt {
         self.directory_owned().is_ok()
             && crate::config_marker::read_marker(&self.path, MAX_BYTES).as_deref()
                 == Some(self.text.as_str())
+    }
+
+    /// Whether this unchanged custody record belongs to the exact child still in the pool.
+    pub(super) fn owns(&self, sid: &str, pid: i32, birth: Option<u64>) -> bool {
+        self.sid == sid && self.pid == pid && Some(self.birth) == birth && self.matches()
     }
 
     pub(super) fn remove_if_matching(&self) {

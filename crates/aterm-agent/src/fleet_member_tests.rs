@@ -128,6 +128,9 @@ mod deny_wait;
 #[path = "fleet_member_tests/unread_log.rs"]
 mod unread_log;
 
+#[path = "fleet_member_tests/vault_tenure.rs"]
+mod vault_tenure;
+
 #[test]
 fn automatic_join_uses_a_local_lan_address_and_reserves_its_port() {
     let local = "192.168.1.102".parse().unwrap();
@@ -4841,6 +4844,8 @@ fn an_init_mints_the_seed_a_rotate_keeps_and_a_leave_keeps_its_digest() {
         member::fleet_seed::conflict_line(&seed, 1).as_bytes(),
     )
     .unwrap();
+    let unheld = world.places.state.join(member::fleet_seed::UNHELD_FILE);
+    write_private(&world.places.state, member::fleet_seed::UNHELD_FILE, b"1\n").unwrap();
     let left = ok(leave(&world.places, &[]));
     assert!(left.contains("the fleet seed's digest"), "{left}");
     assert!(left.contains("(the fleet seed)"), "{left}");
@@ -4848,6 +4853,7 @@ fn an_init_mints_the_seed_a_rotate_keeps_and_a_leave_keeps_its_digest() {
         !refused.exists(),
         "its conflict record goes too, unreported"
     );
+    assert!(!unheld.exists(), "and a root's record of holding none");
     assert_eq!(member::fleet_seed::read(&world.places.state).unwrap(), None);
     assert_eq!(
         member::fleet_seed::read_digest(&world.places.state).unwrap(),
@@ -9945,7 +9951,10 @@ fn all_members_can_drive_and_an_explicit_leave_stays_off_until_a_rejoin() {
     );
     ok(leave(&member.places, &[]));
     let synced = Opts {
-        synced: Some(Held::Nothing),
+        synced: Some(Synced {
+            from: Held::Nothing,
+            under: None,
+        }),
         port: opts.port,
         ..Opts::default()
     };
@@ -11136,7 +11145,11 @@ fn a_stale_sync_marker_cannot_undo_a_rekey() {
     let record = member.places.state.join(SYNCED_FILE);
     let committed = std::fs::read(&record).unwrap();
     assert!(matches!(
-        converged(in_fleet(&member.places, (&old, &old_key))),
+        converged(in_fleet(
+            &member.places,
+            (&old, &old_key),
+            vault_now(&member.places).as_ref()
+        )),
         FleetSync::Current
     ));
     assert_eq!(std::fs::read(&record).unwrap(), committed);
@@ -11175,7 +11188,11 @@ fn a_stale_sync_marker_keeps_a_leave_or_manual_join() {
         let held = read_key_file(&member.places.state).ok();
         assert!(!member.places.state.join(SYNCED_FILE).exists());
         assert!(matches!(
-            converged(in_fleet(&member.places, (&old, &old_key))),
+            converged(in_fleet(
+                &member.places,
+                (&old, &old_key),
+                vault_now(&member.places).as_ref()
+            )),
             FleetSync::Current
         ));
         assert!(!member.places.state.join(SYNCED_FILE).exists());

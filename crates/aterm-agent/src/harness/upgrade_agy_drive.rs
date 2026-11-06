@@ -19,7 +19,7 @@ use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, NoSocket, Opts, Plan, PromptLook,
     RelaunchLineError, Report, STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of,
     descendants_in, exe_of, exit_status, file_holders, ids, is_generation, ledger, line_status,
-    load, managed_agent_twin, now_s, open_files, pause, read_upgrade_dir, registry_graph,
+    load_record, managed_agent_twin, now_s, open_files, pause, read_upgrade_dir, registry_graph,
     registry_life, roster, running_block, said, save, screen, shell_dialect_of, squash, started_ms,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
     under_hand, unheld_hour, upgrade, wait_now, wait_until,
@@ -537,7 +537,10 @@ pub(super) fn after_exit_onto(
     }
     prune_known(opts, vec![snap.tab.clone()]);
     let mut relaunched_before = false;
-    let prior = load(opts, &session_key);
+    let prior = match load_record(opts, &session_key) {
+        Ok(prior) => prior,
+        Err(_) => return said(r, format!("wait:{}", super::UNREAD_SAVED_RECORD)),
+    };
     let mut closed = None;
     if let Some(mut st) = prior.clone().filter(St::in_flight) {
         let overtaken = (st.pid != snap.pid || st.relaunched_gone(|pid| k.alive(pid))).then(|| {
@@ -1529,15 +1532,15 @@ pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
         else {
             continue;
         };
-        if !super::sat_a_week(&entry, now) {
+        if !super::sat_a_week(&path, now) {
             continue;
         }
-        let Some(st) = load(opts, &key(tab)) else {
+        let Ok(Some(st)) = load_record(opts, &key(tab)) else {
             continue;
         };
         let ours = st.agent == Agent::Agy && (st.tab.is_empty() || st.tab == tab);
         if ours && !st.in_flight() && super::settled(&st) && life(tab) == TabLife::Gone {
-            let _ = std::fs::remove_file(&path);
+            super::prune_if_unchanged(opts, &key(tab), &st, now);
         }
     }
 }

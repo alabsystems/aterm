@@ -3,6 +3,7 @@
 
 use super::super::upgrade_drive::{HarnessToken, Instances, Tell};
 use super::*;
+use crate::harness::upgrade_drive::load;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 

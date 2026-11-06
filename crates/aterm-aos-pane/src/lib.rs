@@ -20,9 +20,9 @@ use aterm_core::config::TerminalConfig;
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS, ResizeLaw, ResizePolicy};
 use aterm_core::terminal::{
     CHECKPOINT_CANON_VERSION, CONFIG_CANON_VERSION, CanonFault, ClockReading, CutKind, HolderCut,
-    HostOp, PANE_CARRY_CANON_VERSION, POLICY_CANON_VERSION, PaneStepCarry, ShellIntegrationNonce,
-    Terminal, TerminalCheckpoint, are_canonical_hyperlink_schemes, policy_canonical,
-    policy_from_canonical,
+    HostConfig, HostOp, PANE_CARRY_CANON_VERSION, POLICY_CANON_VERSION, PaneStepCarry,
+    ShellIntegrationNonce, Terminal, TerminalCheckpoint, are_canonical_hyperlink_schemes,
+    policy_canonical, policy_from_canonical,
 };
 
 pub mod trace;
@@ -83,42 +83,60 @@ pub fn target_name() -> String {
 /// The task artifact `aterm.pane.screen` v1.
 #[must_use]
 pub fn task_artifact() -> ArtifactId {
-    let mut e = Enc::new();
-    e.str("the screen history of one pane: aterm_core::terminal::Terminal fed its recorded output");
-    ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
+    static ARTIFACT: std::sync::OnceLock<ArtifactId> = std::sync::OnceLock::new();
+    ARTIFACT
+        .get_or_init(|| {
+            let mut e = Enc::new();
+            e.str(
+                "the screen history of one pane: aterm_core::terminal::Terminal fed its recorded output",
+            );
+            ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
+        })
+        .clone()
 }
 
 /// The schema artifact `pane.checkpoint+output` v1: the canonical checkpoint and config versions, and the history a state keeps.
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
-    let mut e = Enc::new();
-    e.u32(CHECKPOINT_CANON_VERSION);
-    e.u32(CONFIG_CANON_VERSION);
-    e.u32(PANE_CARRY_CANON_VERSION);
-    e.u32(POLICY_CANON_VERSION);
-    e.u64(PANE_HISTORY_LINES as u64);
-    e.str(
-        "state: canonical TerminalCheckpoint, canonical PaneStepCarry, canonical TerminalConfig, \
-         resize policy, host resync, host alternate scroll, cell_px, canonical security Policy, \
-         hyperlink schemes, kitty_media_admitted; inputs Bytes|Resize|Witness|CellPx|Host; \
-         observations Parsed|Resized|Witnessed|CellPx|Host; replies are effects",
-    );
-    ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
+    static ARTIFACT: std::sync::OnceLock<ArtifactId> = std::sync::OnceLock::new();
+    ARTIFACT
+        .get_or_init(|| {
+            let mut e = Enc::new();
+            e.u32(CHECKPOINT_CANON_VERSION);
+            e.u32(CONFIG_CANON_VERSION);
+            e.u32(PANE_CARRY_CANON_VERSION);
+            e.u32(POLICY_CANON_VERSION);
+            e.u64(PANE_HISTORY_LINES as u64);
+            e.str(
+                "state: canonical TerminalCheckpoint, canonical PaneStepCarry, canonical TerminalConfig, \
+                 resize policy, host resync, host alternate scroll, cell_px, canonical security Policy, \
+                 hyperlink schemes, kitty_media_admitted; inputs Bytes|Resize|Witness|CellPx|Host, \
+                 a Host Config (canonical TerminalConfig) moving the state's config; \
+                 observations Parsed|Resized|Witnessed|CellPx|Host; replies are effects",
+            );
+            ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
+        })
+        .clone()
 }
 
 /// The profile artifact: the target and the engine's resize law.
 #[must_use]
 pub fn profile_artifact() -> ArtifactId {
-    let target = target_name();
-    let mut e = Enc::new();
-    e.str(&target);
-    e.u64(ResizeLaw::default().header_value());
-    ArtifactId::new(
-        ArtifactKind::Profile,
-        &format!("{target}/aterm-core"),
-        1,
-        e.as_bytes(),
-    )
+    static ARTIFACT: std::sync::OnceLock<ArtifactId> = std::sync::OnceLock::new();
+    ARTIFACT
+        .get_or_init(|| {
+            let target = target_name();
+            let mut e = Enc::new();
+            e.str(&target);
+            e.u64(ResizeLaw::default().header_value());
+            ArtifactId::new(
+                ArtifactKind::Profile,
+                &format!("{target}/aterm-core"),
+                1,
+                e.as_bytes(),
+            )
+        })
+        .clone()
 }
 
 /// The five artifacts a pane task runs under, with `code` running it.
@@ -502,6 +520,11 @@ fn encode_host_op(e: &mut Enc, op: &HostOp) {
             e.raw(nonce);
         }
         HostOp::AdvanceKittyAnimations => e.u8(12),
+        HostOp::Config { config, recolored } => {
+            e.u8(13);
+            e.bool(*recolored);
+            e.bytes(&config.0.canonical());
+        }
     }
 }
 
@@ -566,6 +589,15 @@ fn decode_host_op(d: &mut Dec<'_>) -> Result<HostOp, WireFault> {
             "input.host.nonce",
         )?)),
         12 => Ok(HostOp::AdvanceKittyAnimations),
+        13 => {
+            let recolored = d.bool("input.host.recolored")?;
+            let config = TerminalConfig::from_canonical(d.bytes("input.host.config")?)
+                .map_err(|f| canon_fault(&f))?;
+            Ok(HostOp::Config {
+                config: HostConfig(Arc::new(config)),
+                recolored,
+            })
+        }
         tag => Err(WireFault::BadTag {
             field: "input.host.op",
             tag,
@@ -1066,7 +1098,7 @@ impl Code<PaneSchema> for PrebuiltPane {
             }
             PaneInput::Host { op, clock } => {
                 let mut term = state.engine_on(schema);
-                term.apply_host_op_at(*op, self.code.reading(schema, *clock));
+                term.apply_host_op_at(op.clone(), self.code.reading(schema, *clock));
                 state.checkpoint = project(&term).ok_or_else(|| {
                     refusal(
                         UNCARRIED_PARTIAL,
@@ -1075,12 +1107,50 @@ impl Code<PaneSchema> for PrebuiltPane {
                 })?;
                 state.carry =
                     PaneStepCarry::capture(&term, schema.origin.monotonic, PANE_HISTORY_LINES);
+                #[cfg(test)]
+                let moves = !config_step::kept();
+                #[cfg(not(test))]
+                let moves = true;
+                if let HostOp::Config { config, .. } = op
+                    && moves
+                {
+                    Arc::make_mut(&mut state.env).config = TerminalConfig::clone(&config.0);
+                }
                 Ok(PaneObservation::Host {
-                    op: *op,
+                    op: op.clone(),
                     clocked: clock.is_some(),
                 })
             }
         }
+    }
+}
+
+/// Test-only switch the host step reads: a config install that leaves the state's config where it was, the negative control of one that moves it.
+#[cfg(test)]
+pub(crate) mod config_step {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEPT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Moves the state's config again when dropped.
+    pub(crate) struct Kept;
+
+    impl Drop for Kept {
+        fn drop(&mut self) {
+            KEPT.with(|k| k.set(false));
+        }
+    }
+
+    /// Leave the state's config on every later config install on this thread, until the returned guard drops.
+    pub(crate) fn keep_old() -> Kept {
+        KEPT.with(|k| k.set(true));
+        Kept
+    }
+
+    pub(super) fn kept() -> bool {
+        KEPT.with(Cell::get)
     }
 }
 
@@ -1108,12 +1178,17 @@ impl FaithfulReplay {
     /// Its artifact: the descriptor names the laws.
     #[must_use]
     pub fn artifact() -> ArtifactId {
-        let mut e = Enc::new();
-        for law in [WITNESS_MATCHES, REPLIES_MATCH, CLOCK_RECORDED] {
-            e.str(law);
-        }
-        e.str("full equality of the canonical visible checkpoint");
-        ArtifactId::new(ArtifactKind::Contract, CONTRACT_NAME, 1, e.as_bytes())
+        static ARTIFACT: std::sync::OnceLock<ArtifactId> = std::sync::OnceLock::new();
+        ARTIFACT
+            .get_or_init(|| {
+                let mut e = Enc::new();
+                for law in [WITNESS_MATCHES, REPLIES_MATCH, CLOCK_RECORDED] {
+                    e.str(law);
+                }
+                e.str("full equality of the canonical visible checkpoint");
+                ArtifactId::new(ArtifactKind::Contract, CONTRACT_NAME, 1, e.as_bytes())
+            })
+            .clone()
     }
 }
 
@@ -1196,7 +1271,7 @@ impl Contract<PaneSchema> for FaithfulReplay {
                             WITNESS_MATCHES,
                             format!(
                                 "the live screen is {}, the replay's {}",
-                                live.short(),
+                                live.short_display(),
                                 replayed.map_or_else(
                                     || "inside a partial sequence".into(),
                                     |d| d.short()

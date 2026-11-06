@@ -617,11 +617,14 @@ fn ensure_real_dir(dir: &Path) -> Result<(), Error> {
 fn write_durably(path: &Path, text: &str) -> Result<(), Error> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(path);
-    let mut file = std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| io("create", path, &e))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(path).map_err(|e| io("create", path, &e))?;
     file.write_all(text.as_bytes())
         .map_err(|e| io("write", path, &e))?;
     aterm_durable::durable(&file).map_err(|e| io("flush", path, &e))
@@ -634,8 +637,8 @@ fn files(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
         .filter(|e| e.file_name().to_str().is_some_and(&keep))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
         .map(|e| e.path())
         .collect();
     found.sort();

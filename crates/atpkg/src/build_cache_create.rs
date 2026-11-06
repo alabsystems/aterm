@@ -213,7 +213,7 @@ pub(super) fn begin(
     {
         return None;
     }
-    aterm_dirfd::fsync(&held_parent).ok()?;
+    aterm_durable::primitive::fsync(&held_parent).ok()?;
     write(record, &receipt)?;
     step(Point::Intent)?;
     finish(home, record, &receipt)
@@ -285,7 +285,7 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
                 aterm_dirfd::RenameFlags::NOREPLACE,
             )
             .ok()?;
-            aterm_dirfd::fsync(&held_parent).ok()?;
+            aterm_durable::primitive::fsync(&held_parent).ok()?;
             step(Point::Renamed)?;
         }
         Ok(_)
@@ -305,7 +305,7 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
     {
         return None;
     }
-    aterm_dirfd::fsync(&held_parent).ok()?;
+    aterm_durable::primitive::fsync(&held_parent).ok()?;
     write(record, &published)?;
     step(Point::Committed)?;
     (super::same(home, &published) && read(record).as_ref() == Some(&published))
@@ -368,7 +368,7 @@ pub(super) fn step(point: Point) -> Option<()> {
 #[cfg(unix)]
 pub(super) fn sync_directory(directory: &aterm_dirfd::OwnedFd, point: Point) -> Option<()> {
     step(point)?;
-    aterm_dirfd::fsync(directory).ok()
+    aterm_durable::primitive::fsync(directory).ok()
 }
 
 #[cfg(all(test, unix))]

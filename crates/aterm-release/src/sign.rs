@@ -887,23 +887,27 @@ pub enum DrClass {
 /// ```
 #[must_use]
 pub fn classify_dr(codesign_output: &str) -> DrClass {
+    let has = |haystack: &str, needle: &[u8]| {
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    };
     let Some(requirement) = designated_requirement(codesign_output) else {
-        let lower = codesign_output.to_ascii_lowercase();
-        return if lower.contains("code object is not signed") {
+        return if has(codesign_output, b"code object is not signed") {
             DrClass::Unsigned
         } else {
             DrClass::Unknown
         };
     };
-    let lower = requirement.to_ascii_lowercase();
-    if lower.contains("cdhash") {
+    if has(requirement, b"cdhash") {
         return DrClass::Cdhash;
     }
-    let has_identifier = lower.contains("identifier ") || lower.contains("identifier\"");
-    let has_anchor = lower.contains("anchor apple")
-        || lower.contains("certificate leaf")
-        || lower.contains("certificate root")
-        || lower.contains("subject.ou");
+    let has_identifier = has(requirement, b"identifier ") || has(requirement, b"identifier\"");
+    let has_anchor = has(requirement, b"anchor apple")
+        || has(requirement, b"certificate leaf")
+        || has(requirement, b"certificate root")
+        || has(requirement, b"subject.ou");
     if has_identifier && has_anchor {
         return DrClass::Identity;
     }

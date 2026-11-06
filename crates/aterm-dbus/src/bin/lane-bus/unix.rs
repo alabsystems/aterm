@@ -34,6 +34,10 @@ const CALL: Duration = HANG;
 
 const POLL: Duration = Duration::from_millis(100);
 
+/// A wait at least this long is said on stderr, the unit's journal: the lane's peers answer in
+/// milliseconds, and a row that fails on a stall has nothing else to name it by.
+const SLOW: Duration = Duration::from_secs(5);
+
 const ACTIVE_BIT: u32 = 1;
 
 const MAX_DEPTH: usize = 32;
@@ -365,9 +369,31 @@ fn call(
     let msg = Message::method_call(Some(dest), path, Some(iface), member)
         .map_err(|e| e.to_string())?
         .with_body(body);
-    conn.call(msg, CALL)
+    let t0 = Instant::now();
+    let answer = conn
+        .call(msg, CALL)
         .map(|reply| reply.body)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    let waited = t0.elapsed();
+    if waited >= SLOW {
+        let who = (dest != BUS)
+            .then(|| pid_of(conn, dest))
+            .flatten()
+            .map_or_else(
+                || "process unknown".to_string(),
+                |pid| {
+                    let comm =
+                        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                    format!("process {pid} {}", comm.trim())
+                },
+            );
+        let outcome = if answer.is_ok() { "answered" } else { "failed" };
+        eprintln!(
+            "lane-bus: {iface}.{member} on {path}: {dest} ({who}) {outcome} after {:.1} s",
+            waited.as_secs_f64()
+        );
+    }
+    answer
 }
 
 fn property(
@@ -421,31 +447,11 @@ fn pid_of(conn: &mut Connection, name: &str) -> Option<u32> {
     .as_u32()
 }
 
-fn names_of(conn: &mut Connection, pid: u32) -> Vec<String> {
-    let names: Vec<String> = call(
-        conn,
-        BUS,
-        "/org/freedesktop/DBus",
-        BUS,
-        "ListNames",
-        Vec::new(),
-    )
-    .ok()
-    .and_then(|b| {
-        b.first().and_then(Value::as_array).map(|a| {
-            a.items()
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|n| n.starts_with(':'))
-                .map(str::to_owned)
-                .collect()
-        })
-    })
-    .unwrap_or_default();
-    names
-        .into_iter()
-        .filter(|n| pid_of(conn, n) == Some(pid))
-        .collect()
+/// The connection at which process `pid` serves `well_known`, as the bus says. Asking each of the
+/// process's connections instead waits out the hang detector on one that never answers: gnome-shell
+/// has three, one of them silent, and `ListNames` has no order, so it comes first in some runs.
+fn served_by(conn: &mut Connection, pid: u32, well_known: &str) -> Option<String> {
+    owner(conn, well_known).filter(|name| pid_of(conn, name) == Some(pid))
 }
 
 fn a11y_bus() -> Result<Connection, Fail> {
@@ -1127,11 +1133,18 @@ fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
     Ok(steps)
 }
 
-fn frame_active(conn: &mut Connection, app: &str, pid: u32) -> Option<bool> {
-    let (bus, root) = find_app(conn, app, pid).ok()?.into_iter().next()?;
-    let kids = call(conn, &bus, &root, ACCESSIBLE, "GetChildren", Vec::new()).ok()?;
+/// Whether the frame of `app`'s process `pid` is active, or what stood in the way of reading it.
+fn frame_active(conn: &mut Connection, app: &str, pid: u32) -> Result<bool, &'static str> {
+    let (bus, root) = find_app(conn, app, pid)
+        .map_err(|_| "the registry did not list its children")?
+        .into_iter()
+        .next()
+        .ok_or("the application is not on the bus")?;
+    let kids = call(conn, &bus, &root, ACCESSIBLE, "GetChildren", Vec::new())
+        .map_err(|_| "its root did not list its children")?;
     for (b, p) in children_of(&kids) {
-        let role = call(conn, &b, &p, ACCESSIBLE, "GetRole", Vec::new()).ok()?;
+        let role = call(conn, &b, &p, ACCESSIBLE, "GetRole", Vec::new())
+            .map_err(|_| "a child of its root did not say its role")?;
         if role
             .first()
             .and_then(Value::as_u32)
@@ -1141,26 +1154,42 @@ fn frame_active(conn: &mut Connection, app: &str, pid: u32) -> Option<bool> {
         {
             continue;
         }
-        let states = call(conn, &b, &p, ACCESSIBLE, "GetState", Vec::new()).ok()?;
+        let states = call(conn, &b, &p, ACCESSIBLE, "GetState", Vec::new())
+            .map_err(|_| "its frame did not say its state")?;
         let low = states
             .first()
             .and_then(Value::as_array)
-            .and_then(|a| a.items().first().and_then(Value::as_u32))?;
-        return Some(low & (1 << ACTIVE_BIT) != 0);
+            .and_then(|a| a.items().first().and_then(Value::as_u32))
+            .ok_or("its frame's state was no set of states")?;
+        return Ok(low & (1 << ACTIVE_BIT) != 0);
     }
-    None
+    Err("its root has no frame")
 }
 
 fn await_focus(conn: &mut Connection, app: &str, pid: u32, want: bool) -> Result<(), Fail> {
+    let word = |active: bool| if active { "active" } else { "inactive" };
     let t0 = Instant::now();
+    let mut read = "nothing";
     loop {
-        if frame_active(conn, app, pid) == Some(want) {
-            return Ok(());
+        match frame_active(conn, app, pid) {
+            Ok(active) if active == want => {
+                if t0.elapsed() >= SLOW {
+                    eprintln!(
+                        "lane-bus: the frame of {app} (process {pid}) became {} after {:.1} s; \
+                         until then: {read}",
+                        word(want),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Ok(active) => read = word(active),
+            Err(why) => read = why,
         }
         if t0.elapsed() > HANG {
             return Err(Fail::Fault(format!(
-                "the frame of {app} (process {pid}) never became {} ({} s)",
-                if want { "active" } else { "inactive" },
+                "the frame of {app} (process {pid}) never became {} ({} s): {read}",
+                word(want),
                 HANG.as_secs()
             )));
         }
@@ -1192,23 +1221,7 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
         await_focus(a11y, app, pid, false)?;
     }
     let mut conn = session_bus()?;
-    let mut rd = None;
-    for name in names_of(&mut conn, mutter) {
-        if call(
-            &mut conn,
-            &name,
-            RD_PATH,
-            PROPERTIES,
-            "GetAll",
-            vec![RD.into()],
-        )
-        .is_ok()
-        {
-            rd = Some(name);
-            break;
-        }
-    }
-    let Some(rd) = rd else {
+    let Some(rd) = served_by(&mut conn, mutter, RD) else {
         return Err(Fail::NotHere(format!(
             "process {mutter} serves no {RD} on the session bus (not a Mutter)"
         )));
@@ -1270,24 +1283,11 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
 
 fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
     let mut conn = session_bus()?;
-    let sc = names_of(&mut conn, mutter)
-        .into_iter()
-        .find(|name| {
-            call(
-                &mut conn,
-                name,
-                SC_PATH,
-                PROPERTIES,
-                "GetAll",
-                vec![SC.into()],
-            )
-            .is_ok()
-        })
-        .ok_or_else(|| {
-            Fail::NotHere(format!(
-                "process {mutter} serves no {SC} on the session bus (not a Mutter)"
-            ))
-        })?;
+    let sc = served_by(&mut conn, mutter, SC).ok_or_else(|| {
+        Fail::NotHere(format!(
+            "process {mutter} serves no {SC} on the session bus (not a Mutter)"
+        ))
+    })?;
     let none = Value::dict(Type::Str, Type::Variant, Vec::new()).map_err(Fail::fault)?;
     let body = call(&mut conn, &sc, SC_PATH, SC, "CreateSession", vec![none])
         .map_err(|e| Fail::NotHere(format!("no screencast here: CreateSession: {e}")))?;

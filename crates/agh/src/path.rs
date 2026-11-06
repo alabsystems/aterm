@@ -9,8 +9,7 @@ use crate::error::{Error, Result};
 
 const UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
-fn encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn encode_into(out: &mut String, text: &str) {
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));
@@ -20,6 +19,11 @@ fn encode(text: &str) -> String {
             out.push(char::from(UPPER[usize::from(b & 0x0f)]));
         }
     }
+}
+
+fn encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    encode_into(&mut out, text);
     out
 }
 
@@ -33,21 +37,27 @@ pub fn segment(text: &str) -> String {
 /// A file path: each `/`-separated part encoded, empty parts dropped, joined with `/`.
 #[must_use]
 pub fn file_path(path: &str) -> String {
-    path.split('/')
-        .filter(|part| !part.is_empty())
-        .map(encode)
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        encode_into(&mut out, part);
+    }
+    out
 }
 
 /// A ref (`heads/feature`, a tag): each part encoded, every `/` kept.
 #[must_use]
 pub fn ref_path(reference: &str) -> String {
-    reference
-        .split('/')
-        .map(encode)
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(reference.len());
+    for (i, part) in reference.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        encode_into(&mut out, part);
+    }
+    out
 }
 
 /// Returns whether any `/`-separated segment of `text` is `.` or `..`.
@@ -124,11 +134,16 @@ pub fn query_value(text: &str) -> String {
 /// `k=v&k2=v2` in the given order, keys and values encoded; `""` for none.
 #[must_use]
 pub fn query(pairs: &[(String, String)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut out = String::with_capacity(pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum());
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        encode_into(&mut out, k);
+        out.push('=');
+        encode_into(&mut out, v);
+    }
+    out
 }
 
 /// Whether `text` is one or more ASCII digits and nothing else.

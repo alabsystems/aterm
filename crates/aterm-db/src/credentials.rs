@@ -84,10 +84,11 @@ fn ids(text: &str) -> Result<[u8; 16]> {
 /// arrived in.
 #[must_use]
 pub fn request_key(requester: &Actor, nonce: &[u8; 16]) -> [u8; 16] {
-    let mut input = REQUEST_KEY_DOMAIN.to_vec();
-    input.extend_from_slice(requester);
-    input.extend_from_slice(nonce);
-    let digest = Sha256::digest(&input);
+    let mut sha = Sha256::new();
+    sha.update(REQUEST_KEY_DOMAIN);
+    sha.update(requester);
+    sha.update(nonce);
+    let digest = sha.finalize();
     let mut key = [0; 16];
     key.copy_from_slice(&digest[..16]);
     key
@@ -113,22 +114,31 @@ impl Record {
         }
     }
 
+    fn command_request_from(&self, bytes: &[u8]) -> [u8; 16] {
+        let mut sha = Sha256::new();
+        sha.update(COMMAND_DOMAIN);
+        sha.update(self.kind.as_bytes());
+        sha.update([0]);
+        sha.update(self.key.as_bytes());
+        sha.update([0]);
+        sha.update(bytes);
+        let digest = sha.finalize();
+        let mut request = [0; 16];
+        request.copy_from_slice(&digest[..16]);
+        request
+    }
+
+    fn command_request(&self) -> Result<[u8; 16]> {
+        Ok(self.command_request_from(&canonical(&self.body)?))
+    }
+
     /// The command that carries it. Its retry identity is derived from the record, so a
     /// second write of the same record returns the first one's receipt rather than a twin.
     ///
     /// # Errors
     /// The body is over [`MAX_RECORD`] bytes or cannot be encoded.
     pub fn command(&self) -> Result<Command> {
-        let bytes = canonical(&self.body)?;
-        let mut input = COMMAND_DOMAIN.to_vec();
-        input.extend_from_slice(self.kind.as_bytes());
-        input.push(0);
-        input.extend_from_slice(self.key.as_bytes());
-        input.push(0);
-        input.extend_from_slice(&bytes);
-        let digest = Sha256::digest(&input);
-        let mut request = [0; 16];
-        request.copy_from_slice(&digest[..16]);
+        let request = self.command_request()?;
         Ok(Command::Write {
             request,
             changes: vec![Change {
@@ -154,7 +164,7 @@ impl Record {
     ) -> Result<Self> {
         self.body.remove("att");
         let key = ids(&self.key)?;
-        let body = self.attested_bytes()?;
+        let body = canonical(&self.body)?;
         let signature = sign(custody::Attested {
             kind: &self.kind,
             key: &key,
@@ -226,7 +236,7 @@ fn hex_field<const N: usize>(value: &Value) -> Option<[u8; N]> {
 }
 
 /// Check a record's closed schema: the fields its kind allows, each well formed.
-fn check(record: &Record) -> Result<()> {
+fn check(record: &Record) -> Result<Vec<u8>> {
     let allowed: &[&str] = match record.kind.as_str() {
         "request" => &[
             "nonce",
@@ -257,9 +267,6 @@ fn check(record: &Record) -> Result<()> {
         ));
     }
     ids(&record.key)?;
-    if record.key != record.key.to_ascii_lowercase() {
-        return Err(Error::new("credential record key is not lowercase hex"));
-    }
     let body = &record.body;
     let att = || optional(body, "att", hex_field::<64>);
     match record.kind.as_str() {
@@ -335,12 +342,11 @@ fn check(record: &Record) -> Result<()> {
         }
         _ => {}
     }
-    canonical(body)?;
-    Ok(())
+    canonical(body)
 }
 
 fn record_of(command: &Command) -> Result<Record> {
-    let Command::Write { changes, .. } = command else {
+    let Command::Write { request, changes } = command else {
         return Err(Error::new("credential records are whole-value writes"));
     };
     let [change] = changes.as_slice() else {
@@ -356,8 +362,8 @@ fn record_of(command: &Command) -> Result<Record> {
         key: change.key.clone(),
         body: body.clone(),
     };
-    check(&record)?;
-    if record.command()? != *command {
+    let bytes = check(&record)?;
+    if record.command_request_from(&bytes) != *request {
         return Err(Error::new(
             "credential command's retry identity is not its record's",
         ));
@@ -887,10 +893,11 @@ fn request_record(me: &Actor, need: &Need) -> Record {
 /// retries the same retirement and request, before the local ledger adopts it.
 fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Record)> {
     let current = request_record(me, need);
-    let mut material = SUCCESSOR_DOMAIN.to_vec();
-    material.extend_from_slice(me);
-    material.extend_from_slice(&canonical(&current.body)?);
-    let digest = Sha256::digest(&material);
+    let mut sha = Sha256::new();
+    sha.update(SUCCESSOR_DOMAIN);
+    sha.update(me);
+    sha.update(&canonical(&current.body)?);
+    let digest = sha.finalize();
     let mut nonce = [0; 16];
     nonce.copy_from_slice(&digest[..16]);
     let successor = Need {
@@ -986,7 +993,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         let context = context(&facts, session, scope, now_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
         let writer = session.writer().is_ok() && log.writable(session.actor()).is_ok();
-        let book = Book::read(&log, &context);
+        let mut book = Book::read(&log, &context);
         let me = session.actor();
         let request = |record| match &origin {
             Some(origin) => origin.bind(session, scope, record),
@@ -1176,7 +1183,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             }
         }
         report.threads = book.threads.values().cloned().collect();
-        report.inert = book.inert.clone();
+        report.inert = std::mem::take(&mut book.inert);
         Ok((report, scope.trust().network, book))
     })?;
     report.decided = need::absorb(paths, &moves)

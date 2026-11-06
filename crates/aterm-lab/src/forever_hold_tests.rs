@@ -761,6 +761,20 @@ fn the_hover_is_read_off_the_strips_tooltip() {
         tabs[1].driven().as_deref(),
         Some("driven by aterm (land: not landed yet, 1 untracked file)")
     );
+    let codex = "toolbar-tabs count=2 selected=0 labels=[\"land\", \"worker\"] icons=[None, \
+                 None] states=[[\"selected\"], []] tooltips=[Some(\"land\\ncodex-alab autopilot \
+                 (land: codex-alab: not landed yet)\"), Some(\"worker\\nworker of manager\")]";
+    let tabs = super::super::strip_tabs(codex);
+    assert_eq!(
+        tabs[0].driven().as_deref(),
+        Some("codex-alab autopilot (land: codex-alab: not landed yet)"),
+        "a codex-alab tab's own Autopilot is its driver line"
+    );
+    assert_eq!(
+        tabs[1].driven(),
+        None,
+        "CONTROL: a worker line names no Autopilot"
+    );
     let g = super::super::Glance::of(T0, chrome, "");
     let mut w = Window {
         label: "land-c".into(),

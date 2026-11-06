@@ -136,7 +136,7 @@ pub fn unit_graph(ctx: &Ctx, piece: &crate::shape::Piece) -> Result<String, Stri
     }
 }
 
-/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], the first child's), no doctests (the doctests stage runs those) and no examples or benches.
+/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], which the first child compiles, beside the measuring benches where it builds them: [`crate::plan::folds_measuring`]), no doctests (the doctests stage runs those) and no examples or benches.
 #[must_use]
 pub fn test_run_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(scope);
@@ -144,7 +144,7 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]).
+/// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]); the release's compile child adds the measuring benches ([`measuring_bench_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
 const MEASURING_TARGETS: [&str; 4] = ["paint", "spin", "aos", "rewind"];
@@ -155,12 +155,23 @@ pub fn measuring_args() -> Vec<String> {
     measuring_targets_args()
 }
 
-/// [`measuring_args`]'s compile alone (`--no-run`): the measuring rows' prebuild, the main lane's last row before the first barrier, so the exclusive stage that runs them compiles nothing.
+/// [`measuring_args`]'s compile alone (`--no-run`): the measuring rows' prebuild, the main lane's last row before the first barrier, so the exclusive stage that runs them compiles nothing. Planned only where no workspace test compile builds them ([`crate::plan::folds_measuring`]).
 #[must_use]
 pub fn measure_prebuild_args() -> Vec<String> {
     let mut a = measuring_targets_args();
     a.push("--no-run".to_string());
     a
+}
+
+/// `--bench paint --bench spin --bench aos --bench rewind`: the measuring matrices' targets
+/// ([`MEASURING_TARGETS`]), which the workspace's test compile adds where it builds them
+/// ([`crate::plan::folds_measuring`]).
+#[must_use]
+pub fn measuring_bench_args() -> Vec<String> {
+    MEASURING_TARGETS
+        .iter()
+        .flat_map(|t| ["--bench".to_string(), (*t).to_string()])
+        .collect()
 }
 
 fn measuring_targets_args() -> Vec<String> {
@@ -175,9 +186,7 @@ fn measuring_targets_args() -> Vec<String> {
     ]
     .map(String::from)
     .into();
-    for t in MEASURING_TARGETS {
-        a.extend(["--bench".to_string(), t.to_string()]);
-    }
+    a.extend(measuring_bench_args());
     a
 }
 
@@ -911,8 +920,13 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
         .filter(|p| p.shaped() && !p.closing())
         .map(|p| &p.piece);
     let label = format!(
-        "targo test {} --no-run",
-        cut.map_or_else(|| ctx.scope.label(), crate::shape::Piece::label)
+        "targo test {} --no-run{}",
+        cut.map_or_else(|| ctx.scope.label(), crate::shape::Piece::label),
+        if crate::plan::folds_measuring(ctx) {
+            " (and the measuring benches)"
+        } else {
+            ""
+        }
     );
     if ctx.scope.selects_nothing() {
         r.skip(format!("{label} {EMPTY_CONE}"));
@@ -1092,8 +1106,12 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
         if bind { with_trustdoc(ctx, c) } else { c }
     };
     let (k, v) = TRAIL_LAWS_FULL;
+    let mut compile = test_compile_args(&ctx.scope);
+    if crate::plan::folds_measuring(ctx) {
+        compile.extend(measuring_bench_args());
+    }
     [
-        cmd(with_checkers(ctx, test_compile_args(&ctx.scope))).demoted(),
+        cmd(with_checkers(ctx, compile)).demoted(),
         cmd(with_checkers(ctx, test_run_args(&ctx.scope)))
             .env(k, v)
             .counting_waits(),
@@ -1175,11 +1193,18 @@ const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window rows (--no-windows: each o
                                         the desktop — fix: run without --no-windows when the \
                                         desktop is free)";
 
-fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
+/// The main lane's targo over `args`, widened as every helper is ([`helper_scope_args`]), and its
+/// label.
+fn measuring_targo(ctx: &Ctx, args: Vec<String>) -> (String, Cmd) {
     let args = helper_scope_args(&ctx.scope, args);
     let label = format!("targo {}", args[1..].join(" "));
+    (label, main_targo(ctx, args))
+}
+
+fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
+    let (label, cmd) = measuring_targo(ctx, args);
     let bin = artifact.bin("aterm");
-    let mut cmd = main_targo(ctx, args)
+    let mut cmd = cmd
         .env(RELEASE_PAINT_BIN, bin.as_os_str())
         .env(RELEASE_SPIN_BIN, bin.as_os_str());
     if ctx.no_windows {
@@ -1188,16 +1213,14 @@ fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>
     (label, cmd)
 }
 
+/// The measuring rows' compile: the matrices read the bundle only when they run
+/// (`ATERM_PAINT_BIN`, `ATERM_SPIN_BIN`), and no unit reads either name, so it needs none.
 fn measure_prebuild(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("measuring rows' compile (no targo)");
         return;
     }
-    let Some(artifact) = &ctx.measure_artifact else {
-        r.skip(format!("measuring rows' compile {NO_APP}"));
-        return;
-    };
-    let (label, cmd) = measuring_cmd(ctx, artifact, measure_prebuild_args());
+    let (label, cmd) = measuring_targo(ctx, measure_prebuild_args());
     run_labeled(ctx, r, &label, &cmd.demoted());
 }
 
@@ -1211,6 +1234,16 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let (label, cmd) = measuring_cmd(ctx, artifact, measuring_args());
+    if crate::plan::folds_measuring(ctx)
+        && ctx
+            .test_compile_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // Its benches were the test compile's to build: compiling them here would hold the
+        // quiet machine for a build no memory claim covers.
+        not_run_behind(r, &label, "the test compile that builds its benches failed");
+        return;
+    }
     let subject = Subject::of(ctx, artifact);
     if ctx.no_windows {
         r.skip(MEASURE_WINDOW_ROWS_SKIP);
@@ -2648,6 +2681,109 @@ mod tests {
     }
 
     #[test]
+    fn a_measuring_plan_builds_its_benches_once_and_before_the_quiet_machine() {
+        use crate::checks::{Check, RELEASE};
+        use crate::plan::{folds_measuring, named_skip};
+        let benches = measuring_bench_args();
+        assert_eq!(benches.len(), 2 * MEASURING_TARGETS.len());
+        let app = || Some(crate::MeasureArtifact::unnamed("/release/aterm.app"));
+        let narrowed = || Scope::packages(&["aterm-verify".to_string()]);
+        let contexts = [
+            ctx(Scope::workspace())
+                .with_checks(&RELEASE)
+                .with_release(true)
+                .with_measure_artifact(app()),
+            ctx(Scope::workspace())
+                .with_checks(&RELEASE)
+                .with_release(true),
+            ctx(Scope::workspace())
+                .with_checks(&[Check::Test])
+                .with_checkers_in_tests(true)
+                .with_compile_only(true),
+            ctx(narrowed())
+                .with_checks(&[Check::Test])
+                .with_checkers_in_tests(true),
+            ctx(Scope::workspace())
+                .with_checks(&[Check::Test, Check::Measure])
+                .with_measure_artifact(app()),
+            ctx(narrowed())
+                .with_checks(&[Check::Test, Check::Measure])
+                .with_measure_artifact(app()),
+            ctx(Scope::workspace())
+                .with_checks(&[Check::Measure])
+                .with_measure_artifact(app()),
+            ctx(Scope::workspace()).with_checks(&[Check::Test]),
+        ];
+        for c in &contexts {
+            let ids: Vec<StageId> = crate::plan::plan(c).iter().map(|s| s.id).collect();
+            let [compile, run] = test_cmds(c, false);
+            let (compile, run) = (compile.argv(), run.argv());
+            let folded = compile.iter().any(|a| a == "--bench");
+            assert_eq!(folded, folds_measuring(c), "{:?}: {compile:?}", c.checks);
+            if folded {
+                assert!(
+                    compile
+                        .windows(benches.len())
+                        .any(|w| w == benches.as_slice())
+                );
+                assert!(compile.iter().any(|a| a == "--tests"), "{compile:?}");
+            }
+            assert!(
+                !run.iter().any(|a| a == "--bench"),
+                "the run child runs no bench: {run:?}"
+            );
+            let prebuilt = ids.contains(&StageId::MeasurePrebuild);
+            let compiled = folded && ids.contains(&StageId::TestCompile);
+            assert!(!(prebuilt && compiled), "built twice: {:?}", c.checks);
+            if ids.contains(&StageId::MeasuringTests) && !named_skip(c, StageId::MeasuringTests) {
+                assert!(
+                    prebuilt || compiled,
+                    "the quiet stage would compile its benches: {:?}",
+                    c.checks
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_measuring_stage_does_not_run_behind_the_failed_compile_that_builds_its_benches() {
+        use crate::checks::{Check, RELEASE};
+        let behind = "the test compile that builds its benches failed";
+        let outcome = |c: Ctx| {
+            let mut c = c
+                .with_measure_artifact(Some(crate::MeasureArtifact::unnamed("/release/aterm.app")));
+            c.tools.targo = PathBuf::from("/usr/bin/false");
+            c.tools.refused = None;
+            c.test_compile_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            let mut r = Report::new("measuring");
+            measuring_tests(&c, &mut r);
+            r.outcomes()
+                .next()
+                .map(|(o, l)| (o, l.to_string()))
+                .expect("a decision")
+        };
+        let release = ctx(Scope::workspace())
+            .with_checks(&RELEASE)
+            .with_release(true);
+        let (o, label) = outcome(release);
+        assert_eq!(
+            o,
+            crate::Outcome::Fail(crate::Severity::CouldNotRun),
+            "{label}"
+        );
+        assert!(
+            label.contains(behind) && label.ends_with(NOT_RUN_BEHIND),
+            "{label}"
+        );
+        // NEGATIVE CONTROL: a run whose prebuild row built the benches measures whatever its
+        // test compile did.
+        let dev = ctx(Scope::workspace()).with_checks(&[Check::Test, Check::Measure]);
+        let (_, label) = outcome(dev);
+        assert!(!label.contains(behind), "{label}");
+    }
+
+    #[test]
     fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
         let c = ctx(Scope::workspace());
         let artifact = crate::MeasureArtifact::unnamed("/release/aterm.app");
@@ -2658,14 +2794,18 @@ mod tests {
                 .map(|(_, v)| PathBuf::from(v))
         };
         let (_, run) = measuring_cmd(&c, &artifact, measuring_args());
-        let (_, prebuild) = measuring_cmd(&c, &artifact, measure_prebuild_args());
+        let (_, prebuild) = measuring_targo(&c, measure_prebuild_args());
         for var in ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"] {
             assert_eq!(
                 env_of(&run, var),
                 Some(PathBuf::from("/release/aterm.app/Contents/MacOS/aterm")),
                 "{var}"
             );
-            assert_eq!(env_of(&prebuild, var), env_of(&run, var), "{var}");
+            assert_eq!(
+                env_of(&prebuild, var),
+                None,
+                "the compile needs no bundle: {var}"
+            );
         }
         assert_eq!(
             env_of(&run, "ATERM_MEASURE_NO_WINDOWS"),

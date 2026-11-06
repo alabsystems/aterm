@@ -35,9 +35,11 @@ fn boot_sid(w: &World) -> String {
 /// for far longer than a relaunch's exec, read off the node log's link marks: the killed
 /// generation's `state=disconnected`, then the next one's `state=stalled`.
 ///
-/// A retire that does not wait for the lanes, or a lane that lets go of its `LaneEnded` before
-/// its guard has run, attaches the next bridge during the hold, and the loss lands behind it.
-/// This asserts no time: that a healthy run's relaunch waits nothing is `fabric_launch`'s
+/// The supervisor tells the loss itself at the bridge's exit, waiting on no lane: one that left
+/// the loss to the lanes alone attaches the next bridge during the hold, and the loss lands
+/// behind it. This asserts no time: that a relaunch waits on no lane is `fabric_launch`'s
+/// `a_relaunch_waits_on_no_old_lane_and_the_old_ones_late_loss_holds_no_session`, and that a
+/// healthy run's relaunch waits nothing is its
 /// `the_loop_waits_nothing_after_a_healthy_run_and_the_floor_after_a_young_death`.
 #[test]
 fn a_killed_bridges_loss_lands_ahead_of_the_next_attach_however_long_its_lanes_take() {

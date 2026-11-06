@@ -124,11 +124,11 @@ impl<T: Send + 'static> ChildCustody<T> {
     ///
     /// # Errors
     /// Returns the entire original custody unchanged when no positive reap is known.
-    pub fn try_into_retained(mut self) -> Result<T, Self> {
+    pub fn try_into_retained(mut self) -> Result<T, Box<Self>> {
         if !self.started || decision::may_release(self.reaped.is_some(), false, false) {
             Ok(self.retained.take().expect("custody retains its resources"))
         } else {
-            Err(self)
+            Err(Box::new(self))
         }
     }
 
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(custody.completion(), ChildCompletion::Pending);
 
         assert_eq!(custody.poll_with(|_| Ok(None)).unwrap(), None);
-        custody = custody.try_into_retained().expect_err("no positive poll");
+        custody = *custody.try_into_retained().expect_err("no positive poll");
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         let error = custody
@@ -245,7 +245,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "injected owning-wait failure");
         assert_eq!(custody.completion(), ChildCompletion::Pending);
-        custody = custody
+        custody = *custody
             .try_into_retained()
             .expect_err("wait error is not a reap");
         assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -272,7 +272,7 @@ mod tests {
         let mut custody = ChildCustody::from_child(child, Retained(Arc::clone(&drops)));
         assert_eq!(custody.observe_until(Instant::now()).unwrap(), None);
         assert_eq!(custody.completion(), ChildCompletion::Pending);
-        custody = custody
+        custody = *custody
             .try_into_retained()
             .expect_err("cat still reads its input");
         assert_eq!(drops.load(Ordering::SeqCst), 0);

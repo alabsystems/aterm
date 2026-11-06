@@ -84,7 +84,6 @@ enum Op {
     RenameNoReplace(&'static str, &'static str),
     Link(&'static str, &'static str),
     Chmod(&'static str, u32),
-    FsyncDir,
     ReadDir,
 }
 
@@ -183,7 +182,6 @@ fn run_mine(root: &OwnedFd, op: &Op, ids: &mut Identities) -> Outcome {
             }
             Err(e) => Outcome::Failed(e.raw_os_error()),
         },
-        Op::FsyncDir => unit(mine::fsync(root)),
         Op::ReadDir => match mine::Dir::read_from(root) {
             Ok(dir) => {
                 let mut names = Vec::new();
@@ -279,11 +277,6 @@ fn run_reference(root: &Path, op: &Op, ids: &mut Identities) -> Outcome {
             Ok(f) => unit(f.set_permissions(std::fs::Permissions::from_mode(bits))),
             Err(e) => errno(&e),
         },
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the reference model's own directory flush; the test compares results, not tiers"
-        )]
-        Op::FsyncDir => unit(reference_open(root, true).and_then(|f| f.sync_all())),
         Op::ReadDir => match std::fs::read_dir(root) {
             Ok(entries) => {
                 let mut names = vec![".".to_string(), "..".to_string()];
@@ -535,7 +528,6 @@ fn renames_links_and_modes_agree() {
             Op::Chmod("third", 0o755),
             Op::Chmod("third", 0o600),
             Op::Chmod("missing", 0o600),
-            Op::FsyncDir,
         ],
     );
 }

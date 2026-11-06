@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Vocabulary mirror tests between `aterm-slog`, `aterm-phase`, and fabric grammar.
+//! Vocabulary mirror tests between `aterm-slog` and `aterm-phase`. The mail kinds, the inbox
+//! verdicts and the story verbs need none: `vocab` spells them from astream-wire's `WakeClass`
+//! and `ReceiptVerdict` and aterm-messages' `StoryVerb`.
 
 use aterm_phase::{ApiCause, PromptKind, WallKind as PhaseWall};
 use aterm_slog::vocab::{BOX_WORDS, WALL_WORDS};
@@ -36,6 +38,7 @@ fn prompt_kinds() -> Vec<PromptKind> {
         P::AutocompactOffer,
         P::McpServer,
         P::AutoModeSetup,
+        P::ConversationResume,
         P::ChromeIntro,
         P::Other,
     ];
@@ -67,6 +70,7 @@ fn prompt_kinds() -> Vec<PromptKind> {
             | P::AutocompactOffer
             | P::McpServer
             | P::AutoModeSetup
+            | P::ConversationResume
             | P::ChromeIntro
             | P::Other => {}
         }
@@ -148,20 +152,4 @@ fn vocab_mirrors_the_screen_reader() {
         Verdict::from_agent_word("wall:new-kind", None),
         Verdict::Unknown
     );
-}
-
-#[test]
-fn mail_story_and_verdict_words_mirror_the_fabric_and_the_story() {
-    use aterm_slog::vocab::{MAIL_KIND_WORDS, WORD_WORDS};
-    for k in aterm_types::fabric_grammar::KINDS {
-        assert!(MAIL_KIND_WORDS.contains(&k), "mail kind {k:?}");
-    }
-    for v in aterm_types::fabric_grammar::VERDICTS {
-        assert!(WORD_WORDS.contains(&v), "inbox verdict {v:?}");
-    }
-    for w in aterm_messages::presence::StoryVerb::TOLD_WORDS {
-        assert!(WORD_WORDS.contains(&w), "story verb {w:?}");
-    }
-    assert!(!aterm_types::fabric_grammar::is_kind("teleport"));
-    assert!(!MAIL_KIND_WORDS.contains(&"teleport"));
 }

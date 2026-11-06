@@ -32,7 +32,8 @@ aterm-tempfile = { workspace = true }
 aterm-durable = { workspace = true }
 aterm-alloc = { workspace = true }
 # The fabric's nine `in` kinds are astream-wire's `WakeClass` (`fabric_grammar::KINDS`,
-# `is_kind`): one list, astream's. astream-wire has no dependencies and no platform
+# `is_kind`) and its three receipt verdicts are `ReceiptVerdict` (`VERDICTS`,
+# `is_verdict`): one list each, astream's. astream-wire has no dependencies and no platform
 # code, and it is in this graph already through aterm-codec and aterm-hash.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash.

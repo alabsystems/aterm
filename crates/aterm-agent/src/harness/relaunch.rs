@@ -19,7 +19,7 @@ use super::upgrade_drive::{
     conversation_typed_by, credits_billed_for, cwd_of, earlier_tabs, exe_of,
     finished_where_written, first_word, foreground_shell, held, home_carried, host_roster, ids,
     is_our_ancestor, kept_move, kernel_start, launch_kept, ledger, left_to_person, line_model_of,
-    live_background, load, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
+    live_background, load_record, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
     process_in_tab, read_upgrade_dir, record_asked, restart_models, restore, roster, said, save,
     save_checked, screen, since, squash, sweep_lock, table, tail_to_end, take_back_ask, terminate,
     turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
@@ -4551,16 +4551,24 @@ fn claim_of(
     report: &Report,
     met: Met,
 ) -> RestartClaim {
-    let live = || load(opts, &report.session).filter(|st| its_own(why, ask, st) && claim_live(st));
+    let live = || {
+        load_record(opts, &report.session)
+            .map(|record| record.filter(|st| its_own(why, ask, st) && claim_live(st)))
+    };
     match met {
         Met::Unread => RestartClaim::Unread,
         Met::Stood => RestartClaim::Unclaimed,
         Met::Made => RestartClaim::Held,
-        Met::Carried if live().is_some() => RestartClaim::Held,
-        Met::Claiming(prior) if live().is_some_and(|st| prior.as_deref() != Some(&st)) => {
-            RestartClaim::Taken
-        }
-        Met::Carried | Met::Claiming(_) => RestartClaim::Unclaimed,
+        Met::Carried => match live() {
+            Err(_) => RestartClaim::Unread,
+            Ok(Some(_)) => RestartClaim::Held,
+            Ok(None) => RestartClaim::Unclaimed,
+        },
+        Met::Claiming(prior) => match live() {
+            Err(_) => RestartClaim::Unread,
+            Ok(Some(st)) if prior.as_deref() != Some(&st) => RestartClaim::Taken,
+            Ok(_) => RestartClaim::Unclaimed,
+        },
     }
 }
 
@@ -4673,7 +4681,15 @@ fn restart_locked(
     r.session.clone_from(&session);
     r.from.clone_from(&sf.version);
     r.to = format!("{}(same)", sf.version);
-    let prior = load(opts, &session);
+    let prior = match load_record(opts, &session) {
+        Ok(record) => record,
+        Err(_) => {
+            return said(
+                r,
+                format!("wait:{}", super::upgrade_drive::UNREAD_SAVED_RECORD),
+            );
+        }
+    };
     *met = Met::Stood;
     if let Some(st) = prior.clone().filter(St::in_flight) {
         if st.native_retired_unissued {
@@ -4890,7 +4906,16 @@ fn restart_locked(
             if st.native_prepare.is_empty()
                 || super::native_restart::abort(opts, &session, &mut c, &tab, &mut st)
             {
-                restore(opts, &session, prior.as_ref());
+                if super::native_restart::coordinated(&st) {
+                    let _ = super::native_record::restore_inactive(
+                        opts,
+                        &session,
+                        &mut st,
+                        prior.as_ref(),
+                    );
+                } else {
+                    restore(opts, &session, prior.as_ref());
+                }
             } else {
                 save(opts, &session, &st);
             }
@@ -4911,7 +4936,8 @@ fn restart_locked(
                 || records.unique_owner(&sf).is_err())
         {
             if super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
-                restore(opts, &session, prior.as_ref());
+                let _ =
+                    super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
             } else {
                 save(opts, &session, &st);
             }
@@ -4935,11 +4961,31 @@ fn restart_locked(
                     save(opts, &session, &st);
                     break 'signal Some(said(r.clone(), format!("wait:signal-{no}")));
                 }
-                restore(opts, &session, prior.as_ref());
+                if super::native_restart::coordinated(&st) {
+                    let _ = super::native_record::restore_inactive(
+                        opts,
+                        &session,
+                        &mut st,
+                        prior.as_ref(),
+                    );
+                } else {
+                    restore(opts, &session, prior.as_ref());
+                }
                 Some(said(r.clone(), format!("wait:signal-{no}")))
             }
             Terminated::Failed => {
-                restore(opts, &session, prior.as_ref());
+                if st.native.is_some() || !st.native_prepare.is_empty() {
+                    save(opts, &session, &st);
+                } else if super::native_restart::coordinated(&st) {
+                    let _ = super::native_record::restore_inactive(
+                        opts,
+                        &session,
+                        &mut st,
+                        prior.as_ref(),
+                    );
+                } else {
+                    restore(opts, &session, prior.as_ref());
+                }
                 Some(said(r.clone(), "failed:signal-refused"))
             }
         }
@@ -6300,15 +6346,25 @@ fn after_exit_as(
         .map(|sf| sf.cwd.clone())
         .filter(|c| !c.is_empty())
         .unwrap_or_else(|| snap.cwd.clone());
+    let prior = match load_record(opts, &session) {
+        Ok(record) => record,
+        Err(_) => {
+            return said(
+                r,
+                format!("wait:{}", super::upgrade_drive::UNREAD_SAVED_RECORD),
+            );
+        }
+    };
     if cause != ExitCause::HostEnded
-        && let Some(st) = load(opts, &session)
+        && let Some(st) = prior
+            .clone()
             .filter(|st| ended_by_restart(st, upgrade::Agent::Claude, &snap.tab, snap.pid, now_s()))
     {
         r.to = format!("{}({})", st.to, st.source);
         return carry_own(opts, r, st, &session, &snap.tab);
     }
     let mut relaunched_before = false;
-    if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
+    if let Some(mut st) = prior.filter(St::in_flight) {
         if st.native_retired_unissued {
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
         }
@@ -6387,7 +6443,15 @@ fn after_exit_as(
     } else {
         Vec::new()
     };
-    let prior = load(opts, &session);
+    let prior = match load_record(opts, &session) {
+        Ok(record) => record,
+        Err(_) => {
+            return said(
+                r,
+                format!("wait:{}", super::upgrade_drive::UNREAD_SAVED_RECORD),
+            );
+        }
+    };
     let now = now_s();
     let held = |t: &upgrade::Candidate| {
         prior
@@ -6606,7 +6670,11 @@ pub(super) fn exit_fallback(
     riding: Option<&str>,
     hand: Option<&str>,
 ) -> Option<String> {
-    let origin = load(opts, session).as_ref().and_then(fallback_origin);
+    let origin = load_record(opts, session)
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(fallback_origin);
     fallback_carried(origin, riding, hand)
 }
 
@@ -6675,7 +6743,7 @@ fn record_where(opts: &Opts, ours: impl Fn(&St) -> bool) -> Option<(String, St)>
             return None;
         }
         let session = path.file_stem()?.to_string_lossy().into_owned();
-        let st = load(opts, &session)?;
+        let st = load_record(opts, &session).ok()??;
         ours(&st).then_some((session, st))
     })
 }
@@ -6816,7 +6884,7 @@ fn told_by_its_row(opts: &Opts, r: Report, session: &str) -> Report {
     let Some(why) = r.step.strip_prefix("refused:") else {
         return r;
     };
-    let raised = load(opts, session).is_some_and(|st| {
+    let raised = load_record(opts, session).ok().flatten().is_some_and(|st| {
         st.is_upgrade() && st.exited_at != 0 && matches!(st.phase, upgrade::Phase::Failed(_))
     });
     if raised {
@@ -6941,7 +7009,7 @@ pub fn moved_off(opts: &Opts, session: &str, at: Option<u64>, live: &Snapshot) -
                 st.moved_left_model.as_deref(),
             )
     };
-    let record = load(opts, session).is_some_and(|st| {
+    let record = load_record(opts, session).ok().flatten().is_some_and(|st| {
         let (login, left) = own_move_target(&st);
         let own = moves(&st.cause)
             && at.is_none_or(|at| st.relaunched_at == 0 || at <= st.relaunched_at)
@@ -6997,14 +7065,20 @@ pub(super) fn last_move_at(st: &St) -> u64 {
 /// Whether the agent a relaunch of conversation `session` in tab `tab` adopted is gone.
 #[must_use]
 pub fn adopted_gone(opts: &Opts, tab: &str, session: &str) -> Option<bool> {
-    let st = load(opts, session).filter(|st| st.in_flight() && st.tab == tab)?;
+    let st = load_record(opts, session)
+        .ok()
+        .flatten()
+        .filter(|st| st.in_flight() && st.tab == tab)?;
     (st.relaunched_pid != 0).then(|| st.relaunched_gone(alive))
 }
 
 /// Whether a relaunch of conversation `session` is in flight in tab `tab` ([`St::in_flight`]).
 #[must_use]
 pub fn in_flight_here(opts: &Opts, tab: &str, session: &str) -> bool {
-    load(opts, session).is_some_and(|st| st.in_flight() && st.tab == tab)
+    load_record(opts, session)
+        .ok()
+        .flatten()
+        .is_some_and(|st| st.in_flight() && st.tab == tab)
 }
 
 const fn carried_here(agent: upgrade::Agent) -> bool {
@@ -7064,7 +7138,7 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
             return None;
         }
         let session = path.file_stem()?.to_string_lossy().into_owned();
-        let st = load(opts, &session)?;
+        let st = load_record(opts, &session).ok()??;
         if st.native_retired_unissued {
             return None;
         }
@@ -7117,7 +7191,7 @@ pub fn agent_resumed(opts: &Opts, snap: &Snapshot) -> bool {
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             return false;
         };
-        let Some(st) = load(opts, &session) else {
+        let Ok(Some(st)) = load_record(opts, &session) else {
             return false;
         };
         record_resumed_snapshot(snap, &snap_start, snap_began, &session, &st)
@@ -7382,8 +7456,16 @@ pub const CARRIED_DONE: &str = "done:said-done";
 pub const CARRIED_HELD: &str = "done:replies-held";
 
 fn carried_done(opts: &Opts, r: Report, session: &str, (word, why): (&str, &str)) -> Report {
-    let Some(mut st) =
-        load(opts, session).filter(|st| matches!(st.phase, upgrade::Phase::Relaunched { .. }))
+    let record = match load_record(opts, session) {
+        Ok(record) => record,
+        Err(_) => {
+            return said(
+                r,
+                format!("wait:{}", super::upgrade_drive::UNREAD_SAVED_RECORD),
+            );
+        }
+    };
+    let Some(mut st) = record.filter(|st| matches!(st.phase, upgrade::Phase::Relaunched { .. }))
     else {
         return r;
     };

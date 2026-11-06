@@ -48,8 +48,13 @@ fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for (dir, targets) in &pkgs {
         let files = owned.get(dir.as_str()).map_or(&[][..], Vec::as_slice);
         let roots = pkg_roots(dir, targets, files);
-        all_reach.extend(reachable(tree.corpus, dir, &roots.all));
-        libtest_reach.extend(reachable(tree.corpus, dir, &roots.libtest));
+        let libtest = reachable(tree.corpus, dir, &roots.libtest);
+        if roots.all.len() == roots.libtest.len() {
+            all_reach.extend(libtest.iter().cloned());
+        } else {
+            all_reach.extend(reachable(tree.corpus, dir, &roots.all));
+        }
+        libtest_reach.extend(libtest);
     }
     for dir in pkgs.keys() {
         let files = owned.get(dir.as_str()).map_or(&[][..], Vec::as_slice);
@@ -104,15 +109,13 @@ fn load_packages(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, Ma
     pkgs
 }
 
-/// The deepest package directory in `dirs` containing `rel`.
+/// The deepest package directory in `dirs` (sorted lexicographically) containing `rel`.
 fn owner_dir<'a>(rel: &str, dirs: &[&'a str]) -> Option<&'a str> {
-    dirs.iter()
-        .copied()
-        .filter(|dir| {
-            rel.strip_prefix(dir)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
-        .max_by_key(|dir| dir.len())
+    let idx = dirs.partition_point(|&dir| dir < rel);
+    dirs[..idx].iter().rev().copied().find(|&dir| {
+        rel.strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// Declared and Cargo-discovered target roots for package `dir`.
@@ -142,17 +145,23 @@ fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> Pkg
     }
     for &file in files {
         let sub = &file.rel[dir.len() + 1..];
-        let parts: Vec<&str> = sub.split('/').collect();
-        if parts.as_slice() == ["build.rs"] {
+        if sub == "build.rs" {
             all.insert(file.rel.clone());
             continue;
         }
-        let (kind, default_libtest) = match parts.as_slice() {
-            ["src", "lib.rs"] if !has_lib => ("lib", true),
-            ["src", "main.rs"] | ["src", "bin", _] | ["src", "bin", _, "main.rs"] => ("bin", true),
-            ["tests", _] | ["tests", _, "main.rs"] => ("test", true),
-            ["benches", _] | ["benches", _, "main.rs"] => ("bench", false),
-            ["examples", _] | ["examples", _, "main.rs"] => ("example", false),
+        let mut it = sub.split('/');
+        let (kind, default_libtest) = match (it.next(), it.next(), it.next(), it.next(), it.next())
+        {
+            (Some("src"), Some("lib.rs"), None, None, None) if !has_lib => ("lib", true),
+            (Some("src"), Some("main.rs"), None, None, None)
+            | (Some("src"), Some("bin"), Some(_), None, None)
+            | (Some("src"), Some("bin"), Some(_), Some("main.rs"), None) => ("bin", true),
+            (Some("tests"), Some(_), None, None, None)
+            | (Some("tests"), Some(_), Some("main.rs"), None, None) => ("test", true),
+            (Some("benches"), Some(_), None, None, None)
+            | (Some("benches"), Some(_), Some("main.rs"), None, None) => ("bench", false),
+            (Some("examples"), Some(_), None, None, None)
+            | (Some("examples"), Some(_), Some("main.rs"), None, None) => ("example", false),
             _ => continue,
         };
         if !targets.undiscovered.contains(&kind) && !claimed.contains(&file.rel) {

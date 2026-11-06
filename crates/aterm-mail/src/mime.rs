@@ -45,7 +45,7 @@ fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
                 value.push_str(line.trim());
             }
         } else if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+            headers.push((name.to_owned(), value.trim().to_owned()));
         }
     }
     (headers, body)
@@ -54,7 +54,7 @@ fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
 fn raw_header<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
     headers
         .iter()
-        .find(|(key, _)| key == name)
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map_or("", |(_, value)| value)
 }
 

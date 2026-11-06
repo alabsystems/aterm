@@ -273,6 +273,25 @@ fn check_world_socket_paths(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The world `instance` runs in: a fresh scratch one, or the kept one at `at`, laid out there with
+/// `config` when it is new. One laid out already keeps its own `aterm.toml`, so `configured` (a
+/// `--toml`, `--toml-after`, `--harness` or `--harness-key` given) is refused there, never dropped.
+fn instance_world(at: Option<&Path>, config: &str, configured: bool) -> Result<World, Fail> {
+    let Some(dir) = at else {
+        return Ok(World::new(config)?);
+    };
+    if !dir.exists() {
+        return Ok(World::create_at(dir, config)?);
+    }
+    if configured {
+        return Err(Fail::usage(
+            "instance: --world DIR, laid out already, keeps its own aterm.toml; it takes no \
+             --toml, --toml-after, --harness or --harness-key",
+        ));
+    }
+    Ok(World::open_at(dir)?)
+}
+
 /// A test's parent folder for [`World::create_at`], under `/tmp` so the world's socket paths fit
 /// `sun_path`: the targo shim runs tests with `TMPDIR` at `$TMPDIR/.ubd/`, a `/var/folders` path
 /// that leaves them too long.
@@ -309,6 +328,31 @@ mod prepared_world_tests {
         assert!(!long.exists());
         drop(reopened);
         assert!(identity.exists());
+    }
+
+    /// A WORLD LAID OUT ALREADY REFUSES A CONFIGURATION IT WOULD DROP: `instance --world DIR` on
+    /// a world an earlier run laid out keeps that world's `aterm.toml`, so a `--toml`,
+    /// `--toml-after`, `--harness` or `--harness-key` given with it is refused, never dropped
+    /// without a word, and the world reopens as it is with none. NEGATIVE CONTROL: reopen the
+    /// world whatever is configured, and the configured run is not refused.
+    #[test]
+    fn a_laid_out_world_refuses_a_configuration_it_would_drop() {
+        let parent = world_parent();
+        let root = parent.path().join("world");
+        let config = World::create_at(&root, CONFIG_OFF)
+            .unwrap()
+            .cfg
+            .join("aterm/aterm.toml");
+        let original = std::fs::read(&config).unwrap();
+        let refused = super::instance_world(Some(&root), "x = 1", true).err();
+        assert_eq!(
+            refused.map(|fail| fail.code),
+            Some(2),
+            "a configuration the world would drop is a usage error"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        let reopened = super::instance_world(Some(&root), CONFIG_OFF, false).expect("reopened");
+        assert_eq!(reopened.cfg.join("aterm/aterm.toml"), config);
     }
 
     #[cfg(unix)]
@@ -1168,13 +1212,17 @@ impl Instance {
     }
 
     /// Cut the lifeline and record one bounded stop attempt for the original process/job.
-    /// Repeated calls, including Drop, return the recorded result without another timeout.
+    /// The signal that stops a run asks for this, so the attempt waits through it
+    /// ([`stop::Grace`]). Repeated calls, including Drop, return the recorded result without
+    /// another timeout.
     /// # Errors
     /// The child cannot be reaped, the job registration/absence is unknown, an operation
-    /// fails or is interrupted, or the common one-minute deadline expires (native helper
-    /// termination/reap has its separate finite grace). Failure retains this Instance's
-    /// custody while borrowed and keeps its private World and immutable diagnostics.
+    /// fails or a second signal cuts it short, or the common one-minute deadline expires
+    /// (native helper termination/reap has its separate finite grace); the error then says
+    /// whether the instance's processes still run ([`standing`]). Failure retains this
+    /// Instance's custody while borrowed and keeps its private World and immutable diagnostics.
     pub fn stop(&mut self) -> Result<(), String> {
+        let _grace = stop::grace();
         if self.kept && self.gui.is_none() {
             self.gui = self.aterm_pid().and_then(aterm_uds::process::read_identity);
         }
@@ -1186,8 +1234,34 @@ impl Instance {
                 self.kept,
                 self.gui,
             )
+            .map_err(|why| format!("{why}; {}", standing(self.pid, self.kept, self.gui)))
         })
     }
+}
+
+/// What the kernel says now of an instance whose stop did not establish its end: its process
+/// and, for a windowed one (`kept`), whose process is its keeper, its aterm (`gui`).
+fn standing(pid: i32, kept: bool, gui: Option<aterm_uds::process::Identity>) -> String {
+    use aterm_uds::process::{ProcessPresence, process_presence};
+    let one = |what: &str, pid: i32| match process_presence(pid) {
+        ProcessPresence::Present => format!("{what} pid {pid} still runs"),
+        ProcessPresence::Exited => format!("{what} pid {pid} has exited, not yet reaped"),
+        ProcessPresence::Absent => format!("{what} pid {pid} has ended"),
+        ProcessPresence::Unknown => format!("{what} pid {pid} is neither seen nor seen gone"),
+    };
+    if !kept {
+        return one("the instance's", pid);
+    }
+    let keeper = one("its keeper's", pid);
+    match gui {
+        Some(gui) => format!("{keeper}, {}", one("its aterm's", gui.pid)),
+        None => format!("{keeper}, its aterm's pid was never read"),
+    }
+}
+
+/// A cleanup wait's error once a second signal cut it short ([`stop::Grace`]).
+fn cut_short(phase: &'static str) -> impl Fn(Stopped) -> String {
+    move |Stopped(sig)| format!("signal {sig} cut the {phase} short")
 }
 
 fn stop_process(
@@ -1206,8 +1280,7 @@ fn stop_process(
         job.cut();
         let grace = (Instant::now() + Duration::from_secs(8)).min(deadline);
         while Instant::now() < grace && job.running() {
-            stop::sleep(Duration::from_millis(20))
-                .map_err(|why| format!("interrupted during job lifeline grace: {why:?}"))?;
+            stop::sleep(Duration::from_millis(20)).map_err(cut_short("job lifeline grace"))?;
         }
         job.remove_until(deadline).map_err(|why| why.to_string())?;
         loop {
@@ -1221,8 +1294,7 @@ fn stop_process(
             if Instant::now() >= deadline {
                 return Err("one-minute hang detector: original job native absence".into());
             }
-            stop::sleep(Duration::from_millis(20))
-                .map_err(|why| format!("interrupted during job native absence: {why:?}"))?;
+            stop::sleep(Duration::from_millis(20)).map_err(cut_short("job's native absence"))?;
         }
     }
     let Proc::Child(child) = child else {
@@ -1241,8 +1313,7 @@ fn stop_process(
             if Instant::now() >= until {
                 break;
             }
-            stop::sleep(Duration::from_millis(20))
-                .map_err(|why| format!("interrupted during child grace: {why:?}"))?;
+            stop::sleep(Duration::from_millis(20)).map_err(cut_short("child grace"))?;
         }
         if let Err(error) = crate::sys::kill_group(pid, signal) {
             if child.try_wait().map_err(|why| why.to_string())?.is_some() {
@@ -1262,8 +1333,7 @@ fn stop_process(
         if Instant::now() >= deadline {
             return Err("one-minute hang detector: original child reap".into());
         }
-        stop::sleep(Duration::from_millis(20))
-            .map_err(|why| format!("interrupted during child reap: {why:?}"))?;
+        stop::sleep(Duration::from_millis(20)).map_err(cut_short("child reap"))?;
     }
 }
 
@@ -1314,8 +1384,7 @@ fn wait_gui_absent(
                 "one-minute hang detector: original GUI native absence after keeper closure".into(),
             );
         }
-        stop::sleep(Duration::from_millis(20))
-            .map_err(|why| format!("interrupted during GUI native absence: {why:?}"))?;
+        stop::sleep(Duration::from_millis(20)).map_err(cut_short("GUI's native absence"))?;
     }
 }
 
@@ -1427,6 +1496,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let pre = take_values(&mut a, "--pre")?;
     let post = take_values(&mut a, "--post")?;
     let keep = take_flag(&mut a, "--keep");
+    let at = take_value(&mut a, "--world")?.map(|p| from_caller(&p));
     let window = take_flag(&mut a, "--window");
     let band = Band::pick(take_value(&mut a, "--band")?.as_deref())?;
     let cold = match take_value(&mut a, "--pages")?.as_deref() {
@@ -1448,6 +1518,12 @@ pub fn cmd_instance(args: &[String]) -> Res {
             "instance: --reroute-prefix DIR makes DIR the HOME; it takes no --home",
         ));
     }
+    if at.is_some() && (home.is_some() || reroute.is_some() || keep) {
+        return Err(Fail::usage(
+            "instance: --world DIR is kept and keeps its own HOME; it takes no --home, \
+             --reroute-prefix or --keep",
+        ));
+    }
     if !post.is_empty() && image.is_none() {
         return Err(Fail::usage(
             "instance: --post runs after --image's frame; drive a held instance with `aterm ctl` instead",
@@ -1455,7 +1531,13 @@ pub fn cmd_instance(args: &[String]) -> Res {
     }
     let aterm = resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
     let config = config_after(&config_with(&toml), harness, &toml_after);
-    let mut world = World::new(&with_harness_keys(&config, &harness_keys))?;
+    let configured =
+        !toml.is_empty() || !toml_after.is_empty() || harness || !harness_keys.is_empty();
+    let mut world = instance_world(
+        at.as_deref().map(Path::new),
+        &with_harness_keys(&config, &harness_keys),
+        configured,
+    )?;
     if keep {
         world.keep();
     }
@@ -1591,17 +1673,18 @@ pub fn cmd_instance(args: &[String]) -> Res {
     });
     println!(
         "instance pid={} sock={} build={build} band={} coalition={coalition} role={role} main_pri={main_pri}{kept}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
-         world:    {}{}\n  it ends when this command does (Ctrl-C, SIGTERM)",
+         world:    {}{}\n  it ends when this command does: Ctrl-C or SIGTERM ends it and waits for its end \
+         (a second signal cuts that wait short)",
         inst.pid,
         inst.sock.display(),
         band.name(),
         inst.aterm.display(),
         inst.sock.display(),
         world.dir.display(),
-        if keep {
+        if world.keep {
             " (kept)"
         } else {
-            " (removed at the end)"
+            " (removed once the instance has ended)"
         }
     );
     loop {
@@ -1612,8 +1695,17 @@ pub fn cmd_instance(args: &[String]) -> Res {
             )));
         }
         if let Err(Stopped(sig)) = stop::sleep(Duration::from_millis(500)) {
-            println!("instance: ended (signal {sig})");
-            return Ok(0);
+            // The signal asks for the instance's end: end it, wait for that end under the
+            // stop's own bounds, and say what came of it.
+            return match inst.stop() {
+                Ok(()) => {
+                    println!("instance: ended (signal {sig})");
+                    Ok(0)
+                }
+                Err(why) => Err(Fail::die(format!(
+                    "instance: signal {sig}, and its end is not established: {why}"
+                ))),
+            };
         }
     }
 }
@@ -1807,8 +1899,9 @@ pub(crate) fn await_band(inst: &Instance) -> Result<(), Fail> {
                 rows.first()
             )));
         }
-        stop::sleep(Duration::from_millis(100))
-            .map_err(|Stopped(sig)| Fail::die(format!("instance: ended (signal {sig})")))?;
+        stop::sleep(Duration::from_millis(100)).map_err(|Stopped(sig)| {
+            Fail::die(format!("instance: signal {sig} before the band settled"))
+        })?;
     }
 }
 

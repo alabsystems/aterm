@@ -64,14 +64,13 @@ impl Request {
     /// Stable across day-table retransmission and issuer restarts. A changed
     /// local nonce cannot reuse the same root decision's single-use authority.
     pub fn issue_nonce(&self) -> [u8; 16] {
-        let mut bytes = DOMAIN.to_vec();
-        bytes.extend_from_slice(&self.requester.actor());
-        bytes.extend_from_slice(&self.account);
-        bytes.extend_from_slice(&self.decision);
-        bytes.extend_from_slice(&self.attempt);
-        Sha256::digest(&bytes)[..16]
-            .try_into()
-            .expect("fixed digest width")
+        let mut sha = Sha256::new();
+        sha.update(DOMAIN);
+        sha.update(self.requester.actor());
+        sha.update(self.account);
+        sha.update(self.decision);
+        sha.update(self.attempt);
+        sha.finalize()[..16].try_into().expect("fixed digest width")
     }
 }
 
@@ -243,32 +242,36 @@ impl Recovery {
             require_time(deadline)?;
             for (operation, command) in log.eligible() {
                 let actor = operation.header.actor;
-                let Ok(requester) = session.peer_writer(actor) else {
+                let Ok((key, account, decision, attempt, record_period)) = body(&command) else {
                     continue;
                 };
-                let Ok((key, body)) = body(&command) else {
-                    continue;
-                };
-                if key != aterm_codec::hex::encode_lower(&Sha256::digest(actor))
-                    || body["period"].as_u64() != Some(period)
-                {
+                if key != Sha256::digest(actor) || record_period != period {
                     continue;
                 }
-                let request = Request {
-                    account: digest(&body["account"])?,
-                    decision: digest(&body["decision"])?,
-                    attempt: digest(&body["attempt"])?,
-                    requester,
-                };
                 let rank = (period, operation.header.sequence);
                 let key = DecisionKey {
                     writer: actor,
-                    account: request.account,
-                    decision: request.decision,
+                    account,
+                    decision,
                 };
-                if latest.get(&key).is_none_or(|(old, _)| *old < rank) {
-                    latest.insert(key, (rank, request));
+                if latest.get(&key).is_some_and(|(old, _)| *old >= rank) {
+                    continue;
                 }
+                let Ok(requester) = session.peer_writer(actor) else {
+                    continue;
+                };
+                latest.insert(
+                    key,
+                    (
+                        rank,
+                        Request {
+                            account,
+                            decision,
+                            attempt,
+                            requester,
+                        },
+                    ),
+                );
             }
         }
         Ok(latest.into_values().map(|(_, request)| request).collect())
@@ -317,13 +320,12 @@ fn command_key(
     let body = json!({"account":aterm_codec::hex::encode_lower(&account),
         "decision":aterm_codec::hex::encode_lower(&decision),
         "attempt":aterm_codec::hex::encode_lower(&attempt),"period":period});
-    let mut input = DOMAIN.to_vec();
-    input.extend_from_slice(&key);
-    input.extend_from_slice(&aterm_json::to_vec(&body).expect("fixed scalar recovery body"));
+    let mut sha = Sha256::new();
+    sha.update(DOMAIN);
+    sha.update(key);
+    sha.update(aterm_json::to_vec(&body).expect("fixed scalar recovery body"));
     Command::Write {
-        request: Sha256::digest(&input)[..16]
-            .try_into()
-            .expect("fixed digest width"),
+        request: sha.finalize()[..16].try_into().expect("fixed digest width"),
         changes: vec![Change {
             collection: COLLECTION.into(),
             key: aterm_codec::hex::encode_lower(&key),
@@ -343,7 +345,7 @@ fn digest<const N: usize>(value: &Value) -> Result<[u8; N]> {
     Ok(digest)
 }
 
-fn body(command: &Command) -> Result<(&str, &Value)> {
+fn body(command: &Command) -> Result<(Digest, Digest, Digest, [u8; 16], u64)> {
     let Command::Write { changes, .. } = command else {
         return Err(Error::new("recovery request is not a write"));
     };
@@ -358,19 +360,21 @@ fn body(command: &Command) -> Result<(&str, &Value)> {
     let object = value
         .as_object()
         .ok_or_else(|| Error::new("invalid recovery body"))?;
+    let Some(period) = value["period"].as_u64() else {
+        return Err(Error::new("invalid recovery body"));
+    };
     if object.len() != 4
         || object
             .keys()
             .any(|key| !["account", "decision", "attempt", "period"].contains(&key.as_str()))
-        || value["period"].as_u64().is_none()
     {
         return Err(Error::new("invalid recovery body"));
     }
-    digest::<32>(&value["account"])?;
-    digest::<32>(&value["decision"])?;
-    digest::<16>(&value["attempt"])?;
-    crate::database::decode_hex::<32>(&change.key)?;
-    Ok((&change.key, value))
+    let account = digest::<32>(&value["account"])?;
+    let decision = digest::<32>(&value["decision"])?;
+    let attempt = digest::<16>(&value["attempt"])?;
+    let key = crate::database::decode_hex::<32>(&change.key)?;
+    Ok((key, account, decision, attempt, period))
 }
 
 fn decode(payload: &[u8]) -> Result<Command> {
@@ -381,15 +385,8 @@ fn decode(payload: &[u8]) -> Result<Command> {
     if command.encode()? != payload {
         return Err(Error::new("recovery request is not canonical"));
     }
-    let (key, value) = body(&command)?;
-    if command_key(
-        crate::database::decode_hex::<32>(key)?,
-        digest(&value["account"])?,
-        digest(&value["decision"])?,
-        digest(&value["attempt"])?,
-        value["period"].as_u64().unwrap(),
-    ) != command
-    {
+    let (key, account, decision, attempt, period) = body(&command)?;
+    if command_key(key, account, decision, attempt, period) != command {
         return Err(Error::new("recovery retry identity differs from its body"));
     }
     Ok(command)

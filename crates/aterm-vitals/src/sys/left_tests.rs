@@ -102,6 +102,8 @@ pub(crate) fn view_fixture() -> LeftView {
             closed_ms: 1_792_185_000_000,
             agent_spans: Vec::new(),
             left: 1,
+            restored: false,
+            told: false,
         }],
         live: Vec::new(),
         complete: true,

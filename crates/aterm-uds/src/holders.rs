@@ -3332,7 +3332,7 @@ mod tests {
             .is_none_or(|info| info.pbsi_uid == me)
         {
             assert!(started.elapsed() < HANG, "top never ran as its owner");
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         let key = file_key(&sought);
         let read = super::read_table(pid, &[key], Lookup::BY_FILE);
@@ -3371,7 +3371,7 @@ mod tests {
         let started = Instant::now();
         while super::read_table(pid, &[file_key(&held)], Lookup::BY_FILE) != [TableRead::Holds] {
             assert!(started.elapsed() < HANG, "the child never showed the file");
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         let key = file_key(&sought);
         // "Nothing described" refuses every number up to 255, far past any the child holds, not
@@ -3468,7 +3468,7 @@ mod tests {
                 started.elapsed() < HANG,
                 "the child never showed the device"
             );
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         (child, rdev)
     }
@@ -3482,7 +3482,7 @@ mod tests {
         let started = Instant::now();
         while watch.exit_status().is_none() {
             assert!(started.elapsed() < HANG, "the child never exited");
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
     }
 
@@ -3548,7 +3548,7 @@ mod tests {
                 started.elapsed().as_secs() < 60,
                 "the child never showed the device"
             );
-            std::thread::yield_now();
+            crate::deadline::poll_yield();
         }
         let scan = super::scan_rdev_holders(rdev, &[]).expect("scan");
         assert!(scan.holds(child.id()), "{scan:?}");

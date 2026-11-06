@@ -35,11 +35,13 @@ pub const MAX_KEYED_RECORDS: usize = 12_288;
 /// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §8, "The 8,500 stop"): the ranked tender's re-key
 /// of an audience that no held `Remove` made due (a coalesce of concurrent heads after no
 /// removal, an F21 reseal's re-`Put`s) is not signed where the log's keyed records and the
-/// batch's planned ones together would pass it, and stays due. A heal, a person's act and every
-/// batch a held `Remove` made due never wait: writers wait on those (one-mesh M4), and their room
+/// batch's planned ones together would pass it, or where it would take the room the re-keys a
+/// held `Remove` made due still owe, and stays due. A heal, a person's act and every batch a held
+/// `Remove` made due never wait on the stop: writers wait on those (one-mesh M4), and their room
 /// is kept instead, as each way a person removes a Mac (`members remove`, `secrets revoke`, a
-/// `code-only` line) refuses up front where its own batch and the worst-case re-keys it makes
-/// due would pass [`MAX_KEYED_RECORDS`] (`client/remove.rs`'s `RemovalFill`), and a seat move is
+/// `code-only` line) refuses up front where its own batch and the worst case of every re-key owed
+/// after it would pass [`MAX_KEYED_RECORDS`] or the byte bound (`client/remove.rs`'s
+/// `RemovalFill`), a heal signs only the `Wrap`s that leave that room free, and a seat move is
 /// signed only below the proof-admission stop. The stop leaves 3,788 keyed records under that bound,
 /// about 57 removals' worth at the 66 records one costs once the fold lands; the proof-admission
 /// stop (`client/readmit.rs`'s `PROVEN_FILL` of the keyed budget, 9,216) lies between.
@@ -181,6 +183,21 @@ pub struct RecordBudgets {
 thread_local! {
     /// The budgets [`RecordBudgets::within`] set on this thread.
     static WITHIN: std::cell::Cell<Option<RecordBudgets>> = const { std::cell::Cell::new(None) };
+    /// The byte bound [`RecordBudgets::within_bytes`] set on this thread.
+    static WITHIN_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The wire bytes a [`Log`](super::Log)'s held records stay within ([`Budget::Bytes`]):
+/// [`MAX_RECORDS_STREAM`], the bound of every stream a member reads, or in a test or debug build
+/// the smaller one [`RecordBudgets::within_bytes`] set on this thread, so a test fills it with a
+/// few records.
+#[must_use]
+pub fn held_bytes_bound() -> usize {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(bytes) = WITHIN_BYTES.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    MAX_RECORDS_STREAM
 }
 
 impl RecordBudgets {
@@ -234,6 +251,30 @@ impl RecordBudgets {
         run()
     }
 
+    /// Run `run` with every [`Log`](super::Log) on this thread holding its records within
+    /// `bytes` wire bytes ([`held_bytes_bound`]) rather than [`MAX_RECORDS_STREAM`]: a test's
+    /// smaller byte bound, which a few large records fill. The bound before comes back when `run`
+    /// returns or unwinds.
+    ///
+    /// # Panics
+    /// `bytes` is larger than [`MAX_RECORDS_STREAM`].
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn within_bytes<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WITHIN_BYTES.with(|within| within.set(self.0));
+            }
+        }
+        assert!(
+            bytes <= MAX_RECORDS_STREAM,
+            "a test's byte bound stays within the production one"
+        );
+        let _restore = Restore(WITHIN_BYTES.with(|within| within.replace(Some(bytes))));
+        run()
+    }
+
     /// [`AUTOMATIC_KEYED_STOP`] scaled to this keyed budget as it is to [`MAX_KEYED_RECORDS`],
     /// rounded down: exactly 8,500 under [`RecordBudgets::PRODUCTION`], and the same share of a
     /// test's smaller budget ([`RecordBudgets::within`]), so the stop lies as far below the hard
@@ -260,9 +301,9 @@ impl RecordBudgets {
     }
 
     /// [`RecordBudgets::passed_by`], and [`Budget::Bytes`] where `held_bytes` and `more_bytes`
-    /// together pass [`MAX_RECORDS_STREAM`].
+    /// together pass [`held_bytes_bound`] ([`MAX_RECORDS_STREAM`]).
     #[must_use]
-    pub const fn passed_with_bytes(
+    pub fn passed_with_bytes(
         self,
         held: RecordCounts,
         more: RecordCounts,
@@ -271,7 +312,7 @@ impl RecordBudgets {
     ) -> Option<Budget> {
         match self.passed_by(held, more) {
             Some(budget) => Some(budget),
-            None if held_bytes.saturating_add(more_bytes) > MAX_RECORDS_STREAM => {
+            None if held_bytes.saturating_add(more_bytes) > held_bytes_bound() => {
                 Some(Budget::Bytes)
             }
             None => None,

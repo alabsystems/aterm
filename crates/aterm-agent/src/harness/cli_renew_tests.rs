@@ -2127,6 +2127,94 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
 
 #[cfg(unix)]
 #[test]
+fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
+    use std::io::Write as _;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let gate = tmp.path().join("gate");
+    let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: c names a new FIFO in this test's private temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate)
+        .unwrap();
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.arg("-c").arg("printf 'opener-outcome=1\\nphase=failed\\nmet=bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7");
+    cmd.env("GATE", &gate);
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let answer = capture_unattended_renewal(cmd, std::time::Duration::from_secs(3600));
+        let _ = done.send(answer);
+    });
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    // Release our own blocked child cooperatively even on the old implementation.
+    writeln!(release, "finish").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(
+        returned,
+        "terminal opener failure held its capture until the provider budget"
+    );
+    let failure = answer.expect_err("a stopped capture is not a provider exit code");
+    assert_eq!(
+        failure.met.unwrap().word,
+        crate::harness::open_url::MetWord::BotCheck
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
+    use std::io::Write as _;
+    let (tmp, env) = renew_env("renew-terminal-opener");
+    let store = env.accounts_store();
+    std::fs::create_dir_all(
+        store
+            .dir
+            .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
+    )
+    .unwrap();
+    let program = tmp.path().join("bin").join("provider");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    let gate = program.parent().unwrap().join("gate");
+    let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: c names a new FIFO in this test's private temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate)
+        .unwrap();
+    aterm_tempfile::stand_in(&program, "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=failed\\nmet=browser-control\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nread answer < \"${0%/*}/gate\"\nexit 7\n").unwrap();
+    let before = logins_of(&env).get("work-2").cloned();
+    let worker_env = env.clone();
+    let host = NativeRenewal {
+        program,
+        user_home: env.home.clone().unwrap().into_os_string(),
+        within: std::time::Duration::from_secs(3600),
+    };
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let answer = acc(renew(&["work-2"], false, None), &worker_env, &host);
+        let _ = done.send(answer);
+    });
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    writeln!(release, "finish").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(returned, "the opener failure retained the sign-in lock");
+    assert_ne!(answer.0, exit(0));
+    assert!(store.signin_now().unwrap().is_some());
+    assert_eq!(logins_of(&env).get("work-2").cloned(), before);
+}
+
+#[cfg(unix)]
+#[test]
 fn an_unattended_renewal_timeout_releases_the_machine_signin_lock() {
     let (tmp, env) = renew_env("renew-unattended-timeout");
     let store = env.accounts_store();
@@ -2183,6 +2271,54 @@ fn an_unattended_renewal_timeout_releases_the_machine_signin_lock() {
     );
 }
 
+/// An unattended renewal whose provider waits for ever (Claude Code at its paste prompt) runs out
+/// at its bound and leaves nothing running: its run is an owned capture, so the provider gets
+/// `SIGTERM` first, by proof, and it and what it left in its group are gone, by pid and birth.
+#[cfg(unix)]
+#[test]
+fn an_unattended_renewal_that_runs_out_leaves_no_provider_running() {
+    use crate::harness::align;
+
+    let provider = align::owned_fixture::Provider::new("renewal-runs-out");
+    let home = provider.folder("state/accounts/logins/work-2+1");
+    align::settle_next_owned(provider.ready());
+    let failure = renew_flow_of(
+        provider.program().as_os_str(),
+        home.to_str().expect("a UTF-8 staging home"),
+        WORK,
+        &RenewBrowser::Remote { opener: None },
+        &|name| match name {
+            "HOME" => Some(home.as_os_str().to_owned()),
+            "USER" => Some("fixture-user".into()),
+            _ => None,
+        },
+        Some(std::time::Duration::from_millis(200)),
+    )
+    .expect_err("a provider that waits for ever fails its renewal");
+    assert!(
+        !align::next_owned_pending(),
+        "the renewal's provider run is not an owned capture: its settle was never taken"
+    );
+    let why = failure.to_string();
+    assert!(why.contains("deadline"), "{why}");
+    let [leader, member] = provider.said();
+    assert!(
+        provider.termed(),
+        "the renewal's provider (pid {}) got no SIGTERM before its group's kill",
+        leader.pid
+    );
+    assert!(
+        leader.gone_within_a_minute(),
+        "the renewal's provider (pid {}) ran on past its bound",
+        leader.pid
+    );
+    assert!(
+        member.gone_within_a_minute(),
+        "what the renewal's provider left in its group (pid {}) ran on past its bound",
+        member.pid
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries() {
@@ -2192,7 +2328,7 @@ fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries
         aterm_tempfile::stand_in(
             &program,
             &format!(
-                "#!/bin/sh\nprintf 'bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
+                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet=bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
             ),
         )
         .unwrap();
@@ -2271,7 +2407,7 @@ fn an_unattended_renewal_keeps_the_safe_browser_outcome_after_capture_fails() {
         let mut cmd = aterm_uds::spawnfd::Command::new("unused-provider");
         cmd.env(OUTCOME_ENV, &stale);
         let mut actual_path = None;
-        let failure = capture_unattended_renewal_with(cmd, |cmd| {
+        let failure = capture_unattended_renewal_with(cmd, |cmd, _| {
             let path = cmd
                 .get_envs()
                 .find(|(key, _)| *key == OUTCOME_ENV)
@@ -2279,7 +2415,11 @@ fn an_unattended_renewal_keeps_the_safe_browser_outcome_after_capture_fails() {
                 .map(PathBuf::from)
                 .expect("this attempt has its own outcome file");
             assert_ne!(path, stale);
-            std::fs::write(&path, text).unwrap();
+            std::fs::write(
+                &path,
+                format!("opener-outcome=1\nphase=continuing\nmet={text}"),
+            )
+            .unwrap();
             actual_path = Some(path);
             Err(reason.to_owned())
         })
@@ -2313,7 +2453,7 @@ fn an_unattended_provider_exit_keeps_its_browser_outcome() {
     let program = tmp.path().join("provider");
     aterm_tempfile::stand_in(
         &program,
-        "#!/bin/sh\nprintf 'block-page claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n",
+        "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet=block-page claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n",
     )
     .unwrap();
     let cmd = aterm_uds::spawnfd::Command::new(&program);

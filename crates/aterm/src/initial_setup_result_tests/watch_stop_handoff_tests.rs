@@ -414,7 +414,9 @@ fn watch_stop_handoff_late_identity_loss_never_targets_a_newer_explicit_choice()
     let current = setup.snapshot().unwrap().revision;
     assert_eq!(current, target + 1);
     // The writer whose publication went unidentified was let go with its look: the next look
-    // is a fresh one, which expands the new partial plan independently of the old Stop.
+    // is a fresh one, which preserves the new personal plan independently of the old Stop.
+    let chosen = setup.snapshot().unwrap();
+    assert!(!chosen.provisional);
     assert_eq!(
         look_setup_upgrade_with(
             &mut widened,
@@ -426,9 +428,9 @@ fn watch_stop_handoff_late_identity_loss_never_targets_a_newer_explicit_choice()
                 lose_publication: None,
             },
         ),
-        Ok(Some(current + 1))
+        Ok(None)
     );
-    let current = current + 1;
+    assert_eq!(setup.snapshot().unwrap().observation, chosen.observation);
     wait_until("the old evidence's Stop queue finishes", stop_worker_idle);
     let before = setup.snapshot().unwrap().observation;
     assert_eq!(setup.upgrade_outcome(None), Ok(None));

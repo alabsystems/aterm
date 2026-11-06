@@ -990,10 +990,13 @@ pub fn smoke(tools: &dyn Tools, root: &Path, home: &Path, tool: &str) -> Result<
             .run(&hidden(Run::new(&bin, [probe]).bounded(), root, home))
             .map_err(|e| Error::refused(format!("smoke FAIL — {tool}: {e}")))?;
         let text = ran.text();
-        if let Some(line) = text
-            .lines()
-            .find(|l| LOADER.iter().any(|w| l.to_ascii_lowercase().contains(w)))
-        {
+        if let Some(line) = text.lines().find(|l| {
+            LOADER.iter().any(|w| {
+                l.as_bytes()
+                    .windows(w.len())
+                    .any(|win| win.eq_ignore_ascii_case(w.as_bytes()))
+            })
+        }) {
             return Err(Error::refused(format!(
                 "smoke FAIL — {tool}: loader error on '{probe}': {}",
                 line.trim()

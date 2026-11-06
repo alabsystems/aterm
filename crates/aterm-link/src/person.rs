@@ -191,6 +191,12 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if let Act::Post { sid, node, .. } = &cmd.act {
+        if let Err(why) = carried_from_here(cfg, sid, node) {
+            eprintln!("aterm fabric {verb}: {why}");
+            return ExitCode::from(2);
+        }
+    }
     let caps = cmd.cap_files.join(" ");
     let done = match &cmd.act {
         Act::Halt(reason) => halt(cfg, cmd, &person, reason.as_deref()),
@@ -234,6 +240,44 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// With the mesh on (§11 C3), whether a person's post to `@<sid>@<node>` is carried: only to this
+/// Mac's own sessions. A Mac's mail push carries only the lanes its own node wrote
+/// ([`crate::federate::mail_lanes`]), and no peer's ring takes a person's lane, since a Mac that
+/// could write one could forge human mail. A post to another Mac's session would be taken here and
+/// never delivered, so it is refused before anything is written; so is one while this Mac's node
+/// key cannot be read, since then its node is not known.
+fn carried_from_here(cfg: &Config, sid: &str, node: &str) -> Result<(), String> {
+    let Some(mesh) = &cfg.mesh else {
+        return Ok(());
+    };
+    let to = format!("@{}@{}", safe(sid, 64), safe(node, 64));
+    let here = match crate::federate::node_of_key(&mesh.keys) {
+        Ok(Some(here)) => here,
+        Ok(None) => {
+            return Err(format!(
+                "{} holds no node key yet, so this Mac cannot tell whether {to} is one of its own \
+                 sessions; nothing was posted (`aterm node status` says whether the node service \
+                 runs)",
+                mesh.keys.display()
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "this Mac's node key in {} cannot be read ({e}), so it cannot tell whether {to} \
+                 is one of its own sessions; nothing was posted",
+                mesh.keys.display()
+            ))
+        }
+    };
+    if node == here {
+        return Ok(());
+    }
+    Err(format!(
+        "{to} is a session on another Mac (this one is {here}): a person's post is carried only \
+         to the sessions of the Mac it is written on, so post it on that Mac; nothing was posted"
+    ))
 }
 
 /// An inbox whose mail stdout refused (the reader went away, a full disk): nothing is marked
@@ -1177,6 +1221,7 @@ mod tests {
             presence: crate::presence::Mode::default(),
             receipts: true,
             log: crate::mirror::LogMode::Off,
+            mesh: None,
         }
     }
 
@@ -1755,6 +1800,61 @@ mod tests {
         for p in ["h-andrew", "a-svc"] {
             assert!(can(p, &format!("/f/f1/in/n-a/s-b/{p}/answer")), "{p} posts");
         }
+    }
+
+    /// §11 C3: with the mesh on, a person's post to another Mac's session is refused at the
+    /// door and writes nothing, since no push carries a person's lane; so is any post while this
+    /// Mac has no node key. One to this Mac's own session lands.
+    /// NEGATIVE CONTROL: the same post with the mesh off is written, where nothing carries it.
+    #[cfg(unix)]
+    #[test]
+    fn with_the_mesh_on_a_persons_post_to_another_mac_is_refused_before_anything_is_written() {
+        let (dir, _server, mut cfg, mut cmd) = guarded_person("h-andrew", false);
+        let keys = dir.path().join("keys");
+        aterm_uds::private_file::ensure_private_dir(&keys).unwrap();
+        let seed = format!("{}\n", aterm_codec::hex::encode_lower(&[5u8; 32]));
+        aterm_uds::private_file::write_private(
+            &keys,
+            crate::federate::NODE_KEY_FILE,
+            seed.as_bytes(),
+        )
+        .unwrap();
+        let here = crate::federate::node_of_key(&keys).unwrap().unwrap();
+        let there = "n-00000000000000ff";
+        assert_ne!(here, there);
+        // A reader of every lane, minted under the broker's secret: a person's ring reads its own.
+        let mut reader = astream_broker::Client::connect(dir.path().join("bus.sock")).unwrap();
+        let cap = astream_cap::mint(&[0x51; 32], "ro:/f/f/in/>").unwrap();
+        reader.attach(&cap.filter, &cap.tag).unwrap();
+        let mut held = || reader.fetch(0, "/f/f/in/>", 64).unwrap().0.len();
+        let to = |node: &str| Act::Post {
+            sid: "s-a".to_string(),
+            node: node.to_string(),
+            kind: "note".to_string(),
+            re: None,
+            text: "hi".to_string(),
+        };
+        let mesh = |keys: &std::path::Path| {
+            Some(crate::federate::MeshPaths {
+                keys: keys.to_path_buf(),
+                root: dir.path().to_path_buf(),
+            })
+        };
+        let mut posted = |cfg: &Config, act: Act| {
+            cmd.act = act;
+            main("post", &cmd, cfg)
+        };
+        cfg.mesh = mesh(&keys);
+        assert_eq!(posted(&cfg, to(there)), ExitCode::from(2), "another Mac");
+        assert_eq!(held(), 0, "a refused post writes nothing");
+        assert_eq!(posted(&cfg, to(&here)), ExitCode::SUCCESS, "this Mac");
+        assert_eq!(held(), 1);
+        cfg.mesh = mesh(&dir.path().join("no-key"));
+        assert_eq!(posted(&cfg, to(&here)), ExitCode::from(2), "no node key");
+        assert_eq!(held(), 1);
+        cfg.mesh = None;
+        assert_eq!(posted(&cfg, to(there)), ExitCode::SUCCESS, "the control");
+        assert_eq!(held(), 2, "with the mesh off the post is written");
     }
 
     #[test]

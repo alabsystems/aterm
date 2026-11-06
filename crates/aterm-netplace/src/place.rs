@@ -188,12 +188,16 @@ impl RouteFacts {
     #[must_use]
     pub fn on_link(&self, addr: IpAddr) -> bool {
         match addr {
-            IpAddr::V4(v4) => network_of(v4, self.prefix) == self.subnet().0,
+            IpAddr::V4(v4) => on_link_v4(self.address, self.prefix, v4),
             IpAddr::V6(v6) => v6
                 .to_ipv4_mapped()
-                .is_some_and(|v4| network_of(v4, self.prefix) == self.subnet().0),
+                .is_some_and(|v4| on_link_v4(self.address, self.prefix, v4)),
         }
     }
+}
+
+pub(crate) fn on_link_v4(local: Ipv4Addr, prefix: u8, peer: Ipv4Addr) -> bool {
+    network_of(peer, prefix) == network_of(local, prefix)
 }
 
 /// `addr` with its host bits past `prefix` cleared.

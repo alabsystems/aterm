@@ -305,7 +305,19 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
-        self.historical_binding(roster, actor).is_some()
+        if !self.history.borrow().contains_key(roster) {
+            let Ok(history) = self
+                .bootstrap
+                .historical(&self.journal, &self.access, *roster)
+            else {
+                return false;
+            };
+            self.history.borrow_mut().insert(*roster, history);
+        }
+        self.history.borrow()[roster]
+            .members()
+            .iter()
+            .any(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
     }
 
     /// The binding `actor` held as a Writer in the roster `roster`, the one a record names,
@@ -444,15 +456,22 @@ impl<'a> Session<'a> {
                 "Commons membership changed during writer observation",
             ));
         }
-        let members = self.access.members();
+        let roster = aterm_secrets::client::swarm_roster_until(
+            self.bootstrap.paths(),
+            crate::admission::deadline(),
+        )
+        .map_err(failure)?;
         Ok(self
-            .members()?
-            .into_iter()
-            .filter(|binding| {
-                members.iter().any(|member| {
-                    member.binding().actor() == binding.actor() && member.role() == Role::Writer
-                })
+            .access
+            .members()
+            .iter()
+            .filter(|member| {
+                member.role() == Role::Writer
+                    && !roster
+                        .as_ref()
+                        .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
             })
+            .map(|member| member.binding().clone())
             .collect())
     }
 
@@ -1075,24 +1094,26 @@ impl<'a> Session<'a> {
         let salt = crypto::random()?;
         wire.extend_from_slice(&salt);
         wire.extend_from_slice(&((payload.len() + 16) as u32).to_le_bytes());
-        let mut body = Zeroizing::new(Vec::with_capacity(payload.len() + 16));
-        body.extend_from_slice(payload);
-        self.access
+        let aad_end = wire.len();
+        wire.extend_from_slice(payload);
+        let (aad, in_out) = wire.split_at_mut(aad_end);
+        let tag = self
+            .access
             .with_key(&self.journal, |network_key| {
                 crypto::cipher(
                     &scope.key(self.access.basis(), self.epoch(), network_key),
                     &salt,
-                    &wire,
+                    aad,
                 )?
-                .seal_in_place_append_tag(
+                .seal_in_place_separate_tag(
                     aead::Nonce::assume_unique_for_key([0; 12]),
-                    aead::Aad::from(&wire),
-                    &mut *body,
+                    aead::Aad::from(&*aad),
+                    in_out,
                 )
                 .map_err(|_| Error::new("table encryption failed"))
             })
             .map_err(failure)??;
-        wire.extend_from_slice(&body);
+        wire.extend_from_slice(tag.as_ref());
         wire.extend_from_slice(
             &self
                 .bootstrap
@@ -1469,9 +1490,13 @@ pub(crate) fn binding_denied_in_roster(
     roster: &aterm_secrets::swarm_roster::SwarmRoster,
     binding: &aterm_secrets::commons::binding::Binding,
 ) -> bool {
-    if roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
-        || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
-        || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine()))
+    if roster.deny_nodes.is_empty() && roster.deny_labels.is_empty() {
+        return false;
+    }
+    if !roster.deny_nodes.is_empty()
+        && (roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine())))
     {
         return true;
     }

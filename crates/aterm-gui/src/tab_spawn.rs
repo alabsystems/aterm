@@ -1950,9 +1950,7 @@ impl App {
             return;
         }
         if let Some(tc) = &self.session_factory.terminal_config {
-            let mut term = crate::term_lock(&session.term);
-            term.apply_config(tc);
-            session.ctx.crash_journal.host_settings(&term, Some(tc));
+            crate::session_theme::install_session_config(session, &Arc::new(tc.clone()));
         }
     }
 

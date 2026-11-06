@@ -213,15 +213,6 @@ fn watch_spawn_recovery_stop_and_full_plans_create_no_extra_watch() {
         let before = h.setup.snapshot().unwrap().observation;
         with_setup_watch(true, || {}, |how| h.maintain(how));
         h.maintain(WatchMaintenance::Spawn);
-        if terminal == "person" {
-            assert_eq!(h.spawns.get(), 1);
-            assert_eq!(h.runs.get(), 1);
-            assert_eq!(
-                h.setup.snapshot().unwrap().plan.selection,
-                aterm_types::macos_setup::Selection::all()
-            );
-            continue;
-        }
         assert_eq!(h.spawns.get(), 0, "{terminal}");
         assert_eq!(h.inline.get(), 0, "{terminal}");
         assert_eq!(h.runs.get(), 0, "{terminal}");

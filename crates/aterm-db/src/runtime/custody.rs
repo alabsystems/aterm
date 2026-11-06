@@ -36,8 +36,17 @@ impl Custody {
             immutable,
             journal: journal.into(),
         };
-        custody.recheck()?;
+        custody.check_journal()?;
         Ok(custody)
+    }
+    fn check_journal(&self) -> Result<()> {
+        let dir = aterm_uds::private_file::JudgedDir::judge(&self.journal)
+            .map_err(|_| Error::new("Commons established history is missing or not private"))?;
+        for name in ["control.astream", "control.checkpoint"] {
+            dir.open(name)
+                .map_err(|_| Error::new("Commons established history is missing or not private"))?;
+        }
+        Ok(())
     }
     pub(super) fn recheck(&self) -> Result<()> {
         for (path, expected) in &self.immutable {
@@ -45,11 +54,7 @@ impl Custody {
                 return Err(Error::new("Commons immutable custody changed"));
             }
         }
-        for name in ["control.astream", "control.checkpoint"] {
-            aterm_uds::private_file::open_private(&self.journal, name)
-                .map_err(|_| Error::new("Commons established history is missing or not private"))?;
-        }
-        Ok(())
+        self.check_journal()
     }
 }
 

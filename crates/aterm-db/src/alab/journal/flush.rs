@@ -250,9 +250,12 @@ pub(crate) fn pass_with(
     if !off && let Some(held) = holdings() {
         book.hold(&held, now);
     }
-    let owed = !book.uses_due(n, period, now)?.is_empty()
-        || !book.places_due(n, period, now).is_empty()
-        || !book.relays_due(&heard_now, &me, n, period, now)?.is_empty();
+    let owed = !off
+        && outbox.is_empty()
+        && now >= book.flushed_at.saturating_add(book::ROUTINE_S)
+        && (!book.uses_due(n, period, now)?.is_empty()
+            || !book.places_due(n, period, now).is_empty()
+            || !book.relays_due(&heard_now, &me, n, period, now)?.is_empty());
     if !book.due(&outbox, owed, now, period, under, off) {
         book.checked_at = now;
         book.save(spool)?;
@@ -509,13 +512,10 @@ pub(crate) fn read_window(
             .heard
             .get(&machine)
             .is_some_and(|held| held.contains(&entry.n));
-        in_window
-            .entry(machine.clone())
-            .or_default()
-            .insert(entry.n);
         if !archived && !events.is_empty() {
-            batches.push((machine, entry.n, entry.period, events));
+            batches.push((machine.clone(), entry.n, entry.period, events));
         }
+        in_window.entry(machine).or_default().insert(entry.n);
     }
     for (key, row) in &uses.rows {
         if let Some(account) = key.split_once('.').and_then(|(pk, _)| Pk::new(pk)) {

@@ -715,6 +715,31 @@ pub enum StopForm {
     Spoken,
 }
 
+/// WHO DRIVES A TAB UNDER AN AUTOPILOT, AS ITS HOVER AND THE OVERVIEW SAY IT: aterm's harness,
+/// the head of [`driver_line`] (`driven by aterm (land: …)`). One source for the window that
+/// writes the line and the lab that reads it.
+pub const ATERM_DRIVES: &str = "driven by aterm";
+
+/// The same line's head on a tab whose codex-alab drives itself inside its own process, its own
+/// claim proven (`codex-alab autopilot (land: …)`).
+pub const CODEX_ALAB_DRIVES: &str = "codex-alab autopilot";
+
+/// THE DRIVER LINE: `head` ([`ATERM_DRIVES`] or [`CODEX_ALAB_DRIVES`]) and the Autopilot's words
+/// in brackets.
+#[must_use]
+pub fn driver_line(head: &str, autopilot: &str) -> String {
+    format!("{head} ({autopilot})")
+}
+
+/// Whether `line` is a [`driver_line`] under either head.
+#[must_use]
+pub fn is_driver_line(line: &str) -> bool {
+    [ATERM_DRIVES, CODEX_ALAB_DRIVES].into_iter().any(|head| {
+        line.strip_prefix(head)
+            .is_some_and(|rest| rest.starts_with(" ("))
+    })
+}
+
 /// A STOPPED AUTOPILOT, IN WORDS (§14.3): ONE function for every surface that says the stop —
 /// the chip's title and description, the state line, the hover and the Overview, a worker's tip —
 /// and for the lab that reads them. `switch`: the person's switch to Land would ask once more
@@ -762,6 +787,18 @@ impl std::fmt::Debug for OpenWord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The driver line the window writes under either head is the one the lab reads; a head
+    /// alone, a worker's line or a longer word is none.
+    #[test]
+    fn a_driver_line_under_either_head_reads_as_one() {
+        for head in [ATERM_DRIVES, CODEX_ALAB_DRIVES] {
+            assert!(is_driver_line(&driver_line(head, "land: not landed yet")));
+            assert!(!is_driver_line(head));
+        }
+        assert!(!is_driver_line("worker of manager"));
+        assert!(!is_driver_line("driven by atermx (land)"));
+    }
 
     /// `status held=` and the journal's ` held=` read back to the arm they print, `-` to none, and
     /// every form of the stop leads with the one stop word.

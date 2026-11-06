@@ -442,6 +442,7 @@ mod tests {
                     for_word: None,
                     wait: true,
                     read_only: false,
+                    secret: None,
                 },
                 real_uri: crate::control_edit::real_file_uri(&uri),
                 reply,

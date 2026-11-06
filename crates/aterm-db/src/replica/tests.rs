@@ -1785,7 +1785,12 @@ impl Read for LostReceipt {
 }
 impl Write for LostReceipt {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.receipt.as_ref().is_some_and(|id| bytes == id) {
+        // A receipt is one write: the record's id, then its verdict.
+        if self
+            .receipt
+            .as_ref()
+            .is_some_and(|id| bytes.starts_with(id))
+        {
             self.failed = true;
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost receipt"));
         }

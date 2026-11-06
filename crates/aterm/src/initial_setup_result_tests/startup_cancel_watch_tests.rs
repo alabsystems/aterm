@@ -239,12 +239,17 @@ fn startup_cancel_watch_an_older_cancel_of_a_staged_offer_cannot_run_on_a_late_s
         sent,
         |how| maintain(root.path(), &looks, how),
     );
-    let expanded = chosen.snapshot().unwrap();
-    assert_eq!(script().runs, [revision, expanded.revision]);
-    assert_eq!(expanded.plan.selection, Selection::all());
-    assert_eq!(expanded.plan.vault_url, plan.vault_url);
-    assert_eq!(looks.get(), 1, "resumed setup expands for fleet membership");
-    clear_setup_run(expanded.revision);
+    let resumed = chosen.snapshot().unwrap();
+    assert_eq!(script().runs, [revision]);
+    assert_eq!(resumed.revision, revision);
+    assert_eq!(resumed.plan, plan);
+    assert!(!resumed.provisional, "the later choice is the person's");
+    assert_eq!(
+        looks.get(),
+        0,
+        "fleet membership preserves the later choice"
+    );
+    clear_setup_run(revision);
 }
 
 /// An older aterm's Cancel holds until the person asks again: the launch that reads it offers

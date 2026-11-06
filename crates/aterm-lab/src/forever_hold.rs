@@ -12,7 +12,7 @@ use super::{
     worker_field,
 };
 use crate::util::one_line;
-use aterm_agent::harness::acts::{NOT_LANDED_YET, StopForm};
+use aterm_agent::harness::acts::{ATERM_DRIVES, NOT_LANDED_YET, StopForm, driver_line};
 use aterm_agent::harness::hold_said::{OPEN_IN_REPORT, WAITS_ON_YOU, quoted};
 
 /// How far before the land act's journal line a read may already show its
@@ -391,13 +391,13 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
     };
     let hover_reads = observed(&w.hover, &w.hover_reads, t1, until);
     // A stopped tab's hover and state line lead with the stop (3a), the hold's words behind it.
-    let hover_head = format!("driven by aterm (land: {}", want.head);
+    let hover_head = format!("{ATERM_DRIVES} (land: {}", want.head);
     let hovers: Vec<(i64, std::borrow::Cow<'_, str>)> = hover_reads
         .iter()
         .map(|(t, h)| (*t, unstopped(h, StopForm::Hover)))
         .filter(|(_, h)| {
-            h.starts_with(&format!("driven by aterm (land: {NOT_LANDED_YET}"))
-                || h.starts_with(&format!("driven by aterm (land: {WAITS_ON_YOU}"))
+            h.starts_with(&format!("{ATERM_DRIVES} (land: {NOT_LANDED_YET}"))
+                || h.starts_with(&format!("{ATERM_DRIVES} (land: {WAITS_ON_YOU}"))
         })
         .collect();
     let says =
@@ -419,7 +419,7 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         let stale = late.and_then(|late| {
             hover_reads
                 .iter()
-                .find(|(t, h)| *t >= late && *h == "driven by aterm (land)")
+                .find(|(t, h)| *t >= late && *h == driver_line(ATERM_DRIVES, "land"))
         });
         if hovers.is_empty()
             && let (Some(late), Some(_)) = (late, stale)

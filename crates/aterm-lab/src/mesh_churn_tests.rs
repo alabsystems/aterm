@@ -131,19 +131,50 @@ fn a_seed_repeats_its_plan() {
     assert_ne!(plan(30, 99), plan(30, 100));
 }
 
+/// The cut is at the `[everyone]` epoch wherever the batch rotates it, and stops short of the
+/// admin's `Wrap` of it.
+/// NEGATIVE CONTROLS: a cut at the batch's first `Epoch` (the lab's before) leaves the second
+/// case's ring epoch and half its `Wrap`s, and no `[everyone]` epoch at all (3, not 7); a cut
+/// that ignores the admin delivers its `Wrap` (4, not 3).
 #[test]
-fn a_kill_mid_batch_leaves_the_epoch_and_half_its_wraps() {
+fn a_kill_mid_batch_leaves_the_everyone_epoch_and_half_its_wraps() {
     use Kind::{Epoch, Put, Remove, Wrap};
-    let batch = [Remove, Epoch, Wrap, Wrap, Wrap, Wrap, Put, Epoch, Wrap];
-    assert_eq!(prefix_len(&batch), 4, "Remove, Epoch, two of four Wraps");
-    assert_eq!(prefix_len(&[Remove, Epoch, Wrap]), 2);
-    assert_eq!(prefix_len(&[Remove, Epoch]), 2);
+    let (e, ring) = ((Epoch, true), (Epoch, false));
+    let (r, w, p) = ((Remove, false), (Wrap, false), (Put, false));
     assert_eq!(
-        prefix_len(&[Remove, Put, Put, Put]),
-        2,
-        "no epoch: half the batch"
+        prefix_len(&[r, e, w, w, w, w, p, ring, w], None),
+        4,
+        "Remove, Epoch, two of four Wraps"
     );
-    assert_eq!(prefix_len(&[]), 0);
+    assert_eq!(
+        prefix_len(&[r, ring, w, w, e, w, w, w, w], None),
+        7,
+        "the ring epoch whole, then the [everyone] epoch and two of its four Wraps"
+    );
+    assert_eq!(
+        prefix_len(&[r, e, w, w, w, w], Some(3)),
+        3,
+        "short of the admin's Wrap, the second"
+    );
+    assert_eq!(
+        prefix_len(&[r, e, w, w, w, w], Some(5)),
+        4,
+        "an admin past the half changes nothing"
+    );
+    assert_eq!(
+        prefix_len(&[r, e, w, w], Some(0)),
+        3,
+        "a record before the epoch is no admin Wrap of it"
+    );
+    assert_eq!(prefix_len(&[r, e, w], None), 2);
+    assert_eq!(prefix_len(&[r, e], None), 2);
+    assert_eq!(
+        prefix_len(&[r, ring, w, w], None),
+        2,
+        "no [everyone] epoch: half the batch"
+    );
+    assert_eq!(prefix_len(&[r, p, p, p], None), 2);
+    assert_eq!(prefix_len(&[], None), 0);
 }
 
 #[test]
@@ -219,6 +250,11 @@ fn holding() -> Evidence {
     let mut gone = mac("m09");
     gone.current = false;
     let end = vec![mac("m01"), mac("m02"), gone];
+    // The prefix wrapped m01; m02 was in its gap, which a heal Wrap closed.
+    let (to_m01, to_m02) = (
+        end[0].recipient.expect("m01's recipient"),
+        end[1].recipient.expect("m02's recipient"),
+    );
     let wrote = |entry: &str, digest: [u8; 32], record: u8| Wrote {
         entry: entry.to_owned(),
         digest,
@@ -263,8 +299,27 @@ fn holding() -> Evidence {
             read: true,
             crossed: Vec::new(),
         },
+        partial: Partial {
+            epoch: Some(epoch),
+            delivered: [to_m01].into_iter().collect(),
+            reached_ms: 1_000,
+            heal_wraps: vec![(
+                "m01".to_owned(),
+                to_m02,
+                1_000 + client::SETTLE_GRACE_MS + 61_000,
+            )],
+            newer: Vec::new(),
+            read: true,
+        },
         control: None,
     }
+}
+
+/// `ev` with one more heal `Wrap` to m02, signed `after` milliseconds past its prefix's posting.
+fn healed_after(ev: &mut Evidence, after: u64) {
+    let at = ev.partial.reached_ms + after;
+    let to = ev.healed[1].recipient.expect("m02's recipient");
+    ev.partial.heal_wraps.push(("m01".to_owned(), to, at));
 }
 
 fn failing(ev: &Evidence) -> Vec<&'static str> {
@@ -299,9 +354,24 @@ fn each_check_fails_on_the_evidence_it_names() {
             ev.end.remove(1);
         }),
         (NEWEST_KEY, |ev| ev.healed[0].opens_newest = false),
+        (GAP_HEALED, |ev| ev.partial.heal_wraps.clear()),
+        (GAP_HEALED, |ev| ev.partial.delivered.clear()),
+        (GAP_HEALED, |ev| ev.partial.epoch = None),
+        (GAP_HEALED, |ev| {
+            ev.partial.newer = vec![("08080808 by m00".to_owned(), 0)];
+        }),
+        (GAP_HEALED, |ev| {
+            let to = ev.healed[0].recipient.expect("m01's recipient");
+            ev.partial.delivered = [to, recipient()].into_iter().collect();
+            ev.partial.heal_wraps[0].1 = to;
+        }),
         (VAULT_IN, |ev| ev.end[1].vault_state = "revoked".to_owned()),
         (WRAP_BOUND, |ev| {
             ev.most_wraps = (3, "epoch 09 to x".to_owned())
+        }),
+        (PREFIX_HELD, |ev| healed_after(ev, 12_300)),
+        (PREFIX_HELD, |ev| {
+            healed_after(ev, client::SETTLE_GRACE_MS - 1)
         }),
         (REMOVED_NO_KEY, |ev| {
             let r = ev.removed["m10"];
@@ -394,8 +464,10 @@ fn nothing_read_holds_nothing_and_judges_nothing() {
         SETTLED,
         FRONTIER,
         NEWEST_KEY,
+        GAP_HEALED,
         VAULT_IN,
         WRAP_BOUND,
+        PREFIX_HELD,
         REMOVED_NO_KEY,
         POST_CUTOFF_VOID,
         SEAT_VIEW,
@@ -411,13 +483,75 @@ fn nothing_read_holds_nothing_and_judges_nothing() {
     }
 }
 
+/// The heal is judged by the `Wrap`s that closed its gap, not by which epoch is newest once its
+/// wait ended: an epoch a writer mints after the heal's first `Wrap` (the admin's envelope
+/// mirror, once its own heal `Wrap` lets it open the partial epoch) supersedes the rest of the
+/// gap, and the remover, down, is no member the gap must reach.
+/// NEGATIVE CONTROLS: the same epoch minted before the heal's first `Wrap` covered the gap, and
+/// left-out members no heal `Wrap` reached with no newer epoch were skipped.
+#[test]
+fn a_heal_is_judged_by_its_wraps_not_by_the_newest_epoch() {
+    let mut ev = holding();
+    let first = ev.partial.heal_wraps[0].2;
+    ev.partial.delivered.clear();
+    ev.partial.newer = vec![("08080808 by m00".to_owned(), first + 5_000)];
+    assert!(
+        !failing(&ev).contains(&GAP_HEALED),
+        "an epoch after the heal's first Wrap supersedes the rest of its gap"
+    );
+    ev.partial.newer[0].1 = first - 1;
+    assert!(
+        failing(&ev).contains(&GAP_HEALED),
+        "CONTROL: an epoch before the heal's first Wrap covered the gap"
+    );
+    ev.partial.newer.clear();
+    assert!(
+        failing(&ev).contains(&GAP_HEALED),
+        "CONTROL: m01, left out, unhealed and superseded by nothing"
+    );
+    let mut down = holding();
+    down.partial.heal_wraps.clear();
+    down.healed[1].up = false;
+    let c = judge(&down).into_iter().find(|c| c.name == GAP_HEALED);
+    assert!(
+        c.is_some_and(|c| !c.ran),
+        "a member down at the heal is not in its gap, which leaves none here to judge"
+    );
+}
+
+/// A heal `Wrap` at the settle grace's end holds the prefix; the heal is judged by what it read
+/// once its wait ended, and the Wrap bound alone cannot tell a heal from the prefix apart.
+#[test]
+fn the_prefix_hold_reads_when_the_heal_signed() {
+    let mut ev = holding();
+    healed_after(&mut ev, client::SETTLE_GRACE_MS);
+    assert!(!failing(&ev).contains(&PREFIX_HELD), "at the grace's end");
+    let mut ev = holding();
+    healed_after(&mut ev, 2_000);
+    ev.most_wraps = (2, String::new());
+    let failed = failing(&ev);
+    assert!(
+        failed.contains(&PREFIX_HELD) && !failed.contains(&WRAP_BOUND),
+        "a heal from the prefix leaves two Wraps a gap, as one after the grace does: {failed:?}"
+    );
+    let mut ev = holding();
+    ev.partial.read = false;
+    for check in [GAP_HEALED, PREFIX_HELD] {
+        let c = judge(&ev).into_iter().find(|c| c.name == check);
+        assert!(
+            c.is_some_and(|c| !c.ran && !c.pass),
+            "{check} judged unread"
+        );
+    }
+}
+
 #[test]
 fn a_control_bites_only_on_its_evidence_in_a_sound_run() {
     let control = CONTROLS[1];
-    assert_eq!(control.breaks, WRAP_BOUND);
+    assert_eq!(control.breaks, PREFIX_HELD);
     let bitten = || {
         let mut ev = holding();
-        ev.most_wraps = (4, String::new());
+        healed_after(&mut ev, 5_000);
         ev
     };
     assert!(
@@ -429,7 +563,7 @@ fn a_control_bites_only_on_its_evidence_in_a_sound_run() {
     type Spoil = fn(&mut Evidence);
     let spoiled: [(&str, Spoil); 4] = [
         ("its check failed for want of evidence", |ev| {
-            ev.wrap_histogram.clear();
+            ev.partial.heal_wraps.clear();
         }),
         ("an act did not run", |ev| ev.steps[0].ok = false),
         ("the split did not hold", |ev| {

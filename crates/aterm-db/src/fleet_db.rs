@@ -106,8 +106,8 @@ fn read_fleet_secret(candidates: &[PathBuf]) -> Result<Vec<u8>> {
             }
         }
         // Keep every read failure after observed existence bound to this candidate.
-        let mut bytes = match private_file::read_private(dir, "fleet.key", 65) {
-            Ok(bytes) => bytes,
+        let bytes = match private_file::read_private(dir, "fleet.key", 65) {
+            Ok(bytes) => Zeroizing::new(bytes),
             Err(error) => {
                 return Err(Error::new(&format!(
                     "cannot read provisioned fleet key: {error}"
@@ -115,14 +115,11 @@ fn read_fleet_secret(candidates: &[PathBuf]) -> Result<Vec<u8>> {
             }
         };
         if let Err(error) = aterm_net::fleet::parse_key_file(&bytes) {
-            bytes.zeroize();
             return Err(Error::new(&format!(
                 "invalid provisioned fleet key: {error}"
             )));
         }
-        let secret = bytes.trim_ascii().to_vec();
-        bytes.zeroize();
-        return Ok(secret);
+        return Ok(bytes.trim_ascii().to_vec());
     }
     Err(Error::new(
         "no provisioned fleet key; join the fleet before opening its database",
@@ -133,16 +130,25 @@ fn read_fleet_secret(candidates: &[PathBuf]) -> Result<Vec<u8>> {
 /// Note: `"phones"` maps to the underlying collection `"phone_numbers"` so legacy
 /// `contacts::validate` hooks on `"phones"` in `database.rs` are never triggered.
 pub fn resolve_table(raw: &str) -> Result<(&'static str, &'static str)> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "computers" | "computer" | "machines" | "machine" => Ok(("computers", "computers")),
-        "emails" | "email" | "mailboxes" | "addresses" => Ok(("emails", "emails")),
-        "phones" | "phone" | "phone_numbers" | "phone-numbers" => Ok(("phones", "phone_numbers")),
-        "ai_accounts" | "ai-accounts" | "ai_account" | "ai-account" | "accounts" => {
-            Ok(("ai_accounts", "ai_accounts"))
-        }
-        _ => Err(Error::new(
+    let trimmed = raw.trim();
+    let is = |name: &str| trimmed.eq_ignore_ascii_case(name);
+    if is("computers") || is("computer") || is("machines") || is("machine") {
+        Ok(("computers", "computers"))
+    } else if is("emails") || is("email") || is("mailboxes") || is("addresses") {
+        Ok(("emails", "emails"))
+    } else if is("phones") || is("phone") || is("phone_numbers") || is("phone-numbers") {
+        Ok(("phones", "phone_numbers"))
+    } else if is("ai_accounts")
+        || is("ai-accounts")
+        || is("ai_account")
+        || is("ai-account")
+        || is("accounts")
+    {
+        Ok(("ai_accounts", "ai_accounts"))
+    } else {
+        Err(Error::new(
             "unknown table: expected one of computers, emails, phones, ai_accounts",
-        )),
+        ))
     }
 }
 
@@ -180,6 +186,21 @@ pub fn normalize_natural_key(logical_table: &str, raw: &str) -> Result<String> {
     }
 }
 
+fn sha256_ascii_lowercase(bytes: &[u8]) -> [u8; 32] {
+    if !bytes.iter().any(u8::is_ascii_uppercase) {
+        return Sha256::digest(bytes);
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256];
+    for chunk in bytes.chunks(buf.len()) {
+        for (dst, &src) in buf[..chunk.len()].iter_mut().zip(chunk) {
+            *dst = src.to_ascii_lowercase();
+        }
+        hasher.update(&buf[..chunk.len()]);
+    }
+    hasher.finalize()
+}
+
 /// Convert a natural primary key (`m104`, `root@example.com`, `+1-555-234-5678`,
 /// `acc-001`) into a uniform `crypto::name`-safe storage key (`<prefix>-<24 hex chars>`).
 pub fn storage_key(logical_table: &str, natural_key: &str) -> Result<String> {
@@ -191,8 +212,12 @@ pub fn storage_key(logical_table: &str, natural_key: &str) -> Result<String> {
         "ai_accounts" => "ac",
         _ => "rk",
     };
-    let digest = Sha256::digest(canonical.to_ascii_lowercase().as_bytes());
-    Ok(format!("{prefix}-{}", hex::encode_lower(&digest[..12])))
+    let digest = sha256_ascii_lowercase(canonical.as_bytes());
+    let mut out = String::with_capacity(prefix.len() + 1 + 24);
+    out.push_str(prefix);
+    out.push('-');
+    hex::push_lower(&mut out, &digest[..12]);
+    Ok(out)
 }
 
 /// Extract the natural primary key from a stored row object, falling back to the storage key.
@@ -214,8 +239,7 @@ pub fn natural_key_of(logical_table: &str, stored_key: &str, row: &Value) -> Str
 
 /// Return true if `email` is one of the 3 personal email addresses that must always be `protected: true`.
 pub fn is_always_protected_email(email: &str) -> bool {
-    let lower = email.trim().to_ascii_lowercase();
-    let digest = Sha256::digest(lower.as_bytes());
+    let digest = sha256_ascii_lowercase(email.trim().as_bytes());
     PROTECTED_EMAIL_DIGESTS.contains(&digest)
 }
 
@@ -238,7 +262,11 @@ pub fn validate_email_record(stored_key: &str, value: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new("emails record requires string \"email\" field"))?;
     let trimmed = email.trim();
-    if trimmed.is_empty() || !trimmed.contains('@') || trimmed != email.to_ascii_lowercase() {
+    if trimmed.is_empty()
+        || !trimmed.contains('@')
+        || trimmed.len() != email.len()
+        || trimmed.bytes().any(|b| b.is_ascii_uppercase())
+    {
         return Err(Error::new(
             "emails record requires lowercase email address containing '@'",
         ));
@@ -593,12 +621,7 @@ fn cell_is_protected_email(view: &View, skey: &str) -> bool {
 
 /// Whether a field carries credentials rather than an account identifier or secret reference.
 fn credential_field(key: &str) -> bool {
-    let key: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect();
-    [
+    const SUFFIXES: &[&str] = &[
         "password",
         "passwords",
         "passwd",
@@ -630,9 +653,19 @@ fn credential_field(key: &str) -> bool {
         "recoverycodes",
         "backupcode",
         "backupcodes",
-    ]
-    .iter()
-    .any(|suffix| key.ends_with(suffix))
+    ];
+    if key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return SUFFIXES.iter().any(|suffix| key.ends_with(suffix));
+    }
+    let key: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+    SUFFIXES.iter().any(|suffix| key.ends_with(suffix))
 }
 
 fn sensitive_field(key: &str, value: &Value) -> bool {
@@ -717,10 +750,11 @@ pub fn redact_row(logical_table: &str, mut row: Value, show_passwords: bool) -> 
 pub fn scan_table(view: &View, logical_table: &str) -> Result<BTreeMap<String, Value>> {
     let (_, collection) = resolve_table(logical_table)?;
     let mut rows = BTreeMap::new();
-    for ((coll, stored_key), cell) in &view.cells {
-        if coll != collection {
-            continue;
-        }
+    for ((_, stored_key), cell) in view
+        .cells
+        .range((collection.to_owned(), String::new())..)
+        .take_while(|((coll, _), _)| coll == collection)
+    {
         if let Some(projected) = project_cell(logical_table, cell) {
             let nat = natural_key_of(logical_table, stored_key, &projected);
             rows.insert(nat, projected);
@@ -743,9 +777,8 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
     if let Some(val) = rows.get(&canonical) {
         return Ok(Some(val.clone()));
     }
-    let lower = canonical.to_ascii_lowercase();
     for (k, v) in &rows {
-        if k.to_ascii_lowercase() == lower {
+        if k.eq_ignore_ascii_case(&canonical) {
             return Ok(Some(v.clone()));
         }
     }
@@ -755,14 +788,14 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
             let nick_match = v
                 .get("nickname")
                 .and_then(Value::as_str)
-                .is_some_and(|n| n.eq_ignore_ascii_case(&lower));
+                .is_some_and(|n| n.eq_ignore_ascii_case(&canonical));
             let alias_match = v
                 .get("aliases")
                 .and_then(Value::as_array)
                 .is_some_and(|arr| {
                     arr.iter()
                         .filter_map(Value::as_str)
-                        .any(|a| a.eq_ignore_ascii_case(&lower))
+                        .any(|a| a.eq_ignore_ascii_case(&canonical))
                 });
             let nick_alias_match = v
                 .get("nickname_aliases")
@@ -770,7 +803,7 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
                 .is_some_and(|arr| {
                     arr.iter()
                         .filter_map(Value::as_str)
-                        .any(|a| a.eq_ignore_ascii_case(&lower))
+                        .any(|a| a.eq_ignore_ascii_case(&canonical))
                 });
             if nick_match || alias_match || nick_alias_match {
                 matches.push(v.clone());
@@ -933,13 +966,17 @@ fn transactions(changes: Vec<Change>) -> Result<Vec<Vec<Change>>> {
         // A row `put` accepted has to load too: alone in a transaction it may use all of one.
         let alone = Command::Write {
             request: [0; 16],
-            changes: vec![change.clone()],
+            changes: vec![change],
         };
         if alone.encode()?.len() > crypto::MAX_BODY {
             return Err(Error::new(
                 "single row exceeds maximum operation payload limit",
             ));
         }
+        let Command::Write { mut changes, .. } = alone else {
+            unreachable!()
+        };
+        let change = changes.pop().expect("single change");
         if !current_chunk.is_empty()
             && (current_chunk.len() >= MAX_WRITES || current_bytes + change_bytes > MAX_BATCH_BYTES)
         {
@@ -1023,7 +1060,11 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
                 .unwrap_or("");
             if root.is_empty() {
                 broken_root_refs.push(format!("{email} -> <missing root_account>"));
-            } else if let Some(target) = emails.get(&root.to_ascii_lowercase()) {
+            } else if let Some(target) = if root.bytes().any(|b| b.is_ascii_uppercase()) {
+                emails.get(&root.to_ascii_lowercase())
+            } else {
+                emails.get(root)
+            } {
                 let target_type = target
                     .get("account_type")
                     .and_then(Value::as_str)
@@ -1046,15 +1087,31 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
         {
             broken_phone_refs.push(format!("{email} -> {ph}"));
         }
+        let has_ci = |map: &BTreeMap<String, Value>, raw: &str| {
+            let trimmed = raw.trim();
+            if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+                map.contains_key(&trimmed.to_ascii_lowercase())
+            } else {
+                map.contains_key(trimmed)
+            }
+        };
         if let Some(comps) = row.get("assigned_computers").and_then(Value::as_array) {
             for c in comps.iter().filter_map(Value::as_str) {
-                if !computers.contains_key(&c.trim().to_ascii_lowercase()) {
+                if !has_ci(&computers, c) {
                     broken_computer_refs.push(format!("emails:{email} -> {c}"));
                 }
             }
         }
     }
 
+    let has_ci = |map: &BTreeMap<String, Value>, raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            map.contains_key(&trimmed.to_ascii_lowercase())
+        } else {
+            map.contains_key(trimmed)
+        }
+    };
     for (id, row) in &ai_accounts {
         for field_name in ["email", "receiving_mailbox"] {
             if let Some(em) = row
@@ -1062,14 +1119,14 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                && !emails.contains_key(&em.to_ascii_lowercase())
+                && !has_ci(&emails, em)
             {
                 broken_account_emails.push(format!("{id}.{field_name} -> {em}"));
             }
         }
         if let Some(comps) = row.get("assigned_computers").and_then(Value::as_array) {
             for c in comps.iter().filter_map(Value::as_str) {
-                if !computers.contains_key(&c.trim().to_ascii_lowercase()) {
+                if !has_ci(&computers, c) {
                     broken_computer_refs.push(format!("ai_accounts:{id} -> {c}"));
                 }
             }
@@ -1086,7 +1143,7 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
         }
         if let Some(ems) = row.get("assigned_emails").and_then(Value::as_array) {
             for em in ems.iter().filter_map(Value::as_str) {
-                if !emails.contains_key(&em.trim().to_ascii_lowercase()) {
+                if !has_ci(&emails, em) {
                     broken_account_emails.push(format!("computers:{comp} -> {em}"));
                 }
             }
@@ -1096,14 +1153,14 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
     for (ph, row) in &phones {
         if let Some(ems) = row.get("linked_emails").and_then(Value::as_array) {
             for em in ems.iter().filter_map(Value::as_str) {
-                if !emails.contains_key(&em.trim().to_ascii_lowercase()) {
+                if !has_ci(&emails, em) {
                     broken_account_emails.push(format!("phones:{ph} -> {em}"));
                 }
             }
         }
         if let Some(comps) = row.get("linked_computers").and_then(Value::as_array) {
             for c in comps.iter().filter_map(Value::as_str) {
-                if !computers.contains_key(&c.trim().to_ascii_lowercase()) {
+                if !has_ci(&computers, c) {
                     broken_computer_refs.push(format!("phones:{ph} -> {c}"));
                 }
             }
@@ -1345,13 +1402,23 @@ fn unfinished_rekeys(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     };
     let mut found = Vec::new();
     for entry in entries {
-        let path = entry?.path();
-        let kept = path
+        let entry = entry?;
+        if !entry
             .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&prefix));
-        if kept && let Ok(place) = std::fs::read_to_string(path.join(REKEY_UNFINISHED)) {
-            found.push((place.trim().parse().unwrap_or(0), path));
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok((open, meta)) = aterm_uds::regular_file::open(&path.join(REKEY_UNFINISHED))
+            && meta.len() <= 64
+        {
+            use std::io::Read as _;
+            let mut place = String::with_capacity(meta.len() as usize + 1);
+            if open.take(65).read_to_string(&mut place).is_ok() && place.len() <= 64 {
+                found.push((place.trim().parse().unwrap_or(0), path));
+            }
         }
     }
     found.sort_by(|a, b| b.cmp(a));
@@ -1861,9 +1928,14 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
             .collect::<Vec<_>>()
             .join("; ");
         let raw_comp_col = row.get(2).map_or("", |s| s.trim());
-        let is_paused = raw_comp_col.starts_with('*')
-            || notes_joined.to_ascii_lowercase().contains("deactivated")
-            || notes_joined.to_ascii_lowercase().contains("disabled");
+        let has_note = |needle: &[u8]| {
+            notes_joined
+                .as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+        };
+        let is_paused =
+            raw_comp_col.starts_with('*') || has_note(b"deactivated") || has_note(b"disabled");
         let acc_status = if is_paused { "suspended" } else { "active" };
 
         let receiving_mailbox = emails_map

@@ -504,36 +504,36 @@ impl Device {
     }
 
     /// Observe an existing authenticated binding without acquiring device custody or repairing
-    /// files. This grants no bootstrap or membership. A present public claim must match; second
-    /// reads of the ciphertext and recipient must still match the authenticated observation.
-    pub(crate) fn existing_binding_for_observation(paths: &Paths) -> Result<Binding> {
-        Self::existing_binding_before_claim(paths, || {})
-    }
-
-    fn existing_binding_before_claim(
+    /// files. This grants no bootstrap or membership. A present public claim must match.
+    ///
+    /// `None` is a Mac with no device, neither key nor claim, which is no node yet. A key gone from
+    /// under its claim is that node's device lost, and an error as a failed read is: this Mac may
+    /// be any node, so a caller that needs the answer has none.
+    pub(crate) fn existing_binding_for_observation(
         paths: &Paths,
-        before_claim: impl FnOnce(),
-    ) -> Result<Binding> {
-        let identity = client::read_identity(paths)?
-            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
-        Self::observe_binding(paths, identity, before_claim)
+        identity: &Identity,
+    ) -> Result<Option<Binding>> {
+        Self::observe_binding(paths, identity, || {})
     }
 
     fn observe_binding(
         paths: &Paths,
-        identity: Identity,
+        identity: &Identity,
         before_claim: impl FnOnce(),
-    ) -> Result<Binding> {
+    ) -> Result<Option<Binding>> {
         type Key = ([u8; 32], [u8; 32]);
         type Public = (Binding, [u8; 32]);
         static BINDINGS: std::sync::Mutex<std::collections::VecDeque<(Key, Public)>> =
             std::sync::Mutex::new(std::collections::VecDeque::new());
-        let recipient = identity.recipient();
         let dir = paths.dir.join("commons");
-        let ciphertext = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?
-            .ok_or_else(|| Error::new("Commons device key is missing"))?;
+        let Some(ciphertext) = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)? else {
+            return match fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)? {
+                Some(_) => Err(Error::new("Commons device key is missing")),
+                None => Ok(None),
+            };
+        };
         let key = (
-            recipient.0,
+            identity.recipient().0,
             aterm_digest::Sha256::digest(ciphertext.as_slice()),
         );
         let cached = BINDINGS.lock().ok().and_then(|cache| {
@@ -546,22 +546,18 @@ impl Device {
         let (binding, expected) = match cached {
             Some(public) => public,
             None => {
-                let device = Self::decode(identity, ciphertext.as_slice())?;
+                let device = Self::decode(
+                    Identity::from_secret_bytes(*identity.secret_bytes()),
+                    ciphertext.as_slice(),
+                )?;
                 (
                     device.request([1; 16], [2; 32])?.binding().clone(),
                     aterm_digest::Sha256::digest(device.claim()),
                 )
             }
         };
-        let current_ciphertext = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?;
         before_claim();
         let current_claim = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?;
-        if current_ciphertext.as_ref().map(|bytes| bytes.as_slice()) != Some(ciphertext.as_slice())
-            || client::read_identity(paths)?
-                .is_none_or(|identity| identity.recipient() != recipient)
-        {
-            return Err(Error::new("Commons device changed during its observation"));
-        }
         if current_claim
             .as_ref()
             .is_some_and(|claim| aterm_digest::Sha256::digest(claim.as_slice()) != expected)
@@ -570,16 +566,16 @@ impl Device {
                 "Commons device differs from its immutable claim",
             ));
         }
-        // Only an authenticated public binding and claim digest survive. Every
-        // use privately rereads the files and identity; denial is evaluated by
-        // the caller's current roster, never by this cache.
+        // Only an authenticated public binding and claim digest survive. Every use
+        // privately reads the files again; denial is evaluated by the caller's current
+        // roster, never by this cache.
         if !was_cached && let Ok(mut cache) = BINDINGS.lock() {
             if cache.len() >= 16 {
                 cache.pop_front();
             }
             cache.push_back((key, (binding.clone(), expected)));
         }
-        Ok(binding)
+        Ok(Some(binding))
     }
 
     #[cfg(test)]
@@ -588,7 +584,9 @@ impl Device {
         identity: Identity,
         roster: &crate::swarm_roster::SwarmRoster,
     ) -> Result<bool> {
-        let binding = Self::observe_binding(paths, identity, || {})?;
+        let Some(binding) = Self::observe_binding(paths, &identity, || {})? else {
+            return Ok(false);
+        };
         Ok([
             binding.writer().as_slice(),
             binding.incarnation().as_slice(),

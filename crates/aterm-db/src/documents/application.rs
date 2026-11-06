@@ -262,16 +262,26 @@ pub(crate) fn peek_catalog(
     )))
 }
 
+/// What this Mac's catalog says of one table ([`peek_declaration`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Declaration {
+    /// The catalog's own table id.
+    pub catalog: astream_wire::sync::Digest,
+    /// Any Mac declared the table in it.
+    pub declared: bool,
+    /// A Mac other than this one declared it.
+    pub elsewhere: bool,
+}
+
 /// What this Mac's catalog says of `descriptor`'s table, read as an observer that creates
-/// nothing: the catalog's own table id, and whether a Mac other than this one declared that table
-/// in it. `None` where there is no Commons here.
+/// nothing ([`Declaration`]). `None` where there is no Commons here.
 ///
 /// # Errors
 /// Custody, membership or the catalog's storage cannot be read.
-pub(crate) fn peek_declared_elsewhere(
+pub(crate) fn peek_declaration(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
-) -> Result<Option<(astream_wire::sync::Digest, bool)>> {
+) -> Result<Option<Declaration>> {
     let deadline = admission_deadline();
     let paths = crate::generation::observed_paths_until(paths, deadline)?;
     if Bootstrap::cached(&paths)
@@ -286,17 +296,18 @@ pub(crate) fn peek_declared_elsewhere(
     let directory = Directory::new(&paths, bootstrap.trust());
     let table = descriptor(&bootstrap)?.scope.digest();
     let me = session.actor();
-    let elsewhere = directory
-        .snapshot_if_exists(&session)?
-        .entries
-        .get(&table)
-        .is_some_and(|entry| {
+    let snapshot = directory.snapshot_if_exists(&session)?;
+    let entry = snapshot.entries.get(&table);
+    Ok(Some(Declaration {
+        catalog: directory.catalog_scope().digest(),
+        declared: entry.is_some_and(|entry| !entry.declarations.is_empty()),
+        elsewhere: entry.is_some_and(|entry| {
             entry
                 .declarations
                 .iter()
                 .any(|declaration| declaration.actor != me)
-        });
-    Ok(Some((directory.catalog_scope().digest(), elsewhere)))
+        }),
+    }))
 }
 
 fn pass_current(deadline: std::time::Instant) -> Result<()> {

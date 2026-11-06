@@ -270,24 +270,28 @@ impl Seen {
     /// Add the batches of this Mac's heard archive from `since` on (§7: the log reaches past the
     /// ring's window, labelled "heard by this Mac"): every event no window batch already holds.
     pub(crate) fn hear(&mut self, batches: &[super::heard::Batch]) {
-        let held: std::collections::BTreeSet<(String, u64)> = self
-            .events
-            .iter()
-            .map(|logged| (logged.uuid.clone(), logged.n))
-            .collect();
-        for (uuid, n, _, events) in batches {
-            if held.contains(&(uuid.clone(), *n)) {
-                continue;
-            }
-            for event in events {
-                self.events.push(Logged {
-                    uuid: uuid.clone(),
-                    n: *n,
-                    event: *event,
-                    heard: true,
-                });
+        let mut added = Vec::new();
+        {
+            let held: std::collections::BTreeSet<(&str, u64)> = self
+                .events
+                .iter()
+                .map(|logged| (logged.uuid.as_str(), logged.n))
+                .collect();
+            for (uuid, n, _, events) in batches {
+                if held.contains(&(uuid.as_str(), *n)) {
+                    continue;
+                }
+                for event in events {
+                    added.push(Logged {
+                        uuid: uuid.clone(),
+                        n: *n,
+                        event: *event,
+                        heard: true,
+                    });
+                }
             }
         }
+        self.events.extend(added);
         self.sort_events();
     }
 
@@ -477,15 +481,9 @@ impl Seen {
         );
         let mut out = Vec::new();
         for pk in pks {
-            let windows: std::collections::BTreeSet<Window> = self
-                .readings
-                .keys()
-                .chain(self.walls.keys())
-                .filter(|(at, _)| at == pk)
-                .map(|(_, w)| *w)
-                .collect();
-            for window in windows {
-                let key = (pk.to_owned(), window);
+            let mut key = (pk.to_owned(), Window::FiveHour);
+            for &window in Window::ALL {
+                key.1 = window;
                 let usage = self
                     .readings
                     .get(&key)
@@ -497,7 +495,7 @@ impl Seen {
                     .cloned();
                 if usage.is_some() || wall.is_some() {
                     out.push(WindowQuota {
-                        pk: pk.to_owned(),
+                        pk: key.0.clone(),
                         window,
                         usage,
                         wall,
@@ -614,7 +612,7 @@ fn usage(window: Window, readings: &[Reading], now: u64) -> Option<Usage> {
         // No reading names its window: the newest one, its reset unknown.
         return reset_less
             .iter()
-            .max_by_key(|r| (r.t, r.uuid.clone()))
+            .max_by_key(|r| (r.t, r.uuid.as_str()))
             .map(|r| current_of(r));
     };
     let mut current: Vec<&Reading> = reset_known
@@ -627,7 +625,7 @@ fn usage(window: Window, readings: &[Reading], now: u64) -> Option<Usage> {
         if let Some(since) = figure(reset_less.iter().copied().filter(|r| r.t > last_reset)) {
             return Some(current_of(since));
         }
-        let last = reset_known.iter().max_by_key(|r| (r.t, r.uuid.clone()))?;
+        let last = reset_known.iter().max_by_key(|r| (r.t, r.uuid.as_str()))?;
         return Some(Usage::ResetUnread {
             reset: last_reset,
             read: last.t,

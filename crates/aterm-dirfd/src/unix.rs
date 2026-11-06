@@ -582,15 +582,6 @@ pub fn fchmod<Fd: AsFd>(fd: Fd, mode: Mode) -> Result<()> {
     check(unsafe { libc::fchmod(fd.as_fd().as_raw_fd(), mode.bits()) })
 }
 
-/// `fsync(2)`.
-///
-/// # Errors
-/// The raw `errno` from the syscall.
-pub fn fsync<Fd: AsFd>(fd: Fd) -> Result<()> {
-    // SAFETY: `fd` is a live descriptor.
-    check(unsafe { libc::fsync(fd.as_fd().as_raw_fd()) })
-}
-
 /// One directory entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {

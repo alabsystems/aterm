@@ -48,6 +48,7 @@ struct Mac {
     admitted: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     serving: Option<std::thread::JoinHandle<()>>,
+    unread: Arc<Mutex<Vec<super::super::Served>>>,
 }
 
 /// What a Mac answers on each stream: it echoes what it reads behind its op's name, refuses
@@ -96,6 +97,15 @@ impl Mac {
 
     /// [`Self::start`], its listener cutting each proved connection `lifetime` after its proof.
     fn start_living(me: NodeIdentity, seats: &[&NodeIdentity], lifetime: Duration) -> Self {
+        Self::start_reading(me, seats, lifetime, true)
+    }
+
+    fn start_reading(
+        me: NodeIdentity,
+        seats: &[&NodeIdentity],
+        lifetime: Duration,
+        reads: bool,
+    ) -> Self {
         let clock = ManualClock::new();
         let verdict = Arc::new(Mutex::new(seating(seats)));
         let deny: DenyFn = {
@@ -120,6 +130,7 @@ impl Mac {
         let addr = listener.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let admitted = Arc::new(AtomicU64::new(0));
+        let unread = Arc::new(Mutex::new(Vec::new()));
         let listening = Listening {
             secret: FleetSecret::new(&[7; FleetSecret::MIN_LEN]).unwrap(),
             scope: FleetScope::Content,
@@ -130,6 +141,7 @@ impl Mac {
             lifetime,
         };
         let serving = {
+            let unread = Arc::clone(&unread);
             let (running, admitted, table) = (
                 Arc::clone(&running),
                 Arc::clone(&admitted),
@@ -150,6 +162,10 @@ impl Mac {
                     HANG,
                     move |served, op| {
                         if op != FleetOp::Neighbour {
+                            return Ok(());
+                        }
+                        if !reads {
+                            lock(&unread).push(served);
                             return Ok(());
                         }
                         let link = served.into_link(&me, table.config())?;
@@ -176,6 +192,7 @@ impl Mac {
             admitted,
             running,
             serving: Some(serving),
+            unread,
         }
     }
 
@@ -193,7 +210,7 @@ impl Mac {
                 return link;
             }
             assert!(Instant::now() < until, "no link within the hang detector");
-            std::thread::yield_now();
+            aterm_uds::deadline::poll_yield();
         }
     }
 
@@ -419,7 +436,7 @@ fn a_key_the_log_took_out_ends_its_link_at_the_next_reproof() {
     let until = Instant::now() + HANG;
     while link.closed().is_none() {
         assert!(Instant::now() < until, "the link still runs");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     // Its proof verified, but no answer of a key the log holds out is noted.
     assert_eq!(link.reproofs(), (1, 1));
@@ -469,7 +486,7 @@ fn a_pair_that_dials_each_other_keeps_one_link_the_lower_node_dialed() {
     let until = Instant::now() + HANG;
     while from_b.closed().is_none() {
         assert!(Instant::now() < until, "the duplicate still runs");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     }
     let kept_b = mac_b.link_to(&mac_a);
     assert!(!kept_b.dialed());
@@ -630,6 +647,9 @@ fn a_link_its_peer_closes_ends_with_the_reason_the_peer_gave() {
     let mac_b = Mac::start(b.clone(), &[&a, &b]);
     let link = mac_a.dial(&mac_b);
     let held = mac_b.link_to(&mac_a);
+    let (ended, rx) = mpsc::channel();
+    let seen = Arc::clone(&link);
+    link.on_end(Box::new(move || ended.send(seen.closed()).unwrap()));
     link.close("this Mac's node service stopped");
     let until = Instant::now() + HANG;
     let why = loop {
@@ -637,12 +657,93 @@ fn a_link_its_peer_closes_ends_with_the_reason_the_peer_gave() {
             break why;
         }
         assert!(Instant::now() < until, "no end within the hang detector");
-        std::thread::yield_now();
+        aterm_uds::deadline::poll_yield();
     };
     assert_eq!(
         why,
         "the neighbour closed it: this Mac's node service stopped"
     );
+    assert_eq!(
+        rx.recv_timeout(HANG).unwrap().as_deref(),
+        Some("this Mac's node service stopped"),
+        "a successful drain records the same local reason"
+    );
+}
+
+/// A proved peer keeps its socket but never reads after the handshake. Fill the writer past
+/// the socket's capacity, then stop the generation. Only the injected clock decides the drain
+/// bound; real waits are one-minute hang detectors. The old queue-only close is the negative
+/// control: advancing the same clock leaves it open with its Close still queued.
+#[test]
+fn an_unreading_peer_cannot_hold_generation_teardown() {
+    use std::os::fd::AsRawFd;
+
+    for bounded in [false, true] {
+        let (a, b) = (node(0x5a), node(0x5b));
+        let mac_a = Mac::start(a.clone(), &[&a, &b]);
+        let mac_b = Mac::start_reading(b.clone(), &[&a, &b], HANG, false);
+        let link = mac_a.dial(&mac_b);
+        let until = Instant::now() + HANG;
+        while lock(&mac_b.unread).is_empty() {
+            assert!(Instant::now() < until, "the peer keeps its proved socket");
+            aterm_uds::deadline::poll_yield();
+        }
+        {
+            let mut state = link.shared.link_state();
+            for _ in 0..4096 {
+                state.data.push_back(frame(Kind::Data, 1, &[0; FRAME_MAX]));
+            }
+        }
+        link.shared.changed.notify_all();
+        loop {
+            let mut fd = libc::pollfd {
+                fd: link.shared.sock.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: fd names a live socket and points to one initialized pollfd for this call.
+            let ready = unsafe { libc::poll(&raw mut fd, 1, 0) };
+            assert!(ready >= 0, "poll succeeds");
+            if ready == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "the unreading peer fills the socket"
+            );
+            aterm_uds::deadline::poll_yield();
+        }
+        assert!(!link.shared.link_state().data.is_empty());
+        // Keep the queued Close from being prepared even if an ACK briefly frees socket
+        // space. The deadline must need neither the writer nor its TLS lock to make progress.
+        let tls = lock(&link.shared.tls);
+        let (ended, rx) = mpsc::channel();
+        let seen = Arc::clone(&link);
+        link.on_end(Box::new(move || ended.send(seen.closed()).unwrap()));
+        let why = "this Mac's node service stopped";
+        if bounded {
+            mac_a.table.stop();
+        } else {
+            // NEGATIVE CONTROL: the former stop only queued Close, with no drain timer.
+            assert!(link.shared.queue_close(why).is_some());
+        }
+        mac_a.clock.advance(CLOSE_DRAIN - Duration::from_nanos(1));
+        assert!(link.closed().is_none(), "the deadline has not arrived");
+        mac_a.clock.advance(Duration::from_nanos(1));
+        if bounded {
+            assert_eq!(rx.recv_timeout(HANG).unwrap().as_deref(), Some(why));
+            assert_eq!(link.closed().as_deref(), Some(why));
+            mac_a.table.stop();
+            assert!(mac_a.table.links().is_empty());
+            assert!(mac_a.table.adopt(Arc::clone(&link)).is_none());
+        } else {
+            assert!(link.closed().is_none(), "old stop still waits on its peer");
+            assert!(rx.try_recv().is_err());
+            link.abort("end the negative control");
+            assert_eq!(rx.recv_timeout(HANG).unwrap().as_deref(), Some(why));
+        }
+        drop(tls);
+    }
 }
 
 /// What a holder hooks on a link runs once when the link ends, after `closed` reads the end, on

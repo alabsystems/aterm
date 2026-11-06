@@ -96,6 +96,10 @@ struct LockHost {
     /// What that sign-in leaves in the records as it ends.
     left: RefCell<Option<Box<dyn FnOnce()>>>,
     agent: bool,
+    tty: bool,
+    mailbox: Option<PathBuf>,
+    finish_on_contention: bool,
+    contended: Cell<bool>,
 }
 
 impl LockHost {
@@ -111,6 +115,10 @@ impl LockHost {
             running: RefCell::new(None),
             left: RefCell::new(None),
             agent: false,
+            tty: true,
+            mailbox: None,
+            finish_on_contention: false,
+            contended: Cell::new(false),
         }
     }
     fn held(&self) {
@@ -133,7 +141,21 @@ impl LockHost {
 
 impl AccountsHost for LockHost {
     fn stdin_is_terminal(&self) -> bool {
-        true
+        self.tty
+    }
+    fn automatic_sign_in(&self) -> bool {
+        // This existing host observation follows signin_lock's failed immediate take.
+        if self.finish_on_contention {
+            let held = self.running.borrow_mut().take();
+            if held.is_some() {
+                self.contended.set(true);
+                if let Some(left) = self.left.borrow_mut().take() {
+                    left();
+                }
+                drop(held);
+            }
+        }
+        false
     }
     fn current_exe(&self) -> Option<PathBuf> {
         Some(std::env::current_exe().expect("the test executable"))
@@ -146,7 +168,13 @@ impl AccountsHost for LockHost {
         ended
     }
     fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {
-        (self.agent && name == "CLAUDECODE").then(|| "1".into())
+        if name == crate::harness::open_url::MAILBOX_ENV {
+            self.mailbox
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned())
+        } else {
+            (self.agent && name == "CLAUDECODE").then(|| "1".into())
+        }
     }
     fn unaskable(&self) -> Option<String> {
         None
@@ -435,4 +463,58 @@ fn a_claude_fallback_keeps_the_lock_until_the_new_binding_is_published() {
         "the binding was published while holding the guard"
     );
     assert!(host.peer.signin_now().unwrap().is_some());
+}
+
+/// A non-TTY caller can acquire inside the existing bounded ladder after contention.
+/// It must observe the completed renewal instead of treating its old capture as current.
+#[test]
+fn a_non_tty_sign_in_rechecks_the_renewal_that_ended_its_contention() {
+    for contended in [false, true] {
+        let (tmp, env, form) = fixture("signin-non-tty-contention", true);
+        let mut host = LockHost::new(&env, Ok(0));
+        host.tty = false;
+        let mailbox = tmp.path().join("synthetic-mailbox");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        host.mailbox = Some(mailbox);
+        host.finish_on_contention = true;
+        if contended {
+            host.running
+                .replace(Some(host.peer.signin_now().unwrap().unwrap()));
+            let store = env.accounts_store();
+            let now = env.now;
+            let dir = store
+                .login_dir("main")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            host.left.replace(Some(Box::new(move || {
+                store
+                    .transact_logins(now, &mut None, |state, logins| {
+                        Ok(accounts::note_renewed(
+                            state, logins, "main", None, &dir, None, now,
+                        ))
+                    })
+                    .unwrap();
+            })));
+        }
+        let (code, out, err) = acc(form, &env, &host);
+        assert_eq!(
+            host.contended.get(),
+            contended,
+            "the completion seam must follow a real failed lock take"
+        );
+        assert_eq!(code, exit(0), "{out}{err}");
+        assert_eq!(out.contains(RENEWED_WHILE_WAITING), contended, "{out}{err}");
+        assert_eq!(
+            host.login_calls.get(),
+            usize::from(!contended),
+            "stale work must not start an external flow"
+        );
+        assert_eq!(host.check_calls.get(), usize::from(!contended));
+        assert!(
+            host.peer.signin_now().unwrap().is_some(),
+            "the machine lock is released"
+        );
+    }
 }

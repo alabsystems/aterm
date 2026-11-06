@@ -585,11 +585,7 @@ const REQUEST_DOMAIN: &[u8] = b"aterm/att/1/request\0";
 /// # Errors
 /// The changes cannot be encoded.
 pub fn request_id(application: &str, role: &str, changes: &[Change]) -> crate::Result<[u8; 16]> {
-    let canonical: Vec<Value> = changes
-        .iter()
-        .map(|c| json!({"collection": c.collection, "key": c.key, "value": c.value}))
-        .collect();
-    let bytes = aterm_json::to_vec(&canonical)
+    let bytes = aterm_json::to_vec(changes)
         .map_err(|_| crate::Error::new("typed changes could not be encoded"))?;
     let mut sha = Sha256::new();
     sha.update(REQUEST_DOMAIN);

@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use super::journal::{JournalRecord, Noted, Word, json_str, read_journal};
 use super::limit::{civil, days_from_civil};
 use super::report::{
-    MARKER_CHARS, Mark, OffscreenError, PASTED, decimal, is_user_row, join, parse_offscreen,
-    paste_fits, paste_like, pct_decode, user_text, without_verb,
+    MARKER_CHARS, Mark, OffscreenError, PASTED, begins_with, decimal, is_user_row, join,
+    parse_offscreen, paste_fits, paste_like, pct_decode, without_verb,
 };
 use super::run::{Ctl, CtlReply};
 
@@ -830,7 +830,8 @@ fn reply_sizes<C: Ctl>(
 }
 
 /// The first user row at or after `from` whose text begins with `text`'s first 60 characters
-/// (whitespace aside), else, for a paste-like text, the first `[Pasted text …]` row that fits.
+/// (whitespace aside), its rows read as they are or cut at each `│` its first row draws
+/// ([`begins_with`]), else, for a paste-like text, the first `[Pasted text …]` row that fits.
 fn find_turn_row(rows: &[String], from: usize, text: &str) -> Option<usize> {
     let want: String = text
         .chars()
@@ -840,7 +841,7 @@ fn find_turn_row(rows: &[String], from: usize, text: &str) -> Option<usize> {
     let need = want.chars().count();
     let users = (from..rows.len()).filter(|&i| is_user_row(&rows[i]));
     if need > 0
-        && let Some(i) = users.clone().find(|&i| user_text(rows, i, need) == want)
+        && let Some(i) = users.clone().find(|&i| begins_with(rows, i, &want, need))
     {
         return Some(i);
     }

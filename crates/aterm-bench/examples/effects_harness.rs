@@ -744,6 +744,10 @@ impl Rig {
                     "GPU-time frame {serial} never settled: a completion never reported"
                 ));
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the harness's poll for a frame's GPU completion, bounded by HANG: it reports the GPU's own clock, so the wait's length is never measured"
+            )]
             std::thread::yield_now();
         }
     }

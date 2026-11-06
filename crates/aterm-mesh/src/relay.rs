@@ -19,7 +19,7 @@
 //!
 //! The opener reads those lines, keeps any bytes it read past them, and speaks astream's protocol
 //! on what follows ([`BusLink`]). A revoked key's stream is refused by the broker and ended at
-//! once when the key is revoked (`revoke_identity`).
+//! once when the key is revoked (`revoke_key`).
 //!
 //! **The relay.** For each neighbour and each log, one push relay ([`run`]) follows its own log
 //! with a consumer group named for the neighbour (`/relay/n-<neighbour>`), so the broker pushes each
@@ -36,10 +36,14 @@
 //!   (an unclean stop or a reboot of the neighbour), resumes from its group, and delivers, once
 //!   and in order, every record that landed since; after a generation move it sends the newest
 //!   rows first, as a log that flushes lazily may have lost the last ones it held, and leaves the
-//!   rest of what the fork took to `Inventory` (B7b). It first sends again the record at its
-//!   group's last commit, which the neighbour answers "already held" where it has it: astream's
-//!   push bridge commits one past a burst cut at its cap, so a relay that ended between two
-//!   bursts would otherwise skip that one record.
+//!   rest of what the fork took to `Inventory` (B7b). Its group never resumes past a record the
+//!   neighbour has not answered (astream's `TlaPushEdge.NoSkip`).
+//! - **A record whose origin the neighbour does not take yet is held back.** The neighbour answers
+//!   it `ERR_ORIGIN_UNKNOWN` (it has not seated that Mac yet, still holds it removed, its
+//!   removal since voided, or reads its key contested): while this Mac seats the origin, the relay holds the record, and every
+//!   later one of that origin, and offers the first again with each burst and each idle mark; its
+//!   group stays below them, so a restarted relay offers them again. Once this Mac no longer seats
+//!   the origin they are let go (`FederationBridge::hold_while`, [`crate::Mesh`]'s `still_seats`).
 //! - **A new connection starts with the newest values.** A relay with no cursor, or one older than
 //!   7 days, first sends its newest `now` and `quota` rows (on `metrics.log`), each with its
 //!   origin's key, then follows its log's head. What is older is `Inventory`'s (B7b).
@@ -163,8 +167,11 @@ pub enum Event {
         appended: usize,
         /// Records the neighbour already held.
         deduped: usize,
-        /// Records the neighbour refused for good (a bad signature, a revoked or unknown origin).
+        /// Records the neighbour refused for good (a record that is not its origin's), and ones of
+        /// an origin it did not take that this Mac no longer seats.
         refused: usize,
+        /// Records the relay holds back now, for origins the neighbour does not take yet.
+        held: usize,
     },
     /// A relay ended; it tries again unless its link ended or it was stopped.
     Ended {
@@ -533,7 +540,11 @@ impl Relayed {
 
     /// This Mac relays to `peer`'s log `dest` at `now_ms`.
     pub(crate) fn relays_to(&mut self, peer: &str, dest: Option<LogIdentity>, now_ms: u64) {
-        self.at.insert(peer.to_owned(), (now_ms, dest));
+        if let Some(entry) = self.at.get_mut(peer) {
+            *entry = (now_ms, dest);
+        } else {
+            self.at.insert(peer.to_owned(), (now_ms, dest));
+        }
         self.write(peer, now_ms);
     }
 
@@ -556,14 +567,18 @@ impl Relayed {
         {
             return;
         }
-        let text: String = self
-            .at
-            .iter()
-            .map(|(peer, (at, dest))| match dest {
-                Some(dest) => format!("{peer} {at} {dest}\n"),
-                None => format!("{peer} {at} -\n"),
-            })
-            .collect();
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(self.at.len() * 64);
+        for (peer, (at, dest)) in &self.at {
+            match dest {
+                Some(dest) => {
+                    let _ = writeln!(text, "{peer} {at} {dest}");
+                }
+                None => {
+                    let _ = writeln!(text, "{peer} {at} -");
+                }
+            }
+        }
         match aterm_uds::private_file::write_private(&self.dir, RELAYED_FILE, text.as_bytes()) {
             Ok(()) => self.written.clone_from(&self.at),
             Err(e) => aterm_log::warn!("mesh: {RELAYED_FILE} could not be written: {e}"),
@@ -573,13 +588,15 @@ impl Relayed {
 
 /// Write `grants` at the head of a `Bus` stream this Mac accepted.
 pub(crate) fn hand_grants(stream: &LinkStream, grants: &[Capability]) -> io::Result<()> {
-    let mut text = format!("{GRANTS_HEAD}\n");
+    let mut text = String::with_capacity(GRANTS_HEAD.len() + 5 + grants.len() * 96);
+    text.push_str(GRANTS_HEAD);
+    text.push('\n');
     for cap in grants {
-        text.push_str(&format!(
-            "cap {} {}\n",
-            cap.filter,
-            aterm_codec::hex::encode_lower(&cap.tag)
-        ));
+        text.push_str("cap ");
+        text.push_str(&cap.filter);
+        text.push(' ');
+        aterm_codec::hex::push_lower(&mut text, &cap.tag);
+        text.push('\n');
     }
     text.push_str("end\n");
     stream.set_write_timeout(Some(IO_WITHIN));
@@ -620,17 +637,20 @@ fn grant_of(line: &str) -> io::Result<Capability> {
 /// Read the grants at the head of a `Bus` stream this Mac opened: the grants, and the bytes read
 /// past them, which belong to the stream.
 pub(crate) fn read_grants(stream: &LinkStream) -> io::Result<(Vec<Capability>, Vec<u8>)> {
-    let mut held = Vec::new();
+    let mut held = Vec::with_capacity(256);
+    let mut scanned = 0usize;
     let mut chunk = [0u8; 1024];
     stream.set_read_timeout(Some(IO_WITHIN));
     let end = loop {
-        if let Some(at) = held
+        let start = scanned.saturating_sub(4);
+        if let Some(at) = held[start..]
             .windows(5)
             .position(|w| w == b"\nend\n")
-            .map(|at| at + 5)
+            .map(|at| start + at + 5)
         {
             break at;
         }
+        scanned = held.len();
         if held.len() > GRANTS_MAX {
             stream.set_read_timeout(None);
             return Err(damaged("they run past their bound"));
@@ -781,11 +801,14 @@ fn io_of(error: FederationError) -> io::Error {
     }
 }
 
-/// Whether a relayed record's refusal is for the record alone, not the connection.
-fn refused_for_good(error: &io::Error) -> bool {
+/// Whether a relayed record's refusal is for the record alone, not the connection: it is not its
+/// origin's, its origin is over its subject budget there, or the neighbour does not take its origin
+/// yet.
+fn for_the_record_alone(error: &io::Error) -> bool {
     astream_broker::broker_refusal(error).is_some_and(|refusal| {
         refusal.code == astream_broker::proto::ERR_ORIGIN_REFUSED
-            || refusal.code == astream_broker::proto::ERR_SUBJECT_BOUND
+            || refusal.is_subject_bound()
+            || refusal.is_origin_unknown()
     })
 }
 
@@ -906,7 +929,8 @@ fn stamped(
 }
 
 /// Relay `rows` to the neighbour behind `dial`, each under its origin's key: a row the neighbour
-/// refuses for itself alone (an origin it does not seat) is skipped.
+/// refuses for itself alone is skipped. They are the newest rows of a relay that starts at its
+/// log's head or after a fork, below where its group starts: what they miss is `Inventory`'s.
 fn send_rows(dial: &BusDial, grants: &[Capability], rows: &[Row]) -> io::Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -916,7 +940,7 @@ fn send_rows(dial: &BusDial, grants: &[Capability], rows: &[Row]) -> io::Result<
     for row in rows {
         match dest.relay(row.pid, row.seq, &row.subject, &row.body) {
             Ok(_) => {}
-            Err(e) if refused_for_good(&e) => {}
+            Err(e) if for_the_record_alone(&e) => {}
             Err(e) => return Err(e),
         }
     }
@@ -1073,11 +1097,8 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         wall_ms(&mesh.wall),
     );
     match cursor {
-        Cursor::Kept => resend_last(mesh, slot, &dial, &grants, &group)?,
-        Cursor::Moved => {
-            send_newest(mesh, slot, &dial, &grants)?;
-            resend_last(mesh, slot, &dial, &grants, &group)?;
-        }
+        Cursor::Kept => {}
+        Cursor::Moved => send_newest(mesh, slot, &dial, &grants)?,
         Cursor::Gone => start_at_head(mesh, slot, &dial, &grants, &group)?,
     }
     if slot.stopped() {
@@ -1100,6 +1121,10 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         relay: true,
     };
     let mut bridge = FederationBridge::open(cfg).map_err(io_of)?;
+    let seats = Arc::downgrade(mesh);
+    bridge.hold_while(Arc::new(move |owner: &str| {
+        seats.upgrade().is_none_or(|mesh| mesh.still_seats(owner))
+    }));
     {
         let mut closer = slot.closer.lock_or_recover();
         if slot.stopped() {
@@ -1116,42 +1141,26 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         peer: slot.peer.clone(),
         log: slot.log,
     });
+    let mut held = 0;
     bridge
         .run(BURST, &mut |report| {
             hosted
                 .relayed
                 .lock_or_recover()
                 .touch(&slot.peer, wall_ms(&mesh.wall));
-            if report.mirrored > 0 || report.refused > 0 {
+            if report.mirrored > 0 || report.refused > 0 || report.held != held {
+                held = report.held;
                 mesh.report(&Event::Burst {
                     peer: slot.peer.clone(),
                     log: slot.log,
                     appended: report.mirrored.saturating_sub(report.deduped),
                     deduped: report.deduped,
                     refused: report.refused,
+                    held: report.held,
                 });
             }
         })
         .map_err(io_of)
-}
-
-/// A relay that resumes its cursor sends again the record at its group's last commit: astream's
-/// push bridge commits one past a burst it cut at its cap (`FederationBridge::run`), so where the
-/// last run ended before the next burst's commit that record would never go. The neighbour
-/// answers it "already held" where it has it.
-fn resend_last(
-    mesh: &Mesh,
-    slot: &Slot,
-    dial: &BusDial,
-    grants: &[Capability],
-    group: &str,
-) -> io::Result<()> {
-    let hosted = mesh.hosted(slot.log);
-    let Some(last) = hosted.broker.group_start(group).checked_sub(1) else {
-        return Ok(());
-    };
-    let rows = stamped(mesh, slot.log, slot.log.filter(), &BTreeSet::from([last]))?;
-    send_rows(dial, grants, &rows)
 }
 
 /// Send `slot`'s log's newest rows, each with its origin's key ([`newest_rows`]), where it has
@@ -1183,10 +1192,6 @@ fn start_at_head(
     let mut local = client_over(hosted.adopt(mesh.me.key)?, &hosted.source_grants(&mesh.me)?)?;
     let (_, (_, head)) = local.fetch(0, slot.log.filter(), 0)?;
     send_newest(mesh, slot, dial, grants)?;
-    // astream's commit is inclusive (the group resumes one past it), and a log with nothing yet
-    // needs none: the group starts at its first offset.
-    if let Some(through) = head.checked_sub(1) {
-        local.commit(group, through)?;
-    }
+    local.commit_before(group, head)?;
     Ok(())
 }

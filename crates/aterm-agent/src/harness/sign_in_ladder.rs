@@ -4,8 +4,8 @@
 //! THE AUTOMATIC SIGN-IN LADDER of a Claude Code roster row: every route this machine has to
 //! make the row's login by itself, tried in order, each named with what it found, so a row that
 //! no route can sign in ends as a recorded error that names them all
-//! ([`super::accounts::note_sign_in_attempt`]), never as a silent stop and never as a person
-//! asked.
+//! ([`super::accounts::note_sign_in_attempt`]), never as a silent stop and never as the AI
+//! asked to solve a challenge.
 //!
 //! The routes, in order ([`Read::route`]): a configured mailbox read directly; the row's own
 //! proven browser profile; and a webmail-only mailbox (the last two beside a headless browser).
@@ -14,8 +14,10 @@
 //! the routes are read again. The line also names what is never a route here: the row's own desk
 //! browser profile, which opens a window and so is never used unattended, and
 //! `[harness] hosts`, which renew their own logins and none of this machine's. No route opens a
-//! window on the desk or the system's default browser, and none copies, stores or relays a
-//! login: a route that runs makes a fresh one on this machine.
+//! window on this desk or the system's default browser, and none copies, stores or relays a
+//! login: a route that runs makes a fresh one on this machine. A blocked Claude OAuth page may
+//! instead use the fleet issuer's interactive challenge service, which returns only the exact
+//! loopback callback to this machine's own waiting sign-in.
 //!
 //! This module holds the ladder's words and its clocks; `accounts_sync` reads the machine and
 //! runs the routes.
@@ -738,7 +740,7 @@ impl Ladder {
 // never in a burst. Every sign-in this harness starts takes a [`SignIn`], minted by one of these:
 // a row a session here runs on whose login is signed out here (and the row a launch here starts
 // on, whose login was refused), a person naming the account, and one due login this Mac uses
-// ([`super::accounts::renew_due`]). A timer holds none of that evidence, so it can mint nothing.
+// ([`super::accounts::renewal_due`]). A timer holds none of that evidence, so it can mint nothing.
 // The token starts its sign-in under the machine-wide sign-in lock, and an automatic one only
 // [`SPACING_S`] after another account's: the spacing clock is a file beside the lock, so every
 // process on this Mac keeps one spacing.
@@ -839,7 +841,7 @@ pub(super) enum Why {
     /// <account>`, `signin --cli grok` (the default home, whose device code goes to them), or a
     /// selection saved from the window's account menu.
     Asked,
-    /// One due login this Mac uses ([`super::accounts::renew_due`]).
+    /// One due login this Mac uses ([`super::accounts::renewal_due`]).
     Due,
     /// An account a root approved for this Mac's first custody (a shared adoption).
     Granted,
@@ -912,6 +914,55 @@ pub(super) fn session_signed_out(
             .is_some_and(|a| a.current_auth(row) == super::accounts::Auth::SignedOut)
 }
 
+/// Whether a door the upkeep holds admits `row` (of the bound roster), so aterm signs it in by
+/// itself with nobody asking: a session here runs on it and its login is signed out here
+/// ([`session_signed_out`]), or this Mac used its login within a week, it has ended or comes due,
+/// and it is not one of `others`, the rows whose account may be another Mac's
+/// ([`super::accounts::renewal_due`]). What a report reads before it promises a sign-in.
+#[must_use]
+pub(super) fn upkeep_signs_in(
+    row: &super::accounts::Row,
+    (logins, state, others): (
+        &super::accounts::Logins,
+        &super::accounts::State,
+        &super::accounts::OtherMacs,
+    ),
+    now: i64,
+) -> bool {
+    session_signed_out(row, state) || super::accounts::renewal_due(row, logins, state, others, now)
+}
+
+/// Why neither door the upkeep holds admits `row` ([`upkeep_signs_in`] false), in a report's
+/// words: the first condition of [`super::accounts::renewal_due`] it fails, `others` being the
+/// rows whose account the source gives to other Macs alone or whose source this Mac cannot
+/// compare.
+#[must_use]
+pub(super) fn upkeep_waits_because(
+    row: &super::accounts::Row,
+    state: &super::accounts::State,
+    others: &super::accounts::OtherMacs,
+    now: i64,
+) -> &'static str {
+    if row.held_by.is_some() {
+        "this Mac is not in its warm set"
+    } else if row.email.is_none() {
+        "it names no email"
+    } else if others.named.contains_key(&row.label) {
+        "its source gives its account to another Mac"
+    } else if !super::accounts::ran_here(state, &row.label, now) {
+        "no session here runs on it or ran on it within a week"
+    } else if !super::accounts::claim_ours_or_none(state, &row.label, now) {
+        "another Mac holds its claim"
+    } else if others.unread.contains(&row.label) {
+        others
+            .unread_why
+            .unwrap_or(super::accounts::UnreadWhy::Source)
+            .words()
+    } else {
+        "its login is not on record as ended or due here"
+    }
+}
+
 impl SignIn {
     /// The upkeep's door for a row a session on this Mac runs on whose login is signed out here
     /// (and that no other Mac's warm set holds): [`session_signed_out`].
@@ -928,29 +979,26 @@ impl SignIn {
         })
     }
 
-    /// The renewal door: `label` is one of the due logins [`super::accounts::renew_due`] lists
-    /// over `roster` (bound), `logins`, `state` and `enrolled`, so this Mac ran on it within a
-    /// week and holds its senior claim, or no Mac claims it.
+    /// The renewal door: `row` (of the bound roster) is a login this Mac's upkeep renews by
+    /// itself ([`super::accounts::renewal_due`]), so this Mac ran on it within a week and holds its
+    /// senior claim, or no Mac claims it, and it is not one of `others`, the rows whose account
+    /// the source gives to other Macs alone or whose source this Mac cannot compare.
     #[must_use]
     pub(super) fn renewal_sign_in(
         cli: super::accounts::Cli,
-        label: &str,
-        (roster, logins, state, enrolled): (
-            &super::accounts::Roster,
+        row: &super::accounts::Row,
+        (logins, state, others): (
             &super::accounts::Logins,
             &super::accounts::State,
-            &std::collections::BTreeSet<String>,
+            &super::accounts::OtherMacs,
         ),
         now: i64,
     ) -> Option<Self> {
-        super::accounts::renew_due(roster, logins, state, enrolled, now)
-            .iter()
-            .any(|due| due == label)
-            .then(|| Self {
-                cli,
-                label: label.to_owned(),
-                why: Why::Due,
-            })
+        super::accounts::renewal_due(row, logins, state, others, now).then(|| Self {
+            cli,
+            label: row.label.clone(),
+            why: Why::Due,
+        })
     }
 
     /// A person's command naming the account ([`super::cli::AskedSignIn`]).

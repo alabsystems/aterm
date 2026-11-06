@@ -1217,7 +1217,12 @@ impl Item for Synced<'_> {
                     return self.forget_owed_clone(why);
                 }
                 match owed {
-                    crate::init::OwedClone::Nothing(now) => Probe::Ok { now },
+                    crate::init::OwedClone::Nothing(why) => not_applicable(why),
+                    crate::init::OwedClone::Verified { present, total } => Probe::Ok {
+                        now: format!(
+                            "{present}/{total} vault repositories verified on this machine"
+                        ),
+                    },
                     crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) => {
                         not_applicable(why)
                     }
@@ -1759,13 +1764,13 @@ fn builds_after(record: Option<&Record>, build: &str) -> Vec<String> {
     builds
 }
 
-/// The sync kinds, in run order: the vault before what it brings.
+/// The sync kinds, in run order: the vault before what it brings, and potentially long
+/// repository clones after the fleet, node and account setup they must not delay.
 fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'a> {
     [
         Kind::Peers,
         Kind::Vault,
         Kind::Github,
-        Kind::OwedClone,
         Kind::Identity,
         Kind::StewardRevoke,
         Kind::StewardLease,
@@ -1778,6 +1783,7 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
         Kind::Release,
         Kind::Fabric,
         Kind::Awake,
+        Kind::OwedClone,
     ]
     .into_iter()
     .map(|kind| Box::new(Synced::new(kind, ports, trigger, mode)) as Box<dyn Item + 'a>)

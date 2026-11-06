@@ -1586,7 +1586,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "A world of its own, the bridge's wait tally on, {} idle bystander session(s). An ask \
              (`post kind=ask dl={DL_MS}`) waits for its landing by default: aterm answers `OK \
              <id> off=<n>` — RELEASES it — once the bridge retires the post (`outbox sent`), \
-             after its ack and `post_landed`'s writes (the self-ack append, and for an ask one \
+             after its ack and `land_group`'s writes (the self-ack append, and for an ask one \
              append of its recipient and its deadline to the asks journal, `journal/asks`). \
              Acked and durable are the broker's \
              heads, as in the messaging section. A release later than {:.3} ms after its ack — \

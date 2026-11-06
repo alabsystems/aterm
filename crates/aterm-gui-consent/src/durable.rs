@@ -22,16 +22,3 @@ pub fn finish(file: &File, flush: Flush) -> std::io::Result<()> {
         Flush::Ordered => aterm_durable::ordered(file),
     }
 }
-
-/// A plain `fsync(2)`, not `F_FULLFSYNC`.
-#[cfg(unix)]
-#[inline]
-pub fn fsync(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: `fsync` on a descriptor this `File` owns for the call.
-    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}

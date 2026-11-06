@@ -23,25 +23,27 @@ pub mod services;
 pub mod strain;
 pub mod sys;
 pub mod trend;
+pub mod units;
 pub mod words;
 pub mod writes;
 
 pub use gpu_clients::{GpuClientRow, GpuClientsSample, GpuSplit};
 pub use history::{Filling, FreeHistory, Rates};
 pub use model::{
-    AccountIx, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView, CommitSample, CoreView,
-    CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot, Hog, LinkKind,
-    LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView, NetState, NetView,
-    NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
-    ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView,
-    Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView,
-    TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
+    AccountIx, AneCheck, AneSample, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView,
+    CommitSample, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot,
+    Hog, LinkKind, LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView,
+    NetState, NetView, NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcLimits, ProcSample,
+    ProcState, ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig,
+    ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens,
+    TabView, TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
 };
-pub use peaks::{DailyMax, PeakRow, Peaks};
+pub use peaks::{DailyMax, DiskPeaks, PeakRow, Peaks};
 pub use ring::{
     Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
     SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, Tiers, TimeGap,
 };
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};
+pub use units::{BlockSample, DiskLocation, Units};
 pub use writes::{ProgramHour, WriteHour};

@@ -298,6 +298,12 @@ const HELP_DISK: &str = "\
 `--apply` adds a final `disk-apply` result. Read one JSON object per line and select
 records by `kind`.
 
+Directory sizes and counted removals may include shared storage, so they can exceed
+the volume's capacity. Measure `aterm ctl @self sys disk` before and after cleanup,
+comparing the same volume's `free_bytes`. Report that difference as a net change;
+other sessions can also write or remove data during the interval. Keep counted
+removal bytes separate from that measurement.
+
 Removal needs both `disk.apply = true` in `aterm.toml` and `--apply <class>`. Every run
 journals its report, and each removal or refusal, to `<state>/disk.jsonl`. An unreadable or
 invalid `aterm.toml`, or a `[disk]` removal key (`apply`, `target_stale_days`,
@@ -809,16 +815,20 @@ FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster sta
   - A window's upkeep and the first-run setup's retries sync a roster that stands only when
     something it is made from changed (the files above, the default login, a local file
     `[fleet] accounts_source` names), and a sync writes only the files whose bytes differ.
-    A row a sync leaves with no login here waits for a session or a person (below).
+    A row a sync leaves with no login here waits for a person unless a session here runs
+    on it, or ran on it within a week (below).
   - Wherever an `accounts.toml` stands, source or none, that window signs in by itself, one
     at a time and at least 10 minutes after another account's sign-in on this Mac, only a
-    row a session here runs on whose login is signed out here, and a due login a session
-    here ran on within a week whose senior claim this Mac holds or no Mac claims (`claude
-    auth login --claudeai --email <row's email>`; `[harness] accounts = \"off\"`, `logins =
-    \"off\"` or `enabled = false` turns this off). Every other row stays as it is until a
-    person runs `accounts login <label>`, or a session here runs on it and loses its login.
-    A report says whose a row is where its source names only other Macs for its account, and
-    `aterm ai login` leaves such a row for a person to name.
+    row a session here runs on whose login is signed out here, and a login that ended or
+    comes due (its directory removed or written over included) that a session here ran on
+    within a week, whose senior claim this Mac holds or no Mac claims, and whose account its
+    source, read here without the network, does not give to other Macs alone (a source only
+    the network reads, a source, lab or swarm roster this Mac cannot read, or a Mac with no
+    name leaves the row for a person) (`claude auth login --claudeai --email <row's email>`;
+    `[harness] accounts = \"off\"`, `logins = \"off\"` or `enabled = false` turns this off). Every other row stays as it is until a person runs `accounts renew <label>`
+    (`accounts login <label>` for a row with no email), or a session here runs on it and
+    loses its login. A report says whose a row is where its source names only other Macs for
+    its account, and `aterm ai login` leaves such a row for a person to name.
     `accounts renew --due` keeps the same rule and spacing, and the fact menu's rotation
     signs in only the account a person picked. Its routes: the mailbox
     (`<state>/accounts/mailbox`, or a mailbox file), a stored browser profile in a headless
@@ -2289,8 +2299,9 @@ pub(super) struct Launch<'a> {
     /// row signs in with nobody here ([`rows_no_route_signs_in`]).
     host: Option<&'a dyn AccountsHost>,
     /// The rows whose accounts its source gives other Macs alone, each with the first of them
-    /// ([`super::accounts_sync::rows_of_other_macs`]), where a report has read them.
-    other_macs: Option<&'a BTreeMap<String, String>>,
+    /// ([`super::accounts_sync::rows_of_other_macs`]), and those whose source this Mac cannot
+    /// compare, where a report has read them.
+    other_macs: Option<&'a accounts::OtherMacs>,
 }
 
 impl<'a> Launch<'a> {
@@ -2317,7 +2328,23 @@ impl<'a> Launch<'a> {
 
     /// The Mac `label`'s account belongs to, where the report read it is another's.
     fn holder_of(&self, label: &str) -> Option<&'a str> {
-        self.other_macs?.get(label).map(String::as_str)
+        self.other_macs?.named.get(label).map(String::as_str)
+    }
+
+    /// [`Self::holder_of`] for what a report tells a person to do: `None` where a session here runs
+    /// on the row with its login signed out, since the session door signs that row in here
+    /// whatever its source says ([`super::sign_in_ladder::session_signed_out`]).
+    fn holder_unless_session(
+        &self,
+        label: &str,
+        roster: &Roster,
+        state: &accounts::State,
+    ) -> Option<&'a str> {
+        self.holder_of(label).filter(|_| {
+            !roster
+                .row(label)
+                .is_some_and(|row| super::sign_in_ladder::session_signed_out(row, state))
+        })
     }
 }
 
@@ -3317,9 +3344,19 @@ fn person_sign_in(cli: Cli, label: &str) -> SignIn {
     SignIn::asked_sign_in(AskedSignIn(cli, label.to_owned()))
 }
 
-/// What `accounts renew` says of a row it found due that no door admits by the time it starts.
-const NO_LONGER_DUE: &str = "no longer one this machine signs in by itself (no session here runs on \
-     it, and it is not a due login this machine used within a week); nothing was run";
+/// What `accounts renew` says of a row it found due that no door admits by the time it starts,
+/// with the reason the doors' own inputs give ([`super::sign_in_ladder::upkeep_waits_because`]).
+fn no_longer_due(
+    row: Option<&accounts::Row>,
+    state: &accounts::State,
+    others: &accounts::OtherMacs,
+    now: i64,
+) -> String {
+    let because = row.map_or("it is not in the roster", |row| {
+        super::sign_in_ladder::upkeep_waits_because(row, state, others, now)
+    });
+    format!("no longer one this machine signs in by itself ({because}); nothing was run")
+}
 
 /// The sign-in a person's `accounts renew` starts for `label`: their own where they named it
 /// (`named`), else the upkeep's doors over the `records` it read (a row a session here runs on
@@ -3329,17 +3366,20 @@ fn renew_sign_in(
     cli: Cli,
     label: &str,
     named: bool,
-    (roster, logins, state): (&Roster, &accounts::Logins, &accounts::State),
+    (roster, logins, state, others): (
+        &Roster,
+        &accounts::Logins,
+        &accounts::State,
+        &accounts::OtherMacs,
+    ),
     now: i64,
 ) -> Option<SignIn> {
     if named {
         return Some(person_sign_in(cli, label));
     }
     let row = roster.row(label)?;
-    SignIn::session_sign_in(cli, row, state).or_else(|| {
-        let enrolled = accounts::enrolled_for(cli, roster);
-        SignIn::renewal_sign_in(cli, label, (roster, logins, state, &enrolled), now)
-    })
+    SignIn::session_sign_in(cli, row, state)
+        .or_else(|| SignIn::renewal_sign_in(cli, row, (logins, state, others), now))
 }
 
 /// The words for a sign-in `accounts renew --due` leaves for later because another account's
@@ -4209,8 +4249,14 @@ fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
         .not
         .iter()
         .map(|(label, why)| match why {
-            NotNext::Pool(accounts::WhyNot::NotEnrolled) if other_macs.contains_key(label) => {
-                let holder = other_macs.get(label).map_or("", String::as_str);
+            // A session here that runs on it is this Mac's use of it: the session door signs it in.
+            NotNext::Pool(accounts::WhyNot::NotEnrolled)
+                if other_macs.named.contains_key(label)
+                    && !roster.row(label).is_some_and(|row| {
+                        super::sign_in_ladder::session_signed_out(row, &state)
+                    }) =>
+            {
+                let holder = other_macs.named.get(label).map_or("", String::as_str);
                 let renew = Step::Renew(Cli::Claude, label.to_owned());
                 format!(
                     "{label}: not-enrolled ({})",
@@ -4231,8 +4277,14 @@ fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
             NotNext::Pool(accounts::WhyNot::NotEnrolled)
                 if roster.row(label).is_some_and(|row| row.email.is_some()) =>
             {
+                // A session here ran on it, so its login was made here and went.
+                let gone = if accounts::ran_here_ever(&state, label) {
+                    "its login here has gone"
+                } else {
+                    "no login made yet"
+                };
                 format!(
-                    "{label}: not-enrolled (no login made yet: `{}` signs it in)",
+                    "{label}: not-enrolled ({gone}: `{}` signs it in)",
                     Step::Renew(Cli::Claude, label.to_owned())
                 )
             }
@@ -7735,7 +7787,7 @@ impl AccountsHost for LiveAccounts {
                 Some(Path::new(super::login_drive::SANDBOX_EXEC)),
             ),
         )?;
-        terminal_run(cmd)
+        person_flow(cmd)
     }
 
     fn window_browser(&self) -> Option<PathBuf> {
@@ -8088,10 +8140,11 @@ fn renew_flow_of(
     if let Some(within) = within {
         return RenewalExit::from_capture(capture_unattended_renewal(cmd, within)?);
     }
-    terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
-        .map(exit_code)
+    // A person's sign-in on this terminal waits for them, unbounded, as Claude Code's own paste
+    // prompt does.
+    person_flow(cmd)
         .map(RenewalExit::from)
-        .map_err(|e| RenewalFailure::from(e.to_string()))
+        .map_err(RenewalFailure::from)
 }
 
 /// A failed provider run and the safe browser outcome recorded before it ended.
@@ -8134,19 +8187,81 @@ impl std::fmt::Display for RenewalFailure {
     }
 }
 
-/// Retain the opener's validated outcome even when the bounded provider run fails.
+/// Run one unattended renewal's provider (`claude auth login`), bounded by `within`, and retain
+/// its opener's validated outcome even when the run fails. Claude Code allows the run no end of
+/// its own: it waits at its paste prompt once its opener gives up (MEASURED,
+/// `docs/measured/mailbox-signin-cloudflare-2026-11-01.md`). So the run is an owned capture
+/// ([`super::align::capture_bounded_owned`]): `within` ends it, and so does every other way the
+/// wait for it stops, this process's own end included; on Unix, so does the failure its opener
+/// records in its outcome file ([`super::align::capture_bounded_owned_watching`]).
 pub(super) fn capture_unattended_renewal(
     cmd: aterm_uds::spawnfd::Command,
     within: std::time::Duration,
 ) -> Result<(super::align::Captured, Option<super::open_url::Met>), RenewalFailure> {
-    capture_unattended_renewal_with(cmd, |cmd| {
-        super::align::capture_bounded(cmd, within, MAX_AUTH_STDOUT)
+    capture_unattended_renewal_with(cmd, |cmd, outcome| {
+        #[cfg(unix)]
+        {
+            let Some(outcome) = outcome else {
+                return super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT);
+            };
+            match super::align::capture_bounded_owned_watching(
+                cmd,
+                within,
+                MAX_AUTH_STDOUT,
+                || super::open_url::read_failed_outcome(outcome).is_some(),
+            )? {
+                super::align::Ended::Exited(ran) => Ok(ran),
+                super::align::Ended::Stopped => {
+                    Err("its browser opener failed before authorization completed".to_owned())
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = outcome;
+            super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT)
+        }
     })
+}
+
+/// TEST SEAM: one renewal's run of `program`, a stand-in for `claude`, in the staging home
+/// `home`, as [`renew_flow_of`] runs it: bounded by `within` as a renewal with no terminal runs
+/// it, or, with none, waited for as a person's sign-in on their terminal is. Its exit code, or
+/// why it has none. For a test in another crate whose stand-in starter ends while the run waits.
+///
+/// # Errors
+///
+/// Why the run gave no exit code: it would not start, or `within` ended it.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn renewal_run(
+    program: &Path,
+    home: &Path,
+    within: Option<std::time::Duration>,
+) -> Result<i32, String> {
+    let user_home = home.as_os_str().to_owned();
+    renew_flow_of(
+        program.as_os_str(),
+        &home.to_string_lossy(),
+        "stand-in@example.invalid",
+        &RenewBrowser::Remote { opener: None },
+        &|name| match name {
+            "HOME" => Some(user_home.clone()),
+            "USER" => Some(OsString::from("stand-in")),
+            _ => None,
+        },
+        within,
+    )
+    .map(|exit| exit.code)
+    .map_err(|failure| failure.to_string())
 }
 
 fn capture_unattended_renewal_with(
     mut cmd: aterm_uds::spawnfd::Command,
-    capture: impl FnOnce(aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String>,
+    capture: impl FnOnce(
+        aterm_uds::spawnfd::Command,
+        Option<&Path>,
+    ) -> Result<super::align::Captured, String>,
 ) -> Result<(super::align::Captured, Option<super::open_url::Met>), RenewalFailure> {
     let outcome = aterm_tempfile::tempdir()
         .ok()
@@ -8155,7 +8270,7 @@ fn capture_unattended_renewal_with(
     if let Some((path, _)) = &outcome {
         cmd.env(super::open_url::OUTCOME_ENV, path);
     }
-    let ran = capture(cmd);
+    let ran = capture(cmd, outcome.as_ref().map(|(path, _)| path.as_path()));
     let met = outcome
         .as_ref()
         .and_then(|(path, _)| super::open_url::read_outcome(path));
@@ -8228,13 +8343,29 @@ fn login_command(program: &std::ffi::OsStr, dir: Option<&str>) -> aterm_uds::spa
 }
 
 fn login_flow_of(program: &std::ffi::OsStr, dir: Option<&str>) -> Result<i32, String> {
+    person_flow(login_command(program, dir))
+}
+
+/// One sign-in on this terminal, a person's, waited for as long as they take, as
+/// [`terminal_flow`] waits: tied to this process ([`super::align::tie`]), so an `aterm` killed,
+/// quit or replaced in place while it waits leaves no sign-in waiting on the terminal for a code
+/// nobody will paste. Its exit code, or why it has none.
+fn person_flow(mut cmd: aterm_uds::spawnfd::Command) -> Result<i32, String> {
+    super::align::tie(&mut cmd)?;
     terminal_flow(
-        || login_command(program, dir).spawn(),
-        |mut child| child.wait(),
+        || {
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            if let Err(why) = super::align::tie_held() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(why);
+            }
+            Ok(child)
+        },
+        |mut child| child.wait().map_err(|e| e.to_string()),
         || {},
     )
     .map(exit_code)
-    .map_err(|e| e.to_string())
 }
 
 /// One run of `cmd` on this terminal, waited for as [`login_flow_of`] waits: the AI CLIs' sign-in flows (`crate::ai::login`).
@@ -9046,19 +9177,19 @@ struct AccountsNext {
 /// in aterm.toml (`mode`, [`SupervisorConfig::accounts_for`], which is off where the harness or
 /// `cli` is switched off, as a launch reads it: [`super::accounts_pool::Seat::mode_for`]), what
 /// there turns rotation off where it is off (`off_by`, [`SupervisorConfig::accounts_off_by`], or
-/// why aterm.toml is not valid TOML, whose lines are read one by one), whether the CLI's login is
+/// why no setting can be named, [`OffUnnamed`]), whether the CLI's login is
 /// kept in the OS keyring (`keyring`, [`super::accounts_pool::keyring_held_in`]), and the switch
 /// there that keeps aterm's unattended sign-ins of the CLI off (`sign_ins_off`,
-/// [`super::accounts_sync::sign_ins_off_under`]), whether aterm.toml lets a weekly-limit handoff run
+/// [`super::accounts_sync::sign_ins_off_for`]), whether aterm.toml lets a weekly-limit handoff run
 /// (`handoff_allowed`, [`super::codex_rotation::policy_allows_handoff`]), the address the default
 /// login names (`default_login`, [`accounts::default_login_address`]), and where that login names
 /// one, the environment a sync with no source named would read under (`sync_env`, [`twin_verdict`]).
 struct Rotation {
     mode: accounts::Mode,
-    off_by: Result<Vec<crate::supervise::config::AccountsOff>, String>,
+    off_by: Result<Vec<crate::supervise::config::OffSetting>, OffUnnamed>,
     keyring: bool,
     home: Option<PathBuf>,
-    sign_ins_off: Option<&'static str>,
+    sign_ins_off: Option<String>,
     handoff_allowed: bool,
     default_login: Option<String>,
     sync_env: Option<Env>,
@@ -9075,16 +9206,19 @@ impl Rotation {
         home: Option<&Path>,
     ) -> Rotation {
         let mode = policy.accounts_for(cli.program());
+        // Read as `policy` was ([`SupervisorConfig::from_path`]): a file that reader refuses
+        // turns the harness off whatever it says.
         let off_by = match config {
             Some(path) if mode == accounts::Mode::Off => {
-                super::ai_pool::read_bounded_bytes(path, 2 * 1024 * 1024)
-                    .map(|bytes| {
-                        SupervisorConfig::accounts_off_by(
-                            &String::from_utf8_lossy(&bytes),
-                            cli.program(),
-                        )
-                    })
-                    .unwrap_or(Ok(Vec::new()))
+                match aterm_types::dirs::read_aterm_config(path) {
+                    Ok(Some(bytes)) => SupervisorConfig::accounts_off_by(
+                        &String::from_utf8_lossy(&bytes),
+                        cli.program(),
+                    )
+                    .map_err(OffUnnamed::NotToml),
+                    Ok(None) => Ok(Vec::new()),
+                    Err(why) => Err(OffUnnamed::Unread(why.to_string())),
+                }
             }
             _ => Ok(Vec::new()),
         };
@@ -9094,7 +9228,7 @@ impl Rotation {
             keyring: cli == Cli::Codex
                 && home.is_none_or(|home| super::accounts_pool::keyring_held_in(cli, home)),
             home: home.map(Path::to_path_buf),
-            sign_ins_off: super::accounts_sync::sign_ins_off_under(policy, cli),
+            sign_ins_off: config.and_then(|path| super::accounts_sync::sign_ins_off_for(path, cli)),
             handoff_allowed: super::codex_rotation::policy_allows_handoff(policy, warnings),
             default_login: home.and_then(|home| accounts::default_login_address(cli, home)),
             sync_env: None,
@@ -10065,19 +10199,39 @@ fn off_next(
     }
 }
 
+/// Why the `rotation off:` line names no setting of aterm.toml ([`Rotation`]'s `off_by`).
+enum OffUnnamed {
+    /// It is not valid TOML, whose lines are read one by one: where the parser stopped and why
+    /// ([`SupervisorConfig::accounts_off_by`]).
+    NotToml(String),
+    /// It cannot be read, or its reader refuses it ([`aterm_types::dirs::read_aterm_config`]),
+    /// which turns the harness off ([`SupervisorConfig::from_path`]): why.
+    Unread(String),
+}
+
 /// What in aterm.toml turns rotation off (`off_by`, [`SupervisorConfig::accounts_off_by`]), as
 /// the `rotation off:` line leads with it, and how to turn rotation back on (led by `; `), where
 /// the report can say: `"early"` or `"wall"` in place of `[harness] accounts` where that is all
 /// that turns it off, else each setting gone. Where aterm.toml is not valid TOML, whose lines are
 /// read one by one, it says so, with the parser's reason, and that the line names the setting
-/// once the file is valid; where nothing else is named it says no more than that rotation is off.
+/// once the file is valid; where it cannot be read it says so and why, which turns the harness
+/// off whatever the file says; where nothing else is named it says no more than that rotation is
+/// off.
 fn off_by_words(
-    off_by: &Result<Vec<crate::supervise::config::AccountsOff>, String>,
+    off_by: &Result<Vec<crate::supervise::config::OffSetting>, OffUnnamed>,
 ) -> (String, String) {
-    use crate::supervise::config::AccountsOff;
+    use crate::supervise::config::OffSetting;
     let off_by = match off_by {
         Ok(off_by) => off_by.as_slice(),
-        Err(why) => {
+        Err(OffUnnamed::Unread(why)) => {
+            return (
+                format!("aterm.toml cannot be read ({why}), which turns the harness off"),
+                "; once it can be read, this line names what in it turns rotation off, if \
+                 anything does"
+                    .to_string(),
+            );
+        }
+        Err(OffUnnamed::NotToml(why)) => {
             return (
                 format!(
                     "aterm.toml is not valid TOML ({why}), and its lines, read one by one, turn \
@@ -10090,7 +10244,7 @@ fn off_by_words(
     };
     match off_by {
         [] => ("aterm.toml turns rotation off".to_string(), String::new()),
-        [only @ AccountsOff::Harness(_)] => (
+        [only] if only.is_harness_accounts() => (
             format!("{} in aterm.toml", only.words()),
             "; `\"early\"` (the default) or `\"wall\"` there turns rotation back on".to_string(),
         ),
@@ -10103,7 +10257,7 @@ fn off_by_words(
             format!(
                 "{} in aterm.toml",
                 many.iter()
-                    .map(AccountsOff::words)
+                    .map(OffSetting::words)
                     .collect::<Vec<_>>()
                     .join(" and ")
             ),
@@ -10146,10 +10300,13 @@ fn not_next_phrase(
     if let Some(until) = state.accounts.get(label).and_then(|a| a.limited_until(now)) {
         return format!("{word} (limited until {})", rfc3339_utc(until));
     }
-    let gone = if matches!(pool_why, accounts::WhyNot::NotEnrolled) {
-        "no login made yet"
-    } else {
-        "no current login"
+    let gone = match pool_why {
+        // A session here ran on it, so its login was made here and has gone.
+        accounts::WhyNot::NotEnrolled if accounts::ran_here_ever(state, label) => {
+            "its login here has gone"
+        }
+        accounts::WhyNot::NotEnrolled => "no login made yet",
+        _ => "no current login",
     };
     let row = roster.row(label);
     if let Some(custody) = row.and_then(|row| shared_custody_words(cli, row, logins)) {
@@ -10158,7 +10315,13 @@ fn not_next_phrase(
     let addressed = row.is_some_and(|row| row.email.is_some());
     let verb = cli.sign_in_verb(addressed);
     let sign_in_of_row = Step::sign_in(cli, label, addressed);
-    if let Some(holder) = signing.other_macs.and_then(|rows| rows.get(label)) {
+    // A session here that runs on it is this Mac's use of it: the session door signs it in.
+    let session_here = row.is_some_and(|row| super::sign_in_ladder::session_signed_out(row, state));
+    if let Some(holder) = signing
+        .other_macs
+        .and_then(|rows| rows.named.get(label))
+        .filter(|_| !session_here)
+    {
         return format!(
             "{word} ({gone}: {})",
             another_macs_words(holder, &sign_in_of_row)
@@ -10191,15 +10354,24 @@ fn not_next_phrase(
              signs it in)"
         );
     }
-    let session_runs_on_it =
-        row.is_some_and(|row| super::sign_in_ladder::session_signed_out(row, state));
+    let no_others = accounts::OtherMacs::NONE;
+    let others = signing.other_macs.unwrap_or(&no_others);
+    let waits_because = match row {
+        Some(row) if super::sign_in_ladder::upkeep_signs_in(row, (logins, state, others), now) => {
+            None
+        }
+        Some(row) => Some(super::sign_in_ladder::upkeep_waits_because(
+            row, state, others, now,
+        )),
+        None => Some("it is not in the roster"),
+    };
     match signing.no_route.map(|rows| rows.contains(label)) {
-        Some(false) if session_runs_on_it => {
-            format!("{word} ({gone}: aterm signs it in by itself, and {renew} runs that now)")
-        }
-        Some(false) => {
-            format!("{word} ({gone}: no session here runs on it, so it waits for {renew})")
-        }
+        Some(false) => match waits_because {
+            None => {
+                format!("{word} ({gone}: aterm signs it in by itself, and {renew} runs that now)")
+            }
+            Some(because) => format!("{word} ({gone}: {because}, so it waits for {renew})"),
+        },
         Some(true) => format!(
             "{word} ({gone}: no route signs it in with nobody at this Mac, so {renew} needs a \
              terminal here, and `{}` gives it a route)",
@@ -10219,10 +10391,10 @@ struct SignInFacts<'a> {
     /// The Codex a launch runs keeps no row's login its own ([`super::codex_alab::auth_path_unread`]),
     /// so the row on the default login signs in by Codex's own sign-in there.
     default_only: bool,
-    off: Option<&'static str>,
+    off: Option<&'a str>,
     no_route: Option<&'a BTreeSet<String>>,
     /// [`Launch::other_macs`].
-    other_macs: Option<&'a BTreeMap<String, String>>,
+    other_macs: Option<&'a accounts::OtherMacs>,
 }
 
 /// What a report says of a row whose account its source gives another Mac
@@ -10288,6 +10460,25 @@ fn rows_no_route_signs_in(
         }
         _ => Some(BTreeSet::new()),
     }
+}
+
+/// The rows of Claude Code's `records` with no login here that no route signs in with nobody at
+/// this Mac, judged on `host` ([`rows_no_route_signs_in`], `enrolled` the logins made here): what
+/// a sync's receipt reads before it promises a sign-in by itself.
+pub(super) fn claude_rows_no_route(
+    env: &Env,
+    host: &dyn AccountsHost,
+    records: &accounts::AccountRecords,
+    enrolled: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    rows_no_route_signs_in(
+        (Cli::Claude, Launch::on(host)),
+        env,
+        &records.roster,
+        &records.raw_roster,
+        (&records.state, &records.logins),
+        enrolled,
+    )
 }
 
 /// Whether a sign-in of `row` runs `cli`'s own program, which has to be here
@@ -10519,7 +10710,7 @@ fn accounts_text(
                             && launch.program.is_some_and(|program| {
                                 super::codex_alab::auth_path_unread(program).is_some()
                             }),
-                        off: rotation.sign_ins_off,
+                        off: rotation.sign_ins_off.as_deref(),
                         no_route,
                         other_macs: launch.other_macs,
                     },
@@ -10563,7 +10754,7 @@ fn accounts_text(
         });
     }
     let to_sign_in = next.not.iter().any(|(label, why)| {
-        launch.holder_of(label).is_none()
+        launch.holder_unless_session(label, roster, state).is_none()
             && matches!(
                 why,
                 NotNext::Pool(accounts::WhyNot::NotEnrolled | accounts::WhyNot::SignedOut)
@@ -10689,7 +10880,9 @@ fn sign_in_needed(
     here: bool,
     now: i64,
 ) -> Option<String> {
-    if launch.holder_of(&row.label).is_some() {
+    if launch.holder_of(&row.label).is_some()
+        && !super::sign_in_ladder::session_signed_out(row, read.0)
+    {
         return None;
     }
     let step = sign_in_step(cli, (row, raw), read, here, now)?;
@@ -12039,12 +12232,12 @@ fn signin_records_ready(
     }
 }
 
-/// The machine's sign-in lock for `label`, or why not. An automatic sign-in that holds it ends by
-/// itself, within [`LONGEST_SIGN_IN_S`], so a person at a terminal waits for it, told so once;
-/// anyone else is told `held` at once. The second value says a person waited: the sign-in they
-/// outlasted can have moved the records, so the caller reads them again, or its policy check
-/// refuses a row that only changed under the wait. A capture no one waited on stands, and so does
-/// that refusal.
+/// The machine's sign-in lock for `label`, or why not. A person at a terminal
+/// retries its bounded take within the existing sign-in budget; other callers
+/// keep their one bounded take. The second value says the immediate take was
+/// contended, regardless of who called: the sign-in that ended can have moved
+/// the records, so the caller reads them again and retains its policy checks.
+/// An uncontended capture stands, as does a policy refusal after the reread.
 fn signin_guard(
     store: &accounts::Store,
     host: &dyn AccountsHost,
@@ -12074,7 +12267,8 @@ fn signin_guard(
 }
 
 /// [`accounts::Store::signin_within`], tried again for a person at a terminal for as long as the
-/// sign-in that holds the lock can run, with whether a person waited for it ([`signin_guard`]).
+/// sign-in that holds the lock can run, with whether the immediate take was contended
+/// ([`signin_guard`]).
 fn signin_lock(
     store: &accounts::Store,
     host: &dyn AccountsHost,
@@ -12098,7 +12292,7 @@ fn signin_lock(
                     );
                 }
             }
-            taken => return taken.map(|lock| lock.map(|lock| (lock, person))),
+            taken => return taken.map(|lock| lock.map(|lock| (lock, true))),
         }
     }
     Ok(None)
@@ -12485,7 +12679,7 @@ struct UseHere<'a> {
 /// What a row in shared custody takes where it has no login: only a root's decision renews it
 /// (`logins.shared.required`), so a sign-in here is never its step; `None` for a row
 /// in no such custody. A custody that cannot be read says that, as the sign-in itself refuses.
-fn shared_custody_words(
+pub(super) fn shared_custody_words(
     cli: Cli,
     row: &accounts::Row,
     logins: &accounts::Logins,
@@ -13790,9 +13984,11 @@ fn run_accounts_renew(
             )
         })
     };
+    // The rows whose account the source gives to other Macs alone: `--due` signs none in, as the
+    // upkeep does not ([`accounts::renewal_due`]).
+    let others = super::accounts_sync::rows_of_other_macs(Cli::Claude, env, &file_roster, &logins);
     if due {
-        let enrolled = accounts::enrolled(&roster);
-        let due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
+        let due_labels = accounts::renew_due(&roster, &logins, &state, &others, now);
         for label in &due_labels {
             if !chosen.contains(label) {
                 chosen.push(label.clone());
@@ -13807,8 +14003,12 @@ fn run_accounts_renew(
         if !has_non_limited_due {
             // What a session here needs now (its own login signed out, a due login it used), as
             // the upkeep reads it, never a row nobody here runs on.
-            let candidates =
-                super::accounts_sync::needed_renew_candidates(&file_roster, &state, &logins, now);
+            let candidates = super::accounts_sync::needed_renew_candidates(
+                &file_roster,
+                &state,
+                (&logins, &others),
+                now,
+            );
             let target = candidates
                 .iter()
                 .find(|r| {
@@ -13890,18 +14090,22 @@ fn run_accounts_renew(
             ok = false;
             continue;
         };
+        let attempt_rows = accounts::bound(&file_roster, &attempt_logins);
+        let attempt_others = super::accounts_sync::rows_of_other_macs(
+            Cli::Claude,
+            env,
+            &file_roster,
+            &attempt_logins,
+        );
         let Some(sign_in) = renew_sign_in(
             Cli::Claude,
             label,
             labels.contains(label),
-            (
-                &accounts::bound(&file_roster, &attempt_logins),
-                &attempt_logins,
-                &state,
-            ),
+            (&attempt_rows, &attempt_logins, &state, &attempt_others),
             now,
         ) else {
-            let _ = writeln!(out, "{label}: {NO_LONGER_DUE}");
+            let said = no_longer_due(attempt_rows.row(label), &state, &attempt_others, now);
+            let _ = writeln!(out, "{label}: {said}");
             continue;
         };
         if let Some(words) = spaced_words(&sign_in, &store, now) {
@@ -15589,9 +15793,11 @@ fn run_accounts_renew_for(
             Some(_) => {}
         }
     }
+    // The rows whose account the source gives to other Macs alone: `--due` signs none in, as the
+    // upkeep does not ([`accounts::renewal_due`]).
+    let others = super::accounts_sync::rows_of_other_macs(cli, env, &file_roster, &logins);
     if due {
-        let enrolled = accounts::enrolled_for(cli, &roster);
-        let mut due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
+        let mut due_labels = accounts::renew_due(&roster, &logins, &state, &others, now);
         due_labels.sort_by_key(|label| {
             (
                 file_roster.row(label).and_then(|raw| {
@@ -15617,7 +15823,7 @@ fn run_accounts_renew_for(
                 Some(&store),
                 &file_roster,
                 &state,
-                &logins,
+                (&logins, &others),
                 now,
             );
             if let Some(target) = candidates.first()
@@ -15656,14 +15862,17 @@ fn run_accounts_renew_for(
         let Some(row) = attempt_rows.row(label) else {
             continue;
         };
+        let attempt_others =
+            super::accounts_sync::rows_of_other_macs(cli, env, &file_roster, &attempt_logins);
         let Some(sign_in) = renew_sign_in(
             cli,
             label,
             labels.contains(label),
-            (&attempt_rows, &attempt_logins, &state),
+            (&attempt_rows, &attempt_logins, &state, &attempt_others),
             now,
         ) else {
-            let _ = writeln!(out, "{label}: {NO_LONGER_DUE}");
+            let said = no_longer_due(Some(row), &state, &attempt_others, now);
+            let _ = writeln!(out, "{label}: {said}");
             continue;
         };
         if let Some(words) = spaced_words(&sign_in, &store, now) {
@@ -16360,6 +16569,7 @@ pub fn run_accounts(
             json,
         } => super::accounts_sync::run_accounts_sync(
             env,
+            Some(host),
             source.as_deref(),
             machine.as_deref(),
             *json,

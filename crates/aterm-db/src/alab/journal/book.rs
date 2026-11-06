@@ -267,6 +267,18 @@ pub(crate) fn content(row: &Value) -> Value {
     Value::Object(row)
 }
 
+fn same_content(stated: &Value, row: &Value) -> bool {
+    let (Some(stated), Some(row)) = (stated.as_object(), row.as_object()) else {
+        return false;
+    };
+    let row_len =
+        row.len() - usize::from(row.contains_key("n")) - usize::from(row.contains_key("period"));
+    stated.len() == row_len
+        && stated
+            .iter()
+            .all(|(k, v)| !matches!(k.as_str(), "n" | "period") && row.get(k) == Some(v))
+}
+
 /// What this Mac states about itself in its `sum` row (design §4.17), read by the caller.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Presence {
@@ -350,14 +362,22 @@ pub(crate) struct Planned {
 }
 
 /// Whether `changes` fit one flush record: at most 64 changes and 60 KiB of payload.
-fn fits(changes: &[Change]) -> bool {
-    changes.len() <= MAX_WRITES
-        && Command::Write {
-            request: [0; 16],
-            changes: changes.to_vec(),
-        }
+fn fits(changes: &mut Vec<Change>) -> bool {
+    if changes.len() > MAX_WRITES {
+        return false;
+    }
+    let command = Command::Write {
+        request: [0; 16],
+        changes: std::mem::take(changes),
+    };
+    let ok = command
         .encode()
-        .is_ok_and(|payload| payload.len() <= caps::RECORD)
+        .is_ok_and(|payload| payload.len() <= caps::RECORD);
+    let Command::Write { changes: kept, .. } = command else {
+        unreachable!()
+    };
+    *changes = kept;
+    ok
 }
 
 /// `outbox` with `absorbed` added, each event once, oldest first, those older than 30 days and
@@ -508,12 +528,15 @@ impl Book {
     pub(crate) fn uses_due(&self, n: u64, period: u64, now: u64) -> Result<Vec<(Pk, Value)>> {
         let mut due = Vec::new();
         for (pk, facts) in &self.accounts {
-            let row = facts.use_row(n, period, now, caps::USE_ROW)?;
             let said = facts.stated.as_ref();
-            let changed = said.is_none_or(|s| s.value != content(&row))
-                && said.is_none_or(|s| now >= s.at.saturating_add(USE_EVERY));
             let carry = said.is_some_and(|s| s.period < period)
                 && facts.used.saturating_add(CARRY_S) >= now;
+            let eligible = said.is_none_or(|s| now >= s.at.saturating_add(USE_EVERY));
+            if !carry && !eligible {
+                continue;
+            }
+            let row = facts.use_row(n, period, now, caps::USE_ROW)?;
+            let changed = eligible && said.is_none_or(|s| !same_content(&s.value, &row));
             if changed || carry {
                 due.push((*pk, row));
             }
@@ -588,6 +611,12 @@ impl Book {
     pub(crate) fn places_due(&self, n: u64, period: u64, now: u64) -> Vec<(Pk, Value)> {
         let mut due = Vec::new();
         for (pk, place) in &self.places {
+            let said = place.stated.as_ref();
+            let carry = !place.ended && said.is_some_and(|s| s.period < period);
+            let eligible = said.is_none_or(|s| now >= s.at.saturating_add(USE_EVERY));
+            if !carry && !eligible {
+                continue;
+            }
             let until = if place.ended {
                 place.until
             } else {
@@ -595,10 +624,7 @@ impl Book {
             };
             let row = json!({"r": VERSION, "n": n, "why": place.why.word(),
                 "since": place.since, "until": until});
-            let said = place.stated.as_ref();
-            let changed = said.is_none_or(|s| s.value != content(&row))
-                && said.is_none_or(|s| now >= s.at.saturating_add(USE_EVERY));
-            let carry = !place.ended && said.is_some_and(|s| s.period < period);
+            let changed = eligible && said.is_none_or(|s| !same_content(&s.value, &row));
             if changed || carry {
                 due.push((*pk, row));
             }
@@ -618,13 +644,16 @@ impl Book {
     ) -> Result<Vec<(u8, Value)>> {
         let mut due = Vec::new();
         for bucket in heard.duty(me) {
+            let said = self.relays.get(&bucket);
+            let carry = said.is_some_and(|s| s.period < period);
+            let eligible = said.is_none_or(|s| now >= s.at.saturating_add(ROUTINE_S));
+            if !carry && !eligible {
+                continue;
+            }
             let Some(row) = heard.row(bucket, n, period, caps::RELAY_ROW)? else {
                 continue;
             };
-            let said = self.relays.get(&bucket);
-            let changed = said.is_none_or(|s| s.value != content(&row))
-                && said.is_none_or(|s| now >= s.at.saturating_add(ROUTINE_S));
-            let carry = said.is_some_and(|s| s.period < period);
+            let changed = eligible && said.is_none_or(|s| !same_content(&s.value, &row));
             if changed || carry {
                 due.push((bucket, row));
             }
@@ -706,20 +735,22 @@ impl Book {
             ..Planned::default()
         };
         let outbox = if off { &[] } else { outbox };
-        let values: Vec<Value> = outbox.iter().map(Event::to_value).collect();
-        let batch = |kept: &[Value]| json!({"r": VERSION, "n": n, "e": kept});
-        let events = fit(&values, caps::EV_BATCH, batch)?;
-        if events > 0 {
-            planned.changes.push(Change {
-                collection: super::EV.name.into(),
-                key: format!("{uuid}.{n}"),
-                value: Some(batch(&values[..events])),
-            });
-            planned.events = events;
+        if !outbox.is_empty() {
+            let values: Vec<Value> = outbox.iter().map(Event::to_value).collect();
+            let batch = |kept: &[Value]| json!({"r": VERSION, "n": n, "e": kept});
+            let events = fit(&values, caps::EV_BATCH, batch)?;
+            if events > 0 {
+                planned.changes.push(Change {
+                    collection: super::EV.name.into(),
+                    key: format!("{uuid}.{n}"),
+                    value: Some(batch(&values[..events])),
+                });
+                planned.events = events;
+            }
         }
         let offer = |planned: &mut Planned, change: Change| {
             planned.changes.push(change);
-            let fit = fits(&planned.changes);
+            let fit = fits(&mut planned.changes);
             if !fit {
                 planned.changes.pop();
             }
@@ -767,7 +798,7 @@ impl Book {
                 planned.relays.push((bucket, row));
             }
         }
-        if !fits(&planned.changes) {
+        if !fits(&mut planned.changes) {
             return Err(Error::new("a journal flush record passes its limits"));
         }
         Ok(planned)

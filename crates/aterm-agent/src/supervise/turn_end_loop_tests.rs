@@ -59,6 +59,9 @@ mod point_key_loop;
 #[path = "custody_loop_tests.rs"]
 mod custody_loop;
 
+#[path = "managed_taskless_loop_tests.rs"]
+mod managed_taskless_loop;
+
 #[path = "restart_claim_loop_tests.rs"]
 mod restart_claim_loop;
 
@@ -34922,6 +34925,94 @@ fn an_act_typed_at_a_down_point_leaves_no_reach_hold_for_the_breaks_after_it() {
     );
     drop(s);
     assert_eq!(count(&m, "@s-1 turn"), 1, "{:#?}", m.requests);
+}
+
+/// A host whose repository and left reads are counted: the left read answers one row of the
+/// agent's at the first ask and none after it, as once the agent ended it.
+#[derive(Debug, Default)]
+struct ReadsHost {
+    repo_asks: std::sync::atomic::AtomicUsize,
+    left_asks: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadsHost {
+    fn asks(&self) -> (usize, usize) {
+        (
+            self.repo_asks.load(Ordering::SeqCst),
+            self.left_asks.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl IdleHost for ReadsHost {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn repo_work(&self) -> Option<RepoRead> {
+        self.repo_asks.fetch_add(1, Ordering::SeqCst);
+        Some(RepoRead::Clean)
+    }
+    fn leftover(&self) -> Option<crate::harness::leftover::LeftRead> {
+        let first = self.left_asks.fetch_add(1, Ordering::SeqCst) == 0;
+        let row = crate::harness::leftover::token_of("2606@1792098840004410:3").expect("a token");
+        Some(crate::harness::leftover::LeftRead::Rows(
+            first.then_some(row).into_iter().collect(),
+        ))
+    }
+}
+
+/// AN ACT TYPED SPENDS THE HOST'S REPOSITORY AND LEFT READS: a done claim's point read again with
+/// no turn seen, its words the same, takes the answers its first read got; once an act is typed
+/// there, its answer is a new yield, so the same words said in a turn the loop saw no work of
+/// (no busy frame, no done row) are read again, and a process the agent ended in that turn is
+/// gone from the reading. NEGATIVE CONTROLS (run): with `turn_end_write`'s `self.left_seen =
+/// None` removed, "the act's answer reads the rows again" fails; with its `self.repo_seen = None`
+/// removed, "the act's answer reads the repository again" fails.
+#[test]
+fn an_act_typed_spends_the_hosts_repository_and_left_reads() {
+    let host = Arc::new(ReadsHost::default());
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut said = rows(&[
+        "⏺ Built, tested and landed the parser. All done; nothing left to do.",
+        "",
+    ]);
+    said.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    let mut m = Mock::new(vec![said; 6]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let read = s.screen().expect("the point's read");
+    let point = s.turn_of(read);
+    s.turn_end_at_point(&point, Some(Duration::from_secs(300)), &opts)
+        .expect("a decision");
+    assert_eq!(host.asks(), (1, 1), "the claim's point reads both");
+    s.turn_end_at_point(&point, None, &opts)
+        .expect("a decision");
+    assert_eq!(host.asks(), (1, 1), "the same point read again keeps them");
+    let mut heard = Heard::default();
+    let act = TurnEndAction::Type {
+        text: "Continue where you left off.".to_string(),
+        rule_id: RULE_CONTINUE,
+    };
+    s.turn_end_execute(&point, act, &opts, &[], &mut heard)
+        .expect("the act is typed");
+    s.turn_end_at_point(&point, None, &opts)
+        .expect("a decision");
+    let (repo, left) = host.asks();
+    assert_eq!(repo, 2, "the act's answer reads the repository again");
+    assert_eq!(left, 2, "the act's answer reads the rows again");
+    assert_eq!(
+        s.left_seen.as_ref().map(|(_, _, read)| read.clone()),
+        Some(crate::harness::leftover::LeftRead::Rows(Vec::new())),
+        "the row the agent ended holds nothing"
+    );
 }
 
 /// A RESTART MADE OR A DIALOG'S KEY PRESSED SPENDS THE POINT'S REACH READ, as a typed act does

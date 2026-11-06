@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use super::rules::{PRODUCT, TestCode};
+use super::rules::PRODUCT;
 use super::{Finding, Rule, SourceFile, Tree, is_word, joined};
 
 pub(super) const STOCK_LABEL: Rule = Rule {
@@ -141,7 +141,7 @@ type Kind = &'static str;
 
 fn stock_label(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let roots = target_roots(tree, out);
-    let test_code = TestCode::read_named(tree.corpus, PRODUCT, named_for_tests);
+    let test_code = tree.corpus.test_code();
     for file in tree.corpus.under(PRODUCT) {
         let found = if file.rel.contains("/fuzz/fuzz_targets/") {
             Some((0, "a cargo-fuzz target runs on stock nightly".to_string()))
@@ -163,16 +163,6 @@ fn stock_label(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             ));
         }
     }
-}
-
-/// Does `rel`'s path name test code: a file in a `tests` directory (a test target's, or a
-/// `tests` module's), a `tests.rs` or a `<name>_tests.rs`? Such a file, and one its parent
-/// declares test-only, is test code unless a shipped line loads it ([`TestCode::holds`]), so no
-/// channel it names selects anything shipped. A name that only opens with `test` says nothing:
-/// `testrun.rs` and `test_binary.rs` can ship.
-fn named_for_tests(rel: &str) -> bool {
-    let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-    dirs.split('/').any(|dir| dir == "tests") || name == "tests.rs" || name.ends_with("_tests.rs")
 }
 
 /// The root file of every Cargo target of a package the corpus holds a manifest for (each
@@ -217,13 +207,18 @@ fn target_roots(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, BTr
         let prefix = format!("{dir}/");
         let prefixes = [prefix.as_str()];
         for file in tree.corpus.under(&prefixes) {
-            let parts: Vec<&str> = file.rel[prefix.len()..].split('/').collect();
-            let kind = match parts.as_slice() {
-                ["src", "lib.rs"] => "lib",
-                ["src", "main.rs"] | ["src", "bin", _] | ["src", "bin", _, "main.rs"] => "bin",
-                ["tests", _] | ["tests", _, "main.rs"] => "test",
-                ["benches", _] | ["benches", _, "main.rs"] => "bench",
-                ["examples", _] | ["examples", _, "main.rs"] => "example",
+            let mut it = file.rel[prefix.len()..].split('/');
+            let kind = match (it.next(), it.next(), it.next(), it.next(), it.next()) {
+                (Some("src"), Some("lib.rs"), None, None, None) => "lib",
+                (Some("src"), Some("main.rs"), None, None, None)
+                | (Some("src"), Some("bin"), Some(_), None, None)
+                | (Some("src"), Some("bin"), Some(_), Some("main.rs"), None) => "bin",
+                (Some("tests"), Some(_), None, None, None)
+                | (Some("tests"), Some(_), Some("main.rs"), None, None) => "test",
+                (Some("benches"), Some(_), None, None, None)
+                | (Some("benches"), Some(_), Some("main.rs"), None, None) => "bench",
+                (Some("examples"), Some(_), None, None, None)
+                | (Some("examples"), Some(_), Some("main.rs"), None, None) => "example",
                 _ => continue,
             };
             if !targets.undiscovered.contains(&kind) {
@@ -376,11 +371,16 @@ fn default_of(code: &str, lit: Range<usize>) -> Option<String> {
     (ends && names_stock(name)).then(|| format!("{name}{sign}"))
 }
 
+fn contains_ignore_ascii_case(hay: &str, needle: &[u8]) -> bool {
+    hay.as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// Does this name (a binding's, a field's) name a toolchain (`stock`, `toolchain`,
 /// `rustup_channel`)?
 fn names_stock(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("stock") || names_toolchain(&name)
+    contains_ignore_ascii_case(name, b"stock") || names_toolchain(name)
 }
 
 /// The path of the call whose argument list holds byte `at` directly
@@ -412,8 +412,8 @@ fn enclosing_call(code: &str, at: usize) -> Option<&str> {
 /// `rustup`, `rustup_run`)?
 fn names_toolchain(path: &str) -> bool {
     path.split([':', '.']).any(|segment| {
-        let segment = segment.to_ascii_lowercase();
-        segment.contains("toolchain") || segment.contains("rustup")
+        contains_ignore_ascii_case(segment, b"toolchain")
+            || contains_ignore_ascii_case(segment, b"rustup")
     })
 }
 

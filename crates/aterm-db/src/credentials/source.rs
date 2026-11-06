@@ -15,23 +15,39 @@ use std::path::PathBuf;
 const PREFIX: &str = "credential-give-";
 const HEADER: usize = 4 + 16 + 16 + 8;
 
+fn name(network: [u8; 16], request: [u8; 16]) -> String {
+    let mut out = String::with_capacity(PREFIX.len() + 32 + 1 + 32);
+    out.push_str(PREFIX);
+    hex::push_lower(&mut out, &network);
+    out.push('-');
+    hex::push_lower(&mut out, &request);
+    out
+}
+
 fn path(paths: &Paths, network: [u8; 16], request: [u8; 16]) -> PathBuf {
-    paths.dir.join(format!(
-        "{PREFIX}{}-{}",
-        hex::encode_lower(&network),
-        hex::encode_lower(&request)
-    ))
+    paths.dir.join(name(network, request))
 }
 
 fn header(paths: &Paths, network: [u8; 16], request: [u8; 16]) -> Result<Option<u64>> {
+    header_named(&paths.dir, &name(network, request), network, request)
+}
+
+fn header_named(
+    dir: &std::path::Path,
+    name: &str,
+    network: [u8; 16],
+    request: [u8; 16],
+) -> Result<Option<u64>> {
     use std::io::Read as _;
-    let file = path(paths, network, request);
-    if !file.try_exists()? {
-        return Ok(None);
-    }
-    let name = file.file_name().unwrap().to_string_lossy();
-    let (mut file, _) = aterm_uds::private_file::open_private(&paths.dir, &name)
-        .map_err(|_| Error::new("the retained give is not a private regular file"))?;
+    let (mut file, _) = match aterm_uds::private_file::open_private(dir, name) {
+        Ok(opened) => opened,
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => return Ok(None),
+        Err(_) => {
+            return Err(Error::new(
+                "the retained give is not a private regular file",
+            ));
+        }
+    };
     let mut bytes = [0; HEADER];
     file.read_exact(&mut bytes)?;
     if &bytes[..4] != b"GIV1" || bytes[4..20] != network || bytes[20..36] != request {
@@ -59,7 +75,8 @@ pub(super) fn keep(
 ) -> Result<()> {
     let encoded = values.encode().map_err(crate::table::failure)?;
     let expiry = now_ms().saturating_add(need::WANT_WINDOW_SECS * MS);
-    let mut bytes = zeroize::Zeroizing::new(b"GIV1".to_vec());
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(HEADER + encoded.as_slice().len()));
+    bytes.extend_from_slice(b"GIV1");
     bytes.extend_from_slice(&network);
     bytes.extend_from_slice(&thread.id);
     bytes.extend_from_slice(&expiry.to_be_bytes());
@@ -150,14 +167,18 @@ pub(super) fn read(
 /// the request ended/expired. Never follows a symlink or accepts a peer-supplied path.
 pub(super) fn forget(paths: &Paths, network: [u8; 16], request: [u8; 16]) -> Result<()> {
     need::with_ledger(paths, |_, _| {
-        let path = path(paths, network, request);
-        if std::fs::symlink_metadata(&path).is_ok() {
-            let name = path.file_name().unwrap().to_string_lossy();
-            aterm_uds::private_file::open_private(&paths.dir, &name).map_err(|_| {
-                aterm_secrets::Error::new("the retained give is not a private regular file")
-            })?;
-            std::fs::remove_file(&path)?;
-            aterm_durable::ordered_dir(&paths.dir)?;
+        let name = name(network, request);
+        match aterm_uds::private_file::open_private(&paths.dir, &name) {
+            Ok(_) => {
+                std::fs::remove_file(paths.dir.join(&name))?;
+                aterm_durable::ordered_dir(&paths.dir)?;
+            }
+            Err(aterm_uds::private_file::PrivateFileError::Missing) => {}
+            Err(_) => {
+                return Err(aterm_secrets::Error::new(
+                    "the retained give is not a private regular file",
+                ));
+            }
         }
         Ok(())
     })
@@ -168,20 +189,19 @@ pub(super) fn cleanup(paths: &Paths, network: [u8; 16], book: &Book, now_ms: u64
     for file in std::fs::read_dir(&paths.dir)? {
         let file = file?;
         let name = file.file_name();
-        let Some((net, request)) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(PREFIX))
-            .and_then(|name| name.split_once('-'))
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some((net, request)) = name_str
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.split_once('-'))
         else {
             continue;
         };
         let (Ok(net), Ok(request)) = (ids(net), ids(request)) else {
             continue;
         };
-        if path(paths, net, request) != file.path() {
-            continue;
-        }
-        let Some(expiry) = header(paths, net, request)? else {
+        let Some(expiry) = header_named(&paths.dir, name_str, net, request)? else {
             continue;
         };
         let ended = net == network

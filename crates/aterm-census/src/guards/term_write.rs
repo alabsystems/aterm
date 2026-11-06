@@ -4,7 +4,6 @@
 
 //! term-write: a host writes into a session's terminal only under a `TermGuard`.
 
-use super::rules::test_path;
 use super::{Bound, Finding, Rule, Tree, has, hits, is_word};
 
 const GUI: &str = "crates/aterm-gui/src/";
@@ -32,7 +31,7 @@ pub(super) const TERM_WRITE: Rule = Rule {
 fn term_write(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let test_only = tree.corpus.test_only(GUI);
     for file in tree.corpus.under(&[GUI]) {
-        if test_path(&file.rel)
+        if tree.corpus.test_code().holds(&file.rel)
             || test_only.contains(&file.rel)
             || !file.mentions(&["term", "MutexGuard"])
         {

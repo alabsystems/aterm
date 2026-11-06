@@ -1285,11 +1285,6 @@ impl App {
 
     fn rewind_fold(&mut self, session: u64, ask: Ask) -> Result<(), String> {
         let proxy = self.proxy.clone();
-        let colors = self
-            .pool
-            .own_colors(session)
-            .cloned()
-            .or_else(|| self.session_factory.terminal_config.clone().map(Arc::new));
         let s = self.pool.get(session).ok_or(NO_SESSION)?;
         let (temporal, live_bytes) = (s.ctx.temporal.clone(), s.ctx.job_feed.bytes());
         let view = self.pool.rewind_mut(session).ok_or(NO_VIEW)?;
@@ -1334,7 +1329,6 @@ impl App {
             plan,
             judge,
             around,
-            colors,
         };
         let worker = match (view.worker.take(), proxy) {
             (Some(worker), _) => worker,

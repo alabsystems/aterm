@@ -8185,7 +8185,7 @@ mod tests {
                         released.elapsed() < HANG_DETECTOR,
                         "the readers never ended"
                     );
-                    std::thread::yield_now();
+                    aterm_uds::deadline::poll_yield();
                 }
             };
             *slot.borrow_mut() = Some((1, Box::new(act)));

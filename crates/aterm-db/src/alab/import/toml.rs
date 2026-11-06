@@ -577,19 +577,20 @@ impl Planner<'_> {
                             );
                             continue;
                         }
-                        let lower = first.text.to_ascii_lowercase();
+                        let has_prefix = |p: &str| {
+                            first
+                                .text
+                                .get(..p.len())
+                                .is_some_and(|s| s.eq_ignore_ascii_case(p))
+                        };
                         let column = match field {
                             Field::Webmail => Some("webmail"),
                             Field::Imap | Field::Url
-                                if lower.starts_with("imap://")
-                                    || lower.starts_with("imaps://") =>
+                                if has_prefix("imap://") || has_prefix("imaps://") =>
                             {
                                 Some("imap")
                             }
-                            Field::Http
-                                if lower.starts_with("https://")
-                                    || lower.starts_with("http://") =>
-                            {
+                            Field::Http if has_prefix("https://") || has_prefix("http://") => {
                                 Some("http")
                             }
                             _ => None,

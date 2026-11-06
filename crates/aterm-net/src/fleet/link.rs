@@ -61,6 +61,9 @@ pub const REPROVE_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How long, on the link's clock, a peer has to answer a re-proof before the link ends.
 pub const REPROVE_WITHIN: Duration = Duration::from_secs(60);
 
+/// The maximum time a local Close may drain before its socket is shut down.
+pub const CLOSE_DRAIN: Duration = Duration::from_millis(250);
+
 /// The most a receiver buffers for one stream, and the send credit each stream starts with.
 pub const WINDOW: u32 = 256 * 1024;
 
@@ -410,7 +413,7 @@ struct State {
     /// Why the link ended; nothing moves on it once set.
     closed: Option<String>,
     /// A `Close` is queued: no stream opens or writes, and the writer ends after it.
-    closing: bool,
+    close_reason: Option<String>,
     streams: BTreeMap<u32, Stream>,
     next_id: u32,
     /// The highest id the peer opened.
@@ -433,6 +436,7 @@ struct Shared {
     local: SocketAddr,
     state: Mutex<State>,
     changed: Condvar,
+    close_bell: Arc<Bell>,
     tls: Mutex<rustls::Connection>,
     sock: TcpStream,
     cfg: LinkConfig,
@@ -466,6 +470,20 @@ fn closed_error(why: &str) -> io::Error {
 }
 
 impl Shared {
+    /// Queue the first local close; its caller must enforce the returned drain deadline.
+    fn queue_close(&self, why: &str) -> Option<Duration> {
+        let mut state = self.link_state();
+        if state.closed.is_some() || state.close_reason.is_some() {
+            return None;
+        }
+        state.close_reason = Some(why.to_owned());
+        let until = self.cfg.clock.now().saturating_add(CLOSE_DRAIN);
+        state.control.push_back(frame(Kind::Close, 0, &reason(why)));
+        drop(state);
+        self.changed.notify_all();
+        Some(until)
+    }
+
     fn link_state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -487,17 +505,18 @@ impl Shared {
         if state.closed.is_some() {
             return;
         }
-        state.closed = Some(why.to_owned());
+        state.closed = Some(state.close_reason.take().unwrap_or_else(|| why.to_owned()));
         state.control.clear();
         state.data.clear();
         state.queued = 0;
         let ends = std::mem::take(&mut state.ends);
         drop(state);
+        self.close_bell.ring();
         self.changed.notify_all();
+        let _ = self.sock.shutdown(Shutdown::Both);
         for end in ends {
             end();
         }
-        let _ = self.sock.shutdown(Shutdown::Both);
         drop(
             self.guard
                 .lock()
@@ -686,7 +705,7 @@ impl Shared {
             None => Some("op"),
             Some(op) if takes_log(op) != arg.is_some() => Some("op"),
             Some(op) if takes_log(op) && arg.and_then(BusLog::from_word).is_none() => Some("log"),
-            Some(_) if state.closing => Some("closing"),
+            Some(_) if state.close_reason.is_some() => Some("closing"),
             Some(_) if state.streams.len() >= STREAMS_MAX => Some("busy"),
             Some(_) => None,
         };
@@ -947,7 +966,7 @@ impl Link {
             local,
             state: Mutex::new(State {
                 closed: None,
-                closing: false,
+                close_reason: None,
                 streams: BTreeMap::new(),
                 next_id: if dialed { 1 } else { 2 },
                 peer_max: 0,
@@ -964,6 +983,7 @@ impl Link {
                 ends: Vec::new(),
             }),
             changed: Condvar::new(),
+            close_bell: Arc::new(Bell::default()),
             tls: Mutex::new(conn.into()),
             sock,
             cfg: cfg.clone(),
@@ -1078,7 +1098,7 @@ impl Link {
             if let Some(why) = &state.closed {
                 return Err(closed_error(why));
             }
-            if state.closing {
+            if state.close_reason.is_some() {
                 return Err(closed_error("this end is closing it"));
             }
             if state.streams.len() >= STREAMS_MAX {
@@ -1169,16 +1189,29 @@ impl Link {
         self.shared.tick()
     }
 
-    /// End the link: a `Close` with `why` goes first, then the TLS close and the socket.
+    /// End the link: try to drain a `Close` and TLS close for [`CLOSE_DRAIN`], then shut down
+    /// the socket even if the peer stopped reading. The first local reason remains in
+    /// [`Self::closed`] and is available to [`Self::on_end`] on either path.
     pub fn close(&self, why: &str) {
-        let mut state = self.shared.link_state();
-        if state.closed.is_some() || state.closing {
+        let Some(until) = self.shared.queue_close(why) else {
             return;
+        };
+        let shared = Arc::clone(&self.shared);
+        if std::thread::Builder::new()
+            .name("aterm-mesh-close".to_owned())
+            .spawn(move || {
+                while shared.link_state().closed.is_none() {
+                    if shared.cfg.clock.now() >= until {
+                        shared.fail("the close drain deadline elapsed");
+                        break;
+                    }
+                    shared.cfg.clock.park(until, &shared.close_bell);
+                }
+            })
+            .is_err()
+        {
+            self.shared.fail("the close drain timer could not start");
         }
-        state.closing = true;
-        state.control.push_back(frame(Kind::Close, 0, &reason(why)));
-        drop(state);
-        self.shared.changed.notify_all();
     }
 
     /// A negative control's: from now on this end answers no re-proof its peer asks.
@@ -1464,7 +1497,7 @@ impl LinkStream {
                 if let Some(why) = &state.closed {
                     return Some(Err(closed_error(why)));
                 }
-                if state.closing {
+                if state.close_reason.is_some() {
                     return Some(Err(closed_error("this end is closing it")));
                 }
                 let queued = state.queued;

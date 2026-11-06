@@ -3,9 +3,7 @@
 
 //! aos-step-clock: the Aos step code reads no clock and draws no randomness.
 
-use super::rules::{
-    ClockShape, UseLeaf, first_hit, test_path, type_alias, use_leaves, use_statements,
-};
+use super::rules::{ClockShape, UseLeaf, first_hit, type_alias, use_leaves, use_statements};
 use super::{Bound, Finding, Rule, Tree, hits};
 
 const AOS_STEP: &[&str] = &[
@@ -153,7 +151,10 @@ fn aos_step_clock(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     needles.extend(RANDOM_MODULES);
     needles.extend(["type ", WALL_READER_MODULE]);
     for file in tree.corpus.under(AOS_STEP) {
-        if test_path(&file.rel) || test_only.contains(&file.rel) || !file.mentions(&needles) {
+        if tree.corpus.test_code().holds(&file.rel)
+            || test_only.contains(&file.rel)
+            || !file.mentions(&needles)
+        {
             continue;
         }
         let uses = use_statements(file);
@@ -269,6 +270,10 @@ mod tests {
             (
                 "crates/aterm-effects/src/aos_momentum/host_tests.rs",
                 planted,
+            ),
+            (
+                "crates/aterm-effects/src/cursor_momentum.rs",
+                "pub mod snapshot;\n#[cfg(test)]\nmod test_fixtures;\n",
             ),
             (
                 "crates/aterm-effects/src/cursor_momentum/test_fixtures.rs",

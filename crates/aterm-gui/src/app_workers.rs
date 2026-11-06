@@ -465,9 +465,8 @@ impl App {
 
     /// Keep as Tab: `session`'s worker becomes the person's tab ([`crate::tab_model::TabSet::keep`]):
     /// it leaves the parked tabs for the strip's end, keeping what the window shows, and loses its
-    /// ephemeral mark, so its task's end never closes it (`App::reap_workers`). The one way a
-    /// worker's tab becomes a person's: a tab moved out but still closed for its task's end would
-    /// be neither the person's nor the list's. Whether a tab was kept.
+    /// task-owned mark, so a claim task's execution budget no longer applies to it. Returns
+    /// whether a tab was kept.
     pub(crate) fn keep_as_tab(&mut self, session: u64) -> bool {
         let found = self.windows.iter().find_map(|(wid, ws)| {
             ws.tab_set
@@ -504,7 +503,7 @@ impl App {
         }
         let sid = self.session_id_text(session).unwrap_or_default();
         aterm_log::info!(
-            "workers: @{sid} ({}) kept as a person's tab: its task's end no longer closes it",
+            "workers: @{sid} ({}) kept as a person's tab: its task no longer owns the tab",
             self.tab_label_of_session(session)
         );
         self.note_tab_keep(&held);

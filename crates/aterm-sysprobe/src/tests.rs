@@ -1067,6 +1067,51 @@ fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     assert_eq!(four.clusters.len(), 1, "a level with no cores is left out");
 }
 
+/// `vm_stat` on a MacBook Air (macOS 27.0.1, 32 GiB, 16 KiB pages), 2026-11-05. Its "Pages free"
+/// is `free_count` less the speculative pages, which its file-backed pages hold.
+#[test]
+fn this_macs_vm_classes_partition_what_its_queues_hold() {
+    let page = 16_384;
+    let (free, speculative, active, inactive, wired, compressor) =
+        (8_603, 16_456, 789_779, 772_226, 205_446, 251_323);
+    let p = machine::VmPages {
+        free: free + speculative,
+        speculative,
+        active,
+        inactive,
+        wired,
+        compressor,
+        stored: 510_248,
+        purgeable: 35_622,
+        external: 957_096,
+        internal: 621_365,
+        ..machine::VmPages::default()
+    };
+    assert_eq!(p.internal + p.external, active + inactive + speculative);
+    let total = 34_359_738_368;
+    let m = machine::memory_detail_of(&p, page, total, None, None);
+    let classes = [
+        m.wired,
+        m.app,
+        m.compressed.unwrap_or(0),
+        m.file_backed,
+        m.purgeable.unwrap_or(0),
+        m.free,
+    ]
+    .iter()
+    .sum::<u64>();
+    // Each VM queue's pages once: wired, the compressor's, active, inactive, speculative, free.
+    let queues = (wired + compressor + active + inactive + speculative + free) * page;
+    assert_eq!(classes, queues, "the classes are the queues, page for page");
+    assert_eq!(total - classes, 53_319 * page, "what no VM queue holds");
+    // Negative control: A1's first cache (file-backed + purgeable + speculative) counts the
+    // speculative pages twice.
+    assert_eq!(
+        classes + m.speculative.unwrap_or(0) - queues,
+        speculative * page
+    );
+}
+
 #[test]
 fn memory_by_page_class_is_counted_from_one_read() {
     let page = 16_384;
@@ -1120,6 +1165,7 @@ fn memory_by_page_class_is_counted_from_one_read() {
             decompressions: 1_234,
             compressions: 2_345,
             pageins: 99,
+            page_bytes: page,
         }),
         "the counters come from the same read, swap in bytes"
     );

@@ -741,7 +741,10 @@ fn read_entry_with_version_held(
         };
         let envelope = envelope::parse(&cached)?;
         let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-        if !super::log_entries::applied_log_available(&state, seeded.as_ref()) {
+        if !super::log_entries::applied_log_available(
+            &state,
+            seeded.as_ref().map(|(_, digest)| *digest),
+        ) {
             return Ok(None);
         }
         let (entries, _) = super::log_entries::open_entries_with_log(

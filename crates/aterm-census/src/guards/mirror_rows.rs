@@ -66,14 +66,14 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         None => Vec::new(),
     };
-    let reader = |rel: &str| read(tree, rel).map(Cow::into_owned);
     let mut mentions: BTreeMap<String, Vec<Mention>> = BTreeMap::new();
+    let mut specs_by_pkg: BTreeMap<String, String> = BTreeMap::new();
     for (manifest, _) in &tree.corpus.manifests {
         let Some(package) = manifest.strip_suffix("/Cargo.toml") else {
             continue;
         };
         let specs_path = format!("{package}/SPECS.md");
-        let Some(specs) = reader(&specs_path) else {
+        let Some(specs) = read(tree, &specs_path).map(Cow::into_owned) else {
             continue;
         };
         let clauses = mirror::clauses(&specs);
@@ -81,17 +81,13 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             clauses.iter().map(|c| (c.line, c)).collect();
         for (index, line) in specs.lines().enumerate() {
             let at = index + 1;
-            let cells: Vec<(&str, bool)> = match rows_at.get(&at) {
-                Some(clause) => clause.cells.iter().map(|c| (c.text, c.notes)).collect(),
-                None => vec![(line, false)],
-            };
-            for (text, notes_cell) in cells {
+            let mut check_cell = |text: &str, notes_cell: bool| {
                 let (notes, bad) = mirror::notes(text);
                 for why in bad {
                     out.push(finding(&specs_path, at, why));
                 }
                 if notes.is_empty() {
-                    continue;
+                    return;
                 }
                 let Some(clause) = rows_at.get(&at).filter(|_| notes_cell) else {
                     out.push(finding(
@@ -103,7 +99,7 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                              (gaps) column of the clause it proves"
                         ),
                     ));
-                    continue;
+                    return;
                 };
                 for note in notes {
                     for name in note.rows {
@@ -117,8 +113,17 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                         });
                     }
                 }
+            };
+            match rows_at.get(&at) {
+                Some(clause) => {
+                    for c in &clause.cells {
+                        check_cell(c.text, c.notes);
+                    }
+                }
+                None => check_cell(line, false),
             }
         }
+        specs_by_pkg.insert(package.to_string(), specs);
     }
     let manifests = || {
         tree.corpus
@@ -159,6 +164,12 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
+    let mut parsed_files: BTreeMap<&str, Option<mirror::item::ParsedFile>> = BTreeMap::new();
+    let mut item_digests: BTreeMap<(&str, &str), Result<String, String>> = BTreeMap::new();
+    let clauses_by_pkg: BTreeMap<&str, Vec<mirror::Clause<'_>>> = specs_by_pkg
+        .iter()
+        .map(|(pkg, specs)| (pkg.as_str(), mirror::clauses(specs)))
+        .collect();
     for row in &rows {
         let unreadable = |why: String| {
             finding(
@@ -204,7 +215,15 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             ));
         }
         let stale = row.clause != NO_CLAUSE && said.len() == 1 && said[0].stale;
-        let now = match mirror::reading(row, &package, &reader) {
+        let now = reading_cached(
+            tree,
+            row,
+            &package,
+            &clauses_by_pkg,
+            &mut parsed_files,
+            &mut item_digests,
+        );
+        let now = match now {
             Ok(now) => now,
             Err(why) => {
                 out.push(unreadable(why));
@@ -241,6 +260,61 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             ),
         ));
     }
+}
+
+fn reading_cached<'t>(
+    tree: &'t Tree<'_>,
+    row: &'t Row,
+    package: &str,
+    clauses_by_pkg: &BTreeMap<&str, Vec<mirror::Clause<'_>>>,
+    parsed_files: &mut BTreeMap<&'t str, Option<mirror::item::ParsedFile>>,
+    item_digests: &mut BTreeMap<(&'t str, &'t str), Result<String, String>>,
+) -> Result<mirror::Reading, String> {
+    let mut digests = Vec::with_capacity(row.items.len());
+    for item in &row.items {
+        let key = (item.file.as_str(), item.path.as_str());
+        if let Some(cached) = item_digests.get(&key) {
+            digests.push(cached.clone()?);
+            continue;
+        }
+        let parsed = parsed_files.entry(item.file.as_str()).or_insert_with(|| {
+            read(tree, &item.file).map(|src| mirror::item::ParsedFile::of(&src))
+        });
+        let res = match parsed {
+            Some(p) => {
+                mirror::item_digest_in(p, &item.path).map_err(|e| format!("{}: {e}", item.file))
+            }
+            None => Err(format!("{} does not exist", item.file)),
+        };
+        item_digests.insert(key, res.clone());
+        digests.push(res?);
+    }
+    if row.clause == NO_CLAUSE {
+        return Ok(mirror::Reading {
+            digests,
+            clause_digest: NO_CLAUSE.to_string(),
+            clause_line: None,
+        });
+    }
+    let specs_path = format!("{package}/SPECS.md");
+    let clauses = clauses_by_pkg
+        .get(package)
+        .ok_or_else(|| format!("{specs_path} does not exist"))?;
+    let mut found = clauses.iter().filter(|c| c.id == row.clause);
+    let Some(clause) = found.next() else {
+        return Err(format!("{specs_path} has no clause `{}`", row.clause));
+    };
+    if let Some(again) = found.next() {
+        return Err(format!(
+            "{specs_path}:{} gives clause `{}` a second row: one id, one clause",
+            again.line, row.clause
+        ));
+    }
+    Ok(mirror::Reading {
+        digests,
+        clause_digest: clause.digest(),
+        clause_line: Some(clause.line),
+    })
 }
 
 /// `rel`'s text: from the corpus when it holds the file, else from the tree.

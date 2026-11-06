@@ -110,13 +110,12 @@ pub fn observed<'a>(rows: impl IntoIterator<Item = (&'a str, &'a Value)>) -> Obs
     out
 }
 
+fn row_column<'a>(row: &'a Row, name: &str) -> Option<&'a str> {
+    row.get(name)?.as_str().filter(|s| !s.is_empty())
+}
+
 fn column<'a>(addresses: &'a Projection, pk: &str, name: &str) -> Option<&'a str> {
-    addresses
-        .rows
-        .get(pk)?
-        .get(name)?
-        .as_str()
-        .filter(|s| !s.is_empty())
+    row_column(addresses.rows.get(pk)?, name)
 }
 
 /// Whether `row` is live and not marked `protected`.
@@ -200,14 +199,18 @@ pub fn effective(
     follow(addresses, observed, routes, pk, &mut BTreeSet::new())
 }
 
-fn follow(
-    addresses: &Projection,
+fn follow<'a>(
+    addresses: &'a Projection,
     observed: &Observed,
     routes: &dyn Fn(&str) -> Option<String>,
     pk: &str,
-    seen: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<&'a str>,
 ) -> Option<Effective> {
-    if !addresses.rows.get(pk).is_some_and(unshielded) || !seen.insert(pk.to_owned()) {
+    let (key, row) = addresses
+        .rows
+        .get_key_value(pk)
+        .filter(|(_, row)| unshielded(row))?;
+    if !seen.insert(key.as_str()) {
         return None;
     }
     let found = |mailbox: &str, how| {
@@ -217,10 +220,10 @@ fn follow(
             via: Vec::new(),
         })
     };
-    if let Some(mailbox) = column(addresses, pk, "mailbox") {
+    if let Some(mailbox) = row_column(row, "mailbox") {
         return found(mailbox, How::Owner);
     }
-    if let Some(target) = linked(addresses, pk)
+    if let Some(target) = row_column(row, "alias_of")
         && let Some(mut reached) = follow(addresses, observed, routes, target, seen)
     {
         reached.via.insert(0, target.to_owned());
@@ -242,7 +245,7 @@ fn follow(
     if let Some(mailbox) = routes(pk).filter(|s| !s.is_empty()) {
         return found(&mailbox, How::Routed);
     }
-    column(addresses, pk, "mailbox_hint").and_then(|mailbox| found(mailbox, How::Hint))
+    row_column(row, "mailbox_hint").and_then(|mailbox| found(mailbox, How::Hint))
 }
 
 /// A credential a sign-in types for a mailbox.
@@ -305,83 +308,85 @@ fn token_candidates<'a>(row: &'a Row, column: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn text_ref<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
+    row.fields
+        .get(column)
+        .filter(|field| !field.conflicted())
+        .and_then(|field| field.value())
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+fn mailbox_of(addresses: &Projection, pk: &str, row: &Row) -> Option<Mailbox> {
+    if !row.live() {
+        return None;
+    }
+    let text = |row: &Row, column: &str| text_ref(row, column).map(str::to_owned);
+    let login_pk = text_ref(row, "login")?;
+    let login_row = addresses.rows.get(login_pk).filter(|r| r.live())?;
+    let login = text(login_row, "addr")?;
+    let mut receives: Vec<String> = row
+        .fields
+        .get("receives")
+        .map(|field| field.members())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|address| addresses.rows.get(address))
+        .filter(|address| address.live())
+        .filter_map(|address| text_ref(address, "addr"))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut any = false;
+    for domain in row
+        .fields
+        .get("receives_domains")
+        .filter(|field| !field.conflicted())
+        .and_then(|field| field.value())
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if domain == "*" {
+            any = true;
+        } else {
+            receives.push(format!("*@{}", domain.to_ascii_lowercase()));
+        }
+    }
+    if any {
+        receives.push("*".to_owned());
+    }
+    let held = Credential::ALL
+        .into_iter()
+        .filter(|which| {
+            let holder = match which {
+                Credential::Password => login_row,
+                _ => row,
+            };
+            !token_candidates(holder, which.column()).is_empty()
+        })
+        .collect();
+    Some(Mailbox {
+        pk: pk.to_owned(),
+        label: text(row, "label").unwrap_or_default(),
+        login,
+        login_pk: login_pk.to_owned(),
+        service: text(row, "service"),
+        code_path: text(row, "code_path"),
+        webmail: text(row, "webmail"),
+        receives,
+        held,
+    })
+}
+
 /// Every live mailbox whose `login` names a live address row, by key ([`Mailbox`]). A mailbox
 /// with a conflicted or missing login, or one whose login row is retired, is no sign-in's.
 pub fn mailboxes(addresses: &Projection, mailboxes: &Projection) -> Vec<Mailbox> {
-    fn text_ref<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
-        row.fields
-            .get(column)
-            .filter(|field| !field.conflicted())
-            .and_then(|field| field.value())
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-    }
-    let text = |row: &Row, column: &str| text_ref(row, column).map(str::to_owned);
-    let mut out = Vec::new();
-    for (pk, row) in mailboxes.rows.iter().filter(|(_, row)| row.live()) {
-        let Some(login_pk) = text_ref(row, "login") else {
-            continue;
-        };
-        let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
-            continue;
-        };
-        let Some(login) = text(login_row, "addr") else {
-            continue;
-        };
-        let mut receives: Vec<String> = row
-            .fields
-            .get("receives")
-            .map(|field| field.members())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|address| addresses.rows.get(address))
-            .filter(|address| address.live())
-            .filter_map(|address| text_ref(address, "addr"))
-            .map(str::to_ascii_lowercase)
-            .collect();
-        let mut any = false;
-        for domain in row
-            .fields
-            .get("receives_domains")
-            .filter(|field| !field.conflicted())
-            .and_then(|field| field.value())
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if domain == "*" {
-                any = true;
-            } else {
-                receives.push(format!("*@{}", domain.to_ascii_lowercase()));
-            }
-        }
-        if any {
-            receives.push("*".to_owned());
-        }
-        let held = Credential::ALL
-            .into_iter()
-            .filter(|which| {
-                let holder = match which {
-                    Credential::Password => login_row,
-                    _ => row,
-                };
-                !token_candidates(holder, which.column()).is_empty()
-            })
-            .collect();
-        out.push(Mailbox {
-            pk: pk.clone(),
-            label: text(row, "label").unwrap_or_default(),
-            login,
-            login_pk: login_pk.to_owned(),
-            service: text(row, "service"),
-            code_path: text(row, "code_path"),
-            webmail: text(row, "webmail"),
-            receives,
-            held,
-        });
-    }
-    out
+    mailboxes
+        .rows
+        .iter()
+        .filter_map(|(pk, row)| mailbox_of(addresses, pk, row))
+        .collect()
 }
 
 /// Why a credential could not be handed to a sign-in: value-free words.
@@ -431,27 +436,22 @@ pub fn reveal_in<T>(
     ask: Ask<'_>,
     consume: impl FnOnce(&str) -> T,
 ) -> Result<std::result::Result<T, Withheld>> {
-    let Some(found) = self::mailboxes(addresses, mailboxes)
-        .into_iter()
-        .find(|m| m.pk == ask.mailbox)
-    else {
+    let Some(mb_row) = mailboxes.rows.get(ask.mailbox).filter(|r| r.live()) else {
         return Ok(Err(Withheld::NoMailbox));
     };
+    let Some(login_pk) = text_ref(mb_row, "login") else {
+        return Ok(Err(Withheld::NoMailbox));
+    };
+    let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
+        return Ok(Err(Withheld::NoMailbox));
+    };
+    if text_ref(login_row, "addr").is_none() {
+        return Ok(Err(Withheld::NoMailbox));
+    }
     let column = ask.which.column();
     let (collection, row_pk, row) = match ask.which {
-        Credential::Password => (
-            ADDRESS.name,
-            found.login_pk.as_str(),
-            addresses.rows.get(&found.login_pk),
-        ),
-        Credential::MailboxPassword | Credential::Totp => (
-            MAILBOX.name,
-            found.pk.as_str(),
-            mailboxes.rows.get(&found.pk),
-        ),
-    };
-    let Some(row) = row else {
-        return Ok(Err(Withheld::NoMailbox));
+        Credential::Password => (ADDRESS.name, login_pk, login_row),
+        Credential::MailboxPassword | Credential::Totp => (MAILBOX.name, ask.mailbox, mb_row),
     };
     let tokens = token_candidates(row, column);
     let Some((first, rest)) = tokens.split_first() else {
@@ -467,23 +467,14 @@ pub fn reveal_in<T>(
             Err(_) => return Ok(Err(Withheld::Unopened)),
         }
     }
-    drop(held);
     let cell = Cell {
         table: sealer.table(),
         collection,
         row: row_pk,
         column,
     };
-    super::secret::reveal_sealed(
-        journal,
-        sealer,
-        first,
-        cell,
-        Surface::SignIn,
-        ask.when_ms,
-        consume,
-    )
-    .map(Ok)
+    super::secret::record_reveal(journal, cell, Surface::SignIn, ask.when_ms)?;
+    Ok(Ok(consume(held.plaintext())))
 }
 
 /// The registry's live mailboxes on this Mac ([`mailboxes`]), read as an observer.
@@ -539,9 +530,10 @@ pub fn reveal_bound<T>(
         |view, sealer| {
             let addresses = view.project(&ADDRESS);
             let mailboxes = view.project(&MAILBOX);
-            let Some(found) = self::mailboxes(&addresses, &mailboxes)
-                .into_iter()
-                .find(|m| m.pk == mailbox)
+            let Some(found) = mailboxes
+                .rows
+                .get(mailbox)
+                .and_then(|row| mailbox_of(&addresses, mailbox, row))
             else {
                 return Ok(Err(Withheld::NoMailbox));
             };

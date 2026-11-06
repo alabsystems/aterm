@@ -86,15 +86,26 @@ impl fmt::Display for SubjectError {
 
 impl std::error::Error for SubjectError {}
 
-/// Write `bytes` as lowercase hex into `f` without an intermediate allocation.
-fn write_hex_lower(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    use fmt::Write as _;
+/// Format `bytes` as lowercase hex into `out` (`out.len()` must be `2 * bytes.len()`).
+pub(crate) const fn format_hex_lower<const N: usize, const M: usize>(
+    prefix: &[u8],
+    bytes: &[u8; N],
+) -> [u8; M] {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for &b in bytes {
-        f.write_char(char::from(DIGITS[usize::from(b >> 4)]))?;
-        f.write_char(char::from(DIGITS[usize::from(b & 0x0f)]))?;
+    let mut out = [0u8; M];
+    let mut i = 0;
+    while i < prefix.len() {
+        out[i] = prefix[i];
+        i += 1;
     }
-    Ok(())
+    let mut j = 0;
+    while j < N {
+        let b = bytes[j];
+        out[prefix.len() + 2 * j] = DIGITS[(b >> 4) as usize];
+        out[prefix.len() + 2 * j + 1] = DIGITS[(b & 0x0f) as usize];
+        j += 1;
+    }
+    out
 }
 
 /// Exactly `N` bytes from `2N` lowercase hex digits; uppercase is refused, so each value has
@@ -142,18 +153,25 @@ impl Node {
         self.0
     }
 
+    /// The canonical 18-byte `n-<16 lowercase hex>` representation.
+    #[must_use]
+    pub(crate) const fn to_ascii_bytes(self) -> [u8; 18] {
+        format_hex_lower::<8, 18>(b"n-", &self.0)
+    }
+
     /// The same name as an astream summary origin.
     #[must_use]
     pub fn origin(self) -> Origin {
-        Origin::new(&self.to_string())
-            .unwrap_or_else(|e| unreachable!("a node id is an origin name: {e}"))
+        let buf = self.to_ascii_bytes();
+        let s = std::str::from_utf8(&buf).unwrap_or_default();
+        Origin::new(s).unwrap_or_else(|e| unreachable!("a node id is an origin name: {e}"))
     }
 }
 
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("n-")?;
-        write_hex_lower(f, &self.0)
+        let buf = self.to_ascii_bytes();
+        f.write_str(std::str::from_utf8(&buf).unwrap_or_default())
     }
 }
 
@@ -239,13 +257,19 @@ impl AccountKey {
     pub const fn is_sub(self) -> bool {
         self.sub
     }
+
+    /// The canonical 19-byte `(ac|sa)-<16 lowercase hex>` representation.
+    #[must_use]
+    pub(crate) const fn to_ascii_bytes(self) -> [u8; 19] {
+        let prefix = if self.sub { b"sa-" } else { b"ac-" };
+        format_hex_lower::<8, 19>(prefix, &self.id)
+    }
 }
 
 impl fmt::Display for AccountKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.sub { "sa-" } else { "ac-" };
-        f.write_str(prefix)?;
-        write_hex_lower(f, &self.id)
+        let buf = self.to_ascii_bytes();
+        f.write_str(std::str::from_utf8(&buf).unwrap_or_default())
     }
 }
 
@@ -475,9 +499,84 @@ impl Metric {
         }
     }
 
+    /// The name as a static string, as a subject segment and a summary's metric.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Metric::Tokens(Cli::Claude) => "claude.tokens",
+            Metric::Tokens(Cli::Codex) => "codex.tokens",
+            Metric::Tokens(Cli::Grok) => "grok.tokens",
+            Metric::Tokens(Cli::Kimi) => "kimi.tokens",
+            Metric::Tokens(Cli::Agy) => "agy.tokens",
+            Metric::Class(Cli::Claude, Family::Fable, TokenClass::Input) => "claude.fable.input",
+            Metric::Class(Cli::Claude, Family::Fable, TokenClass::Output) => "claude.fable.output",
+            Metric::Class(Cli::Claude, Family::Fable, TokenClass::CacheRead) => {
+                "claude.fable.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Fable, TokenClass::CacheWrite) => {
+                "claude.fable.cache_write"
+            }
+            Metric::Class(Cli::Claude, Family::Mythos, TokenClass::Input) => "claude.mythos.input",
+            Metric::Class(Cli::Claude, Family::Mythos, TokenClass::Output) => {
+                "claude.mythos.output"
+            }
+            Metric::Class(Cli::Claude, Family::Mythos, TokenClass::CacheRead) => {
+                "claude.mythos.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Mythos, TokenClass::CacheWrite) => {
+                "claude.mythos.cache_write"
+            }
+            Metric::Class(Cli::Claude, Family::Opus, TokenClass::Input) => "claude.opus.input",
+            Metric::Class(Cli::Claude, Family::Opus, TokenClass::Output) => "claude.opus.output",
+            Metric::Class(Cli::Claude, Family::Opus, TokenClass::CacheRead) => {
+                "claude.opus.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Opus, TokenClass::CacheWrite) => {
+                "claude.opus.cache_write"
+            }
+            Metric::Class(Cli::Claude, Family::Sonnet, TokenClass::Input) => "claude.sonnet.input",
+            Metric::Class(Cli::Claude, Family::Sonnet, TokenClass::Output) => {
+                "claude.sonnet.output"
+            }
+            Metric::Class(Cli::Claude, Family::Sonnet, TokenClass::CacheRead) => {
+                "claude.sonnet.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Sonnet, TokenClass::CacheWrite) => {
+                "claude.sonnet.cache_write"
+            }
+            Metric::Class(Cli::Claude, Family::Haiku, TokenClass::Input) => "claude.haiku.input",
+            Metric::Class(Cli::Claude, Family::Haiku, TokenClass::Output) => "claude.haiku.output",
+            Metric::Class(Cli::Claude, Family::Haiku, TokenClass::CacheRead) => {
+                "claude.haiku.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Haiku, TokenClass::CacheWrite) => {
+                "claude.haiku.cache_write"
+            }
+            Metric::Class(Cli::Claude, Family::Other, TokenClass::Input) => "claude.other.input",
+            Metric::Class(Cli::Claude, Family::Other, TokenClass::Output) => "claude.other.output",
+            Metric::Class(Cli::Claude, Family::Other, TokenClass::CacheRead) => {
+                "claude.other.cache_read"
+            }
+            Metric::Class(Cli::Claude, Family::Other, TokenClass::CacheWrite) => {
+                "claude.other.cache_write"
+            }
+            Metric::Class(Cli::Codex, Family::Gpt, TokenClass::Input) => "codex.gpt.input",
+            Metric::Class(Cli::Codex, Family::Gpt, TokenClass::Output) => "codex.gpt.output",
+            Metric::Class(Cli::Codex, Family::Gpt, TokenClass::CacheRead) => "codex.gpt.cache_read",
+            Metric::Class(Cli::Codex, Family::Gpt, TokenClass::CacheWrite) => {
+                "codex.gpt.cache_write"
+            }
+            Metric::Class(..) => "",
+        }
+    }
+
     /// The name, as a subject segment and a summary's metric.
     #[must_use]
     pub fn name(self) -> String {
+        let s = self.as_str();
+        if !s.is_empty() {
+            return s.to_owned();
+        }
         match self {
             Metric::Tokens(cli) => format!("{cli}.tokens"),
             Metric::Class(cli, family, class) => {
@@ -489,6 +588,11 @@ impl Metric {
     /// The name as an astream summary metric.
     #[must_use]
     pub fn metric_name(self) -> MetricName {
+        let s = self.as_str();
+        if !s.is_empty() {
+            return MetricName::new(s)
+                .unwrap_or_else(|e| unreachable!("a compiled metric name is a summary name: {e}"));
+        }
         MetricName::new(&self.name())
             .unwrap_or_else(|e| unreachable!("a compiled metric name is a summary name: {e}"))
     }

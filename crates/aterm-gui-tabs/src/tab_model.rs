@@ -1569,8 +1569,8 @@ pub struct Tab {
     /// are a suffix of their [`TabSet`], which keeps that across every change; write this only
     /// before a [`TabSet::push`].
     pub parked: bool,
-    /// A tab a task opened for itself, never a person's: it goes once its task has concluded, and
-    /// only [`TabSet::keep`] makes it a person's. Every parked tab is one, and the mark outlives
+    /// A tab a task opened for itself, whose pane remains after its task concludes. Only
+    /// [`TabSet::keep`] makes it a person's. Every parked tab is one, and the mark outlives
     /// any other way off the parked tabs.
     pub ephemeral: bool,
 }

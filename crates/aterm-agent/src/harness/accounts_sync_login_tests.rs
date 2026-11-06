@@ -296,8 +296,10 @@ fn a_row_written_over_reads_signed_out_whatever_its_own_directory_holds() {
 /// failed automatic sign-in, and the default login held m2; a person's `/login` signed the
 /// default login in as m2-2's account. m2 is displaced, and m2-2 holds a login made now: Ok,
 /// served, not expired, no failed sign-in, no ended login on record, not a candidate of the
-/// sign-in ladder, and the sessions that ran on the default login are its, so no session here
-/// runs on m2 and the ladder leaves it for a person (§4.15 rule 4). CONTROLS: m2-2's
+/// sign-in ladder, and the sessions that ran on the default login are its. m2, whose login here
+/// was written over a minute after sessions here ran on it, is the ladder's renewal (a login
+/// this Mac used within the week that has ended, §4.15 rule 4), and a week later it waits for a
+/// person. CONTROLS: m2-2's
 /// login then seen ended while the default login still names it stays signed out at the next
 /// sync (a login merely still matched is not one made now); a row moved onto the default login
 /// by a relabel of the same account keeps its sign-out.
@@ -390,8 +392,15 @@ fn a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now() {
         "the ladder does not sign in a login made now: {next:?}"
     );
     assert!(
-        next.iter().all(|row| row.label != "m2"),
-        "the sessions on the row written over moved with the default login: {next:?}"
+        next.iter().any(|row| row.label == "m2"),
+        "the row written over, which this Mac ran on a minute ago, is the ladder's: {next:?}"
+    );
+    let week_on = NOW + 10 + accounts::USED_WITHIN_S;
+    assert!(
+        auto_renew_candidates(&moved, &state, &logins, week_on)
+            .iter()
+            .all(|row| row.label != "m2"),
+        "a week after a session here ran on it, it waits for a person"
     );
     assert_eq!(state.sessions["s-tab-1"].account, "m2-2");
     assert_eq!(state.sessions["s-tab-2"].account, "m2-2");

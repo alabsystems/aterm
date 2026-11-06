@@ -1574,7 +1574,7 @@ impl Log {
     /// The first bound that holding `more` records of `more_bytes` wire bytes past what it holds
     /// would pass ([`RecordBudgets::passed_with_bytes`]); `None` where they fit every one.
     #[must_use]
-    pub const fn passed_by(&self, more: RecordCounts, more_bytes: usize) -> Option<Budget> {
+    pub fn passed_by(&self, more: RecordCounts, more_bytes: usize) -> Option<Budget> {
         self.budgets
             .passed_with_bytes(self.counts, more, self.held_bytes, more_bytes)
     }

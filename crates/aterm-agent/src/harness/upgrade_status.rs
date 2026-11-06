@@ -10,11 +10,14 @@ use aterm_json::{Map, Value};
 
 use super::{
     LiveTab, Opts, Phase, Report, Request, STALE_S, St, alive, check_upgrade_tree, connect,
-    conversation_live, ensure_upgrade_tree, ledger, load, now_s, process_group, read_upgrade_dir,
-    roster_aside, save, session_files, started_s, state_dir, sweep_lock, tab_is_live,
-    unique_tab_for_group, upgrade,
+    conversation_live, ensure_upgrade_tree, ledger, load_record, now_s, process_group,
+    read_upgrade_dir, roster_aside, save, session_files, started_s, state_dir, sweep_lock,
+    tab_is_live, unique_tab_for_group, upgrade,
 };
 use crate::harness::relaunch::{TAB_TAKEN, overtakable, overtaken, overtaken_line};
+
+#[cfg(all(test, unix))]
+use super::load;
 
 /// How long a session may be behind before its upgrade reads stalled on its own.
 pub const STALLED_AFTER_S: u64 = upgrade::RUNG_LAND_S + LAND_GRACE_S;
@@ -3897,7 +3900,7 @@ fn shell_gone_afresh(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> Vec<
         .iter()
         .filter(|s| upgrade::Agent::keyed(s).is_none())
         .filter_map(|s| {
-            let st = load(opts, s)?;
+            let st = load_record(opts, s).ok().flatten()?;
             let r = Row::of(s, &st, now);
             (r.shell_gone_afresh() && now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S)
                 .then(|| ShellGone {
@@ -3972,7 +3975,7 @@ fn agent_down_tabs(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> BTreeS
     sessions
         .iter()
         .filter_map(|s| {
-            let st = load(opts, s)?;
+            let st = load_record(opts, s).ok().flatten()?;
             let taken = !st.tab.is_empty() && overtakable(&st, super::alive);
             let r = Row::of(s, &st, now);
             (taken
@@ -4204,7 +4207,7 @@ fn ask_within(
                         return None;
                     }
                     let session = path.file_stem()?.to_string_lossy().into_owned();
-                    let st = load(opts, &session)?;
+                    let st = load_record(opts, &session).ok().flatten()?;
                     ((st.tab == sid && st.in_flight())
                         || (st.is_upgrade() && (st.tab == sid || st.tab.is_empty())))
                     .then_some((session, st))

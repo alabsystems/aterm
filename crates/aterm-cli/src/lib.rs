@@ -166,6 +166,9 @@ pub enum Verb {
     Agh,
     /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
+    /// `aterm name` — this machine's name: its NAME and nickname
+    /// (`docs/DESIGN-machine-names-2026-11-04.md` §5.7).
+    Name,
     /// `aterm node` — the windowless fleet, Commons and steward node job (`serve | status | on | off`).
     Node,
     /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`,
@@ -230,6 +233,7 @@ impl Verb {
         Verb::Pkg,
         Verb::Agh,
         Verb::Fleet,
+        Verb::Name,
         Verb::Node,
         Verb::Drive,
         Verb::Link,
@@ -265,6 +269,7 @@ impl Verb {
             Verb::Pkg => "pkg",
             Verb::Agh => "agh",
             Verb::Fleet => "fleet",
+            Verb::Name => "name",
             Verb::Node => "node",
             Verb::Drive => "drive",
             Verb::Link => "link",
@@ -304,6 +309,7 @@ impl Verb {
             | Verb::Pkg
             | Verb::Agh
             | Verb::Fleet
+            | Verb::Name
             | Verb::Node
             | Verb::Drive
             | Verb::Link
@@ -337,6 +343,7 @@ impl Verb {
             Verb::Pkg => "aterm pkg <args>",
             Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
+            Verb::Name => "aterm name [nick <word>|--random [--dry-run]] [--json]",
             Verb::Node => "aterm node [<cmd>]",
             Verb::Drive => "aterm drive <args>",
             Verb::Link => "aterm link <args>",
@@ -394,6 +401,12 @@ impl Verb {
                 "drive --from <host|node>` lets that node drive",
                 "this machine, `--all` every member (`aterm ctl",
                 "--host <h> …`, `aterm help workers`). Unix only.",
+            ],
+            Verb::Name => &[
+                "This machine's name: its NAME (m8, or m0 until",
+                "it is numbered) and nickname, made by the first",
+                "read; `nick` sets the nickname, `--json` gives",
+                "one object. Unix only.",
             ],
             Verb::Node => &[
                 "The windowless fleet and Commons job: answers",
