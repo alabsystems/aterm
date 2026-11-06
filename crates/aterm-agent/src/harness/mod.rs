@@ -150,6 +150,7 @@ pub mod upgrade_muse;
 pub mod upgrade_muse_live;
 pub mod upgrade_wake;
 pub mod usage;
+pub mod wake_deadline;
 pub mod witness;
 pub mod work_record;
 pub mod worker;

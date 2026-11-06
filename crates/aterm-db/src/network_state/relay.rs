@@ -183,12 +183,14 @@ impl Server {
             Err(error) => return Err(error),
         }
         let socket = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
+        let meta = std::fs::symlink_metadata(&path)?;
         let bound = BoundSocket {
-            identity: listener::ListenerId::from_metadata(&std::fs::symlink_metadata(&path)?)
-                .ok_or_else(refused)?,
+            identity: listener::ListenerId::from_metadata(&meta).ok_or_else(refused)?,
             path: path.clone(),
         };
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        if meta.mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         socket.set_nonblocking(true)?;
         if endpoint_at(dir, &path)? != bound.identity {
             return Err(refused());

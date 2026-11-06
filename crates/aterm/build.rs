@@ -935,7 +935,70 @@ mod stamp_paths;
 mod build_stamp {
     use super::stamp_paths::PATHSPEC;
     use super::{GIT, rfc3339_utc, run};
+    use aterm_stamp::{Stamp, input};
     use std::path::PathBuf;
+
+    /// Write the binary's identity record (`OUT_DIR/stamp.bin`, which `src/main.rs` places in
+    /// its own section). Its version is this package's, the product version (it alone inherits
+    /// `[workspace.package] version`).
+    ///
+    /// The record changes only with what it holds. Unset, [`input::MODE`] writes a constant
+    /// record: the product version and nothing per commit, so no edit or commit reruns this
+    /// script, and a bump rebuilds this package alone. `commit` stamps the record from git, or
+    /// from the pins a
+    /// release, `ship dev-app` or a handoff fixture sets, and watches what the stamp is of.
+    pub fn emit() {
+        println!("cargo:rerun-if-env-changed={}", input::MODE);
+        let version =
+            std::env::var("CARGO_PKG_VERSION").expect("cargo always sets CARGO_PKG_VERSION");
+        let stamp = match std::env::var(input::MODE)
+            .ok()
+            .filter(|m| !m.is_empty())
+            .as_deref()
+        {
+            None => constant(&version),
+            Some("commit") => from_commit(&version),
+            Some(other) => panic!(
+                "{}={other}: the identity record is written unset (constant) or `commit`",
+                input::MODE
+            ),
+        };
+        let record = aterm_stamp::encode(&stamp).unwrap_or_else(|why| panic!("{why}"));
+        let out = PathBuf::from(
+            std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR for a build script"),
+        )
+        .join("stamp.bin");
+        // Rewritten only when it changed, so a rerun that writes the same record leaves the
+        // file, and the `include_bytes!` that reads it, as it was.
+        if std::fs::read(&out).ok().as_deref() != Some(&record[..]) {
+            std::fs::write(&out, record).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
+        }
+    }
+
+    /// The record of a build that asked for no identity: its version, nothing else. A pin set
+    /// without [`input::MODE`] would be dropped from the binary it was meant for, so it fails
+    /// the build instead.
+    fn constant(version: &str) -> Stamp {
+        for key in [
+            input::COMMIT,
+            input::FULL_COMMIT,
+            input::DEV_COMMITS,
+            input::INDEX_HINT,
+            input::RELEASE,
+        ] {
+            println!("cargo:rerun-if-env-changed={key}");
+            if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
+                panic!(
+                    "{key} is set but {} is not `commit`: the build would drop the identity it pins",
+                    input::MODE
+                );
+            }
+        }
+        Stamp {
+            app_version: leak(version.to_string()),
+            ..Stamp::UNSTAMPED
+        }
+    }
 
     /// A build fact supplied by the caller instead of probed from git. Empty is
     /// treated as absent, so `FOO=` cannot half-pin a build.
@@ -944,11 +1007,11 @@ mod build_stamp {
         std::env::var(key).ok().filter(|v| !v.trim().is_empty())
     }
 
-    /// Emits the git commit stamp and `rerun-if-changed` directives.
-    pub fn emit() {
-        let pinned_commit = pinned("ATERM_BUILD_GIT_COMMIT");
-        let pinned_full_commit = pinned("ATERM_BUILD_GIT_COMMIT_FULL");
-        let pinned_dev_commits = pinned("ATERM_BUILD_DEV_COMMITS");
+    /// The record of a `commit` build: git's facts, or the caller's pins.
+    fn from_commit(version: &str) -> Stamp {
+        let pinned_commit = pinned(input::COMMIT);
+        let pinned_full_commit = pinned(input::FULL_COMMIT);
+        let pinned_dev_commits = pinned(input::DEV_COMMITS);
         let git_is_pinned =
             pinned_commit.is_some() && pinned_full_commit.is_some() && pinned_dev_commits.is_some();
 
@@ -966,13 +1029,14 @@ mod build_stamp {
                 }
             }
         };
-        println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
         let full_commit = pinned_full_commit.unwrap_or_else(|| {
             run(GIT, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
         });
-        let dirty = commit.ends_with("-dirty");
-        println!("cargo:rustc-env=ATERM_GIT_COMMIT_FULL={full_commit}");
-        println!("cargo:rustc-env=ATERM_GIT_DIRTY={dirty}");
+        let dirty = if commit.ends_with("-dirty") {
+            "true"
+        } else {
+            "false"
+        };
 
         let dev_commits = pinned_dev_commits.unwrap_or_else(|| {
             run(
@@ -988,33 +1052,50 @@ mod build_stamp {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "0".into())
         });
-        println!("cargo:rustc-env=ATERM_DEV_COMMITS={dev_commits}");
 
+        println!("cargo:rerun-if-env-changed={}", input::EPOCH);
         let is_epoch = |s: &String| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        let build_number = std::env::var("SOURCE_DATE_EPOCH")
-            .ok()
-            .filter(is_epoch)
+        let epoch = std::env::var(input::EPOCH).ok().filter(is_epoch);
+        let build_number = epoch
+            .clone()
             .or_else(|| run(GIT, &["show", "-s", "--format=%ct", "HEAD"]).filter(is_epoch))
             .unwrap_or_else(|| "0".into());
-        println!("cargo:rustc-env=ATERM_BUILD_NUMBER={build_number}");
-
-        let build_time = match std::env::var("SOURCE_DATE_EPOCH") {
-            Ok(epoch) if !epoch.is_empty() => epoch.parse::<i64>().ok().map(rfc3339_utc),
-            _ => std::time::SystemTime::now()
+        let build_time = match epoch {
+            Some(epoch) => epoch.parse::<i64>().ok().map(rfc3339_utc),
+            None => std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .and_then(|d| i64::try_from(d.as_secs()).ok())
                 .map(rfc3339_utc),
         }
         .unwrap_or_else(|| "unknown".into());
-        println!("cargo:rustc-env=ATERM_BUILD_TIME={build_time}");
+
+        let index_hint = pinned(input::INDEX_HINT).unwrap_or_default();
+        println!("cargo:rerun-if-env-changed={}", input::RELEASE);
+        let release_build = std::env::var_os(input::RELEASE).is_some();
 
         if !git_is_pinned {
             for path in git_watch_paths().into_iter().chain(tracked_files()) {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }
-        println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+        Stamp {
+            app_version: leak(version.to_string()),
+            git_commit: leak(commit),
+            git_commit_full: leak(full_commit),
+            git_dirty: dirty,
+            build_time: leak(build_time),
+            build_number: leak(build_number),
+            dev_commits: leak(dev_commits),
+            index_hint: leak(index_hint),
+            release_build,
+            ..Stamp::UNSTAMPED
+        }
+    }
+
+    /// A build script runs once and exits: the record's text lives as long as it does.
+    fn leak(text: String) -> &'static str {
+        text.leak()
     }
 
     /// Resolve a `git rev-parse` path to an absolute [`PathBuf`].

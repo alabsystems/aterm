@@ -1364,7 +1364,7 @@ mod tests {
             .collect();
         let cargo = resolve::Cargo::pinned("/nonexistent/targo", "/nonexistent");
         let resolved = aterm_uds::output::with_executor(executor, || {
-            resolve_cells(&cargo, Path::new(env!("CARGO_MANIFEST_DIR")), &cells)
+            resolve_cells(&cargo, &aterm_tempfile::manifest_dir(), &cells)
         });
         assert_eq!(resolved.len(), cells.len());
         for (log, cell) in &resolved {

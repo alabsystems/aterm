@@ -212,7 +212,7 @@ fn read_labeled(path: &std::path::Path) -> Vec<(Tone, String, String)> {
 }
 
 fn main() {
-    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+    let data = aterm_tempfile::manifest_dir().join("data");
     let train = load(&data.join("tone_corpus.tsv"));
     let holdout = read_labeled(&data.join("tone_holdout.tsv"));
     let train_labeled = read_labeled(&data.join("tone_corpus.tsv"));

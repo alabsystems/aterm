@@ -855,6 +855,31 @@ pub fn started_words() -> String {
         .join("|")
 }
 
+/// The [`WORKERS`] row a program spawn's `program` names by its file name, where `spawn agent=`
+/// starts that CLI ([`started_words`]) under the harness that concludes its worker: `spawn
+/// program=` refuses it and names the agent form instead, since as a program worker its harness
+/// concludes nothing of its task (aterm refuses a harness's mark on one). `None` for any other
+/// program, Grok Build and Kimi Code included, which no harness concludes, and a wrapper that
+/// starts one of those CLIs, which runs as the program it names.
+#[must_use]
+pub fn harness_of_program(program: &str) -> Option<&'static WorkerCli> {
+    let name = Path::new(program).file_name()?.to_str()?;
+    WORKERS
+        .iter()
+        .find(|w| w.word == name && w.end_unseen().is_none())
+}
+
+/// The shell command line a program worker runs at its first prompt: `program` and each of
+/// `args`, quoted for `dialect`, with the task file as its standard input
+/// ([`upgrade::TASK_STDIN`]). The program runs as the tab's own command, so the shell's
+/// integration reports its exit code.
+///
+/// # Errors
+/// `program` or an argument holds a control character, or the line exceeds its budget.
+pub fn program_line(dialect: Dialect, program: &Path, args: &[String]) -> Result<String, String> {
+    upgrade::task_line_env(dialect, &[], program, args, upgrade::TASK_STDIN)
+}
+
 /// Program, environment, and argv flags carried from a starter onto a worker's launch line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Starter {

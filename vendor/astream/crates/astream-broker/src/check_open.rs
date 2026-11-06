@@ -158,15 +158,14 @@ impl Drop for Locked {
 }
 
 fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
-    use std::io::Read as _;
-    let mut locked = Locked::take(path)?;
+    let locked = Locked::take(path)?;
     if offline_seal::pending(path)? {
         return Ok(OpenCheck::Unsettled(InterruptedStep::SealSwitch));
     }
-    let mut existing = Vec::new();
-    locked.0.read_to_end(&mut existing)?;
+    // Read as the open reads it, through the scan's window (`open_scan.rs`).
+    let len = locked.0.metadata()?.len();
     let at_rest = match key {
-        Some(key) => match bound(path, &existing, key)? {
+        Some(key) => match bound(path, len == 0, key)? {
             Some(at_rest) => Some(at_rest),
             None => {
                 return Ok(OpenCheck::Opens {
@@ -186,7 +185,11 @@ fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
         None => None,
     };
     #[cfg(feature = "retention")]
-    if let Some(new_base) = crate::compact::pending(path, &existing, key_ref)? {
+    if let Some(new_base) = crate::compact::pending(
+        path,
+        open_scan::first_frame(&locked.0, len)?.as_deref(),
+        key_ref,
+    )? {
         return Ok(OpenCheck::Unsettled(InterruptedStep::Compaction {
             new_base,
         }));
@@ -200,11 +203,19 @@ fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
     let boot_volume = on_boot_volume(&locked.0);
     let floor = prior.floor(base.0);
     let unclean = prior.unclean(None, boot);
-    let scanned = scan_from(&existing, key_ref, base.0, floor, Mutation::Off);
+    let open_scan::Streamed { scan, rest } = open_scan::scan(
+        &locked.0,
+        open_scan::Reading::shipped(),
+        key_ref,
+        base.0,
+        floor,
+        Mutation::Off,
+        &mut open_scan::Discard,
+    )?;
     let judged = recover::classify(
-        &scanned,
+        &scan,
         &recover::Judge {
-            bytes: &existing,
+            rest: &rest,
             key: key_ref,
             base: base.0,
             floor,
@@ -218,7 +229,7 @@ fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
         Classified::Keep { keep, records, .. } => Ok(OpenCheck::Opens {
             base,
             head: Offset(base.0.saturating_add(records as u64)),
-            torn: existing.len().saturating_sub(keep) as u64,
+            torn: len.saturating_sub(keep as u64),
         }),
         Classified::Corrupt {
             offset,
@@ -228,7 +239,7 @@ fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
         } => Err(
             match BrokerLog::refuse_or_repair(
                 path,
-                &existing,
+                usize::try_from(len).unwrap_or(usize::MAX),
                 (false, key_ref.is_some()),
                 (offset, at_byte),
                 &reason,
@@ -254,25 +265,25 @@ fn check(path: &Path, key: Option<&[u8; 32]>) -> io::Result<OpenCheck> {
     }
 }
 
-/// The bound open's key for the log at `path` whose bytes are `existing`, read without
+/// The bound open's key for the log at `path` (`empty`: it holds no byte), read without
 /// writing: its `<log>.seal` authenticated under `key`, or the bound open's refusal of a log
 /// with none. `None` for a log never written to (empty, with no sidecar), where the open
 /// would mint a binding and serve an empty log.
 #[cfg(feature = "at-rest")]
-fn bound(path: &Path, existing: &[u8], key: &[u8; 32]) -> io::Result<Option<AtRestKey>> {
+fn bound(path: &Path, empty: bool, key: &[u8; 32]) -> io::Result<Option<AtRestKey>> {
     match read_seal(path, key)? {
         Some(seal_id) => Ok(Some(AtRestKey {
             key: *key,
             seal_id: Some(seal_id),
         })),
-        None if is_virgin_empty_log(path, existing)? => Ok(None),
+        None if is_virgin_empty_log(path, empty)? => Ok(None),
         None => Err(unbound_refusal(path)),
     }
 }
 
 /// A build without `at-rest` opens no log under a key.
 #[cfg(not(feature = "at-rest"))]
-fn bound(_path: &Path, _existing: &[u8], _key: &[u8; 32]) -> io::Result<Option<AtRestKey>> {
+fn bound(_path: &Path, _empty: bool, _key: &[u8; 32]) -> io::Result<Option<AtRestKey>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "at-rest encryption is not compiled into this build",

@@ -25,16 +25,20 @@ pub struct Lease {
 pub fn acquire(home: &Path, email: &str) -> Result<Lease, String> {
     #[cfg(unix)]
     {
-        let path = location(home, email).with_extension("lock");
-        let parent = path.parent().ok_or("Invalid mail session path")?;
-        aterm_secrets::fsx::ensure_private_dir(parent).map_err(|e| e.to_string())?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("Invalid mail session path")?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = email_digest(email);
+        let mut name = [0u8; 69];
+        for (i, &b) in digest.iter().enumerate() {
+            name[i * 2] = HEX[usize::from(b >> 4)];
+            name[i * 2 + 1] = HEX[usize::from(b & 0x0f)];
+        }
+        name[64..].copy_from_slice(b".lock");
+        let file = std::str::from_utf8(&name).unwrap_or("");
+        let parent = home.join(".config/aterm/mail/sessions");
+        aterm_secrets::fsx::ensure_private_dir(&parent).map_err(|e| e.to_string())?;
         let guard = aterm_uds::private_file::PrivateLock::take(
-            parent,
-            name,
+            &parent,
+            file,
             std::time::Duration::ZERO,
             "This mail account is already connected in another aterm instance",
         )
@@ -120,14 +124,26 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
 }
 
 #[cfg(unix)]
-fn location(home: &Path, email: &str) -> std::path::PathBuf {
+fn email_digest(email: &str) -> [u8; 32] {
     let mut hasher = aterm_digest::Sha256::new();
     for b in email.trim().bytes() {
         hasher.update([b.to_ascii_lowercase()]);
     }
-    let key = aterm_codec::hex::encode_lower(&hasher.finalize());
-    home.join(".config/aterm/mail/sessions")
-        .join(format!("{key}.age"))
+    hasher.finalize()
+}
+
+#[cfg(unix)]
+fn location(home: &Path, email: &str) -> std::path::PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = email_digest(email);
+    let mut name = [0u8; 68];
+    for (i, &b) in digest.iter().enumerate() {
+        name[i * 2] = HEX[usize::from(b >> 4)];
+        name[i * 2 + 1] = HEX[usize::from(b & 0x0f)];
+    }
+    name[64..].copy_from_slice(b".age");
+    let file = std::str::from_utf8(&name).unwrap_or("");
+    home.join(".config/aterm/mail/sessions").join(file)
 }
 
 #[cfg(unix)]

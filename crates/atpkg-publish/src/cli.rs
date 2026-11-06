@@ -42,12 +42,12 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "pack-bottle",
         synopsis: artifact::bottle::SYNOPSIS,
-        does: "stage, relocate, gate and sign an upstream bottle or binary archive (gh, git)",
+        does: "stage, relocate, gate and sign a declared upstream bottle or binary archive",
     },
     Verb {
         name: "pack-upstream",
         synopsis: artifact::bottle::upstream::SYNOPSIS,
-        does: "acquire, build and qualify pinned GNU Git; unsigned, without upload",
+        does: "acquire and qualify pinned upstream tools or GNU Git; unsigned, without upload",
     },
     Verb {
         name: "build-local",
@@ -99,6 +99,11 @@ pub const VERBS: &[Verb] = &[
         name: "hosts",
         synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless]",
         does: "whether this builder's agh.toml is ready for --host agh-staging or agh (reads files, sends nothing)",
+    },
+    Verb {
+        name: "adopt",
+        synopsis: crate::adopt::SYNOPSIS,
+        does: "write a checkout's sealed trust.lock for a store Trust build on adopt/trust-<N>, judged by TOOLCHAIN_ACCEPT_CMD_DEFAULT when the compiler changes; commits, never pushes",
     },
     Verb {
         name: "agh",
@@ -213,8 +218,31 @@ pub fn run(args: &[String]) -> Result<()> {
     if !VERBS.iter().any(|v| v.name == verb.as_str()) {
         return Err(unknown_verb(verb));
     }
-    let ctx = Ctx::from_env_hosts(choice.unwrap_or_default())?;
+    let ctx = if live_identity_lookup(verb, rest) {
+        Ctx::from_env_hosts(choice.unwrap_or_default())?
+    } else {
+        Ctx::from_env_hosts_view(choice.unwrap_or_default())?
+    };
     dispatch(&ctx, verb, rest)
+}
+
+/// Learning identity is reserved for an explicitly requested publishing run.
+/// A plan or read-only preflight uses cached identity even if a later flag is invalid.
+fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
+    if rest
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--dry-run" | "--plan"))
+    {
+        return false;
+    }
+    match verb {
+        "upload" | "mirror" => true,
+        "pack" | "pack-bundle" | "pack-package" | "pack-bottle" | "index" | "publish-group" => {
+            rest.iter().any(|arg| arg == "--upload")
+        }
+        "lane" => rest.first().is_some_and(|arg| arg == "run"),
+        _ => false,
+    }
 }
 
 /// Route `verb` against `ctx`.
@@ -240,6 +268,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "status" => channel::status::run(ctx, rest),
         "lane" => lane::run(ctx, rest),
         "hosts" => crate::hosts_check::run(ctx, rest),
+        "adopt" => crate::adopt::run(ctx, rest, &|k| std::env::var_os(k)),
         // `main_entry` forwards a leading `agh` before any context; one routed here came
         // after something else.
         "agh" => Err(Error::usage(
@@ -272,6 +301,26 @@ pub fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_learning_is_only_for_an_explicit_publishing_run() {
+        let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (verb, args) in [
+            ("hosts", vec!["check"]),
+            ("mirror", vec!["quad", "--dry-run"]),
+            ("publish-group", vec!["rustc", "--dry-run"]),
+            ("pack", vec!["ay", "--unsigned"]),
+            ("index", vec![]),
+            ("status", vec![]),
+        ] {
+            assert!(!super::live_identity_lookup(verb, &words(&args)));
+        }
+        assert!(super::live_identity_lookup(
+            "upload",
+            &words(&["staging", "repo"])
+        ));
+        assert!(super::live_identity_lookup("index", &words(&["--upload"])));
+    }
+
     use std::ffi::OsString;
 
     use super::{forwarded, host_flag, run, utf8_words};

@@ -21,6 +21,7 @@ use aterm_uds::secret::Secret;
 use ring::rand::{SecureRandom as _, SystemRandom};
 
 use super::login_drive::{Approval, Approver, Drove, Handoff, Outcome, https_host, pinned};
+use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::Completion;
 
 #[path = "codex_shared_login.rs"]
@@ -488,6 +489,16 @@ const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// How long a sign-in's write waits for a refresh of the login it replaces ([`AuthLock`]).
 const SIGN_IN_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// The longest a sign-in's code exchange request may take: a request in flight while the host
+/// sleeps measures it on the clock that stops in sleep, so it holds a sign-in that sleep ended
+/// this long at most.
+#[cfg(not(test))]
+const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
+/// The longest a sign-in's code exchange request may take: the unit tests' token servers answer
+/// on loopback, so an answer a loaded machine holds is waited for by the hang detector.
+#[cfg(test)]
+const EXCHANGE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The least time a refresh must have left when it would send its request
 /// ([`refresh_admitted`]). The provider spends the refresh token once the request reaches it,
@@ -2588,13 +2599,13 @@ fn build_authorize_url(
     format!("{base}/oauth/authorize?{query}")
 }
 
-fn bind_callback_listener(ports: &[u16], deadline: Instant) -> std::io::Result<TcpListener> {
+fn bind_callback_listener(ports: &[u16], deadline: WakeDeadline) -> std::io::Result<TcpListener> {
     let mut last_err = std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "no callback port configured",
     );
     for &port in ports {
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "callback listener bind deadline expired",
@@ -2612,6 +2623,8 @@ fn bind_callback_listener(ports: &[u16], deadline: Instant) -> std::io::Result<T
 enum CallbackOutcome {
     Code(String),
     Failed,
+    /// The sign-in's deadline passed, by sleep or awake time, before a callback came.
+    Expired,
 }
 
 fn callback_io_budget(deadline: Instant, now: Instant) -> std::io::Result<Duration> {
@@ -2691,7 +2704,7 @@ fn drain_callback(from: &mut impl Read) {
 
 fn write_http_reply(
     stream: &mut TcpStream,
-    deadline: Instant,
+    deadline: WakeDeadline,
     status: &str,
     content_type: &str,
     body: &str,
@@ -2700,9 +2713,11 @@ fn write_http_reply(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    // The reply's writes and its drain are leaves that take an `Instant`: their short caps bound
+    // them, so each gets its share of the deadline as one, read now.
     let _ = write_callback_until(
         head.as_bytes(),
-        deadline.min(Instant::now() + CALLBACK_IO_WAIT),
+        deadline.within(CALLBACK_IO_WAIT).instant(),
         Instant::now,
         |bytes, remaining| {
             stream.set_write_timeout(Some(remaining))?;
@@ -2713,7 +2728,7 @@ fn write_http_reply(
     let _ = stream.shutdown(std::net::Shutdown::Write);
     drain_callback(&mut callback_reader(
         stream,
-        deadline.min(Instant::now() + CALLBACK_DRAIN_WAIT),
+        deadline.within(CALLBACK_DRAIN_WAIT).instant(),
     ));
 }
 
@@ -2829,17 +2844,18 @@ fn serve_callback_loop(
     cancelled: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     tx: mpsc::Sender<CallbackOutcome>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) {
     let _ = listener.set_nonblocking(true);
-    while !cancelled.load(Ordering::SeqCst) && Instant::now() < deadline {
+    while !cancelled.load(Ordering::SeqCst) && !deadline.passed() {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
+                // A leaf that takes an `Instant`, bounded by the request head's short cap.
                 let target = read_request_target(
                     &mut callback_reader(
                         &mut stream,
-                        deadline.min(Instant::now() + CALLBACK_HEAD_WAIT),
+                        deadline.within(CALLBACK_HEAD_WAIT).instant(),
                     ),
                     port,
                 );
@@ -2961,6 +2977,11 @@ fn serve_callback_loop(
             }
         }
     }
+    // The deadline passed with no callback, unless the sign-in cancelled the wait: said so before
+    // `done`, so a sign-in that sees `done` reads a sign-in out of time, never a failed one.
+    if !cancelled.load(Ordering::SeqCst) {
+        let _ = tx.send(CallbackOutcome::Expired);
+    }
     done.store(true, Ordering::SeqCst);
 }
 
@@ -3035,7 +3056,9 @@ impl CodeExchange<'_> {
             Ok(md) if md.is_file() && !md.file_type().is_symlink() => {}
             Ok(_) | Err(_) => return None,
         }
-        let wait = deadline.saturating_duration_since(Instant::now());
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(EXCHANGE_WAIT);
         if wait.is_zero() {
             return None;
         }
@@ -3123,7 +3146,7 @@ pub fn login_with(
     approver: &mut dyn Approver,
     hosts: &[&str],
     email: Option<&str>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Drove {
     let rng = SystemRandom::new();
     let mut verifier_bytes = [0u8; 32];
@@ -3172,7 +3195,7 @@ pub fn login_with(
             host: https_host(&endpoints.token_url),
         };
     }
-    if Instant::now() >= deadline {
+    if deadline.passed() {
         return Drove {
             outcome: Outcome::Hung,
             host,
@@ -3282,8 +3305,8 @@ pub fn login_with(
         }
     };
 
-    let wait = deadline.saturating_duration_since(Instant::now());
-    let callback = rx.recv_timeout(wait);
+    // One tick at a time, so a callback wait the host slept past ends within a tick of its waking.
+    let callback = deadline.recv(&rx);
     cancelled.store(true, Ordering::SeqCst);
     let _ = server_thread.join();
 
@@ -3295,7 +3318,7 @@ pub fn login_with(
                 host,
             };
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        Ok(CallbackOutcome::Expired) | Err(mpsc::RecvTimeoutError::Timeout) => {
             return Drove {
                 outcome: Outcome::Hung,
                 host,
@@ -3309,7 +3332,9 @@ pub fn login_with(
         }
     };
 
-    let left = deadline.saturating_duration_since(Instant::now());
+    // The exchange is a leaf that takes what is left as a span: its lock wait and its request
+    // have their own caps ([`SIGN_IN_LOCK_WAIT`], [`EXCHANGE_WAIT`]).
+    let left = deadline.remaining();
     if left.is_zero() {
         return Drove {
             outcome: Outcome::Hung,
@@ -3347,7 +3372,7 @@ pub fn login_in_home(
     approver: &mut dyn Approver,
     hosts: &[&str],
     email: Option<&str>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Drove {
     login_with(
         home,

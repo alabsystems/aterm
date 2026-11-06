@@ -750,6 +750,73 @@ fn the_walk_says_it_goes_before_local_network_only_when_it_starts() {
     );
 }
 
+/// On a cold first launch the walk that would start by itself waits while the Mac Setup tab is,
+/// or may yet be, the window's next macOS ask: while the launch's reading of the elevation's
+/// steps is out (E3's relaunch, 2026-11-05: the walk started 3 ms before that reading wanted the
+/// tab, and its panel, which nobody answered, held setup's one Mac password), while the want it
+/// brings is due, while the tab's shell is booked and while the tab runs. The walk starts at the
+/// first look after the tab ended, or after the reading said nothing is owed. The tab itself does
+/// not open here (a headless App), so nothing but the yield holds the walk.
+/// NEGATIVE CONTROL: with no reading out and no want, the first look starts the walk.
+#[test]
+fn a_walk_starting_by_itself_lets_the_mac_setup_tab_go_first() {
+    use crate::clt_install::{Install, LAUNCH_WANT};
+    let cold = |awaited| {
+        let mut app = walk_app();
+        app.headless = true;
+        app.workstation_setup.root_steps_awaited = awaited;
+        app.devtools_helper.note_cold_start();
+        app
+    };
+    let t0 = Instant::now();
+    let mut control = cold(false);
+    control.tick_consent_lanes(t0);
+    assert!(
+        control.permission_walk.active(),
+        "nothing to yield to: the walk starts"
+    );
+
+    let mut app = cold(true);
+    app.tick_consent_lanes(t0);
+    assert!(
+        !app.permission_walk.active(),
+        "the elevation's reading is out: no walk"
+    );
+    app.root_steps_owed(true);
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::Wanted(LAUNCH_WANT),
+        "precondition: a root step owed wants the tab"
+    );
+    app.tick_consent_lanes(t0 + GRANT_POLL);
+    assert!(!app.permission_walk.active(), "the tab is due: no walk");
+    app.workstation_setup.developer_tools = Install::Opening {
+        wanted: Some(LAUNCH_WANT),
+    };
+    app.tick_consent_lanes(t0 + GRANT_POLL * 2);
+    assert!(
+        !app.permission_walk.active(),
+        "its shell is booked: no walk"
+    );
+    app.workstation_setup.developer_tools = Install::Opened;
+    app.land_install_session_for_test(7);
+    app.tick_consent_lanes(t0 + GRANT_POLL * 3);
+    assert!(!app.permission_walk.active(), "the tab runs: no walk");
+    assert!(app.finish_developer_tools_install(7));
+    app.tick_consent_lanes(t0 + GRANT_POLL * 4);
+    assert!(app.permission_walk.active(), "the walk follows the tab");
+
+    let mut nothing_owed = cold(true);
+    nothing_owed.tick_consent_lanes(t0);
+    assert!(!nothing_owed.permission_walk.active(), "the reading is out");
+    nothing_owed.root_steps_owed(false);
+    nothing_owed.tick_consent_lanes(t0 + GRANT_POLL);
+    assert!(
+        nothing_owed.permission_walk.active(),
+        "nothing owed: the walk starts"
+    );
+}
+
 thread_local! {
     /// What the Local Network step did with its alert watch, in order: `start <revision>`, `arm`
     /// and `cancel` (`StepsReach::start_local_network_alert_watch`, `…arm…`, `…cancel…`), and its

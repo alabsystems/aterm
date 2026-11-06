@@ -110,9 +110,9 @@ impl Page {
     }
 }
 
-/// The perf drivers beside this crate (`perf/wasm/*.mjs`).
-pub(crate) fn drivers_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/wasm")
+/// The perf drivers in this crate in the checkout at `root` (`perf/wasm/*.mjs`).
+pub(crate) fn drivers_dir(root: &Path) -> PathBuf {
+    root.join("crates/aterm-verify/perf/wasm")
 }
 
 /// The font every driver's terminal is built on: the tree's, so no answer
@@ -131,7 +131,7 @@ pub(crate) fn lay_drivers(root: &Path, site: &Path) -> Result<(), String> {
     let into = site.join(DRIVERS);
     std::fs::create_dir_all(&into)
         .map_err(|e| format!("could not create {}: {e}", into.display()))?;
-    let from = drivers_dir();
+    let from = drivers_dir(root);
     for entry in std::fs::read_dir(&from).map_err(|e| format!("{}: {e}", from.display()))? {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().is_some_and(|x| x == "mjs") {

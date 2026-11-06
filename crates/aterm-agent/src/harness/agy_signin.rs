@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use super::wake_deadline::WakeDeadline;
+
 use aterm_secrets::SecretBytes;
 
 #[path = "agy_signin_observe.rs"]
@@ -509,21 +511,17 @@ impl UnverifiedGoogleGrant {
     /// with one- and two-second delays inside the caller's original deadline. The native
     /// grant and pending browser session stay claimed throughout these attempts.
     /// Provider rejection, deadline expiry, or concurrent binding/grant changes fail closed.
-    pub fn verify(self, deadline: Instant) -> Result<VerifiedGoogleGrant, &'static str> {
-        self.verify_classified(deadline)
-            .map_err(super::google_profile::Error::message)
-    }
-
-    fn verify_classified(
-        self,
-        deadline: Instant,
-    ) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
+    /// `deadline` counts the time the host slept: each look at it (before a request, before a
+    /// delay, before publication) reads both clocks, so no request starts once the host slept
+    /// past it; a request or delay in flight ends at its own cap.
+    pub fn verify(self, deadline: WakeDeadline) -> Result<VerifiedGoogleGrant, &'static str> {
         self.verify_using(deadline, super::google_profile::read)
+            .map_err(super::google_profile::Error::message)
     }
 
     fn verify_using(
         self,
-        deadline: Instant,
+        deadline: WakeDeadline,
         read: impl FnMut(
             &str,
             &str,
@@ -531,12 +529,14 @@ impl UnverifiedGoogleGrant {
         )
             -> Result<super::google_profile::GoogleProfile, super::google_profile::Error>,
     ) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
-        self.verify_with_retry(deadline, read, std::thread::sleep, Instant::now)
+        self.verify_with_retry(|| deadline.remaining(), read, std::thread::sleep)
     }
 
+    /// [`UnverifiedGoogleGrant::verify`]'s steps, where `left` says what is left of its deadline
+    /// now, `read` is the provider's check and `pause` a delay between requests.
     fn verify_with_retry(
         self,
-        deadline: Instant,
+        left: impl Fn() -> Duration,
         mut read: impl FnMut(
             &str,
             &str,
@@ -546,7 +546,6 @@ impl UnverifiedGoogleGrant {
             super::google_profile::Error,
         >,
         mut pause: impl FnMut(Duration),
-        now: impl Fn() -> Instant,
     ) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
         self.check_binding().map_err(|_| "Google binding changed")?;
         let bytes = grant_bytes(self.path())?;
@@ -564,20 +563,19 @@ impl UnverifiedGoogleGrant {
             if grant_digest(grant_bytes(self.path())?.as_slice()) != digest {
                 return Err("Native Google grant changed during verification".into());
             }
-            let wait = deadline
-                .checked_duration_since(now())
+            let wait = Some(left())
                 .filter(|wait| !wait.is_zero())
                 .ok_or("Google verification deadline expired")?;
             let result = read(
                 token.as_str().ok_or("Native Google token is not text")?,
                 self.expected_email(),
-                wait.min(Duration::from_secs(30)),
+                wait.min(GOOGLE_REQUEST),
             );
             match result {
                 Ok(profile) => break profile,
                 Err(super::google_profile::Error::Unavailable) if attempt < 2 => {
                     let delay = Duration::from_secs(1 << attempt);
-                    if deadline.saturating_duration_since(now()) <= delay {
+                    if left() <= delay {
                         return Err(super::google_profile::Error::Unavailable);
                     }
                     pause(delay);
@@ -588,7 +586,7 @@ impl UnverifiedGoogleGrant {
                         error,
                         super::google_profile::Error::CredentialRejected
                             | super::google_profile::Error::Refused(_)
-                    ) && now() < deadline
+                    ) && !left().is_zero()
                         && let Some(journal) = &self.recovery
                         && !(error == super::google_profile::Error::CredentialRejected
                             && journal.supports_staged_refresh())
@@ -599,7 +597,7 @@ impl UnverifiedGoogleGrant {
                 }
             }
         };
-        if now() >= deadline {
+        if left().is_zero() {
             return Err("Google verification deadline expired".into());
         }
         let mut verified = VerifiedGoogleGrant {
@@ -613,7 +611,7 @@ impl UnverifiedGoogleGrant {
                 .commit(&verified)
                 .map_err(|_| "Verified Google browser session could not be persisted")?;
         }
-        if now() >= deadline {
+        if left().is_zero() {
             return Err("Google verification deadline expired".into());
         }
         verified.check_current()?;
@@ -786,7 +784,7 @@ pub fn run_google(
     state: &Path,
     home: &Path,
     account: &str,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     recovery::direct(program, state, home, account, deadline)
 }
@@ -809,7 +807,7 @@ pub fn run_google_staged(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     run_google_staged_scoped(program, state, home, account, staging, deadline, None)
 }
@@ -821,7 +819,7 @@ pub fn run_google_staged_scoped(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     work: Option<super::account_work::Scope>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     if work
@@ -845,7 +843,7 @@ fn run_google_at(
     home: &Path,
     account: &str,
     staging: Option<StagedGoogleLogin<'_>>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     run_google_at_scoped(program, state, home, account, staging, deadline, None)
 }
@@ -856,7 +854,7 @@ fn run_google_at_scoped(
     home: &Path,
     account: &str,
     staging: Option<StagedGoogleLogin<'_>>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     work: Option<super::account_work::Scope>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     remaining(deadline).map_err(GoogleLoginError::Native)?;
@@ -978,9 +976,15 @@ impl Drop for Child {
     }
 }
 
-fn remaining(deadline: Instant) -> Result<Duration, Error> {
-    deadline
-        .checked_duration_since(Instant::now())
+/// The longest one Google account check ([`super::google_profile::read`]) may take: a request
+/// in flight while the host sleeps measures it on the clock that stops in sleep, so it holds a
+/// sign-in that sleep ended this long at most.
+const GOOGLE_REQUEST: Duration = Duration::from_secs(30);
+
+/// What is left of `deadline`, which counts the time the host slept: [`Error::Deadline`] once
+/// it passed.
+fn remaining(deadline: WakeDeadline) -> Result<Duration, Error> {
+    Some(deadline.remaining())
         .filter(|d| !d.is_zero())
         .ok_or(Error::Deadline)
 }
@@ -1050,8 +1054,8 @@ fn finish_exited_group(leader: i32) -> std::io::Result<()> {
 pub fn run(
     program: &Path,
     profile: &Path,
-    deadline: Instant,
-    approve: impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
+    deadline: WakeDeadline,
+    approve: impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<UnverifiedGrant, Error> {
     run_claimed(program, profile, None, None, deadline, approve)
 }
@@ -1093,7 +1097,7 @@ struct StagedRecovery<'a> {
 fn prepare_rejected_staging(
     profile: &Path,
     recovery: &StagedRecovery<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     check: impl FnOnce(&str, Duration) -> Result<(), super::google_profile::Error>,
 ) -> Result<bool, Error> {
     if !(recovery.current)() {
@@ -1103,7 +1107,10 @@ fn prepare_rejected_staging(
     let bytes = grant_bytes(&path).map_err(|_| Error::Native)?;
     let token = native_access_token(bytes.as_slice()).map_err(|_| Error::Native)?;
     let rejected = matches!(
-        check(token.as_str().ok_or(Error::Native)?, remaining(deadline)?),
+        check(
+            token.as_str().ok_or(Error::Native)?,
+            remaining(deadline)?.min(GOOGLE_REQUEST)
+        ),
         Err(super::google_profile::Error::CredentialRejected)
     );
     if !rejected {
@@ -1162,8 +1169,8 @@ fn run_claimed(
     profile: &Path,
     claim: Option<super::browser_window::ProfileLock>,
     recovery: Option<StagedRecovery<'_>>,
-    deadline: Instant,
-    mut approve: impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
+    deadline: WakeDeadline,
+    mut approve: impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<UnverifiedGrant, Error> {
     remaining(deadline)?;
     if !program.is_absolute() || !program.is_file() || !profile.is_absolute() {
@@ -1204,8 +1211,8 @@ fn run_claimed(
 fn run_attempt(
     program: &Path,
     profile: &Path,
-    deadline: Instant,
-    approve: &mut impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
+    deadline: WakeDeadline,
+    approve: &mut impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<(PathBuf, Option<super::google_browser::PendingSession>), Error> {
     remaining(deadline)?;
     let gemini = profile.join(".gemini");
@@ -1325,12 +1332,17 @@ fn run_attempt(
                 Ok(0) => return Err(Error::Process),
                 Ok(n) => bytes = &bytes[n..],
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    aterm_uds::ready::until(
+                    // One tick at a time, so the next turn's look at both clocks ends a write
+                    // the host slept past.
+                    match aterm_uds::ready::until(
                         child.master.as_fd(),
                         aterm_uds::ready::Interest::Write,
-                        deadline,
-                    )
-                    .map_err(|_| Error::Deadline)?;
+                        Instant::now() + deadline.tick(),
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => return Err(Error::Deadline),
+                    }
                 }
                 Err(_) => return Err(Error::Process),
             }
@@ -1464,7 +1476,7 @@ mod tests {
             let mut delays = Vec::new();
             let mut token_seen = None;
             let result = grant.verify_with_retry(
-                deadline,
+                || deadline.saturating_duration_since(clock.get()),
                 |token, expected, wait| {
                     calls += 1;
                     assert_eq!(expected, "person@example.com");
@@ -1514,7 +1526,6 @@ mod tests {
                         aterm_secrets::fsx::write_atomic(&native_path, b"changed", 0o600).unwrap();
                     }
                 },
-                || clock.get(),
             );
             assert_eq!(
                 calls,
@@ -1594,11 +1605,11 @@ mod tests {
                 home.path(),
                 NEW,
             ));
-            let deadline = if scenario == 5 {
-                Instant::now()
+            let deadline = WakeDeadline::after(if scenario == 5 {
+                Duration::ZERO
             } else {
-                Instant::now() + Duration::from_secs(60)
-            };
+                Duration::from_secs(60)
+            });
             let result = grant.verify_using(deadline, |_, expected, _| {
                 assert_ne!(scenario, 5, "expired verification contacted the provider");
                 assert_eq!(expected, "person@example.com");
@@ -1667,6 +1678,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A GRANT VERIFICATION ITS HOST SLEPT PAST STARTS NO NEW REQUEST (KI-1105-14): an hour's
+    /// verification whose host slept two hours during its first account check, which Google
+    /// could not answer, ends then as unavailable, with no retry. NEGATIVE CONTROL: on the clock
+    /// that stops in sleep alone the hour was left, and it paused (a second, then two) and asked
+    /// twice more.
+    #[cfg(unix)]
+    #[test]
+    fn a_grant_verification_its_host_slept_past_starts_no_new_request() {
+        let state = aterm_tempfile::tempdir().unwrap();
+        let profile = aterm_tempfile::tempdir().unwrap();
+        aterm_secrets::fsx::write_atomic(&state.path().join("google-identities.toml"), b"[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n", 0o600).unwrap();
+        let grant =
+            publication_fixture(state.path(), profile.path(), "one", "person@example.com").grant;
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let deadline = WakeDeadline::after(Duration::from_secs(3600));
+        let mut calls = 0;
+        let result = grant.verify_using(deadline, |_, _, _| {
+            calls += 1;
+            super::super::wake_deadline::host_slept(Duration::from_secs(2 * 3600));
+            Err(super::super::google_profile::Error::Unavailable)
+        });
+        assert_eq!(
+            result.err(),
+            Some(super::super::google_profile::Error::Unavailable)
+        );
+        assert_eq!(calls, 1, "no request after the sleep");
     }
 
     #[test]
@@ -2082,7 +2121,7 @@ mod tests {
         let result = run(
             Path::new("/usr/bin/true"),
             &profile,
-            Instant::now(),
+            WakeDeadline::after(Duration::ZERO),
             |_, _| panic!("expired attempt invoked approval"),
         );
         assert!(matches!(result, Err(Error::Deadline)));
@@ -2105,7 +2144,7 @@ mod tests {
             state.path(),
             home.path(),
             "one",
-            Instant::now() + Duration::from_secs(30),
+            WakeDeadline::after(Duration::from_secs(30)),
         );
         assert!(matches!(
             result,
@@ -2118,7 +2157,7 @@ mod tests {
             state.path(),
             home.path(),
             "other",
-            Instant::now() + Duration::from_secs(30),
+            WakeDeadline::after(Duration::from_secs(30)),
         );
         assert!(matches!(result, Err(GoogleLoginError::Configuration)));
     }
@@ -2173,7 +2212,7 @@ mod tests {
                     expected_email: email,
                     recovery: None,
                 },
-                Instant::now() + Duration::from_secs(30),
+                WakeDeadline::after(Duration::from_secs(30)),
             )
         };
         assert!(matches!(
@@ -2376,9 +2415,9 @@ mod tests {
             let current = std::cell::Cell::new(true);
             let claim = super::super::browser_window::ProfileLock::claim(profile.path()).unwrap();
             let deadline = if scenario == 6 {
-                Instant::now()
+                WakeDeadline::after(Duration::ZERO)
             } else {
-                Instant::now() + Duration::from_secs(60)
+                WakeDeadline::after(Duration::from_secs(3600))
             };
             let result = prepare_rejected_staging(
                 profile.path(),
@@ -2387,8 +2426,12 @@ mod tests {
                     current: &|| current.get(),
                 },
                 deadline,
-                |token, _| {
+                |token, wait| {
                     assert_eq!(token, "synthetic-only");
+                    assert!(
+                        !wait.is_zero() && wait <= GOOGLE_REQUEST,
+                        "the account check is capped, not given the hour: {wait:?}"
+                    );
                     assert!(
                         super::super::browser_window::ProfileLock::claim(profile.path()).is_err()
                     );
@@ -2471,7 +2514,7 @@ mod tests {
             let claim = stage_profile(staging.path(), Some(profile.path())).unwrap();
             let original = std::fs::read(profile.path().join(".gemini/antigravity-cli/antigravity-oauth-token")).ok();
             let mut observed = false;
-            let result = run_claimed(&program, staging.path(), Some(claim), Some(StagedRecovery { expected_email: "synthetic@example.invalid", current: &|| true }), Instant::now() + Duration::from_secs(60), |_, _| {
+            let result = run_claimed(&program, staging.path(), Some(claim), Some(StagedRecovery { expected_email: "synthetic@example.invalid", current: &|| true }), WakeDeadline::after(Duration::from_secs(60)), |_, _| {
                 observed = true;
                 Err(Error::Callback)
             });
@@ -2499,7 +2542,7 @@ mod tests {
         let result = run(
             &program,
             profile.path(),
-            Instant::now() + Duration::from_secs(30),
+            WakeDeadline::after(Duration::from_secs(30)),
             |request, _| {
                 assert!(
                     request

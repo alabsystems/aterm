@@ -16,8 +16,8 @@ use aterm_machines::init_secrets::SecretsOps;
 use aterm_types::macos_setup::{AccessOutcome, BASE_PLAN};
 use std::sync::{Arc, Mutex};
 
-/// One Secrets try, ended as the live join's probe ends it here (`row`, [`unjoined_alab_row`]'s):
-/// the join password left for the next try, or spent (`spends`). Each try says where it ran
+/// One Secrets try, with the resulting `row` and the join password left for the next try, or
+/// spent (`spends`). Each try says where it ran
 /// (`ran`): in the lane beside the Workstation stage, or as the stage.
 #[derive(Clone)]
 struct Try {
@@ -205,6 +205,10 @@ impl InitialHost for Host {
     }
 
     fn repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        unreachable!("not in the plan")
+    }
+
+    fn current_repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         unreachable!("not in the plan")
     }
 

@@ -266,6 +266,17 @@ pub(crate) fn request_transition(s: &ModelState, action: &str) -> Option<ModelSt
     Some(project(s, action, before.as_ref(), &real))
 }
 
+/// [`request_transition`] with the model's `Unneeded` taken by a person's withdrawal by hand
+/// rather than by the consumer's own check: both are the model's one `Unneeded`.
+fn hand_transition(s: &ModelState, action: &str) -> Option<ModelState> {
+    if action != "Unneeded" {
+        return request_transition(s, action);
+    }
+    let before = need_of(s)?;
+    let real = act(&before, &facts_of(s), &Act::Withdraw("not now".into()))?;
+    Some(project(s, action, Some(&before), &real))
+}
+
 const BOUND: [&str; 16] = [
     "Raise",
     "RaiseNowhere",
@@ -316,13 +327,15 @@ fn conformance_failures(
 #[test]
 fn the_need_ledger_conforms_to_the_credential_request_model() {
     let model = aterm_models_db::credential_request_model();
-    let failures = conformance_failures(&model, request_transition);
-    assert!(
-        failures.is_empty(),
-        "{} failures, first: {:?}",
-        failures.len(),
-        failures.first()
-    );
+    for transition in [request_transition, hand_transition] {
+        let failures = conformance_failures(&model, transition);
+        assert!(
+            failures.is_empty(),
+            "{} failures, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+    }
     let fired = aterm_spec::interp::fired_actions(&model);
     for action in BOUND {
         assert!(fired.contains(action), "{action} never fires in the model");
@@ -339,6 +352,15 @@ fn the_need_ledger_conforms_to_the_credential_request_model() {
         Some(next)
     };
     assert!(!conformance_failures(&model, decline_keeps_asking).is_empty());
+    // And one of the withdrawal by hand: it leaves the consumer's word that it still needs it.
+    let withdrawal_keeps_need = |s: &ModelState, action: &str| {
+        let mut next = hand_transition(s, action)?;
+        if action == "Unneeded" {
+            next.insert("need", 1);
+        }
+        Some(next)
+    };
+    assert!(!conformance_failures(&model, withdrawal_keeps_need).is_empty());
 }
 
 #[test]
@@ -960,6 +982,60 @@ fn a_decline_retires_with_its_note_and_files_no_entry() {
     assert_eq!(
         withdrawn[0].retired.as_ref().unwrap().reason,
         Reason::NotNeeded
+    );
+}
+
+/// A withdrawal by hand claims no check: it says a person withdrew it on this Mac, rests on
+/// that, and keeps the person's note in a form the table's record takes. Only the consumer's
+/// own check reads as one.
+#[test]
+fn a_withdrawal_by_hand_says_so_and_keeps_its_note() {
+    let vault = vault();
+    crate::need::test_alab_policy(&vault.member);
+    raise(
+        &vault.member,
+        Want::SiteDeployerKey,
+        Purpose::ReleaseSiteKey,
+    )
+    .unwrap();
+    let withdrawn = retire(
+        &vault.member,
+        "site-deployer-key",
+        false,
+        "this Mac\ncuts no releases",
+    )
+    .unwrap();
+    let retired = withdrawn[0].retired.as_ref().unwrap();
+    assert_eq!(
+        (
+            retired.reason,
+            retired.evidence.as_str(),
+            retired.note.as_str()
+        ),
+        (
+            Reason::NotNeeded,
+            "withdrawn by hand on andrews",
+            "this Mac cuts no releases"
+        )
+    );
+    assert_eq!(
+        withdrawn[0].line,
+        "not needed: withdrawn by hand on this Mac (andrews); raising the site deployer's service-account key again asks again"
+    );
+    assert_eq!(ledger::load(&vault.member).unwrap()[0], withdrawn[0]);
+    raise(&vault.member, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let checked = satisfied(&vault.member, &Want::Notary, Purpose::ReleaseNotary)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            checked.retired.as_ref().unwrap().evidence.as_str(),
+            checked.line.as_str()
+        ),
+        (
+            "the requester's own check",
+            "not needed: release.notary's check no longer lacks the notary credential"
+        )
     );
 }
 

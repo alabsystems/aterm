@@ -18,9 +18,13 @@ pub const PS_HANG: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const PS_REAP: Duration = Duration::from_millis(250);
 
-/// The `syspolicyd` running now ([`SYSPOLICYD`], [`Look::NoneRunning`], [`Look::Unread`]).
+/// The `syspolicyd` running now: the first live root process named `syspolicyd` whose image is
+/// [`SYSPOLICYD`], with its pid and start (the kernel's `p_start`, the clock a held process's
+/// fork is read on, [`aterm_sysprobe::jobs::StartFacts::start_us`]). [`Look::NoneRunning`] when
+/// none is; [`Look::Unread`] when the process table cannot be read, or none was found but a
+/// candidate's image could not be read. No argument of any process is read.
 #[cfg(target_os = "macos")]
-fn daemon() -> Result<Daemon, Look> {
+pub fn running() -> Result<Daemon, Look> {
     let records = aterm_sysprobe::kproc::records().ok_or(Look::Unread)?;
     let mut unread = false;
     for r in records
@@ -44,6 +48,12 @@ fn daemon() -> Result<Daemon, Look> {
     } else {
         Look::NoneRunning
     })
+}
+
+/// See the macOS twin: there is no program check to read here, so [`Look::Unread`].
+#[cfg(not(target_os = "macos"))]
+pub fn running() -> Result<Daemon, Look> {
+    Err(Look::Unread)
 }
 
 /// What one look at the program check found.
@@ -79,10 +89,10 @@ type PoolRun = (Daemon, Option<std::process::Output>);
 
 /// [`look`]'s one look, with the `ps` it ran: the daemon now running, one [`pool_output`] of it
 /// under `hang`, and what that output reads as ([`reading_of`]). The run is `None` when no daemon
-/// read, and then the look is what [`daemon`] found instead.
+/// read, and then the look is what [`running`] found instead.
 #[cfg(target_os = "macos")]
 fn look_and_ps(hang: Duration) -> (Look, Option<PoolRun>) {
-    let daemon = match daemon() {
+    let daemon = match running() {
         Ok(daemon) => daemon,
         Err(missed) => return (missed, None),
     };
@@ -228,7 +238,7 @@ mod tests {
         if !out.status.success() {
             assert_eq!(look, Look::Unread, "a failed ps reads as nothing");
             assert_ne!(
-                daemon(),
+                running(),
                 Ok(seen),
                 "ps failed on the running syspolicyd ({}): {stdout:?} {:?}",
                 out.status,

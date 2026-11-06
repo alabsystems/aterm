@@ -20,7 +20,7 @@
 //! vault, macOS's Local Network question still open) is not kept. A network change (a new
 //! gateway) or a Local Network grant ([`forget`]) drops the record. The record never feeds a pin
 //! or the ALab signal — only an anchor does (`docs/DESIGN-init-on-by-default-2026-10-25.md`
-//! §8.2, §8.3); it is a hint that spares an unconfigured Mac a look, read by init's Lookahead,
+//! §8.2, §8.3); it is a hint that spares an unconfigured Mac a look during init's pinned fallback,
 //! the window lane and the first-launch Secrets stage.
 
 use crate::client::Paths;

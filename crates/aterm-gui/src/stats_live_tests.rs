@@ -1299,8 +1299,9 @@ fn the_time_scale_marks_how_far_back_at_every_width() {
 /// strip's period: the label over the strip's old end, and the ticks, by age. The strip is
 /// each row's widest element (the owner, 2026-10-26: "the time series is too short"), so from
 /// Full 550 and Folded 1119 it reads six hours (Full 550's narrow header keeps its key's three
-/// items and the hour's tick); Folded 800's and 600's narrower blocks read 4 hours, the label
-/// taking the room the coarser ticks would.
+/// items and the ten minutes' and the hour's ticks, which since A1's gates stand in the gates
+/// before those bands); Folded 800's and 600's narrower blocks read 4 hours, the label taking
+/// the room the coarser ticks would.
 #[test]
 fn the_time_scale_at_the_mockups_widths() {
     let m = FaceMetrics::helvetica_neue();
@@ -1334,7 +1335,7 @@ fn the_time_scale_at_the_mockups_widths() {
             (10, "6h ago".into(), vec![10, 60, 600, 3600]),
             (10, "6h ago".into(), vec![10, 60, 600, 3600]),
             (10, "6h ago".into(), vec![10, 60, 600, 3600]),
-            (10, "6h ago".into(), vec![3600]),
+            (10, "6h ago".into(), vec![600, 3600]),
             (1, "6h ago".into(), vec![10, 60, 600, 3600]),
             (1, "4h ago".into(), vec![60, 600]),
             (1, "4h ago".into(), vec![60, 600]),

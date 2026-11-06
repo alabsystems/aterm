@@ -160,7 +160,7 @@ impl<F: Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>> Sealer for Keyed<'_
     }
 
     fn open(&self, collection: &str, row: &str, column: &str, token: &str) -> Result<Secret> {
-        let token_epoch = epoch(token)?;
+        let (token_epoch, wire) = parts(token)?;
         let cell = Cell {
             table: self.table,
             collection,
@@ -168,10 +168,10 @@ impl<F: Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>> Sealer for Keyed<'_
             column,
         };
         if token_epoch == self.epoch {
-            return open(token, &self.key, cell);
+            return open_parts(&token_epoch, wire, &self.key, cell);
         }
         let key = (self.resolve)(&token_epoch)?;
-        open(token, &key, cell)
+        open_parts(&token_epoch, wire, &key, cell)
     }
 }
 
@@ -374,6 +374,10 @@ pub(crate) fn mask_type(ty: &super::Ty, value: &aterm_json::Value) -> aterm_json
 
 pub(crate) fn open(token: &str, key: &[u8; 32], cell: Cell<'_>) -> Result<Secret> {
     let (epoch, wire) = parts(token)?;
+    open_parts(&epoch, wire, key, cell)
+}
+
+fn open_parts(epoch: &Digest, wire: Vec<u8>, key: &[u8; 32], cell: Cell<'_>) -> Result<Secret> {
     let mut wire = Zeroizing::new(wire);
     let nonce: [u8; 12] = wire[..12]
         .try_into()
@@ -381,7 +385,7 @@ pub(crate) fn open(token: &str, key: &[u8; 32], cell: Cell<'_>) -> Result<Secret
     let plain_len = cipher(key)?
         .open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(cell.aad(&epoch)),
+            aead::Aad::from(cell.aad(epoch)),
             &mut wire[12..],
         )
         .map_err(|_| Error::new("secret cell authentication failed"))?

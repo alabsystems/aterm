@@ -1620,6 +1620,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
     }
     let facts = SwarmSurveyFacts {
         node: None,
+        release_lines: Vec::new(),
         label: None,
         roster_unread: false,
         version: "0.146.0".to_owned(),
@@ -1811,6 +1812,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
 
     let facts = SwarmSurveyFacts {
         node: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        release_lines: Vec::new(),
         label: Some("m22".to_owned()),
         roster_unread: false,
         version: "0.146.0".to_owned(),
@@ -1880,6 +1882,7 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
     let store = crate::session_store::new_store();
     let facts = SwarmSurveyFacts {
         version: "0.147.0".to_owned(),
+        release_lines: Vec::new(),
         home: Some("/Users//a".to_owned()),
         home_free_mb: Some(812_345),
         repos: Some(HomeRepos {
@@ -2082,6 +2085,7 @@ fn a_record_shows_only_while_its_group_is_in_front() {
 #[test]
 fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
     let facts = |roster_unread: bool| aterm_agent::survey_facts::SwarmSurveyFacts {
+        release_lines: Vec::new(),
         node: Some("n-1".to_owned()),
         label: (!roster_unread).then(|| "m5".to_owned()),
         roster_unread,

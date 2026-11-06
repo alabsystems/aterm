@@ -7,6 +7,132 @@ use super::*;
 
 const FILE: &str = "alab-join-pending";
 const INTENT: &[u8] = b"ALAB-JOIN-1\n";
+const NATIVE_ONLY: &[u8] = b"ALAB-JOIN-NATIVE-1\n";
+
+fn intent(paths: &Paths) -> crate::Result<Option<bool>> {
+    fsx::read_private(&paths.dir.join(FILE), NATIVE_ONLY.len())?
+        .map(|bytes| match bytes.as_slice() {
+            INTENT => Ok(false),
+            NATIVE_ONLY => Ok(true),
+            _ => Err(Error::new("unrecognized ALab bootstrap intent")),
+        })
+        .transpose()
+}
+
+pub(super) fn pending(paths: &Paths) -> bool {
+    matches!(config(paths), Ok(None)) && intent(paths).is_ok_and(|intent| intent.is_some())
+}
+
+/// A native member proof's result. Only a verified log bundle grants membership;
+/// an unanswered possession exchange remains ambiguous and must not queue another enrollment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeAdmission {
+    /// No member admitted this Mac or may have signed an admission.
+    None,
+    /// A verified log bundle was committed locally. Materialization is read separately.
+    Admitted,
+    /// A member may have signed, or another process holds the proof lock.
+    Uncertain,
+}
+
+/// The executable's native member transport, absent in library-only users. `current` is a
+/// read-only authorization check; a proof rechecks it before publication under the vault lock.
+pub type NativeBootstrap =
+    fn(&Paths, &(dyn Fn() -> crate::Result<()> + Sync)) -> crate::Result<NativeAdmission>;
+
+static NATIVE_BOOTSTRAP: std::sync::OnceLock<NativeBootstrap> = std::sync::OnceLock::new();
+/// The executable's local setup-policy read; an unreadable policy holds background work.
+pub type BootstrapAllowed = fn(&Paths) -> crate::Result<bool>;
+static BOOTSTRAP_ALLOWED: std::sync::OnceLock<BootstrapAllowed> = std::sync::OnceLock::new();
+
+/// Install the executable's read-only setup authority check for background bootstrap.
+/// A later Stop, off choice or selected source holds continuation after a restart too.
+pub fn on_bootstrap_allowed(allowed: BootstrapAllowed) {
+    let _ = BOOTSTRAP_ALLOWED.set(allowed);
+}
+
+/// Check the current executable's background setup choices, without acquiring the vault lock.
+/// # Errors
+/// Setup was stopped, disabled, replaced, or could not be read.
+pub fn check_bootstrap_allowed(paths: &Paths) -> crate::Result<()> {
+    if crate::service::subscriber_turned_off(&paths.home) {
+        return Err(Error::new(
+            "the vault subscriber was turned off; bootstrap is held",
+        ));
+    }
+    if BOOTSTRAP_ALLOWED
+        .get()
+        .is_some_and(|allowed| !allowed(paths).unwrap_or(false))
+    {
+        return Err(Error::new(
+            "automatic vault bootstrap is held by setup's current choices",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn background_native(paths: &Paths) -> crate::Result<NativeAdmission> {
+    native_bootstrap(paths, &|| {
+        check_bootstrap_allowed(paths)?;
+        if config(paths)?.is_some() {
+            return Err(Error::new(
+                "the vault source changed while native bootstrap ran",
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Install the executable's native-only, compiled-authority bootstrap transport once.
+pub fn on_native_bootstrap(bootstrap: NativeBootstrap) {
+    let _ = NATIVE_BOOTSTRAP.set(bootstrap);
+}
+
+/// Try native admission without vault HTTP or Bonjour discovery. The callback must admit
+/// only the compiled default authority and commit only over an exactly unconfigured source.
+/// # Errors
+/// Sharing or the caller's authorization changed, this identity is isolated, or proof failed.
+pub fn native_bootstrap(
+    paths: &Paths,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<NativeAdmission> {
+    remember_native(paths, native_attempt(paths, current)?)
+}
+
+fn native_attempt(
+    paths: &Paths,
+    current: &(dyn Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<NativeAdmission> {
+    current()?;
+    let Some(bootstrap) = NATIVE_BOOTSTRAP.get() else {
+        return Ok(NativeAdmission::None);
+    };
+    refuse_lab_identity(paths)?;
+    if !crate::swarm::enabled_in_home(&paths.home)? {
+        return Err(Error::new("sharing is off; native bootstrap was held"));
+    }
+    bootstrap(paths, current)
+}
+
+fn remember_native(paths: &Paths, outcome: NativeAdmission) -> crate::Result<NativeAdmission> {
+    let _lock = StateLock::take(paths)?;
+    if config(paths)?.is_some() {
+        return Ok(outcome);
+    }
+    let previous = intent(paths)?;
+    if outcome == NativeAdmission::Uncertain && previous.is_some() {
+        fsx::write_atomic(&paths.dir.join(FILE), NATIVE_ONLY, 0o600)?;
+    }
+    Ok(
+        if (previous == Some(true) || crate::members::join::pending_proof(paths)?)
+            && outcome == NativeAdmission::None
+        {
+            NativeAdmission::Uncertain
+        } else {
+            outcome
+        },
+    )
+}
 
 #[cfg(test)]
 type Attempt = Box<dyn Fn(&Paths, ExpectedConfig<'static>) -> crate::Result<()>>;
@@ -29,6 +155,9 @@ pub fn prepare_alab_join_retry(paths: &Paths) -> crate::Result<()> {
         return Ok(());
     }
     creation::permit_join(paths)?;
+    if intent(paths)?.is_some() {
+        return Ok(());
+    }
     fsx::write_atomic(&paths.dir.join(FILE), INTENT, 0o600)
 }
 
@@ -66,16 +195,22 @@ fn resume_with(
     paths: &Paths,
     join: impl FnOnce(&Paths, ExpectedConfig<'static>) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    if fsx::read_private(&paths.dir.join(FILE), INTENT.len())?.is_none() {
-        return Ok(());
-    }
+    resume_attempt(paths, join, native_attempt)
+}
+
+fn resume_attempt(
+    paths: &Paths,
+    join: impl FnOnce(&Paths, ExpectedConfig<'static>) -> crate::Result<()>,
+    native: impl FnOnce(
+        &Paths,
+        &(dyn Fn() -> crate::Result<()> + Sync),
+    ) -> crate::Result<NativeAdmission>,
+) -> crate::Result<()> {
+    check_bootstrap_allowed(paths)?;
     {
         let _lock = StateLock::take(paths)?;
-        let Some(intent) = fsx::read_private(&paths.dir.join(FILE), INTENT.len())? else {
+        if intent(paths)?.is_none() {
             return Ok(());
-        };
-        if intent.as_slice() != INTENT {
-            return Err(Error::new("unrecognized ALab bootstrap intent"));
         }
         if config(paths)?.is_some() {
             return fsx::wipe_and_remove(&paths.dir.join(FILE));
@@ -84,6 +219,34 @@ fn resume_with(
             return Ok(());
         }
     }
+    let current = || {
+        check_bootstrap_allowed(paths)?;
+        if config(paths)?.is_some() {
+            return Err(Error::new(
+                "the vault source changed while native bootstrap ran",
+            ));
+        }
+        if !crate::swarm::enabled_in_home(&paths.home)? {
+            return Err(Error::new("sharing is off; native bootstrap was held"));
+        }
+        Ok(())
+    };
+    match remember_native(paths, native(paths, &current)?)? {
+        NativeAdmission::Admitted => {
+            let _lock = StateLock::take(paths)?;
+            if config(paths)?.is_some() {
+                fsx::wipe_and_remove(&paths.dir.join(FILE))?;
+            }
+            return Ok(());
+        }
+        NativeAdmission::Uncertain => {
+            return Err(Error::new(
+                "native admission is not confirmed; the subscriber retries the same proof",
+            ));
+        }
+        NativeAdmission::None => {}
+    }
+    current()?;
     // The ordinary join verifies the pinned signature before configuring anything. Its mode
     // preserves another source chosen during the fetch and rechecks sharing before committing
     // the fetched configuration, applying it or posting a request. Work already in flight may
@@ -99,6 +262,206 @@ fn resume_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_wake_can_attempt_native_bootstrap_with_only_durable_intent() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        prepare_alab_join_retry(&paths).unwrap();
+        assert!(!paths.state_file().exists());
+        let mut asked = MembersAsked {
+            network: || None,
+            ..MembersAsked::default()
+        };
+        let attempts = std::cell::Cell::new(0);
+        let native = |paths: &Paths| {
+            assert!(config(paths)?.is_none());
+            assert!(pending(paths));
+            attempts.set(attempts.get() + 1);
+            Ok(NativeAdmission::None)
+        };
+        ask_members_if_due_with_native(
+            &paths,
+            &mut asked,
+            &|_| panic!("unconfigured bootstrap uses native only"),
+            &native,
+            &|_| {},
+        );
+        assert_eq!(attempts.get(), 1);
+        // A real route wake resets this ordinary backoff; the proof's own durable pin/pause
+        // remains authoritative before any possession, regardless of this reset.
+        asked.at = None;
+        asked.asks = 0;
+        ask_members_if_due_with_native(
+            &paths,
+            &mut asked,
+            &|_| panic!("no Bonjour ask"),
+            &native,
+            &|_| {},
+        );
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn possession_retained_before_a_crash_holds_http_without_intent_conversion() {
+        use crate::commons::bootstrap::Device;
+        use crate::members::{join::ProofLock, joiner::Joining, proof_retry};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        prepare_alab_join_retry(&paths).unwrap();
+        machine_identity(&paths).unwrap();
+        let device = Device::open(&paths).unwrap().unwrap();
+        let request = device.request([1; 16], [2; 32]).unwrap();
+        let joining = Joining {
+            device: &device,
+            records_bound: records_bound(&paths, &load_records(&paths).unwrap()).unwrap(),
+            node: [7; 32],
+            name: "newcomer".into(),
+            model: String::new(),
+        };
+        let proving = ProofLock::take(&paths, None).unwrap().unwrap();
+        proof_retry::sending(
+            &paths,
+            &proving,
+            &joining,
+            "127.0.0.1:7",
+            [3; 32],
+            request.binding(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            intent(&paths).unwrap(),
+            Some(false),
+            "crash before the caller records SignedMaybe"
+        );
+        assert!(
+            resume_attempt(
+                &paths,
+                |_, _| panic!("retained possession must not fall through to HTTP"),
+                |_, _| Ok(NativeAdmission::None),
+            )
+            .is_err()
+        );
+        let signer = crate::b64::decode_padded(crate::ALAB_SIGNER)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let config = Config {
+            source: Source::Url(crate::ALAB_DEFAULT_URL.into()),
+            mirrors: Vec::new(),
+            name: crate::ALAB_VAULT.into(),
+            signer: Some(signer),
+            followed: Vec::new(),
+            host: "newcomer".into(),
+        };
+        let _state = StateLock::take(&paths).unwrap();
+        assert!(refuse_pending_native_enrollment(&paths, &config).is_err());
+        proof_retry::clear(&paths, &proving).unwrap();
+        assert!(refuse_pending_native_enrollment(&paths, &config).is_ok());
+    }
+
+    #[test]
+    fn an_ambiguous_native_proof_never_falls_back_to_http_across_restarts() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        prepare_alab_join_retry(&paths).unwrap();
+        assert!(
+            resume_attempt(
+                &paths,
+                |_, _| panic!("possession may have signed; no HTTP enrollment"),
+                |_, current| {
+                    current()?;
+                    Ok(NativeAdmission::Uncertain)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(intent(&paths).unwrap(), Some(true));
+        prepare_alab_join_retry(&paths).unwrap();
+        assert_eq!(
+            intent(&paths).unwrap(),
+            Some(true),
+            "another setup pass cannot erase uncertainty"
+        );
+        let restarted = Paths::for_home(root.path());
+        assert!(
+            resume_attempt(
+                &restarted,
+                |_, _| panic!("a missing peer does not undo earlier ambiguity"),
+                |_, current| {
+                    current()?;
+                    Ok(NativeAdmission::None)
+                },
+            )
+            .is_err()
+        );
+        assert!(config(&restarted).unwrap().is_none());
+        assert!(read_machine_identity(&restarted).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_bootstrap_is_attempted_before_any_default_vault_fetch() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        prepare_alab_join_retry(&paths).unwrap();
+        let selected = Config {
+            source: Source::Url("http://127.0.0.1:7/v1/fixture".into()),
+            mirrors: Vec::new(),
+            name: "fixture".into(),
+            signer: Some([7; 32]),
+            followed: Vec::new(),
+            host: "newcomer".into(),
+        };
+        resume_attempt(
+            &paths,
+            |_, _| panic!("authenticated native admission needed no vault fetch"),
+            |paths, current| {
+                current()?;
+                // This injected proof stands for the guarded, compiled-authority writer;
+                // admission/entry validity are exercised by the real protocol tests.
+                save_config(paths, &selected)?;
+                Ok(NativeAdmission::Admitted)
+            },
+        )
+        .unwrap();
+        assert_eq!(config(&paths).unwrap(), Some(selected));
+        assert!(!pending(&paths));
+        assert!(!paths.dir.join(FILE).exists());
+    }
+
+    #[test]
+    fn a_later_source_choice_or_sharing_hold_prevents_native_retry_and_fetch() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        prepare_alab_join_retry(&paths).unwrap();
+        let settings = paths.home.join(".config/aterm/aterm.toml");
+        std::fs::write(&settings, "[swarm]\nenabled = false\n").unwrap();
+        resume_attempt(
+            &paths,
+            |_, _| panic!("sharing off"),
+            |_, _| panic!("sharing off"),
+        )
+        .unwrap();
+        std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
+        let selected = Config {
+            source: Source::Path(root.path().join("personal.vault")),
+            mirrors: Vec::new(),
+            name: "personal".into(),
+            signer: None,
+            followed: Vec::new(),
+            host: "newcomer".into(),
+        };
+        save_config(&paths, &selected).unwrap();
+        resume_attempt(
+            &paths,
+            |_, _| panic!("the selected source wins"),
+            |_, _| panic!("the selected source wins"),
+        )
+        .unwrap();
+        assert_eq!(config(&paths).unwrap(), Some(selected));
+        assert!(!paths.dir.join(FILE).exists());
+    }
 
     fn subscriber_attempt(
         paths: &Paths,

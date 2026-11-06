@@ -299,9 +299,10 @@ pub fn held(broker: &astream_broker::Broker) -> Held {
 
 /// The broker's residency tier's tally since its open (astream's `TierTally`, D10f): its
 /// pushes, its one-record reads by index (a cold read two), its walks over a range of summaries
-/// and the rows they read (a filtered read's scan, `Tier::scan`, is a walk and its records are
-/// rows), its subject walks and the pages they read, and the values it read from its wide
-/// maps. Read around a restart as its cold reads are, so an attach's cost is put down to the
+/// and the rows they read (a filtered read's pass, `Tier::passing`, is a walk and the records it
+/// reads are rows), its subject walks and the pages they read, the pages a filtered read passed
+/// whole and the times it asked its filter of a subject (F11c), and the values it read from its
+/// wide maps. Read around a restart as its cold reads are, so an attach's cost is put down to the
 /// pages' code, or not, by a count. A build with debug assertions counts it (the `opt`
 /// profile's); a build without them (`--profile shipped`) counts nothing and reads `None`.
 #[cfg(debug_assertions)]
@@ -331,7 +332,7 @@ pub struct TierCount {
 /// astream's fields, so a count astream adds fails to compile here until the report carries
 /// it; the table's heading and the JSON's keys are read from the same list.
 #[must_use]
-pub fn tier_counts(t: astream_broker::TierTally) -> [TierCount; 7] {
+pub fn tier_counts(t: astream_broker::TierTally) -> [TierCount; 9] {
     let astream_broker::TierTally {
         pushes,
         lookups,
@@ -339,6 +340,8 @@ pub fn tier_counts(t: astream_broker::TierTally) -> [TierCount; 7] {
         rows,
         namings,
         named_pages,
+        passed_pages,
+        verdicts,
         wide,
     } = t;
     let c = |key, column, n| TierCount { key, column, n };
@@ -349,6 +352,8 @@ pub fn tier_counts(t: astream_broker::TierTally) -> [TierCount; 7] {
         c("rows", "rows walked", rows),
         c("namings", "subject walks", namings),
         c("named_pages", "pages named", named_pages),
+        c("passed_pages", "pages passed", passed_pages),
+        c("verdicts", "verdicts", verdicts),
         c("wide", "wide", wide),
     ]
 }
@@ -443,11 +448,13 @@ mod tests {
             rows: 5,
             namings: 6,
             named_pages: 7,
+            passed_pages: 8,
+            verdicts: 9,
         };
         let counts = tier_counts(t);
         let mut ns: Vec<u64> = counts.iter().map(|c| c.n).collect();
         ns.sort_unstable();
-        assert_eq!(ns, (1..=7).collect::<Vec<u64>>());
+        assert_eq!(ns, (1..=9).collect::<Vec<u64>>());
         let keys: std::collections::BTreeSet<_> = counts.iter().map(|c| c.key).collect();
         let columns: std::collections::BTreeSet<_> = counts.iter().map(|c| c.column).collect();
         assert_eq!((keys.len(), columns.len()), (counts.len(), counts.len()));

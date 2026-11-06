@@ -171,27 +171,27 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
 /// Every outside program aterm runs, and why.
 pub const TOOLS: &[Tool] = &[
     workspace(
-        "openssl-signing",
+        super::upstream::OPENSSL_SIGNING.name,
         When::Release,
         Some(Pin {
-            package: "openssl-signing",
-            version: "3.5.9",
+            package: super::upstream::OPENSSL_SIGNING.name,
+            version: super::upstream::OPENSSL_SIGNING.version,
             exe: "bin/openssl",
             built: true,
-            hosts: &["macos-aarch64", "macos-x86_64"],
+            hosts: super::upstream::OPENSSL_SIGNING.hosts,
         }),
         &[],
         "OpenSSL 3 for Ed25519 source attestations on a release host; separate from Apple's certificate tools",
     ),
     workspace(
-        "cpython",
+        super::upstream::CPYTHON.name,
         When::Release,
         Some(Pin {
-            package: "cpython",
-            version: "3.14.8+20261013",
-            exe: "bin/python3.14",
+            package: super::upstream::CPYTHON.name,
+            version: super::upstream::CPYTHON.version,
+            exe: super::upstream::CPYTHON.executable,
             built: false,
-            hosts: MACOS_HOSTS,
+            hosts: super::upstream::CPYTHON.hosts,
         }),
         &[],
         "the publication engine's interpreter on a release host: `bin/pub-python` runs the newest \
@@ -1009,19 +1009,14 @@ pub const TOOLS: &[Tool] = &[
          files before scanning their plaintext (row 18)",
     ),
     workspace(
-        "gitleaks",
+        super::upstream::GITLEAKS.name,
         When::Always,
         Some(Pin {
-            package: "gitleaks",
-            version: "8.30.1",
-            exe: "gitleaks",
+            package: super::upstream::GITLEAKS.name,
+            version: super::upstream::GITLEAKS.version,
+            exe: super::upstream::GITLEAKS.executable,
             built: false,
-            hosts: &[
-                "macos-aarch64",
-                "macos-x86_64",
-                "linux-aarch64",
-                "linux-x86_64",
-            ],
+            hosts: super::upstream::GITLEAKS.hosts,
         }),
         &[],
         "the publication engine's required secret scanner in `pub stage` and `ship check --export` \

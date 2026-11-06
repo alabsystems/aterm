@@ -21,10 +21,11 @@ use crate::stats_gauge::{self as gauge, Gauge, GaugeInks};
 use crate::stats_live::{self as live, DeckLive, LiveLayer};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
-    self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
-    FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Meter,
-    Rows, StateLabel, Strip,
+    self as plan, BOX_GAP, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm,
+    DeckSizePref, FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem,
+    Label, Meter, Rows, StateLabel, Strip,
 };
+use crate::stats_skyline::{self as skyline, BoxValue, Skyline};
 use crate::stats_steam as steam;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
@@ -500,6 +501,10 @@ struct RowWords {
     name: Txt,
     well: Option<(WellMark, InkKind)>,
     heat_now: Option<f32>,
+    /// The live box's peak tick and over share: the trailing 10 s's largest reading and the
+    /// share of those readings over ([`ResourceView::live_box`]); its column is `heat_now`.
+    live_peak: Option<f32>,
+    live_over: f32,
     pct: Txt,
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
@@ -592,6 +597,10 @@ pub(crate) struct DeckWords {
     reading: bool,
 }
 
+/// The name of the row that draws the CPU's cores: block B's fourth in Folded, Full's eighth in
+/// narrow and slim.
+pub(crate) const CORES_NAME: &str = "Cores";
+
 /// The OS resources the Resource Monitor deck draws.
 pub(crate) const DECK_RESOURCES: [Resource; 6] = [
     Resource::Cpu,
@@ -676,6 +685,8 @@ impl DeckWords {
                 name: Txt::new(words::resource_name(res), m),
                 well: None,
                 heat_now: None,
+                live_peak: None,
+                live_over: 0.0,
                 pct: Txt::new(words::pct(None), m),
                 strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
                 multi_scale: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
@@ -699,10 +710,16 @@ impl DeckWords {
         }
     }
 
-    /// Whether one of `rows` draws an over mark in `strip`'s multi-scale horizon.
+    /// Whether one of `rows` draws an over cap in `strip`'s multi-scale horizon, its live box's
+    /// included.
     fn over_shown<'r>(rows: impl IntoIterator<Item = &'r RowWords>, strip: &Strip) -> bool {
         rows.into_iter().any(|row| {
-            row.strip_text.is_none() && row.multi_scale_slots(strip).iter().any(|s| s.cell.over)
+            row.strip_text.is_none()
+                && (row.live_over > 0.0
+                    || row
+                        .multi_scale_slots(strip)
+                        .iter()
+                        .any(|s| !s.slot.is_live_now && s.cell.over > 0.0))
         })
     }
 
@@ -746,11 +763,14 @@ impl RowWords {
             clauses(words::glance_details(res, snap, panes, loc)),
             clauses(words::details(res, snap, loc)),
         ];
+        let (live_peak, live_over) = view.live_box(snap.at_unix_ms);
         Self {
             res,
             name: Txt::new(words::resource_name(res), m),
             well: words::well(res, &view).map(|(mark, ink)| (WellMark::of(mark), ink)),
             heat_now: view.heat_now.filter(|h| !h.is_nan()),
+            live_peak: live_peak.filter(|h| !h.is_nan()),
+            live_over,
             pct: Txt::new(words::pct(view.heat_now), m),
             strip_text,
             multi_scale: STRIP_SPECS.map(|spec| {
@@ -873,30 +893,39 @@ pub(crate) fn fine_band_slots(slots: &[ProgSlot]) -> Option<std::ops::Range<usiz
 }
 
 /// `strip`'s fine band at `scale` ([`live::FineBand`]): its boxes' pitch, device px, as
-/// [`multi_scale_slot_rects`] lays them before rounding, and their period.
+/// [`Strip::box_edges`] lays them before rounding, and their period.
 pub(crate) fn fine_band(strip: &Strip, scale: f64) -> live::FineBand {
     let slots = strip.spec.slots();
-    let Some(slot) = fine_band_slots(&slots).and_then(|band| slots.get(band.start)) else {
+    let edges = strip.box_edges();
+    let Some((start, slot)) =
+        fine_band_slots(&slots).and_then(|band| Some((band.start, *slots.get(band.start)?)))
+    else {
         return live::FineBand::default();
     };
-    let s = scale.max(0.5);
-    let px = |v: f64| (v * s + 0.5).floor();
-    let total_w = (px(strip.end()) - px(strip.x)).max(1.0);
+    let pitch = match (edges.get(start), edges.get(start + 1)) {
+        (Some(a), Some(b)) => b.0 - a.0,
+        (Some(a), None) => a.1 - a.0 + BOX_GAP,
+        _ => 0.0,
+    };
     live::FineBand {
-        box_px: f64::from(slot.x1 - slot.x0) * total_w,
+        box_px: pitch * scale.max(0.5),
         period_ms: slot.age_hi_ms - slot.age_lo_ms,
     }
 }
 
 /// Whole-pixel slot layout `(slot_idx, x_px, w_px, is_live_now)` for `strip` at `scale`, newest
 /// first (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3): the live `now` box at `strip.x`,
-/// then each older box to its right, the oldest ending at the horizon, `strip.end()`.
+/// then each older box to its right, the oldest ending at the horizon, `strip.end()`. Each box's
+/// edges are [`Strip::box_edges`]' rounded to the device px, so a band's boxes stand a point apart
+/// and two bands a gate apart (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3), and the header's
+/// ticks, which come from the same edges ([`Strip::x_at_age_ms`]), stand in the gates.
 ///
 /// `lag_px` displaces the fine band ([`fine_band_slots`]) that many device px left, toward now,
 /// as a reading's slide or glide has yet to carry it right: its newest box then passes under the
-/// live box, and at its old end a box enters that shows the band's own oldest slot, never a
-/// coarser box's. The painter clips the band to the span it stands in at rest, so a box is listed
-/// only while some of it shows there. The live box and the coarser boxes stand at their ticks.
+/// live box, and at its old end a box enters, a pitch past the band's oldest, that shows the
+/// band's own oldest slot, never a coarser box's. The painter clips the band to the span it
+/// stands in at rest, so a box is listed only while some of it shows there. The live box and the
+/// coarser boxes stand at their ticks.
 pub(crate) fn multi_scale_slot_rects(
     strip: &Strip,
     scale: f64,
@@ -904,33 +933,29 @@ pub(crate) fn multi_scale_slot_rects(
 ) -> Vec<(usize, f32, f32, bool)> {
     let s = scale.max(0.5);
     let px = |v: f64| (v * s + 0.5).floor() as f32;
-    let x0 = px(strip.x);
-    let x1 = px(strip.end());
-    let total_w = (x1 - x0).max(1.0);
-    let gap_px = px(1.0).max(1.0);
     let slots = strip.spec.slots();
-    let n = slots.len();
-    let mut rest: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(n + 1);
-    for (j, slot) in slots.iter().enumerate() {
-        let lx = (x0 + slot.x0 * total_w).round();
-        let rx = if j + 1 == n {
-            x1
-        } else {
-            (x0 + slot.x1 * total_w).round() - gap_px
-        };
-        rest.push((j, lx, (rx - lx).max(1.0), slot.is_live_now));
-    }
+    let rest: Vec<(usize, f32, f32, bool)> = strip
+        .box_edges()
+        .into_iter()
+        .zip(&slots)
+        .enumerate()
+        .map(|(j, ((l, r), slot))| {
+            let lx = px(l);
+            (j, lx, (px(r) - lx).max(1.0), slot.is_live_now)
+        })
+        .collect();
     let lag = lag_px.round();
     let Some(band) = fine_band_slots(&slots).filter(|band| lag > 0.0 && !band.is_empty()) else {
         return rest;
     };
+    let gap_px = px(BOX_GAP).max(1.0);
     let oldest = band.end - 1;
     let (band_x0, (_, old_x, old_w, _)) = (rest[band.start].1, rest[oldest]);
     let band_x1 = old_x + old_w;
-    // At rest the box after the band's oldest starts here: the entering box comes from there.
-    let after = rest.get(band.end).map_or(x1 + gap_px, |r| r.1);
+    // The entering box stands a pitch past the band's oldest, as the band's own boxes do.
+    let after = band_x1 + gap_px;
     let shows = |x: f32, w: f32| x.max(band_x0) + 1.0 <= (x + w).min(band_x1);
-    let mut out = Vec::with_capacity(n + 1);
+    let mut out = Vec::with_capacity(rest.len() + 1);
     out.extend_from_slice(&rest[..band.start]);
     out.extend(
         rest[band.clone()]
@@ -951,6 +976,13 @@ impl RowWords {
             .get(spec_ix(strip))
             .map_or(&[][..], Vec::as_slice)
     }
+}
+
+/// A time-scale tick at `x` pt as device px at `scale`: its left edge and its width, one device
+/// px (half a point at 2×), centred on `x`.
+pub(crate) fn tick_px(x: f64, scale: f64) -> (f32, f32) {
+    let w = (0.5 * scale).round().max(1.0) as f32;
+    (((x * scale) as f32 - w / 2.0).round(), w)
 }
 
 /// One table's columns: the Full plan's, or one Folded block's.
@@ -1313,13 +1345,19 @@ impl<'a> Deck<'a> {
         self.rect((0.0, seam, w, h - seam), 0.0, self.inks.seam);
     }
 
-    fn cap_px(&self) -> Option<(f32, f32)> {
-        (self.s >= 2.0).then(|| {
-            (
-                (1.5 * self.s).round().max(2.0) as f32,
-                (0.5 * self.s).round().max(1.0) as f32,
-            )
-        })
+    /// The room an over cap takes above a strip's top, pt: its clear gap and its height
+    /// ([`skyline::cap_px`]).
+    fn cap_room(&self) -> f64 {
+        let (clear, h) = skyline::cap_px(self.s);
+        f64::from(clear + h) / self.s
+    }
+
+    /// Draws one strip box as [`skyline::skyline_box`] laid it.
+    fn skyline(&mut self, sky: &Skyline, radius: f32) {
+        if self.draw {
+            let prims = sky.prims(&self.inks, radius, (0.0, 0.0));
+            self.p.prims.extend(prims);
+        }
     }
 
     fn small_cells(&self, strip: &Strip, cell_h: f64) -> bool {
@@ -1337,33 +1375,41 @@ impl<'a> Deck<'a> {
         })
     }
 
+    /// A gap's ink: sleep is `hollow`, nothing read, never `stuck`, the colour of a stuck
+    /// process (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, "States"); paused is `words2`.
+    /// Increase Contrast lifts both a step, sleep to its `hollow` (`words2`) and paused to
+    /// `words`, so the three kinds stay apart in both modes.
     const fn gap_ink(&self, kind: GapKind) -> Rgb {
         match kind {
             GapKind::Crash => self.inks.critical_text,
-            GapKind::Sleep => self.inks.stuck,
+            GapKind::Sleep => self.inks.hollow,
+            GapKind::Paused if self.ic => self.inks.words,
             GapKind::Paused => self.inks.words2,
         }
     }
 
+    /// An event line's ink: a sleep's wake is `hollow`, as its gap is.
     const fn event_ink(&self, kind: StripEventKind) -> Rgb {
         match kind {
             StripEventKind::Crash => self.inks.critical_text,
             StripEventKind::Restart => self.inks.warn_text,
-            StripEventKind::SleepWake => self.inks.stuck,
+            StripEventKind::SleepWake => self.inks.hollow,
             StripEventKind::PressureSpike => self.inks.warn_text,
         }
     }
 
+    /// One row's strip: every box by [`skyline::skyline_box`], the live box's column the 10 s
+    /// mean `live.0` (the %), its tick the 10 s max and its cap the 10 s over share (`live.1`,
+    /// [`ResourceView::live_box`]); a gap's box its gap mark.
     fn strip(
         &mut self,
         strip: &Strip,
         top: f64,
         cell_h: f64,
         slots: &[HeatSlot],
-        live_heat: Option<f32>,
+        live: (Option<f32>, BoxValue),
     ) {
-        let cap = self.cap_px();
-        let cap_room = cap.map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
+        let cap_room = self.cap_room();
         self.note(
             BoxKind::Strip,
             [strip.x, top - cap_room, strip.end(), top + cell_h],
@@ -1411,60 +1457,34 @@ impl<'a> Deck<'a> {
                 self.gap_cell((x, y, cw, h), radius, gap_kind);
                 continue;
             }
-            let Some(v) = slot_data.cell.heat.filter(|v| !v.is_nan()) else {
-                self.hollow_cell((x, y, cw, h), radius, cw < 4.0 || h < 4.0);
-                continue;
+            let value = BoxValue {
+                mean: slot_data.cell.heat,
+                max: slot_data.cell.max,
+                over: slot_data.cell.over,
             };
-            let step = ink::heat_step(v);
-            let hh = if self.dwc {
-                ink::dwc_height(h as u32, step) as f32
-            } else {
-                h
-            };
-            self.rect(
-                (x, y + h - hh, cw, hh),
-                radius,
-                self.inks.cell_at(v, self.ic),
-            );
-            if slot_data.cell.over {
-                let over = self.inks.over;
-                match cap {
-                    Some((ch, gap)) => self.rect((x, y - ch - gap, cw, ch), 0.0, over),
-                    None => self.rect((x, y, cw, h.min(2.0)), 0.0, over),
-                }
-            }
+            let sky = skyline::skyline_box((x, y, cw, h), value, self.s, &self.inks, self.ic);
+            self.skyline(&sky, radius);
         }
         if clipped {
             self.p.prims.push(DrawPrim::ClipPop);
         }
         if let Some((idx, x, cw, _)) = live_slot {
             let slot_data = slots.get(idx).copied().unwrap_or_default();
-            let v_opt = live_heat.or(slot_data.cell.heat).filter(|v| !v.is_nan());
-            let Some(v) = v_opt else {
-                self.hollow_cell((x, y, cw, h), radius, cw < 4.0 || h < 4.0);
-                return;
+            let (live_heat, live_box) = live;
+            let value = BoxValue {
+                mean: live_heat.or(slot_data.cell.heat),
+                max: live_box.max.or(slot_data.cell.max),
+                over: live_box.over,
             };
-            // The strip cell's own ink for this value (`VitalsInks::cell_at`), at every level.
-            let step = ink::heat_step(v);
-            let cell = self.inks.cell_at(v, self.ic);
-            let fill_rgb = if self.live.fresh {
-                cell
-            } else {
-                ink::mix(self.inks.ground, cell, 0.55)
-            };
-            let hh = if self.dwc {
-                ink::dwc_height(h as u32, step) as f32
-            } else {
-                h
-            };
-            self.rect((x, y + h - hh, cw, hh), radius, fill_rgb);
-            if slot_data.cell.over {
-                let over = self.inks.over;
-                match cap {
-                    Some((ch, gap)) => self.rect((x, y - ch - gap, cw, ch), 0.0, over),
-                    None => self.rect((x, y, cw, h.min(2.0)), 0.0, over),
+            let mut sky = skyline::skyline_box((x, y, cw, h), value, self.s, &self.inks, self.ic);
+            // A live box whose readings stopped draws its marks toward the ground.
+            if !self.live.fresh {
+                let ground = self.inks.ground;
+                for mark in [&mut sky.column, &mut sky.tick].into_iter().flatten() {
+                    mark.1 = ink::mix(ground, mark.1, 0.55);
                 }
             }
+            self.skyline(&sky, radius);
         }
     }
 
@@ -1515,15 +1535,12 @@ impl<'a> Deck<'a> {
         if small {
             self.rect((x, y + h - 1.0, w, 1.0), 0.0, ink);
         } else if self.draw {
-            self.p.prims.push(DrawPrim::Stroke {
-                x: x + 0.5,
-                y: y + 0.5,
-                w: w - 1.0,
-                h: h - 1.0,
+            self.p.prims.push(skyline::outline(
+                (x, y, w, h),
                 radius,
-                width: 1.0,
-                color: rgba(ink, 0xFF),
-            });
+                (0.0, 0.0),
+                rgba(ink, 0xFF),
+            ));
         }
     }
 
@@ -1540,42 +1557,6 @@ impl<'a> Deck<'a> {
             spans.push((y, y1));
         }
         spans
-    }
-
-    fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
-        if !self.draw {
-            return;
-        }
-        // Scale-band gridlines anchor to the X-axis ticks (`lag_px = 0.0`) so band changes (the
-        // live box's edge, `-10s`, `-1m`, `-10m`, `-1h`) never drift off their tick marks during
-        // glide/slide: one in the gap before each band's first box, the live box's band aside. A
-        // band is its boxes' period, not their width: neighbouring bands can share a weight.
-        let rects = multi_scale_slot_rects(strip, self.s, 0.0);
-        let slots = strip.spec.slots();
-        let gap_px = self.px(1.0).max(1.0);
-        let x0 = self.px(strip.x);
-        let spans = Self::strip_spans(y0, y1, holes);
-        let grid = self.inks.grid;
-        let mut prev_band: Option<(i64, bool)> = None;
-        for &(idx, sx, _, is_live_now) in &rects {
-            let Some(slot) = slots.get(idx) else {
-                continue;
-            };
-            let band = (slot.age_hi_ms - slot.age_lo_ms, is_live_now);
-            let boundary = prev_band.is_some_and(|prev| prev != band);
-            prev_band = Some(band);
-            if !boundary {
-                continue;
-            }
-            let gx = sx - gap_px;
-            if gx < x0 {
-                continue;
-            }
-            for &(a, b) in &spans {
-                let (ya, yb) = (self.px(a), self.px(b));
-                self.rect((gx, ya, 1.0, yb - ya), 0.0, grid);
-            }
-        }
     }
 
     /// Draws the strip's X-axis baseline rail, discontinuity break notches over [`TimeGap`]s, and
@@ -1606,23 +1587,20 @@ impl<'a> Deck<'a> {
             return;
         };
         let horizon = strip.spec.horizon_ms();
-        let total_w = x1 - x0;
         for gap in words.time_gaps.iter().rev().take(4) {
             if gap.end_ms <= now_ms - horizon || gap.start_ms >= now_ms {
                 continue;
             }
             let age_start = (now_ms - gap.start_ms).clamp(0, horizon);
             let age_end = (now_ms - gap.end_ms).clamp(0, horizon);
-            let (Some(f0), Some(f1)) = (
-                strip.spec.x_frac_of_age_ms(age_start),
-                strip.spec.x_frac_of_age_ms(age_end),
-            ) else {
+            let (Some(old), Some(new)) = (strip.x_at_age_ms(age_start), strip.x_at_age_ms(age_end))
+            else {
                 continue;
             };
             // The gap's start is the older end, right of its end (x grows with age).
             let (gx_old, gx_new) = (
-                (x0 + f0 * total_w).round().clamp(x0, x1),
-                (x0 + f1 * total_w).round().clamp(x0, x1),
+                ((old * self.s) as f32).round().clamp(x0, x1),
+                ((new * self.s) as f32).round().clamp(x0, x1),
             );
             let (gx0, gx1) = (gx_new.min(gx_old), gx_new.max(gx_old));
             if gx1 > gx0 {
@@ -1671,10 +1649,16 @@ impl<'a> Deck<'a> {
             let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
             let py_pip = (y_axis + 0.5 - pip / 2.0).round().max(0.0);
             self.rect((px_pip, py_pip, pip, pip), (0.5 * self.s) as f32, ev_ink);
+            let ground = rgba(self.inks.ground, 0xFF);
             for &(a, b) in &spans {
                 let (ya, yb) = (self.px(a), self.px(b));
                 if yb <= ya {
                     continue;
+                }
+                // A device px of ground each side keeps the line off the boxes' columns and
+                // ticks (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, "States").
+                for kx in [lx - 1.0, lx + lw] {
+                    self.p.prims.push(panel(kx, ya, 1.0, yb - ya, 0.0, ground));
                 }
                 match ev.kind {
                     StripEventKind::Crash | StripEventKind::Restart => {
@@ -2144,9 +2128,7 @@ impl<'a> Deck<'a> {
                 let room = t.strip.end() - t.strip.x;
                 let text = fit(forms, room, SMALL_PT, false, self.m);
                 let ink = self.inks.words2;
-                let cap_room = self
-                    .cap_px()
-                    .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
+                let cap_room = self.cap_room();
                 let base = base.min(top + rows.pitch - cap_room - DESCENT_EM * SMALL_PT);
                 self.text(
                     t.strip.x,
@@ -2160,7 +2142,12 @@ impl<'a> Deck<'a> {
             }
             None => {
                 let slots = row.multi_scale_slots(&t.strip);
-                self.strip(&t.strip, top, rows.cell, slots, live_heat);
+                let live_box = BoxValue {
+                    mean: None,
+                    max: row.live_peak,
+                    over: row.live_over,
+                };
+                self.strip(&t.strip, top, rows.cell, slots, (live_heat, live_box));
             }
         }
         if let Some(col) = t.pct {
@@ -2506,13 +2493,14 @@ impl<'a> Deck<'a> {
 
     /// A time-scale tick at `x` pt under the header line at `base`: one device px wide (half a
     /// point at 2×), from a point under the baseline to 2.5 pt under it and never under
-    /// [`TICK_MIN_PX`] tall, so at 1× it reads as a tick and not a stray dot; it ends short of
-    /// the strip's top (and its caps) in both forms.
+    /// [`TICK_MIN_PX`] tall, so at 1× it reads as a tick and not a stray dot. It ends on the axis
+    /// rail's foot, short of the strip's top in both forms. At 2× a device px of ground stands
+    /// between the two and row 0's over caps; at 1× a cap stands flush under them, never in them
+    /// (`the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above`).
     fn tick_mark(&mut self, x: f64, base: f64) {
-        let w = (0.5 * self.s).round().max(1.0) as f32;
+        let (x, w) = tick_px(x, self.s);
         let y0 = self.px(base + 1.0);
         let y1 = self.px(base + 2.5).max(y0 + TICK_MIN_PX);
-        let x = ((x * self.s) as f32 - w / 2.0).round();
         let words2 = self.inks.words2;
         self.rect((x, y0, w, y1 - y0), 0.0, words2);
     }
@@ -2568,19 +2556,23 @@ impl<'a> Deck<'a> {
             }
             KeyItem::Over => {
                 self.note(BoxKind::Swatch, [x, top, x + 4.0, base], "", None);
+                // A hot box drawn as the strip draws one, its whole-length cap at the swatch's top.
                 let (cx, cy, cw, bottom) = (self.px(x), self.px(top), self.px(4.0), self.px(base));
-                let (over, hot) = (self.inks.over, self.heat(6));
-                match self.cap_px() {
-                    Some((ch, gap)) => {
-                        self.rect((cx, cy, cw, ch), 0.0, over);
-                        let y = cy + ch + gap;
-                        self.rect((cx, y, cw, bottom - y), 0.0, hot);
-                    }
-                    None => {
-                        self.rect((cx, cy, cw, bottom - cy), 0.0, hot);
-                        self.rect((cx, cy, cw, 2.0), 0.0, over);
-                    }
-                }
+                let (clear, cap_h) = skyline::cap_px(self.s);
+                let y = cy + cap_h + clear;
+                let full = BoxValue {
+                    mean: Some(1.0),
+                    max: None,
+                    over: 1.0,
+                };
+                let sky = skyline::skyline_box(
+                    (cx, y, cw, bottom - y),
+                    full,
+                    self.s,
+                    &self.inks,
+                    self.ic,
+                );
+                self.skyline(&sky, 0.0);
                 self.text(
                     x + 7.0,
                     base,
@@ -2650,7 +2642,6 @@ impl<'a> Deck<'a> {
             .map(|(_, r)| (rows.top(r) - gap / 2.0, rows.top(r) + rows.cell + gap / 2.0))
             .collect();
         let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
-        self.gridlines(&plan.strip, rows.top(0), last, &holes);
         let mut cores_row_hit = None;
         match plan.cores {
             CoresAt::Block { at, divider } => {
@@ -2671,7 +2662,7 @@ impl<'a> Deck<'a> {
                 self.text(
                     plan.name.x,
                     top + rows.baseline,
-                    "Cores".into(),
+                    CORES_NAME.into(),
                     rows.name_pt,
                     true,
                     ink,
@@ -2797,7 +2788,6 @@ impl<'a> Deck<'a> {
                 .map(|(_, r)| (rows.top(r) - gap, rows.top(r) + rows.cell + gap))
                 .collect();
             let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
-            self.gridlines(&block.strip, rows.top(0), last, &holes);
             if let Some(bar) = block.meter.bar {
                 let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
                 self.live_rects.push((LiveLayer::Values, br));
@@ -2833,7 +2823,7 @@ impl<'a> Deck<'a> {
                     self.text(
                         block.name.x,
                         top + rows.baseline,
-                        "Cores".into(),
+                        CORES_NAME.into(),
                         rows.name_pt,
                         true,
                         ink,
@@ -4803,7 +4793,7 @@ pub(crate) mod tests {
 
     /// [`split_tab`] with the panes' programs named `names`.
     pub(crate) fn split_tab_running(a: u64, b: u64, names: [&str; 2]) -> Snapshot {
-        use aterm_vitals::model::ProcLimits;
+        use aterm_vitals::model::TaskRoom;
         let pane = |key: u64, shell_pid: u32| TabRoot {
             key,
             tab: a.min(b),
@@ -4848,11 +4838,13 @@ pub(crate) mod tests {
             ]),
             self_pid: 100,
             tabs: vec![pane(a, 200), pane(b, 300)],
-            proc_limits: ProcLimits {
-                system: Some(1000),
-                per_user: Some(500),
+            room: TaskRoom {
+                procs: Some(900),
+                procs_max: Some(1000),
+                user_procs: Some(400),
+                user_procs_max: Some(500),
+                ..TaskRoom::default()
             },
-            pid_counts: (Some(900), Some(400)),
             ..Sample::default()
         };
         let mut v = aterm_vitals::Vitals::new();

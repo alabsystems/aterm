@@ -3123,17 +3123,17 @@ fn record_kimi_browser_window(bed: &Bed, label: &str, at: i64, why: &str) {
 }
 
 /// A POOL ROW WHOSE BACKGROUND RENEWAL MET CLOUDFLARE'S BOT CHECK IS LEFT ALONE PAST THE
-/// 15-MINUTE COOLDOWN, as one that stopped for a person, though nobody is asked (design R-13):
+/// 15-MINUTE COOLDOWN, with its human login task retained quietly:
 /// each try starts a live sign-in at the vendor that the check ends again, so the cooldown alone
 /// tried it again every 15 minutes. Driven through the upkeep's own path ([`renew_pool_due`],
 /// its seam running nothing), the try itself run by `renew_one_for` ([`kimi_renewal_ending`]),
 /// which writes its end on record, its end noted as `spawn_vendor_renewal_with`'s worker notes
 /// it and the guard's clocks set back to stand for the time passed, for a row never signed in
-/// here and for one bound here with no sign-in task (whose park for a person the vendor's gate
-/// releases). A restart, which forgets the guard, keeps the hold from the bot check on record.
+/// here and for one already bound here. A restart, which forgets the guard, keeps the hold
+/// from the bot check and its human task on record.
 /// CONTROL: a plain failure is tried again once its cooldown has passed; the bot-checked row
-/// once after a new signed-in `accounts browser` window, at once on a person's own selection
-/// ([`renew_requested_pin_for`]), and after a restart once [`PERSON_BACKOFF_SECS`] has passed.
+/// at once on a person's own selection ([`renew_requested_pin_for`]), and after a restart once
+/// [`PERSON_BACKOFF_SECS`] has passed. A browser window alone does not complete the login task.
 #[cfg(unix)]
 #[test]
 fn a_pool_rows_bot_check_is_left_alone_past_the_cooldown() {
@@ -3248,6 +3248,8 @@ region = \"global\"
             Renewal::Failed
         );
 
+        // Start a later challenge episode after the preceding task's wait has elapsed.
+        let now = now + PERSON_BACKOFF_SECS + 1;
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         assert!(!try_again(&bed, &guard, Renewal::BotCheck, now, 901));
         record_kimi_browser_window(
@@ -3257,10 +3259,11 @@ region = \"global\"
             "www.kimi.ai window done session-kept",
         );
         assert!(
-            kimi_pool_upkeep(&bed, &guard, now + 902),
-            "CONTROL: a new signed-in window lifts the hold once (bound here: {bound})"
+            !kimi_pool_upkeep(&bed, &guard, now + 902),
+            "a window alone does not complete the native login task (bound here: {bound})"
         );
 
+        let now = now + PERSON_BACKOFF_SECS + 1;
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         assert!(!try_again(&bed, &guard, Renewal::BotCheck, now, 901));
         let request = store.request_pin("kimi-1", now + 901).unwrap();

@@ -7,7 +7,7 @@ name = "aterm-tty"
 # of the one `aterm_tty_suite` binary. With autotests off a `tests/*.rs` file
 # listed nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

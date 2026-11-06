@@ -78,8 +78,9 @@ fn thread_local_sections(image: &[u8]) -> (u64, u64) {
 
 #[test]
 fn every_threads_copy_of_the_thread_local_template_stays_small() {
-    let path = env!("CARGO_BIN_EXE_aterm-gui");
-    let image = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let exe = aterm_tempfile::bin_exe("aterm-gui");
+    let path = exe.display();
+    let image = std::fs::read(&exe).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let (data, bss) = thread_local_sections(&image);
     assert!(data + bss > 0, "fixture: {path} has thread-locals");
     assert!(

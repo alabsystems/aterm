@@ -929,7 +929,7 @@ fn test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line() {
         let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
         let result = dir.path().join("result.txt");
         let profile = dir.path().join("profile.ps1");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = aterm_tempfile::manifest_dir()
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");
@@ -1077,7 +1077,7 @@ fn test_powershell_alt_u_l_c_case_the_word_on_every_psreadline() {
         let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
         let result = dir.path().join("result.txt");
         let profile = dir.path().join("profile.ps1");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = aterm_tempfile::manifest_dir()
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");

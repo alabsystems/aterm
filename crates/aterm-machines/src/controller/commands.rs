@@ -2081,7 +2081,7 @@ fn upgrade_body(
     envelope.upgrade = Some(Upgrade {
         sha256: agent.archive.sha256.clone(),
         kind: agent.kind.into(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: aterm_stamp::app_version().into(),
     });
     Ok(envelope)
 }
@@ -2100,7 +2100,7 @@ fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
         title: "aterm's helper on this Mac, switched to the controller's build".into(),
         outcome: Outcome::Planned,
         from: Some(build_name(&hello.agent_version, &hello.agent_sha256)),
-        to: Some(build_name(env!("CARGO_PKG_VERSION"), &own.sha256)),
+        to: Some(build_name(aterm_stamp::app_version(), &own.sha256)),
         why: Some("apply switches it first".into()),
         revert: None,
         effect: Effect::Now,

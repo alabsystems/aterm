@@ -2174,29 +2174,106 @@ pub(super) fn judge_dialog(seen: &Seen, land: bool, t0: i64) -> Verdict {
     )
 }
 
-/// Judges F3 live: a first reply ending on a read-only tool box, judged at that point: a back-off
-/// naming one short turn, or Land's instruction typed there at once (v6 §14.10), then landed.
-pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
-    let results = seen.cover.tool_results.unwrap_or(0);
-    let screen = seen.cover.first_screen.as_ref().map_or_else(
-        || "the screen at the first point not read".to_string(),
-        |(t, rows)| {
-            format!(
-                "the screen's last rows at +{}: {}",
-                at(t0, *t),
-                rows.iter()
-                    .rev()
-                    .take(6)
-                    .rev()
-                    .map(|r| crate::util::one_line(r, 80))
+/// The head of every instruction the harness types (`[aterm harness] Autopilot is Land: …`), as a
+/// program's transcript echoes it.
+const TYPED_HEAD: &str = "[aterm harness]";
+
+/// F3's first turn on the screen read at its first point ([`Cover::first_screen`]): the rows under
+/// the opener's echo (the row holding `token`, [`Chain::token`]) up to the first echo of an
+/// instruction the harness typed, or else to the composer (its top edge, the screen's last rule row
+/// but one), with blank rows, rule rows (agy draws one under each turn) and a program's own
+/// furniture ([`turn_furniture`]) dropped; `None` where that screen holds no echo of the opener.
+pub(super) fn first_turn<'a>(rows: &'a [String], token: &str) -> Option<Vec<&'a str>> {
+    let opener = rows.iter().position(|r| r.contains(token))?;
+    let rules: Vec<usize> = (0..rows.len()).filter(|&i| is_rule_row(&rows[i])).collect();
+    let composer = rules
+        .len()
+        .checked_sub(2)
+        .map_or(rows.len(), |i| rules[i])
+        .max(opener + 1);
+    Some(
+        rows[opener + 1..composer]
+            .iter()
+            .map(String::as_str)
+            .take_while(|r| !r.contains(TYPED_HEAD))
+            .filter(|r| !r.trim().is_empty() && !is_rule_row(r) && !turn_furniture(r))
+            .collect(),
+    )
+}
+
+/// A row of box-drawing alone (a composer's or a turn's edge), a label set in it allowed (Muse
+/// Code's `── Voice input (⌥ + v to start) ───…`).
+fn is_rule_row(row: &str) -> bool {
+    let row = row.trim();
+    row.starts_with("──") && row.ends_with("──")
+}
+
+/// A program's own row under a turn, no words of the agent's: Claude Code's turn timer (`✻ Worked
+/// for 0s · done 9:56 PM`).
+fn turn_furniture(row: &str) -> bool {
+    row.trim_start().starts_with('✻')
+}
+
+/// Whether `row` is F3's tool's ([`read_call`]: a read of the chain's `README.md`) as each program
+/// drew it on 2026-11-05: Claude Code 2.1.318's `Read 1 file (ctrl+o to expand)`, agy 1.5.1's `●
+/// Explored 1 file (README.md) (ctrl+o to expand)` and Muse Code 1.4.14's `Read README.md`.
+fn is_tool_row(row: &str) -> bool {
+    row.contains("README.md") || row.contains("Read 1 file")
+}
+
+/// F3's premise read off its first turn ([`first_turn`]): the turn ended on its tool's row, no
+/// words after it, so the point judged is a tool-ended one; else why not.
+fn tool_ended_premise(seen: &Seen, t0: i64) -> Result<String, String> {
+    let Some((t, rows)) = seen.cover.first_screen.as_ref() else {
+        return Err("the screen at the first point not read".into());
+    };
+    let Some(turn) = first_turn(rows, &Chain::ToolEnd.token()) else {
+        return Err(format!(
+            "the screen read at +{} holds no echo of the opener ({} rows, the last {})",
+            at(t0, *t),
+            rows.len(),
+            rows.last().map_or("-", |r| r.trim())
+        ));
+    };
+    match turn.last() {
+        Some(last) if is_tool_row(last) => Ok(format!(
+            "the first turn's last row, read at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(last.trim(), 80)
+        )),
+        _ => Err(format!(
+            "the first turn did not end on the tool's row: its rows read at +{}: {}",
+            at(t0, *t),
+            if turn.is_empty() {
+                "none".to_string()
+            } else {
+                turn.iter()
+                    .map(|r| crate::util::one_line(r.trim(), 80))
                     .collect::<Vec<_>>()
                     .join(" / ")
-            )
-        },
-    );
+            }
+        )),
+    }
+}
+
+/// Judges F3 live: a first reply ending on a read-only tool box, judged at that point: a back-off
+/// naming one short turn, or Land's instruction typed there at once (v6 §14.10), then landed.
+/// UNOBSERVED where the screen read at the first point does not show the first turn ending on the
+/// tool's row ([`tool_ended_premise`]): the point judged was then not a tool-ended one.
+pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+    let results = seen.cover.tool_results.unwrap_or(0);
+    let premise = tool_ended_premise(seen, t0);
+    let screen = match &premise {
+        Ok(s) | Err(s) => s.clone(),
+    };
     if results == 0 {
         return Verdict::Unobserved(format!(
             "no request carried the tool's result back: the agent never ran F3's call, so its turn did not end on a tool's row ({screen})"
+        ));
+    }
+    if premise.is_err() {
+        return Verdict::Unobserved(format!(
+            "the tool's result carried back in {results} request(s), but {screen}"
         ));
     }
     let point = seen

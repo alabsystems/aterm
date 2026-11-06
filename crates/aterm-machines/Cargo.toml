@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-machines"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -31,6 +31,7 @@ aterm-json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # The controller's config and state directories (never the agent's: DESIGN-machines §3.4) and
 # the macOS setup settings (`macos_setup`).
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # SHA-256 of artifacts and of the agent payload.
 aterm-digest = { workspace = true }

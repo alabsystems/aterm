@@ -672,7 +672,7 @@ mod stateful {
     }
 
     fn repo() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+        aterm_tempfile::manifest_dir().join("../..")
     }
 
     fn pin() -> String {

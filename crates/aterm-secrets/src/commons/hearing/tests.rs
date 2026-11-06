@@ -76,6 +76,18 @@ fn versions_read_their_release_and_order_by_it() {
     assert_eq!(LIFTED.to_string(), "0.146.0");
 }
 
+/// A process with no installed identity (this test binary) still runs this code, which is
+/// LIFTED's: it reports LIFTED, not the unstamped 0.0.0 a peer would hold as older.
+#[test]
+fn an_unstamped_process_reports_the_release_its_code_is() {
+    assert_eq!(aterm_stamp::installed(), None);
+    assert_eq!(
+        Version::parse(aterm_stamp::app_version()),
+        Some(Version(0, 0, 0))
+    );
+    assert_eq!(Version::own(), LIFTED);
+}
+
 #[test]
 fn the_ledger_reads_back_and_refuses_another_trust() {
     let (binding, _) = member(1);

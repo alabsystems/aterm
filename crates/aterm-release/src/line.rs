@@ -510,16 +510,15 @@ fn unsteered(git: &dyn GitRunner, pins: &[&str], base: &str, c: &str) -> Result<
         if !attrs.success() {
             return Err(refused_call(git, &args, &attrs));
         }
-        let fields: Vec<std::borrow::Cow<'_, str>> = attrs
-            .stdout
-            .split(|b| *b == 0)
-            .map(String::from_utf8_lossy)
-            .collect();
-        for triple in fields.chunks(3) {
-            if let [path, _, value] = triple
-                && value != "unspecified"
-            {
-                steering.push(format!("{path}: merge {value}"));
+        let mut fields = attrs.stdout.split(|b| *b == 0);
+        while let (Some(path), Some(_), Some(value)) = (fields.next(), fields.next(), fields.next())
+        {
+            if value != b"unspecified" {
+                steering.push(format!(
+                    "{}: merge {}",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(value)
+                ));
             }
         }
     }
@@ -943,9 +942,9 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
             &format!("^{floor}"),
         ],
     )?;
-    let mut range: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    let mut range: BTreeMap<&str, (&str, Vec<&str>)> = BTreeMap::new();
     for row in listed.lines() {
-        let mut words = row.split_whitespace().map(str::to_string);
+        let mut words = row.split_whitespace();
         let (Some(commit), Some(tree)) = (words.next(), words.next()) else {
             return Err(unread(format!(
                 "git rev-list wrote {row:?}, not `<commit> <tree> <parents>`"
@@ -953,23 +952,23 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
         };
         range.insert(commit, (tree, words.collect()));
     }
-    let mut trees: BTreeMap<String, String> = range
+    let mut trees: BTreeMap<&str, &str> = range
         .iter()
-        .map(|(commit, (tree, _))| (commit.clone(), tree.clone()))
+        .map(|(&commit, &(tree, _))| (commit, tree))
         .collect();
-    let outside: BTreeSet<String> = range
+    let outside: BTreeSet<&str> = range
         .values()
         .filter(|(_, parents)| parents.len() > 1)
-        .filter_map(|(_, parents)| parents.first())
+        .filter_map(|(_, parents)| parents.first().copied())
         .filter(|first| !trees.contains_key(*first))
-        .cloned()
         .collect();
+    let read_out;
     if !outside.is_empty() {
         let spelled: Vec<String> = outside.iter().map(|c| format!("{c}^{{tree}}")).collect();
         let mut args = vec!["rev-parse"];
         args.extend(spelled.iter().map(String::as_str));
-        let read = out(git, &args)?;
-        let read: Vec<&str> = read.lines().collect();
+        read_out = out(git, &args)?;
+        let read: Vec<&str> = read_out.lines().collect();
         if read.len() != outside.len() {
             return Err(unread(format!(
                 "git rev-parse named {} tree(s) for {} first parent(s)",
@@ -978,13 +977,13 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
             )));
         }
         for (commit, tree) in outside.into_iter().zip(read) {
-            trees.insert(commit, tree.to_string());
+            trees.insert(commit, tree);
         }
     }
     let mut landed = BTreeSet::new();
-    let mut next = vec![tip];
+    let mut next = vec![tip.as_str()];
     while let Some(commit) = next.pop() {
-        let Some((tree, parents)) = range.get(&commit) else {
+        let Some((tree, parents)) = range.get(commit) else {
             continue;
         };
         if !landed.insert(commit) {
@@ -996,9 +995,9 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
                 .and_then(|first| trees.get(first))
                 .is_some_and(|first| first == tree);
         let followed = if neutral { &parents[..1] } else { &parents[..] };
-        next.extend(followed.iter().filter(|p| !landed.contains(*p)).cloned());
+        next.extend(followed.iter().copied().filter(|p| !landed.contains(*p)));
     }
-    Ok(landed)
+    Ok(landed.into_iter().map(str::to_owned).collect())
 }
 
 /// The refusal for a commit origin/main holds only through a content-neutral merge.
@@ -1029,10 +1028,11 @@ pub fn tree_has(git: &dyn GitRunner, rev: &str, path: &str) -> Result<bool, Stop
     }
     let listed = plumb(git, &["ls-tree", "-z", "--full-tree", rev, "--", path])?;
     Ok(listed.stdout.split(|b| *b == 0).any(|entry| {
-        let entry = String::from_utf8_lossy(entry);
-        entry
-            .split_once('\t')
-            .is_some_and(|(meta, name)| name == path && meta.split(' ').nth(1) == Some("blob"))
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            return false;
+        };
+        &entry[tab + 1..] == path.as_bytes()
+            && entry[..tab].split(|&b| b == b' ').nth(1) == Some(b"blob")
     }))
 }
 

@@ -157,8 +157,8 @@ fn outcome() -> login_drive::Outcome {
         page: false,
     }
 }
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(60)
+fn deadline() -> WakeDeadline {
+    WakeDeadline::after(Duration::from_secs(60))
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn pooled_expired_recovery_preserves_rotation_across_outage_and_never_restores_r
                 fn resume(
                     &mut self,
                     req: &login_drive::Request<'_>,
-                    deadline: Instant,
+                    deadline: WakeDeadline,
                 ) -> Result<login_drive::Resume, String> {
                     self.journal.resume_using(req, self.home, deadline, |scope, now| {
                         self.calls += 1;
@@ -803,7 +803,7 @@ fn kimi_recovery_refuses_changed_context_files_and_ciphertext_without_cookie_pub
             &req,
             &f.home,
             if case == 3 {
-                Instant::now()
+                WakeDeadline::after(Duration::ZERO)
             } else {
                 deadline()
             },
@@ -1020,7 +1020,7 @@ fn kimi_pending_survives_process_death_and_resumes_before_native_program_require
         fn resume(
             &mut self,
             req: &login_drive::Request<'_>,
-            deadline: Instant,
+            deadline: WakeDeadline,
         ) -> Result<login_drive::Resume, String> {
             let mut journal = Journal::open(req, &self.f.home)?.unwrap();
             self.pending = journal.resume_using(req, &self.f.home, deadline, |scope, _| {
@@ -1045,7 +1045,7 @@ fn kimi_pending_survives_process_death_and_resumes_before_native_program_require
             &mut self,
             req: &login_drive::Request<'_>,
             outcome: &login_drive::Outcome,
-            deadline: Instant,
+            deadline: WakeDeadline,
         ) -> Result<(), String> {
             self.pending
                 .take()

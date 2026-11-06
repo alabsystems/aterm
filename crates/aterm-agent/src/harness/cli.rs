@@ -56,8 +56,11 @@ pub const HARNESS: &str = aterm_capacity::room::HARNESS;
 /// How many rows `ledger` prints when the caller names no count.
 pub const LEDGER_DEFAULT_ROWS: usize = 20;
 
-/// The most rows one read of a ledger holds: the tail streams through a ring of this size, so a large ledger is never held whole.
+/// The most rows one ledger read selects, including unreadable rows in display mode.
 pub const READ_MAX_ROWS: usize = 4096;
+
+/// The most UTF-8 text bytes one ledger tail retains, excluding line endings.
+pub const READ_MAX_BYTES: usize = 64 << 20;
 
 /// The disk journal's file name under the harness state directory.
 pub const DISK_LEDGER: &str = "disk.jsonl";
@@ -728,7 +731,10 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     A renewal whose page waits on a person for 90 s stops `needs-sign-in` and names it. A
     Kimi row's email is never typed on Kimi's pages (its form signs a new account up as
     readily as it signs one in). A background renewal that stopped for a person, or met
-    Cloudflare's bot check, leaves its row alone for 6 hours.
+    Cloudflare's bot check, leaves its row alone for 6 hours. A bot check records one
+    human login task in the account read and Messages; it sends no repeated agent prompt
+    and opens no browser automatically. Run the task's `accounts login` at the desk to
+    complete the provider's challenge; aterm still verifies the account before binding it.
   - On macOS Grok Build's sign-in runs under `sandbox-exec` with LaunchServices, Apple
     events and the pasteboard denied, so it opens no browser on the desk.
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
@@ -3471,7 +3477,8 @@ fn run_agy_login(_env: &Env, account: &str, json: bool, out: &mut dyn Write) -> 
             .ok_or("Google login home is unavailable")?;
         // The person's sign-in of the account they named, held until the provider flow ends.
         let _begun = person_begin(&store, (Cli::Agy, account), env.now, &|_| false)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let deadline =
+            super::wake_deadline::WakeDeadline::after(std::time::Duration::from_secs(180));
         let grant =
             super::agy_signin::run_google(&program.path, &env.state, home, account, deadline)
                 .map_err(|error| error.to_string())?;
@@ -6150,11 +6157,75 @@ fn run_disk(
     ExitCode::SUCCESS
 }
 
-/// The newest `max` lines of the JSONL file at `path`, streamed through a ring of at most [`READ_MAX_ROWS`] so the file is never held whole.
+/// The newest `max` nonblank lines at `path`, retaining at most [`READ_MAX_ROWS`] rows
+/// and [`READ_MAX_BYTES`] text bytes. A positive limit scans the whole file; zero checks
+/// path admission without reading rows.
 /// # Errors
-/// An existing path is linked or not a regular file, cannot be opened or read, or a line
-/// is not UTF-8.
+/// An existing path is linked or not a regular file, cannot be opened or read, a line
+/// is not UTF-8 or exceeds 16 MiB, or the final selected tail exceeds [`READ_MAX_BYTES`].
 pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
+    tail_lines_with(path, max, |error| {
+        Err(io::Error::new(io::ErrorKind::InvalidData, error))
+    })
+}
+
+/// A bounded suffix plus the number of older selected rows whose text no longer fits.
+/// Discarded rows stay as a logical prefix until newer input ages them out. Its last
+/// row held text, so a nonempty prefix at EOF witnesses an over-budget final selection.
+struct LedgerTail {
+    rows: VecDeque<Option<Box<str>>>,
+    discarded_prefix: usize,
+    bytes: usize,
+    row_limit: usize,
+    byte_limit: usize,
+}
+
+impl LedgerTail {
+    fn new(row_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            rows: VecDeque::with_capacity(row_limit.saturating_add(1)),
+            discarded_prefix: 0,
+            bytes: 0,
+            row_limit,
+            byte_limit,
+        }
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(Some(row)) = self.rows.pop_front() {
+            self.bytes -= row.len();
+        }
+    }
+
+    fn push(&mut self, row: Option<Box<str>>) {
+        self.bytes += row.as_deref().map_or(0, str::len);
+        self.rows.push_back(row);
+        while self.discarded_prefix + self.rows.len() > self.row_limit {
+            if self.discarded_prefix > 0 {
+                self.discarded_prefix -= 1;
+            } else {
+                self.pop_front();
+            }
+        }
+        while self.bytes > self.byte_limit {
+            self.pop_front();
+            self.discarded_prefix += 1;
+        }
+    }
+
+    fn into_rows(self) -> Option<Vec<String>> {
+        (self.discarded_prefix == 0)
+            .then(|| self.rows.into_iter().flatten().map(String::from).collect())
+    }
+}
+
+/// The bounded tail scan, with an explicit policy for an invalid UTF-8 row.
+/// Such a row still occupies a tail slot; the callback may refuse the whole read.
+fn tail_lines_with(
+    path: &Path,
+    max: usize,
+    mut invalid_utf8: impl FnMut(std::str::Utf8Error) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
     let file = match astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -6169,42 +6240,49 @@ pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
         return Err(io::Error::other("ledger is not a regular file"));
     }
     let keep = max.min(READ_MAX_ROWS);
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(keep.saturating_add(1));
     if keep == 0 {
         return Ok(Vec::new());
     }
+    let mut tail = LedgerTail::new(keep, READ_MAX_BYTES);
     const MAX_LEDGER_LINE_BYTES: u64 = 16 << 20;
     use std::io::Read as _;
     let mut reader = io::BufReader::new(file);
     loop {
-        let mut line = String::new();
+        let mut bytes = Vec::new();
         let n = (&mut reader)
             .take(MAX_LEDGER_LINE_BYTES + 1)
-            .read_line(&mut line)?;
+            .read_until(b'\n', &mut bytes)?;
         if n == 0 {
             break;
         }
-        if n as u64 > MAX_LEDGER_LINE_BYTES && !line.ends_with('\n') {
+        if n as u64 > MAX_LEDGER_LINE_BYTES && !bytes.ends_with(b"\n") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "ledger line exceeds 16 MiB limit",
             ));
         }
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+        if bytes.ends_with(b"\n") {
+            bytes.pop();
+            if bytes.ends_with(b"\r") {
+                bytes.pop();
             }
         }
-        if line.trim().is_empty() {
-            continue;
-        }
-        ring.push_back(line);
-        while ring.len() > keep {
-            ring.pop_front();
-        }
+        let line = match String::from_utf8(bytes) {
+            Ok(line) if line.trim().is_empty() => continue,
+            Ok(line) => Some(line.into_boxed_str()),
+            Err(error) => {
+                invalid_utf8(error.utf8_error())?;
+                None
+            }
+        };
+        tail.push(line);
     }
-    Ok(ring.into_iter().collect())
+    tail.into_rows().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ledger tail exceeds 64 MiB limit",
+        )
+    })
 }
 
 /// Cut the journal at `path` back to its newest `keep` rows once it is larger than `max_bytes`.
@@ -6509,37 +6587,54 @@ fn run_ledger(
             return ExitCode::from(1);
         }
     };
-    let rows = match tail_lines(&path, count) {
+    let mut invalid_utf8 = false;
+    let rows = match tail_lines_with(&path, count, |_| {
+        invalid_utf8 = true;
+        Ok(())
+    }) {
         Ok(rows) => rows,
         Err(e) => {
             let _ = writeln!(err, "aterm harness ledger: {}: {e}", path.display());
             return ExitCode::from(1);
         }
     };
-    for row in &rows {
-        match (json, file) {
-            (true, _) | (false, LedgerFile::Disk) => {
-                let _ = writeln!(out, "{row}");
-            }
-            (false, LedgerFile::Upgrade) => {
-                let _ = writeln!(out, "{}", upgrade_ledger_line(row));
-            }
-            (false, LedgerFile::Accounts(_)) => {
-                let _ = writeln!(out, "{}", accounts_ledger_line(row));
-            }
-            (false, LedgerFile::Approvals(_)) => {
-                let _ = writeln!(out, "{}", approval_line(row));
-            }
-        }
-    }
-    if rows.is_empty() && !json {
+    if invalid_utf8 {
         let _ = writeln!(
-            out,
-            "no rows in {} — nothing has been decided there yet",
+            err,
+            "aterm harness ledger: {}: some rows are not UTF-8; output is incomplete",
             path.display()
         );
     }
-    ExitCode::SUCCESS
+    let written = (|| -> io::Result<()> {
+        for row in &rows {
+            match (json, file) {
+                (true, _) | (false, LedgerFile::Disk) => writeln!(out, "{row}"),
+                (false, LedgerFile::Upgrade) => writeln!(out, "{}", upgrade_ledger_line(row)),
+                (false, LedgerFile::Accounts(_)) => writeln!(out, "{}", accounts_ledger_line(row)),
+                (false, LedgerFile::Approvals(_)) => writeln!(out, "{}", approval_line(row)),
+            }?;
+        }
+        if count > 0 && rows.is_empty() && !json && !invalid_utf8 {
+            writeln!(
+                out,
+                "no rows in {} — nothing has been decided there yet",
+                path.display()
+            )?;
+        }
+        out.flush()
+    })();
+    if let Err(error) = written {
+        let _ = writeln!(
+            err,
+            "aterm harness ledger: could not write results: {error}"
+        );
+        return ExitCode::from(1);
+    }
+    if invalid_utf8 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The step a hand-run `upgrade` answers while `[harness] enabled` reads off ([`upgrade_pass`]), kept stable so scripts that key on it still read it.
@@ -7353,7 +7448,7 @@ pub trait AccountsHost {
         Err("this host fetches no browser; nothing was installed".to_string())
     }
 
-    /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here (or another of [`WINDOW_END_SIGNALS`] arrives), quits the browser, or [`super::login_drive::HANG`] runs out ([`super::browser_window::run_window`]).
+    /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here (or another of [`WINDOW_END_SIGNALS`] arrives), quits the browser, or [`super::login_drive::HANG`] runs out, counting the time the host slept ([`super::browser_window::run_window`]).
     fn open_window(
         &self,
         browser: &Path,
@@ -7820,7 +7915,7 @@ impl AccountsHost for LiveAccounts {
             .expected_identity_email()
             .ok_or("Google login row has no email")?;
         let previous = Some(req.row.dir.as_deref().map_or(home, Path::new));
-        let deadline = std::time::Instant::now() + super::login_drive::HANG;
+        let deadline = super::wake_deadline::WakeDeadline::after(super::login_drive::HANG);
         super::agy_signin::run_google_staged_scoped(
             &program,
             state,
@@ -13449,10 +13544,9 @@ pub(super) enum Renewal {
     /// block page, or its time ran out), so a background renewal of the row waits for one
     /// ([`super::accounts_sync`]'s backoff).
     NeedsPerson,
-    /// Another CLI's sign-in met Cloudflare's bot check, which did not clear: a failure on
-    /// record that nobody is asked to pass (design R-13). Each try starts a live sign-in at the
-    /// vendor that the check ends again, so a background renewal of the row waits as long as
-    /// after a stop for a person ([`super::accounts_sync`]'s backoff); one by hand runs at once.
+    /// A sign-in met Cloudflare's bot check, which did not clear. Its account keeps a human
+    /// sign-in task, without an immediate prompt. Background renewal waits as long as after
+    /// another stop for a person; a human can start the native login explicitly.
     BotCheck,
 }
 
@@ -13817,6 +13911,44 @@ fn renew_one_observed(
             &format!("{why}; its home is kept at {}", staging.display()),
         );
         return Renewal::Deferred;
+    }
+    if exited
+        .as_ref()
+        .map_or(true, |exit| matches!(exit.code, 1..=127))
+        && observation
+            .as_ref()
+            .and_then(RenewalObservation::met)
+            .is_some_and(|met| met.word == super::open_url::MetWord::BotCheck)
+    {
+        let recorded = store.transact_renewal_within(
+            &accounts::LOCK_LADDER,
+            now,
+            &mut None,
+            policy,
+            |_, logins| {
+                if host.work_cancelled() {
+                    return Err(RenewalFailure::cancelled().to_string());
+                }
+                guard.check(row)?;
+                accounts::admit_workflow(logins, label)?;
+                accounts::note_sign_in_task(logins, label, accounts::SignInAction::Login, now);
+                Ok(Vec::new())
+            },
+        );
+        if let Err(why) = recorded {
+            say(
+                err,
+                &format!("the browser challenge could not be recorded: {why}"),
+            );
+            return Renewal::Deferred;
+        }
+        discard_staging(&staging, err);
+        let why = exited
+            .as_ref()
+            .map_or_else(ToString::to_string, RenewalExit::failure_words);
+        say(err, &format!("{why}; no login was bound"));
+        human_challenge_step(Cli::Claude, label, out);
+        return Renewal::BotCheck;
     }
     let exited = match exited {
         Ok(code) => code,
@@ -15754,11 +15886,21 @@ fn person_step(cli: Cli, outcome: &super::login_drive::Outcome) -> Option<accoun
     use super::login_drive::Outcome;
     match outcome {
         Outcome::NeedsSignIn(_) if cli.renews_headlessly() => Some(accounts::SignInAction::Browser),
-        Outcome::NeedsSignIn(_) | Outcome::NeedsYou(_) | Outcome::Hung => {
+        Outcome::NeedsSignIn(_) | Outcome::NeedsYou(_) | Outcome::Hung | Outcome::BotCheck(_) => {
             Some(accounts::SignInAction::Login)
         }
         _ => None,
     }
+}
+
+/// Leave a durable account task visible on demand, without a repeated agent prompt or a
+/// browser opened by background work. The native login creates a fresh human-driven flow.
+fn human_challenge_step(cli: Cli, label: &str, out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "{label}: human browser challenge recorded; {}",
+        accounts::SignInAction::Login.next_step(cli, label)
+    );
 }
 
 /// One renewal of `cli`'s `row` (design §6): its vendor's own sign-in in a fresh staging directory under the machine's sign-in lock, its page approved headlessly on the pinned hosts ([`AccountsHost::vendor_sign_in`]), then bound once its login file exists. A CLI report naming another email is a wrong account; a sign-in that ends any other way removes the staging directory and records its host, flow and outcome in the ledger, never its URL or code. Its clock is the host's, never earlier than `floor`.
@@ -15966,6 +16108,9 @@ pub(super) fn renew_one_for(
                 };
             }
             match person_step(cli, other) {
+                Some(_) if matches!(other, Outcome::BotCheck(_)) => {
+                    human_challenge_step(cli, label, out);
+                }
                 Some(accounts::SignInAction::Browser) => {
                     let _ = writeln!(
                         out,
@@ -15986,9 +16131,8 @@ pub(super) fn renew_one_for(
                 }
                 None => {}
             }
-            // A bot check that did not clear is an error on record, never a person's to pass
-            // (design R-13): no NEEDS YOU and no sign-in task, but its own end, which the
-            // background waits out as long as a stop for a person.
+            // A bot check keeps its own outcome and backoff. Its human task is a quiet
+            // account record, not a prompt repeated into working agent sessions.
             return match other {
                 Outcome::Exited(code) => Renewal::authentication_failed(*code),
                 Outcome::NeedsYou(_) | Outcome::NeedsSignIn(_) | Outcome::Hung => {
@@ -17591,7 +17735,7 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         writeln!(
             out,
             "{}",
-            account_stats::json(&look, &view, env!("CARGO_PKG_VERSION"))
+            account_stats::json(&look, &view, aterm_stamp::app_version())
         )
     } else {
         write!(out, "{}", account_stats::text_local(&look, &view, tz_at))

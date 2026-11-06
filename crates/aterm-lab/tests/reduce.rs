@@ -8,7 +8,7 @@
 use std::path::Path;
 
 fn lab_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
-    let out = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"))
+    let out = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"))
         .args(args)
         .current_dir(dir)
         .output()

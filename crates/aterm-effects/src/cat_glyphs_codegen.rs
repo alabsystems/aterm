@@ -917,15 +917,15 @@ mod tests {
     }
 
     fn glyph_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/glyphs")
+        aterm_tempfile::manifest_dir().join("art/glyphs")
     }
 
     fn pet_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
+        aterm_tempfile::manifest_dir().join("art/pet")
     }
 
     fn animal_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/animal")
+        aterm_tempfile::manifest_dir().join("art/animal")
     }
 
     #[test]
@@ -962,7 +962,7 @@ mod tests {
     }
 
     fn dog_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/dogs")
+        aterm_tempfile::manifest_dir().join("art/dogs")
     }
 
     #[test]

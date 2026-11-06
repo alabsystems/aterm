@@ -31,7 +31,7 @@ use std::time::Duration;
 use aterm_messages::exceptions::{Entry, Family};
 use aterm_messages::need::{Ask, Reason, StandingWhy, Then};
 use aterm_messages::{Intent, Message, Severity, tags};
-use aterm_secrets::client::Asking;
+use aterm_secrets::client::{Asking, Paths};
 use aterm_secrets::members::desk::{self, Desk, Local, Row, RowState};
 use aterm_secrets::members::{self, Allowed, PhraseState};
 use aterm_types::MutexExt;
@@ -147,6 +147,10 @@ pub(crate) fn serve_ask(
         let paths = aterm_secrets::client::Paths::live().ok()?;
         aterm_secrets::client::refuses_before_possession(&paths, proving, book(proving))
     };
+    let authority = |proving: &desk::Proving<'_>| {
+        let paths = aterm_secrets::client::Paths::live()?;
+        aterm_secrets::client::member_authority(&paths, proving)
+    };
     let served = desk::serve_with(
         desk,
         stream,
@@ -155,6 +159,7 @@ pub(crate) fn serve_ask(
         Some(desk::Proof {
             decide: &prove,
             refuses: &refuses,
+            authority: Some(&authority),
             fleet: None,
         }),
     );
@@ -191,17 +196,17 @@ pub(crate) fn serve_ask(
 }
 
 /// Serve one `vault-join` from `peer` on [`LIVE`]'s desk (or, with none, one made for this
-/// connection): the fleet listener judged the channel (`judged`), and the desk's `prove` exchange
-/// runs on the listener's connection thread ([`aterm_agent::vault_join::serve`]), never the main
-/// thread. What it came to goes to the log only: nothing pops up.
+/// connection): the fleet listener judged the channel and named the vault it is served on
+/// (`judged`, [`crate::fleet_listen::vault_join_on`]), and the desk's `prove` exchange runs on
+/// the listener's connection thread ([`aterm_agent::vault_join::serve`]), never the main thread.
+/// What it came to goes to the log only: nothing pops up.
 pub(crate) fn serve_vault_join(
     stream: &mut dyn aterm_net::fleet::Duplex,
     peer: Option<SocketAddr>,
-    judged: Result<aterm_agent::vault_join::Judged, String>,
+    judged: Result<(aterm_agent::vault_join::Judged, Paths), String>,
 ) {
     let from = peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
-    let ended = judged.and_then(|judged| {
-        let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string())?;
+    let ended = judged.and_then(|(judged, paths)| {
         let desk = LIVE.lock_or_recover().clone();
         aterm_agent::vault_join::serve(stream, from, &judged, desk.as_deref(), &paths)
             .map_err(|error| error.to_string())

@@ -4,7 +4,6 @@
 //! Regenerate `src/animal_glyphs_gen.rs` from `art/animal/*.toml`
 //! (`targo --unverified run -p aterm-effects --example gen_animal_glyphs`).
 
-use std::path::Path;
 use std::process::ExitCode;
 
 #[path = "../src/cat_glyphs_codegen.rs"]
@@ -17,7 +16,7 @@ use cat_glyphs_codegen::generate_animal_from_assets;
 mod asset_dir;
 
 fn main() -> ExitCode {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = aterm_tempfile::manifest_dir();
     let animal_dir = root.join("art/animal");
     let out = root.join("src/animal_glyphs_gen.rs");
 

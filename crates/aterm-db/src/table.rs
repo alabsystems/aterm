@@ -127,6 +127,31 @@ impl Record {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the table writer's wait (one-mesh M4, §11 B11): while set, a
+    /// writer that holds a `Remove` whose rotation has not arrived seals its table write at once,
+    /// under the epoch that still wraps the removed Mac, as before B11. A test sets it for its
+    /// thread; a lab instance turns it on for its whole process with `tables-dont-wait` in
+    /// `ATERM_TEST_NEGATIVE_CONTROL` ([`aterm_types::negative_control::on`]).
+    pub(crate) static TABLES_DONT_WAIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`TABLES_DONT_WAIT`] is on: set on this thread, or named for this process
+/// (`tables-dont-wait`); never in a release build, which has neither switch.
+fn tables_dont_wait() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        TABLES_DONT_WAIT.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("tables-dont-wait")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
 /// A current, secrets-backed membership observation. [`Session::open`] holds the
 /// control journal's writer lock for the session, so no control change lands
 /// mid-batch; [`Session::observe`] reads without it and grants no table writing.
@@ -601,8 +626,9 @@ impl<'a> Session<'a> {
             } else {
                 return Err(Error::new("table repair needs complete control history"));
             };
-        // Log-era rows are sealed under the log's Commons epochs: a member admitted after one
-        // holds no `Wrap` of it and asks a peer for its key.
+        // Log-era rows are sealed under the log's Commons epochs, and under the fold under keys
+        // derived from its `[everyone]` epochs (one-mesh M6): a member admitted after one holds
+        // no `Wrap` of it and asks a peer for its table key.
         if self.access.is_log_backed()
             && let Some((log, _)) = aterm_secrets::client::trusted_commons_log(
                 self.bootstrap.paths(),
@@ -611,6 +637,7 @@ impl<'a> Session<'a> {
             .map_err(failure)?
         {
             selected.extend(log.commons_epoch_ids());
+            selected.extend(log.fold_epoch_ids());
         }
         let window: Vec<_> = selected
             .iter()
@@ -1015,13 +1042,29 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
+    /// Whether a write now waits for a removal's rotation (one-mesh M4): the epoch this session
+    /// would seal under still wraps a Mac the log removed. The store keeps such a write pending
+    /// (`table::store::pending`) and seals it under the new epoch once that arrives.
+    pub(crate) fn waits_for_rotation(&self) -> bool {
+        self.access.waits_for_rotation(!tables_dont_wait())
+    }
+    /// The key this Mac seals its pending writes of `scope` under: derived from its table
+    /// writer's device seed, so a pending write opens only on the Mac and in the table that kept
+    /// it.
+    pub(crate) fn pending_key(&self, scope: &Scope) -> Result<Zeroizing<[u8; 32]>> {
+        self.bootstrap.device().with_seed(|seed| {
+            let prk = Zeroizing::new(aterm_digest::hkdf_extract(
+                b"aterm/commons/pending-table-write/1\0",
+                seed,
+            ));
+            Ok(Zeroizing::new(aterm_digest::hkdf_expand_32(
+                &prk,
+                &scope.bytes(),
+            )))
+        })
+    }
     pub(crate) fn writer(&self) -> Result<()> {
         self.generation_guard(true)?;
-        if !self.access.seals() {
-            return Err(Error::new(
-                "Commons still wraps a removed Mac: table writes wait for the removal's rotation",
-            ));
-        }
         if !self.journal.is_writer()
             || self.access.local().role() != Role::Writer
             || !self.access.is_current(&self.journal)
@@ -1111,6 +1154,9 @@ impl<'a> Session<'a> {
     ) -> Result<Vec<u8>> {
         self.context(scope)?;
         self.writer()?;
+        if self.waits_for_rotation() {
+            return Err(Error::write_pending());
+        }
         if payload.len() > MAX_BODY
             || causal.parents.len() > MAX_PARENTS
             || causal.previous == Some([0; 32])

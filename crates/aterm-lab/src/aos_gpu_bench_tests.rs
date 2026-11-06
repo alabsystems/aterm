@@ -903,6 +903,7 @@ fn the_runner_sidecar_round_trips_every_reading_the_record_derives_from() {
         cores: Some(10),
         name: Some("AGXAcceleratorG17G".into()),
         unread: None,
+        unified: true,
     });
     r.cond.driver = Some(GpuDriver {
         bundle: Some("com.apple.AGXG17G".into()),

@@ -60,7 +60,7 @@ impl Level {
     /// Both as shares of `cap`; `None` unless `cap` is positive and finite.
     #[must_use]
     pub fn over(self, cap: f64) -> Option<Self> {
-        (cap > 0.0 && cap.is_finite()).then(|| Self {
+        (cap > 0.0 && cap.is_finite()).then_some(Self {
             mean: self.mean / cap,
             max: self.max / cap,
         })

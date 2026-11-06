@@ -96,8 +96,9 @@ fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
 /// would land in the label's slot, read off the live screen (at once: the background work the row
 /// waits on is no wait of a press's); a press writes the one-shot press of that build; a refused
 /// word says why in the slot until the refusal's few seconds pass; an accepted one turns the
-/// arrow to `◐`, the label as it was, and a second press asks nothing. CONTROL: a skipped build
-/// shows no arrow.
+/// arrow to `◐`, the label as it was, and a second press asks nothing. The refusal takes the
+/// label's own cells (`alab v0.5 (v<build>)`), which hold its reason alone, not its preamble.
+/// CONTROL: a skipped build shows no arrow.
 #[test]
 fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
     let (mut app, wid, session, _reader, _host) = claude_pane(158);
@@ -114,10 +115,7 @@ fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
         "an emoji-presented ⬆️"
     );
     let label = slot(&app, wid);
-    assert!(
-        label.starts_with("alab claude harness"),
-        "at rest, the label: {label:?}"
-    );
+    assert!(label.starts_with("alab v"), "at rest, the label: {label:?}");
     let words = "update to v2.1.310 \u{b7} now";
     let on = (b.frame_row, arrow.start + 1);
     let (x, y) = px_of(&app, wid, on);
@@ -126,8 +124,8 @@ fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
     assert_eq!(
         slot(&app, wid),
         words,
-        "the pointer on it: the build and when the press's restart lands, in the label's own \
-         cells"
+        "the pointer on it: the build and when the press's restart lands, grown left into the \
+         rule's room"
     );
     let (writer, asked) = recording(|_| Err("busy:another-sweep".to_string()));
     app.upgrade_view.set_writer(writer);
@@ -147,7 +145,7 @@ fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
     assert_eq!(
         slot(&app, wid),
         "couldn't update \u{b7} press it again",
-        "the refusal's words"
+        "the refusal and its reason, grown left into the rule's room"
     );
     let later = Instant::now() + REFUSAL_SHOWN + Duration::from_secs(1);
     let _ = app
@@ -267,7 +265,8 @@ fn press_recorded(app: &mut App, wid: WindowId, on: (usize, usize)) -> Option<Wo
 /// arrow is the colour ⬆️, the pointer on it says when the press's restart lands, and the press
 /// writes a press whose restart types only its relaunch line. CONTROL: a tab another supervisor
 /// holds keeps the quiet `↑` (never the colour ⬆️ a press acts on), and its press writes nothing
-/// and says why in the slot.
+/// and says why in the slot, in its fewest words where the label's own cells cannot hold the
+/// reason whole (`supervisor holds it`), and whole on the messages row.
 #[test]
 fn an_off_tabs_arrow_offers_a_one_shot_press() {
     use aterm_agent::harness::upgrade_drive::{AUTOPILOT_OFF, CLAIMED};
@@ -335,7 +334,11 @@ fn an_off_tabs_arrow_offers_a_one_shot_press() {
     frame(&mut app, wid);
     let why = held_why(CLAIMED);
     let said = slot(&app, wid);
-    assert!(said.ends_with(why), "CONTROL: the press says why: {said:?}");
+    assert_eq!(
+        said,
+        format!("couldn't update \u{b7} {why}"),
+        "CONTROL: the press says it failed and why, grown left into the rule's room"
+    );
     let said = held_said(&app, why).expect("the press says why on the messages row too");
     assert!(said.contains(why), "{said}");
 }

@@ -272,14 +272,28 @@ pub struct Keychains<'a> {
     home: PathBuf,
     run: &'a dyn Run,
     lease: OnceCell<SigningLease>,
+    wait: bool,
 }
 
 impl<'a> Keychains<'a> {
+    /// Background convergence's keychains: a tool call while another holder has the signing
+    /// lease defers at once (automatic setup retries).
     pub fn new(home: &Path, run: &'a dyn Run) -> Self {
         Self {
             home: home.to_path_buf(),
             run,
             lease: OnceCell::new(),
+            wait: false,
+        }
+    }
+
+    /// The release tool's keychains (provision and a cut): a tool call waits out another
+    /// holder's signing lease as [`wait_signing_lease`] does, so an automatic repair that is
+    /// finishing is never a refusal.
+    pub fn waiting(home: &Path, run: &'a dyn Run) -> Self {
+        Self {
+            wait: true,
+            ..Self::new(home, run)
         }
     }
 
@@ -307,7 +321,12 @@ impl<'a> Keychains<'a> {
 
     fn lock(&self) -> Result<(), String> {
         if self.lease.get().is_none() {
-            let _ = self.lease.set(signing_lease(&self.home)?);
+            let lease = if self.wait {
+                wait_signing_lease(&self.home)?
+            } else {
+                signing_lease(&self.home)?
+            };
+            let _ = self.lease.set(lease);
         }
         Ok(())
     }
@@ -2223,9 +2242,10 @@ mod tests {
 
     /// A password, made or read back from its file, holds its text where dropping it zeroes the
     /// whole buffer ([`Zeroizing`]), and both spell the same password. This is a check on the
-    /// type: with a bare `String` in the field it does not compile.
+    /// type: with a bare `String` in the field it does not compile. It does not watch freed
+    /// memory; that dropping a [`Zeroizing`] zeroes it is the `zeroize` crate's own claim.
     #[test]
-    fn a_password_made_or_read_is_zeroed_when_it_is_dropped() {
+    fn a_password_made_or_read_is_held_in_storage_that_zeroes_on_drop() {
         fn zeroed_on_drop(text: &Zeroizing<String>) -> &str {
             text.as_str()
         }
@@ -2740,6 +2760,55 @@ mod automatic_tests {
                 .join()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn the_release_tools_keychains_wait_out_another_holders_lease_where_background_ones_defer() {
+        struct NoTool;
+        impl Run for NoTool {
+            fn run(
+                &self,
+                _: &mut aterm_uds::spawnfd::Command,
+                _: std::time::Duration,
+            ) -> Result<Output, RunError> {
+                unreachable!("taking the lease runs no tool")
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let home = root.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let lease = signing_lease(&home).unwrap();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            drop(lease);
+        });
+        held_rx.recv().unwrap();
+        // The negative control: background convergence's keychains defer at once.
+        assert!(
+            Keychains::new(root.path(), &NoTool)
+                .lock()
+                .unwrap_err()
+                .contains("busy")
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let home = root.path().to_path_buf();
+        let caller = std::thread::spawn(move || {
+            done_tx
+                .send(Keychains::waiting(&home, &NoTool).lock())
+                .unwrap();
+        });
+        // While the lease stays held the call has not answered; keychains that deferred
+        // would have answered busy at once.
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(done_rx.recv_timeout(WAIT).unwrap(), Ok(()));
+        caller.join().unwrap();
     }
 
     #[test]

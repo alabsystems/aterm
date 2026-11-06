@@ -29,6 +29,7 @@ pub mod policy;
 pub mod rate;
 pub mod redact;
 pub mod retry;
+pub mod routing;
 pub mod slug;
 #[cfg(test)]
 mod test_fixtures;
@@ -45,7 +46,11 @@ pub use policy::{Permit, PermitTarget, Provenance};
 pub use slug::{ContentRef, RepoArg, Slug};
 pub use write::{Deleted, Effect, Ensured, Outcome};
 
-/// agh's version: the workspace version, printed by `agh version` and sent in `User-Agent`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// agh's version: the running aterm's product version (`aterm_stamp`), printed by `agh version`
+/// and sent in `User-Agent`.
+#[must_use]
+pub fn version() -> &'static str {
+    aterm_stamp::app_version()
+}
 /// The REST API version agh pins (`X-GitHub-Api-Version`), supported until at least 2028-03-10.
 pub const API_VERSION: &str = "2022-11-28";

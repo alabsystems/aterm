@@ -107,7 +107,7 @@ fn owned(file: &File, is_directory: bool) -> io::Result<(u64, u64)> {
     Ok((m.dev(), m.ino()))
 }
 
-fn walk(path: &Path, create: bool) -> io::Result<File> {
+fn walk(path: &Path, create: bool) -> io::Result<(File, (u64, u64))> {
     if !path.is_absolute()
         || path
             .components()
@@ -147,8 +147,8 @@ fn walk(path: &Path, create: bool) -> io::Result<File> {
             };
         }
     }
-    owned(&current, true)?;
-    Ok(current)
+    let id = owned(&current, true)?;
+    Ok((current, id))
 }
 
 struct Inner {
@@ -163,19 +163,23 @@ struct Inner {
 impl Inner {
     fn validate(&self) -> io::Result<()> {
         if owned(&self.directory, true)? != self.directory_id
-            || owned(&walk(&self.path, false)?, true)? != self.directory_id
+            || walk(&self.path, false)?.1 != self.directory_id
             || owned(&self.lock, false)? != self.lock_id
         {
             return Err(refused(
                 "original target directory or lock changed identity",
             ));
         }
-        let named = File::from(fd::openat(
-            &self.directory,
-            LOCK,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )?);
+        let named = aterm_uds::kept_out(|| {
+            fd::openat(
+                &self.directory,
+                LOCK,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
+        })?;
         if owned(&named, false)? != self.lock_id {
             return Err(refused("original target lock name was replaced"));
         }
@@ -208,8 +212,7 @@ impl TargetLease {
     /// WouldBlock if another guard holds its original lock; unsafe paths, linked or
     /// replaced nodes, foreign ownership, and filesystem errors refuse.
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        let directory = walk(path, true)?;
-        let directory_id = owned(&directory, true)?;
+        let (directory, directory_id) = walk(path, true)?;
         let lock: std::fs::File = aterm_uds::kept_out(|| {
             match fd::openat(
                 &directory,

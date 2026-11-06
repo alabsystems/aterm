@@ -334,6 +334,7 @@ pub fn stage_event(
                 "observed_processes": cpu.processes,
             })),
             "decisions": decisions,
+            "findings": report.findings().into_iter().map(|f| f.id).collect::<Vec<_>>(),
         })
     )
 }
@@ -355,6 +356,82 @@ pub struct CheckResult {
     /// rows carries the halt's words ([`crate::sched::Halt`]). The verdict counts it apart from
     /// what the machine kept from running.
     pub stopped: bool,
+}
+
+/// The most bytes a `check-finished` event spends on its check's detail ([`check_event`]).
+pub const EVENT_DETAIL_BYTES: usize = 4096;
+/// The most stage rows a `check-finished` event lists, and the most bytes each row's label, a
+/// finding's id or the rerun command takes there.
+pub const EVENT_ROWS: usize = 64;
+/// See [`EVENT_ROWS`].
+pub const EVENT_ROW_BYTES: usize = 512;
+
+/// `text`'s longest prefix whose JSON string encoding takes at most `max` bytes, cut at a
+/// character and ended with `…` when cut: what keeps a structured line within the bound its
+/// readers hold every line to (the release's 64 KiB). A control character counts as its six-byte
+/// `\u` escape, a quote or a backslash as two, any other character as its UTF-8 length.
+#[must_use]
+pub fn clip_json(text: &str, max: usize) -> String {
+    let cost = |c: char| match c {
+        '"' | '\\' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    };
+    if text.chars().map(cost).sum::<usize>() <= max {
+        return text.to_owned();
+    }
+    let room = max.saturating_sub('…'.len_utf8());
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        used += cost(c);
+        if used > room {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// A finished check's `check-finished` event, one newline-terminated line: its outcome word, its
+/// own time, its detail, its stage rows (each with its word), its findings' ids and the command
+/// that reruns it. The release's cutter keeps one record per check from these (A19), so the line
+/// is bounded well under the 64 KiB its readers hold a line to: the detail to
+/// [`EVENT_DETAIL_BYTES`], [`EVENT_ROWS`] rows of [`EVENT_ROW_BYTES`] each, [`FINDINGS_SHOWN`]
+/// findings, each part's JSON encoding counted ([`clip_json`]); the totals say what was left out.
+#[must_use]
+pub fn check_event(r: &CheckResult, reports: &[&Report]) -> String {
+    let all: Vec<(Outcome, &str)> = reports.iter().flat_map(|rep| rep.outcomes()).collect();
+    let rows: Vec<_> = all
+        .iter()
+        .take(EVENT_ROWS)
+        .map(|(o, label)| {
+            aterm_json::json!({"outcome": word(*o), "detail": clip_json(label, EVENT_ROW_BYTES)})
+        })
+        .collect();
+    let findings: Vec<String> = r
+        .findings
+        .iter()
+        .take(FINDINGS_SHOWN)
+        .map(|f| clip_json(&f.id, EVENT_ROW_BYTES))
+        .collect();
+    format!(
+        "verify-event: {}\n",
+        aterm_json::json!({
+            "schema": 1,
+            "event": "check-finished",
+            "check": r.check.name(),
+            "outcome": word(r.outcome),
+            "seconds": r.seconds,
+            "detail": clip_json(&r.detail, EVENT_DETAIL_BYTES),
+            "rows": rows,
+            "rows_total": all.len(),
+            "findings": findings,
+            "findings_total": r.findings.len(),
+            "rerun": clip_json(&r.rerun, EVENT_ROW_BYTES),
+        })
+    )
 }
 
 /// The word a check's line opens with.
@@ -1278,5 +1355,72 @@ mod tests {
             ran,
             "an unread HEAD is no move"
         );
+    }
+}
+
+#[cfg(test)]
+mod check_event_tests {
+    use super::*;
+
+    fn line_json(line: &str) -> aterm_json::Value {
+        let json = line
+            .strip_prefix("verify-event: ")
+            .and_then(|l| l.strip_suffix('\n'))
+            .expect("one newline-terminated verify-event line");
+        assert!(!json.contains('\n'), "a single line");
+        aterm_json::from_slice(json.as_bytes()).unwrap()
+    }
+
+    /// A check's `check-finished` event names its outcome by the word its line opens with, with
+    /// its rows, and stays far under the release reader's 64 KiB line limit however long and
+    /// however escaped what it carries is. Negative control: [`clip_json`] counting each
+    /// character as one byte lets the escaped rows run past the bound.
+    #[test]
+    fn a_check_finished_event_is_one_bounded_line_whatever_its_rows_say() {
+        let mut report = Report::new("Test");
+        report.pass("compiled");
+        report.cannot_run("the disk ran out");
+        let result = judge(
+            Check::Test,
+            &[&report],
+            12.5,
+            "",
+            "verify test --all".into(),
+            None,
+        );
+        let event = line_json(&check_event(&result, &[&report]));
+        assert_eq!(event["event"].as_str(), Some("check-finished"));
+        assert_eq!(event["check"].as_str(), Some("test"));
+        assert_eq!(event["outcome"].as_str(), Some("NOT RUN"));
+        assert_eq!(event["seconds"].as_f64(), Some(12.5));
+        assert_eq!(event["rows"][1]["outcome"].as_str(), Some("NOT RUN"));
+        assert_eq!(event["rows_total"].as_u64(), Some(2));
+
+        let mut worst = Report::new("Lint");
+        let hostile = "\u{1}\"\\".repeat(10_000);
+        for _ in 0..1_000 {
+            worst.fail(hostile.clone());
+        }
+        let mut result = judge(Check::Lint, &[&worst], 1.0, "", hostile.clone(), None);
+        result.detail.clone_from(&hostile);
+        for _ in 0..100 {
+            result.findings.push(crate::ladder::Finding {
+                id: hostile.clone(),
+                rerun: None,
+                message: vec![hostile.clone()],
+            });
+        }
+        let line = check_event(&result, &[&worst]);
+        assert!(line.len() < 48 * 1024, "{} bytes", line.len());
+        let event = line_json(&line);
+        assert_eq!(event["outcome"].as_str(), Some("FAIL"));
+        assert_eq!(event["rows"].as_array().map(Vec::len), Some(EVENT_ROWS));
+        assert_eq!(event["rows_total"].as_u64(), Some(1_000));
+        assert_eq!(
+            event["findings"].as_array().map(Vec::len),
+            Some(FINDINGS_SHOWN)
+        );
+        assert!(event["detail"].as_str().unwrap().ends_with('…'));
+        assert_eq!(clip_json("short", 512), "short");
     }
 }

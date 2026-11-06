@@ -7,7 +7,8 @@
 //! overlay holds to it, or over one dialed for the mail alone, held in a table of its own the
 //! overlay does not prune. Each pass (the job's watch tick) reads the membership log's standings
 //! the mesh applied, routes by them, writes the hand-off the fabric bridge routes by beside
-//! `bus.sock`, vouches with this Mac's node key for its person key
+//! `bus.sock`, and the reader's ring that reads the mail of this Mac's retired nodes beside it
+//! (`aterm_link::federate::OLD_READS_FILE`, §11 C3b), vouches with this Mac's node key for its person key
 //! (`aterm_link::person_key::vouch`, §11 C3c), and wakes every push waiting out a back-off once a
 //! new link or the log came up.
 
@@ -202,14 +203,12 @@ impl MailLinks {
             handoff
         };
         self.vouch();
-        // Topics go to the Macs whose presence rows name one.
-        self.routes.set(&handoff, &self.mesh.holders());
         let host = self.mesh.bus();
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         let root = host.as_ref().map(|host| host.spec().root.clone());
         // A hand-off left where this node service no longer hosts `bus.log` goes.
         if let Some((was, _)) = kept.written.take_if(|(was, _)| root.as_ref() != Some(was)) {
-            let _ = std::fs::remove_file(was.join(aterm_link::federate::HANDOFF_FILE));
+            remove_handoff(&was);
         }
         if let Some(root) = root
             && kept
@@ -217,11 +216,32 @@ impl MailLinks {
                 .as_ref()
                 .is_none_or(|(at, was)| *at != root || *was != handoff)
         {
+            // The reader's ring first, so a bridge that reads this hand-off finds it: the reads of
+            // the mail lanes of this Mac's retired nodes, where the mail the own-inbox move took
+            // came from (§11 C3b).
+            let reads = host.as_ref().map_or(Ok(()), |host| {
+                aterm_link::federate::write_old_reads(&root, &handoff, &|grant| host.mint(grant))
+            });
             match handoff.write(&root) {
-                Ok(()) => {
-                    kept.said = None;
-                    kept.written = Some((root, handoff));
-                }
+                Ok(()) => match reads {
+                    Ok(()) => {
+                        kept.said = None;
+                        kept.written = Some((root, handoff.clone()));
+                    }
+                    Err(e) => {
+                        // The hand-off routes; the ring is written again on the next pass.
+                        let file = root.join(aterm_link::federate::OLD_READS_FILE);
+                        let why = format!("{}: {e}", file.display());
+                        if kept.said.as_deref() != Some(why.as_str()) {
+                            aterm_log::warn!(
+                                "mesh: the fabric's reader's ring could not be written ({why}); \
+                                 until it is, a receipt for mail moved across this Mac's key \
+                                 rotation names it by its offset here"
+                            );
+                            kept.said = Some(why);
+                        }
+                    }
+                },
                 Err(e) => {
                     // The bridge routes to no other Mac without a current hand-off: the last one
                     // goes, so it fails closed rather than route by members that changed.
@@ -251,6 +271,10 @@ impl MailLinks {
         kept.linked = linked;
         kept.hosted = hosted;
         drop(kept);
+        // The pushes after the hand-off, so the bridge reads the nodes this Mac held before
+        // ahead of the first record the own-inbox move brings it (§11 C3b). Topics go to the Macs
+        // whose presence rows name one.
+        self.routes.set(&handoff, &self.mesh.holders());
         if woke {
             self.routes.kick();
         }
@@ -295,9 +319,9 @@ impl MailLinks {
 }
 
 impl Drop for MailLinks {
-    /// Stops the pushes, and takes the hand-off down: with no push running, the bridge routes to
-    /// no other Mac (it fails closed on a missing hand-off) until the next node service writes
-    /// one.
+    /// Stops the pushes, and takes the hand-off and its reader's ring down: with no push running,
+    /// the bridge routes to no other Mac (it fails closed on a missing hand-off) until the next
+    /// node service writes one.
     fn drop(&mut self) {
         self.stop_soon();
         self.routes.stop();
@@ -311,8 +335,18 @@ impl Drop for MailLinks {
             .written
             .take();
         if let Some((root, _)) = written {
-            let _ = std::fs::remove_file(root.join(aterm_link::federate::HANDOFF_FILE));
+            remove_handoff(&root);
         }
+    }
+}
+
+/// Take the hand-off down in `root`, and the reader's ring beside it.
+fn remove_handoff(root: &std::path::Path) {
+    for file in [
+        aterm_link::federate::HANDOFF_FILE,
+        aterm_link::federate::OLD_READS_FILE,
+    ] {
+        let _ = std::fs::remove_file(root.join(file));
     }
 }
 

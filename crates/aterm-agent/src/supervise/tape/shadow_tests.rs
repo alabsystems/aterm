@@ -113,10 +113,7 @@ fn a_full_ledger_ends_the_feed_at_the_row_it_refuses() {
 /// nothing it holds differs (1 where one does), as a tape longer than the ledger would.
 #[test]
 fn a_tape_past_the_ledger_names_what_it_refused_and_exits_3() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/testdata/tapes/c1-approval.atape.txt"
-    );
+    let path = aterm_tempfile::manifest_dir().join("tests/testdata/tapes/c1-approval.atape.txt");
     let bytes = std::fs::read(path).expect("c1-approval reads");
     let whole = shadow(&bytes, &Candidate::default()).expect("c1-approval shadows");
     assert_eq!(whole.unshadowed, None);

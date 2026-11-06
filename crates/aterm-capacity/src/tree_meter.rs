@@ -756,13 +756,15 @@ fn read_into(root: u32, tally: &Mutex<Tally>) {
         .collect();
     // Stage new decisions until the original root's identity has been checked again.
     // A root that ended during the walk cannot authorize a new permanent booking.
+    let mut parents: HashMap<u32, Option<u32>> = HashMap::with_capacity(members.len());
+    let mut cached_parent = |pid: u32| *parents.entry(pid).or_insert_with(|| parent_of(pid));
     let mut verdicts: HashMap<u32, Option<bool>> = members
         .iter()
         .filter(|m| !tally.seen.contains_key(&(m.pid, m.start)))
         .map(|m| {
             (
                 m.pid,
-                ancestry_verdict(m.pid, root, root_state, &anchors, &mut parent_of),
+                ancestry_verdict(m.pid, root, root_state, &anchors, &mut cached_parent),
             )
         })
         .collect();
@@ -777,7 +779,8 @@ fn read_into(root: u32, tally: &Mutex<Tally>) {
                     || verdicts.get(&m.pid) == Some(&Some(true))
             })
             .filter(|m| {
-                ancestry_verdict(m.pid, root, root_state, &no_anchors, &mut parent_of) == Some(true)
+                ancestry_verdict(m.pid, root, root_state, &no_anchors, &mut cached_parent)
+                    == Some(true)
             })
             .map(|m| m.pid)
             .collect()
@@ -791,7 +794,7 @@ fn read_into(root: u32, tally: &Mutex<Tally>) {
     };
     if root_state == RootState::Live && after != RootState::Live {
         for (&pid, verdict) in &mut verdicts {
-            *verdict = ancestry_verdict(pid, root, after, &anchors, &mut parent_of);
+            *verdict = ancestry_verdict(pid, root, after, &anchors, &mut cached_parent);
         }
     }
     tally.book(&members, &mut |pid| verdicts.get(&pid).copied().flatten());
@@ -880,8 +883,9 @@ fn member_alive(member: &aterm_sysprobe::MemberUsage) -> Result<Option<Alive>, (
 /// can omit members entirely; custody readers must also reconcile their known identities.
 #[cfg(target_os = "macos")]
 fn alive_in_observed(group: u32) -> Option<Vec<Alive>> {
-    let mut alive = Vec::new();
-    for member in aterm_sysprobe::group_usage(group)? {
+    let members = aterm_sysprobe::group_usage(group)?;
+    let mut alive = Vec::with_capacity(members.len());
+    for member in members {
         if let Some(member) = member_alive(&member).ok()? {
             alive.push(member);
         }
@@ -911,8 +915,9 @@ fn alive_using(group: u32) -> Vec<(Alive, u64)> {
 /// macOS) no reader reads one, as [`alive_in_observed`] distinguishes them.
 #[cfg(target_os = "macos")]
 fn alive_using_observed(group: u32) -> Option<Vec<(Alive, u64)>> {
-    let mut alive = Vec::new();
-    for member in aterm_sysprobe::group_usage(group)? {
+    let members = aterm_sysprobe::group_usage(group)?;
+    let mut alive = Vec::with_capacity(members.len());
+    for member in members {
         if let Some(identity) = member_alive(&member).ok()? {
             alive.push((identity, member.footprint));
         }

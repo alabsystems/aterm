@@ -9,11 +9,8 @@ use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
 use crate::common::max_channel_delta_frame as max_channel_delta;
 
-fn merged_ligature_font() -> &'static std::path::Path {
-    std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-render/assets/game/LuckiestGuy-Regular.ttf"
-    ))
+fn merged_ligature_font() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-render/assets/game/LuckiestGuy-Regular.ttf")
 }
 
 fn shaping(admit: bool) -> TextShapingConfig {
@@ -30,7 +27,7 @@ fn merged_ligature_gpu_matches_cpu() {
     let px = 18.0;
 
     let font = merged_ligature_font();
-    let (mut cpu, mut gpu) = common::backends_with_font(font, px, theme);
+    let (mut cpu, mut gpu) = common::backends_with_font(&font, px, theme);
     let family = font.to_str().expect("the fixture path is UTF-8");
     let mut cpu_off = Renderer::from_system_with_family(Some(family), px, theme)
         .expect("the fixture face builds a renderer");
@@ -72,7 +69,7 @@ fn merged_ligature_cursor_gpu_matches_cpu() {
     let px = 18.0;
 
     let font = merged_ligature_font();
-    let (mut cpu, mut gpu) = common::backends_with_font(font, px, theme);
+    let (mut cpu, mut gpu) = common::backends_with_font(&font, px, theme);
     gpu.set_text_shaping(shaping(true));
     cpu.set_text_shaping(shaping(true));
 

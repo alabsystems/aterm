@@ -157,16 +157,19 @@ pub(crate) fn when_sharing_on(
 /// the door's hold of it once it sees it answered. The node job has no window, so it installs no
 /// door: its eligible uses go immediately, as its Commons gate asks by
 /// itself under its own slot.
-/// A window also reads, as a use already asked, that this Mac's and app's vault subscriber used
-/// the local network ([`subscriber_asked_here`]): macOS asks each app once, so its System State
-/// step reads that question as asked and raises no second hold.
+/// A window also reads, as a use already asked, that macOS's question was put to this Mac's app
+/// outside the window's process ([`asked_elsewhere`]): its vault subscriber used the local network,
+/// or a window of an earlier launch lived through the question. macOS asks each app once, so its
+/// System State step reads that question as asked and raises no second hold, and the Secrets
+/// stage's vault join holds no dialog slot for a question its use cannot raise
+/// ([`aterm_types::macos_setup::lan_first_use::asked_elsewhere`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn hold_first_uses_for_the_step(config: &Path, host: Host) {
     install_door(host);
     if matches!(host, Host::Window { .. }) {
         let config = config.to_owned();
         aterm_types::macos_setup::lan_first_use::install_asked_elsewhere(move || {
-            subscriber_asked_here(&config)
+            asked_elsewhere(&config)
         });
     }
     macos::install_step_to_come(config.to_owned(), host);
@@ -181,7 +184,7 @@ const SUBSCRIBER_ASKED_HERE: &str = "subscriber-asked-here";
 /// Keep, for this Mac and app ([`here`]), that the vault subscriber made its first Local Network
 /// use (its `_alab-vault._tcp` browse), which puts macOS's Local Network question to aterm here
 /// if nothing did before. A window's System State step then reads that question as asked
-/// ([`subscriber_asked_here`]). Keyed to this Mac and app, as [`ASKED_HERE`] is, so a home
+/// ([`asked_elsewhere`]). Keyed to this Mac and app, as [`ASKED_HERE`] is, so a home
 /// restored or synced from another Mac carries none of this one's. Registered with the vault
 /// subscriber (`aterm_secrets::client::on_lan_first_use`).
 #[cfg(target_os = "macos")]
@@ -198,17 +201,34 @@ pub(crate) fn keep_subscriber_asked_here() {
     }
 }
 
-/// Whether this Mac's and app's vault subscriber used the local network, as `config`'s Commons
-/// record keeps it ([`keep_subscriber_asked_here`]).
+/// Whether macOS's Local Network question was put to this Mac's app outside this process, as
+/// `config`'s Commons record keeps it ([`asked_elsewhere_in`]).
 #[cfg(target_os = "macos")]
-fn subscriber_asked_here(config: &Path) -> bool {
+fn asked_elsewhere(config: &Path) -> bool {
     here()
-        .is_some_and(|here| subscriber_asked_in(&aterm_db::network_state::directory(config), &here))
+        .is_some_and(|here| asked_elsewhere_in(&aterm_db::network_state::directory(config), &here))
+}
+
+/// Whether `record` keeps that macOS's Local Network question was put to the app `here` names, on
+/// the Mac it names, outside the process reading it: its vault subscriber used the local network
+/// ([`SUBSCRIBER_ASKED_HERE`]), or a window of an earlier launch lived through the question
+/// ([`ASKED_HERE`]), which that launch's Commons gate keeps and this one's opens on.
+/// The folder is judged once for both lines.
+#[cfg(target_os = "macos")]
+fn asked_elsewhere_in(record: &Path, here: &str) -> bool {
+    !here.is_empty()
+        && aterm_uds::private_file::JudgedDir::judge(record)
+            .ok()
+            .is_some_and(|dir| {
+                has_here_in_dir(&dir, SUBSCRIBER_ASKED_HERE, here)
+                    || has_here_in_dir(&dir, ASKED_HERE, here)
+            })
 }
 
 /// Whether `record` keeps that the vault subscriber of the app `here` names, on the Mac it names,
 /// used the local network ([`SUBSCRIBER_ASKED_HERE`]).
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 fn subscriber_asked_in(record: &Path, here: &str) -> bool {
     has_here(record, SUBSCRIBER_ASKED_HERE, here)
 }
@@ -348,6 +368,9 @@ mod macos {
                              network (revision {revision})"
                         );
                         return Some(super::STEP_ASKED);
+                    }
+                    if lan_first_use::asked_elsewhere() {
+                        return Some(super::ELSEWHERE_ASKED);
                     }
                     lan_first_use::asked().then_some(super::USE_ASKED)
                 },
@@ -695,6 +718,15 @@ const STEP_ASKED: &str = "System State's Local Network step asked macOS";
 #[cfg(target_os = "macos")]
 const USE_ASKED: &str =
     "another eligible local network use of this window asked macOS under its dialog slot";
+
+/// Why the gate opens once macOS's question was put to this Mac's app outside this process
+/// ([`aterm_types::macos_setup::lan_first_use::asked_elsewhere`], [`asked_elsewhere`]): its vault
+/// subscriber used the local network, or a window of an earlier launch lived through the
+/// question. Read before [`USE_ASKED`], whose `asked` counts it too, so the log names it.
+#[cfg(target_os = "macos")]
+const ELSEWHERE_ASKED: &str = "macOS asked aterm about Local Network before, outside this \
+    process: its vault subscriber used the local network, or a window here lived through the \
+    question";
 
 /// Why the gate asks at its first eligible use ([`Look::at_door`]).
 #[cfg(target_os = "macos")]
@@ -1047,6 +1079,7 @@ fn has_here_in_dir(dir: &aterm_uds::private_file::JudgedDir, file: &str, here: &
 
 /// Whether `file` in `record` holds a non-empty line equal to `here`.
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 fn has_here(record: &Path, file: &str, here: &str) -> bool {
     !here.is_empty()
         && aterm_uds::private_file::JudgedDir::judge(record)
@@ -1587,6 +1620,7 @@ mod tests {
             None,
             Some(super::STEP_ASKED),
             Some(super::USE_ASKED),
+            Some(super::ELSEWHERE_ASKED),
             Some("aterm's records hear macOS's Local Network answer"),
             Some("an earlier aterm used the local network on this Mac"),
         ] {
@@ -2390,6 +2424,44 @@ mod tests {
         assert!(
             !super::asked_here(&record, HERE),
             "the subscriber's use is no window's life through the question"
+        );
+    }
+
+    /// macOS's question put to this Mac's app outside this process is either record's line for
+    /// it: the vault subscriber's use, or a window of an earlier launch that lived through the
+    /// question, which that launch's Commons gate kept and this one's opens on. A relaunch's
+    /// Secrets join reads it as settled and waits behind no dialog of its own process (E3,
+    /// 2026-11-05: a relaunched guest's join stood at "another macOS dialog is still up" behind
+    /// the Full Disk Access panel for eleven minutes). Another Mac's or app's line is not this
+    /// one's. Negative control: the subscriber's record alone, the reader before, leaves the
+    /// lived-through case unasked.
+    #[test]
+    fn a_window_that_lived_through_the_question_here_counts_as_asked_elsewhere() {
+        const HERE: &str = "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43 /Applications/aterm.app";
+        let root = aterm_tempfile::tempdir().unwrap();
+        let record = root.path().join("network-state");
+        assert!(!super::asked_elsewhere_in(&record, HERE), "nothing kept");
+        for other in [
+            "0E2C5A41-8D7B-4F0E-9A63-2B5D7C1E4F90 /Applications/aterm.app",
+            "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43 /Applications/aterm (dev).app",
+        ] {
+            super::keep_here(&record, super::ASKED_HERE, other).unwrap();
+            assert!(!super::asked_elsewhere_in(&record, HERE), "{other}");
+        }
+        super::keep_here(&record, super::ASKED_HERE, HERE).unwrap();
+        assert!(
+            super::asked_elsewhere_in(&record, HERE),
+            "a window here lived through it"
+        );
+        // NEGATIVE CONTROL: the reader before read the subscriber's record alone.
+        assert!(!super::subscriber_asked_in(&record, HERE));
+
+        let other_root = aterm_tempfile::tempdir().unwrap();
+        let subscribed = other_root.path().join("network-state");
+        super::keep_here(&subscribed, super::SUBSCRIBER_ASKED_HERE, HERE).unwrap();
+        assert!(
+            super::asked_elsewhere_in(&subscribed, HERE),
+            "the subscriber asked"
         );
     }
 }

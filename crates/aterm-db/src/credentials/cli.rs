@@ -11,7 +11,7 @@ use aterm_codec::hex;
 use aterm_json::{Map, Value};
 use aterm_secrets::{
     client::Paths,
-    need::{self, Need, Purpose, Want},
+    need::{self, Need, Purpose, Retirement, Want},
 };
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -251,14 +251,18 @@ fn pass_line(pass: &Result<Pass, String>) -> String {
 }
 
 fn row(need: &Need) -> String {
-    format!(
+    let mut row = format!(
         "{}  {}  {}  {}\n    {}\n",
         need.want.key(),
         need.state.word(),
         need.purpose.id(),
         hex::encode_lower(&need.id),
         need.line
-    )
+    );
+    if let Some(retired) = need.retired.as_ref().filter(|r| !r.note.is_empty()) {
+        row.push_str(&format!("    note: {}\n", retired.note));
+    }
+    row
 }
 
 fn thread_row(thread: &Thread) -> String {
@@ -317,12 +321,14 @@ fn needs_json(needs: &[Need]) -> Map {
             row.insert("state".into(), Value::from(need.state.word()));
             row.insert("waits".into(), Value::from(need.wait.word()));
             row.insert("line".into(), Value::from(need.line.clone()));
-            row.insert(
-                "reason".into(),
+            let retired = |field: fn(&Retirement) -> &str| {
                 need.retired
                     .as_ref()
-                    .map_or(Value::Null, |retired| Value::from(retired.reason.word())),
-            );
+                    .map_or(Value::Null, |retired| Value::from(field(retired)))
+            };
+            row.insert("reason".into(), retired(|r| r.reason.word()));
+            row.insert("evidence".into(), retired(|r| r.evidence.as_str()));
+            row.insert("note".into(), retired(|r| r.note.as_str()));
             Value::Object(row)
         })
         .collect();

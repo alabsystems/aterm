@@ -231,6 +231,7 @@ const _: () = assert!(size_of::<PerformanceInformation64>() == 104);
 const _: () = assert!(offset_of!(PerformanceInformation64, commit_total) == 8);
 const _: () = assert!(offset_of!(PerformanceInformation64, page_size) == 80);
 const _: () = assert!(offset_of!(PerformanceInformation64, process_count) == 92);
+const _: () = assert!(offset_of!(PerformanceInformation64, thread_count) == 96);
 
 fn bytes_at<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
     b.get(at..at.checked_add(N)?)?.try_into().ok()
@@ -513,6 +514,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     resident: None,
                     disk_read: None,
                     disk_written: None,
+                    energy_nj: None,
                     name: short_image_name(name),
                     pgid: 0,
                     uid: None,

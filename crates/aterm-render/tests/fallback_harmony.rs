@@ -463,8 +463,8 @@ fn ct_probe_is_total_and_sound() {
 
 /// Read a checked-in font asset.
 fn asset(rel: &str) -> Vec<u8> {
-    let path = format!("{}/assets/{rel}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    let path = aterm_tempfile::manifest_dir().join("assets").join(rel);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// Build a renderer on checked-in Cascadia Mono with `fallback` as its fallback face.

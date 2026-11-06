@@ -499,11 +499,8 @@ fn intersect_rect_spans_is_exact() {
 }
 
 fn fixture_renderer() -> Renderer {
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/jetbrains-mono.ttf"
-    );
-    let bytes = std::fs::read(FIXTURE).expect("the tracked fixture font must be readable");
+    let fixture = aterm_tempfile::manifest_dir().join("tests/fixtures/jetbrains-mono.ttf");
+    let bytes = std::fs::read(fixture).expect("the tracked fixture font must be readable");
     Renderer::from_bytes(&bytes, 18.0, Theme::default())
         .expect("the tracked fixture font must build an 18px renderer")
 }

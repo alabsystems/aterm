@@ -60,11 +60,7 @@ pub(crate) fn reason_arg(verb: &str, why: &str) -> std::result::Result<String, S
 
 /// Encodes `bytes` as lowercase hexadecimal.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+    aterm_codec::hex::encode_lower(bytes)
 }
 
 pub const CHECK_CANCELLED: &str = "proof validation cancelled by the caller";
@@ -449,7 +445,10 @@ fn foreign_owner(rest: &str) -> Option<Refused> {
     (owner != me).then_some(Refused::Foreign { owner, me })
 }
 
-fn without_ansi(line: &str) -> String {
+fn without_ansi(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(line);
+    }
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
@@ -466,7 +465,7 @@ fn without_ansi(line: &str) -> String {
             }
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 fn path_refusals(line: &str) -> Vec<PathRefusal> {
@@ -474,7 +473,7 @@ fn path_refusals(line: &str) -> Vec<PathRefusal> {
         return Vec::new();
     }
     let line = without_ansi(line);
-    let line = line.as_str();
+    let line: &str = &line;
     let mut out = Vec::new();
     for i in find_all(line, REFUSED_COMPONENT) {
         let Some((path, rest)) = backticked(&line[i + REFUSED_COMPONENT.len()..]) else {
@@ -4044,10 +4043,16 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
     while let Some(dir) = stack.pop() {
         for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
             let Ok(ft) = e.file_type() else { continue };
-            let p = e.path();
             if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() && p.extension().is_some_and(|x| x == "d") {
+                stack.push(e.path());
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let file_name = e.file_name();
+            if Path::new(&file_name).extension().is_some_and(|x| x == "d") {
+                let p = e.path();
                 let Ok(text) = crate::durable::read_file(&p) else {
                     continue;
                 };
@@ -4070,13 +4075,16 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
                     reads.push((name, p.clone(), value));
                 }
                 found += 1;
-            } else if ft.is_file()
-                && e.file_name() == "output"
-                && p.parent()
+            } else if file_name == "output" {
+                let p = e.path();
+                if !p
+                    .parent()
                     .and_then(Path::parent)
                     .and_then(Path::file_name)
                     .is_some_and(|n| n == "build")
-            {
+                {
+                    continue;
+                }
                 let Ok(text) = crate::durable::read_text(&p) else {
                     continue;
                 };

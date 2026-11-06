@@ -386,7 +386,7 @@ pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &st
 /// The ready record beside this named build, shared by install and publication admission.
 pub(crate) fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = build_dir.file_name()?.to_str()?;
-    Some(build_dir.with_file_name(format!("{name}.ready")))
+    Some(build_dir.with_file_name(format!("{name}{}", aterm_toolchain::layout::READY_SUFFIX)))
 }
 
 const READY_PLATFORM_KEY: &str = "platform=";
@@ -853,7 +853,10 @@ pub struct StageRefusal {
     pub signer: bool,
     /// Whether the row is held rather than cooled down.
     pub held: bool,
-    /// The atpkg version that reached the verdict ([`aterm_types::version::app_version`]).
+    /// Recorded by an install of a build named by number, a lock's ([`MemoLane::Named`]): it
+    /// stands for its own build, apart from the update lane's one memo per program.
+    pub named: bool,
+    /// The atpkg version that reached the verdict ([`aterm_stamp::app_version`]).
     pub client: String,
 }
 
@@ -886,7 +889,7 @@ impl StageRefusal {
     #[must_use]
     pub fn binds(&self, digest: (DigestAlg, &str), tree_root: &str, now_unix: i64) -> bool {
         self.same_digests(digest, tree_root)
-            && self.client == aterm_types::version::app_version()
+            && self.client == aterm_stamp::app_version()
             && (self.signer || self.held || now_unix < self.retry_after())
     }
 
@@ -907,25 +910,29 @@ fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(marker))
 }
 
-/// Record that staging `build_dir` failed on the signed digests.
-pub fn record_stage_refusal(
+/// Test shorthand: record that staging `build_dir` failed on the signed digests, in the update
+/// lane ([`record_refusal_in`]).
+#[cfg(test)]
+pub(crate) fn record_stage_refusal(
     build_dir: &Path,
     digest: (DigestAlg, &str),
     tree_root: &str,
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
-    write_stage_refusal(
+    record_refusal_in(
+        MemoLane::Update,
+        RefusalKind::Cooldown,
         build_dir,
         digest,
         tree_root,
         why,
         now_unix,
-        RefusalKind::Cooldown,
     )
 }
 
 /// [`record_stage_refusal`] for a platform signer refusal ([`StageRefusal::signer`]).
+#[cfg(test)]
 pub(crate) fn record_signer_refusal(
     build_dir: &Path,
     digest: (DigestAlg, &str),
@@ -933,17 +940,19 @@ pub(crate) fn record_signer_refusal(
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
-    write_stage_refusal(
+    record_refusal_in(
+        MemoLane::Update,
+        RefusalKind::Signer,
         build_dir,
         digest,
         tree_root,
         why,
         now_unix,
-        RefusalKind::Signer,
     )
 }
 
 /// [`record_stage_refusal`] for a `tree_root` mismatch.
+#[cfg(test)]
 pub(crate) fn record_held_refusal(
     build_dir: &Path,
     digest: (DigestAlg, &str),
@@ -951,21 +960,63 @@ pub(crate) fn record_held_refusal(
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
-    write_stage_refusal(
+    record_refusal_in(
+        MemoLane::Update,
+        RefusalKind::Held,
         build_dir,
         digest,
         tree_root,
         why,
         now_unix,
-        RefusalKind::Held,
     )
 }
 
+/// Which install recorded a memo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefusalKind {
+pub(crate) enum MemoLane {
+    /// An update or a pinned install: one memo per program, each new one replacing the rest.
+    Update,
+    /// An install of a build named by number (`install <p> --build <N>`, the build a
+    /// `trust.lock` names). Several named builds of one program can fail at once (two trees
+    /// locking two builds), so its memo neither replaces the program's other memos nor is
+    /// replaced by them, and gc forgets it once its build is absent and it is older than
+    /// [`crate::trust_lock::LOCKED_KEEP`] ([`is_stale_named_refusal`]).
+    Named,
+}
+
+/// How a memo binds: from the second attempt for a cooldown, from the first otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalKind {
+    /// Binds from the second attempt on the same digests, for a cooldown that grows.
     Cooldown,
+    /// A platform signer refusal ([`StageRefusal::signer`]): binds from the first.
     Signer,
+    /// A verdict on the pack (a tree root mismatch, or a sysroot bundle whose loader cannot
+    /// resolve it here): binds from the first until the digests move or a retry forgets it.
     Held,
+}
+
+/// Record a stage refusal of `kind` for `build_dir` in `lane` ([`MemoLane`], [`RefusalKind`]).
+pub(crate) fn record_refusal_in(
+    lane: MemoLane,
+    kind: RefusalKind,
+    build_dir: &Path,
+    digest: (DigestAlg, &str),
+    tree_root: &str,
+    why: &str,
+    now_unix: i64,
+) -> std::io::Result<()> {
+    write_stage_refusal(build_dir, digest, tree_root, why, now_unix, kind, lane)
+}
+
+/// Whether the memo at `path` is a named build's ([`MemoLane::Named`]) recorded more than
+/// [`crate::trust_lock::LOCKED_KEEP`] before `now_unix`: gc forgets it once its build is absent.
+pub(crate) fn is_stale_named_refusal(path: &Path, now_unix: i64) -> bool {
+    let keep = i64::try_from(crate::trust_lock::LOCKED_KEEP.as_secs()).unwrap_or(i64::MAX);
+    crate::metadata_io::read_bounded_regular_utf8(path, MAX_REFUSAL_BYTES)
+        .ok()
+        .and_then(|text| parse_stage_refusal(&text))
+        .is_some_and(|memo| memo.named && now_unix.saturating_sub(memo.at) > keep)
 }
 
 fn write_stage_refusal(
@@ -975,6 +1026,7 @@ fn write_stage_refusal(
     why: &str,
     now_unix: i64,
     kind: RefusalKind,
+    lane: MemoLane,
 ) -> std::io::Result<()> {
     let dest = stage_refusal_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
@@ -1001,8 +1053,11 @@ fn write_stage_refusal(
         RefusalKind::Held => body.push_str("\nhold=1"),
         RefusalKind::Cooldown => {}
     }
+    if lane == MemoLane::Named {
+        body.push_str("\nnamed=1");
+    }
     body.push_str("\nclient=");
-    body.push_str(aterm_types::version::app_version());
+    body.push_str(aterm_stamp::app_version());
     body.push_str("\nwhy=");
     let one_line: String = why
         .replace(['\n', '\r'], " ")
@@ -1016,12 +1071,16 @@ fn write_stage_refusal(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Some(name) = dest.file_name() {
+    if lane == MemoLane::Update
+        && let Some(name) = dest.file_name()
+    {
         sweep_other_refusals(parent, name);
     }
     Ok(())
 }
 
+/// The update lane's one memo per program: every other memo in `dir` but `keep` goes, except a
+/// named build's ([`MemoLane::Named`]), which stands for its own build.
 fn sweep_other_refusals(dir: &Path, keep: &OsStr) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1034,6 +1093,10 @@ fn sweep_other_refusals(dir: &Path, keep: &OsStr) {
         if name
             .to_str()
             .is_some_and(|n| n.ends_with(STAGE_REFUSAL_SUFFIX))
+            && !crate::metadata_io::read_bounded_regular_utf8(&entry.path(), MAX_REFUSAL_BYTES)
+                .ok()
+                .and_then(|text| parse_stage_refusal(&text))
+                .is_some_and(|memo| memo.named)
         {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -1055,7 +1118,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
     }
     let (mut sha256, mut sha512, mut tree_root, mut why) = (None, None, None, None);
     let (mut at, mut attempts, mut signer) = (None, None, false);
-    let (mut held, mut client) = (false, String::new());
+    let (mut held, mut named, mut client) = (false, false, String::new());
     for line in lines {
         if let Some(v) = line.strip_prefix("sha256=") {
             sha256 = Some(v);
@@ -1084,6 +1147,8 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
             signer = v.trim() == "1";
         } else if let Some(v) = line.strip_prefix("hold=") {
             held = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("named=") {
+            named = v.trim() == "1";
         } else if let Some(v) = line.strip_prefix("client=") {
             client = v.trim().to_string();
         }
@@ -1105,6 +1170,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         attempts: attempts?,
         signer,
         held,
+        named,
         client,
     })
 }
@@ -1178,6 +1244,8 @@ pub fn recorded_version(build_dir: &Path) -> Option<String> {
 /// [`crate::install::StageHooks::sidecars`], or a kept unit ([`crate::peers::keep`]) — which gc
 /// sweeps once their build is gone.
 pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
+    crate::trust_lock::TREE_ROOT_SUFFIX,
+    crate::trust_lock::LOCKED_SUFFIX,
     VENDOR_SIDECAR_SUFFIX,
     crate::shim_env::SIDECAR_SUFFIX,
     DECLARED_MODES_SUFFIX,
@@ -1730,6 +1798,24 @@ mod first_exec_tests;
 /// Discard a build after its marker's removal is flushed. A failed removal or flush
 /// retains the tree; a held build ([`held_unproven`]) stays unmarked until a later sweep.
 pub(crate) fn discard_build(build_dir: &Path) {
+    discard_build_as(build_dir, Memo::Clear);
+}
+
+/// [`discard_build`], keeping the build's stage refusal memo ([`stage_refusal`]): gc's sweep of a
+/// tree that never completed, and a named build its resolve check refused, whose memo is a
+/// verdict on the pack, not on the tree.
+pub(crate) fn discard_build_keeping_memo(build_dir: &Path) {
+    discard_build_as(build_dir, Memo::Keep);
+}
+
+/// Whether a discard forgets the build's stage refusal memo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Memo {
+    Clear,
+    Keep,
+}
+
+fn discard_build_as(build_dir: &Path, memo: Memo) {
     let Ok(first_exec) = first_exec_removal(build_dir) else {
         return;
     };
@@ -1758,12 +1844,27 @@ pub(crate) fn discard_build(build_dir: &Path) {
         let _ = std::fs::remove_file(build_dir.with_file_name(prov));
     }
     crate::shim_env::remove_sidecar(build_dir);
-    clear_stage_refusal(build_dir);
+    if memo == Memo::Clear {
+        clear_stage_refusal(build_dir);
+    }
     clear_declared_modes(build_dir);
     for &suffix in STAGE_SIDECAR_SUFFIXES {
         if let Some(record) = sidecar_path(build_dir, suffix) {
             let _ = std::fs::remove_file(record);
         }
+    }
+}
+
+/// Take a refused build that [`discard_build`] left in place (its first-exec hold keeps the tree)
+/// out of every reader's reach: its ready marker and its tree-root record go, so completeness
+/// checks, discovery and a lock's standing read it absent and gc's partial arm sweeps the tree
+/// once the hold lets go. Best effort: a marker that cannot be removed leaves the build as it was.
+pub(crate) fn unmark_refused(build_dir: &Path) {
+    if clear_build_ready(build_dir).is_err() {
+        return;
+    }
+    if let Some(record) = sidecar_path(build_dir, crate::trust_lock::TREE_ROOT_SUFFIX) {
+        let _ = std::fs::remove_file(record);
     }
 }
 
@@ -1798,6 +1899,18 @@ pub fn resolve_configured() -> Option<Layout> {
     resolve_from(&crate::config::load())
 }
 
+/// Resolve the same admitted prefix without configuration notices or host-log writes.
+pub(crate) fn resolve_for_lookup() -> Result<Option<Layout>, &'static str> {
+    let cfg = crate::config::load_for_lookup()?;
+    let Some(home) = aterm_types::dirs::home_dir() else {
+        return Ok(None);
+    };
+    let configured = cfg.prefix_path(Some(&home));
+    Ok(Some(Layout {
+        prefix: vet_prefix_reporting(configured.as_deref(), &home, false),
+    }))
+}
+
 /// [`resolve_configured`] over a `[packages]` table already read.
 #[must_use]
 pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
@@ -1810,6 +1923,10 @@ pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
 /// Validate a configured prefix against `home` ([`default_prefix`]).
 #[must_use]
 pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
+    vet_prefix_reporting(configured, home, true)
+}
+
+fn vet_prefix_reporting(configured: Option<&Path>, home: &Path, report: bool) -> PathBuf {
     let default = default_prefix(home);
     let Some(p) = configured else {
         return default;
@@ -1833,10 +1950,12 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
                     default.display()
                 )
             };
-            crate::notice::say_once_with_log(
-                &notice(&said),
-                &notice(&aterm_log::words::Len(&said)),
-            );
+            if report {
+                crate::notice::say_once_with_log(
+                    &notice(&said),
+                    &notice(&aterm_log::words::Len(&said)),
+                );
+            }
             return default;
         }
         return p.to_path_buf();
@@ -2332,7 +2451,7 @@ mod tests {
         let l = Layout { prefix: h.clone() };
         let build = l.build_dir("agy", 1_000_001_000_003_000_006);
         let marker = build.with_file_name("1000001000003000006.refused");
-        let client = aterm_types::version::app_version();
+        let client = aterm_stamp::app_version();
         let earlier = format!(
             "stage-refusal v1\nsha256=aa\ntree_root=bb\nattempts=2\nat=1000\nclient={client}\n\
              why=asset sha256 mismatch: expected aa, got cc\n"
@@ -2422,7 +2541,8 @@ mod tests {
             attempts,
             signer: false,
             held: false,
-            client: aterm_types::version::app_version().into(),
+            named: false,
+            client: aterm_stamp::app_version().into(),
         };
         assert_eq!(memo(1).cooldown_secs(), 0, "one failure holds nothing");
         assert_eq!(memo(2).cooldown_secs(), 12 * 3600);
@@ -2470,7 +2590,7 @@ mod tests {
             .binds(sha256(""), "bb", 1_000),
             "a memo with no digest binds nothing"
         );
-        let another = format!("{}+another", aterm_types::version::app_version());
+        let another = format!("{}+another", aterm_stamp::app_version());
         assert!(
             !StageRefusal {
                 client: another.clone(),
@@ -2524,7 +2644,8 @@ mod tests {
             attempts: 1,
             signer: true,
             held: false,
-            client: aterm_types::version::app_version().into(),
+            named: false,
+            client: aterm_stamp::app_version().into(),
         };
         assert!(
             m.binds(sha256("aa"), "BB", 1_000),
@@ -2560,7 +2681,7 @@ mod tests {
         let m = stage_refusal(&build).unwrap();
         assert!(m.signer);
         assert!(!m.held, "a signer memo is its own kind, not a hold");
-        assert_eq!(m.client, aterm_types::version::app_version());
+        assert_eq!(m.client, aterm_stamp::app_version());
         assert_eq!((m.attempts, m.why.as_str()), (1, "signer refused: x"));
         assert!(m.binds(sha256("aa"), "bb", i64::MAX));
         record_stage_refusal(&build, sha256("aa"), "bb", "asset sha256 mismatch", 2_000).unwrap();
@@ -2568,6 +2689,72 @@ mod tests {
         record_signer_refusal(&build, sha256("aa"), "bb", "signer refused: x", 3_000).unwrap();
         clear_stage_refusals(&l, "claude");
         assert_eq!(stage_refusal(&build), None);
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// A NAMED BUILD'S MEMO STANDS FOR ITS OWN BUILD AND BINDS AS ITS KIND DOES (A14): a held one
+    /// (a resolve verdict) binds from the first verdict for its digests alone and reads back as
+    /// named, a cooled-down one (a fault of the run) from the second, and neither replaces the
+    /// program's other memos nor is replaced by them, so two trees locking two failing builds do
+    /// not wipe each other's memo. NEGATIVE CONTROL: the update lane's memos are still one per
+    /// program.
+    #[test]
+    fn a_named_refusal_binds_as_its_kind_and_stands_for_its_own_build() {
+        let h = temp_home("named-refusal");
+        let l = Layout { prefix: h.clone() };
+        let b = |n: u64| l.build_dir("trust", n);
+        let named = |n: u64, kind: RefusalKind, hex: &str, at: i64| {
+            record_refusal_in(
+                MemoLane::Named,
+                kind,
+                &b(n),
+                sha256(hex),
+                "bb",
+                "resolve",
+                at,
+            )
+            .unwrap();
+        };
+        named(17, RefusalKind::Held, "aa", 1_000);
+        let m = stage_refusal(&b(17)).unwrap();
+        assert!(m.named && m.held && !m.signer, "{m:?}");
+        assert_eq!(m.attempts, 1);
+        assert!(
+            m.binds(sha256("aa"), "bb", i64::MAX),
+            "held from the first verdict"
+        );
+        assert!(
+            !m.binds(sha256("dd"), "bb", 1_000),
+            "another pack is another question"
+        );
+        named(16, RefusalKind::Cooldown, "ab", 1_000);
+        let fault = stage_refusal(&b(16)).unwrap();
+        assert!(fault.named && !fault.held, "{fault:?}");
+        assert!(
+            !fault.binds(sha256("ab"), "bb", 1_001),
+            "a first fault binds nothing"
+        );
+        named(16, RefusalKind::Cooldown, "ab", 1_002);
+        assert!(
+            stage_refusal(&b(16))
+                .unwrap()
+                .binds(sha256("ab"), "bb", 1_003)
+        );
+
+        record_stage_refusal(&b(18), sha256("cc"), "bb", "digest", 2_000).unwrap();
+        assert!(
+            stage_refusal(&b(17)).is_some() && stage_refusal(&b(16)).is_some(),
+            "the lane's memo leaves the named ones"
+        );
+        named(19, RefusalKind::Held, "ee", 3_000);
+        assert!(
+            stage_refusal(&b(17)).is_some() && stage_refusal(&b(18)).is_some(),
+            "a named memo replaces no other"
+        );
+
+        record_stage_refusal(&b(20), sha256("ff"), "bb", "digest", 4_000).unwrap();
+        assert_eq!(stage_refusal(&b(18)), None, "the lane keeps one memo");
+        assert!(stage_refusal(&b(17)).is_some() && stage_refusal(&b(19)).is_some());
         let _ = std::fs::remove_dir_all(&h);
     }
 
@@ -2596,7 +2783,7 @@ mod tests {
         assert!(!m.held, "a sha256 mismatch cools down; it is not held");
         assert_eq!(
             m.client,
-            aterm_types::version::app_version(),
+            aterm_stamp::app_version(),
             "the memo names the client that wrote it"
         );
         let text = std::fs::read_to_string(&marker).unwrap();

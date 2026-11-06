@@ -129,6 +129,8 @@ pub struct Call {
     /// The exact-body capability of the typed atomic-ref resource; never set
     /// by a generic call or raw API request.
     pub(crate) atomic_refs: Option<crate::github::refs::AtomicRefWrite>,
+    /// A typed repository-creation call's exact-body capability.
+    pub(crate) repo_create: Option<crate::github::repos::RepoCreateWrite>,
 }
 
 impl Call {
@@ -155,6 +157,7 @@ impl Call {
             rate_book: true,
             sleep_budget: None,
             atomic_refs: None,
+            repo_create: None,
         }
     }
 
@@ -555,7 +558,7 @@ impl GithubBuilder {
         self
     }
 
-    /// The `User-Agent` caller: `agh/{VERSION} ({caller})`.
+    /// The `User-Agent` caller: `agh/{version} ({caller})`.
     #[must_use]
     pub fn caller(mut self, caller: &str) -> GithubBuilder {
         self.caller = caller.to_string();
@@ -624,7 +627,7 @@ impl GithubBuilder {
         let transport = self
             .transport
             .unwrap_or_else(|| Arc::new(HttpTransport::new(self.env.clone())));
-        let user_agent = format!("agh/{} ({})", crate::VERSION, self.caller);
+        let user_agent = format!("agh/{} ({})", crate::version(), self.caller);
         Github {
             inner: Arc::new(Inner {
                 router: self.router,
@@ -708,7 +711,7 @@ impl Github {
         &self.inner.redactor
     }
 
-    /// `agh/{VERSION} ({caller})`.
+    /// `agh/{version} ({caller})`.
     #[inline]
     #[must_use]
     pub fn user_agent(&self) -> &str {
@@ -1138,15 +1141,45 @@ impl Github {
         intents: &dyn IntentStore,
         created: &dyn Fn(&Answered) -> Option<(u64, String)>,
     ) -> Result<Outcome<Answered>> {
+        self.one_shot_inner(call, permit, draft, intents, created, false)
+    }
+
+    /// As `one_shot`, retaining the resource's already-judged `draft.after`.
+    /// A concurrent intent must refuse at begin, never become a new baseline
+    /// after the resource's existence and recovery checks have run.
+    pub(crate) fn one_shot_judged(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        draft: &IntentDraft,
+        intents: &dyn IntentStore,
+        created: &dyn Fn(&Answered) -> Option<(u64, String)>,
+    ) -> Result<Outcome<Answered>> {
+        self.one_shot_inner(call, permit, draft, intents, created, true)
+    }
+
+    fn one_shot_inner(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        draft: &IntentDraft,
+        intents: &dyn IntentStore,
+        created: &dyn Fn(&Answered) -> Option<(u64, String)>,
+        judged: bool,
+    ) -> Result<Outcome<Answered>> {
         // The target and the login binding come before the journal: a call its permit does
         // not cover, or a binding that fails, leaves no intent in it.
         let on_repo = |error: Error| with_call_repo(call, error);
         write_target(call, permit).map_err(on_repo)?;
         self.bind_login(permit.profile())
             .map_err(|error| on_repo(before_the_write(error)))?;
-        let after = intents
-            .latest(draft.op, &draft.key)?
-            .map(|view| view.intent.id);
+        let after = if judged {
+            draft.after.clone()
+        } else {
+            intents
+                .latest(draft.op, &draft.key)?
+                .map(|view| view.intent.id)
+        };
         let id = intents.begin(&draft.clone().with_after(after))?;
         let result = self.call_write(call, permit, &How::write());
         let made = result.as_ref().ok().and_then(created);
@@ -1432,6 +1465,7 @@ const PACE: Duration = Duration::from_secs(1);
 
 struct Prepared {
     atomic_refs: Option<crate::github::refs::AtomicRefWrite>,
+    repo_create: Option<crate::github::repos::RepoCreateWrite>,
     method: Method,
     url: String,
     headers: Vec<(String, String)>,
@@ -1460,6 +1494,7 @@ impl Prepared {
             body_digest: None,
             as_profile: self.as_profile.as_deref(),
             atomic_refs: self.atomic_refs.as_ref(),
+            repo_create: self.repo_create.as_ref(),
         }
     }
 
@@ -1744,7 +1779,7 @@ fn open_unchanged(path: &std::path::Path, len: u64) -> Result<std::fs::File> {
 fn file_digest(file: &mut std::fs::File, path: &std::path::Path, len: u64) -> Result<String> {
     use std::io::{Seek, SeekFrom};
     let mut hasher = aterm_digest::Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = [0u8; 64 * 1024];
     let mut read = 0u64;
     loop {
         match file.read(&mut buf) {
@@ -2194,6 +2229,7 @@ impl Github {
         };
         Prepared {
             atomic_refs: call.atomic_refs.clone(),
+            repo_create: call.repo_create.clone(),
             method: call.method,
             url: endpoints.url(call.origin, &call.path_and_query()),
             headers,

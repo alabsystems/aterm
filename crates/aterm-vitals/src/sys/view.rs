@@ -300,6 +300,15 @@ pub(super) fn unavailable(word: &str) -> String {
     format!("unavailable({word})")
 }
 
+/// `n`, with `≤` before it when it is only a bound (a counter that counts more than its state).
+fn at_most_word(n: u32, bound: bool) -> String {
+    if bound {
+        format!("\u{2264}{n}")
+    } else {
+        n.to_string()
+    }
+}
+
 /// A record value or `unavailable(<why>)`.
 pub(super) fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
     v.map_or_else(|| unavailable(why), |v| v.to_string())
@@ -367,12 +376,13 @@ fn net_clause(net: &crate::model::NetView) -> Option<String> {
         ));
     }
     if let Some(tcp) = net.tcp {
-        sub.push(format!(
-            "{} TCP ({} established, {} listen)",
-            tcp.total(),
-            tcp.established,
-            tcp.listen
-        ));
+        sub.push(match (tcp.known_total(), tcp.other(tcp.listen)) {
+            (Some(total), Some(listen)) => format!(
+                "{total} TCP ({} established, {listen} listen)",
+                tcp.established
+            ),
+            _ => format!("{} TCP established or close-wait", tcp.established),
+        });
     }
     (!sub.is_empty()).then(|| format!("net {}", sub.join(", ")))
 }
@@ -1328,10 +1338,7 @@ fn gpu_words(s: &Snapshot) -> String {
         t.push_str(&format!(" · {} allocated", words::mem(b)));
     }
     t.push_str(" · GPU memory total not reported · available not reported");
-    if g.name
-        .as_deref()
-        .is_some_and(|name| name.starts_with("Apple "))
-    {
+    if g.unified {
         t.push_str(" (unified system memory)");
     }
     t
@@ -2164,15 +2171,22 @@ fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
         parts.push(p);
     }
     if let Some(tcp) = net.tcp {
-        parts.push(format!(
-            "tcp {} total ({} established, {} listen, {} time_wait, {} close_wait, {} connecting)",
-            tcp.total(),
-            tcp.established,
-            tcp.listen,
-            tcp.time_wait,
-            tcp.close_wait,
-            tcp.connecting()
-        ));
+        parts.push(if tcp.counters_only {
+            format!(
+                "tcp {} established or close_wait, {} time_wait or orphaned fin_wait2 (other states not_sampled)",
+                tcp.established, tcp.time_wait
+            )
+        } else {
+            format!(
+                "tcp {} total ({} established, {} listen, {} time_wait, {} close_wait, {} connecting)",
+                tcp.total(),
+                tcp.established,
+                tcp.listen,
+                tcp.time_wait,
+                tcp.close_wait,
+                tcp.connecting()
+            )
+        });
     }
     if let Some(ms) = net.srtt_ms {
         parts.push(format!("rtt {ms:.1} ms"));
@@ -2207,18 +2221,18 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
             "tcp",
             format!(
                 "tcp     total={} established={} listen={} time_wait={} close_wait={} syn_sent={} syn_recv={} fin_wait1={} fin_wait2={} closing={} last_ack={} close={} srtt_us={}",
-                tcp.total(),
-                tcp.established,
-                tcp.listen,
-                tcp.time_wait,
-                tcp.close_wait,
-                tcp.syn_sent,
-                tcp.syn_recv,
-                tcp.fin_wait1,
-                tcp.fin_wait2,
-                tcp.closing,
-                tcp.last_ack,
-                tcp.close,
+                rec(tcp.known_total(), "not_sampled"),
+                at_most_word(tcp.established, tcp.counters_only),
+                rec(tcp.other(tcp.listen), "not_sampled"),
+                at_most_word(tcp.time_wait, tcp.counters_only),
+                rec(tcp.other(tcp.close_wait), "not_sampled"),
+                rec(tcp.other(tcp.syn_sent), "not_sampled"),
+                rec(tcp.other(tcp.syn_recv), "not_sampled"),
+                rec(tcp.other(tcp.fin_wait1), "not_sampled"),
+                rec(tcp.other(tcp.fin_wait2), "not_sampled"),
+                rec(tcp.other(tcp.closing), "not_sampled"),
+                rec(tcp.other(tcp.last_ack), "not_sampled"),
+                rec(tcp.other(tcp.close), "not_sampled"),
                 rec(srtt_us(net.srtt_ms), "not_sampled"),
             ),
         )),
@@ -2626,12 +2640,9 @@ fn global_json(s: &Snapshot) -> Jv {
     }
     o.set(
         "tcp_established",
-        Jv::known_or(
-            s.net
-                .as_ref()
-                .and_then(|n| n.tcp)
-                .map(|t| u64::from(t.established)),
-            "not_sampled",
+        s.net.as_ref().and_then(|n| n.tcp).map_or_else(
+            || Jv::why("not_sampled"),
+            |t| tcp_counter_json(t.established, t.counters_only, "close_wait_counted"),
         ),
     );
     o.set(
@@ -2640,7 +2651,8 @@ fn global_json(s: &Snapshot) -> Jv {
             s.net
                 .as_ref()
                 .and_then(|n| n.tcp)
-                .map(|t| u64::from(t.listen)),
+                .and_then(|t| t.other(t.listen))
+                .map(u64::from),
             "not_sampled",
         ),
     );
@@ -3784,22 +3796,43 @@ fn link_rates_json(r: crate::model::LinkRates) -> Jv {
     ])
 }
 
+/// `n` of a counter-read state: exact, or, with only the counters read
+/// ([`crate::model::TcpCounts::counters_only`]), at most `n`, since the counter also counts what
+/// `cause` names (`CurrEstab` the `CLOSE_WAIT` connections, `tw` the orphaned `FIN_WAIT2` sockets
+/// held as timewait ones).
+fn tcp_counter_json(n: u32, counters_only: bool, cause: &str) -> Jv {
+    if counters_only {
+        Jv::at_most(u64::from(n), cause)
+    } else {
+        Jv::u(u64::from(n))
+    }
+}
+
+/// A reading's TCP counts; with only the counters read, every other state is `not_sampled` and
+/// the two counted ones are bounds ([`tcp_counter_json`]).
 fn tcp_counts_json(t: crate::model::TcpCounts) -> Jv {
+    let other = |n: u32| Jv::known_or(t.other(n).map(u64::from), "not_sampled");
     Jv::obj([
-        ("total", Jv::u(u64::from(t.total()))),
-        ("established", Jv::u(u64::from(t.established))),
-        ("syn_sent", Jv::u(u64::from(t.syn_sent))),
-        ("syn_recv", Jv::u(u64::from(t.syn_recv))),
-        ("fin_wait1", Jv::u(u64::from(t.fin_wait1))),
-        ("fin_wait2", Jv::u(u64::from(t.fin_wait2))),
-        ("time_wait", Jv::u(u64::from(t.time_wait))),
-        ("close", Jv::u(u64::from(t.close))),
-        ("close_wait", Jv::u(u64::from(t.close_wait))),
-        ("last_ack", Jv::u(u64::from(t.last_ack))),
-        ("listen", Jv::u(u64::from(t.listen))),
-        ("closing", Jv::u(u64::from(t.closing))),
-        ("connecting", Jv::u(u64::from(t.connecting()))),
-        ("closing_total", Jv::u(u64::from(t.closing_total()))),
+        ("total", other(t.total())),
+        (
+            "established",
+            tcp_counter_json(t.established, t.counters_only, "close_wait_counted"),
+        ),
+        ("syn_sent", other(t.syn_sent)),
+        ("syn_recv", other(t.syn_recv)),
+        ("fin_wait1", other(t.fin_wait1)),
+        ("fin_wait2", other(t.fin_wait2)),
+        (
+            "time_wait",
+            tcp_counter_json(t.time_wait, t.counters_only, "fin_wait2_counted"),
+        ),
+        ("close", other(t.close)),
+        ("close_wait", other(t.close_wait)),
+        ("last_ack", other(t.last_ack)),
+        ("listen", other(t.listen)),
+        ("closing", other(t.closing)),
+        ("connecting", other(t.connecting())),
+        ("closing_total", other(t.closing_total())),
     ])
 }
 

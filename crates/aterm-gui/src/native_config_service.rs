@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn startup_service_publishes_sparkle_consumers_only_after_exact_preparation() {
-        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let pack = aterm_tempfile::manifest_dir()
             .join("../aterm-effects/toy-packs/community/tiny-triumphs/pack.toml");
         let text = format!(
             "[sparkle_words]\ntoy_packs = [{:?}]\n",

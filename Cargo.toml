@@ -41,7 +41,7 @@ default-members = [
     "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
     "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
-    "crates/aterm-spec-models", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
+    "crates/aterm-spec-models", "crates/aterm-stamp", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
     "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
     "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
@@ -78,8 +78,12 @@ bundle = []
 [workspace.metadata.aterm]
 update_channel = "alabsystems/aterm"
 
+# `version` is the product version: `pub bump` moves it and the publication engine reads it. Only
+# the `aterm` bin package inherits it, and its build script writes it into the binary's identity
+# record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
+# constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.157.0"
+version = "0.158.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -254,6 +258,9 @@ aterm-spec = { path = "crates/aterm-spec", features = ["anchors"] }
 # while stock compilers and the lint driver use `aterm-spec-macros`.
 aterm-spec-anchor = { path = "crates/aterm-spec-anchor" }
 aterm-spec-macros = { path = "crates/aterm-spec-macros" }
+# The binary's identity record, read at run time (A20): no library compiles a version,
+# commit, build number or index hint in.
+aterm-stamp = { path = "crates/aterm-stamp" }
 aterm-sysprobe = { path = "crates/aterm-sysprobe" }
 aterm-telemetry = { path = "crates/aterm-telemetry" }
 aterm-tempfile = { path = "crates/aterm-tempfile" }

@@ -1324,51 +1324,6 @@ fn in_plan_vault(plan: &Plan, configured: Result<Option<ConfiguredVault>, String
     }
 }
 
-/// Whether this process let a probe of the ALab vault nobody answered through to the join, to
-/// wait for macOS's Local Network answer ([`unjoined_alab_row`]).
-static UNANSWERED_PROBE_JOINED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The row System State's Secrets stage stops at for a plan that names the ALab vault this Mac
-/// has not joined, from what the probe of its address heard (`here`) and what a LAN look last
-/// heard of macOS's Local Network switch (`lan`, [`access::last_answer`]); `None` lets the join
-/// go ahead (design §3.3).
-///
-/// A server that holds no ALab vault leaves the row waiting for a change of network, the next
-/// launch, a new plan or Check again. A probe nobody answered is asked again after the Secrets
-/// retry pause, except the first in this process (`joined`, set here) while no look has heard
-/// how the switch stands: macOS may be holding the probe's lookup until the person answers its
-/// question, so that join goes ahead and its own look waits for the answer (`init_secrets`'
-/// patient look, spent once per process too), and the Mac joins within seconds of Allow, not a
-/// retry pause later. Once a look heard the switch, waiting for the person cannot help: the
-/// network or the vault failed with it on, or the person turned it off. The record keeps an
-/// answer from earlier launches, and an asked question from one long answered, so only the
-/// first probe of a process waits for it.
-fn unjoined_alab_row(
-    here: scope::VaultHere,
-    lan: Option<access::LanAnswer>,
-    joined: &std::sync::atomic::AtomicBool,
-) -> Option<Row> {
-    use access::LanAnswer;
-    let status = match here {
-        scope::VaultHere::Absent => WAITING,
-        scope::VaultHere::Unreached => {
-            let heard = matches!(lan, Some(LanAnswer::Reached | LanAnswer::Refused));
-            if !heard && !joined.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                return None;
-            }
-            UNREACHED
-        }
-        scope::VaultHere::Found | scope::VaultHere::Unasked => return None,
-    };
-    Some(Row {
-        name: Stage::Secrets.name().into(),
-        status: status.into(),
-        detail: here.note_for(lan)?.into(),
-        elapsed_ms: None,
-    })
-}
-
 /// What the Secrets stage's `rows` heard of the ALab vault where they leave it off this network:
 /// every row not in place is a vault nobody answered ([`UNREACHED`], read as
 /// [`scope::VaultHere::Unreached`]) or a server there holding none ([`WAITING`] on
@@ -1424,8 +1379,7 @@ fn vault_token_wait(vault: SetupNext) -> Row {
     }
 }
 
-/// [`secrets_rows`] of the join a probe nobody answered let through ([`unjoined_alab_row`]): a
-/// row its look stood aside on reads as the probe's own row would have for what the look heard,
+/// A bootstrap row whose fallback look stood aside reads as the look's observation,
 /// with the look's words. A vault that did not answer it either is [`UNREACHED`], so the pass
 /// parks and the Secrets retry pause asks again; a server there holding no vault is [`WAITING`]
 /// for a change ([`aterm_machines::init_secrets::NO_VAULT_NOW`]).
@@ -1460,15 +1414,15 @@ fn unanswered_join_rows(reports: Vec<aterm_machines::model::ItemReport>) -> Vec<
         .collect()
 }
 
-/// What the join a probe nobody answered let through ([`unjoined_alab_row`]) heard of macOS's
+/// What an authorized join heard of macOS's
 /// Local Network switch, kept for the Local Network row and later launches
 /// ([`access::lan_answered`]) as the probe would have kept it. A join made, waiting for an admin
 /// Mac, or failing after the vault answered (its subscriber not installed), and a server there
 /// holding no vault are a reach; macOS refusing the vault's `.local` name is the person's Don't
 /// Allow; a look nothing answered, or a join that failed before the vault answered, says nothing
 /// of the switch.
-/// The rows of a join a probe nobody answered let through, after `keep` is handed what its look
-/// heard of Local Network ([`join_lan_answer`], [`unanswered_join_rows`]).
+/// The authorized join's rows, after `keep` receives what its attempt heard of Local Network
+/// ([`join_lan_answer`], [`unanswered_join_rows`]).
 fn unanswered_join(
     reports: Vec<aterm_machines::model::ItemReport>,
     keep: impl FnOnce(access::LanAnswer),
@@ -1486,6 +1440,11 @@ fn join_lan_answer(reports: &[aterm_machines::model::ItemReport]) -> Option<acce
     reports
         .iter()
         .find_map(|report| match (report.outcome, &report.stood_aside) {
+            (Outcome::Blocked, Some(StoodAside::Waiting(why)))
+                if why.starts_with(aterm_machines::init_secrets::NATIVE_ADMISSION_PENDING) =>
+            {
+                None
+            }
             (Outcome::Changed, None) | (Outcome::Blocked, Some(StoodAside::Waiting(_))) => {
                 Some(Reached)
             }
@@ -1564,6 +1523,22 @@ pub fn initial_setup_holds() -> aterm_machines::init::Holds {
         Ok(root) => holds_at(&root),
         Err(why) => unread_holds(&why),
     }
+}
+
+/// Whether background default-vault bootstrap still belongs to this Mac's current setup.
+/// Reads setup records only, without taking their HeldLock or the vault lock.
+/// # Errors
+/// Current setup records cannot be read; callers then hold bootstrap.
+pub fn automatic_vault_bootstrap_allowed() -> Result<bool, String> {
+    automatic_vault_bootstrap_allowed_at(&state_root()?)
+}
+
+fn automatic_vault_bootstrap_allowed_at(root: &Path) -> Result<bool, String> {
+    let records = Records::read(root)?;
+    Ok(!holds(&records).holds(Setting::Secrets)
+        && records
+            .presented_plan_record()
+            .is_none_or(|(plan, _)| aterm_secrets::is_alab_default_url(&plan.vault_url)))
 }
 
 /// [`initial_setup_holds`] at `root`.
@@ -5117,6 +5092,9 @@ trait InitialHost {
     }
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
+    /// Read current repository inputs, credential routing and required checkout readiness
+    /// without changing them. A prior completed stage remains current only while this is ready.
+    fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String>;
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String>;
     /// The reason the failed part of the Repositories stage, as [`Self::repositories`] last ran
     /// it, gives where the step that stopped decided one
@@ -5261,6 +5239,20 @@ pub(super) const WAITING: &str = "waiting";
 /// vault coming back moves it without a person.
 pub(super) const UNREACHED: &str = "unreached";
 
+/// Git availability and the admitted executable behind its selected command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepositoryGit {
+    Missing,
+    Installed(PathBuf),
+}
+
+impl RepositoryGit {
+    fn read(sys: &dyn aterm_machines::port::System) -> Self {
+        aterm_machines::items::github::installed_git_identity(sys)
+            .map_or(Self::Missing, Self::Installed)
+    }
+}
+
 /// Local facts that can wake a parked setup run. This is an observation, never
 /// authorization to run its stages.
 #[derive(Clone, PartialEq, Eq)]
@@ -5272,16 +5264,19 @@ pub struct InitialSetupParkMark {
     subscriber_run: Option<u64>,
     subscriber: Option<bool>,
     local_network: Option<access::LanAnswer>,
+    /// Only an unfinished Secrets join may wait on its first-use door or retry deadline.
+    join_run: Option<u64>,
     /// The network this Mac's traffic leaves on ([`aterm_secrets::network::default_route`]), for
-    /// an unfinished Secrets or Repositories stage: an address that comes and goes beside it
+    /// selected Secrets or Repositories while setup remains pending: an address beside it
     /// (AirDrop, a VPN's `utun`, a temporary IPv6 address) is no move, so it wakes nothing.
     network: Option<String>,
-    /// The run whose Repositories stage is unfinished: the Command Line Tools arriving may end
-    /// its wait ([`InitialSetupParkMark::facts_changed_since`]).
-    developer_tools_run: Option<u64>,
-    /// Whether the git every clone runs is installed, read for [`Self::developer_tools_run`]
-    /// ([`InitialSetupParkMark::with_developer_tools`]).
-    developer_tools: Option<bool>,
+    /// The pending run whose Repositories stage is selected: a changed Git can invalidate
+    /// completed checkout evidence too ([`InitialSetupParkMark::facts_changed_since`]).
+    git_run: Option<u64>,
+    /// The selected Git's admitted build, read only for [`Self::git_run`].
+    git: Option<RepositoryGit>,
+    /// The selected repository inputs and pinned helper, without running either Git or helper.
+    repository_inputs: Option<aterm_machines::init_github::RepositoryInputMark>,
     retry_due: Option<u64>,
     mac_settings_retry_due: Option<u64>,
     /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
@@ -5325,12 +5320,15 @@ impl InitialSetupParkMark {
                 && (changed(&self.subscriber, &before.subscriber)
                     || changed(&self.local_network, &before.local_network)
                     || changed(&self.lan, &before.lan)))
-            // The tools' install (the tab the window opened, or a person's own `aterm init`)
-            // finishing during the pass ends the Repositories stage's wait on them.
-            || (self.developer_tools_run.is_some()
-                && self.developer_tools_run == before.developer_tools_run
-                && self.developer_tools == Some(true)
-                && before.developer_tools == Some(false))
+            // Activation can replace Git behind the same stable shim; losing it also changes
+            // whether a completed repository stage can still be verified.
+            || (self.git_run.is_some()
+                && self.git_run == before.git_run
+                && (changed(&self.repository_inputs, &before.repository_inputs)
+                    || match (&self.git, &before.git) {
+                        (Some(now), Some(old)) => now != old,
+                        _ => false,
+                    }))
     }
 
     /// Read the first-use door only for an unfinished Secrets stage.
@@ -5338,19 +5336,26 @@ impl InitialSetupParkMark {
         mut self,
         door: impl FnOnce() -> aterm_types::macos_setup::lan_first_use::Door,
     ) -> Self {
-        self.lan = self.subscriber_run.map(|_| door());
+        self.lan = self.join_run.map(|_| door());
         self
     }
 
-    /// The mark with whether the Command Line Tools are installed (`installed`), read only
-    /// for a run whose Repositories stage is unfinished.
-    fn with_developer_tools(mut self, installed: impl FnOnce() -> Option<bool>) -> Self {
-        self.developer_tools = self.developer_tools_run.and_then(|_| installed());
+    /// Read the selected Git while this pending run still selects Repositories.
+    fn with_git(mut self, read: impl FnOnce() -> Option<RepositoryGit>) -> Self {
+        self.git = self.git_run.and_then(|_| read());
+        self
+    }
+
+    fn with_repository_inputs(
+        mut self,
+        read: impl FnOnce() -> Option<aterm_machines::init_github::RepositoryInputMark>,
+    ) -> Self {
+        self.repository_inputs = self.git_run.and_then(|_| read());
         self
     }
 
     /// A contended or unreadable local state gives no new fact. Keep the
-    /// last known materialization or service state only within its same run.
+    /// last known materialization, service or Git state only within its same run.
     pub fn retain_known_from(&mut self, previous: &Self) {
         if self.materialization_run.is_some()
             && self.materialization_run == previous.materialization_run
@@ -5363,6 +5368,15 @@ impl InitialSetupParkMark {
             && self.subscriber.is_none()
         {
             self.subscriber = previous.subscriber;
+        }
+        if self.git_run.is_some() && self.git_run == previous.git_run && self.git.is_none() {
+            self.git = previous.git.clone();
+        }
+        if self.git_run.is_some()
+            && self.git_run == previous.git_run
+            && self.repository_inputs.is_none()
+        {
+            self.repository_inputs = previous.repository_inputs.clone();
         }
     }
 
@@ -5402,27 +5416,26 @@ impl InitialSetupParkMark {
     }
 
     /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
-    /// secrets folder and the network for unfinished Secrets or Repositories, and the Command Line
-    /// Tools for Repositories that wait on them. A run that waits on a person alone watches none.
+    /// secrets folder and network while a pending run selects Secrets or Repositories, and Git
+    /// activation while it selects Repositories. A run without network groups watches none.
     pub fn watches(&self) -> Watches {
         Watches {
             secrets: self.network_run.is_some(),
             network: self.network_run.is_some(),
-            developer_tools: self.network_run.is_some()
-                && self.developer_tools_run.is_some()
-                && self.developer_tools != Some(true),
+            git: self.network_run.is_some() && self.git_run.is_some(),
         }
     }
 }
 
 /// What a parked run waits on that moves without the window: this login's vault
-/// state and, for admitted unfinished Secrets or Repositories, the network this Mac is on.
-/// Unfinished Secrets also observes subscriber state and an existing retry
-/// deadline. A selected, unfinished Mac settings stage wakes for its second
+/// state and, while an admitted pending run selects Secrets or Repositories, this Mac's network.
+/// Selected Secrets also observes subscriber state; only an unfinished join keeps its existing
+/// retry deadline and first-use door. A selected, unfinished Mac settings stage wakes for its second
 /// automatic try. It also says whether an Accounts or Permissions stage is left,
 /// which a person moves in System Settings or macOS. No network request or
 /// permission prompt is made here.
 pub fn initial_setup_park_mark() -> InitialSetupParkMark {
+    let sys = aterm_machines::port::Live::new();
     initial_setup_park_mark_at(
         state_root().ok().as_deref(),
         aterm_secrets::client::Paths::live().ok().as_ref(),
@@ -5430,11 +5443,8 @@ pub fn initial_setup_park_mark() -> InitialSetupParkMark {
         aterm_secrets::network::default_route,
     )
     .with_lan_door(aterm_types::macos_setup::lan_first_use::door)
-    .with_developer_tools(|| {
-        Some(aterm_machines::init_github::git_installed(
-            &aterm_machines::port::Live::new(),
-        ))
-    })
+    .with_git(|| Some(RepositoryGit::read(&sys)))
+    .with_repository_inputs(|| aterm_machines::init_github::repository_input_mark(&sys).ok())
 }
 
 fn initial_setup_park_mark_at(
@@ -5503,6 +5513,9 @@ fn initial_setup_park_mark_reading(
             && progress.belongs_to(plan)
             && !progress.completed
             && !progress.stopped_by(records.stop_request)
+            && Stage::ALL
+                .iter()
+                .any(|stage| stage.selected(plan) && progress.done & stage.bit() == 0)
             && matches!(
                 records.decision,
                 Decision::Pending | Decision::Applied(true)
@@ -5526,34 +5539,27 @@ fn initial_setup_park_mark_reading(
     let unfinished_secrets = pending.filter(|(_, progress, secrets, _, _, _)| {
         *secrets && progress.done & Stage::Secrets.bit() == 0
     });
-    let unfinished_network = pending.filter(|(_, progress, secrets, repositories, _, _)| {
-        (*secrets && progress.done & Stage::Secrets.bit() == 0)
-            || (*repositories && progress.done & Stage::Repositories.bit() == 0)
-    });
-    let materialization_run = pending
-        .filter(|(_, progress, secrets, repositories, _, _)| {
-            *secrets
-                && (progress.done & Stage::Secrets.bit() == 0
-                    || (*repositories && progress.done & Stage::Repositories.bit() == 0))
-        })
-        .map(|(_, progress, _, _, _, _)| progress.revision);
+    let selected_secrets = pending.filter(|(_, _, secrets, _, _, _)| *secrets);
+    let selected_network =
+        pending.filter(|(_, _, secrets, repositories, _, _)| *secrets || *repositories);
+    let materialization_run = selected_network.map(|(_, progress, _, _, _, _)| progress.revision);
     InitialSetupParkMark {
         vault,
-        network_run: unfinished_network.map(|(_, progress, _, _, _, _)| progress.revision),
+        network_run: selected_network.map(|(_, progress, _, _, _, _)| progress.revision),
         materialization_run,
         materialization: materialization_run.and_then(|_| materialization()),
-        subscriber_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
-        subscriber: unfinished_secrets.and_then(|_| subscriber()),
+        subscriber_run: selected_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
+        subscriber: selected_secrets.and_then(|_| subscriber()),
         local_network: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
             access::answer_at(root, progress.access_revision())
         }),
-        network: unfinished_network.and_then(|_| network()),
-        developer_tools_run: pending
-            .filter(|(_, progress, _, repositories, _, _)| {
-                *repositories && progress.done & Stage::Repositories.bit() == 0
-            })
+        join_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
+        network: selected_network.and_then(|_| network()),
+        git_run: pending
+            .filter(|(_, _, _, repositories, _, _)| *repositories)
             .map(|(_, progress, _, _, _, _)| progress.revision),
-        developer_tools: None,
+        git: None,
+        repository_inputs: None,
         retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
             secrets_retry::retry_due(root, progress.revision, now)
         }),
@@ -5563,7 +5569,7 @@ fn initial_setup_park_mark_reading(
                 super::mac_settings_retry_due(
                     root,
                     progress.revision,
-                    &aterm_types::version::build_id(),
+                    &aterm_stamp::build_id(),
                     now,
                 )
                 .ok()
@@ -5581,7 +5587,7 @@ fn initial_setup_park_mark_reading(
                         super::mac_settings_retry_ahead(
                             root,
                             progress.revision,
-                            &aterm_types::version::build_id(),
+                            &aterm_stamp::build_id(),
                             now,
                         )
                         .ok()
@@ -5608,6 +5614,14 @@ mod parked_secrets_route_tests {
 
     fn routes(last: u8) -> Option<String> {
         Some(format!("en0 192.0.2.{last} 00:11:22:33:44:55"))
+    }
+
+    fn git(present: bool) -> RepositoryGit {
+        if present {
+            RepositoryGit::Installed(aterm_machines::items::github::CLT_GIT.into())
+        } else {
+            RepositoryGit::Missing
+        }
     }
 
     fn vault(membership: Membership) -> Option<Status> {
@@ -5804,6 +5818,101 @@ mod parked_secrets_route_tests {
     }
 
     #[test]
+    fn completed_network_stages_still_wake_while_accounts_is_pending() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut selected = plan(Setting::Secrets);
+        selected.selection.set(Setting::Repositories, true);
+        selected.selection.set(Setting::Messages, true);
+        let revision = authorize_at(root.path(), &selected).unwrap().unwrap();
+        let mut saved = progress(root.path()).unwrap().unwrap();
+        saved.done = Stage::Secrets.bit() | Stage::Repositories.bit();
+        save_progress(root.path(), saved).unwrap();
+        let materializations = Cell::new(0);
+        let read = |network: u8, subscriber: Option<bool>, installed: Option<bool>| {
+            initial_setup_park_mark_reading(
+                Some(root.path()),
+                vault(Membership::In { seq: 1, heard: 0 }),
+                1_000,
+                || routes(network),
+                || {
+                    materializations.set(materializations.get() + 1);
+                    None
+                },
+                || subscriber,
+            )
+            .with_git(|| installed.map(git))
+            .with_lan_door(|| panic!("a completed join has no first-use door to poll"))
+        };
+        let before = read(1, Some(true), Some(false));
+        assert!(before.watches().secrets && before.watches().network && before.watches().git);
+        assert_eq!(before.network_run, Some(revision));
+        assert_eq!(before.materialization_run, Some(revision));
+        assert_eq!(materializations.get(), 1);
+        assert_eq!(before.subscriber_run, Some(revision));
+        assert_eq!(before.git_run, Some(revision));
+        assert_eq!(before.retry_due(), None);
+        assert_eq!(before.next_due(), None);
+        assert!(!before.waits_on_lan_door());
+        assert!(!read(1, Some(true), Some(false)).facts_changed_since(&before));
+        assert!(read(2, Some(true), Some(false)).facts_changed_since(&before));
+        assert!(read(1, Some(false), Some(false)).facts_changed_since(&before));
+        assert!(read(1, Some(true), Some(true)).facts_changed_since(&before));
+        let installed = read(1, Some(true), Some(true));
+        assert!(read(1, Some(true), Some(false)).facts_changed_since(&installed));
+        let mut unknown = read(1, None, None);
+        assert!(!unknown.facts_changed_since(&before));
+        unknown.retain_known_from(&before);
+        assert_eq!(
+            unknown, before,
+            "unknown inputs cannot keep waking the park"
+        );
+
+        for inactive in [
+            Progress {
+                completed: true,
+                ..saved
+            },
+            Progress {
+                stopped: true,
+                ..saved
+            },
+            Progress {
+                admitted: false,
+                ..saved
+            },
+            Progress {
+                done: saved.done | Stage::Accounts.bit(),
+                ..saved
+            },
+        ] {
+            save_progress(root.path(), inactive).unwrap();
+            let retired = read(2, Some(false), Some(true));
+            assert!(retired.watches().none(), "{inactive:?}");
+            assert!(!retired.facts_changed_since(&before));
+            assert_eq!(retired.next_due(), None);
+        }
+        save_progress(root.path(), saved).unwrap();
+        request_stop_at(root.path(), revision).unwrap();
+        assert!(read(2, Some(false), Some(true)).watches().none());
+
+        let off = aterm_tempfile::tempdir().unwrap();
+        authorize_at(off.path(), &plan(Setting::Messages)).unwrap();
+        let mark = initial_setup_park_mark_reading(
+            Some(off.path()),
+            None,
+            1_000,
+            || panic!("network groups are off"),
+            || panic!("no selected materialization"),
+            || panic!("no selected subscriber"),
+        )
+        .with_git(|| panic!("Repositories is off"))
+        .with_lan_door(|| panic!("Secrets is off"));
+        assert!(mark.watches().none());
+        assert!(mark.waits_on_settings());
+        assert_eq!(mark.next_due(), None);
+    }
+
+    #[test]
     fn routes_are_not_sampled_without_a_coherent_pending_network_stage() {
         for state in [
             "missing",
@@ -5905,8 +6014,8 @@ mod parked_secrets_route_tests {
     /// The Command Line Tools arriving during a pass is a fact that wakes the run's park on
     /// its Repositories stage (the tab the window opened for their install, or a person's own
     /// `aterm init`), whatever else the mark reads, and a park already sampling sees them
-    /// change the mark. Their going away, a reading taken for no unfinished Repositories stage,
-    /// and a finished stage are no such fact.
+    /// change the mark. Losing Git also changes current repository readiness; unknown readings,
+    /// unselected Repositories and a run with no selected work left supply no such fact.
     #[test]
     fn the_command_line_tools_arriving_wakes_a_run_parked_on_its_repositories() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -5922,7 +6031,7 @@ mod parked_secrets_route_tests {
                 || None,
                 || Some(false),
             )
-            .with_developer_tools(|| installed)
+            .with_git(|| installed.map(git))
         };
         let missing = read(Some(false));
         assert!(!read(Some(false)).facts_changed_since(&missing));
@@ -5937,8 +6046,8 @@ mod parked_secrets_route_tests {
             "the tools' install changes the sample"
         );
         assert!(
-            !missing.facts_changed_since(&read(Some(true))),
-            "the tools going away is no fact"
+            missing.facts_changed_since(&read(Some(true))),
+            "losing Git invalidates current repository evidence"
         );
         assert!(!read(None).facts_changed_since(&missing));
         assert!(!read(Some(true)).facts_changed_since(&read(None)));
@@ -5947,10 +6056,7 @@ mod parked_secrets_route_tests {
         saved.done |= Stage::Secrets.bit() | Stage::Repositories.bit();
         save_progress(root.path(), saved).unwrap();
         let finished = read(Some(true));
-        assert_eq!(
-            finished.developer_tools, None,
-            "read for no unfinished stage"
-        );
+        assert_eq!(finished.git, None, "read for no unfinished stage");
         assert!(!finished.facts_changed_since(&missing));
 
         // A plan without the repositories never reads the tools.
@@ -5965,10 +6071,106 @@ mod parked_secrets_route_tests {
                 || None,
                 || Some(false),
             )
-            .with_developer_tools(|| installed)
+            .with_git(|| installed.map(git))
         };
-        assert_eq!(unselected(Some(true)).developer_tools, None);
+        assert_eq!(unselected(Some(true)).git, None);
         assert!(!unselected(Some(true)).facts_changed_since(&unselected(Some(false))));
+    }
+
+    /// A repositories-only run can exhaust its automatic tries while native Git lacks a
+    /// required capability. Managed Git arriving later must wake it without Secrets or a
+    /// network move; both executables being installed is not the same readiness fact.
+    #[test]
+    fn a_new_managed_git_wakes_repositories_even_when_native_git_was_already_installed() {
+        use aterm_machines::model::User;
+        use aterm_machines::port::{Fake, Stat};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = authorize_at(root.path(), &plan(Setting::Repositories))
+            .unwrap()
+            .unwrap();
+        let user = User {
+            name: "tester".into(),
+            uid: 501,
+            gid: 20,
+            home: "/test-git-readiness-home".into(),
+            shell: "/bin/zsh".into(),
+            admin: false,
+        };
+        let sys = Fake::root();
+        sys.logged_in(&user);
+        sys.file(aterm_machines::items::github::CLT_GIT, b"old native Git");
+        let read = || {
+            initial_setup_park_mark_reading(
+                Some(root.path()),
+                None,
+                1_000,
+                || routes(1),
+                || None,
+                || None,
+            )
+            .with_git(|| Some(RepositoryGit::read(&sys)))
+        };
+        let before = read();
+        let prefix = Path::new(&user.home).join("Library/Application Support/aterm/pkg");
+        let store = prefix.join("store/git");
+        let file = Stat {
+            uid: user.uid,
+            gid: user.gid,
+            mode: 0o755,
+            dir: false,
+            symlink: false,
+            len: 0,
+        };
+        sys.link(store.join("current").to_str().unwrap(), "12");
+        for path in [
+            store.join("12.ready"),
+            store.join("12/bin/git"),
+            prefix.join("bin/git"),
+        ] {
+            sys.stat_of(path.to_str().unwrap(), file);
+        }
+        sys.runtime_unready(&store.join("12"), "runtime not ready");
+        assert!(
+            !read().facts_changed_since(&before),
+            "an unadmitted build does not wake setup"
+        );
+        sys.runtime_ready(&store.join("12"));
+        let after = read();
+        assert!(
+            after.facts_changed_since(&before),
+            "a new admitted Git must restart the parked run"
+        );
+        assert!(
+            before.watches().git,
+            "keep watching a selected unfinished repository stage"
+        );
+        let command = aterm_machines::items::github::installed_git(&sys);
+        assert!(
+            !read().facts_changed_since(&after),
+            "unchanged activation stays parked"
+        );
+        sys.link(store.join("current").to_str().unwrap(), "13");
+        for path in [store.join("13.ready"), store.join("13/bin/git")] {
+            sys.stat_of(path.to_str().unwrap(), file);
+        }
+        assert_eq!(
+            aterm_machines::items::github::installed_git(&sys),
+            command,
+            "atpkg's command shim stays at the same path"
+        );
+        assert!(
+            read().facts_changed_since(&after),
+            "a newer build behind that shim wakes too"
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "sampling Git readiness starts no processes"
+        );
+        request_stop_at(root.path(), revision).unwrap();
+        let stopped = read();
+        assert!(!stopped.facts_changed_since(&before));
+        assert!(!stopped.watches().git);
     }
 
     #[test]
@@ -6007,13 +6209,16 @@ mod parked_secrets_route_tests {
         assert!(!unknown.facts_changed_since(&before));
         assert!(before.facts_changed_since(&unknown), "newly known inputs");
 
-        // Secrets completed within the pass. Retiring its subscriber input
-        // supplies no new fact while Repositories still uses this network.
+        // Secrets completion itself supplies no new fact, but its subscriber must still
+        // be observed while the selected repository work keeps this setup pending.
         let mut saved = progress(root.path()).unwrap().unwrap();
         saved.done |= Stage::Secrets.bit();
         save_progress(root.path(), saved).unwrap();
+        assert!(
+            !read(Some(1), Some(false), vault(Membership::Pending)).facts_changed_since(&before)
+        );
         let after_secrets = read(Some(1), Some(true), vault(Membership::Pending));
-        assert!(!after_secrets.facts_changed_since(&before));
+        assert!(after_secrets.facts_changed_since(&before));
 
         saved.done |= Stage::Repositories.bit();
         saved.completed = true;
@@ -6324,6 +6529,16 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         Ok(ran.rows)
     }
 
+    fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        let sys = aterm_machines::port::Live::new();
+        repositories::run(
+            &sys,
+            &self.context()?,
+            vault,
+            aterm_machines::model::Mode::Plan,
+        )
+    }
+
     fn repositories_want_token(&mut self) -> bool {
         self.token_wanted
     }
@@ -6391,7 +6606,7 @@ fn run_live_secrets(
     // System State's step (its door pass, `lan_first_use::step_use`) is the join's: it holds it
     // through the use rather than wait behind it, and it goes back to the question's hold when
     // the join lets it go. A slot another use's pass took is that use's question's.
-    let mut dialog = match join_dialog_slot(access::heard_here(), access::last_answer(), || {
+    let _dialog = match join_dialog_slot(lan_asked(), || {
         door.and_then(aterm_types::macos_setup::lan_first_use::take_door_slot)
             .map(|held| JoinSlot::Door { _held: held })
             .or_else(|| {
@@ -6409,31 +6624,23 @@ fn run_live_secrets(
     {
         return Ok(rows);
     }
-    // The ALab vault's own address, not joined yet: the probe's answer decides whether the
-    // join goes ahead ([`unjoined_alab_row`]).
-    let mut unanswered = false;
-    if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL
-        && !in_plan_vault(plan, live_configured_vault())
-    {
-        let here = scope::probe_vault();
-        if let Some(row) = unjoined_alab_row(here, access::last_answer(), &UNANSWERED_PROBE_JOINED)
-        {
-            return Ok(vec![row]);
-        }
-        unanswered = here == scope::VaultHere::Unreached;
-        // A probe that heard macOS's answer settled the question, so the join's own LAN use
-        // raises none: the slot goes now rather than through APPROVAL_WAIT and the fetch.
-        if !join_needs_slot(access::heard_here(), access::last_answer()) {
-            drop(dialog.take());
-        }
-    }
-    if let Some(rows) =
-        automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
-    {
-        return Ok(rows);
-    }
     let ops = aterm_machines::init_secrets::unattended(&ctx)?;
-    aterm_machines::init::run_initial_secrets(
+    let root = state_root()?;
+    let expected_revision = revision_at(&root)?;
+    let start = initial_setup_holds();
+    let current = || {
+        let now = initial_setup_holds();
+        if now.later(&start, Setting::Secrets) {
+            return Err(now.why(Setting::Secrets));
+        }
+        if revision_at(&root)? != expected_revision
+            || saved_plan(&root)?.as_ref().is_some_and(|now| now != plan)
+        {
+            return Err("the selected setup plan changed while vault bootstrap ran".into());
+        }
+        Ok(())
+    };
+    aterm_machines::init::run_initial_secrets_guarded(
         &sys,
         &ctx,
         ops,
@@ -6441,13 +6648,9 @@ fn run_live_secrets(
         replaces,
         password,
         APPROVAL_WAIT,
+        &current,
     )
-    .map(|reports| {
-        if !unanswered {
-            return secrets_rows(reports);
-        }
-        unanswered_join(reports, access::lan_answered)
-    })
+    .map(|reports| unanswered_join(reports, access::lan_answered))
 }
 
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -6471,19 +6674,40 @@ const SECRETS_WAIT_LOCAL_NETWORK: &str = "waits for System State's Local Network
     join looks for the vault on this Mac's network, which would put macOS's question up before \
     System State asks it";
 
+/// What the vault join reads of macOS's Local Network question for this app ([`join_needs_slot`]).
+#[derive(Clone, Copy, Debug)]
+struct LanAsked {
+    /// This process's last answer ([`access::heard_here`]).
+    heard: Option<access::LanAnswer>,
+    /// The later of it and the one an earlier launch kept ([`access::last_answer`]).
+    last: Option<access::LanAnswer>,
+    /// macOS put the question to this app on this Mac outside this process: the vault subscriber
+    /// asked, or a window of an earlier launch lived through it
+    /// ([`aterm_types::macos_setup::lan_first_use::asked_elsewhere`]).
+    elsewhere: bool,
+}
+
+/// [`LanAsked`], live.
+fn lan_asked() -> LanAsked {
+    LanAsked {
+        heard: access::heard_here(),
+        last: access::last_answer(),
+        elsewhere: aterm_types::macos_setup::lan_first_use::asked_elsewhere(),
+    }
+}
+
 /// The join's hold on this process's one macOS dialog slot (System State design §6), taken by
 /// `take` (`None` once its wait ends with another dialog still up) while [`join_needs_slot`] says
-/// the join's LAN use could still raise macOS's Local Network question (`heard` and `last` as it
-/// reads them): the join then holds the slot, waits behind another dialog this process put up,
-/// and stops at a row that says so. Once the question is settled, the join takes no slot (`take`
-/// is never called), so it neither waits behind the window's Full Disk Access or Developer Tools
-/// step nor holds those steps off while it waits for an admin Mac's approval.
+/// the join's LAN use could still raise macOS's Local Network question (`asked` as it reads it):
+/// the join then holds the slot, waits behind another dialog this process put up, and stops at a
+/// row that says so. Once the question is settled, the join takes no slot (`take` is never
+/// called), so it neither waits behind the window's Full Disk Access or Developer Tools step nor
+/// holds those steps off while it waits for an admin Mac's approval.
 fn join_dialog_slot<G>(
-    heard: Option<access::LanAnswer>,
-    last: Option<access::LanAnswer>,
+    asked: LanAsked,
     take: impl FnOnce() -> Option<G>,
 ) -> Result<Option<G>, Row> {
-    if !join_needs_slot(heard, last) {
+    if !join_needs_slot(asked) {
         return Ok(None);
     }
     take().map(Some).ok_or_else(|| {
@@ -6496,19 +6720,20 @@ fn join_dialog_slot<G>(
 }
 
 /// Whether the vault join's LAN use could still raise macOS's Local Network question, so the
-/// join must hold the dialog slot (pure). `heard` is this process's last answer
-/// ([`access::heard_here`]); `last` is the later of it and the one an earlier launch kept
-/// ([`access::last_answer`]). The question is settled once macOS answered (`last` is `Reached`
-/// or `Refused`), or once this process's own Local Network step raised it (`heard` is `Asked`:
-/// the window's step runs in the process the setup worker runs in). An `Asked` known only from
-/// an earlier launch's record is not settled: that launch may have quit, crashed or relaunched
-/// with macOS's alert unanswered, and the window's step runs once per revision, so nothing
-/// raises the question again in order; the join takes the slot then, as the Commons gate does.
-fn join_needs_slot(heard: Option<access::LanAnswer>, last: Option<access::LanAnswer>) -> bool {
+/// join must hold the dialog slot (pure). The question is settled once macOS answered (`last` is
+/// `Reached` or `Refused`), once this process's own Local Network step raised it (`heard` is
+/// `Asked`: the window's step runs in the process the setup worker runs in), or once it was put
+/// to this app on this Mac outside this process (`elsewhere`: the vault subscriber's use, or a
+/// window of an earlier launch that lived through it, on which the Commons gate opens with no
+/// slot too). An `Asked` known only from an earlier launch's record, with no window that lived
+/// through it, is not settled: that launch may have quit, crashed or relaunched with macOS's
+/// alert unanswered, and the window's step runs once per revision, so nothing raises the
+/// question again in order; the join takes the slot then, as the Commons gate does.
+fn join_needs_slot(asked: LanAsked) -> bool {
     use access::LanAnswer;
-    let answered = matches!(last, Some(LanAnswer::Reached | LanAnswer::Refused));
-    let asked_here = heard == Some(LanAnswer::Asked);
-    !(answered || asked_here)
+    let answered = matches!(asked.last, Some(LanAnswer::Reached | LanAnswer::Refused));
+    let asked_here = asked.heard == Some(LanAnswer::Asked);
+    !(answered || asked_here || asked.elsewhere)
 }
 
 /// Automatic setup leaves explicit manual joins alone. A disabled or unreadable master
@@ -6836,6 +7061,86 @@ fn execute_initial(
     Ok(execute_pass(host, root, password, SetupHooks::NONE)?.map(|(report, _)| report))
 }
 
+fn current_setup_vault_plan(
+    host: &mut dyn InitialHost,
+    plan: &Plan,
+    admitted_vault: AdmittedVault,
+) -> Result<Plan, String> {
+    secrets_try(host, plan, admitted_vault).map(|read| match read {
+        SecretsTry::LeaveInPlace(vault) => vault.present(plan.clone()),
+        SecretsTry::RunItem(_) => plan.clone(),
+    })
+}
+
+/// Network stages can finish while another selected stage stays pending across launches.
+/// Their old done bits cannot complete that later pass after local vault or checkout state
+/// changes. Read them without effects; an unfinished reading reopens only its ordinary stage.
+fn revalidate_completed_network_stages(
+    host: &mut dyn InitialHost,
+    root: &Path,
+    plan: &Plan,
+    progress: &mut Progress,
+) -> Result<(), String> {
+    let before = progress.done;
+    let completed = [Stage::Secrets, Stage::Repositories];
+    if !completed
+        .iter()
+        .any(|stage| stage.selected(plan) && before & stage.bit() != 0)
+    {
+        return Ok(());
+    }
+    let sharing = host.swarm_enabled();
+    let uses_vault = Stage::Secrets.selected(plan) && sharing == Ok(true);
+    let mut current_vault = None;
+    for stage in completed {
+        if !stage.selected(plan) || progress.done & stage.bit() == 0 {
+            continue;
+        }
+        // A pending Repositories stage already reads Secrets immediately before its own
+        // effects. Keep that boundary's observation rather than repeat it ahead of the stage.
+        if stage == Stage::Secrets
+            && uses_vault
+            && Stage::Repositories.selected(plan)
+            && before & Stage::Repositories.bit() == 0
+        {
+            continue;
+        }
+        let reading = if stage == Stage::Secrets {
+            match automatic_secrets_rows(sharing.clone()) {
+                Some(rows) => Ok(rows),
+                None => {
+                    let selected = current_vault.get_or_insert_with(|| {
+                        current_setup_vault_plan(host, plan, progress.admitted_vault)
+                    });
+                    match selected {
+                        Ok(selected) => host.current_vault(selected),
+                        Err(why) => Err(why.clone()),
+                    }
+                }
+            }
+        } else {
+            let selected = if uses_vault {
+                Some(current_vault.get_or_insert_with(|| {
+                    current_setup_vault_plan(host, plan, progress.admitted_vault)
+                }))
+            } else {
+                None
+            };
+            match selected {
+                Some(Err(why)) => Err(why.clone()),
+                selected => host.current_repositories(selected.and_then(|plan| plan.as_ref().ok())),
+            }
+        };
+        if !reading.as_ref().is_ok_and(|rows| rows_ready(rows)) {
+            progress.done &= !stage.bit();
+        }
+    }
+    if progress.done != before {
+        save_progress(root, *progress)?;
+    }
+    Ok(())
+}
+
 /// One pass over the selected stages that are not done, in order, asking `hooks` and the durable
 /// stop request before each and at the end whether a person stopped this revision
 /// ([`stop_at_boundary`]). A Stop ends the revision without cancelling its plan.
@@ -6873,6 +7178,7 @@ fn execute_pass(
     if progress.running.take().is_some() {
         save_progress(root, progress)?;
     }
+    revalidate_completed_network_stages(host, root, &plan, &mut progress)?;
     let boot = host.boot_session();
     let mut report = Report {
         action: Action::Apply,
@@ -6996,12 +7302,8 @@ fn execute_pass(
                 && host.swarm_enabled().unwrap_or(false)
             {
                 if progress.done & Stage::Secrets.bit() != 0 {
-                    let current =
-                        secrets_try(host, &plan, progress.admitted_vault).and_then(|read| {
-                            let selected = match read {
-                                SecretsTry::LeaveInPlace(vault) => vault.present(plan.clone()),
-                                SecretsTry::RunItem(_) => plan.clone(),
-                            };
+                    let current = current_setup_vault_plan(host, &plan, progress.admitted_vault)
+                        .and_then(|selected| {
                             let current = host.current_vault(&selected);
                             repository_vault = Some(selected);
                             current
@@ -7782,6 +8084,19 @@ mod tests {
 
         fn repositories_failure(&mut self) -> Option<&'static str> {
             self.repositories_failure
+        }
+
+        fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+            match &self.native_repositories {
+                Some((sys, ctx)) => {
+                    repositories::run(sys, ctx, vault, aterm_machines::model::Mode::Plan)
+                }
+                None => Ok(vec![readiness_row(
+                    Stage::Repositories.name(),
+                    true,
+                    "injected current repository readiness".into(),
+                )]),
+            }
         }
 
         fn repositories_want_token(&mut self) -> bool {
@@ -10722,6 +11037,226 @@ mod tests {
         assert_eq!(host.calls, [Stage::Repositories, Stage::Repositories]);
     }
 
+    #[test]
+    fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
+        use aterm_machines::port::{Ran, Stat, System as _};
+
+        for change in [
+            "inventory",
+            "credential-route",
+            "profile-path",
+            "unchanged",
+            "stopped",
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Repositories, Setting::Messages]);
+            let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let mut host = native_repositories(true, true);
+            let (sys, ctx) = host.native_repositories.as_ref().unwrap();
+            let user = &ctx.users[0];
+            sys.logged_in(user);
+            let (uid, gid) = (user.uid, user.gid);
+            let stat = |dir, len| Stat {
+                uid,
+                gid,
+                mode: if dir { 0o700 } else { 0o600 },
+                dir,
+                symlink: false,
+                len,
+            };
+            let home = user.home.clone();
+            let inventory = format!("{home}/.secrets/github-repositories.json");
+            let metadata = |name| {
+                aterm_json::to_vec(&aterm_json::json!({
+                    "schema":2,"account":"tester","repositories":[{
+                        "id":1,"name":name,"owner":{"login":"tester"},
+                        "full_name":format!("tester/{name}"),"private":true,
+                        "clone_url":format!("https://github.com/tester/{name}.git"),
+                        "default_branch":"main"
+                    }]
+                }))
+                .unwrap()
+            };
+            let before = metadata("before");
+            sys.file(&inventory, &before)
+                .stat_of(&inventory, stat(false, before.len() as u64));
+            let launcher = format!("{home}/.local/bin/aterm");
+            sys.file(&launcher, b"launcher");
+            sys.stat_of(&format!("{home}/before"), stat(true, 0));
+            // The new inventory's destination contains personal work, so readback must
+            // reopen the stage while apply preserves the file without cloning over it.
+            sys.file(&format!("{home}/after"), b"personal work")
+                .stat_of(&format!("{home}/after"), stat(false, 13));
+            let route = launcher.clone();
+            let worktree = format!("{home}/before");
+            sys.simulate(move |sys, command| {
+                let command = command.display();
+                Some(if command.ends_with(" credential fill") {
+                    if sys.read_file(Path::new(&route)).is_ok_and(|bytes| bytes == b"launcher") {
+                        Ran::ok("protocol=https\nhost=github.com\nusername=tester\npassword=inert_repository_tools_token\n")
+                    } else {
+                        Ran::exit(128, "credential is no longer available")
+                    }
+                } else if command.contains(" config --null --show-origin --get-regexp ") {
+                    Ran::ok("")
+                } else if command.ends_with(" rev-parse --is-inside-work-tree --show-prefix --show-toplevel") {
+                    Ran::ok(&format!("true\n\n{worktree}\n"))
+                } else if command.ends_with(" config --get-all remote.origin.url") {
+                    Ran::ok("https://github.com/tester/before.git\n")
+                } else {
+                    panic!("unexpected repository effect: {command}")
+                })
+            });
+            host.pending = Some(Stage::Accounts);
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .unwrap();
+            let prior = progress(root.path()).unwrap().unwrap();
+            assert!(!prior.completed);
+            assert_ne!(prior.done & Stage::Repositories.bit(), 0);
+            let profile = format!("{home}/.config/aterm/init.toml");
+            let custom = |path| format!("[github]\naccount='tester'\ntoken_file='{path}'\n");
+            let old_source = format!("{home}/old/token");
+            let new_source = format!("{home}/new/token");
+            if change == "profile-path" {
+                let (sys, _) = host.native_repositories.as_ref().unwrap();
+                for path in [&old_source, &new_source] {
+                    sys.file(path, b"unsafe").stat_of(
+                        path,
+                        Stat {
+                            mode: 0o644,
+                            ..stat(false, 6)
+                        },
+                    );
+                }
+                let bytes = custom(&old_source);
+                sys.file(&profile, bytes.as_bytes())
+                    .stat_of(&profile, stat(false, bytes.len() as u64));
+            }
+            let parked = |host: &Fake| {
+                let (sys, _) = host.native_repositories.as_ref().unwrap();
+                let calls = sys.calls();
+                let mark = initial_setup_park_mark_with(Some(root.path()), None, 1_000, || None)
+                    .with_repository_inputs(|| {
+                        aterm_machines::init_github::repository_input_mark(sys).ok()
+                    });
+                assert!(
+                    sys.calls()[calls.len()..]
+                        .iter()
+                        .all(|call| call == "identity"),
+                    "park sampling starts no helper or other program"
+                );
+                mark
+            };
+            let before_park = parked(&host);
+            assert!(before_park.watches().secrets && before_park.watches().git);
+
+            match change {
+                "inventory" => {
+                    let after = metadata("after");
+                    let (sys, _) = host.native_repositories.as_ref().unwrap();
+                    sys.file(&inventory, &after)
+                        .stat_of(&inventory, stat(false, after.len() as u64));
+                }
+                "credential-route" => {
+                    let (sys, _) = host.native_repositories.as_ref().unwrap();
+                    sys.file(&launcher, b"badexec!");
+                }
+                "profile-path" => {
+                    let (sys, _) = host.native_repositories.as_ref().unwrap();
+                    let bytes = custom(&new_source);
+                    sys.file(&profile, bytes.as_bytes())
+                        .stat_of(&profile, stat(false, bytes.len() as u64));
+                    let paths =
+                        aterm_machines::init_github::repository_input_watch_paths(sys).unwrap();
+                    assert!(paths.contains(&PathBuf::from(&new_source)));
+                    assert!(!paths.contains(&PathBuf::from(&old_source)));
+                }
+                "stopped" => request_stop_at(root.path(), revision).unwrap(),
+                "unchanged" => {}
+                _ => unreachable!(),
+            }
+            let after_park = parked(&host);
+            assert_eq!(
+                after_park.facts_changed_since(&before_park),
+                matches!(change, "inventory" | "credential-route" | "profile-path"),
+                "{change}: actual local input changes must wake the still-pending run"
+            );
+            if after_park.facts_changed_since(&before_park) {
+                host.calls.clear();
+                execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .unwrap();
+                let reopened = progress(root.path()).unwrap().unwrap();
+                assert_eq!(host.pending, Some(Stage::Accounts), "Accounts still waits");
+                assert_eq!(reopened.done & Stage::Accounts.bit(), 0);
+                assert_eq!(reopened.done & Stage::Repositories.bit(), 0);
+                assert!(!reopened.completed);
+                assert!(
+                    host.calls.contains(&Stage::Repositories),
+                    "{change}: input wake ran readback"
+                );
+            }
+            host.pending = None;
+            host.calls.clear();
+            let pass = execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
+            let saved = progress(root.path()).unwrap().unwrap();
+            match change {
+                "unchanged" => {
+                    assert!(saved.completed);
+                    assert_eq!(host.calls, [Stage::Accounts]);
+                    let retired =
+                        initial_setup_park_mark_with(Some(root.path()), None, 1_000, || None)
+                            .with_repository_inputs(|| {
+                                panic!("completed setup reads no repository inputs")
+                            });
+                    assert!(!retired.facts_changed_since(&before_park));
+                    assert!(retired.watches().none());
+                }
+                "stopped" => {
+                    assert!(pass.is_none());
+                    assert!(host.calls.is_empty());
+                    assert!(saved.stopped);
+                }
+                _ => {
+                    assert!(
+                        !saved.completed,
+                        "{change}: old repository readiness cannot complete a changed setup"
+                    );
+                    assert_eq!(saved.done & Stage::Repositories.bit(), 0, "{change}");
+                    assert!(!rows_ready(&pass.unwrap().0.rows), "{change}");
+                }
+            }
+            let (sys, _) = host.native_repositories.as_ref().unwrap();
+            assert!(
+                sys.calls().iter().all(|call| !call.contains(" clone ")
+                    && !call.contains(" agh GET ")
+                    && !call.contains("credential approve")),
+                "{change}: readback and preservation must have no repository effects: {:?}",
+                sys.calls()
+            );
+        }
+    }
+
     fn repositories_recover_after_an_interface_change(with_secrets: bool) {
         use aterm_machines::items::Ctx;
         use aterm_machines::model::{HostFacts, User};
@@ -10984,6 +11519,9 @@ mod tests {
         }
         fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
             self.rest.repositories(vault)
+        }
+        fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+            self.rest.current_repositories(vault)
         }
         fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.doctor.follow_up(root)
@@ -11855,6 +12393,9 @@ mod tests {
             }
             fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
                 self.rest.repositories(vault)
+            }
+            fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+                self.rest.current_repositories(vault)
             }
             fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
                 self.rest.withheld(root)
@@ -14297,8 +14838,79 @@ mod tests {
             fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
                 self.rest.repositories(vault)
             }
+            fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+                self.rest.current_repositories(vault)
+            }
             fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
                 self.rest.withheld(root)
+            }
+        }
+
+        #[test]
+        fn a_completed_vault_is_rechecked_before_pending_accounts_finish() {
+            for (subscriber_stopped, person_stopped) in
+                [(false, false), (true, true), (true, false)]
+            {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let plan = selected(&[Setting::Secrets, Setting::Messages]);
+                let lan = Lan::new(true, "home");
+                lan.in_vault(&plan.vault_url, START);
+                let joined = lan.status_now();
+                lan.set(joined.clone(), true);
+                let mut host = Vaulted::new(&lan);
+                host.rest.waiting = Some(Stage::Accounts);
+                let admitted = host.configured_vault().unwrap();
+                let revision = authorize_reading(root.path(), &plan, || Ok(admitted))
+                    .unwrap()
+                    .unwrap();
+                execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .expect("the first pass leaves Accounts pending");
+                let saved = progress(root.path()).unwrap().unwrap();
+                assert_ne!(saved.done & Stage::Secrets.bit(), 0);
+                assert_eq!(saved.done & Stage::Accounts.bit(), 0);
+                assert!(!finished_at(root.path()).unwrap());
+                assert!(lan.log().is_empty());
+
+                if subscriber_stopped {
+                    lan.set(joined.clone(), false);
+                }
+                if person_stopped {
+                    request_stop_at(root.path(), revision).unwrap();
+                }
+                host.rest.waiting = None;
+                let resumed = execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap();
+                if person_stopped {
+                    assert!(resumed.is_none());
+                    assert!(!*lan.subscribed.lock().unwrap());
+                    assert!(lan.log().is_empty(), "Stop authorizes no subscriber repair");
+                } else {
+                    assert!(resumed.is_some());
+                    assert!(
+                        *lan.subscribed.lock().unwrap(),
+                        "setup completed with its previously verified subscriber down"
+                    );
+                    assert_eq!(
+                        lan.log().iter().filter(|entry| *entry == "install").count(),
+                        usize::from(subscriber_stopped),
+                        "only the changed subscriber needs repair"
+                    );
+                    assert!(finished_at(root.path()).unwrap());
+                }
+                assert_eq!(lan.status_now(), joined);
             }
         }
 
@@ -15017,17 +15629,22 @@ mod tests {
         let lan = Lan::new(false, "away");
         let mut unpaced = Vaulted::new(&lan);
         unpaced.paced = false;
+        // Keep the same join admission; this control changes only pacing.
         passes(
             &mut unpaced,
             root.path(),
             revision,
-            &mut None,
+            &mut password,
             0..=20,
             |_, _| {},
         );
         assert_eq!(unpaced.minutes(), (0..=20).collect::<Vec<_>>());
         assert_eq!(*lan.asked.lock().unwrap(), 21);
         assert!(lan.log().is_empty());
+        assert!(
+            password.is_some(),
+            "the unpaced preflight also keeps its password"
+        );
     }
 
     #[test]
@@ -15237,11 +15854,13 @@ mod tests {
         let (root, revision) = authorized();
         let lan = Lan::new(false, "away");
         let mut host = Vaulted::new(&lan);
+        // Both builds use the same password-backed join, whose offline preflight makes nothing.
+        let mut password = Some(join_password());
         passes(
             &mut host,
             root.path(),
             revision,
-            &mut None,
+            &mut password,
             0..=20,
             |minute, host| {
                 host.build = if minute % 2 == 0 {
@@ -15259,11 +15878,15 @@ mod tests {
             &mut host,
             root.path(),
             revision,
-            &mut None,
+            &mut password,
             21..=21,
             |_, host| host.build = "1.0.0+gthird".into(),
         );
         assert_eq!(*host.minutes().last().unwrap(), 21, "the control");
+        assert!(
+            password.is_some(),
+            "no offline build spends the join password"
+        );
     }
 
     #[test]
@@ -15319,12 +15942,16 @@ mod tests {
             &mut host,
             root.path(),
             revision,
-            &mut None,
+            &mut password,
             0..=60,
             |_, _| {},
         );
         assert_eq!(host.minutes().len(), 17, "{:?}", host.minutes());
         assert_eq!(lines(&lan), 0);
+        assert!(
+            password.is_some(),
+            "an unreachable preflight changes nothing"
+        );
     }
 
     #[test]
@@ -15433,6 +16060,8 @@ mod tests {
             |_, _| {},
         );
         assert_eq!(rows[0].status, "blocked", "{rows:?}");
+        let bootstrap = lan.log();
+        assert_eq!(bootstrap, ["line init.secrets@tester", "install"]);
 
         lan.in_vault(JOINED_SINCE, START);
         let joined = lan.status_now();
@@ -15453,7 +16082,11 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(host.minutes(), [0], "the vault item ran again");
-        assert!(lan.log().is_empty(), "{:?}", lan.log());
+        assert_eq!(
+            lan.log(),
+            bootstrap,
+            "the newer vault permits no further change"
+        );
         assert_eq!(lan.status_now(), joined);
         let [left, vault, subscriber] = report.rows.as_slice() else {
             panic!("{:?}", report.rows)
@@ -15483,7 +16116,11 @@ mod tests {
         .0;
         assert!(rows_ready(&report.rows), "{:?}", report.rows);
         assert_eq!(host.minutes(), [0]);
-        assert!(lan.log().is_empty(), "{:?}", lan.log());
+        assert_eq!(
+            lan.log(),
+            bootstrap,
+            "the newer vault is read back without changes"
+        );
         assert!(finished_at(root.path()).unwrap());
         assert!(!root.path().join(secrets_retry::RECORD).exists());
     }
@@ -15695,86 +16332,69 @@ mod tests {
         assert!(finished_at(root.path()).unwrap());
     }
 
-    /// The ALab vault's probe stops an unjoined Mac's Secrets stage at what it heard, except the
-    /// first probe nobody answered in a process while no look has heard how macOS's Local Network
-    /// switch stands (no answer, or a question asked): that join goes ahead and its own look
-    /// waits for the answer. A later one, or one after a look heard the switch, stops unreached.
-    /// Negative controls: stopping at every probe nobody answered, as before, fails the untold
-    /// and asked first tries; letting every one through fails the second.
     #[test]
-    fn only_a_first_unanswered_alab_probe_lets_the_join_wait_for_the_local_network_answer() {
-        use access::LanAnswer::{Asked, Reached, Refused};
-        use scope::VaultHere;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let stops = |here, lan, joined: &AtomicBool| {
-            unjoined_alab_row(here, lan, joined).map(|row| (row.name, row.status, row.detail))
-        };
-        let row = |status: &str, detail: &str| {
-            Some((
-                Stage::Secrets.name().to_owned(),
-                status.to_owned(),
-                detail.to_owned(),
-            ))
-        };
-        let unreached = row(UNREACHED, scope::NOT_REACHED);
-        for lan in [None, Some(Asked)] {
-            let joined = AtomicBool::new(false);
-            assert_eq!(stops(VaultHere::Unreached, lan, &joined), None, "{lan:?}");
-            assert!(joined.load(Ordering::Relaxed));
-            assert_eq!(
-                stops(VaultHere::Unreached, lan, &joined),
-                unreached,
-                "{lan:?}"
-            );
-        }
-        // macOS refusing aterm the LAN is named as such: no look reaches the vault until the
-        // person turns Local Network on.
-        for (lan, stopped) in [
-            (Some(Reached), unreached.clone()),
-            (Some(Refused), row(UNREACHED, scope::LAN_OFF)),
-        ] {
-            let joined = AtomicBool::new(false);
-            assert_eq!(
-                stops(VaultHere::Unreached, lan, &joined),
-                stopped,
-                "{lan:?}"
-            );
-            assert!(!joined.load(Ordering::Relaxed), "{lan:?}: no join waited");
-        }
-        for lan in [None, Some(Asked), Some(Reached), Some(Refused)] {
-            let joined = AtomicBool::new(false);
-            assert_eq!(
-                stops(VaultHere::Absent, lan, &joined),
-                row(WAITING, scope::NO_VAULT),
-                "{lan:?}"
-            );
-            assert_eq!(stops(VaultHere::Found, lan, &joined), None, "{lan:?}");
-            assert_eq!(stops(VaultHere::Unasked, lan, &joined), None, "{lan:?}");
-            assert!(!joined.load(Ordering::Relaxed), "{lan:?}");
-        }
+    fn background_bootstrap_reads_current_stop_off_source_and_unreadable_choices() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut selection = Selection::none();
+        selection.set(Setting::Secrets, true);
+        let mut selected = Plan::from(selection);
+        assert!(automatic_vault_bootstrap_allowed_at(root.path()).unwrap());
+        authorize_at(root.path(), &selected).unwrap();
+        assert!(automatic_vault_bootstrap_allowed_at(root.path()).unwrap());
+        request_stop_at(root.path(), revision_at(root.path()).unwrap()).unwrap();
+        assert!(!automatic_vault_bootstrap_allowed_at(root.path()).unwrap());
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        selected.selection.set(Setting::Secrets, false);
+        authorize_at(root.path(), &selected).unwrap();
+        assert!(!automatic_vault_bootstrap_allowed_at(root.path()).unwrap());
+        selected.selection.set(Setting::Secrets, true);
+        selected.vault_url = "https://chosen.example/v1/personal".into();
+        save_plan(root.path(), &selected).unwrap();
+        assert!(!automatic_vault_bootstrap_allowed_at(root.path()).unwrap());
+        std::fs::write(root.path().join("automatic-plan.json"), b"invalid").unwrap();
+        assert!(automatic_vault_bootstrap_allowed_at(root.path()).is_err());
     }
 
     /// The vault join takes this process's macOS dialog slot until macOS's Local Network question
     /// is settled (0.145's website run: a join that always took it waited on the window's Full
     /// Disk Access and Developer Tools steps, credentials at +621 s). Settled is macOS's answer,
-    /// `Reached` or `Refused` as the last answer heard here or kept, or this process's own step
-    /// having asked (`Asked` heard here). An `Asked` kept only from an earlier launch is not
-    /// settled (that launch may have left macOS's alert unanswered, and no step raises it again in
-    /// order), nor is one heard here that a later `Asked` kept outranks. Taking the slot, the join
-    /// holds it when it is free and stops at the "still up" row when another dialog holds it.
-    /// Negative controls: reading any answer as settled (`last.is_some()`) fails the kept-`Asked`
-    /// case; dropping the asked-here half fails the case where this process asked.
+    /// `Reached` or `Refused` as the last answer heard here or kept, this process's own step
+    /// having asked (`Asked` heard here), or the question put to this app on this Mac outside this
+    /// process (the vault subscriber's use, or a window of an earlier launch that lived through
+    /// it). An `Asked` kept only from an earlier launch, with no window that lived through it, is
+    /// not settled (that launch may have left macOS's alert unanswered, and no step raises it
+    /// again in order), nor is one heard here that a later `Asked` kept outranks. Taking the slot,
+    /// the join holds it when it is free and stops at the "still up" row when another dialog
+    /// holds it. E3 (2026-11-05): a relaunched guest whose first launch's window lived through
+    /// the question stood at that row behind the Full Disk Access panel, which nobody answered,
+    /// for eleven minutes, while its Commons runtime had opened at once. Negative controls:
+    /// reading any answer as settled (`last.is_some()`) fails the kept-`Asked` case; dropping
+    /// the asked-here half fails the case where this process asked; dropping `elsewhere` fails
+    /// the relaunch's case.
     #[test]
     fn the_vault_join_takes_the_dialog_slot_until_macos_local_network_question_is_settled() {
         use access::LanAnswer::{Asked, Reached, Refused};
         use std::cell::Cell;
+        let asked = |heard, last, elsewhere| LanAsked {
+            heard,
+            last,
+            elsewhere,
+        };
         for (heard, last, why) in [
             (None, None, "never asked"),
             (None, Some(Asked), "asked in an earlier launch"),
             (Some(Reached), Some(Asked), "ask kept after Reached"),
             (Some(Refused), Some(Asked), "ask kept after Refused"),
         ] {
-            assert!(join_needs_slot(heard, last), "{why}: takes the slot");
+            assert!(
+                join_needs_slot(asked(heard, last, false)),
+                "{why}: takes the slot"
+            );
+            assert!(
+                !join_needs_slot(asked(heard, last, true)),
+                "{why}, asked outside this process: takes no slot"
+            );
         }
         for (heard, last, why) in [
             (Some(Asked), Some(Asked), "asked here"),
@@ -15785,7 +16405,10 @@ mod tests {
             (Some(Asked), Some(Reached), "Reached since asked here"),
             (Some(Asked), Some(Refused), "Refused since asked here"),
         ] {
-            assert!(!join_needs_slot(heard, last), "{why}: takes no slot");
+            assert!(
+                !join_needs_slot(asked(heard, last, false)),
+                "{why}: takes no slot"
+            );
         }
 
         let takes = Cell::new(0_u32);
@@ -15795,12 +16418,25 @@ mod tests {
             None::<&str>
         };
         assert!(
-            matches!(join_dialog_slot(Some(Asked), Some(Asked), held), Ok(None)),
+            matches!(
+                join_dialog_slot(asked(Some(Asked), Some(Asked), false), held),
+                Ok(None)
+            ),
             "settled: the join goes on"
         );
         assert_eq!(takes.get(), 0, "settled: the join takes no slot");
+        // The relaunch: an `Asked` kept from the launch whose window lived through the question.
+        assert!(
+            matches!(
+                join_dialog_slot(asked(None, Some(Asked), true), held),
+                Ok(None)
+            ),
+            "asked outside this process: the join goes on beside the panel"
+        );
+        assert_eq!(takes.get(), 0, "asked outside this process: no slot taken");
 
-        let row = join_dialog_slot(None, Some(Asked), held).expect_err("unsettled: the join waits");
+        let row = join_dialog_slot(asked(None, Some(Asked), false), held)
+            .expect_err("unsettled: the join waits");
         assert_eq!(takes.get(), 1);
         assert_eq!(
             (row.name.as_str(), row.status.as_str(), row.detail.as_str()),
@@ -15813,12 +16449,12 @@ mod tests {
 
         // Unsettled, and the slot is free: the join holds it while its LAN use may ask.
         assert!(matches!(
-            join_dialog_slot(None, None, || Some("slot")),
+            join_dialog_slot(asked(None, None, false), || Some("slot")),
             Ok(Some("slot"))
         ));
     }
 
-    /// The join a probe nobody answered let through parks as the probe's own row would have:
+    /// An authorized join parks where the vault cannot yet answer:
     /// a row stood aside because the vault did not answer is unreached, and one whose look heard
     /// a server with no vault waits, each with the look's words, so the pass parks; any other row
     /// is as [`secrets_rows`] has it. Negative control: the plain rows leave it blocked, which
@@ -15890,8 +16526,8 @@ mod tests {
         assert_eq!(SetupNext::of(&secrets_rows(reports)[..1]), SetupNext::Retry);
     }
 
-    /// The join a probe nobody answered let through keeps what its look heard of macOS's Local
-    /// Network switch, as the probe would have: a join made or waiting for an admin Mac, or a
+    /// An authorized join keeps what its attempt heard of macOS's Local Network switch:
+    /// a join made or waiting for an admin Mac, or a
     /// server there with no vault, reads the switch on; macOS refusing the vault's `.local` name
     /// reads it off; a look nothing answered leaves it untold, so a laptop away from the vault's
     /// LAN never reads on. A join that failed after the vault answered it (its subscriber not
@@ -15992,6 +16628,16 @@ mod tests {
             ),
             (
                 failed("joining the vault: could not write source.toml"),
+                None,
+                Lan::Untold,
+            ),
+            (
+                item(
+                    Outcome::Blocked,
+                    Some(StoodAside::Waiting(
+                        aterm_machines::init_secrets::NATIVE_ADMISSION_PENDING.into(),
+                    )),
+                ),
                 None,
                 Lan::Untold,
             ),
@@ -20328,6 +20974,10 @@ mod tests {
                     state: Arc::clone(&self.state),
                 }
                 .current_vault(plan)
+            }
+
+            fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+                self.repositories(vault)
             }
 
             fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {

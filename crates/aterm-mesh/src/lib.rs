@@ -19,6 +19,7 @@
 //! cannot, each over the stores the node service hands it ([`stores`]).
 //! [`presence`] supplies the origin-signed presence rows and their per-seat reading (B7c).
 //! [`mail`] runs the fabric's mail pushes over the same links, one hop to the addressed Mac (C3).
+//! [`push`] answers the claims push a window or a session lane asks of the node service (B7b).
 //!
 //! Nothing here runs unless the node service is built with `aterm_types::mesh_switch::MESH` on:
 //! the node service opens a [`Mesh`] only then.
@@ -37,6 +38,7 @@ pub mod logs;
 pub mod mail;
 pub mod overlay;
 pub mod presence;
+pub mod push;
 pub mod relay;
 pub mod stores;
 

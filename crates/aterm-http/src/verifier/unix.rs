@@ -374,16 +374,13 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/aterm/definitely/not/here.pem");
         assert_eq!(bundle_file(Some(missing.clone())), None);
         assert!(bundle_dirs(Some(missing)).is_empty());
-        let real = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/testdata/tls/root.der"
-        ));
+        let real = aterm_tempfile::manifest_dir().join("src/testdata/tls/root.der");
         assert!(
             real.exists(),
             "the fixture must be where the test says it is"
         );
         assert_eq!(bundle_file(Some(real.clone())), Some(real.clone()));
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls"));
+        let dir = aterm_tempfile::manifest_dir().join("src/testdata/tls");
         assert_eq!(bundle_file(Some(dir.clone())), None);
         let mut capped = Vec::new();
         read_pem_file_up_to(&real, 4, &mut capped);
@@ -395,9 +392,10 @@ mod tests {
     /// `rustls-native-certs` read it.
     #[test]
     fn a_configured_cert_dir_is_a_list_of_directories() {
-        let a = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata");
-        let b = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls");
-        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls/root.der");
+        let testdata = aterm_tempfile::manifest_dir().join("src/testdata");
+        let a = testdata.to_str().expect("a UTF-8 package directory");
+        let b = &format!("{a}/tls");
+        let file = &format!("{a}/tls/root.der");
         let both = vec![PathBuf::from(a), PathBuf::from(b)];
         assert_eq!(bundle_dirs(Some(PathBuf::from(format!("{a}:{b}")))), both);
         assert_eq!(

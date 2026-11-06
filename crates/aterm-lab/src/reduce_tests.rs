@@ -10,19 +10,20 @@ use aterm_agent::harness::steps::StepEvent;
 use super::oracle::{Arg, Args, call_ids, check_no_text, check_tool_arguments};
 use super::*;
 
-const FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-agent/src/supervise/fixtures"
-);
+/// The transcript fixtures, in the agent crate beside this package.
+fn fixtures_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-agent/src/supervise/fixtures")
+}
 
 fn fixtures() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = std::fs::read_dir(FIXTURES)
+    let dir = fixtures_dir();
+    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
         .expect("the fixtures directory")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("claude-") && n.contains("-transcript-") && n.ends_with(".jsonl"))
         .map(|n| {
-            let text = std::fs::read_to_string(format!("{FIXTURES}/{n}")).expect("a fixture");
+            let text = std::fs::read_to_string(dir.join(&n)).expect("a fixture");
             (n, text)
         })
         .collect();
@@ -258,20 +259,15 @@ fn a_reduction_keeps_no_key_or_stamp_tail_anyone_wrote() {
     }
 }
 
-const STEPS_2_1_303: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-agent/src/harness/testdata/steps/2.1.303.jsonl"
-);
-
-const STEPS_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-agent/src/harness/testdata/steps"
-);
+/// The step testdata, in the agent crate beside this package.
+fn steps_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-agent/src/harness/testdata/steps")
+}
 
 /// Every committed Claude Code transcript reduction (`<build>.jsonl`, every `.jsonl` in the step
 /// testdata that is no Codex rollout's), by name: what `MEASURED_BUILDS` lists.
 fn steps_claude() -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(STEPS_DIR)
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(steps_dir())
         .expect("the step testdata")
         .filter_map(Result::ok)
         .map(|e| e.path())
@@ -285,14 +281,14 @@ fn steps_claude() -> Vec<std::path::PathBuf> {
     assert!(
         paths
             .iter()
-            .any(|p| p.as_path() == std::path::Path::new(STEPS_2_1_303)),
+            .any(|p| *p == steps_dir().join("2.1.303.jsonl")),
         "{paths:?}"
     );
     paths
 }
 
 fn steps_codex() -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(STEPS_DIR)
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(steps_dir())
         .expect("the step testdata")
         .filter_map(Result::ok)
         .map(|e| e.path())

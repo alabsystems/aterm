@@ -168,7 +168,12 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
         }
     }
     if !plain.is_empty() {
-        let input: String = plain.iter().map(|(p, _)| format!("{p}\n")).collect();
+        let mut input =
+            String::with_capacity(plain.iter().map(|(p, _)| p.len() + 1).sum::<usize>());
+        for (p, _) in &plain {
+            input.push_str(p);
+            input.push('\n');
+        }
         let ids = git(
             root,
             &["hash-object", "--no-filters", "--stdin-paths"],
@@ -240,7 +245,7 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
         .filter(|r| !r.is_empty())
         .map(|rec| {
             let tab = rec.iter().position(|b| *b == b'\t')?;
-            let meta = String::from_utf8_lossy(&rec[..tab]).into_owned();
+            let meta = String::from_utf8_lossy(&rec[..tab]);
             let mut fields = meta.split(' ');
             Some(IndexEntry {
                 tag: fields.next()?.chars().next()?,
@@ -253,12 +258,11 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
 }
 
 fn flag_hidden_edits(root: &Path, index: &[IndexEntry]) -> Option<Vec<String>> {
-    let flagged: Vec<&IndexEntry> = index
+    let mut edited = Vec::new();
+    for entry in index
         .iter()
         .filter(|e| e.tag.is_ascii_lowercase() || e.tag == 'S')
-        .collect();
-    let mut edited = Vec::new();
-    for entry in flagged {
+    {
         let full = root.join(&entry.path);
         let same = match std::fs::symlink_metadata(&full) {
             Ok(m) if entry.mode == GITLINK_MODE => {

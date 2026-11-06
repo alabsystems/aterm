@@ -79,10 +79,11 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::accounts_step::Step;
 use super::login_drive::{self, Approval, Approver, Drove, Handoff, Outcome};
+use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::{Cli, Drive, Flow, GROK_SIGNIN};
 
 /// The machine-wide lock one sign-in holds, in the harness state directory.
@@ -981,7 +982,7 @@ impl Auto for LiveAuto {
             if (handoff.finished)() {
                 return Approval::Approved { page: false };
             }
-            if Instant::now() >= handoff.deadline {
+            if handoff.deadline.passed() {
                 return Approval::NeedsYou(format!(
                     "{} for the automatic rung's time",
                     super::accounts::SIGNIN_HELD
@@ -1425,10 +1426,7 @@ fn wait_for(
     owner: &mut dyn Owner,
 ) -> Result<Held, Ended> {
     let wait_span = gate.hang.saturating_add(LOCK_GRACE);
-    let now = Instant::now();
-    let until = now
-        .checked_add(wait_span)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
+    let until = WakeDeadline::after(wait_span);
     let mut told = false;
     loop {
         if !told && running(gate.state) {
@@ -1445,7 +1443,7 @@ fn wait_for(
                 why: "it was stopped while it waited".to_owned(),
             });
         }
-        if Instant::now() >= until {
+        if until.passed() {
             return Err(Ended::NotRun(format!(
                 "another sign-in held the lock past {} min",
                 wait_span.as_secs() / 60
@@ -1566,7 +1564,7 @@ impl Approver for NeedApprover<'_, '_> {
             handoff.url,
         );
         loop {
-            if (handoff.finished)() || Instant::now() >= handoff.deadline {
+            if (handoff.finished)() || handoff.deadline.passed() {
                 return Approval::Approved { page: false };
             }
             if (self.gate.stopped)() {
@@ -1607,8 +1605,6 @@ impl Approver for LadderApprover<'_, '_> {
         if self.ready && !(gate.stopped)() {
             // A stop ends the automatic rung as grok's own end does; it is told apart below.
             let finished = || (handoff.finished)() || (gate.stopped)();
-            let now = Instant::now();
-            let auto_until = now.checked_add(AUTO_WITHIN).unwrap_or(handoff.deadline);
             let within = Handoff {
                 url: handoff.url,
                 code: handoff.code,
@@ -1616,7 +1612,7 @@ impl Approver for LadderApprover<'_, '_> {
                 hosts: handoff.hosts,
                 email: handoff.email,
                 finished: &finished,
-                deadline: handoff.deadline.min(auto_until),
+                deadline: handoff.deadline.within(AUTO_WITHIN),
             };
             self.ran = true;
             let said = self.auto.approve(&within);

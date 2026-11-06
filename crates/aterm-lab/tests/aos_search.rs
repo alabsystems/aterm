@@ -88,15 +88,13 @@ impl std::ops::DerefMut for Spawned {
 fn spawn(args: &[&str]) -> (Spawned, aterm_tempfile::TempDir, PathBuf) {
     // macOS's first-exec check of a fresh build is waited out here, outside the run's hang
     // detector.
-    aterm_spec::wait::first_exec(
-        std::path::Path::new(env!("CARGO_BIN_EXE_aterm-lab")),
-        &["--help"],
-    );
+    let lab = aterm_tempfile::bin_exe("aterm-lab");
+    aterm_spec::wait::first_exec(&lab, &["--help"]);
     let dir = aterm_tempfile::tempdir().expect("a scratch dir");
     let plans_file = dir.path().join("plans.txt");
     std::fs::write(&plans_file, SIX).expect("the plans file");
     let out = dir.path().join("out");
-    let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"));
+    let mut cmd = aterm_uds::spawnfd::command(&lab);
     cmd.args(["aos-search", "--plans"])
         .arg(&plans_file)
         .arg("--out")

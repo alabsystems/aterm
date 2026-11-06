@@ -20,7 +20,7 @@ use crate::{Error, age, fsx};
 use std::collections::BTreeSet;
 
 /// The file a new Mac keeps the [`Allowed`] it was handed in, re-sent with each join request.
-fn allowed_file(paths: &Paths) -> std::path::PathBuf {
+pub(super) fn allowed_file(paths: &Paths) -> std::path::PathBuf {
     paths.dir.join("allowed")
 }
 

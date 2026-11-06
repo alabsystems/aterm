@@ -4,8 +4,9 @@
 //! THE LIVE PROBE.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +14,10 @@ use std::time::Duration;
 
 use aterm_types::domain::ENV_PARENT_SESSION_ID;
 
+use super::approval::{SecretRule, walk_hit};
 use super::claude_settings::OwnerAsk;
 use super::git_config::{GitView, WorkerEnv};
-use super::probe::{LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
+use super::probe::{Below, LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
 use super::rm_breaker::abs_components;
 use super::shell_startup::ShellStartup;
 
@@ -45,6 +47,21 @@ impl PolicyProbe for LiveProbe {
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String> {
         let comps = comps.to_vec();
         bounded("an rm's path on the disk", move || physical(&comps), Err)
+    }
+
+    fn below_tree(
+        &self,
+        root: &[String],
+        below: usize,
+        secrets: &[SecretRule],
+        home: Option<&Path>,
+    ) -> Result<Below, String> {
+        let (root, secrets, home) = (root.to_vec(), secrets.to_vec(), home.map(Path::to_path_buf));
+        bounded(
+            "a tree a reader descends",
+            move || below_within(&root, below, &secrets, home.as_deref(), TREE_ENTRIES),
+            Err,
+        )
     }
 
     /// The process leading `group`, read through the kernel
@@ -357,6 +374,143 @@ fn real_components(comps: &[String]) -> Option<Vec<String>> {
             Err(_) => return None,
         }
     }
+}
+
+/// Most entries [`below_within`] reads below one tree before it refuses the tree as too big to
+/// prove: [`HIDDEN_TWIN_ENTRIES`]' bound, counted over the whole walk.
+pub(crate) const TREE_ENTRIES: usize = HIDDEN_TWIN_ENTRIES;
+
+/// What a reader that descends the absolute path `root` may open within `below` levels of it
+/// (`usize::MAX`: any), walked as the most permissive reader walks it. Nothing there is
+/// [`Below::Missing`]. Else the tree's own path, every name below it (a directory's only where a
+/// reader enters it, above the last level) and, for each symbolic link, where it leads (a link to
+/// a directory entered as that directory) are held to `secrets` by [`walk_hit`], each path as the
+/// disk resolves it and every `Under` rule also as the disk resolves its directory
+/// ([`real_components`]); a hit is [`Below::Secret`], naming that path and its rule, and none is
+/// [`Below::Clear`].
+///
+/// Every link is followed because some reader follows it: MEASURED 2026-11-05 on macOS 27.0
+/// (`docs/measured/classifier-tree-reach-2026-11-05.md`), macOS grep's `-S` and `find … -exec cat
+/// {} +` printed a secret through a link below the tree that its plain `-r` did not, and `diff -r`
+/// compared a linked file; rg's `-L` followed both a file link and a directory link.
+///
+/// # Errors
+///
+/// The walk was cut, so the tree is unproven: a folder that cannot be listed or lies where it is
+/// never listed ([`never_listed`]), more than `max_entries` entries, a path or link that cannot
+/// be resolved, or a Windows host, whose paths this walk does not spell.
+pub(crate) fn below_within(
+    root: &[String],
+    below: usize,
+    secrets: &[SecretRule],
+    home: Option<&Path>,
+    max_entries: usize,
+) -> Result<Below, String> {
+    if cfg!(windows) {
+        return Err("a tree on Windows, whose files this check does not list".to_string());
+    }
+    let tree = PathBuf::from(format!("/{}", root.join("/")));
+    let real_home = home.and_then(|h| std::fs::canonicalize(h).ok());
+    let mut rules = secrets.to_vec();
+    rules.extend(secrets.iter().filter_map(|rule| {
+        match rule {
+            SecretRule::Under(dir) => abs_components(&dir.to_string_lossy())
+                .and_then(|comps| real_components(&comps))
+                .map(|real| SecretRule::Under(PathBuf::from(format!("/{}", real.join("/"))))),
+            SecretRule::Component(_) | SecretRule::Basename(_) => None,
+        }
+    }));
+    let met = |path: &Path, dir: bool| {
+        let comps = abs_components(&path.to_string_lossy())?;
+        walk_hit(&comps, &rules, dir).map(|rule| format!("{} ({rule:?})", path.display()))
+    };
+    let gone =
+        |e: &std::io::Error| matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory);
+    let is_dir = |p: &Path| {
+        std::fs::metadata(p).map(|m| m.is_dir()).map_err(|e| {
+            format!(
+                "a path below a tree that cannot be examined ({e}): {}",
+                p.display()
+            )
+        })
+    };
+    let real = match std::fs::canonicalize(&tree) {
+        Ok(real) => real,
+        Err(e) if gone(&e) => return Ok(Below::Missing),
+        Err(e) => {
+            return Err(format!(
+                "a tree that cannot be resolved ({e}): {}",
+                tree.display()
+            ));
+        }
+    };
+    let root_dir = is_dir(&real)?;
+    if let Some(hit) = met(&real, root_dir) {
+        return Ok(Below::Secret(hit));
+    }
+    if !root_dir || below == 0 {
+        return Ok(Below::Clear);
+    }
+    let mut queue = VecDeque::from([(real.clone(), 0usize)]);
+    let mut entered = HashSet::from([real]);
+    let mut entries = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if never_listed(&dir, home, real_home.as_deref()) {
+            return Err(format!(
+                "a tree a reader descends into another app's data or a file-provider domain, \
+                 which is never listed: {}",
+                dir.display()
+            ));
+        }
+        let cut = |e: std::io::Error| {
+            format!(
+                "a folder below a tree that cannot be listed ({e}): {}",
+                dir.display()
+            )
+        };
+        let level = depth + 1;
+        for entry in std::fs::read_dir(&dir).map_err(cut)? {
+            let entry = entry.map_err(cut)?;
+            entries += 1;
+            if entries > max_entries {
+                return Err(format!(
+                    "a tree too big to prove (over {max_entries} entries): {}",
+                    tree.display()
+                ));
+            }
+            let path = dir.join(entry.file_name());
+            let kind = entry.file_type().map_err(cut)?;
+            let (lands, dir_like) = if kind.is_symlink() {
+                match std::fs::canonicalize(&path) {
+                    Ok(target) => {
+                        let d = is_dir(&target)?;
+                        (target, d)
+                    }
+                    // A link that names nothing opens nothing.
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => {
+                        return Err(format!(
+                            "a symbolic link below a tree that cannot be resolved ({e}): {}",
+                            path.display()
+                        ));
+                    }
+                }
+            } else {
+                (path.clone(), kind.is_dir())
+            };
+            // A directory on the last level is entered by no reader that stops there.
+            if dir_like && level >= below {
+                continue;
+            }
+            if let Some(hit) = met(&path, dir_like).or_else(|| met(&lands, dir_like)) {
+                return Ok(Below::Secret(hit));
+            }
+            if dir_like && entered.insert(lands.clone()) {
+                queue.push_back((lands, level));
+            }
+        }
+    }
+    Ok(Below::Clear)
 }
 
 /// How many symbolic links [`physical`] follows for one path before it gives

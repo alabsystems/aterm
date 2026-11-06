@@ -1124,7 +1124,7 @@ mod tests {
         assert!(usage_of(&["--plans"]).contains("--plans needs a value"));
         assert!(usage_of(&["--grid", "--out", "o", "--toolchain", " "]).contains("non-empty"));
         assert!(usage_of(&["--grid", "--out", "o", "extra"]).contains("unexpected 'extra'"));
-        assert!(LAB_BUILD.starts_with("aterm-lab "));
+        assert!(LAB_BUILD.starts_with("aterm-lab+g"));
     }
 
     #[test]
@@ -1163,7 +1163,7 @@ not a plan
             "  selection provenance=declared\n",
             "  held_out T=5119 Z=161 baseline T=6685 Z=1750 gain_ppm=234255\n",
             "  bundle file=plans.bundle bytes=",
-            " verified=true build=aterm-lab_",
+            " verified=true build=aterm-lab+g",
             " toolchain=targo_test-line\n",
             "  MEASURED (never scored) wall_ms=",
             " stepped=",
@@ -1210,7 +1210,7 @@ not a plan
         assert!(!none.path().join("plans.bundle").exists());
     }
 
-    const TEST_BUILD: &str = concat!("aterm-lab ", env!("CARGO_PKG_VERSION"), "+g0123456789ab");
+    const TEST_BUILD: &str = "aterm-lab+g0123456789ab";
 
     const GRID_STATS: SearchStats = SearchStats {
         rounds: 4,
@@ -1470,8 +1470,8 @@ not a plan
     #[test]
     fn a_bundle_of_another_build_is_refused_before_any_evaluator_is_built() {
         let bytes = searched_bundle();
-        let v = env!("CARGO_PKG_VERSION");
-        let other = format!("aterm-lab {v}+g0123456789ac");
+        let v = "0.157.0";
+        let other = "aterm-lab+g0123456789ac".to_owned();
         let (code, r) = report_unbuilt(&bytes, &other);
         assert_eq!(code, 1, "{r}");
         assert_eq!(statuses(&r), refused_at(Check::Build, "pass"), "{r}");
@@ -1490,8 +1490,8 @@ not a plan
 
         for (build, reason) in [
             (format!("{TEST_BUILD}-dirty"), "DirtyBuild"),
-            (format!("aterm-lab {v}+gunknown"), "UnstampedBuild"),
-            (format!("aterm-lab {v}"), "UnstampedBuild"),
+            ("aterm-lab+gunknown".to_owned(), "UnstampedBuild"),
+            ("aterm-lab".to_owned(), "UnstampedBuild"),
         ] {
             let named = resealed(&bytes, |b| b.build = build.clone());
             let (code, r) = report_unbuilt(&named, &build);

@@ -156,7 +156,6 @@ pub(super) fn local_network_step(outcome: AccessOutcome) {
         if let Ok(paths) = aterm_secrets::client::Paths::live() {
             aterm_secrets::heard::forget(&paths);
         }
-        super::UNANSWERED_PROBE_JOINED.store(false, std::sync::atomic::Ordering::Release);
         if let Ok(root) = super::state_root() {
             super::secrets_retry::clear_at(&root);
         }

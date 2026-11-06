@@ -36,6 +36,9 @@ use aterm_secrets::alab_join::JoinPlace;
 /// subscriber keeps retrying while it waits (`aterm_secrets::client::on_ask_members`).
 pub use aterm_secrets::members::join::LET_IN;
 
+/// A native possession exchange is still ambiguous; this alone proves no LAN grant.
+pub const NATIVE_ADMISSION_PENDING: &str = "Joining ALab is not confirmed yet";
+
 /// Progress while this Mac's automatic ALab join is pending.
 pub fn quiet_first() -> String {
     "joining ALab automatically".to_owned()
@@ -427,6 +430,25 @@ pub trait SecretsOps: Send + Sync {
         Err("this port asks no member".into())
     }
 
+    /// Retain an unconfigured default join for the subscriber, without claiming membership.
+    /// This runs only at the authorized apply boundary.
+    /// # Errors
+    /// The identity is isolated, sharing is off, or private state cannot be retained.
+    fn prepare_bootstrap(&self) -> aterm_secrets::Result<()> {
+        Ok(())
+    }
+
+    /// Try a native member proof before vault discovery. The callback rechecks `current`
+    /// and the exact source under its publication lock, and admits only the compiled vault.
+    /// # Errors
+    /// Authorization changed, or the proof could not run safely.
+    fn native_bootstrap(
+        &self,
+        _current: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+    ) -> aterm_secrets::Result<aterm_secrets::client::NativeAdmission> {
+        Ok(aterm_secrets::client::NativeAdmission::None)
+    }
+
     /// Whether a member let this Mac in and its vault has yet to record it
     /// (`aterm_secrets::client::holds_allowed`).
     fn allowed(&self) -> bool {
@@ -474,41 +496,6 @@ pub enum Checked {
     },
 }
 
-/// The look for the ALab vault `aterm init` starts before it reads anything else of the Mac
-/// ([`Lookahead::start`]), so the look overlaps that reading instead of preceding the rest of
-/// the run; the secrets step takes its answer ([`LiveSecrets::looking`]).
-pub struct Lookahead(Mutex<Option<std::thread::JoinHandle<aterm_secrets::Result<ProbeOutcome>>>>);
-
-impl Lookahead {
-    /// Start the look for the login whose home is `home` ([`look_here`]).
-    #[must_use]
-    pub fn start(home: &Path) -> Self {
-        let home = home.to_path_buf();
-        let look = std::thread::Builder::new()
-            .name("aterm-init-vault-look".into())
-            .spawn(move || look_here(&home))
-            .ok();
-        Self(Mutex::new(look))
-    }
-
-    /// The look's answer, once: `None` when it was taken already, or its thread did not start
-    /// or panicked.
-    fn take(&self) -> Option<aterm_secrets::Result<ProbeOutcome>> {
-        let look = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()?;
-        look.join().ok()
-    }
-}
-
-impl std::fmt::Debug for Lookahead {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Lookahead").finish_non_exhaustive()
-    }
-}
-
 /// Whether a person can be asked: this process has a terminal.
 fn at_terminal() -> bool {
     use std::io::IsTerminal as _;
@@ -519,27 +506,6 @@ fn at_terminal() -> bool {
         .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/dev/tty")
         .is_ok_and(|tty| tty.is_terminal())
-}
-
-/// Start the look for the ALab vault that this login's `aterm init` apply would make
-/// ([`items`]), so it overlaps reading the Mac: for a person at this Mac's console
-/// ([`crate::console::here`]: the login that owns it, in its own session, at a terminal, not
-/// started by a coding agent), with no vault configured. `None` elsewhere, where the secrets
-/// step looks for itself as it starts ([`items_at`]): an agent's tab, a run with no terminal
-/// (once macOS's Local Network question has an answer) and a remote shell of the console's own
-/// login join the open ALab vault with no question, and another login's console, or nobody's,
-/// sets up nothing of this one.
-#[must_use]
-pub fn look_ahead() -> Option<Arc<Lookahead>> {
-    if crate::console::here() != crate::console::Presence::AtConsole {
-        return None;
-    }
-    if !aterm_secrets::swarm::enabled_live().unwrap_or(false) {
-        return None;
-    }
-    let paths = Paths::live().ok()?;
-    let unconfigured = matches!(aterm_secrets::client::config(&paths), Ok(None));
-    unconfigured.then(|| Arc::new(Lookahead::start(&paths.home)))
 }
 
 /// One look for the ALab vault from the login whose home is `home`. A look that heard another
@@ -670,8 +636,6 @@ pub struct LiveSecrets {
     home: PathBuf,
     /// Nothing is said ([`SecretsOps::say`]): System State's unattended pass.
     quiet: bool,
-    /// The look `aterm init` started first, which [`SecretsOps::probe_alab`] answers with once.
-    ahead: Option<Arc<Lookahead>>,
     /// When this port's last join request was queued: the vault refuses a changed request
     /// sooner than [`aterm_secrets::server::JOIN_CHANGE_GAP`] after it, so a retyped password
     /// waits out the rest of that gap first.
@@ -688,17 +652,10 @@ impl LiveSecrets {
         Self {
             home: home.to_path_buf(),
             quiet: false,
-            ahead: None,
             asked: Arc::default(),
             #[cfg(test)]
             heard: None,
         }
-    }
-
-    /// This vault, answering its first look for the ALab vault with `ahead`'s.
-    #[must_use]
-    pub fn looking(self, ahead: Option<Arc<Lookahead>>) -> Self {
-        Self { ahead, ..self }
     }
 
     /// The vault of the user whose home is `home`, saying nothing.
@@ -876,6 +833,23 @@ impl SecretsOps for LiveSecrets {
         aterm_secrets::client::config(&self.paths())
     }
 
+    fn prepare_bootstrap(&self) -> aterm_secrets::Result<()> {
+        let paths = self.paths();
+        aterm_secrets::client::refuse_lab_identity(&paths)?;
+        aterm_secrets::client::prepare_alab_join_retry(&paths)
+    }
+
+    fn native_bootstrap(
+        &self,
+        current: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+    ) -> aterm_secrets::Result<aterm_secrets::client::NativeAdmission> {
+        let result = aterm_secrets::client::native_bootstrap(&self.paths(), current)?;
+        if result == aterm_secrets::client::NativeAdmission::Admitted {
+            self.hear_vault_lan(LanHeard::Reached);
+        }
+        Ok(result)
+    }
+
     fn subscriber(&self) -> aterm_secrets::Result<State> {
         aterm_secrets::service::state(&self.home, aterm_secrets::service::Job::Subscriber)
     }
@@ -885,10 +859,7 @@ impl SecretsOps for LiveSecrets {
     }
 
     fn probe_alab(&self) -> aterm_secrets::Result<ProbeOutcome> {
-        match self.ahead.as_ref().and_then(|ahead| ahead.take()) {
-            Some(looked) => looked,
-            None => look_here(&self.home),
-        }
+        look_here(&self.home)
     }
 
     fn check(&self, source: &str) -> Result<Checked, String> {
@@ -1141,15 +1112,12 @@ fn trusts(sys: &dyn System, fingerprint: &str) -> io::Result<bool> {
     }))
 }
 
-/// The live port for the one user `aterm init` configures, answering its first look for the
-/// ALab vault with `ahead`'s ([`Lookahead`]).
+/// The live port for the one user `aterm init` configures.
 /// # Errors
 /// The run does not name exactly one user.
-pub fn live(ctx: &Ctx, ahead: Option<Arc<Lookahead>>) -> Result<Arc<dyn SecretsOps>, String> {
+pub fn live(ctx: &Ctx) -> Result<Arc<dyn SecretsOps>, String> {
     let user = only_user(ctx)?;
-    Ok(Arc::new(
-        LiveSecrets::new(Path::new(&user.home)).looking(ahead),
-    ))
+    Ok(Arc::new(LiveSecrets::new(Path::new(&user.home))))
 }
 
 /// The live port for System State's unattended Secrets stage: [`LiveSecrets::unattended`].
@@ -1528,25 +1496,20 @@ pub fn items_at(
             Chose::Join(source) => source,
             Chose::Note(probe) => return Ok(Secrets::note(user, probe)),
         },
-        None => match look(ops.as_ref(), sys.macos(), person) {
-            Looked::Found => {
-                ops.say("the ALab vault answers on this network");
-                aterm_secrets::ALAB_DEFAULT_URL.to_owned()
-            }
-            Looked::NotHere => return Ok(Secrets::not_applicable(user, NOT_HERE)),
-            Looked::Refused => return Ok(Secrets::not_applicable(user, LAN_REFUSED)),
-            Looked::Unanswered if person => {
-                return Ok(Secrets::not_applicable(user, LAN_UNANSWERED));
-            }
-            Looked::Unanswered => {
-                return Ok(Secrets::note(
-                    user,
-                    Probe::Deferred {
-                        why: LAN_NOT_ASKED.into(),
-                    },
-                ));
-            }
-        },
+        None => {
+            let id = item_id(&user);
+            let vault = selected(
+                ctx,
+                ops,
+                aterm_secrets::ALAB_DEFAULT_URL,
+                Duration::ZERO,
+                Replaces::Read(None),
+            )?;
+            return Ok(Secrets {
+                items: vec![Box::new(vault.saying_codes(says_codes).asking(person))],
+                waited_on: Some(id),
+            });
+        }
     };
     let id = item_id(&user);
     let vault = Vault::new(user, ops, source, Origin::Chosen, None, Duration::ZERO);
@@ -1667,7 +1630,7 @@ pub(crate) struct Vault {
     /// join, and wiped with it once the join has used it.
     password: Mutex<Option<SecretBytes>>,
     /// Why the last apply stood aside: this Mac waits to be let in.
-    aside: Mutex<Option<String>>,
+    aside: Mutex<Option<StoodAside>>,
     /// Why the last probe found this Mac waiting to be let in with its subscriber
     /// running, which finishes the join by itself ([`Item::read_aside`]).
     waiting: Mutex<Option<String>>,
@@ -1782,15 +1745,15 @@ impl Vault {
     }
 
     fn set_aside(&self, why: Option<String>) {
-        *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = why;
+        *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = why.map(StoodAside::Waiting);
     }
 
     fn aside_also(&self, why: String) {
         let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
-        *aside = Some(match aside.take() {
-            Some(first) => format!("{first}; {why}"),
+        *aside = Some(StoodAside::Waiting(match aside.take() {
+            Some(first) => format!("{}; {why}", first.why()),
             None => why,
-        });
+        }));
     }
 
     fn plan(&self, planned: Planned) {
@@ -1928,8 +1891,36 @@ impl Vault {
             .unwrap_or(false)
     }
 
-    fn join(&self, sys: &dyn System, interactive: bool) -> Result<(), String> {
+    fn native_first(&self) -> bool {
         let planned = self.planned();
+        self.origin == Origin::Selected
+            && planned.join
+            && planned.over.is_none()
+            && !self.has_password()
+            && aterm_secrets::is_alab_default_url(&self.source)
+    }
+
+    fn join(
+        &self,
+        sys: &dyn System,
+        interactive: bool,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let was_off = self.ops.turned_off();
+        let admitted_now = || -> Result<(), String> {
+            current()?;
+            if !was_off && self.ops.turned_off() {
+                return Err(
+                    "the vault subscriber was turned off during this join; setup left it off"
+                        .into(),
+                );
+            }
+            Ok(())
+        };
+        let current = &admitted_now;
+        current()?;
+        let planned = self.planned();
+        let native_first = self.native_first();
         let before = planned.over.clone();
         let replaces = match self.origin {
             Origin::Selected => Replaces::Read(planned.over),
@@ -1944,7 +1935,72 @@ impl Vault {
                 })?;
         }
         let installed: OnceCell<Result<bool, String>> = OnceCell::new();
-        let requested = || self.subscribe_queued(&installed);
+        let requested = || current().is_ok() && self.subscribe_queued(&installed);
+        if native_first {
+            self.ops
+                .prepare_bootstrap()
+                .map_err(|why| why.to_string())?;
+            let admitted = || {
+                current().map_err(aterm_secrets::Error::new)?;
+                if self.ops.configured()?.is_some() {
+                    return Err(aterm_secrets::Error::new(
+                        "the vault source changed while native bootstrap ran",
+                    ));
+                }
+                if !self.ops.swarm_enabled()? {
+                    return Err(aterm_secrets::Error::new(
+                        "sharing is off; bootstrap is held",
+                    ));
+                }
+                Ok(())
+            };
+            match self
+                .ops
+                .native_bootstrap(&admitted)
+                .map_err(|why| why.to_string())?
+            {
+                aterm_secrets::client::NativeAdmission::None => {
+                    admitted().map_err(|why| why.to_string())?
+                }
+                result => {
+                    current()?;
+                    self.subscribe()?;
+                    if result == aterm_secrets::client::NativeAdmission::Uncertain {
+                        let follows = if self.ops.turned_off() {
+                            "joining resumes when sync is on"
+                        } else {
+                            "sync retries automatically"
+                        };
+                        self.aside_also(format!("{NATIVE_ADMISSION_PENDING}; {follows}"));
+                    }
+                    // A successful proof is read back through the ordinary subscriber and
+                    // complete-materialization checks, never treated as readiness by itself.
+                    return Ok(());
+                }
+            }
+            let why = match look(self.ops.as_ref(), sys.macos(), interactive) {
+                Looked::Found => None,
+                Looked::NotHere => Some(NOT_HERE),
+                Looked::Refused => Some(LAN_REFUSED),
+                Looked::Unanswered => Some(LAN_UNANSWERED),
+            };
+            if let Some(why) = why {
+                current()?;
+                let running = self.subscribe()?;
+                let then = if running && !self.ops.turned_off() {
+                    "the subscriber retries setup automatically"
+                } else {
+                    "setup resumes once sync can run"
+                };
+                let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
+                let why = match aside.take() {
+                    Some(previous) => format!("{}; {why}; {then}", previous.why()),
+                    None => format!("{why}; {then}"),
+                };
+                *aside = Some(StoodAside::Offline(why));
+                return Ok(());
+            }
+        }
         let password = self
             .password
             .lock()
@@ -1961,6 +2017,7 @@ impl Vault {
             self.ops.say(&format!("joining {}…", shown(&self.source)));
         }
         let sent = password.is_some();
+        current()?;
         let outcome = self.ops.join(
             sys,
             (&self.source, &replaces),
@@ -1985,6 +2042,12 @@ impl Vault {
                     drop(password);
                 }
                 let why = format!("joining the vault: {why}");
+                if native_first && self.ops.configured().is_ok_and(|now| now.is_none()) {
+                    current()?;
+                    if self.subscribe_queued(&installed) {
+                        return Err(format!("{why}; the subscriber retries setup automatically"));
+                    }
+                }
                 // A join that fails after saving the vault (its request refused or its reply
                 // lost) leaves this Mac set to it and waiting, its request due at once: the
                 // subscriber that asks goes in now, as `aterm secrets join`'s does. A change to
@@ -2022,7 +2085,7 @@ impl Vault {
             let approve = status
                 .and_then(|status| status.approve_command())
                 .unwrap_or_else(|| format!("aterm secrets approve {code}"));
-            self.wait_to_be_let_in(Some(&approve), sent || !chosen);
+            self.wait_to_be_let_in(Some(&approve), sent);
         }
         Ok(())
     }
@@ -2091,10 +2154,10 @@ impl Vault {
             )
         };
         let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
-        *aside = Some(match aside.take() {
-            Some(then) => format!("{waiting}; {then}"),
+        *aside = Some(StoodAside::Waiting(match aside.take() {
+            Some(then) => format!("{waiting}; {}", then.why()),
             None => waiting,
-        });
+        }));
     }
 }
 
@@ -2468,11 +2531,21 @@ impl Item for Vault {
         probe
     }
 
-    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        current()?;
         self.set_aside(None);
         match self.origin {
             Origin::Configured => self.settle(),
-            Origin::Chosen => self.join(sys, self.asks),
+            Origin::Chosen => self.join(sys, self.asks, current),
             Origin::Selected => {
                 let status = self
                     .ops
@@ -2483,7 +2556,7 @@ impl Item for Vault {
                     Step::Join(_)
                         if planned.join && planned.over.as_ref() == status.config.as_ref() =>
                     {
-                        self.join(sys, false)
+                        self.join(sys, self.asks, current)
                     }
                     Step::Join(now) if !planned.join => Err(format!(
                         "this Mac's vault state changed after it was read ({now}), so nothing was changed; the next try plans the join"
@@ -2542,6 +2615,9 @@ impl Item for Vault {
 
     fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<StoodAside> {
         let planned = self.planned();
+        if self.native_first() {
+            return self.configured_since(&planned);
+        }
         if !(planned.join || (planned.files && !planned.subscribe)) {
             return None;
         }
@@ -2565,7 +2641,6 @@ impl Item for Vault {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .map(aterm_converge::StoodAside::Waiting)
     }
 
     fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
@@ -2625,6 +2700,10 @@ pub(crate) mod tests {
     /// every look for the ALab vault, join and subscriber install.
     #[derive(Default)]
     pub(crate) struct Scripted {
+        bootstrap: Mutex<Option<(aterm_secrets::client::NativeAdmission, Option<Status>)>>,
+        prepared: Mutex<u32>,
+        native_tries: Mutex<u32>,
+        stop_at_native: Mutex<Option<Arc<AtomicBool>>>,
         statuses: Mutex<VecDeque<aterm_secrets::Result<Status>>>,
         subscriber: Mutex<Option<aterm_secrets::Result<State>>>,
         terminal: Mutex<bool>,
@@ -2838,6 +2917,29 @@ pub(crate) mod tests {
     }
 
     impl SecretsOps for Scripted {
+        fn prepare_bootstrap(&self) -> aterm_secrets::Result<()> {
+            *self.prepared.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn native_bootstrap(
+            &self,
+            current: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+        ) -> aterm_secrets::Result<aterm_secrets::client::NativeAdmission> {
+            current()?;
+            *self.native_tries.lock().unwrap() += 1;
+            if let Some(stop) = self.stop_at_native.lock().unwrap().as_ref() {
+                stop.store(true, Ordering::SeqCst);
+                current()?;
+            }
+            let Some((admission, status)) = self.bootstrap.lock().unwrap().take() else {
+                return Ok(aterm_secrets::client::NativeAdmission::None);
+            };
+            if let Some(status) = status {
+                *self.statuses.lock().unwrap() = vec![Ok(status)].into();
+            }
+            Ok(admission)
+        }
         fn status(&self) -> aterm_secrets::Result<Status> {
             let mut statuses = self.statuses.lock().unwrap();
             if statuses.len() > 1 {
@@ -3121,6 +3223,116 @@ pub(crate) mod tests {
         let mut sys = Fake::root();
         sys.euid = 501;
         sys
+    }
+
+    #[test]
+    fn default_native_admission_precedes_discovery_and_requires_complete_readback() {
+        use aterm_secrets::client::NativeAdmission;
+        for (mode, incomplete) in [
+            (Mode::Plan, false),
+            (Mode::Apply, false),
+            (Mode::Apply, true),
+        ] {
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            *ops.bootstrap.lock().unwrap() = Some((
+                NativeAdmission::Admitted,
+                Some(configured(Membership::In { seq: 7, heard: 0 })),
+            ));
+            *ops.unwritten.lock().unwrap() = incomplete;
+            let rows = run(&sys, &ops, mode);
+            let want = if mode == Mode::Plan {
+                Outcome::NotApplicable
+            } else if incomplete {
+                Outcome::Failed
+            } else {
+                Outcome::Changed
+            };
+            assert_eq!(rows[0].outcome, want, "{mode:?}/{incomplete}: {rows:?}");
+            assert_eq!(ops.probes(), 0, "native admission preceded vault discovery");
+            assert!(ops.joins().is_empty());
+            assert_eq!(*ops.reached.lock().unwrap(), 0, "no HTTP preflight");
+            assert_eq!(
+                *ops.native_tries.lock().unwrap(),
+                u32::from(mode == Mode::Apply)
+            );
+            assert_eq!(
+                *ops.prepared.lock().unwrap(),
+                u32::from(mode == Mode::Apply)
+            );
+            assert_eq!(ops.installs(), u32::from(mode == Mode::Apply));
+        }
+    }
+
+    #[test]
+    fn ambiguous_native_admission_starts_its_subscriber_without_another_enrollment() {
+        use aterm_secrets::client::NativeAdmission;
+        let sys = fake();
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.bootstrap.lock().unwrap() = Some((NativeAdmission::Uncertain, None));
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Waiting(why)) if why.starts_with(NATIVE_ADMISSION_PENDING))
+        );
+        assert_eq!(ops.probes(), 0);
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+        assert!(ops.joins().is_empty());
+        assert_eq!(ops.installs(), 1);
+    }
+
+    #[test]
+    fn a_late_stop_reaches_native_publication_and_prevents_fallback() {
+        let sys = fake();
+        let context = ctx(&[user("alice", 501)]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let stopped = Arc::new(AtomicBool::new(false));
+        *ops.stop_at_native.lock().unwrap() = Some(Arc::clone(&stopped));
+        let rows = crate::init::run_initial_secrets_guarded(
+            &sys,
+            &context,
+            ops.clone(),
+            aterm_secrets::ALAB_DEFAULT_URL,
+            Replaces::Read(None),
+            &mut None,
+            Duration::ZERO,
+            &|| {
+                if stopped.load(Ordering::SeqCst) {
+                    Err("setup stopped during native proof".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Waiting(why)) if why.contains("setup stopped"))
+        );
+        assert_eq!(*ops.native_tries.lock().unwrap(), 1);
+        assert_eq!(ops.probes(), 0);
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+        assert!(ops.joins().is_empty());
+        assert_eq!(ops.installs(), 0);
+    }
+
+    #[test]
+    fn a_source_chosen_during_native_lookup_is_never_replaced_by_default_fallback() {
+        let sys = fake();
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let mut chosen = configured(Membership::Pending);
+        chosen.config.as_mut().unwrap().source =
+            Source::Url("https://chosen.example/v1/alab".into());
+        *ops.bootstrap.lock().unwrap() = Some((
+            aterm_secrets::client::NativeAdmission::None,
+            Some(chosen.clone()),
+        ));
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+        assert_eq!(ops.status().unwrap().config, chosen.config);
+        assert_eq!(ops.probes(), 0);
+        assert!(ops.joins().is_empty());
+        assert_eq!(ops.installs(), 0);
     }
 
     fn run(sys: &Fake, ops: &Arc<Scripted>, mode: Mode) -> Vec<ItemReport> {
@@ -3591,12 +3803,15 @@ pub(crate) mod tests {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
             *ops.probed.lock().unwrap() = Some(probed);
             let rows = run(&sys, &ops, Mode::Apply);
-            assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
-            assert_eq!(rows[0].why.as_deref(), Some(NOT_HERE));
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+            assert!(
+                matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(NOT_HERE))
+            );
             assert_eq!(asked(&sys), 0, "{:?}", sys.calls());
             assert_eq!(ops.probes(), 1);
             assert!(ops.joins().is_empty());
-            assert_eq!(ops.installs(), 0);
+            assert_eq!(ops.installs(), 1);
+            assert_eq!(*ops.prepared.lock().unwrap(), 1);
         }
 
         // Control: where the ALab vault answers, it is joined, and nothing is asked either.
@@ -3615,7 +3830,9 @@ pub(crate) mod tests {
             aterm_http::LOCAL_NETWORK_REFUSED
         ))));
         let rows = run(&sys, &ops, Mode::Apply);
-        assert_eq!(rows[0].why.as_deref(), Some(LAN_REFUSED));
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(LAN_REFUSED))
+        );
         assert_eq!(asked(&sys), 0);
     }
 
@@ -3654,14 +3871,16 @@ pub(crate) mod tests {
     fn off_the_console_the_open_alab_vault_is_joined_asking_nothing() {
         for here in [Here::Session, Here::Remote] {
             let sys = fake();
-            let ops = Scripted::new(vec![
-                Ok(unconfigured()),
-                Ok(unconfigured()),
-                Ok(configured(Membership::In {
-                    seq: 8,
-                    heard: 1_800_000_000,
-                })),
-            ]);
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            let after = configured(Membership::In {
+                seq: 8,
+                heard: 1_800_000_000,
+            });
+            let outcome = JoinOutcome::Joined {
+                seq: 8,
+                names: after.names.clone(),
+            };
+            ops.joins_as(Some(after), Ok(outcome));
             *ops.terminal.lock().unwrap() = false;
             ops.alab_answers();
             let rows = run_at(&sys, &ops, Mode::Apply, here);
@@ -3707,7 +3926,10 @@ pub(crate) mod tests {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
             *ops.probed.lock().unwrap() = Some(pending_look());
             let rows = run_at(&sys, &ops, Mode::Apply, here);
-            assert_eq!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{here:?}: {rows:?}");
+            assert!(
+                matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(LAN_UNANSWERED))
+            );
             assert_eq!(ops.probes(), 1, "{here:?}: one look, no wait");
             assert_eq!(*ops.pauses.lock().unwrap(), 0, "{here:?}");
             assert!(
@@ -3882,8 +4104,10 @@ pub(crate) mod tests {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
         *ops.probed.lock().unwrap() = Some(pending_look());
         let rows = run(&sys, &ops, Mode::Apply);
-        assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
-        assert_eq!(rows[0].why.as_deref(), Some(LAN_UNANSWERED));
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(LAN_UNANSWERED))
+        );
         assert_eq!(ops.probes(), LOCAL_NETWORK_TRIES);
         assert_eq!(asked(&sys), 0);
 
@@ -3894,8 +4118,10 @@ pub(crate) mod tests {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
         *ops.probed.lock().unwrap() = Some(pending_look());
         let rows = run(&sys, &ops, Mode::Apply);
-        assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
-        assert_eq!(rows[0].why.as_deref(), Some(NOT_HERE));
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(NOT_HERE))
+        );
         assert_eq!(ops.probes(), 1);
         assert_eq!(*ops.pauses.lock().unwrap(), 0);
         assert!(
@@ -3916,7 +4142,10 @@ pub(crate) mod tests {
             io::Error::from_raw_os_error(libc::EHOSTUNREACH)
         ))));
         let rows = run(&sys, &ops, Mode::Apply);
-        assert_eq!(rows[0].why.as_deref(), Some(NOT_HERE), "{rows:?}");
+        assert!(
+            matches!(&rows[0].stood_aside, Some(StoodAside::Offline(why)) if why.starts_with(NOT_HERE)),
+            "{rows:?}"
+        );
         assert_eq!(ops.probes(), 1);
         assert_eq!(*ops.pauses.lock().unwrap(), 0);
         assert_eq!(asked(&sys), 0);
@@ -4032,14 +4261,16 @@ pub(crate) mod tests {
     #[test]
     fn the_alab_vault_answering_is_joined_with_no_join_password_asked() {
         let sys = fake();
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In {
-                seq: 8,
-                heard: 1_800_000_000,
-            })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let after = configured(Membership::In {
+            seq: 8,
+            heard: 1_800_000_000,
+        });
+        let outcome = JoinOutcome::Joined {
+            seq: 8,
+            names: after.names.clone(),
+        };
+        ops.joins_as(Some(after), Ok(outcome));
         ops.alab_answers();
         *ops.requests.lock().unwrap() = true;
         let rows = run(&sys, &ops, Mode::Apply);
@@ -4058,13 +4289,6 @@ pub(crate) mod tests {
         );
         assert_eq!(*ops.installed_by_join.lock().unwrap(), [1]);
         assert_eq!(*ops.hooked.lock().unwrap(), [true]);
-        assert_eq!(
-            *ops.said.lock().unwrap(),
-            [
-                "the ALab vault answers on this network".to_owned(),
-                format!("joining {}…", aterm_secrets::ALAB_DEFAULT_URL)
-            ]
-        );
     }
 
     /// A run aterm decided with a person at the console ([`Here::Unbidden`]) shows them the
@@ -4077,14 +4301,16 @@ pub(crate) mod tests {
     #[test]
     fn a_run_aterm_decided_joins_the_alab_vault_asking_nothing() {
         let sys = fake();
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In {
-                seq: 8,
-                heard: 1_800_000_000,
-            })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let after = configured(Membership::In {
+            seq: 8,
+            heard: 1_800_000_000,
+        });
+        let outcome = JoinOutcome::Joined {
+            seq: 8,
+            names: after.names.clone(),
+        };
+        ops.joins_as(Some(after), Ok(outcome));
         ops.alab_answers();
         let rows = run_at(&sys, &ops, Mode::Apply, Here::Unbidden);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
@@ -4225,14 +4451,16 @@ pub(crate) mod tests {
     fn without_a_terminal_the_open_alab_vault_is_joined_and_a_named_vault_is_left() {
         let sys = fake();
         sys.answer(Some(aterm_secrets::ALAB_DEFAULT_URL));
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In {
-                seq: 8,
-                heard: 1_800_000_000,
-            })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let after = configured(Membership::In {
+            seq: 8,
+            heard: 1_800_000_000,
+        });
+        let outcome = JoinOutcome::Joined {
+            seq: 8,
+            names: after.names.clone(),
+        };
+        ops.joins_as(Some(after), Ok(outcome));
         ops.alab_answers();
         *ops.terminal.lock().unwrap() = false;
         let rows = run(&sys, &ops, Mode::Apply);
@@ -4392,13 +4620,16 @@ pub(crate) mod tests {
             status
         };
         let joining = |status: Status| {
-            let ops = Scripted::new(vec![Ok(unconfigured()), Ok(unconfigured()), Ok(status)]);
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
             ops.alab_answers();
             *ops.requests.lock().unwrap() = true;
-            *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
-                code: CODE.into(),
-                host: "m22".into(),
-            }));
+            ops.joins_as(
+                Some(status),
+                Ok(JoinOutcome::Pending {
+                    code: CODE.into(),
+                    host: "m22".into(),
+                }),
+            );
             ops
         };
         let waiting = |ops: &Arc<Scripted>| {
@@ -4476,17 +4707,16 @@ pub(crate) mod tests {
     fn a_join_that_waits_for_an_admin_stands_aside_naming_the_code() {
         let sys = fake();
         sys.answer(None);
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::Pending)),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
         ops.alab_answers();
         *ops.requests.lock().unwrap() = true;
-        *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
-            code: CODE.into(),
-            host: "m22".into(),
-        }));
+        ops.joins_as(
+            Some(configured(Membership::Pending)),
+            Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }),
+        );
         let rows = run(&sys, &ops, Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
         assert!(matches!(rows[0].stood_aside, Some(StoodAside::Waiting(_))));
@@ -4513,20 +4743,19 @@ pub(crate) mod tests {
     fn a_join_that_gave_up_waiting_on_a_mac_the_subscriber_let_in_is_done() {
         let sys = fake();
         sys.answer(None);
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In {
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        *ops.requests.lock().unwrap() = true;
+        ops.joins_as(
+            Some(configured(Membership::In {
                 seq: 8,
                 heard: 1_800_000_000,
             })),
-        ]);
-        ops.alab_answers();
-        *ops.requests.lock().unwrap() = true;
-        *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
-            code: CODE.into(),
-            host: "m22".into(),
-        }));
+            Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }),
+        );
         let rows = run(&sys, &ops, Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
         assert_eq!(rows[0].why, None);
@@ -4569,16 +4798,15 @@ pub(crate) mod tests {
 
         let sys = fake();
         configured_github(&sys);
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::Pending)),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
         ops.alab_answers();
-        *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
-            code: CODE.into(),
-            host: "m22".into(),
-        }));
+        ops.joins_as(
+            Some(configured(Membership::Pending)),
+            Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }),
+        );
         let port: Arc<dyn SecretsOps> = ops.clone();
         let step = items(&sys, &context, port, Mode::Apply, None).unwrap();
         let mut all = step.items;
@@ -4930,9 +5158,11 @@ pub(crate) mod tests {
         assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
         assert_eq!(
             rows[0].why.as_deref(),
-            Some("joining the vault: vault alab: the signature does not verify")
+            Some(
+                "joining the vault: vault alab: the signature does not verify; the subscriber retries setup automatically"
+            )
         );
-        assert_eq!(ops.installs(), 0);
+        assert_eq!(ops.installs(), 1);
 
         // A join that fails after saving the vault (its request refused) leaves this Mac set to
         // it and waiting: the subscriber that asks again goes in, and the row says so.
@@ -5075,7 +5305,7 @@ pub(crate) mod tests {
         let ops: Arc<dyn SecretsOps> = Scripted::new(vec![Ok(unconfigured())]);
         let two = ctx(&[user("alice", 501), user("bob", 502)]);
         assert!(items(&sys, &two, ops, Mode::Plan, None).is_err());
-        assert!(live(&two, None).is_err());
+        assert!(live(&two).is_err());
         assert!(unattended(&two).is_err());
     }
 
@@ -5205,11 +5435,14 @@ pub(crate) mod tests {
         assert!(fleeting_wait(&image).contains(moved));
         assert!(!fleeting_wait(&image).contains("--program"));
 
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In { seq: 7, heard: 0 })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: Vec::new(),
+            }),
+        );
         *ops.requests.lock().unwrap() = true;
         *ops.fleeting.lock().unwrap() = Some(image.clone());
         let row = setup_pass(&ops, source, &mut Some(password()), false);
@@ -5226,11 +5459,15 @@ pub(crate) mod tests {
         assert_eq!(row.why.as_deref(), Some(fleeting_wait(&image).as_str()));
         assert_eq!(ops.changes(), ["install"]);
 
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::Pending)),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        ops.joins_as(
+            Some(configured(Membership::Pending)),
+            Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }),
+        );
         *ops.requests.lock().unwrap() = true;
         *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
             code: CODE.into(),
@@ -5273,11 +5510,15 @@ pub(crate) mod tests {
     #[test]
     fn the_setup_stage_journals_into_the_accounts_journal() {
         let sys = fake();
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In { seq: 7, heard: 0 })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: Vec::new(),
+            }),
+        );
         *ops.requests.lock().unwrap() = true;
         let port: Arc<dyn SecretsOps> = ops.clone();
         let rows = crate::init::run_initial_secrets(
@@ -5453,11 +5694,15 @@ pub(crate) mod tests {
     fn a_selected_join_waits_for_an_admin_only_with_the_join_password() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
         for typed in [false, true] {
-            let ops = Scripted::new(vec![Ok(unconfigured()), Ok(unconfigured())]);
-            *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
-                code: CODE.into(),
-                host: "m22".into(),
-            }));
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.alab_answers();
+            ops.joins_as(
+                Some(configured(Membership::Pending)),
+                Ok(JoinOutcome::Pending {
+                    code: CODE.into(),
+                    host: "m22".into(),
+                }),
+            );
             let mut held = typed.then(password);
             let row = setup_pass(&ops, source, &mut held, false);
             let wait = if typed { SETUP_WAIT } else { Duration::ZERO };
@@ -5652,6 +5897,14 @@ pub(crate) mod tests {
         }
 
         let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: Vec::new(),
+            }),
+        );
         *ops.turned_off.lock().unwrap() = true;
         let _ = setup_pass(&ops, source, &mut None, false);
         assert_eq!(ops.joins().len(), 1, "the join is made");
@@ -5668,6 +5921,14 @@ pub(crate) mod tests {
     fn the_converge_join_keeps_a_turn_off_recorded_since_its_read() {
         for off in [true, false] {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.alab_answers();
+            ops.joins_as(
+                Some(configured(Membership::In { seq: 7, heard: 0 })),
+                Ok(JoinOutcome::Joined {
+                    seq: 7,
+                    names: Vec::new(),
+                }),
+            );
             *ops.turned_off.lock().unwrap() = off;
             let port: Arc<dyn SecretsOps> = ops.clone();
             let rows = crate::init::run_converge_join(
@@ -5893,11 +6154,14 @@ pub(crate) mod tests {
             config.name = "team".into();
             team
         };
-        let ops = Scripted::new(vec![
-            Ok(team()),
-            Ok(team()),
-            Ok(configured(Membership::In { seq: 7, heard: 0 })),
-        ]);
+        let ops = Scripted::new(vec![Ok(team())]);
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: vec!["gh_access_token".into()],
+            }),
+        );
         ops.subscribed(Ok(installed_state()));
         let row = setup_pass(&ops, source, &mut Some(password()), false);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
@@ -5939,11 +6203,15 @@ pub(crate) mod tests {
         assert!(ops.joins().is_empty());
         assert!(held.is_some());
 
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In { seq: 7, heard: 0 })),
-        ]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: vec!["gh_access_token".into()],
+            }),
+        );
         let row = setup_pass(&ops, source, &mut None, false);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
         assert_eq!(ops.changes(), [format!("join {source}"), "install".into()]);
@@ -6660,11 +6928,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_offline_join_at_the_terminal_stands_aside_before_anything_is_made() {
+    fn an_offline_default_join_keeps_bootstrap_and_its_subscriber_for_retry() {
         let sys = fake();
         sys.answer(None);
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        ops.alab_answers();
         *ops.unreachable.lock().unwrap() =
             Some(Look::Unreached("alab-secrets.local: no such host".into()));
         let rows = run(&sys, &ops, Mode::Apply);
@@ -6674,7 +6941,36 @@ pub(crate) mod tests {
             Some(69)
         );
         assert!(ops.joins().is_empty());
+        assert_eq!(*ops.prepared.lock().unwrap(), 1);
+        assert_eq!(*ops.native_tries.lock().unwrap(), 1);
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+        assert_eq!(ops.changes(), ["install"]);
+    }
+
+    #[test]
+    fn an_offline_explicit_join_stands_aside_before_anything_is_made() {
+        let sys = fake();
+        sys.answer(None);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.unreachable.lock().unwrap() =
+            Some(Look::Unreached("vault.example: no such host".into()));
+        let rows = run_with(
+            &sys,
+            &ops,
+            Mode::Apply,
+            Some("https://vault.example/v1/team"),
+        );
+        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert_eq!(
+            rows[0].stood_aside.as_ref().map(StoodAside::exit_status),
+            Some(69)
+        );
+        assert!(ops.joins().is_empty());
+        assert_eq!(*ops.prepared.lock().unwrap(), 0);
+        assert_eq!(*ops.native_tries.lock().unwrap(), 0);
+        assert_eq!(*ops.reached.lock().unwrap(), 1);
         assert_eq!(ops.installs(), 0);
+        assert!(ops.changes().is_empty());
     }
 
     /// A join waiting to be let in on a Mac with Sync off says so and is no step and nothing to
@@ -6780,12 +7076,15 @@ pub(crate) mod tests {
             "no LAN probe while [swarm] enabled = false"
         );
         assert!(ops.changes().is_empty());
-        // Negative control: flipping `[swarm] enabled` back on probes and joins the answering vault.
-        let ops = Scripted::new(vec![
-            Ok(unconfigured()),
-            Ok(unconfigured()),
-            Ok(configured(Membership::In { seq: 7, heard: 0 })),
-        ]);
+        // Negative control: sharing enabled admits native bootstrap and the answering vault join.
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.joins_as(
+            Some(configured(Membership::In { seq: 7, heard: 0 })),
+            Ok(JoinOutcome::Joined {
+                seq: 7,
+                names: vec!["gh_access_token".into()],
+            }),
+        );
         ops.alab_answers();
         *ops.swarm.lock().unwrap() = Some(Ok(true));
         let sys = fake();
@@ -6793,5 +7092,7 @@ pub(crate) mod tests {
         let row = run(&sys, &ops, Mode::Apply).remove(0);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
         assert_eq!(ops.probes(), 1);
+        assert_eq!(*ops.prepared.lock().unwrap(), 1);
+        assert_eq!(*ops.native_tries.lock().unwrap(), 1);
     }
 }

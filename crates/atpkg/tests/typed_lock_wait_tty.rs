@@ -46,7 +46,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
         cmd.arg("seed")
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))

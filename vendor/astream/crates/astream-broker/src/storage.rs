@@ -297,9 +297,13 @@ impl Backing {
         }
     }
 
-    /// Exactly `len` bytes from byte `start`, by a POSITIONAL read (`pread`): the file
-    /// offset the appends use is never moved, so a reader holding only `&self` (a cold
-    /// record read under the log's shared borrow) cannot disturb the next write.
+    /// Exactly `len` bytes from byte `start`, by a POSITIONAL read. On Unix (`pread`) the
+    /// file offset the appends write at is never moved, so a reader holding only `&self` (a
+    /// cold record read under the log's shared borrow) cannot disturb the next write. On
+    /// Windows the read (`seek_read`) leaves that offset at the end of what it read, and the
+    /// appends ([`write_all`](Self::write_all), [`BatchOut::write_all`]) write at it, so
+    /// there a cold read followed by an append before any [`seek_end`](Self::seek_end)
+    /// writes the append inside the log.
     pub(crate) fn read_at(&self, start: u64, len: usize) -> io::Result<Vec<u8>> {
         match self {
             Backing::Os(f) => {
@@ -316,6 +320,29 @@ impl Backing {
                     .map(<[u8]>::to_vec)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
             }
+        }
+    }
+
+    /// The file's length in bytes.
+    pub(crate) fn len(&self) -> io::Result<u64> {
+        match self {
+            Backing::Os(f) => Ok(f.metadata()?.len()),
+            #[cfg(any(test, debug_assertions))]
+            Backing::Sim(s) => Ok(s.log_len() as u64),
+        }
+    }
+
+    /// Up to `buf.len()` bytes from byte `start`, by POSITIONAL reads, fewer only where the
+    /// file ends: how many were read. The open's scan reads the log through it a window at
+    /// a time (`open_scan.rs`). On Unix (`pread`) that leaves the file offset the appends
+    /// write at where it was; on Windows (`seek_read`) it moves it to the end of each read,
+    /// as [`read_at`](Self::read_at) does, and the open puts it back at the end of the file
+    /// (`flush_open_phase1`'s [`seek_end`](Self::seek_end)) before its first append.
+    pub(crate) fn read_some_at(&self, start: u64, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Backing::Os(f) => read_some_at(f, buf, start),
+            #[cfg(any(test, debug_assertions))]
+            Backing::Sim(s) => Ok(s.read_log_at(start, buf)),
         }
     }
 
@@ -353,6 +380,40 @@ impl Backing {
     }
 }
 
+/// Up to `buf.len()` bytes of `file` from byte `start`, by positional reads, fewer only
+/// where the file ends: how many were read.
+pub(crate) fn read_some_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<usize> {
+    let mut got = 0usize;
+    while !buf.is_empty() {
+        let n = match read_once_at(file, buf, start) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        got = got.saturating_add(n);
+        start = start.saturating_add(n as u64);
+        let rest = std::mem::take(&mut buf);
+        buf = rest.get_mut(n..).unwrap_or(&mut []);
+    }
+    Ok(got)
+}
+
+/// One positional read of `file` into `buf` from byte `start`.
+#[cfg(unix)]
+fn read_once_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, start)
+}
+
+/// One positional read of `file` into `buf` from byte `start` (`seek_read`, which leaves the
+/// file offset at the end of what it read).
+#[cfg(windows)]
+fn read_once_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, start)
+}
+
 /// `pread` the whole of `buf` from byte `start` of `file`.
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
@@ -360,7 +421,8 @@ fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
     file.read_exact_at(buf, start)
 }
 
-/// `pread` the whole of `buf` from byte `start` of `file`.
+/// The whole of `buf` from byte `start` of `file`, by `seek_read`s, which leave the file
+/// offset at the end of what they read.
 #[cfg(windows)]
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -446,7 +508,9 @@ impl FlushHandle {
 /// replaces the file), the un-batched retirement, the fenced replica append, the clean
 /// close and its read-back of the newest frame (`staged` stays non-empty, and `writing`
 /// set, from the batch's begin to its end) — and the broker's retention calls also take
-/// the writer's batch lock first, so they wait for the batch instead.
+/// the writer's batch lock first, so they wait for the batch instead. A cold read
+/// ([`Backing::read_at`]) runs under the lock while a batch is written, and moves the offset
+/// on Windows alone, where that holds only while no cold read runs.
 pub(crate) struct BatchOut(HandleBacking);
 
 impl BatchOut {

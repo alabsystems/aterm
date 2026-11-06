@@ -649,8 +649,8 @@ fn harness_update_rows(
             .map(|row| format!("{} · {}", row.title, row.detail))
             .unwrap_or_else(|| "Not read yet. Open AI CLI versions to refresh.".to_string())
     };
-    // Every harness by the name its top rule reads (`alab <cli> harness`), with its own version,
-    // built into this aterm build.
+    // Every harness by the name its launch card reads (`alab <cli> harness`), with its own
+    // version, built into this aterm build.
     let mut rows: Vec<(String, String)> = aterm_phase::CliHarness::ALL
         .iter()
         .map(|h| {

@@ -44400,3 +44400,48 @@ fn time_alone_never_makes_another_usage_read_due() {
     idle.turn_ran();
     assert!(idle.account_probe().is_ok(), "a turn ran: the read is due");
 }
+
+/// A PROGRAM WORKER HAS STARTED ONCE ITS SHELL RAN THE LINE ITS LAUNCHER TYPED
+/// (`crate::program_worker::started`): one the startup deadline stalled before its launcher typed,
+/// in whose tab a person then ran a command, has not, so its stall is never marked working again
+/// by that command. NEGATIVE CONTROL: the same tab with that block noted as the one typed into is a
+/// start.
+#[test]
+fn a_program_worker_starts_only_at_the_line_its_launcher_typed() {
+    use crate::task_record::TaskState;
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(3);
+    {
+        let mut timeline = h.ctx.timeline.lock().unwrap();
+        let mut mark = crate::task_record::TaskMark::new(TaskState::Stalled);
+        mark.why = Some("startup");
+        timeline.mark_task(&mark, false, Instant::now(), 0);
+        timeline.set_task_worker(Program::Generic, None);
+    }
+    let block = {
+        let mut term = h.term.lock().unwrap();
+        term.process(b"\x1b]133;A\x07% \x1b]133;B\x07");
+        let block = term.all_blocks().last().expect("its prompt").id;
+        term.process(b"ls\r\n\x1b]133;C\x07Cargo.toml\r\n\x1b]133;D;0\x07\x1b]133;A\x07% ");
+        block
+    };
+    store.write().unwrap().register(h.clone());
+    let seen = || {
+        startups_on(&store, &std::collections::HashSet::new(), &|| None)
+            .into_iter()
+            .find(|w| w.sid == h.sid.as_str())
+            .expect("listed")
+            .seen
+    };
+    assert_ne!(
+        seen(),
+        StartupSeen::Started,
+        "a person's command is no start of its program"
+    );
+    assert!(crate::task_record::note_program_block(
+        &h.ctx,
+        block,
+        Duration::ZERO
+    ));
+    assert_eq!(seen(), StartupSeen::Started, "CONTROL: its typed line ran");
+}

@@ -55,7 +55,7 @@ impl Fixture {
     }
 
     fn lane(&self, payload: &[u8], extra: &[&str]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        let mut child = Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(["lane", "--json", "tool_input.command"])
             .args(extra)
             .current_dir(&self.checkout)

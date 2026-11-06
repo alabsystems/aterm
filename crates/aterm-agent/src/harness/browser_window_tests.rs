@@ -226,6 +226,39 @@ fn the_window_ends_on_enter_with_a_hangup_and_waits_before_any_kill() {
     );
 }
 
+/// A WINDOW ITS HOST SLEPT PAST ENDS AT ITS FIRST LOOK AFTER THE HOST WAKES (KI-1105-14): a window
+/// given an hour, whose host slept two hours once the browser was up, ends `TimeLimit` at its
+/// next look, with a hangup, which the browser exits on. NEGATIVE CONTROL: the hour measured on the clock
+/// that stops in sleep alone was left, so the window waited until the stand-in gave up on its own
+/// at a minute (`Exited(1)`) or the one-minute hang detector reports it.
+#[cfg(unix)]
+#[test]
+fn a_window_its_host_slept_past_ends_at_its_first_look() {
+    let dir = aterm_tempfile::tempdir().expect("tmp");
+    let at = dir.path().to_string_lossy().into_owned();
+    let ready = dir.path().join("ready");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The window's deadline is made on this thread, under its seam.
+    std::thread::spawn(move || {
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let slept = std::cell::Cell::new(false);
+        // The host sleeps once the browser handles a hangup.
+        let ended = || {
+            if ready.is_file() && !slept.replace(true) {
+                super::super::wake_deadline::host_slept(Duration::from_secs(2 * 3600));
+            }
+            None
+        };
+        let hour = Duration::from_secs(3600);
+        let _ = tx.send(window_with(&["hup", &at], hour, hour, &ended));
+    });
+    let end = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).expect(
+        "the window waited on the clock that stops in sleep, past the hour its host slept through",
+    );
+    assert_eq!(end, WindowEnd::TimeLimit);
+    assert!(dir.path().join("hup").is_file(), "it was hung up on");
+}
+
 /// A browser the person quits ends the window with no signal sent: `Quit`, no hangup marker.
 /// CONTROL: one that exits 21 by itself is `Exited(21)`.
 #[cfg(unix)]

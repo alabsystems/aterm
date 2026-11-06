@@ -14,10 +14,9 @@ use crate::trail_rig::TrailRig;
 use std::time::{Duration, Instant};
 
 /// The font the rig draws, as the dump draws it.
-const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
+fn fixture_font() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf")
+}
 
 /// The row the new composer's `❯` lands on (0-based) on the rig's 24-row grid, which is also its
 /// rule's 1-based row.
@@ -72,7 +71,7 @@ fn composer(rule: u16, cols: u16) -> Vec<u8> {
 /// `seen`, `seen + 16 ms` and `seen + 32 ms`, each read for the streak's light on the new
 /// composer's prompt row in that pane.
 fn landing(path: Path, landed: u64, seen: u64) -> Vec<Vec<(u16, u16, u16)>> {
-    let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
+    let mut rig = TrailRig::new(&fixture_font()).expect("the rig");
     let t0 = rig.t0();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     rig.configure("trail_sounds = false\nmotion = \"full\"\n", t0)

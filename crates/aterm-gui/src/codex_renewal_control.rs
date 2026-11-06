@@ -1858,7 +1858,9 @@ mod tests {
             inode: 1,
         };
         let policy = crate::native_session_policy::FixturePolicy::new(
-            aterm_agent::harness::contract::ROSTER,
+            std::slice::from_ref(
+                aterm_agent::harness::contract::row_named("grok-alab").expect("rostered"),
+            ),
             vec![crate::native_session_policy::FixtureImages {
                 row: "grok-alab",
                 images: vec![image],

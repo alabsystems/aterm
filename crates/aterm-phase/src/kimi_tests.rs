@@ -275,7 +275,7 @@ fn a_claude_code_screen_quoting_kimi_codes_welcome_is_still_claude_codes() {
 /// frames and over a thousand of the other programs'.
 #[test]
 fn its_footer_claims_no_other_programs_screen() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .flatten()

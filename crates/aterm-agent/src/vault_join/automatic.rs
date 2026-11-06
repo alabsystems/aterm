@@ -80,6 +80,10 @@ trait Backend: Send + Sync + 'static {
     fn refuses(&self, _proving: &desk::Proving<'_>, _peer: IpAddr) -> Option<String> {
         Some(UNAVAILABLE.to_owned())
     }
+    /// Public acknowledged membership evidence, before the joining Mac sends possession.
+    fn authority(&self, _proving: &desk::Proving<'_>) -> Result<Vec<u8>> {
+        Err(Error::new(UNAVAILABLE))
+    }
     #[cfg(test)]
     fn waiting(&self, _until: Instant) {}
 }
@@ -106,6 +110,10 @@ impl Backend for Vault {
 
     fn refuses(&self, proving: &desk::Proving<'_>, peer: IpAddr) -> Option<String> {
         aterm_secrets::client::refuses_before_possession(&self.paths, proving, book(proving, peer))
+    }
+
+    fn authority(&self, proving: &desk::Proving<'_>) -> Result<Vec<u8>> {
+        aterm_secrets::client::member_authority(&self.paths, proving)
     }
 }
 
@@ -268,6 +276,17 @@ impl AutomaticJoinHandle {
                 Some(UNAVAILABLE.to_owned())
             }
         };
+        let authority = |proving: &desk::Proving<'_>| {
+            if proving.lan != home || !current() {
+                return Err(Error::new(UNAVAILABLE));
+            }
+            let witness = backend.authority(proving)?;
+            if proving.lan == home && current() {
+                Ok(witness)
+            } else {
+                Err(Error::new(UNAVAILABLE))
+            }
+        };
         desk::serve_with_request_policy(
             &desk,
             stream,
@@ -276,6 +295,7 @@ impl AutomaticJoinHandle {
             Some(desk::Proof {
                 decide: &decide,
                 refuses: &refuses,
+                authority: Some(&authority),
                 fleet: None,
             }),
             &request_policy,

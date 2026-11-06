@@ -257,7 +257,8 @@ pub const SECRET_LEN: usize = FleetSecret::MIN_LEN;
 /// ([`Signed`]) takes some 160 bytes of it. An aterm before 0.147 reads 512 at most.
 pub const RECORD_MAX: usize = 1024;
 
-const PEERS_FILE_MAX: usize = 256 * 1024;
+/// Maximum bytes in either on-disk fleet book, shared by strict readers of signed claims.
+pub const PEERS_FILE_MAX: usize = 256 * 1024;
 
 /// How long a take of the book's lock waits for another writer, which holds it for one
 /// read-modify-write ([`write_held`]), before it refuses: in a debug build, a test's wait on its
@@ -6318,6 +6319,11 @@ impl Drop for Opened<'_> {
     }
 }
 
+/// What a lookup that ran out says of its host ([`Unreached::Lookup`]): nothing answered for it.
+/// A caller that knows more (a browse that just heard the name, as `aterm members join`'s does)
+/// reads it to say why.
+pub const LOOKUP_UNANSWERED: &str = "no DNS or multicast-DNS answer";
+
 /// Why a peer was not reached, as a person can act on it. A survey or a drive reports a node
 /// it judged wrong (`OtherNode`, `Impostor`, `Misnamed`, `Unproved`, `Unbound`) only once the
 /// peer's host name did not answer as the target either.
@@ -6715,7 +6721,7 @@ impl fmt::Display for Unreached {
             }
             Self::Lookup(host, within) => write!(
                 f,
-                "{host} did not resolve within {:.1}s (no DNS or multicast-DNS answer)",
+                "{host} did not resolve within {:.1}s ({LOOKUP_UNANSWERED})",
                 within.as_secs_f64()
             ),
             Self::Reply(addr, why) => write!(f, "{addr} {why}"),

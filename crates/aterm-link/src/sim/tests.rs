@@ -1225,7 +1225,46 @@ fn each_rule_switched_off_is_caught() {
             "neither answered nor expired",
             282,
         ),
+        // The keyed world's own bug (F23): a keyed re-post published past a cut that carried
+        // its key's winner unread and dropped its dedup key lands a second copy of the key. The
+        // world's first census, before the read back, broke the key law in 311 of 512 seeds, so
+        // the bug is a control here, not a found row: its first seed is this row's.
+        (
+            "a keyed re-post reads its key's winner back before it is published (F23)",
+            Box::new(|s| keyed(s).with(Mutant::KeyedRepostWithoutReadingBack)),
+            "key:",
+            1,
+        ),
+        // Critic item F21's, in the stray world (F23, [`Opts::strays`]): another writer under
+        // the node's producer id at a refused publish's sequence, so a retry at its pin meets
+        // a dedup answer it cannot vouch for (case 5).
+        (
+            "an unverifiable answer holds its own sender (F21)",
+            Box::new(|s| strayed(s).with(Mutant::UnverifiableHoldsNothing)),
+            "order:",
+            6,
+        ),
+        (
+            "an unverifiable answer leaves the link up (F21)",
+            Box::new(|s| strayed(s).with(Mutant::UnverifiableDropsTheLink)),
+            "order:",
+            115,
+        ),
+        (
+            "the attach's replay holds an unverifiable entry's lane (F21)",
+            Box::new(|s| strayed(s).with(Mutant::ReplayPastAnUnverifiableEntry)),
+            "order:",
+            115,
+        ),
     ];
+    // Critic item F21's other two rules have no sim witness: in 3,000 seeds of the stray world
+    // neither `Mutant::HeldRecordWaitsForTheHold` nor `Mutant::HoldPastTheListing` breaks a law
+    // (measured 2026-11-05). Each needs the attach's replay to meet an unverifiable entry, a
+    // refused publish whose answer a kill lost, and then another entry of its lane: read back
+    // on the bus (the first), or whose post left aterm's outbox while retention gave its record
+    // up (the second). And the first's harm is a delay no law bounds: the held record's
+    // deliveries drop the link only until the hold ends, at the next cut that drops the stray's
+    // key. Their controls stay bridge unit tests on a real broker.
     // The replay's drain rule (a record the attach published again is delivered once its
     // post is retired, sim item S7) is held by bridge's
     // `a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once`, whose
@@ -1263,6 +1302,10 @@ fn each_rule_switched_off_is_caught() {
         "an answer is delivered only once the deadline it settles is off the disk (F4)",
         "an attach takes a hand-off's files before its incarnation (F4)",
         "an adoption names the attach of the hand-off it takes (F4)",
+        // F21's, each first met at seed 115 of the stray world: a link dropped at an
+        // unverifiable answer, or a replay past one, sends a sender's later post ahead of it.
+        "an unverifiable answer leaves the link up (F21)",
+        "the attach's replay holds an unverifiable entry's lane (F21)",
     ];
     const RAREST: &[&str] = &["the incarnation lease is trusted only in the boot that wrote it"];
     for rare in RARE.iter().chain(RAREST) {
@@ -3869,6 +3912,86 @@ fn on_a_clean_disk(seed: u64) -> Opts {
     }
 }
 
+/// The keyed world (critic item F23, [`Opts::keys`]): the seed's world, its notes keyed half the
+/// time and re-posted under their keys, a cut landing after one dedup answer in two.
+fn keyed(seed: u64) -> Opts {
+    Opts {
+        keys: true,
+        ..Opts::seed(seed)
+    }
+}
+
+/// The stray world (critic item F23, [`Opts::strays`]): the seed's world over a retained broker,
+/// another writer under the node's producer id taking the sequence of one refused publish in
+/// two, a cut landing after one dedup answer in two. Retained, as every broker aterm ships: on
+/// one that set no rules nothing drops a stray record's key, so nothing ends the hold it
+/// puts on a sender (the limit `Bridge::unverified_publication` states).
+fn strayed(seed: u64) -> Opts {
+    Opts {
+        strays: true,
+        retained: true,
+        ..Opts::seed(seed)
+    }
+}
+
+/// The unverifiable answers the outcomes met, by case (index 0 is case 1).
+fn unverifiable_by_case(outs: &[Outcome]) -> [u64; 5] {
+    outs.iter().fold([0u64; 5], |mut all, out| {
+        for (sum, n) in all.iter_mut().zip(out.stats.unverifiable) {
+            *sum += n;
+        }
+        all
+    })
+}
+
+/// **A SENDER AN UNVERIFIABLE ANSWER HOLDS WAITS ALONE, AND ITS POSTS LAND IN ORDER** (the F23
+/// sim's stray world, [`Opts::strays`]): another writer under the node's producer id takes the
+/// sequence of one refused publish in two, so the node's retry at its pin meets a dedup answer
+/// with a record of none of the pin's faces (`Bridge::unverified_publication`'s case 5), or,
+/// a cut landing after the answer, one whose record retention gave up before its read back
+/// (case 4). Each holds only its own sender's lane ([`crate::unverified_hold`]) until the cut
+/// that drops the stray's key, and every law holds: the sender's posts on the bus in its order,
+/// every post and receipt retired once settled, the world settling while others' posts land.
+/// The answers are counted ([`crate::fx::ReservationTap`]); F21's mutants are found here
+/// ([`each_rule_switched_off_is_caught`]).
+#[test]
+fn every_seed_of_the_stray_world_holds_every_law() {
+    let outs = run_all(&strayed, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds of the stray world broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let sum = |field: fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| field(&out.stats)).sum()
+    };
+    let unverifiable = unverifiable_by_case(&outs);
+    let counts = [
+        ("stray records", sum(|s| s.strays)),
+        (
+            "cuts between a dedup answer and the next request",
+            sum(|s| s.cuts_after_dedup),
+        ),
+        ("unverifiable answers of case 5", unverifiable[4]),
+    ];
+    eprintln!(
+        "the stray world over {SEEDS} seeds: {counts:?}; unverifiable by case {unverifiable:?}, \
+         verified {}, collisions {}, weeks the settle let pass for a stray {}",
+        sum(|s| s.reservations_verified),
+        sum(|s| s.reservation_collisions),
+        sum(|s| s.stray_weeks)
+    );
+    for &(what, n) in &counts {
+        assert!(n > 0, "the seeds met no {what}: {counts:?}");
+    }
+}
+
 fn both_ways_erring(seed: u64) -> Opts {
     Opts {
         write_errors: true,
@@ -3939,6 +4062,78 @@ fn every_seed_of_the_fetching_world_holds_every_law() {
         ("opens under changed rules", sum(|s| s.changed_starts)),
     ];
     eprintln!("the fetching world over {SEEDS} seeds: {counts:?}");
+    for &(what, n) in &counts {
+        assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
+    }
+}
+
+/// **A KEY'S POSTS ARE ONE POST ON THE BUS** (the F23 sim's keyed world, [`Opts::keys`]): half
+/// the notes carry an idempotency key and are posted again under it, a cut lands after one
+/// dedup answer in two, and every law holds, the key's own ([`super::world`]'s `key_copies`)
+/// among them: a re-post is retired at its key's earlier record (`dup=1`) while retention
+/// holds it, read back first (`Bridge::keyed_winner_at`, whose control is
+/// [`each_rule_switched_off_is_caught`]'s), and lands a copy of its own only once retention
+/// gave that record up. The reservations its worlds publish at their pins are counted
+/// ([`crate::fx::ReservationTap`]): the read backs leave a dedup answer only to a re-post whose
+/// key pin names no winner's offset yet, its winner still in aterm's outbox (its landing not
+/// yet reconciled, or the disk refused that write), so the winner's record is undelivered and
+/// unread, and aterm's rules give it up only past the mail rule's bytes or a week: a cut after
+/// the answer gives it up only where those bytes are a few records (the scaled seeds,
+/// [`Opts::scaled`]), so case 4 is rare here, not impossible. No seed of these, nor of
+/// 1..=2,000 (measured), meets an answer it cannot verify (`Bridge::unverified_publication`;
+/// the stray world does: [`every_seed_of_the_stray_world_holds_every_law`]), nor a re-post's
+/// in-flight entry the attach's replay settles at its key's winner (counted too; its rule's
+/// tests are bridge's `a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner`
+/// and `a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy`).
+#[test]
+fn every_seed_of_the_keyed_world_holds_every_law() {
+    let outs = run_all(&keyed, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds of the keyed world broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let sum = |field: fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| field(&out.stats)).sum()
+    };
+    let counts = [
+        ("keyed re-posts", sum(|s| s.reposts)),
+        (
+            "re-posts retired at their key's earlier record",
+            sum(|s| s.reposts_deduped),
+        ),
+        (
+            "re-posts that landed past their key's record given up",
+            sum(|s| s.reposts_appended),
+        ),
+        (
+            "cuts between a dedup answer and the next request",
+            sum(|s| s.cuts_after_dedup),
+        ),
+        ("records retention gave up", sum(|s| s.given_up)),
+    ];
+    let reservations = (
+        sum(|s| s.reservations_verified),
+        sum(|s| s.reservation_collisions),
+        outs.iter().fold([0u64; 5], |mut all, out| {
+            for (sum, n) in all.iter_mut().zip(out.stats.unverifiable) {
+                *sum += n;
+            }
+            all
+        }),
+        sum(|s| s.replayed_at_the_winner),
+    );
+    eprintln!(
+        "the keyed world over {SEEDS} seeds: {counts:?}; reservations at their pins \
+         (verified, collisions, unverifiable by case) and entries replayed at their key's \
+         winner: {reservations:?}"
+    );
     for &(what, n) in &counts {
         assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
     }

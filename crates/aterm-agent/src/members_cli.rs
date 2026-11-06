@@ -56,16 +56,10 @@ const BROWSE_WITHIN: Duration = Duration::from_secs(3);
 /// Each member's dial and every exchange on it.
 const DIAL_WITHIN: Duration = Duration::from_secs(5);
 
-/// How long a phraseless `join` keeps dialing members to prove this Mac to ([`proved_back`]),
-/// which tries them one after another (the fleet path in the first half of what is left): once
-/// it passed, no further member is dialed and, where none let this Mac in and none may have
-/// signed, the members are asked plainly, all at once ([`join::ask_all`]), while this Mac's vault
-/// subscriber goes on proving with no such bound. It bounds the dials only: an exchange already
-/// begun keeps its own bounds (a member's port within its 3 s handshake watchdog, a fleet
-/// member's `VaultJoin` within the member's 30 s `SERVED_WITHIN`), and once a member let this Mac
-/// in, its first sync from the vault's servers keeps the transport's. So install.sh's 60 s hang
-/// detector (`VERIFY_WAIT_SECS`) can cut a slow run short; a Mac let in before that is in, and
-/// its subscriber, which the join set up, follows the vault from there.
+/// One automatic proof round's dial budget. Fresh member addresses take the first half;
+/// retained fleet recovery keeps the rest. Each connect, TLS handshake and complete proof
+/// exchange share one absolute deadline. Verified admission returns after guarded local
+/// publication; the subscriber follows the saved vault and repairs materialization separately.
 const PROVE_WITHIN: Duration = Duration::from_secs(20);
 
 /// The port a member's fleet listener serves when `--at` names none.
@@ -505,16 +499,14 @@ fn dial(at: &str) -> aterm_secrets::Result<Box<dyn Stream>> {
     dial_within(at, DIAL_WITHIN)
 }
 
-/// [`dial`], its connect and handshake within `within`, every exchange after them within
-/// [`DIAL_WITHIN`].
+/// [`dial`], one absolute budget shared by connect, TLS and the whole proof exchange.
 fn dial_within(at: &str, within: Duration) -> aterm_secrets::Result<Box<dyn Stream>> {
+    let until = std::time::Instant::now() + within;
     let (host, port) = aterm_net::fleet_member::parse_host_port(at, None)
         .map_err(|_| aterm_secrets::Error::new(format!("{at} is not host:port")))?;
     let (transport, _) = aterm_net::fleet_member::dial_ask(&host, None, port, within)
         .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
-    let stream = transport.into_stream();
-    stream.sock.set_read_timeout(Some(DIAL_WITHIN))?;
-    stream.sock.set_write_timeout(Some(DIAL_WITHIN))?;
+    let stream = transport.into_bounded_stream(until)?;
     Ok(Box::new(stream))
 }
 
@@ -624,6 +616,45 @@ struct Reach<'a> {
 }
 
 fn run_join(args: &JoinArgs) -> ExitCode {
+    if args.phrase.is_none() && args.at.is_empty() {
+        let tried = (|| {
+            let paths = Paths::live()?;
+            if client::config(&paths)?.is_some() {
+                return Ok((paths, client::NativeAdmission::None));
+            }
+            client::refuse_lab_identity(&paths)?;
+            client::prepare_alab_join_retry(&paths)?;
+            client::native_bootstrap(&paths, &|| {
+                if client::config(&paths)?.is_some() {
+                    return Err(aterm_secrets::Error::new(
+                        "the vault source changed during bootstrap",
+                    ));
+                }
+                Ok(())
+            })
+            .map(|admitted| (paths, admitted))
+        })();
+        match tried {
+            Ok((paths, admitted)) if admitted != client::NativeAdmission::None => {
+                let follows = Follows::live(&paths.home);
+                let first = if admitted == client::NativeAdmission::Admitted {
+                    PROVED_IN
+                } else {
+                    join::LET_IN
+                };
+                return ExitCode::from(said_proved(
+                    first,
+                    Some(Ok(follows)),
+                    &mut std::io::stdout(),
+                ));
+            }
+            Err(error) => {
+                eprintln!("aterm members join: {error}");
+                return ExitCode::from(1);
+            }
+            _ => {}
+        }
+    }
     let me = match Me::live() {
         Ok(me) => me,
         Err(why) => {
@@ -634,7 +665,7 @@ fn run_join(args: &JoinArgs) -> ExitCode {
     let reach = Reach {
         browse: &|| crate::lan_members::members(BROWSE_WITHIN),
         dial: &dial,
-        prove: &|me, ats, until| proved_back(me, ats, Some(until)),
+        prove: &|me, ats, until| proved_back(me, ats, Some(until), args.at.is_empty(), false),
         join_vault: &join_alab_vault,
         follow: &Follows::live,
     };
@@ -767,8 +798,9 @@ fn join_tried(
     // `--no-wait` sets this Mac up at the ALab vault while it proves this Mac (dialing no member
     // after [`PROVE_WITHIN`]) and then asks the members, each within its own bound, so
     // install.sh's lane ends within its own.
+    let native_first = args.phrase.is_none() && args.at.is_empty();
     let (asked, waits) = std::thread::scope(|scope| {
-        let waits = (args.no_wait || args.phrase.is_none())
+        let waits = (!native_first && (args.no_wait || args.phrase.is_none()))
             .then(|| scope.spawn(|| wait_at_vault(&me.paths, reach)));
         let found = if args.at.is_empty() {
             (reach.browse)()
@@ -791,11 +823,28 @@ fn join_tried(
             };
             (proved, heard, missed)
         });
-        let waits = waits.map(|waiting| {
-            waiting
-                .join()
-                .unwrap_or_else(|_| Err("the vault join stopped".to_owned()))
-        });
+        let waits = if native_first {
+            Some(match &asked {
+                Ok((Proved::In | Proved::SignedMaybe, ..)) => {
+                    // No HTTP enrollment follows a successful or ambiguous possession.
+                    // The proof's durable pin also survives a crash before this intent write.
+                    if matches!(&asked, Ok((Proved::SignedMaybe, ..))) {
+                        client::prepare_alab_join_retry(&me.paths)
+                            .map_err(|error| error.to_string())
+                            .map(|()| (reach.follow)(&me.paths.home))
+                    } else {
+                        Ok((reach.follow)(&me.paths.home))
+                    }
+                }
+                _ => wait_at_vault(&me.paths, reach),
+            })
+        } else {
+            waits.map(|waiting| {
+                waiting
+                    .join()
+                    .unwrap_or_else(|_| Err("the vault join stopped".to_owned()))
+            })
+        };
         (asked, waits)
     });
     let (heard, missed) = match (asked, waits) {
@@ -805,15 +854,29 @@ fn join_tried(
         }
         (Ok((_, heard, missed)), None) => (heard, missed),
         (Ok((_, heard, missed)), Some(waits)) => {
-            return Tried::Ended(said_no_wait(me.place, Ok(&heard), &missed, waits, out, err));
+            let browsed = args.at.is_empty();
+            return Tried::Ended(said_no_wait(
+                me.place,
+                Asked {
+                    heard: Ok(&heard),
+                    missed: &missed,
+                    browsed,
+                },
+                waits,
+                out,
+                err,
+            ));
         }
         // A Mac that cannot browse (off macOS, or one macOS refuses the local network) still
         // waits at the vault, and says why it asked no member where install.sh shows it.
         (Err(error), Some(waits)) => {
             return Tried::Ended(said_no_wait(
                 me.place,
-                Err(error.to_string()),
-                &[],
+                Asked {
+                    heard: Err(error.to_string()),
+                    missed: &[],
+                    browsed: args.at.is_empty(),
+                },
                 waits,
                 out,
                 err,
@@ -829,9 +892,7 @@ fn join_tried(
             err,
             "aterm members join: no ALab member answers on this network"
         );
-        for (at, why) in &missed {
-            let _ = writeln!(err, "  {at}: {why}");
-        }
+        say_missed(err, &missed, args.at.is_empty());
         return Tried::NoMember;
     }
     let phrase = match Phrase::parse(
@@ -943,15 +1004,54 @@ fn said_proved(first: &str, waits: Option<Result<Follows, String>>, out: &mut dy
     0
 }
 
+/// What `join` adds under the members its browse named when aterm's own lookup of every one of
+/// their names got no answer ([`aterm_net::fleet_member::LOOKUP_UNANSWERED`]). macOS's Bonjour
+/// answered the browse with those names (it runs as `dns-sd`, which macOS does not hold), and
+/// macOS holds an app's own lookups on the local network while its question whether that app may
+/// find devices there stands unanswered. E3 (2026-11-05, `docs/measured/e2e-new-mac-2026-11-05.md`)
+/// measured it in a guest: `members join <phrase>` waited out its 5 s on the member's `.local`
+/// name while macOS asked, and `dscacheutil` resolved the same name at once.
+const LOOKUP_HELD: &str = "macOS's Bonjour found these members, but aterm's own lookup of their \
+     names got no answer: macOS holds those lookups while it asks whether aterm may find devices \
+     on the local network. Answer Allow there (or turn aterm on in System Settings › Privacy & \
+     Security › Local Network), then run this again.";
+
+/// Each member `join` did not reach, with why, on `err`; then [`LOOKUP_HELD`] where the browse
+/// named them all (`browsed`: no `--at`) and every lookup of their names got no answer. A name a
+/// person gave with `--at` that does not resolve is no sign of macOS's question: that Mac may be
+/// asleep or elsewhere.
+fn say_missed(err: &mut dyn Write, missed: &[(String, String)], browsed: bool) {
+    for (at, why) in missed {
+        let _ = writeln!(err, "  {at}: {why}");
+    }
+    let unanswered = |why: &String| why.contains(aterm_net::fleet_member::LOOKUP_UNANSWERED);
+    if browsed && !missed.is_empty() && missed.iter().map(|(_, why)| why).all(unanswered) {
+        let _ = writeln!(err, "  {LOOKUP_HELD}");
+    }
+}
+
+/// Who the members' half of `join --no-wait` asked ([`said_no_wait`]).
+struct Asked<'a> {
+    /// The members that answered (`Err`: why no member could be looked for).
+    heard: Result<&'a [Heard], String>,
+    /// Those that did not, each with why.
+    missed: &'a [(String, String)],
+    /// Whether the browse named them (no `--at`).
+    browsed: bool,
+}
+
 /// What `join --no-wait` says, and its exit code; its first line is the one install.sh shows.
-/// `heard` answered (`Err`: why no member could be looked for), `missed` did not, and `waits`
-/// says whether this Mac waits at the ALab vault and whether its subscriber, which asks the
-/// members again through the same browse, runs. What lets it in follows where it is (`at`,
-/// [`join::let_in`]): automatic admission only on the ALab LAN.
+/// `asked` is who its members' half asked, and `waits` says whether this Mac waits at the ALab
+/// vault and whether its subscriber, which asks the members again through the same browse,
+/// runs. What lets it in follows where it is (`at`, [`join::let_in`]): automatic admission only
+/// on the ALab LAN.
 fn said_no_wait(
     at: join::JoinPlace,
-    heard: Result<&[Heard], String>,
-    missed: &[(String, String)],
+    Asked {
+        heard,
+        missed,
+        browsed,
+    }: Asked<'_>,
     waits: Result<Follows, String>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -1013,9 +1113,7 @@ fn said_no_wait(
                 "aterm members join: no ALab member answers on this network, and the ALab vault \
                  was not reached ({why})"
             );
-            for (at, why) in missed {
-                let _ = writeln!(err, "  {at}: {why}");
-            }
+            say_missed(err, missed, browsed);
             return 1;
         }
     }
@@ -1100,7 +1198,15 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
         .collect();
     ask_discovered(
         direct,
-        |ats| proved_back(&me, ats, Some(std::time::Instant::now() + PROVE_WITHIN)),
+        |ats| {
+            proved_back(
+                &me,
+                ats,
+                Some(std::time::Instant::now() + PROVE_WITHIN),
+                true,
+                true,
+            )
+        },
         || discover::browse_members(BROWSE_WITHIN).map_err(|error| error.to_string()),
         |ats| {
             let dial: &Dial<'_> = &dial;
@@ -1109,6 +1215,50 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
                 return Err("no ALab member answers on this network".to_owned());
             }
             Ok(heard.len())
+        },
+    )
+}
+
+/// Prove an unconfigured default join through numeric native hints, then the retained fleet.
+/// Both paths require compiled membership authority before possession; no vault lookup or
+/// HTTP enrollment runs here. The caller owns setup authorization and subscriber intent.
+/// # Errors
+/// Setup authority, sharing, source identity or lab isolation refuses this operation.
+pub fn bootstrap_from_members(
+    paths: &Paths,
+    current: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+) -> aterm_secrets::Result<client::NativeAdmission> {
+    current()?;
+    client::refuse_lab_identity(paths)?;
+    if client::config(paths)?.is_some() {
+        return Err(aterm_secrets::Error::new(
+            "native bootstrap requires an unconfigured source",
+        ));
+    }
+    let me = Me::at(paths.clone()).map_err(aterm_secrets::Error::new)?;
+    let until = std::time::Instant::now() + PROVE_WITHIN;
+    let ats: Vec<_> = crate::lan_members::probe(Duration::from_millis(500))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hint| hint.address.to_string())
+        .collect();
+    let authorized = || {
+        current()?;
+        if client::config(paths)?.is_some() {
+            return Err(aterm_secrets::Error::new(
+                "the vault source changed during bootstrap",
+            ));
+        }
+        Ok(())
+    };
+    Ok(
+        match prove_routes(&me, &ats, Some(until), true, &authorized) {
+            Proved::In => client::NativeAdmission::Admitted,
+            Proved::SignedMaybe => client::NativeAdmission::Uncertain,
+            Proved::No => {
+                authorized()?;
+                client::NativeAdmission::None
+            }
         },
     )
 }
@@ -1199,14 +1349,81 @@ fn ask_after_proof(
 /// it (`aterm members join` beside the subscriber's round) this one waits until `until`, then
 /// sends nothing, as after a member that may have signed. [`Proved::No`] where no member let it
 /// in: this Mac then asks a person as before.
-fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Proved {
+fn proved_back(
+    me: &Me,
+    ats: &[String],
+    until: Option<std::time::Instant>,
+    default_alab: bool,
+    background: bool,
+) -> Proved {
+    prove_routes(me, ats, until, default_alab, &|| {
+        if background {
+            client::check_bootstrap_allowed(&me.paths)?;
+        }
+        Ok(())
+    })
+}
+
+struct ProofScope<'a> {
+    admission: Option<join::ProofAdmission<'a>>,
+}
+
+impl<'a> ProofScope<'a> {
+    fn read(
+        paths: &Paths,
+        expected: Option<&'a client::Config>,
+        default_alab: bool,
+        current: &'a (dyn Fn() -> aterm_secrets::Result<()> + Sync),
+        proving: &'a join::ProofLock,
+    ) -> aterm_secrets::Result<Self> {
+        let retained = join::pending_proof(paths)?;
+        let default_context = expected.is_none_or(client::alab_vault);
+        Ok(Self {
+            admission: (default_context && (default_alab || retained)).then_some(
+                join::ProofAdmission {
+                    expected,
+                    default_alab: true,
+                    current,
+                    proving,
+                },
+            ),
+        })
+    }
+
+    fn direct(
+        &self,
+        paths: &Paths,
+        dial: &Dial<'_>,
+        joining: &Joining<'_>,
+        sign_node: aterm_secrets::members::joiner::SignNode<'_>,
+        ats: &[String],
+    ) -> Result<join::Joined, join::Missed> {
+        match self.admission.as_ref() {
+            Some(admission) => {
+                join::prove_first_admitted(paths, dial, joining, sign_node, ats, admission)
+            }
+            None => join::prove_first(paths, dial, joining, sign_node, ats),
+        }
+    }
+}
+
+fn prove_routes(
+    me: &Me,
+    ats: &[String],
+    until: Option<std::time::Instant>,
+    default_alab: bool,
+    authorized: &(dyn Fn() -> aterm_secrets::Result<()> + Sync),
+) -> Proved {
     use aterm_net::fleet_member::{read_join_code, read_node_identity, read_peers};
     let Ok(lock) = join::ProofLock::take(&me.paths, until) else {
         return Proved::No;
     };
-    let Some(_proving) = lock else {
+    let Some(proving) = lock else {
         return Proved::SignedMaybe;
     };
+    if authorized().is_err() {
+        return Proved::No;
+    }
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Proved::No;
     };
@@ -1224,9 +1441,32 @@ fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Pr
     };
     let direct =
         crate::vault_join::dial_until(until.map(first_proof_share), DIAL_WITHIN, &dial_within);
-    match proof_outcome(join::prove_first(
-        &me.paths, &direct, &joining, &sign_node, ats,
-    )) {
+    let Ok(expected) = client::config(&me.paths) else {
+        return Proved::No;
+    };
+    let current = || {
+        authorized()?;
+        if client::config(&me.paths)? != expected
+            || !aterm_secrets::swarm::enabled_in_home(&me.paths.home)?
+        {
+            return Err(aterm_secrets::Error::new(
+                "this Mac's bootstrap authority changed",
+            ));
+        }
+        Ok(())
+    };
+    let scope = match ProofScope::read(
+        &me.paths,
+        expected.as_ref(),
+        default_alab,
+        &current,
+        &proving,
+    ) {
+        Ok(scope) => scope,
+        Err(_) => return Proved::SignedMaybe,
+    };
+    let tried = scope.direct(&me.paths, &direct, &joining, &sign_node, ats);
+    match proof_outcome(tried) {
         Proved::No => {}
         done => return done,
     }
@@ -1242,12 +1482,13 @@ fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Pr
         if !peers.is_empty() {
             // The next try comes after the subscriber's pause, by when a member that may have
             // signed has posted its records to the servers.
-            match proof_outcome(crate::vault_join::prove_over_fleet(
+            match proof_outcome(crate::vault_join::prove_over_fleet_admitted(
                 &me.paths,
                 &joining,
                 (&secret, &node),
                 &peers,
                 until,
+                scope.admission.as_ref(),
             )) {
                 Proved::No => {}
                 done => return done,
@@ -1294,7 +1535,7 @@ pub fn join_with_phrase(phrase: &SecretBytes) -> PhraseTry {
     let reach = Reach {
         browse: &|| crate::lan_members::members(BROWSE_WITHIN),
         dial: &dial,
-        prove: &|me, ats, until| proved_back(me, ats, Some(until)),
+        prove: &|me, ats, until| proved_back(me, ats, Some(until), false, false),
         join_vault: &join_alab_vault,
         follow: &Follows::live,
     };
@@ -1400,27 +1641,39 @@ impl Standing {
         follows: &dyn Fn(&Path) -> Follows,
         place: &dyn Fn() -> join::JoinPlace,
     ) -> Self {
-        match client::status(paths).map(|status| status.membership) {
-            Ok(client::Membership::In { .. }) if client::seat_asks(paths) => Self::Seatless,
-            Ok(client::Membership::In { .. }) => Self::Member(
-                client::config(paths)
-                    .ok()
-                    .flatten()
+        Self::of_status(paths, client::status(paths), follows, place)
+    }
+
+    /// The standing `status` (the vault's at `paths`, read once) says.
+    fn of_status(
+        paths: &Paths,
+        status: aterm_secrets::Result<client::Status>,
+        follows: &dyn Fn(&Path) -> Follows,
+        place: &dyn Fn() -> join::JoinPlace,
+    ) -> Self {
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => return Self::Unknown(error.to_string()),
+        };
+        match status.membership {
+            client::Membership::In { .. } if client::seat_asks(paths) => Self::Seatless,
+            client::Membership::In { .. } => Self::Member(
+                status
+                    .config
                     .map_or_else(client::default_host_name, |config| config.host),
             ),
-            Ok(client::Membership::Pending) if client::holds_allowed(paths) => {
+            client::Membership::Pending if client::holds_allowed(paths) => {
                 let follows = follows(&paths.home);
                 Self::Allowed {
                     fix: follows.fix(),
                     held: matches!(follows, Follows::Off),
                 }
             }
-            Ok(client::Membership::Pending) => Self::Asking(place()),
-            Ok(client::Membership::Revoked { seq }) => {
+            client::Membership::Pending => Self::Asking(place()),
+            client::Membership::Revoked { seq } => {
                 client::dropped_words(paths, seq).map_or(Self::NotIn, Self::Dropped)
             }
-            Ok(_) => Self::NotIn,
-            Err(error) => Self::Unknown(error.to_string()),
+            client::Membership::Unconfigured | client::Membership::Plain => Self::NotIn,
         }
     }
 
@@ -1431,6 +1684,21 @@ impl Standing {
         Self::read(paths, &Follows::now, &|| {
             aterm_types::dirs::state_dir()
                 .map_or(join::JoinPlace::Unknown, |state| join_place(&state))
+        })
+    }
+
+    /// The standing `status` (the vault's at `paths`, read once) says to a reader of in, joining
+    /// or out alone ([`crate::machine_name::InFleet`]: the machine title's row, `aterm name`'s
+    /// `fleet=`): it asks no service manager whether the subscriber runs and reads no network
+    /// place, so an `Allowed` says no turn-off and `Asking` an unknown place, and it spawns
+    /// nothing. Not for `aterm members status`, whose lines need both.
+    #[must_use]
+    pub(crate) fn membership_of(
+        paths: &Paths,
+        status: aterm_secrets::Result<client::Status>,
+    ) -> Self {
+        Self::of_status(paths, status, &|_| Follows::Absent, &|| {
+            join::JoinPlace::Unknown
         })
     }
 
@@ -1705,6 +1973,34 @@ mod tests {
         assert!(!line.contains("aterm members join"), "{line}");
     }
 
+    /// IN A FLEET (`docs/DESIGN-machine-names-2026-11-04.md` §11.85): a vault that took this
+    /// Mac out outranks the fleet key it still holds, which is a secret it was let go from, not
+    /// a membership.
+    ///
+    /// CONTROLS: the same Mac and key while it is in reads in, and the key alone, where no vault
+    /// is read ([`crate::machine_name::standing_vault`]), still reads in.
+    #[test]
+    fn a_vault_that_took_this_mac_out_outranks_its_fleet_key() {
+        use crate::machine_name::InFleet;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let m1 = member(root.path(), "m1");
+        let j = me(root.path(), "j");
+        let _ = let_in(&m1, &j, &|_| Follows::Runs);
+        let state = root.path().join("state");
+        aterm_uds::private_file::ensure_private_dir(&state).expect("state");
+        let key = format!("{}\n", "ab".repeat(32));
+        aterm_uds::private_file::write_private(&state, aterm_net::fleet::KEY_FILE, key.as_bytes())
+            .expect("a fleet key");
+        assert_eq!(
+            InFleet::read(&state, Some(&j.paths)),
+            InFleet::In,
+            "the control: in, with a key"
+        );
+        store_membership(&j.paths, "revoked");
+        assert_eq!(InFleet::read(&state, Some(&j.paths)), InFleet::Out);
+        assert_eq!(InFleet::read(&state, None), InFleet::In, "the key alone");
+    }
+
     /// A Mac a rotation dropped (one-mesh E2, f299) asks no member of that vault with its key:
     /// where its browse finds the members of the vault that dropped it (here a lab's members
     /// service, the lab's vault being this world's), `aterm members join` and the window's phrase
@@ -1960,6 +2256,69 @@ mod tests {
         );
     }
 
+    /// A join whose browse named a member, and whose own lookup of that member's name got no
+    /// answer, says macOS's Local Network question holds it (E3, 2026-11-05: a guest's
+    /// `members join <phrase>` waited out its 5 s on the member's `.local` name while macOS asked,
+    /// and was told only that no member answers). The same lookup of a name a person gave with
+    /// `--at`, or a member the browse named that refused the connection, says no such thing: that
+    /// Mac may be asleep or elsewhere.
+    ///
+    /// NEGATIVE CONTROL: drop the [`LOOKUP_HELD`] line from `say_missed`: the browsed join's
+    /// words name no Local Network question, as the guest's did.
+    #[test]
+    fn a_member_the_browse_named_that_aterm_could_not_look_up_is_macos_local_network_question() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        // An identity a release build made: a lab identity browses no members (A12).
+        let j = me(root.path(), "j");
+        assert_eq!(client::lab_mark(&j.paths).expect("its mark"), None);
+        let named = "lab-mini.local:7486".to_owned();
+        let unanswered = aterm_net::fleet_member::Unreached::Lookup(
+            "lab-mini.local".to_owned(),
+            Duration::from_secs(5),
+        )
+        .to_string();
+        let said = |args: &JoinArgs, why: &str| {
+            let dial = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+                Err(aterm_secrets::Error::new(why))
+            };
+            let reach = Reach {
+                browse: &|| Ok(vec![named.clone()]),
+                dial: &dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
+                join_vault: &no_vault,
+                follow: &|_| Follows::Runs,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let tried = join_tried(&j, args, &reach, &mut out, &mut err);
+            assert_eq!(tried, Tried::NoMember);
+            String::from_utf8(err).unwrap()
+        };
+        let phrase = || {
+            Some(SecretBytes::from(
+                Phrase::generate().expect("a phrase").words().join(" "),
+            ))
+        };
+        let browsed = JoinArgs {
+            phrase: phrase(),
+            ..JoinArgs::default()
+        };
+        let err = said(&browsed, &unanswered);
+        assert!(err.contains(&unanswered), "{err}");
+        assert!(err.contains(LOOKUP_HELD), "the browse named it: {err}");
+        let given = JoinArgs {
+            phrase: phrase(),
+            at: vec![named.clone()],
+            ..JoinArgs::default()
+        };
+        let err = said(&given, &unanswered);
+        assert!(
+            err.contains(&unanswered) && !err.contains(LOOKUP_HELD),
+            "{err}"
+        );
+        let err = said(&browsed, "nothing listens on 192.168.64.17:7486");
+        assert!(!err.contains(LOOKUP_HELD), "a refused connect: {err}");
+    }
+
     /// A12: a lab identity (one this test binary makes, as a debug build, a lab lane or a VM
     /// makes one) that runs `aterm members join` with no `--at`, or the window's phrase join,
     /// looks for no member, dials none and proves itself to none: a loopback member records no
@@ -2143,7 +2502,17 @@ mod tests {
             join::JoinPlace::Unknown,
         ] {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = said_no_wait(at, Ok(&[]), &[], Ok(Follows::Runs), &mut out, &mut err);
+            let code = said_no_wait(
+                at,
+                Asked {
+                    heard: Ok(&[]),
+                    missed: &[],
+                    browsed: true,
+                },
+                Ok(Follows::Runs),
+                &mut out,
+                &mut err,
+            );
             let said = String::from_utf8(out).unwrap();
             assert_eq!(code, 0, "{at:?}: {said}");
             let first = said.lines().next().unwrap_or_default();
@@ -2188,8 +2557,11 @@ mod tests {
         assert_eq!(
             said_no_wait(
                 join::JoinPlace::Home,
-                Ok(&[]),
-                &[],
+                Asked {
+                    heard: Ok(&[]),
+                    missed: &[],
+                    browsed: true,
+                },
                 waiting,
                 &mut out,
                 &mut err
@@ -2228,8 +2600,11 @@ mod tests {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = said_no_wait(
                 join::JoinPlace::Home,
-                heard,
-                &[],
+                Asked {
+                    heard,
+                    missed: &[],
+                    browsed: true,
+                },
                 bootstrapping(),
                 &mut out,
                 &mut err,
@@ -2510,6 +2885,84 @@ mod tests {
             dialed_then.iter().all(|(_, within)| *within == DIAL_WITHIN),
             "{dialed_then:?}"
         );
+    }
+
+    #[test]
+    fn a_pending_default_vault_requires_authority_after_restart_without_a_native_pin() {
+        use std::io::{BufRead as _, Write as _};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mac = me(root.path(), "pending");
+        let source = mac.paths.dir.join("source.toml");
+        let saved = format!(
+            "url = {:?}\nname = 'alab'\nsigner = '{}'\nhost = 'pending'\n",
+            aterm_secrets::ALAB_DEFAULT_URL,
+            aterm_secrets::ALAB_SIGNER,
+        );
+        aterm_secrets::fsx::write_atomic(&source, saved.as_bytes(), 0o600).unwrap();
+        assert_eq!(
+            client::status(&mac.paths).unwrap().membership,
+            client::Membership::Pending
+        );
+        for paths in [mac.paths.clone(), Paths::for_home(&mac.paths.home)] {
+            assert!(!join::pending_proof(&paths).unwrap());
+            let expected = client::config(&paths).unwrap();
+            assert!(expected.as_ref().is_some_and(client::alab_vault));
+            let device = Device::open(&paths).unwrap().unwrap();
+            let joining = Joining {
+                device: &device,
+                records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
+                node: mac.node,
+                name: mac.name.clone(),
+                model: mac.model.clone(),
+            };
+            let proving = join::ProofLock::take(&paths, None).unwrap().unwrap();
+            let current = || Ok(());
+            let scope =
+                ProofScope::read(&paths, expected.as_ref(), true, &current, &proving).unwrap();
+            let captured = Mutex::new(Vec::new());
+            let tried = std::thread::scope(|threads| {
+                let dial = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+                    let (mut member, joiner) = UnixStream::pair()?;
+                    for stream in [&member, &joiner] {
+                        stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                        stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                    }
+                    let captured = &captured;
+                    threads.spawn(move || {
+                        // A legacy member advertises a syntactically valid greeting, then
+                        // refuses this extension before issuing any possession challenge.
+                        writeln!(member,
+                            "ALAB member=1 key={} network={} authority={} genesis={} name=legacy allow=1 invite=0 challenge={}",
+                            "09".repeat(32), "01".repeat(16), "02".repeat(32),
+                            "03".repeat(32), "04".repeat(16),
+                        ).unwrap();
+                        let mut line = String::new();
+                        std::io::BufReader::new(&mut member).read_line(&mut line).unwrap();
+                        captured.lock().unwrap().push(line);
+                        member.write_all(b"NO why=unsupported-authority\n").unwrap();
+                    });
+                    Ok(Box::new(joiner))
+                };
+                scope.direct(&paths, &dial, &joining, &|_| [0; 64], &[M1.to_owned()])
+            });
+            assert!(matches!(proof_outcome(tried), Proved::No));
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(request.starts_with("prove "));
+            let nonce = request
+                .split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("authority="))
+                .expect("the production selector must use the admitted witness path");
+            assert_eq!(nonce.len(), 64);
+            assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(std::fs::read(&source).unwrap(), saved.as_bytes());
+            assert!(!join::pending_proof(&paths).unwrap());
+            assert_eq!(
+                client::status(&paths).unwrap().membership,
+                client::Membership::Pending
+            );
+        }
     }
 
     /// A member whose vault state a pass holds (an admission publishing on the admin Mac, an

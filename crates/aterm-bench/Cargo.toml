@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-bench"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -22,6 +22,9 @@ aterm-restore = { workspace = true }
 aterm-effects = { workspace = true }
 aterm-gpu = { workspace = true }
 aterm-render = { workspace = true }
+# ...and the fixture font it draws, found from the package directory when it runs
+# (`aterm_tempfile::manifest_dir`).
+aterm-tempfile = { workspace = true }
 # ...and its `--light` ground, Default Light, from the shipped theme registry.
 aterm-types = { workspace = true }
 # The effects harness declares its thread user-interactive, the QoS the app's render thread has.

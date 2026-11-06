@@ -21,13 +21,6 @@ fn refused(why: &str) -> io::Error {
 #[derive(Debug, PartialEq, Eq)]
 struct Identity(u64, u64);
 
-impl Identity {
-    fn of(file: &File) -> io::Result<Self> {
-        let stat = fd::fstat(file)?;
-        Ok(Self(stat.st_dev, stat.st_ino))
-    }
-}
-
 fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
@@ -63,7 +56,7 @@ fn directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn owned(file: &File, private: bool) -> io::Result<()> {
+fn owned(file: &File, private: bool) -> io::Result<(Identity, std::fs::Metadata)> {
     let metadata = file.metadata()?;
     // SAFETY: geteuid only reads this process's effective account identity.
     let uid = unsafe { libc::geteuid() };
@@ -73,7 +66,7 @@ fn owned(file: &File, private: bool) -> io::Result<()> {
             "epoch node must remain owned with its original privacy",
         ));
     }
-    Ok(())
+    Ok((Identity(metadata.dev(), metadata.ino()), metadata))
 }
 
 #[derive(Debug)]
@@ -159,7 +152,7 @@ impl Endpoint {
         // Resolve an existing alias such as macOS /tmp once, then pin and walk
         // its actual parent without following any further component links.
         let parent = directory(&parent_path.canonicalize()?)?;
-        owned(&parent, false)?;
+        let (parent_identity, _) = owned(&parent, false)?;
         match fd::fstatat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
             Err(error) if error.is_noent() => {}
             Err(error) => return Err(error.into()),
@@ -168,7 +161,7 @@ impl Endpoint {
         Ok(Self {
             path: path.to_owned(),
             leaf,
-            parent_identity: Identity::of(&parent)?,
+            parent_identity,
             parent,
             captured: None,
             phase: Phase::Awaiting,
@@ -192,8 +185,8 @@ impl Endpoint {
                 .ok_or_else(|| refused("missing epoch parent"))?
                 .canonicalize()?,
         )?;
-        owned(&current, false)?;
-        if Identity::of(&current)? != self.parent_identity {
+        let (current_identity, _) = owned(&current, false)?;
+        if current_identity != self.parent_identity {
             return Err(refused("original epoch parent identity changed"));
         }
         Ok(())
@@ -206,7 +199,7 @@ impl Endpoint {
         let captured = (|| {
             self.validate_parent()?;
             let directory = child_directory(&self.parent, &self.leaf)?;
-            owned(&directory, true)?;
+            let (directory_identity, _) = owned(&directory, true)?;
             let fifo = aterm_uds::kept_out(|| {
                 fd::openat(
                     &directory,
@@ -217,14 +210,13 @@ impl Endpoint {
                 .map(File::from)
                 .map_err(io::Error::from)
             })?;
-            owned(&fifo, true)?;
-            let metadata = fifo.metadata()?;
+            let (fifo_identity, metadata) = owned(&fifo, true)?;
             if !metadata.file_type().is_fifo() || metadata.nlink() != 1 {
                 return Err(refused("epoch endpoint is not its single-link FIFO"));
             }
             Ok(Captured {
-                directory_identity: Identity::of(&directory)?,
-                fifo_identity: Identity::of(&fifo)?,
+                directory_identity,
+                fifo_identity,
                 directory,
                 fifo,
             })
@@ -255,22 +247,25 @@ impl Endpoint {
             .captured
             .as_ref()
             .ok_or_else(|| refused("missing epoch handles"))?;
-        owned(&captured.directory, true)?;
-        owned(&captured.fifo, true)?;
+        let (captured_dir_id, _) = owned(&captured.directory, true)?;
+        let (captured_fifo_id, _) = owned(&captured.fifo, true)?;
         let current_directory = child_directory(&self.parent, &self.leaf)?;
-        owned(&current_directory, true)?;
-        let current_fifo = File::from(fd::openat(
-            &current_directory,
-            FIFO,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        owned(&current_fifo, true)?;
-        let metadata = current_fifo.metadata()?;
-        if Identity::of(&current_directory)? != captured.directory_identity
-            || Identity::of(&current_fifo)? != captured.fifo_identity
-            || Identity::of(&captured.directory)? != captured.directory_identity
-            || Identity::of(&captured.fifo)? != captured.fifo_identity
+        let (current_dir_id, _) = owned(&current_directory, true)?;
+        let current_fifo = aterm_uds::kept_out(|| {
+            fd::openat(
+                &current_directory,
+                FIFO,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
+        })?;
+        let (current_fifo_id, metadata) = owned(&current_fifo, true)?;
+        if current_dir_id != captured.directory_identity
+            || current_fifo_id != captured.fifo_identity
+            || captured_dir_id != captured.directory_identity
+            || captured_fifo_id != captured.fifo_identity
             || !metadata.file_type().is_fifo()
             || metadata.nlink() != 1
         {
@@ -329,11 +324,11 @@ impl Endpoint {
             .captured
             .as_ref()
             .ok_or_else(|| refused("missing original epoch directory"))?;
-        owned(&captured.directory, true)?;
-        owned(&captured.fifo, true)?;
-        if Identity::of(&captured.directory)? != captured.directory_identity
-            || Identity::of(&captured.fifo)? != captured.fifo_identity
-            || captured.fifo.metadata()?.nlink() != 0
+        let (captured_dir_id, _) = owned(&captured.directory, true)?;
+        let (captured_fifo_id, fifo_meta) = owned(&captured.fifo, true)?;
+        if captured_dir_id != captured.directory_identity
+            || captured_fifo_id != captured.fifo_identity
+            || fifo_meta.nlink() != 0
         {
             self.phase = Phase::Refused;
             return Err(refused(

@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-update"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,6 +25,7 @@ libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 # `aterm_types::rfc3339`.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # `aterm_time::unix_secs`, the workspace's one epoch-clock read.
 aterm-time = { workspace = true }

@@ -727,10 +727,15 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
-  reveal-tab [--json] [ATERM]     one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
+  reveal-tab [--json] [--ax-helper HELPER] [--plain-publication] [ATERM]
+                                 one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
                                  `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
                                  read-only Editor tab that `text|screen|image|window|video|key|doc read` refuse,
-                                 leaving no value in the tab's text, blocks or log (debug lab image)
+                                 leaving no value in the tab's text, blocks or log, and the window's accessibility
+                                 tree carries the grid and every login and no value (read here, or with --ax-helper
+                                 by the guest helper's ax-texts, as `mac nux --scenario reveal-tab` runs it in a
+                                 guest); --plain-publication: the GUI's negative control, under which the tree's
+                                 no-value check must fail (debug lab image)
   commons-lan prepare-recipient|prepare-source|join|run|node|pair|follow|stop|db|secrets|declare|write|read|emails-* …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
@@ -1012,6 +1017,7 @@ Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many ver
 ";
 
 /// The lines of [`USAGE`] that name `verb`: its entry and the lines that continue it.
+#[cfg(any(target_os = "macos", test))]
 fn verb_usage(verb: &str) -> Option<String> {
     let mut out = String::new();
     let mut inside = false;
@@ -1035,6 +1041,7 @@ fn verb_usage(verb: &str) -> Option<String> {
 
 /// A verb with no help of its own that refused `rest` as a usage error answers `-h`/`--help`
 /// before any `--` with its lines of [`USAGE`].
+#[cfg(any(target_os = "macos", test))]
 fn help_instead(verb: &str, rest: &[String], fail: &Fail) -> Option<String> {
     let asked = rest
         .iter()

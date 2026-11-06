@@ -987,7 +987,7 @@ pub(crate) struct BorderSwitch {
     /// The switch's cells (` ● on ` when lit, ` ○ off ` when off), its blanks included: a press
     /// anywhere on them turns it.
     pub(crate) cols: std::ops::Range<usize>,
-    /// The harness label's cells (`alab claude harness v0.5 (v2.1.305)`): hover only.
+    /// The harness label's cells (`alab v0.5 (v2.1.305)`): hover only.
     pub(crate) label: Option<std::ops::Range<usize>>,
     /// The ⬆️ of a newer CLI build with its side blanks: a press asks for the move now.
     pub(crate) arrow: Option<std::ops::Range<usize>>,
@@ -5540,12 +5540,9 @@ pub(crate) fn switch_label(
     product: &str,
 ) -> String {
     use crate::autopilot::{HarnessSwitch, SwitchOff};
-    let named = words.split(' ').any(|w| w == "harness");
-    match (face, named) {
-        (HarnessSwitch::Off(SwitchOff::Agent(_)), true) => format!("{words}: {product}"),
-        (HarnessSwitch::Off(SwitchOff::Agent(_)), false) => format!("{words}: {product} harness"),
-        (_, true) => words.to_owned(),
-        (_, false) => format!("{words}: harness"),
+    match face {
+        HarnessSwitch::Off(SwitchOff::Agent(_)) => format!("{words}: {product} harness"),
+        _ => format!("{words}: harness"),
     }
 }
 

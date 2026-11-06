@@ -221,3 +221,93 @@ fn a_late_relay_credential_is_not_marked_consumed() {
     assert!(!seen.is_empty() && !codes.is_empty());
     assert!(seen_file.exists());
 }
+
+/// A SIGN-IN'S MAILBOX POLL ENDS WHEN ITS DEADLINE PASSES ON AWAKE TIME: an empty Maildir polled
+/// within a sign-in deadline 50 ms off ends with the deadline's words once that passes, with no
+/// sleep at all. NEGATIVE CONTROL: a poll clock that stopped at the sign-in's end, a few
+/// nanoseconds short of the end the poll took when it began, never reached it, and the poll spun
+/// until the one-minute hang detector reported it.
+#[cfg(unix)]
+#[test]
+fn a_sign_ins_mailbox_poll_ends_when_its_deadline_passes() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let cfg = MailboxConfig {
+        dir: Some(tmp.path().to_owned()),
+        seen_file: Some(tmp.path().join("mail.seen")),
+        ..MailboxConfig::default()
+    };
+    let (said, polled) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (_commands, to_browser) = std::io::pipe().unwrap();
+        let (from_browser, _events) = std::io::pipe().unwrap();
+        let mut cdp = CdpClient::new(to_browser, from_browser);
+        let mut seen = BTreeSet::new();
+        let _ = said.send(poll_mailbox_or_webmail_for_credential_by(
+            &mut cdp,
+            &cfg,
+            Some("one@example.test"),
+            WakeDeadline::after(Duration::from_millis(50)),
+            Duration::from_millis(400),
+            &mut seen,
+        ));
+    });
+    let result = polled
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the poll ended once its sign-in's deadline passed");
+    assert_eq!(result, Err(super::super::auth_deadline::EXPIRED));
+}
+
+/// A SIGN-IN'S MAILBOX POLL ASKED FOR AFTER ITS HOST SLEPT PAST ITS DEADLINE READS NO MAIL: a
+/// Maildir that holds the sign-in's link, polled within an hour of which the host slept two hours
+/// before the poll began, ends with the deadline's words and takes nothing. CONTROL: the same
+/// Maildir polled within a live deadline gives that link. NEGATIVE CONTROL: a passed deadline
+/// taken as a zero timeout scanned the mailbox once, on no deadline at all, and took the link.
+#[cfg(unix)]
+#[test]
+fn a_mailbox_poll_its_host_slept_past_reads_no_mail() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let link = "https://claude.ai/magic?token=slept";
+    std::fs::write(
+        tmp.path().join("message"),
+        format!("To: one@example.test\r\n\r\nSign in to Claude: {link}\n"),
+    )
+    .unwrap();
+    let cfg = MailboxConfig {
+        dir: Some(tmp.path().to_owned()),
+        seen_file: Some(tmp.path().join("mail.seen")),
+        ..MailboxConfig::default()
+    };
+    let (_commands, to_browser) = std::io::pipe().unwrap();
+    let (from_browser, _events) = std::io::pipe().unwrap();
+    let mut cdp = CdpClient::new(to_browser, from_browser);
+    let mut seen = BTreeSet::new();
+    let _seam = super::super::wake_deadline::SleepSeam::hold();
+    let slept_past = WakeDeadline::after(HOUR);
+    super::super::wake_deadline::host_slept(2 * HOUR);
+    assert!(slept_past.passed(), "CONTROL: the host slept past it");
+    assert_eq!(
+        poll_mailbox_or_webmail_for_credential_by(
+            &mut cdp,
+            &cfg,
+            Some("one@example.test"),
+            slept_past,
+            Duration::ZERO,
+            &mut seen,
+        ),
+        Err(super::super::auth_deadline::EXPIRED)
+    );
+    assert!(seen.is_empty());
+    assert_eq!(
+        poll_mailbox_or_webmail_for_credential_by(
+            &mut cdp,
+            &cfg,
+            Some("one@example.test"),
+            WakeDeadline::after(HOUR),
+            Duration::ZERO,
+            &mut seen,
+        ),
+        Ok(MailboxCredential::MagicLink(link.into())),
+        "CONTROL: a live deadline reads the link"
+    );
+}

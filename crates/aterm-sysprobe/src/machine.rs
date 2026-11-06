@@ -97,6 +97,22 @@ impl Probe {
         }
     }
 
+    /// Every process and thread the machine started since boot, as the last
+    /// [`core_ticks`](Self::core_ticks) read it, where a counter says it: Linux `/proc/stat`'s
+    /// `processes`, from that same read ([`crate::linux::StatReader::forks`]); `None` before
+    /// one, and elsewhere (macOS counts starts by resource coalition, [`crate::coalitions`]).
+    #[must_use]
+    pub const fn forks(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            self.stat.forks()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Current thermal throttle level, or [`Why`] it is unavailable.
     ///
     /// # Errors
@@ -607,10 +623,15 @@ pub struct GpuReading {
     pub recoveries: Option<u64>,
     /// `gpu-core-count` on the accelerator entry, where present.
     pub cores: Option<u16>,
-    /// Accelerator model/class name (macOS) or DRM driver name (Linux).
+    /// Accelerator model/class name (macOS); on Linux, NVML's name for an NVIDIA card it read
+    /// (`NVIDIA GB10`), else the DRM driver's name.
     pub name: Option<String>,
     /// Reason [`Self::device_pct`] is `None` (such as [`Why::Asleep`] or [`Why::Unsupported`]).
     pub unread: Option<Why>,
+    /// Whether the GPU has no memory of its own and works in the system's, as its reader knows
+    /// it: an Apple GPU (macOS), or an NVIDIA card NVML reports no memory of its own for and that
+    /// addresses system memory through ATS (Linux). `false` where the reader cannot tell.
+    pub unified: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1116,7 +1137,15 @@ impl TcpCounts {
 pub struct TcpSummary {
     /// TCP socket counts grouped by state.
     pub counts: TcpCounts,
-    /// Median kernel smoothed RTT (`t_srtt`, milliseconds) across established non-loopback connections, if any.
+    /// Only `ESTABLISHED` and `TIME_WAIT` were read, from the kernel's counters: Linux holds no
+    /// all-states dump yet, or its self-check retired it. Every other state is unread, not 0, and
+    /// `ESTABLISHED` may hold `CLOSE_WAIT` (`crate::linux::tcp::reading_counts`).
+    pub counters_only: bool,
+    /// Median kernel smoothed RTT (milliseconds), if any. On macOS, `t_srtt` across established
+    /// non-loopback connections. On Linux, `tcpi_rtt` across at most 64 followed connections, each
+    /// established to a remote peer at the newest dump and looked up by cookie this reading: the
+    /// first to each IPv4 /24 or IPv6 /48, then the rest in dump order, so a site's many
+    /// connections count as one place (`crate::linux::tcp::choose_followed`).
     pub srtt_ms: Option<f32>,
 }
 
@@ -1138,7 +1167,8 @@ pub fn tcp_summary() -> Option<TcpSummary> {
     tcp_summary_into(&mut Vec::new())
 }
 
-/// Read machine-wide TCP state counts and passive smoothed RTT using caller-provided `scratch` storage.
+/// Read machine-wide TCP state counts and passive smoothed RTT using caller-provided `scratch` storage
+/// (macOS's table; Linux reads its counters and the newest dump, [`crate::linux::tcp::reading`]).
 #[must_use]
 pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     #[cfg(target_os = "macos")]
@@ -1147,10 +1177,8 @@ pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     }
     #[cfg(target_os = "linux")]
     {
-        crate::linux::tcp_counts_under_into(Path::new("/"), scratch).map(|counts| TcpSummary {
-            counts,
-            srtt_ms: crate::linux::tcp_srtt_ms(),
-        })
+        let _ = scratch;
+        crate::linux::tcp::reading()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1159,7 +1187,18 @@ pub fn tcp_summary_into(scratch: &mut Vec<u8>) -> Option<TcpSummary> {
     }
 }
 
-/// Count open socket file descriptors held by `pid` without taking descriptor I/O references (`PROC_PIDLISTFDS` on macOS, `/proc/<pid>/fd` symlinks on Linux), or `None` when unreadable.
+/// After a reading publishes, the machine's TCP readers' own work, off the reading's path: on
+/// Linux, the all-states dump when one is due, else other namespaces' tables
+/// ([`crate::linux::tcp::after_publish`]); nothing elsewhere. `hidden`: no window in view shows
+/// the bars or a page that reads them.
+pub fn tcp_after_publish(hidden: bool) {
+    #[cfg(target_os = "linux")]
+    crate::linux::tcp::after_publish(hidden);
+    #[cfg(not(target_os = "linux"))]
+    let _ = hidden;
+}
+
+/// Count open socket file descriptors held by `pid` without taking descriptor I/O references (`PROC_PIDLISTFDS` on macOS; on Linux, the `/proc/<pid>/fd` links to a TCP socket the newest dump names, [`crate::linux::tcp::newest`]), or `None` when unreadable or, on Linux, before the first dump.
 #[must_use]
 pub fn open_socket_count(pid: u32) -> Option<u32> {
     #[cfg(target_os = "macos")]
@@ -1168,7 +1207,8 @@ pub fn open_socket_count(pid: u32) -> Option<u32> {
     }
     #[cfg(target_os = "linux")]
     {
-        crate::linux::Root::system().open_socket_count(pid)
+        crate::linux::tcp::newest()
+            .and_then(|dump| crate::linux::Root::system().open_socket_count(pid, &dump.sockets))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1177,16 +1217,7 @@ pub fn open_socket_count(pid: u32) -> Option<u32> {
     }
 }
 
-/// System-wide and per-user process/task table ceilings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProcessLimits {
-    /// Maximum processes/tasks system-wide.
-    pub system: Option<u64>,
-    /// Maximum processes/tasks for one user.
-    pub per_user: Option<u64>,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+/// The smaller of two ceilings, either one where the other is unknown.
 #[must_use]
 pub(crate) fn smaller(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -1219,32 +1250,6 @@ pub(crate) fn nproc_rlimit() -> Option<u64> {
         return None;
     }
     rlimit_ceiling(u64::from(r.rlim_cur), u64::from(libc::RLIM_INFINITY))
-}
-
-/// Read system-wide and per-user process limits.
-#[must_use]
-pub fn process_limits() -> ProcessLimits {
-    #[cfg(target_os = "macos")]
-    {
-        crate::macos::process_limits()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let read = |path: &str| {
-            crate::with_bounded(Path::new(path), |t| crate::parse_uint::<u64>(t.trim())).flatten()
-        };
-        ProcessLimits {
-            system: smaller(
-                read("/proc/sys/kernel/pid_max"),
-                read("/proc/sys/kernel/threads-max"),
-            ),
-            per_user: nproc_rlimit(),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        ProcessLimits::default()
-    }
 }
 
 /// Kernel workqueue thread-pool ceilings per process (`workqueue_limits`).
@@ -1285,34 +1290,6 @@ pub fn load_average() -> Option<[f64; 3]> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
-    }
-}
-
-/// Count total processes/tasks on the machine and processes owned by real user `uid`.
-#[must_use]
-pub fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
-    #[cfg(target_os = "macos")]
-    {
-        crate::macos::pid_counts(uid)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = uid;
-        (crate::linux::Root::system().tasks(), None)
-    }
-    #[cfg(all(windows, target_pointer_width = "64"))]
-    {
-        let _ = uid;
-        crate::win::pid_counts()
-    }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        all(windows, target_pointer_width = "64")
-    )))]
-    {
-        let _ = uid;
-        (None, None)
     }
 }
 

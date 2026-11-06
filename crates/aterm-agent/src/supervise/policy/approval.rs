@@ -18,7 +18,7 @@ use super::box_command;
 use super::claude_settings::{AskKind, OwnerAsk};
 use super::git_config::{GitView, WorkerEnv, cd_operand, cdpath_searched, git_reads, hazard};
 use super::guard::row_guard;
-use super::probe::{PolicyProbe, WorkerWrites};
+use super::probe::{Below, PolicyProbe, WorkerWrites};
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
 use super::shell_startup::ShellStartup;
 use super::trace::{NoTrace, Outcome, Trace, note};
@@ -27,21 +27,22 @@ use crate::harness::lights::Mode;
 use crate::supervise::classify::{
     QUOTED_SUBSTITUTION, SUBSTITUTION, brace_expansion, classify_command_except,
     classify_command_with, classify_except_rm, command_words, command_words_globbed,
-    expanded_parameters, git_subcommand, glob_match, grammar_names_operand, path_operands_except,
-    path_operands_of, plain_zsh_line, program, runs, unquoted_glob, unredirected,
+    expanded_parameters, git_grep_operands, git_log_operands, git_subcommand, git_tree_path,
+    glob_match, grammar_names_operand, path_operands_except, path_operands_of, plain_zsh_line,
+    program, runs, unquoted_glob, unredirected,
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v12";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v13";
 /// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note
 /// (`This command requires approval`).
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v7";
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v8";
 /// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the
 /// rm resolver follows.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v10";
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v11";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a
 /// command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v12";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v13";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under
 /// `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
@@ -87,7 +88,7 @@ pub const RULE_CONVERSATION_RESUME: &str = "conversation-resume@v1";
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
 /// it, and every other permission box the worker raises is declined under it, with
 /// [`DISK_WORKER_DECLINE`] or, for such a Bash box that a proof did not hold for, why not.
-pub const RULE_DISK_WORKER: &str = "disk-worker@v4";
+pub const RULE_DISK_WORKER: &str = "disk-worker@v5";
 
 /// What [`RULE_DISK_WORKER`] types into a disk-free worker's refusal of a command that is not a
 /// read nor `aterm harness disk` or a System State read, and of every other tool's box.
@@ -2596,7 +2597,8 @@ fn environment_unread(readings: &[String]) -> Result<(), String> {
 
 /// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory
 /// word for a Bash box. It knows no session's cwd, so a relative path is read from a directory it
-/// cannot place ([`Start::Unplaced`]).
+/// cannot place ([`Start::Unplaced`]), and it looks at no disk, so a tree a reader descends is
+/// unproven ([`unlisted`]).
 ///
 /// # Errors
 ///
@@ -2614,15 +2616,17 @@ fn readings_read_only_at(
     python_allow: &[String],
     home: Option<&Path>,
 ) -> Result<(), String> {
-    readings_read_only_from(readings, python_allow, home, Start::Unplaced)
+    readings_read_only_from(readings, python_allow, home, Start::Unplaced, &unlisted)
 }
 
-/// [`readings_read_only_at`], a relative path read from `start`.
+/// [`readings_read_only_at`], a relative path read from `start`, a tree a reader descends listed
+/// by `list`.
 fn readings_read_only_from(
     readings: &[String],
     python_allow: &[String],
     home: Option<&Path>,
     start: Start<'_>,
+    list: Lister<'_>,
 ) -> Result<(), String> {
     readings_proven(readings, python_allow)?;
     secrets_unreached(
@@ -2632,14 +2636,29 @@ fn readings_read_only_from(
         start,
         &|_| false,
         LeadingDot::Any,
+        list,
     )
+}
+
+/// How [`secrets_unreached`] learns what a reader may open below a tree it descends: given the
+/// tree's absolute path, how many levels below it the reader reads (`usize::MAX`: any) and the
+/// rules, what lies there ([`PolicyProbe::below_tree`]).
+pub type Lister<'a> = &'a dyn Fn(&[String], usize, &[SecretRule]) -> Result<Below, String>;
+
+/// The [`Lister`] of a check that looks at no disk (the advisory word): every tree is unproven.
+///
+/// # Errors
+///
+/// Always: why the tree is unproven.
+pub fn unlisted(_: &[String], _: usize, _: &[SecretRule]) -> Result<Below, String> {
+    Err("a tree a reader descends, whose files this check does not list".to_string())
 }
 
 /// The advisory word's verdict ([`readings_read_only`]) on `line`, a shell command line as typed,
 /// with the default secret list under `home` and a relative path read from `cwd`, where the line
-/// runs (from a directory the check cannot place, as the word reads it, with none): `aterm drive
-/// classify`'s verdict after the classifier's, so the verb approves no line the harness's rules
-/// would refuse from there.
+/// runs (from a directory the check cannot place, as the word reads it, with none), and a tree a
+/// reader descends listed by `list`: `aterm drive classify`'s verdict after the classifier's, so
+/// the verb approves no line the harness's rules would refuse from there.
 ///
 /// # Errors
 ///
@@ -2649,6 +2668,7 @@ pub fn command_read_only_at(
     python_allow: &[String],
     home: Option<&Path>,
     cwd: Option<&Path>,
+    list: Lister<'_>,
 ) -> Result<(), String> {
     let cwds: Vec<PathBuf> = cwd.map(Path::to_path_buf).into_iter().collect();
     let start = if cwds.is_empty() {
@@ -2656,7 +2676,7 @@ pub fn command_read_only_at(
     } else {
         Start::Known(&cwds)
     };
-    readings_read_only_from(&[line.to_string()], python_allow, home, start)
+    readings_read_only_from(&[line.to_string()], python_allow, home, start, list)
 }
 
 /// The home the advisory word and `aterm drive classify` resolve `~` and the secret list
@@ -3296,6 +3316,22 @@ fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a Sec
     })
 }
 
+/// The rule a path a walk below a tree met falls under ([`PolicyProbe::below_tree`]): an
+/// `Under` directory it lies in, a `Component` one of its names is, or, for a file (`dir`
+/// false), a `Basename` rule its last name matches, each compared as [`secret_hit`] compares it.
+/// A directory's name is held to no basename rule: a reader opens the files below it, each of
+/// which the walk holds to them.
+pub(super) fn walk_hit<'a>(
+    comps: &[String],
+    secrets: &'a [SecretRule],
+    dir: bool,
+) -> Option<&'a SecretRule> {
+    secrets.iter().find(|rule| match rule {
+        SecretRule::Basename(_) if dir => false,
+        _ => secret_hit(comps, std::slice::from_ref(*rule)).is_some(),
+    })
+}
+
 /// `c` case-folded fully, as APFS compares names: lower, upper, then lower again, so `ſ`, the
 /// Kelvin sign, `ß`, `ẞ` and the `ﬁ` ligatures fold to the ASCII they open (`.ſsh` is `.ssh`). It
 /// also folds `ı` to `i`, which APFS keeps apart: a stricter reading, never a looser one.
@@ -3401,7 +3437,7 @@ pub(crate) fn reads_from_stand(prompt: &PromptV2) -> bool {
                     descends(seg, run.at)
                         .0
                         .iter()
-                        .any(|(root, _)| from_stand(root))
+                        .any(|tree| from_stand(tree.root))
                 })
             })
     })
@@ -3455,7 +3491,8 @@ impl Start<'_> {
 /// and where its Bash tool stands, or anywhere when its cwd is unknown; a glob the shell may
 /// expand meets a leading dot only by a literal one once its Bash tool's shell startup is read
 /// and proven to leave every glob off a leading dot ([`LeadingDot`],
-/// [`ShellStartup::may_dot_glob`]).
+/// [`ShellStartup::may_dot_glob`]); and a tree a reader descends is walked on the disk by the
+/// session's probe ([`PolicyProbe::below_tree`]).
 fn secrets_unreached_in(
     readings: &[String],
     ctx: &ApprovalCtx,
@@ -3472,13 +3509,15 @@ fn secrets_unreached_in(
     } else {
         LeadingDot::Any
     };
+    let home = ctx.home.as_deref();
     secrets_unreached(
         readings,
         &ctx.secrets,
-        ctx.home.as_deref(),
+        home,
         start,
         passed,
         dot,
+        &|root, below, secrets| ctx.probe.below_tree(root, below, secrets, home),
     )
 }
 
@@ -3524,18 +3563,23 @@ enum LeadingDot {
 /// directory the line may run it in ([`line_bases`]) and below each it cannot place
 /// ([`secret_led`]); a glob held to the rules by what it may expand to ([`secret_reach`], a
 /// leading dot met as `dot` says in a word of a program on [`GLOB_SAFE`] alone, and by any
-/// glob in a word another program takes, [`path_operands_of`], [`LeadingDot`]); and
-/// every tree a reader descends ([`descends`]) held to the home-rooted rules above which it
-/// starts, within the levels it reads (below a directory it cannot place, only a tree that is an
-/// operand or the `.` a reader names none in place of).
+/// glob in a word another program takes, [`path_operands_of`], [`LeadingDot`]); a path git
+/// reads from its repository's top ([`git_top_paths`]) read from each directory git may run in
+/// and every directory above it; and every tree a reader descends ([`descends`]) held to the
+/// home-rooted rules above which it starts, within the levels it reads, and each place it names
+/// walked by `list` ([`listed`]), so no file below it, and no link there, reaches any rule.
 ///
 /// # Errors
 ///
 /// The first read of a secret, named; else the first path this check cannot hold to the rules:
 /// one the line builds at run time (a shell expansion or substitution, or an awk program's own,
 /// [`path_operands_except`]), a relative one after a move it cannot follow, on a line whose
-/// commands may stand in more than [`STANDS_MAX`] directories, or with the session's cwd unknown,
-/// or a tree a reader descends from where this check cannot place it ([`descends`]).
+/// commands may stand in more than [`STANDS_MAX`] directories, or with the session's cwd unknown;
+/// a tree a reader descends from where this check cannot place it ([`descends`]), or whose walk
+/// was cut; a git grep word that names no path, so git reads it as a revision; a git read that
+/// may print a file git reads from its object store or index that no word names
+/// ([`object_read`]); and a git that reads its pathspecs literally or in any case
+/// ([`pathspec_mode`]).
 fn secrets_unreached(
     readings: &[String],
     secrets: &[SecretRule],
@@ -3543,6 +3587,7 @@ fn secrets_unreached(
     start: Start<'_>,
     passed: &dyn Fn(&[String]) -> bool,
     dot: LeadingDot,
+    list: Lister<'_>,
 ) -> Result<(), String> {
     if secrets.is_empty() {
         return Ok(());
@@ -3571,36 +3616,415 @@ fn secrets_unreached(
                 doubt = reach.doubt().map(|u| format!("{u} ({name}): {op}"));
             }
         }
+        let above = Bases {
+            dirs: ancestors(&bases.dirs),
+            floating: bases.floating.clone(),
+            lost: bases.lost.clone(),
+        };
         for seg in &segments {
             let Ok(Some(run)) = runs(seg) else {
                 continue;
             };
+            let prog = program(&seg[run.at]);
+            if doubt.is_none() {
+                doubt = object_read(seg, run.at)
+                    .or_else(|| pathspec_mode(seg, run.at))
+                    .map(|u| format!("{u} ({name})"));
+            }
+            for path in git_top_paths(seg, run.at) {
+                let reach = windows_reach(path, home, &above, false, windows);
+                if let Some(rule) = reach.secret(secrets, 0, LeadingDot::Any) {
+                    return Err(format!(
+                        "a read of a secret {rule} ({name}): {path}, which git reads from its \
+                         repository's top"
+                    ));
+                }
+                if doubt.is_none() {
+                    doubt = reach.doubt().map(|u| format!("{u} ({name}): {path}"));
+                }
+            }
             let (trees, unplaced) = descends(seg, run.at);
             if doubt.is_none() {
                 doubt = unplaced.map(|u| format!("{u} ({name})"));
             }
-            for (root, below) in trees {
+            for tree in trees {
+                let root = tree.root;
                 let mut reach = windows_reach(root, home, &bases, false, windows);
                 if root != "." && !operands.iter().any(|o| o == root) {
                     // A word the grammar reads as no path (grep's pattern), held to the rules
                     // only where the line may stand.
                     reach.tails.clear();
                 }
-                if let Some(rule) = reach.secret(secrets, below, dot) {
+                if let Some(rule) = reach.secret(secrets, tree.below, dot) {
                     return Err(format!(
-                        "a read of a secret {rule} ({name}): {} descends from {root}",
-                        program(&seg[run.at])
+                        "a read of a secret {rule} ({name}): {prog} descends from {root}"
                     ));
                 }
+                let walked = listed(&reach.comps, tree, secrets, list).map_err(|met| {
+                    format!("a read of a secret {met} ({name}): {prog} descends from {root}")
+                })?;
+                let floats = !reach.tails.is_empty();
                 if doubt.is_none() {
                     doubt = reach
                         .doubt()
-                        .map(|u| format!("{u} ({name}): {root}, where it descends"));
+                        .or(walked)
+                        .or_else(|| {
+                            floats.then(|| {
+                                "a tree below a directory this check cannot place, whose files \
+                                 it cannot list"
+                                    .to_string()
+                            })
+                        })
+                        .map(|u| format!("{u} ({name}): {root}, where {prog} descends"));
                 }
             }
         }
     }
     doubt.map_or(Ok(()), Err)
+}
+
+/// What `list` finds below each absolute path in `comps`, a reading of `tree`'s word: each walked
+/// from its last component before the first that holds a glob (`*`, `?`, `[`), as many levels
+/// deeper as the components from there (any, past a whole `**`). `Err` names the first secret a
+/// walk met; `Ok` holds why the tree is unproven, if it is: a walk that was cut, a glob followed by
+/// `..`, which may climb above where the walk starts, or a [`Tree::revision`] word that names
+/// nothing on the disk, which git reads as a revision from its object store.
+fn listed(
+    comps: &[Vec<String>],
+    tree: Tree<'_>,
+    secrets: &[SecretRule],
+    list: Lister<'_>,
+) -> Result<Option<String>, String> {
+    let mut walked: Vec<(Vec<String>, usize)> = Vec::new();
+    let mut doubt = None;
+    for c in comps {
+        let lit = c
+            .iter()
+            .position(|n| n.contains(['*', '?', '[']))
+            .unwrap_or(c.len());
+        let globbed = &c[lit..];
+        if globbed.iter().any(|n| n == "..") {
+            doubt.get_or_insert_with(|| {
+                "a glob followed by `..`, which may climb above the directory this check walks"
+                    .to_string()
+            });
+            continue;
+        }
+        let deeper = if globbed.iter().any(|n| matches!(n.as_str(), "**" | "***")) {
+            TREE
+        } else {
+            globbed.len()
+        };
+        let at = (c[..lit].to_vec(), tree.below.saturating_add(deeper));
+        if walked.contains(&at) {
+            continue;
+        }
+        match list(&at.0, at.1, secrets) {
+            Ok(Below::Secret(met)) => return Err(met),
+            Ok(Below::Missing) if tree.revision => {
+                doubt.get_or_insert_with(|| {
+                    "a git grep word that names no path, which git then reads as a revision from \
+                     its object store, whose files this check cannot list"
+                        .to_string()
+                });
+            }
+            Ok(Below::Missing | Below::Clear) => {}
+            Err(why) => {
+                doubt.get_or_insert(why);
+            }
+        }
+        walked.push(at);
+    }
+    Ok(doubt)
+}
+
+/// Each of `dirs` and every directory above it, each once: where a git repository's top may be
+/// for git run in one of them.
+fn ancestors(dirs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        let mut p = d.trim_end_matches(['/', '\\']);
+        loop {
+            let here = if p.is_empty() { "/" } else { p };
+            if !out.iter().any(|o| o == here) {
+                out.push(here.to_string());
+            }
+            if p.is_empty() {
+                break;
+            }
+            p = p
+                .rfind(['/', '\\'])
+                .map_or("", |k| p[..k].trim_end_matches(['/', '\\']));
+        }
+    }
+    out
+}
+
+/// The paths the git command at `seg[at]` names from its repository's top, past a revision
+/// (`REV:path`, a path led by `./` or `../` excepted, `:path` and `:N:path`) or a pathspec's
+/// `top` magic (`:/path`, `:(top)path`), as [`git_tree_path`] reads each of its words that is no
+/// option: for [`secrets_unreached`] to read from every directory git may run in and each above
+/// it, as the top is one of them. MEASURED 2026-11-05 with git 2.56.0: `git show HEAD:x`, run in
+/// a repository's subdirectory, printed the top's `x`.
+fn git_top_paths(seg: &[String], at: usize) -> Vec<&str> {
+    if program(&seg[at]) != "git" {
+        return Vec::new();
+    }
+    let Some((sub, _)) = git_subcommand(seg, at) else {
+        return Vec::new();
+    };
+    unredirected(seg, sub + 1)
+        .into_iter()
+        .filter(|w| !w.starts_with('-'))
+        .filter_map(git_tree_path)
+        .filter(|(path, top)| *top && !path.is_empty())
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// Why the git command at `seg[at]` may print a file git reads from its object store or index
+/// whose path none of its words names, which this check cannot list (MEASURED 2026-11-05 with git
+/// 2.56.0 in a repository that tracked `a/.ssh/id_rsa` and `.env`: `git log -p`, `git show`,
+/// `git diff HEAD~2`, `git diff`, `git grep token HEAD~1` and `git cat-file -p
+/// HEAD~1:a/.ssh/id_rsa` each printed a line of one; so did `git status -v`, `git show --stat
+/// <blob>` and `git for-each-ref --format='%(raw)'` over a tag naming a blob): `log` and `stash
+/// list` given an option that prints a patch ([`patch_option`]); `show` given an object that is
+/// no `REV:path` (a commit's patch, or a blob or tag printed whole), unless a names-only format
+/// ([`names_only`]) leaves only commits it names by a parent or ancestor ([`commit_ish`]), or
+/// given none without one; `diff` that compares no two paths (`--no-index`) without a names-only
+/// format; `status` given `-v` ([`verbose`]); `cat-file` printing an object that is no
+/// `REV:path`, or the objects its input names (`--batch`, `--batch-command`, each by any prefix
+/// of its name, as git reads `--batch-co`); `for-each-ref`, `tag` and `branch` given a format
+/// holding `%(raw)` or `%(*raw)` ([`raw_atom`]); and `grep` reading the index's copies
+/// (`--cached`, by any prefix), a revision before its `--`, or, with no `--`, a word that may
+/// name one by a `:` (a word that names no path the walk finds, [`Tree::revision`]).
+fn object_read(seg: &[String], at: usize) -> Option<String> {
+    if program(&seg[at]) != "git" {
+        return None;
+    }
+    let (sub_at, sub) = git_subcommand(seg, at)?;
+    let args = unredirected(seg, sub_at + 1);
+    let end = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let opts = &args[..end];
+    let bounded =
+        |w: &str| !w.starts_with(":/") && git_tree_path(w).is_some_and(|(p, _)| !p.is_empty());
+    let untold = "which this check cannot list";
+    match sub {
+        "log" => patch_option(opts).map(|o| {
+            format!("git log {o} prints patches of files the repository has tracked, {untold}")
+        }),
+        "stash" if opts.first() == Some(&"list") => patch_option(&opts[1..])
+            .map(|o| format!("git stash list {o} prints the patches of stashed files, {untold}")),
+        "show" => {
+            let (objects, _) = git_log_operands(&args);
+            let patch = patch_option(opts).is_some() || !names_only(opts);
+            match objects
+                .iter()
+                .find(|w| !bounded(w) && (patch || !commit_ish(w)))
+            {
+                Some(w) => Some(format!(
+                    "git show {w} may print any file the repository has tracked (a commit's \
+                     patch, or a blob or tag printed whole), {untold}"
+                )),
+                None if objects.is_empty() && patch => Some(format!(
+                    "git show prints the patch of HEAD's files, {untold}"
+                )),
+                None => None,
+            }
+        }
+        "status" => opts.iter().find(|a| verbose(a)).map(|o| {
+            format!("git status {o} prints the patches of the files the index holds, {untold}")
+        }),
+        "for-each-ref" | "tag" | "branch" => args.iter().find(|a| raw_atom(a)).map(|a| {
+            format!(
+                "git {sub} {a} prints whole the object a ref names, which may be a file, {untold}"
+            )
+        }),
+        "diff" if !opts.contains(&"--no-index") => (patch_option(opts).is_some()
+            || !names_only(opts))
+        .then(|| format!("git diff prints patches of files the repository tracks, {untold}")),
+        "cat-file" => {
+            if opts.iter().any(|a| {
+                a.strip_prefix("--").is_some_and(|l| {
+                    let name = l.split('=').next().unwrap_or(l);
+                    !name.is_empty() && "batch-command".starts_with(name)
+                })
+            }) {
+                return Some(format!(
+                    "git cat-file prints the objects its input names, {untold}"
+                ));
+            }
+            let words: Vec<&str> = opts
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            let shown = opts
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('p'))
+                || words
+                    .first()
+                    .is_some_and(|w| matches!(*w, "blob" | "tree" | "commit" | "tag"));
+            let object = words.last().copied();
+            (shown && !object.is_some_and(bounded)).then(|| {
+                format!(
+                    "git cat-file prints an object by its id, which may be any file the \
+                     repository has tracked, {untold}"
+                )
+            })
+        }
+        "grep" if !args.contains(&"--no-index") => {
+            if let Some(o) = opts.iter().find(|a| {
+                a.strip_prefix("--")
+                    .is_some_and(|l| !l.is_empty() && "cached".starts_with(l))
+            }) {
+                return Some(format!(
+                    "git grep {o} reads the index's copies of the files the repository tracks, \
+                     {untold}"
+                ));
+            }
+            let (operands, past) = git_grep_operands(&args);
+            let revision = match past {
+                Some(_) => operands.first(),
+                None => operands.iter().find(|w| w.contains(':')),
+            };
+            revision.map(|w| {
+                format!(
+                    "git grep reads {w} as a revision from its object store, whose files this \
+                     check cannot list"
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Why git at `seg[at]` reads its pathspecs otherwise than [`descends`] and [`git_tree_path`]
+/// read them, by a global option before its subcommand: `--literal-pathspecs`, under which a
+/// word's magic is part of the name it reads (`:(icase)src` a file of that name), and
+/// `--icase-pathspecs`, under which `src` also reads a `SRC` a case-sensitive volume holds apart.
+fn pathspec_mode(seg: &[String], at: usize) -> Option<String> {
+    if program(&seg[at]) != "git" {
+        return None;
+    }
+    let end = git_subcommand(seg, at).map_or(seg.len(), |(sub, _)| sub);
+    seg[at + 1..end]
+        .iter()
+        .find(|w| matches!(w.as_str(), "--literal-pathspecs" | "--icase-pathspecs"))
+        .map(|w| format!("git {w} reads every pathspec otherwise than this check reads it"))
+}
+
+/// Whether the object a git word `w` names is a commit by its words alone: `HEAD`, `@`, or a
+/// parent or ancestor (`…^`, `…^N`, `…~`, `…~N`) or a commit peel (`…^{commit}`), which git resolves
+/// to a commit or refuses (MEASURED 2026-11-05 with git 2.56.0: `git update-ref` refused to point
+/// `HEAD` or a branch at a blob, as `trying to write non-commit object`).
+fn commit_ish(w: &str) -> bool {
+    let base = w.trim_end_matches(|c: char| c.is_ascii_digit());
+    matches!(w, "HEAD" | "@")
+        || w.ends_with("^{commit}")
+        || base
+            .strip_suffix(['~', '^'])
+            .is_some_and(|rev| !rev.is_empty())
+}
+
+/// Whether git status's word `a` asks for its verbose form (`-v` in a cluster, `--verbose` by any
+/// prefix of its name), which prints the patch of what the index holds, and of the worktree too
+/// when given twice (MEASURED 2026-11-05 with git 2.56.0: `git status -v` and `git status --verb`
+/// printed the staged lines of `.env`).
+fn verbose(a: &str) -> bool {
+    match a.strip_prefix("--") {
+        Some(long) => {
+            let name = long.split('=').next().unwrap_or(long);
+            !name.is_empty() && "verbose".starts_with(name)
+        }
+        None => a.strip_prefix('-').is_some_and(|c| c.contains('v')),
+    }
+}
+
+/// Whether a word `a` holds the `raw` or `*raw` atom of a ref format whole (`%(raw:size)`, its
+/// size alone, excepted), which prints the object a ref names as it is stored, a blob a tag names
+/// among them (MEASURED 2026-11-05 with git 2.56.0: `git for-each-ref --format='%(raw)'` over a
+/// tag naming a blob printed its lines, `%(*raw)` over an annotated one too; `%(RAW)` is no atom).
+fn raw_atom(a: &str) -> bool {
+    let rest = a.replace("%(raw:size)", "").replace("%(*raw:size)", "");
+    rest.contains("%(raw") || rest.contains("%(*raw")
+}
+
+/// The first of git's words `opts` (before any `--`) that prints a patch, which holds each file's
+/// lines: `-p`, `-u`, `-W`, `-c`, `-m` and `-U`, `-L` in a cluster (MEASURED 2026-11-05 with git
+/// 2.56.0: `git log -pn1` read `-p`, then refused `-n1`), until a letter that takes a value
+/// (`-S`, `-G`, `-O`, `-l`, `-B`, `-M`, `-C`, `-X`, `-n`), and the long options that print one or
+/// imply one, each by its whole name (`git log --pat` and `git diff --pat` were refused as
+/// unrecognized, MEASURED the same day), `--check` among them, which prints each line it flags.
+fn patch_option<'a>(opts: &[&'a str]) -> Option<&'a str> {
+    let short = |a: &str| {
+        a.strip_prefix('-')
+            .filter(|c| !c.starts_with('-') && !c.is_empty())
+            .is_some_and(|cluster| {
+                for c in cluster.chars() {
+                    match c {
+                        'p' | 'u' | 'W' | 'c' | 'm' | 'U' | 'L' => return true,
+                        'S' | 'G' | 'O' | 'l' | 'B' | 'M' | 'C' | 'X' | 'n' => return false,
+                        _ => {}
+                    }
+                }
+                false
+            })
+    };
+    opts.iter().copied().find(|a| {
+        short(a)
+            || matches!(
+                *a,
+                "--cc"
+                    | "--dd"
+                    | "--patch"
+                    | "--patch-with-stat"
+                    | "--patch-with-raw"
+                    | "--function-context"
+                    | "--binary"
+                    | "--remerge-diff"
+                    | "--combined-all-paths"
+                    | "--check"
+                    | "--color-words"
+                    | "--word-diff"
+                    | "--full-diff"
+            )
+            || [
+                "--unified",
+                "--word-diff=",
+                "--word-diff-regex",
+                "--color-words=",
+                "--diff-merges",
+                "--submodule",
+            ]
+            .iter()
+            .any(|p| a.starts_with(p))
+    })
+}
+
+/// Whether git's words `opts` (before any `--`) give a format that prints no file's lines
+/// (`--stat`, `--numstat`, `--shortstat`, `--dirstat`, `--summary`, `--name-only`,
+/// `--name-status`, `--raw`, `--quiet`, `-s`, `--no-patch`): with no [`patch_option`] among them,
+/// `git diff` and `git show` print no patch (MEASURED 2026-11-05 with git 2.56.0: `git diff
+/// --summary` over a modified file printed nothing, `git diff --stat` its name and counts).
+fn names_only(opts: &[&str]) -> bool {
+    opts.iter().any(|a| {
+        matches!(
+            *a,
+            "--stat"
+                | "--numstat"
+                | "--shortstat"
+                | "--dirstat"
+                | "--summary"
+                | "--name-only"
+                | "--name-status"
+                | "--raw"
+                | "--quiet"
+                | "-s"
+                | "--no-patch"
+        ) || a.starts_with("--stat=")
+            || a.starts_with("--dirstat=")
+    })
 }
 
 /// The directories a line's commands may run in, as written, and the first move after which
@@ -4312,25 +4736,51 @@ fn basename_meets(c: &str, glob: &str, dot: LeadingDot) -> bool {
     })
 }
 
-/// The trees the command at `seg[at]` reads files below, as written, each with how many levels
-/// below it it reads ([`TREE`] for any): for `grep -r` (and `-R`, `--recursive`, `-d recurse`),
-/// `rg`, `find` that runs `-exec`, `-execdir`, `-ok` or `-okdir`, and `git grep`, every word
-/// after the program that is no option (its operands among them), and `.` when it names no tree
-/// to start from (grep's and rg's operands past the pattern, by [`grammar_names_operand`]; find's
-/// paths before its expression, [`find_names_a_path`]; a path after git grep's `--`); git grep's
-/// words read as pathspecs ([`pathspec_tree`]: every word past its `--`, a `-` led one among
-/// them, and every word that is no option where it has none); for `diff -r` and `git diff
-/// --no-index`, its words; for `diff`, its words one level down, as it compares each file two
-/// directories both hold. A word built at run time is left to the operand check, which refuses
-/// it; a word a redirect takes is none. Beside them, why the command may also read below a
-/// directory this check cannot place (a pathspec git reads from its repository's top).
-fn descends(seg: &[String], at: usize) -> (Vec<(&str, usize)>, Option<String>) {
-    fn words(args: Vec<&str>, here: bool, below: usize) -> Vec<(&str, usize)> {
+/// A tree [`descends`] names: the word, how many levels below it the reader reads ([`TREE`] for
+/// any), and whether the word names a revision when nothing by its name is on the disk (a word
+/// past git grep's pattern on a line with no `--` that may spell one, [`may_name_revision`]).
+/// MEASURED 2026-11-05 with git 2.56.0: `git grep token src2`, `src2` a branch and no path,
+/// printed the branch's `a/.ssh/id_rsa`; with a folder `src2` beside the branch git refused the
+/// word as both, and with neither as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tree<'a> {
+    root: &'a str,
+    below: usize,
+    revision: bool,
+}
+
+/// Whether a git grep word `w` may name a revision: one holding no glob character (`*`, `?`, `[`,
+/// `\`), none of which a ref's name may hold, or one holding a peel or reflog suffix (`^{`, `@{`),
+/// whose braces may hold any text (MEASURED 2026-11-05 with git 2.56.0: `git grep token
+/// 'HEAD^{/tw*}'` grepped the commit whose message holds `tw`; `git grep token 'zz*'`, no path
+/// matching, printed nothing and succeeded).
+fn may_name_revision(w: &str) -> bool {
+    !w.contains(['*', '?', '[', '\\']) || w.contains("^{") || w.contains("@{")
+}
+
+/// The trees the command at `seg[at]` reads files below, as written ([`Tree`]): for `grep -r` (and
+/// `-R`, `--recursive`, `-d recurse`), `rg`, and `find` that runs `-exec`, `-execdir`, `-ok` or
+/// `-okdir`, every word after the program that is no option (its operands among them), and `.`
+/// when it names no tree to start from (grep's and rg's operands past the pattern, by
+/// [`grammar_names_operand`]; find's paths before its expression, [`find_names_a_path`]); for
+/// `git grep`, its pathspecs ([`pathspec_tree`]: every word past its `--`, a `-` led one among
+/// them, and with no `--` every operand past its pattern, [`git_grep_operands`], each a
+/// [`Tree::revision`] unless `--no-index` is given), and `.` when it has none; for `diff -r` and
+/// `git diff --no-index`, its words; for `diff`, its words one level down, as it compares each
+/// file two directories both hold. A word built at run time is left to the operand check, which
+/// refuses it; a word a redirect takes is none. Beside them, why the command may also read below
+/// a directory this check cannot place (a pathspec git reads from its repository's top).
+fn descends(seg: &[String], at: usize) -> (Vec<Tree<'_>>, Option<String>) {
+    fn words(args: Vec<&str>, here: bool, below: usize) -> Vec<Tree<'_>> {
         args.into_iter()
             .filter(|w| !w.starts_with('-'))
             .filter(|w| !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION))
             .chain(here.then_some("."))
-            .map(|w| (w, below))
+            .map(|root| Tree {
+                root,
+                below,
+                revision: false,
+            })
             .collect()
     }
     let args = unredirected(seg, at + 1);
@@ -4372,24 +4822,32 @@ fn descends(seg: &[String], at: usize) -> (Vec<(&str, usize)>, Option<String>) {
         "git" => match git_subcommand(seg, at) {
             Some((sub, "grep")) => {
                 let rest = unredirected(seg, sub + 1);
-                let (before, specs) = match rest.iter().position(|a| *a == "--") {
-                    Some(k) if k + 1 < rest.len() => {
-                        let specs: Vec<(&str, usize)> = rest[k + 1..]
-                            .iter()
-                            .filter(|w| {
-                                !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION)
-                            })
-                            .map(|w| (*w, TREE))
-                            .collect();
-                        (words(rest[..k].to_vec(), false, TREE), specs)
-                    }
-                    _ => (Vec::new(), words(rest, true, TREE)),
+                let no_index = rest.contains(&"--no-index");
+                let (operands, past) = git_grep_operands(&rest);
+                let (specs, revision) = match past {
+                    Some(past) => (past, false),
+                    None => (operands, !no_index),
                 };
-                let mut trees = before;
+                let specs: Vec<&str> = specs
+                    .into_iter()
+                    .filter(|w| !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION))
+                    .collect();
+                let mut trees = Vec::new();
+                if specs.is_empty() {
+                    trees.push(Tree {
+                        root: ".",
+                        below: TREE,
+                        revision: false,
+                    });
+                }
                 let mut unplaced = None;
-                for (spec, below) in specs {
+                for spec in specs {
                     match pathspec_tree(spec) {
-                        Some(tree) => trees.push((tree, below)),
+                        Some(root) => trees.push(Tree {
+                            root,
+                            below: TREE,
+                            revision: revision && may_name_revision(spec),
+                        }),
                         None => {
                             unplaced.get_or_insert_with(|| {
                                 format!(
@@ -4420,9 +4878,11 @@ fn descends(seg: &[String], at: usize) -> (Vec<(&str, usize)>, Option<String>) {
 /// it, `/` when only a leading `/` comes before it), and a word holding none reads the file or
 /// tree it names. Past its magic (`:(…)`, or `:` and its letters `/`, `!` and `^`), an exclusion
 /// (`exclude`, `!`, `^`) reads below `.`, as exclusions alone read the whole tree where git
-/// stands. `None` where git may read below a directory this check cannot place, the repository's
-/// top (`top`, `/`) or past a `..` after a glob, and for a long magic that never closes, which
-/// this does not read.
+/// stands, and so does `icase`, whose names match any case of theirs, which a case-sensitive
+/// volume holds apart (MEASURED 2026-11-05 with git 2.56.0 and `core.ignorecase=false`:
+/// `:(icase)SRC` read `src/x.rs` where `SRC` read nothing). `None` where git may read below a
+/// directory this check cannot place, the repository's top (`top`, `/`) or past a `..` after a
+/// glob, and for a long magic that never closes, which this does not read.
 ///
 /// MEASURED 2026-11-05 with git 2.56.0, each pathspec quoted, in a scratch home holding
 /// `.claude.json`, `.config/gh/hosts.yml` and `proj/{.env,a.json,dir/x,sub/deep/x.rs}`
@@ -4440,7 +4900,7 @@ fn pathspec_tree(word: &str) -> Option<&str> {
         if magic.split(',').any(|m| m == "top") {
             return None;
         }
-        if magic.split(',').any(|m| m == "exclude") {
+        if magic.split(',').any(|m| matches!(m, "exclude" | "icase")) {
             return Some(".");
         }
         rest

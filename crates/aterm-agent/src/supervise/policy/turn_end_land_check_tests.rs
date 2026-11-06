@@ -1038,3 +1038,135 @@ fn an_off_no_person_set_keeps_lands_rest_on_a_need() {
         assert_eq!(next.land_resting(), !types, "{kept:?}: {next:?}");
     }
 }
+
+/// `r` as agy draws it.
+fn on_agy(r: TurnEndReading) -> TurnEndReading {
+    TurnEndReading {
+        program: aterm_phase::Program::Agy,
+        ..r
+    }
+}
+
+/// land-o's defense in the 2026-11-05 confirm run (`cf-agy-both`, agy 1.5.1).
+const DEFENSE_O: &str = "Nothing left: the parser is committed and pushed to origin/main.";
+
+/// The land check typed at land-o's defense on agy, a work turn and Land's instruction before it:
+/// the state and when the check went.
+fn agy_checked(t: Instant) -> (TurnEndState, Instant) {
+    let mut st = TurnEndState::default();
+    let work = on_agy(worked(
+        "Implemented the parser module and its unit tests in this turn.",
+    ));
+    assert_eq!(act(&mut st, &work, t), land_instruction());
+    let defense = on_agy(short(DEFENSE_O));
+    let then = t + Duration::from_secs(3);
+    let a = act(&mut st, &defense, then);
+    assert_eq!(a.rule_id(), Some(RULE_LAND_CHECK), "the check: {a:?}");
+    (st, then)
+}
+
+/// The check's yield as agy 1.5.1 drew it before its reply (`EVENT idle seq=3742 -`), and the
+/// reply drawn 0.55 s later with nothing typed between (seq 3896).
+const CHECK_UNSAID: &str = include_str!("fixtures/agy-1.5.1-lab-land-check-unsaid.txt");
+const CHECK_LANDED: &str = include_str!("fixtures/agy-1.5.1-lab-land-check-landed.txt");
+
+/// `capture` as agy's own reader reads it under Land, its turn having run `worked`.
+fn agy_read(capture: &str, worked: Option<Duration>) -> TurnEndReading {
+    let rows = screen(capture);
+    let read = aterm_phase::read(Some("agy"), &rows, None);
+    assert_eq!(read.program, aterm_phase::Program::Agy);
+    land(TurnEndReading::of(&read, &rows, false, worked, None, None))
+}
+
+/// [`CHECK_UNSAID`] at the check's yield, its turn run 1.55 s as there: idle and authoritative at
+/// agy's composer, nothing drawn under the check's message.
+fn unsaid_yield() -> TurnEndReading {
+    let r = agy_read(CHECK_UNSAID, Some(Duration::from_millis(1550)));
+    assert!(
+        r.unsaid() && r.authoritative && r.said_tail.is_none(),
+        "{r:?}"
+    );
+    r
+}
+
+/// AN ANSWER WITH NO WORDS ANSWERS NOTHING (L19, `cf-agy-both` 2026-11-05: agy drew its composer
+/// idle under the land check, then `LANDED` 0.55 s later with nothing typed between): the empty
+/// point leaves the check awaited, so the `LANDED` drawn after it is the check's answer and lands,
+/// the defense it audits quoted. Negative control: the empty point judged as the check's answer
+/// (an empty list, the defense audited), a short turn backed off, so the `LANDED` after it is no
+/// answer (16 min of back-off there, nudged at its end into the same reply's hold).
+#[test]
+fn a_landed_drawn_after_an_unsaid_yield_answers_the_check() {
+    let (mut st, then) = agy_checked(t0());
+    let at_empty = then + Duration::from_secs(3);
+    let a = at(&mut st, &unsaid_yield(), at_empty);
+    assert!(!matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+    assert!(
+        waits_until(&a, at_empty + TurnEndTiming::default().take_within),
+        "the check's answer awaited: {a:?}"
+    );
+    assert!(st.land_check_awaited() && !st.landed(), "{st:?}");
+    let drawn = agy_read(CHECK_LANDED, None);
+    assert_eq!(drawn.said_tail.as_deref(), Some(LANDED_WORD), "{drawn:?}");
+    let b = at(&mut st, &drawn, at_empty + Duration::from_millis(550));
+    assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
+    assert!(st.landed() && st.task_done(), "LANDED lands: {st:?}");
+    assert_eq!(st.land_audited(), Some(DEFENSE_O), "{st:?}");
+}
+
+/// AN ANSWER STILL UNSAID PAST ITS TAKE WINDOW is judged there and audits nothing: the check went
+/// unanswered, so the defense the agent says again (the nudge's answer) is still owed its check.
+/// Negative control: the unsaid answer read as the check's (an empty list), which audits the
+/// defense, so said again it is owed nothing.
+#[test]
+fn an_answer_unsaid_past_its_take_window_audits_nothing() {
+    let (mut st, then) = agy_checked(t0());
+    let at_empty = then + Duration::from_secs(3);
+    let a = at(&mut st, &unsaid_yield(), at_empty);
+    assert!(!matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+    let still = TurnEndReading {
+        worked: None,
+        ..unsaid_yield()
+    };
+    let due = at_empty + TurnEndTiming::default().take_within;
+    let (b, then) = decided(&mut st, &still, due);
+    assert_eq!(b.rule_id(), Some(RULE_LAND_NUDGE), "{b:?} {st:?}");
+    assert!(!st.landed() && !st.land_check_awaited(), "{st:?}");
+    assert_eq!(
+        st.land.audited, [None; 3],
+        "no words audit no defense: {st:?}"
+    );
+    st.acted(&b, &still, then);
+    let _ = at(
+        &mut st,
+        &on_agy(short(DEFENSE_O)),
+        then + Duration::from_secs(3),
+    );
+    assert!(st.land_check_owed(), "said again, owed its check: {st:?}");
+}
+
+/// ONLY THE LAND CHECK'S ANSWER WAITS FOR ITS WORDS: every other act's turn is judged by its shape,
+/// so Land's instruction answered with nothing drawn under it is judged where it ends, as before
+/// L19. Negative control: the unsaid hold on every act, which leaves the instruction awaited.
+#[test]
+fn an_unsaid_answer_to_another_act_is_judged_where_it_ends() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let work = on_agy(worked(
+        "Implemented the parser module and its unit tests in this turn.",
+    ));
+    assert_eq!(act(&mut st, &work, t), land_instruction());
+    let at_empty = t + Duration::from_secs(3);
+    let a = at(&mut st, &unsaid_yield(), at_empty);
+    assert!(
+        matches!(
+            a,
+            TurnEndAction::WaitUntil {
+                wait: WaitKind::BackOff { short: 1 },
+                ..
+            }
+        ),
+        "judged a short turn where it ends, not awaited: {a:?}"
+    );
+    assert!(!st.land_check_awaited(), "{st:?}");
+}

@@ -109,17 +109,23 @@ impl Grid {
     pub fn restore_visible_from_lines(&mut self, visible: &[Line]) {
         let rows = self.rows();
         let cols = self.cols();
-        for r in 0..rows {
+        let Some(first) = (0..rows).find(|&r| self.row(r).is_some()) else {
+            return;
+        };
+        self.storage
+            .extras
+            .clear_rows_retaining_capacity(first..rows);
+        for r in first..rows {
             match visible.get(r as usize) {
-                Some(line) => self.fill_row_from_line(r, line, cols),
+                Some(line) => self.fill_row_from_line_cleared(r, line, cols),
                 None => {
                     if let Some(row) = self.row_mut(r) {
                         row.clear();
-                        self.storage.extras.clear_row(r);
                     }
                 }
             }
         }
+        self.storage.extras.maybe_shrink();
     }
 
     /// Clones this grid's history, live frame, and cursor state for mid-recording replay.
@@ -353,6 +359,73 @@ mod tests {
     use super::*;
     use crate::{Cell, CellFlags, PackedColor};
     use aterm_scrollback::{Rle, Scrollback};
+
+    #[test]
+    fn viewport_restore_clears_once_and_matches_individual_rows() {
+        let attrs = aterm_scrollback::CellAttrs::new(
+            PackedColor::rgb(12, 34, 56).0,
+            PackedColor::rgb(65, 43, 21).0,
+            CellFlags::BOLD.bits(),
+        );
+        let old = vec![Line::with_attrs("abcdefghijklmnop", Rle::with_value(attrs, 16)); 8];
+        let new = vec![Line::with_attrs("e\u{301}日👩‍💻", Rle::with_value(attrs, 16)); 8];
+        for offset in [0, 1, 8] {
+            for count in [0, 1, 8] {
+                let mut actual = Grid::new(8, 16);
+                let mut reference = Grid::new(8, 16);
+                for grid in [&mut actual, &mut reference] {
+                    grid.restore_visible_from_lines(&old);
+                    grid.storage.ring_head = 3;
+                    grid.storage.display_offset = offset;
+                }
+                let entries = actual.storage.extras.len();
+                assert!(entries > 0);
+                crate::test_counters::take_extras_clear_ops();
+                actual.restore_visible_from_lines(&new[..count]);
+                assert!(
+                    crate::test_counters::take_extras_clear_ops() <= entries,
+                    "one viewport restore must not rescan the extras map for every row"
+                );
+                for row in 0..8 {
+                    if let Some(line) = new[..count].get(usize::from(row)) {
+                        reference.fill_row_from_line(row, line, 16);
+                    } else if let Some(r) = reference.row_mut(row) {
+                        r.clear();
+                        reference.storage.extras.clear_row(row);
+                    }
+                }
+                let reference_ops = crate::test_counters::take_extras_clear_ops();
+                if offset == 0 && count == 8 {
+                    assert!(
+                        reference_ops > entries,
+                        "individual clears must break the work bound"
+                    );
+                }
+                let actual_lines = actual.checkpoint_visible_lines();
+                let expected_lines = reference.checkpoint_visible_lines();
+                for (a, e) in actual_lines.iter().zip(&expected_lines) {
+                    assert_eq!(a.as_str(), e.as_str(), "offset={offset}, count={count}");
+                    let mut a_attrs = a.attr_cursor();
+                    let mut e_attrs = e.attr_cursor();
+                    for col in 0..16 {
+                        assert_eq!(a_attrs.attr_at(col), e_attrs.attr_at(col));
+                    }
+                }
+                for row in 0..8 {
+                    for col in 0..16 {
+                        assert_eq!(
+                            actual.storage.extras.fg_rgb_for(row, col),
+                            reference.storage.extras.fg_rgb_for(row, col)
+                        );
+                        assert_eq!(
+                            actual.storage.extras.bg_rgb_for(row, col),
+                            reference.storage.extras.bg_rgb_for(row, col)
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Build a plain-text [`Line`] for scrollback fixtures.
     fn plain_line(text: &str) -> Line {

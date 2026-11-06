@@ -2496,12 +2496,20 @@ impl Planner<'_> {
                 .and_then(|col| cells.get(col))
                 .is_some_and(|val| !val.trim().is_empty());
             // Never inspect or copy the Password column if present in an unstripped export.
-            let mut sanitized = cells.clone();
-            if let Some(pw_col) = password
-                && let Some(slot) = sanitized.get_mut(pw_col)
-            {
-                slot.clear();
-            }
+            let sanitized: std::borrow::Cow<'_, [String]> = match password {
+                Some(pw_col) if has_password => {
+                    let mut copy = Vec::with_capacity(cells.len());
+                    for (i, cell) in cells.iter().enumerate() {
+                        copy.push(if i == pw_col {
+                            String::new()
+                        } else {
+                            cell.clone()
+                        });
+                    }
+                    std::borrow::Cow::Owned(copy)
+                }
+                _ => std::borrow::Cow::Borrowed(cells),
+            };
             let Some(address) = self.address_of(n, sheet, row, &sanitized, email) else {
                 continue;
             };

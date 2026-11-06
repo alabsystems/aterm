@@ -12,8 +12,10 @@ use aterm_dbus::{Type, Value};
 
 /// The rows of a recorded TSV, `#` comments skipped, split on tabs.
 pub fn rows(file: &str) -> Vec<Vec<String>> {
-    let path = format!("{}/tests/recorded/{file}", env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let path = aterm_tempfile::manifest_dir()
+        .join("tests/recorded")
+        .join(file);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     text.lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .map(|line| line.split('\t').map(str::to_owned).collect())

@@ -68,8 +68,7 @@ fn corpus() -> Vec<(String, Vec<String>, usize)> {
             (name, screen(&text), cols)
         })
         .collect();
-    let agent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../aterm-agent/src/supervise/policy/fixtures");
+    let agent = aterm_tempfile::manifest_dir().join("../aterm-agent/src/supervise/policy/fixtures");
     let mut paths: Vec<_> = std::fs::read_dir(&agent)
         .expect("aterm-agent's policy fixtures")
         .map(|e| e.expect("a fixture").path())

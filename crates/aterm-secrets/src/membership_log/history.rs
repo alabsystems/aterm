@@ -129,7 +129,11 @@ impl HistoryLease<'_> {
         epoch: &RecordLease<'_>,
     ) -> Result<Option<(u64, Vec<Binding>)>> {
         self.check_record(epoch)?;
-        Ok(self.view.log.historical_commons_writers(epoch.record.id()))
+        let log = self.view.log;
+        let id = epoch.record.id();
+        Ok(log
+            .historical_commons_writers(id)
+            .or_else(|| log.historical_fold_writers(id)))
     }
 
     pub(crate) fn unwrap_commons_epoch(
@@ -138,14 +142,23 @@ impl HistoryLease<'_> {
         identity: &Identity,
     ) -> Result<Option<Zeroizing<[u8; 32]>>> {
         self.check_record(epoch)?;
-        self.view
-            .log
-            .unwrap_commons_epoch(epoch.record.id(), identity)
+        let log = self.view.log;
+        if log.is_fold_epoch(epoch.record.id()) {
+            return log.unwrap_fold_epoch(epoch.record.id(), identity);
+        }
+        log.unwrap_commons_epoch(epoch.record.id(), identity)
     }
 
     /// Whether `key` is the key of the counting Commons epoch `epoch` (it matches the
     /// commitment its signed `Epoch` names) and `epoch` is `under` or in its causal past: what a
     /// history handoff of a log-era Commons epoch carries, checked against the original record.
+    ///
+    /// For a counting `[everyone]` epoch (the fold, B11) the handoff carries the derived network
+    /// key, never the `[everyone]` key, which would also open the vault entries that epoch seals
+    /// to a Mac it was never wrapped to; the commitment is to the `[everyone]` key, so only the
+    /// epoch and the issuance's past are checked here. A wrong key opens no operation (each is
+    /// AEAD-sealed) and grants no authorship (each is signed by its writer), so an issuer that
+    /// lies can deny the recipient a read, as withholding the handoff would, and nothing more.
     pub(crate) fn commons_epoch_key_under(
         &self,
         epoch: &RecordLease<'_>,
@@ -158,6 +171,10 @@ impl HistoryLease<'_> {
         else {
             return Ok(false);
         };
+        let effective = log.effective();
+        if log.is_fold_epoch(epoch.record.id()) {
+            return Ok(effective.counts(at) && (at == top || effective.before(at, top)));
+        }
         let Body::Epoch {
             audience: EpochAudience::Commons,
             generation,
@@ -166,7 +183,6 @@ impl HistoryLease<'_> {
         else {
             return Ok(false);
         };
-        let effective = log.effective();
         Ok(effective.counts(at)
             && (at == top || effective.before(at, top))
             && aterm_digest::ct_eq(

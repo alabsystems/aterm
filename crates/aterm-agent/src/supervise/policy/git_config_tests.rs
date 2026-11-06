@@ -368,6 +368,41 @@ fn a_clean_repository_loads_nothing_that_runs() {
     assert_eq!(hazard(&v, &reads_in(plain.0.path())), None, "{v:?}");
 }
 
+/// An index entry marked assume-unchanged is read by `git grep` from the index, not from the file
+/// a walk of the disk lists (MEASURED 2026-11-05 with git 2.56.0: after `git update-index
+/// --assume-unchanged a/.ssh/id_rsa` and the file's removal, `git grep token` printed
+/// `a/.ssh/id_rsa:token rsa`), so the view sees the mark and a grep that reads the index is a
+/// hazard there; `--no-index` and a log read none.
+#[test]
+fn an_assume_unchanged_entry_holds_a_grep_of_the_index() {
+    let r = repo("assume");
+    std::fs::write(r.0.path().join("x.rs"), "fn x() {}\n").unwrap();
+    git(r.0.path(), &["add", "x.rs"]);
+    let dirs = [r.0.path().to_path_buf()];
+    let grep = git_reads("git grep token", &dirs, None)
+        .expect("a git read")
+        .expect("git");
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
+    // NEGATIVE CONTROL: the entry unmarked.
+    assert!(!v.assume_unchanged, "{v:?}");
+    assert_eq!(hazard(&v, &grep), None, "{v:?}");
+    git(r.0.path(), &["update-index", "--assume-unchanged", "x.rs"]);
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
+    assert!(v.assume_unchanged, "{v:?}");
+    let why = hazard(&v, &grep).expect("a grep of the index");
+    assert!(why.contains("assume-unchanged"), "{why}");
+    for line in ["git grep --no-index token", "git log -1"] {
+        let reads = git_reads(line, &dirs, None)
+            .expect("a git read")
+            .expect("git");
+        assert_eq!(hazard(&v, &reads), None, "{line}");
+    }
+}
+
 #[test]
 fn each_dangerous_key_in_the_repository_is_seen() {
     for key in [
@@ -749,6 +784,39 @@ fn the_workers_external_diff_is_a_hazard() {
     );
 }
 
+/// A worker whose environment reads every pathspec literally or in any case reads none as the
+/// secret check reads it, so every git read is held to a person.
+#[test]
+fn the_workers_pathspec_variables_are_a_hazard() {
+    let r = repo("pathspec-env");
+    for key in ["GIT_LITERAL_PATHSPECS", "GIT_ICASE_PATHSPECS"] {
+        let worker = isolated().with(&format!("{key}=1"));
+        let why = hazard(
+            &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
+            &reads_in(r.0.path()),
+        )
+        .expect("a hazard");
+        assert!(why.contains(key), "{why}");
+    }
+    // NEGATIVE CONTROL: empty, as git reads an unset one, and the glob switches, which read
+    // within the same literal folders.
+    for set in [
+        "GIT_LITERAL_PATHSPECS=",
+        "GIT_GLOB_PATHSPECS=1",
+        "GIT_NOGLOB_PATHSPECS=1",
+    ] {
+        let worker = isolated().with(set);
+        assert_eq!(
+            hazard(
+                &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
+                &reads_in(r.0.path())
+            ),
+            None,
+            "{set}"
+        );
+    }
+}
+
 #[test]
 fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let r = repo("git-config-var");
@@ -919,12 +987,15 @@ fn every_read() -> Vec<GitReads> {
     let mut out = Vec::new();
     for signatures in [false, true] {
         for log_like in [false, true] {
-            out.push(GitReads {
-                dirs: vec![PathBuf::from("/w")],
-                signatures,
-                log_like,
-                remote: None,
-            });
+            for grep_index in [false, true] {
+                out.push(GitReads {
+                    dirs: vec![PathBuf::from("/w")],
+                    signatures,
+                    log_like,
+                    grep_index,
+                    remote: None,
+                });
+            }
         }
     }
     out
@@ -1006,6 +1077,8 @@ fn generated(rng: &mut aterm_spec::rng::XorShift, depth: usize) -> GitView {
                 .collect()
         },
         external_diff: (rng.below(6) == 0).then(|| "/tmp/planted-difftool".to_string()),
+        assume_unchanged: rng.below(4) == 0,
+        pathspec_env: (rng.below(6) == 0).then(|| "GIT_ICASE_PATHSPECS".to_string()),
     }
 }
 
@@ -1043,6 +1116,14 @@ fn fixture_views() -> Vec<GitView> {
         index_hook: Some(PathBuf::from("/w/.git/hooks/post-index-change")),
         ..GitView::default()
     });
+    out.push(GitView {
+        assume_unchanged: true,
+        ..GitView::default()
+    });
+    out.push(GitView {
+        pathspec_env: Some("GIT_LITERAL_PATHSPECS".to_string()),
+        ..GitView::default()
+    });
     out
 }
 
@@ -1072,6 +1153,18 @@ fn hazard_judges_the_projection_as_it_judges_the_view() {
     };
     let (v, r) = projection_holds(dropping).expect("the control is caught");
     assert!(r.log_like && !r.signatures, "{v:?} {r:?}");
+    let forgetting = |v: &GitView| GitView {
+        assume_unchanged: false,
+        ..v.project()
+    };
+    let (v, r) = projection_holds(forgetting).expect("the second control is caught");
+    assert!(v.assume_unchanged && r.grep_index, "{v:?} {r:?}");
+    let unset = |v: &GitView| GitView {
+        pathspec_env: None,
+        ..v.project()
+    };
+    let (v, _) = projection_holds(unset).expect("the third control is caught");
+    assert!(v.pathspec_env.is_some(), "{v:?}");
 }
 
 #[test]

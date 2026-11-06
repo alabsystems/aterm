@@ -65,6 +65,10 @@ fn a_one_shot_recording_against_github_com_is_refused() {
     let refs = "repos/alabsystems/aterm/git/refs";
     for (line, names) in [
         (
+            vec!["repo", "create", "alabsystems/aterm", "--public"],
+            "repo create",
+        ),
+        (
             vec!["release", "create", "alabsystems/aterm", "v1", "--draft"],
             "release create",
         ),

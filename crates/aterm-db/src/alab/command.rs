@@ -757,7 +757,9 @@ fn workbook(path: &Path, kind: SheetKind) -> Option<(PathBuf, String)> {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
     };
-    if path.is_file() || !path.to_str().is_some_and(|p| p.contains('#')) {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+        || !path.to_str().is_some_and(|p| p.contains('#'))
+    {
         return xlsx(path).then(|| (path.to_path_buf(), default_tab(kind).to_owned()));
     }
     let (file, tab) = path.to_str()?.rsplit_once('#')?;
@@ -855,7 +857,7 @@ fn harness_sheets(
         .into_iter()
         .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
         .chain([(SheetKind::AiPool, secrets.join("ai-pool.toml"))])
-        .filter(|(_, path)| path.is_file())
+        .filter(|(_, path)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
         .collect()
     };
     let everyone = everyone(paths);

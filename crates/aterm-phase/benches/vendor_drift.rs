@@ -150,7 +150,7 @@ fn literal_anchors_in_build(path: &str, bytes: &[u8], table: &[Anchor]) -> Outco
         "{path} ({}): every literal anchor is present",
         version
             .as_deref()
-            .unwrap_or("no store record: every anchor owed")
+            .unwrap_or("no store record: taken for the newest build")
     );
     Outcome::Pass(format!(
         "{path} ({}): literal anchors checked",

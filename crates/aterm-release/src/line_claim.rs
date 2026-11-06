@@ -1,0 +1,1119 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Fleet exclusion for candidate lines. Git's lease is the serialization point; timestamps
+//! on refs are never liveness evidence. Transport errors leave a holder's work running.
+
+use crate::ledger::{GitCli, GitRunner, git_ok};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Network waits are bounded and cancellable when the claim is handed off. The sampler
+/// never calls this runner, so no network wait can hide the holder's local progress.
+struct Network<'a> {
+    repo: &'a Path,
+    stopped: &'a AtomicBool,
+}
+
+impl GitRunner for Network<'_> {
+    fn git(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        crate::credential_wait::ask_no_one(&mut cmd)
+            .arg("-C")
+            .arg(self.repo)
+            .args(args);
+        let out = aterm_uds::deadline::output_until_from_unless(
+            &mut cmd,
+            aterm_uds::spawnfd::Stdio::null(),
+            std::time::Instant::now() + std::time::Duration::from_secs(120),
+            &mut || self.stopped.load(Ordering::SeqCst),
+        )
+        .map_err(|e| crate::ledger::Error::new(e.to_string()))?;
+        Ok(crate::ledger::RunOut {
+            status: out.status.code().unwrap_or(-1),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+    fn git_input(
+        &self,
+        args: &[&str],
+        input: &[u8],
+    ) -> crate::ledger::Result<crate::ledger::RunOut> {
+        GitCli::new(self.repo).git_input(args, input)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Holder {
+    pub node: String,
+    pub host: String,
+    pub sid: String,
+    pub pid: u32,
+    pub boot: String,
+    pub start: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct State {
+    pub line: crate::line::Line,
+    pub holder: Holder,
+    pub step: String,
+    pub boundary: String,
+    pub at: u64,
+    pub p95_s: u64,
+    pub rows: Vec<String>,
+}
+
+/// A host observation is tri-state. Failure to reach a peer is never evidence of death.
+#[derive(Clone, Debug)]
+enum Observation {
+    Dead,
+    Live(Box<State>),
+    Unknown,
+}
+
+fn progressing(state: &State, now: u64) -> bool {
+    now.saturating_sub(state.at) <= 1800.max(state.p95_s.saturating_mul(2))
+}
+
+/// Positive host evidence is required for adoption. A locally advancing boundary takes
+/// precedence over an old ref when GitHub is unavailable.
+fn adoptable(state: &State, observed: &Observation, now: u64) -> bool {
+    match observed {
+        Observation::Dead => true,
+        Observation::Live(live) if live.holder == state.holder => {
+            !progressing(state, now) && !progressing(live, now)
+        }
+        Observation::Live(_) | Observation::Unknown => false,
+    }
+}
+
+fn reference(version: &str) -> Result<String, String> {
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("line version must be numeric X.Y.Z".into());
+    }
+    Ok(format!("refs/aterm-release/line/{version}"))
+}
+
+fn remote(git: &dyn GitRunner, name: &str) -> Result<Option<(String, State)>, String> {
+    let listed =
+        git_ok(git, &["ls-remote", "--refs", "origin", name]).map_err(|e| e.to_string())?;
+    let Some(sha) = listed
+        .stdout_utf8()
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    git_ok(git, &["fetch", "--no-tags", "origin", &sha]).map_err(|e| e.to_string())?;
+    let out = git_ok(git, &["show", &format!("{sha}:line.toml")]).map_err(|e| e.to_string())?;
+    let state: State =
+        aterm_toml::from_str(&out.stdout_utf8()).map_err(|e| format!("invalid fleet line: {e}"))?;
+    if reference(&state.line.version)? != name {
+        return Err("fleet line version does not match its ref".into());
+    }
+    Ok(Some((sha, state)))
+}
+
+/// A fresh state-only tree, with the previous state as parent. The candidate checkout and
+/// its index are never used to store claim data.
+fn commit(git: &dyn GitRunner, previous: &str, state: &State) -> Result<String, String> {
+    let text = aterm_toml::to_string(state).map_err(|e| e.to_string())?;
+    let blob = git
+        .git_input(&["hash-object", "-w", "--stdin"], text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    if !blob.success() {
+        return Err(blob.stderr_utf8());
+    }
+    let entry = format!("100644 blob {}\tline.toml\0", blob.stdout_utf8().trim());
+    let tree = git
+        .git_input(&["mktree", "-z"], entry.as_bytes())
+        .map_err(|e| e.to_string())?;
+    if !tree.success() {
+        return Err(tree.stderr_utf8());
+    }
+    let tree_sha = tree.stdout_utf8();
+    let mut args = vec!["commit-tree", tree_sha.trim()];
+    if !previous.is_empty() {
+        args.extend(["-p", previous]);
+    }
+    let out = git
+        .git_input(&args, b"release line progress\n")
+        .map_err(|e| e.to_string())?;
+    if !out.success() {
+        return Err(out.stderr_utf8());
+    }
+    Ok(out.stdout_utf8().trim().to_owned())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Write {
+    Written(String),
+    Race,
+    Offline(String),
+}
+
+fn replace(git: &dyn GitRunner, name: &str, previous: &str, state: &State) -> Write {
+    let sha = match commit(git, previous, state) {
+        Ok(sha) => sha,
+        Err(e) => return Write::Offline(e),
+    };
+    let out = match git.git(&[
+        "push",
+        &format!("--force-with-lease={name}:{previous}"),
+        "origin",
+        &format!("{sha}:{name}"),
+    ]) {
+        Ok(out) => out,
+        Err(e) => return Write::Offline(e.to_string()),
+    };
+    if out.success() {
+        Write::Written(sha)
+    } else if crate::ledger::lost_race(&out.stderr_utf8()) {
+        Write::Race
+    } else {
+        Write::Offline(out.stderr_utf8())
+    }
+}
+
+fn local_observation(state: &State, directory: &Path) -> Observation {
+    observation(state, &aterm_agent::release_progress::survey(directory))
+}
+
+fn observation(state: &State, lines: &[String]) -> Observation {
+    for line in lines {
+        let Some(raw) = line.strip_prefix("release_line alive=") else {
+            continue;
+        };
+        let Some((alive, data)) = raw.split_once(" data=") else {
+            continue;
+        };
+        let data = aterm_codec::pct::decode(data);
+        let Ok(live) = aterm_json::from_str::<State>(&data) else {
+            continue;
+        };
+        if live.holder != state.holder {
+            continue;
+        }
+        return match alive {
+            "0" => Observation::Dead,
+            "1" => Observation::Live(Box::new(live)),
+            _ => Observation::Unknown,
+        };
+    }
+    Observation::Unknown
+}
+
+fn observe(state: &State, here: &Holder, directory: &Path) -> Observation {
+    if state.holder.node == here.node {
+        return local_observation(state, directory);
+    }
+    #[cfg(unix)]
+    if let Ok(read) = aterm_agent::survey_fleet(&aterm_ctl::FleetAsk {
+        host: Some(&state.holder.node),
+        within: std::time::Duration::from_secs(3),
+    }) {
+        for peer in read.peers {
+            if !peer.unproven
+                && peer.node.as_deref() == Some(&state.holder.node)
+                && let Ok(lines) = peer.answer
+            {
+                return observation(state, &lines);
+            }
+        }
+    }
+    Observation::Unknown
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+pub fn existing(repo: &Path, version: &str) -> Result<Option<crate::line::Line>, String> {
+    let name = reference(version)?;
+    let stopped = AtomicBool::new(false);
+    remote(
+        &Network {
+            repo,
+            stopped: &stopped,
+        },
+        &name,
+    )
+    .map(|old| old.map(|(_, state)| state.line))
+}
+
+/// A read cannot take ownership, but must steer preflight to the saved candidate so an
+/// already-staged line is not rejected for a different commit chosen from moving main.
+pub fn follow(
+    backend: &mut dyn crate::release::Backend,
+    candidate: &mut crate::release::Candidate,
+    journal: &mut Option<crate::release::Journal>,
+) -> Result<(), String> {
+    if let Some(selected) = backend.fleet_existing(&candidate.version)? {
+        let selected = journal
+            .as_ref()
+            .filter(|journal| journal.commit == candidate.commit)
+            .map_or_else(
+                || selected.clone(),
+                |journal| preferred(&journal.line(), &selected),
+            );
+        adopt(candidate, journal, selected);
+    }
+    Ok(())
+}
+
+fn preferred(proposed: &crate::line::Line, existing: &crate::line::Line) -> crate::line::Line {
+    if proposed.base == existing.base && proposed.hops.starts_with(&existing.hops) {
+        proposed.clone()
+    } else {
+        existing.clone()
+    }
+}
+
+fn adopt(
+    candidate: &mut crate::release::Candidate,
+    journal: &mut Option<crate::release::Journal>,
+    selected: crate::line::Line,
+) {
+    candidate.commit = selected.head().into();
+    candidate.version = selected.version.clone();
+    candidate.bump_from = None;
+    candidate.why = "the fleet line".into();
+    if let Some(journal) = journal
+        .as_mut()
+        .filter(|journal| journal.commit == selected.head())
+    {
+        journal.line = Some(selected);
+        return;
+    }
+    let asks = journal.as_ref().map(|j| j.asks.clone()).unwrap_or_default();
+    *journal = Some(crate::release::Journal {
+        version: selected.version.clone(),
+        commit: selected.head().into(),
+        started: selected.started,
+        line: Some(selected),
+        asks,
+        ..crate::release::Journal::default()
+    });
+}
+
+/// Selection happens before carrying fixes or judging a newer main: an adopter resumes
+/// the fleet's exact line, with this clone's records, and carries fixes onto that head.
+pub fn select(
+    backend: &mut dyn crate::release::Backend,
+    handed: bool,
+    candidate: &mut crate::release::Candidate,
+    journal: &mut Option<crate::release::Journal>,
+    started: u64,
+) -> Result<(), String> {
+    let proposed = journal
+        .as_ref()
+        .filter(|j| j.commit == candidate.commit)
+        .map_or_else(
+            || crate::line::Line::start(&candidate.version, &candidate.commit, started),
+            crate::release::Journal::line,
+        );
+    let selected = backend.fleet_line(&proposed, handed)?;
+    if selected != proposed {
+        adopt(candidate, journal, selected);
+    }
+    Ok(())
+}
+
+/// One owned lease; the monitor retries its pending writes independently of progress.
+struct Lease {
+    repo: PathBuf,
+    name: String,
+    sha: String,
+    pub state: State,
+    local: PathBuf,
+}
+
+impl Lease {
+    fn take(repo: &Path, line: &crate::line::Line, handed: bool) -> Result<Self, String> {
+        let env = aterm_agent::harness::cli::Env::from_process()?;
+        let host =
+            aterm_agent::survey_facts::machine_label().ok_or("no canonical fleet host label")?;
+        #[cfg(unix)]
+        let node = aterm_agent::fleet_node().ok_or("no authenticated fleet node identity")?;
+        #[cfg(not(unix))]
+        let node = host.clone();
+        let pid = std::process::id();
+        let (boot, start) = aterm_agent::release_progress::identity(pid)
+            .ok_or("cannot read this process's identity")?;
+        let holder = Holder {
+            node,
+            host,
+            sid: std::env::var("ATERM_SESSION_ID").unwrap_or_default(),
+            pid,
+            boot,
+            start,
+        };
+        let name = reference(&line.version)?;
+        let stopped = AtomicBool::new(false);
+        let git = Network {
+            repo,
+            stopped: &stopped,
+        };
+        loop {
+            let old = remote(&git, &name)?;
+            if let Some((_, state)) = &old {
+                let observed = observe(state, &holder, &env.state);
+                let handed = handed
+                    && state.holder.node == holder.node
+                    && state.holder.boot == holder.boot
+                    && crate::cutter::ancestors().contains(&state.holder.pid);
+                if !handed && !adoptable(state, &observed, now()) {
+                    if matches!(observed, Observation::Unknown)
+                        || matches!(&observed, Observation::Live(live) if live.holder != state.holder)
+                    {
+                        return Err(format!(
+                            "COULD NOT RUN: cannot establish fleet line holder {}'s process and progress; the existing cut continues",
+                            state.holder.host
+                        ));
+                    }
+                    return Err(format!(
+                        "CUTTING ELSEWHERE: v{} by {} at {} head {}; red: {}; help: land a fix with verify land; the holder carries it with ship release --fix",
+                        line.version,
+                        state.holder.host,
+                        state.step,
+                        state.line.head(),
+                        red_items(state)
+                    ));
+                }
+            }
+            let selected = old.as_ref().map_or_else(
+                || line.clone(),
+                |(_, state)| {
+                    // A carried fix extends this exact line. A different base selected on a
+                    // moving main is discarded when adopting the fleet's existing line.
+                    preferred(line, &state.line)
+                },
+            );
+            let state = State {
+                line: selected,
+                holder: holder.clone(),
+                step: "commit".into(),
+                boundary: "claimed".into(),
+                at: now(),
+                p95_s: 0,
+                rows: Vec::new(),
+            };
+            let previous = old.as_ref().map_or("", |(sha, _)| sha.as_str());
+            let local = env
+                .state
+                .join(aterm_agent::release_progress::DIRECTORY)
+                .join(format!(
+                    "{}-{}-{}.json",
+                    line.version, holder.pid, holder.start
+                ));
+            let mut claim = Self {
+                repo: repo.into(),
+                name: name.clone(),
+                sha: previous.into(),
+                state,
+                local,
+            };
+            // Make the identity observable before publishing it. A failure here can never
+            // strand a remote lease with no host record from which to prove its death.
+            claim.keep_local()?;
+            match replace(&git, &name, previous, &claim.state) {
+                Write::Race => continue,
+                Write::Offline(e) => return Err(format!("could not claim fleet line: {e}")),
+                Write::Written(sha) => {
+                    claim.sha = sha;
+                    return Ok(claim);
+                }
+            }
+        }
+    }
+
+    fn keep_local(&self) -> Result<(), String> {
+        keep_local(&self.local, &self.state)
+    }
+
+    /// The public cut calls this even when no new row completed.
+    fn write(&mut self, stopped: &AtomicBool) -> Result<bool, String> {
+        let git = Network {
+            repo: &self.repo,
+            stopped,
+        };
+        match replace(&git, &self.name, &self.sha, &self.state) {
+            Write::Written(sha) => {
+                self.sha = sha;
+                Ok(true)
+            }
+            Write::Offline(_) => Ok(false),
+            Write::Race => match remote(&git, &self.name) {
+                Ok(Some((sha, state))) if state.holder == self.state.holder => {
+                    self.sha = sha;
+                    Ok(false)
+                }
+                Ok(_) => Err("COULD NOT RUN: fleet line adopted by another holder".into()),
+                Err(_) => Ok(false),
+            },
+        }
+    }
+}
+
+type Reply = std::sync::mpsc::Sender<Result<bool, String>>;
+enum Request {
+    Wake,
+    Audit(Reply),
+    Stop,
+}
+
+fn keep_local(path: &Path, state: &State) -> Result<(), String> {
+    let text = aterm_json::to_vec(state).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(path.parent().ok_or("no registry parent")?)
+        .map_err(|e| e.to_string())?;
+    crate::durable::write_atomic_durable(path, &text, 0o600).map_err(|e| e.to_string())
+}
+
+struct Local {
+    state: Mutex<State>,
+    path: PathBuf,
+}
+
+impl Local {
+    fn snapshot(&self) -> Result<State, String> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|e| e.to_string())
+    }
+
+    fn update(&self, update: impl FnOnce(&mut State)) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|e| e.to_string())?;
+        update(&mut state);
+        keep_local(&self.path, &state)
+    }
+
+    fn sample(&self, reader: &mut Rows, logs: &Path) -> Result<(), String> {
+        let rows = reader.read(logs);
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.update(|state| {
+            state.boundary = rows.last().cloned().unwrap_or_default();
+            state.rows.extend(rows);
+            state.at = now();
+        })
+    }
+}
+
+/// A monitor retries writes with bounded backoff, while the cutter keeps working. It only
+/// advances progress on completed rows, never on a heartbeat or arbitrary log activity.
+pub struct Claim {
+    pub line: crate::line::Line,
+    tx: std::sync::mpsc::Sender<Request>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    local: Arc<Local>,
+    sampler: Option<std::thread::JoinHandle<()>>,
+    sample_stop: std::sync::mpsc::Sender<()>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Claim {
+    pub fn take(
+        repo: &Path,
+        line: &crate::line::Line,
+        logs: &Path,
+        handed: bool,
+    ) -> Result<Self, String> {
+        let lease = Lease::take(repo, line, handed)?;
+        let line = lease.state.line.clone();
+        let local = Arc::new(Local {
+            state: Mutex::new(lease.state.clone()),
+            path: lease.local.clone(),
+        });
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (sample_stop, sample_rx) = std::sync::mpsc::channel();
+        let mut reader = Rows::default();
+        // Seed before either thread starts: old rows cannot prove new progress.
+        let _ = reader.read(logs);
+        let logs = logs.to_path_buf();
+        let sampling = Arc::clone(&local);
+        let sampler = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                sample_rx.recv_timeout(std::time::Duration::from_secs(1))
+            {
+                if let Err(error) = sampling.sample(&mut reader, &logs) {
+                    fail(error);
+                    break;
+                }
+            }
+        });
+        let publishing = Arc::clone(&local);
+        let stopping = Arc::clone(&stopped);
+        let worker =
+            std::thread::spawn(move || publish_progress(lease, &publishing, &stopping, &rx));
+        Ok(Self {
+            line,
+            tx,
+            worker: Some(worker),
+            local,
+            sampler: Some(sampler),
+            sample_stop,
+            stopped,
+        })
+    }
+
+    pub fn boundary(
+        &mut self,
+        line: &crate::line::Line,
+        step: &str,
+        history: &str,
+    ) -> Result<(), String> {
+        if let Some(error) = failure() {
+            return Err(error.into());
+        }
+        self.local.update(|state| {
+            state.line = line.clone();
+            state.step = step.into();
+            state.boundary = "step boundary".into();
+            state.at = now();
+            state.p95_s = p95(history, step);
+        })?;
+        self.tx.send(Request::Wake).map_err(|e| e.to_string())?;
+        self.line = line.clone();
+        Ok(())
+    }
+
+    /// A public write needs a successful ownership round trip. Offline retries wait here,
+    /// preserving the qualified candidate, rather than turning a transport error into a red.
+    pub fn audit(&mut self) -> Result<(), String> {
+        loop {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.tx
+                .send(Request::Audit(tx))
+                .map_err(|e| e.to_string())?;
+            if rx.recv().map_err(|e| e.to_string())?? {
+                return Ok(());
+            }
+            if crate::interrupt::caught().is_some() {
+                return Err("interrupted while checking fleet ownership".into());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+static FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn fail(error: String) {
+    if FAILURE.set(error).is_ok() {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(std::process::id()) {
+            crate::interrupt::send(pid, crate::interrupt::SIGTERM);
+        }
+    }
+}
+
+fn publish_progress(
+    lease: Lease,
+    local: &Local,
+    stopped: &AtomicBool,
+    rx: &std::sync::mpsc::Receiver<Request>,
+) {
+    publish_progress_with(lease, local, rx, &mut |lease| lease.write(stopped));
+}
+
+fn publish_progress_with(
+    mut lease: Lease,
+    local: &Local,
+    rx: &std::sync::mpsc::Receiver<Request>,
+    write: &mut dyn FnMut(&mut Lease) -> Result<bool, String>,
+) {
+    let mut written = lease.state.clone();
+    let mut backoff = 1;
+    let mut next = std::time::Instant::now();
+    loop {
+        let audit = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Request::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Request::Audit(reply)) => Some(reply),
+            Ok(Request::Wake) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+        };
+        if let Some(error) = failure() {
+            if let Some(reply) = audit {
+                let _ = reply.send(Err(error.into()));
+            }
+            continue;
+        }
+        let current = match local.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                fail(error);
+                continue;
+            }
+        };
+        if std::time::Instant::now() < next || (audit.is_none() && current == written) {
+            if let Some(reply) = audit {
+                let _ = reply.send(Ok(false));
+            }
+            continue;
+        }
+        lease.state = current;
+        // No state lock is held during network I/O. The independent sampler and the
+        // cutter's step boundaries keep the host record current throughout this call.
+        let result = write(&mut lease);
+        match &result {
+            Ok(true) => {
+                written = lease.state.clone();
+                backoff = 1;
+            }
+            Ok(false) => backoff = (backoff * 2).min(60),
+            Err(error) => fail(error.clone()),
+        }
+        next = std::time::Instant::now()
+            + std::time::Duration::from_secs(if result == Ok(true) { 0 } else { backoff });
+        if let Some(reply) = audit {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+pub fn failure() -> Option<&'static str> {
+    FAILURE.get().map(String::as_str)
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = self.sample_stop.send(());
+        let _ = self.tx.send(Request::Stop);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn p95(history: &str, step: &str) -> u64 {
+    let mut samples: Vec<u64> = history
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() == 4 && fields[2] == step)
+                .then(|| fields[3].parse().ok())
+                .flatten()
+        })
+        .collect();
+    samples.sort_unstable();
+    samples
+        .get(
+            samples
+                .len()
+                .saturating_mul(95)
+                .div_ceil(100)
+                .saturating_sub(1),
+        )
+        .copied()
+        .unwrap_or(0)
+}
+
+#[derive(Default)]
+struct Rows(std::collections::BTreeMap<PathBuf, u64>);
+
+impl Rows {
+    fn read(&mut self, logs: &Path) -> Vec<String> {
+        use std::io::{BufRead as _, Seek as _};
+        let mut rows = Vec::new();
+        let Ok(entries) = std::fs::read_dir(logs) else {
+            return rows;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_none_or(|name| {
+                name != "transcript.log" && !name.to_string_lossy().ends_with(".events")
+            }) {
+                continue;
+            }
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let offset = self.0.entry(path).or_default();
+            if file.seek(std::io::SeekFrom::Start(*offset)).is_err() {
+                continue;
+            }
+            let mut reader = std::io::BufReader::new(file);
+            let mut bytes = Vec::new();
+            while let Ok(n) = reader.read_until(b'\n', &mut bytes) {
+                if n == 0 || bytes.last() != Some(&b'\n') {
+                    break;
+                }
+                *offset += n as u64;
+                if let Ok(text) = std::str::from_utf8(&bytes)
+                    && let Some(row) = completed_row(text)
+                {
+                    rows.push(row);
+                }
+                bytes.clear();
+            }
+        }
+        rows
+    }
+}
+
+fn completed_row(text: &str) -> Option<String> {
+    let text = text
+        .trim()
+        .strip_prefix("release-event: ")
+        .or_else(|| text.trim().strip_prefix("verify-event: "))
+        .unwrap_or(text.trim());
+    let event: aterm_json::Value = aterm_json::from_str(text).ok()?;
+    let kind = event["event"].as_str()?;
+    if !matches!(
+        kind,
+        "stage-finished" | "test-binary-finished" | "check-finished" | "test-case-failed"
+    ) {
+        return None;
+    }
+    let summary = aterm_json::json!({ "event": kind, "stage": event.get("stage"), "check": event.get("check"), "test": event.get("test"), "outcome": event.get("outcome"), "detail": event.get("detail"), "findings": event.get("findings") });
+    Some(summary.to_string())
+}
+
+fn red_items(state: &State) -> String {
+    state
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let event: aterm_json::Value = aterm_json::from_str(row).ok()?;
+            (matches!(event["outcome"].as_str(), Some("FAIL" | "fail" | "failed"))
+                || event["event"].as_str() == Some("test-case-failed"))
+            .then(|| event.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub fn status(repo: &Path) -> Result<(), String> {
+    let git = GitCli::new(repo);
+    let refs = git_ok(
+        &git,
+        &["ls-remote", "--refs", "origin", "refs/aterm-release/line/*"],
+    )
+    .map_err(|e| e.to_string())?;
+    for line in refs.stdout_utf8().lines() {
+        let Some((_, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some((_, state)) = remote(&git, name)? {
+            println!(
+                "v{} {} {} step={} boundary={} at={} head={}",
+                state.line.version,
+                state.holder.host,
+                state.holder.sid,
+                state.step,
+                state.boundary,
+                state.at,
+                state.line.head()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(node: &str, at: u64) -> State {
+        State {
+            line: crate::line::Line::start("0.156.0", "base", 1),
+            holder: Holder {
+                node: node.into(),
+                host: node.into(),
+                sid: node.into(),
+                pid: 1,
+                boot: "boot".into(),
+                start: 1,
+            },
+            step: "verify".into(),
+            boundary: "test-binary-finished".into(),
+            at,
+            p95_s: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stalled_holder_is_adopted_but_live_progress_and_network_faults_are_not() {
+        let old = state("m3", 1);
+        assert!(adoptable(
+            &old,
+            &Observation::Live(Box::new(old.clone())),
+            1802
+        ));
+        // Negative control: only the boundary changes, not a heartbeat or ref age.
+        let live = state("m3", 1801);
+        assert!(!adoptable(
+            &old,
+            &Observation::Live(Box::new(live.clone())),
+            1802
+        ));
+        assert!(
+            !adoptable(&live, &Observation::Live(Box::new(old.clone())), 1802),
+            "a cached fleet read cannot overrule a fresh ref boundary"
+        );
+        assert!(!adoptable(&old, &Observation::Unknown, 99999));
+        assert!(adoptable(&old, &Observation::Dead, 2));
+        let mut long_step = old.clone();
+        long_step.p95_s = 2000;
+        assert!(!adoptable(
+            &old,
+            &Observation::Live(Box::new(long_step.clone())),
+            4001
+        ));
+        assert!(adoptable(
+            &old,
+            &Observation::Live(Box::new(long_step)),
+            4002
+        ));
+    }
+
+    #[test]
+    fn activity_without_a_completed_row_cannot_extend_the_progress_bound() {
+        assert!(completed_row("compiler still busy").is_none());
+        assert!(completed_row(r#"{"event":"stage-started","stage":"compile"}"#).is_none());
+        assert!(
+            completed_row(r#"{"event":"test-binary-finished","test":"db","outcome":"FAIL"}"#)
+                .is_some()
+        );
+        assert_eq!(
+            p95(
+                "1\t0.155.0\tverify\t2000\n2\t0.155.0\tbuild\t9000",
+                "verify"
+            ),
+            2000
+        );
+    }
+
+    #[test]
+    fn only_the_private_events_stream_advances_progress_and_partial_rows_wait() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let event = r#"{"event":"check-finished","check":"lint","outcome":"PASS"}"#;
+        let output = dir.path().join("06-verify.log");
+        std::fs::write(output, format!("{event}\n")).unwrap();
+        let events = dir.path().join("06-verify.events");
+        std::fs::write(&events, event).unwrap();
+        let mut rows = Rows::default();
+        // Negative controls: output that resembles a row, and an incomplete private row.
+        assert!(rows.read(dir.path()).is_empty());
+        std::fs::write(&events, format!("{event}\n")).unwrap();
+        assert_eq!(rows.read(dir.path()).len(), 1);
+        assert!(
+            rows.read(dir.path()).is_empty(),
+            "a poll is not another boundary"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn blocked_publication_cannot_hide_completed_progress_from_the_fleet() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut old = state("m3", 1);
+        old.holder.pid = std::process::id();
+        (old.holder.boot, old.holder.start) =
+            aterm_agent::release_progress::identity(old.holder.pid).unwrap();
+        let local = Arc::new(Local {
+            state: Mutex::new(old.clone()),
+            path: dir
+                .path()
+                .join(aterm_agent::release_progress::DIRECTORY)
+                .join("line.json"),
+        });
+        let lease = Lease {
+            repo: dir.path().into(),
+            name: "unused".into(),
+            sha: "old".into(),
+            state: old.clone(),
+            local: local.path.clone(),
+        };
+        local.update(|state| state.step = "build".into()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publishing = Arc::clone(&local);
+        let writer = std::thread::spawn(move || {
+            publish_progress_with(lease, &publishing, &rx, &mut |_| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap();
+                Ok(true)
+            })
+        });
+        tx.send(Request::Wake).unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::write(
+            logs.join("06-verify.events"),
+            "{\"event\":\"test-binary-finished\",\"test\":\"db\",\"outcome\":\"PASS\"}\n",
+        )
+        .unwrap();
+        // This is the production sampler path, while the publisher is held by a channel.
+        local.sample(&mut Rows::default(), &logs).unwrap();
+        let observed = local_observation(&old, dir.path());
+        assert!(!adoptable(&old, &observed, now()));
+        // Negative control: without the sampler's fresh host observation this same old
+        // ref and live process would be judged stalled and adopted.
+        assert!(adoptable(
+            &old,
+            &Observation::Live(Box::new(old.clone())),
+            now()
+        ));
+        tx.send(Request::Stop).unwrap();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+    }
+
+    fn repository(root: &Path, name: &str, origin: &Path) -> GitCli {
+        let path = root.join(name);
+        std::fs::create_dir(&path).unwrap();
+        let git = GitCli::new(path);
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Andrew Yates"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["remote", "add", "origin", origin.to_str().unwrap()],
+        ] {
+            git_ok(&git, &args).unwrap();
+        }
+        git
+    }
+
+    #[test]
+    fn two_macs_have_one_holder_and_stalled_cut_is_not_lost() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git_ok(&GitCli::new(&origin), &["init", "--bare"]).unwrap();
+        let a = repository(dir.path(), "a", &origin);
+        let b = repository(dir.path(), "b", &origin);
+        // Before B6 each clone could acquire its own run claim for the same version.
+        // These are the existing production local locks, not a model of them.
+        let local_a = crate::release::RunClaim::take(
+            &dir.path().join("a/running"),
+            (101, "start-a"),
+            dir.path(),
+            &mut |_| None,
+            &[],
+        )
+        .unwrap();
+        let local_b = crate::release::RunClaim::take(
+            &dir.path().join("b/running"),
+            (102, "start-b"),
+            dir.path(),
+            &mut |_| None,
+            &[],
+        )
+        .unwrap();
+        let baseline_holders = [&local_a, &local_b].len();
+        assert_eq!(baseline_holders, 2);
+        let name = reference("0.156.0").unwrap();
+        let initial = state("m3", 1);
+        // Both Macs read the absent ref. Exactly one CAS can install a holder.
+        let first = match replace(&a, &name, "", &initial) {
+            Write::Written(sha) => sha,
+            other => panic!("{other:?}"),
+        };
+        let mut holder = Lease {
+            repo: dir.path().join("a"),
+            name: name.clone(),
+            sha: first.clone(),
+            state: initial.clone(),
+            local: dir.path().join("local.json"),
+        };
+        git_ok(
+            &a,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                dir.path().join("unavailable").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let stopped = AtomicBool::new(false);
+        assert_eq!(
+            holder.write(&stopped),
+            Ok(false),
+            "a transport fault is pending, never ownership loss"
+        );
+        assert_eq!(holder.sha, first);
+        git_ok(
+            &a,
+            &["remote", "set-url", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            holder.write(&stopped),
+            Ok(true),
+            "the same candidate continues once transport returns"
+        );
+        let first = holder.sha.clone();
+        assert_eq!(replace(&b, &name, "", &state("m22", 1)), Write::Race);
+        let (old_sha, old) = remote(&b, &name).unwrap().unwrap();
+        assert_eq!(old_sha, first);
+        assert!(!adoptable(
+            &old,
+            &Observation::Live(Box::new(state("m3", 1801))),
+            1802
+        ));
+        assert!(adoptable(
+            &old,
+            &Observation::Live(Box::new(old.clone())),
+            1802
+        ));
+        let mut adopted = old.clone();
+        adopted.holder = state("m22", 1802).holder;
+        adopted.at = 1802;
+        let new = match replace(&b, &name, &old_sha, &adopted) {
+            Write::Written(sha) => sha,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(replace(&a, &name, &first, &initial), Write::Race);
+        assert!(
+            holder.write(&stopped).is_err(),
+            "positive ownership loss stops the old holder"
+        );
+        assert_eq!(
+            remote(&a, &name).unwrap().unwrap().1.line,
+            initial.line,
+            "the exact candidate survives takeover"
+        );
+        // Negative control: removing the expected-old lease lets the stale holder overwrite
+        // the adopter. The same stale write with the lease above was refused.
+        let stale = commit(&a, &new, &initial).unwrap();
+        git_ok(
+            &a,
+            &["push", "--force", "origin", &format!("{stale}:{name}")],
+        )
+        .unwrap();
+        assert_eq!(remote(&b, &name).unwrap().unwrap().1.holder, initial.holder);
+        println!(
+            "B6 measured: before holders/version={baseline_holders}; after holders/version=1; unfenced stale overwrite=1; leased stale overwrite=0; stalled adoptions=1; cuts lost=0"
+        );
+    }
+}

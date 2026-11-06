@@ -118,7 +118,7 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
     assert!(receipt.matches());
     assert_eq!(
         receipt.claimed(),
-        Some(aterm_types::version::build_id().as_str()),
+        Some(aterm_stamp::build_id().as_str()),
         "the automatic landing's claim added this build's line"
     );
     let original_sid = session.ctx.self_id.clone();
@@ -296,7 +296,7 @@ fn clt_recovery_an_update_adopted_tab_adopted_again_after_a_crash_takes_back_its
         return;
     }
     let earlier = "0.1.0+gdeadbeef";
-    let build = aterm_types::version::build_id();
+    let build = aterm_stamp::build_id();
     let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
     for (end, kept) in [
         (ChildExit::Code(1), false),
@@ -684,4 +684,62 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
         "a refused dispatch never acquired the occupied record"
     );
     assert!(drain(&read).is_empty());
+}
+
+/// A tab its window took down before the PTY keeper held it (a new Mac's first launch killed in
+/// its first seconds: E3's kill-stage row, 2026-11-05) is gone with its end unread. The next
+/// launch of the build takes back the line the tab's landing claimed, and the tab's receipt, so
+/// that launch opens the tab by itself again. A tab still running (the keeper's, for its
+/// adoption) keeps both; one gone whose claim added another build's line leaves that line and its
+/// receipt to that build; one gone whose claim added none goes, taking back no line.
+/// NEGATIVE CONTROL: the mutant whose launch takes nothing back reads this build's ask as spent,
+/// so setup's one Mac password is never asked again (the kill-stage guest's `debugger`, owed for
+/// good).
+#[test]
+fn clt_recovery_a_tab_gone_with_its_end_unread_is_asked_again_by_the_next_launch() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mark = directory.path().join("command-line-tools-tab");
+    let build = aterm_stamp::build_id();
+    let (child, _read) = landed_child(&mark);
+    let receipt = receipt_for(&mark, &child);
+    assert_eq!(
+        receipt.claimed(),
+        Some(build.as_str()),
+        "its landing claimed this build's ask"
+    );
+
+    let running = |pid: i32, birth: u64| pid == CHILD_PID && birth == CHILD_BIRTH;
+    assert!(
+        Mark::launched(mark.clone(), running).opened(),
+        "a running tab is the keeper's"
+    );
+    assert!(receipt.matches(), "left for its adoption");
+
+    let next = Mark::launched(mark.clone(), |_, _| false);
+    assert!(!next.opened(), "gone unread: this launch asks again");
+    assert!(launch_install(true, true, true, next.opened()).want);
+    assert!(!Mark::at(mark.clone()).opened(), "the line left the record");
+    assert!(!receipt.matches(), "and the receipt went with it");
+
+    const EARLIER: &str = "0.1.0+gdeadbeef";
+    let live = aterm_types::clt_mark::Live;
+    assert!(aterm_types::clt_mark::claim(&live, &mark, EARLIER).unwrap());
+    this_builds_mark(&mark);
+    for (claimed, kept) in [(Some(EARLIER), true), (None, false)] {
+        let orphan = new_receipt(&mark, &child, claimed);
+        orphan.write_exclusive().unwrap();
+        assert!(
+            Mark::launched(mark.clone(), |_, _| false).opened(),
+            "{claimed:?}: this build's line is no gone tab's"
+        );
+        assert!(
+            aterm_types::clt_mark::opened_on_build(&live, &mark, EARLIER),
+            "{claimed:?}"
+        );
+        assert_eq!(orphan.matches(), kept, "{claimed:?}");
+        orphan.remove_if_matching();
+    }
 }

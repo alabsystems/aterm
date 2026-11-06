@@ -14,7 +14,7 @@
 [package]
 name = "aterm-win32"
 description = "aterm's Win32 declarations: the windows-sys 0.61.2 types, constants and imports aterm's Windows graph reads, generated at upstream's module paths, plus the COM vocabulary, the DXGI, Direct3D 11 and DirectComposition slices aterm calls and the UI Automation provider interfaces aterm implements, with no third-party dependency (derived from windows-sys, windows-link, windows-core and windows, MIT OR Apache-2.0 upstream)."
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

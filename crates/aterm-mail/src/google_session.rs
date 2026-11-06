@@ -44,9 +44,16 @@ fn email(value: &str) -> Result<String, String> {
 }
 
 fn location(home: &Path, email: &str) -> PathBuf {
-    let key = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(email.as_bytes()));
-    home.join(".config/aterm/mail/google")
-        .join(format!("{key}.age"))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = aterm_digest::Sha256::digest(email.as_bytes());
+    let mut name = [0u8; 68];
+    for (i, &b) in digest.iter().enumerate() {
+        name[i * 2] = HEX[usize::from(b >> 4)];
+        name[i * 2 + 1] = HEX[usize::from(b & 0x0f)];
+    }
+    name[64..].copy_from_slice(b".age");
+    let file = std::str::from_utf8(&name).unwrap_or("");
+    home.join(".config/aterm/mail/google").join(file)
 }
 
 #[cfg(any(unix, test))]
@@ -210,6 +217,7 @@ pub fn accounts(home: &Path) -> Vec<String> {
                 .as_os_str()
                 .as_encoded_bytes()
                 .ends_with(b".age")
+                && entry.file_type().is_ok_and(|ft| ft.is_file())
         })
         .take(128)
         .collect();
@@ -348,10 +356,12 @@ impl Session {
         now_unix: impl Fn() -> Option<u64>,
         mut request: impl FnMut(&Grant) -> Result<Tokens, Error>,
     ) -> Result<bool, Error> {
+        let mut grant_path = None;
         if let Some(error) = &self.rejected {
             // A new explicit enrollment may replace this grant from another process.
             // A rejection suppresses retries only while the persisted credential is unchanged.
-            let fresh = load_grant(&self.home, &location(&self.home, &self.grant.email))
+            let path = location(&self.home, &self.grant.email);
+            let fresh = load_grant(&self.home, &path)
                 .map_err(|_| Error {
                     kind: ErrorKind::Storage,
                 })?
@@ -365,6 +375,7 @@ impl Session {
             {
                 return Err(error.clone());
             }
+            grant_path = Some(path);
             self.grant = fresh;
             self.rejected = None;
             self.access = None;
@@ -377,12 +388,13 @@ impl Session {
         if self.access.is_some() && now < self.expires {
             return Ok(changed);
         }
+        let grant_path = grant_path.unwrap_or_else(|| location(&self.home, &self.grant.email));
         let lease = crate::session::acquire(&self.home, &format!("google:{}", self.grant.email))
             .map_err(|_| Error {
                 kind: ErrorKind::Storage,
             })?;
         // Another process may have renewed since this session loaded its grant.
-        let grant = load_grant(&self.home, &location(&self.home, &self.grant.email))
+        let grant = load_grant(&self.home, &grant_path)
             .map_err(|_| Error {
                 kind: ErrorKind::Storage,
             })?

@@ -771,8 +771,9 @@ fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 /// The child half of [`an_install_under_an_open_umask_leaves_nothing_others_can_write`]:
-/// under umask `000`, the end-to-end install plus a shim-env sidecar and a stage-refusal
-/// memo leave nothing in the prefix writable by group or others.
+/// under umask `000`, the end-to-end install (its tree-root record included) plus a shim-env
+/// sidecar, a stage-refusal memo and a lock's keep mark leave nothing in the prefix writable by
+/// group or others.
 #[cfg(unix)]
 fn probe_an_install_under_an_open_umask_if_asked() -> bool {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
@@ -796,6 +797,14 @@ fn probe_an_install_under_an_open_umask_if_asked() -> bool {
     let digest = (crate::manifest::DigestAlg::Sha256, "aa");
     crate::store::record_stage_refusal(&layout.build_dir("nn", 3), digest, "bb", "probe", 0)
         .unwrap();
+    assert!(
+        crate::trust_lock::recorded_root_at(&layout.build_dir("ay", 18)).is_some(),
+        "the install recorded its tree root"
+    );
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o755)
+        .create(crate::trust_lock::build_dir(&layout.prefix, 16387))
+        .unwrap();
+    crate::trust_lock::mark_locked(&layout.prefix, 16387).unwrap();
     let mut loose = Vec::new();
     writable_by_others(&layout.prefix, &layout.prefix, &mut loose);
     assert!(loose.is_empty(), "laid writable by others: {loose:#?}");
@@ -1003,7 +1012,7 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     reclaim_after_failed_stage(&dl, &fault);
     assert!(dl.is_file(), "a machine fault keeps the verified archive");
     assert_eq!(
-        digest_refusal_note(&layout, "claude", build, &art, false),
+        digest_refusal_note(&layout, "claude", build, &art, Retry::Program),
         None
     );
 
@@ -1017,7 +1026,7 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
         !dl.exists() && !part.exists(),
         "the refused bytes are reclaimed"
     );
-    let note = digest_refusal_note(&layout, "claude", build, &art, false)
+    let note = digest_refusal_note(&layout, "claude", build, &art, Retry::Program)
         .expect("the first signer refusal already binds");
     assert!(
         note.starts_with(crate::state::HELD_FAILED_PREFIX)
@@ -1027,7 +1036,7 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     let mut moved = art.clone();
     moved.sha256 = "0".repeat(64);
     assert_eq!(
-        digest_refusal_note(&layout, "claude", build, &moved, false),
+        digest_refusal_note(&layout, "claude", build, &moved, Retry::Program),
         None,
         "new digests are a new question"
     );
@@ -1642,6 +1651,7 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         exposes: vec![tool("ay")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::Off,
@@ -2284,14 +2294,20 @@ fn missing_triple_is_a_clean_skip() {
     let dir = scratch("triple");
     let fake = fixture(&dir);
     let layout = layout(&dir);
-    let req = InstallRequest {
-        channel: "stable",
-        program: "ay",
-        triple: "x86_64-unknown-linux-gnu",
-        installed: None,
-    };
-    let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
-    assert!(matches!(err, FlowError::NoArtifact(_)), "got {err:?}");
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    ] {
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple,
+            installed: None,
+        };
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(err, FlowError::NoArtifact(_)), "{triple}: {err:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4794,6 +4810,7 @@ fn rollback_restores_a_tool_the_new_build_dropped() {
         exposes: vec![tool("ay")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -4849,6 +4866,7 @@ fn a_trust_rollback_never_takes_another_programs_shim() {
         exposes: vec![tool("trustc")],
         prior_build: Some(1),
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Alab,
         tree_root: String::new(),
@@ -4929,6 +4947,7 @@ fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
         exposes: vec![tool("trustc")],
         prior_build: Some(1),
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Alab,
         tree_root: String::new(),
@@ -4987,6 +5006,7 @@ fn a_rollback_respects_a_program_installed_without_a_current_link() {
             exposes: vec![tool("trustc")],
             prior_build: Some(1),
             was_live: false,
+            was_held: false,
             reloc: None,
             aliases: Aliases::Off,
             tree_root: String::new(),
@@ -5043,6 +5063,7 @@ fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
         exposes,
         prior_build: Some(8590),
         was_live: true,
+        was_held: true,
         reloc: None,
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -5089,6 +5110,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
         exposes: vec![tool("ay"), tool("aynew")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::Alab,
@@ -5118,6 +5140,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
         exposes: vec![tool("ay")],
         prior_build: None,
         was_live: false,
+        was_held: false,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::Alab,
@@ -5166,6 +5189,7 @@ fn rollback_repoints_the_front_of_path_agents_twin() {
         exposes: vec![claude.clone()],
         prior_build: Some(2_026_091_001),
         was_live: true,
+        was_held: true,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::Off,
@@ -5189,6 +5213,7 @@ fn rollback_repoints_the_front_of_path_agents_twin() {
         exposes: vec![claude.clone()],
         prior_build: None,
         was_live: false,
+        was_held: false,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::Off,
@@ -5227,6 +5252,7 @@ fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
         exposes: vec![tool("ay")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -5258,6 +5284,7 @@ fn a_failed_fresh_install_flip_removes_the_witness_link() {
         exposes: vec![tool("ay")],
         prior_build: None,
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -5290,6 +5317,7 @@ fn a_bundle_resolve_check_runs_from_its_stage_and_the_flip_takes_its_verdict() {
         exposes: vec![tool("ay")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: Some(reloc.to_string()),
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -5419,6 +5447,7 @@ fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
         exposes: vec![tool("ay")],
         prior_build: Some(18),
         was_live: false,
+        was_held: false,
         reloc: None,
         aliases: Aliases::Off,
         tree_root: String::new(),
@@ -5713,7 +5742,7 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
         .lines()
         .map(|l| {
             if l.starts_with("client=") {
-                format!("client={}+another", aterm_types::version::app_version())
+                format!("client={}+another", aterm_stamp::app_version())
             } else {
                 l.to_string()
             }
@@ -6738,7 +6767,10 @@ fn every_resolve_check_runs_and_a_signal_death_in_any_refuses() {
             let name = bin.file_stem().unwrap().to_string_lossy().into_owned();
             checked.lock().unwrap().push(name.clone());
             if killed.contains(&name.as_str()) {
-                Err(format!("resolve check: {name} was killed by a signal"))
+                Err(crate::sysroot::Unresolved {
+                    why: format!("resolve check: {name} was killed by a signal"),
+                    verdict: true,
+                })
             } else {
                 Ok(())
             }
@@ -6749,12 +6781,8 @@ fn every_resolve_check_runs_and_a_signal_death_in_any_refuses() {
         result
     };
     assert!(verdict(&[]).is_ok());
-    assert!(
-        matches!(verdict(&["t3"]), Err(FlowError::Activate(why)) if why.contains("t3 was killed"))
-    );
-    assert!(
-        matches!(verdict(&["t4", "t2"]), Err(FlowError::Activate(why)) if why.contains("t2 was killed"))
-    );
+    assert!(verdict(&["t3"]).is_err_and(|u| u.why.contains("t3 was killed")));
+    assert!(verdict(&["t4", "t2"]).is_err_and(|u| u.why.contains("t2 was killed")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6826,4 +6854,518 @@ fn a_later_download_ticket_waits_for_every_earlier_one() {
         rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("hang detector: muse's transfer never started after codex's");
     });
+}
+
+/// [`fixture`] with a second signed build of ay, 17, the channel does not pin; and its tree root.
+fn fixture_with_unpinned_17(dir: &Path) -> (Fake, String) {
+    fixture_with_unpinned_17_as(dir, "binary", b"#!/bin/true\nay seventeen", b"0000755\0")
+}
+
+/// [`fixture_with_unpinned_17`] whose 17 is an artifact of `kind` shipping `bin/ay` as `ay` with
+/// tar mode `mode`.
+fn fixture_with_unpinned_17_as(
+    dir: &Path,
+    kind: &str,
+    ay: &[u8],
+    mode: &[u8; 8],
+) -> (Fake, String) {
+    let mut fake = fixture(dir);
+    let other = dir.join("seventeen");
+    std::fs::create_dir_all(&other).unwrap();
+    let archive = make_archive_with(&other, ay, mode);
+    let sha = crate::tree::file_sha256(&archive).unwrap();
+    let root = signed_root_of(&archive, &dir.join("probe17"));
+    let body = format!(
+        "schema = 2\nprogram = \"ay\"\nversion = \"0.0.17\"\nbuild_number = 17\n\
+         exposes = [\"ay\"]\n\
+         [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"{kind}\"\nasset = \"ay-17.tar.zst\"\n\
+         sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
+         [artifact.cost]\ndisk_installed = 1048576\n"
+    );
+    fake.pkg.insert(
+        ("ay".to_string(), 17),
+        (
+            body.clone().into_bytes(),
+            sign(&RELEASE_SEED, body.as_bytes()),
+        ),
+    );
+    fake.archives.insert("ay-17.tar.zst".to_string(), archive);
+    (fake, root)
+}
+
+/// [`Fake`] with its index body replaced (and signed).
+fn with_index(mut fake: Fake, body: &str) -> Fake {
+    fake.index = body.as_bytes().to_vec();
+    fake.index_sig = sign(&RELEASE_SEED, body.as_bytes());
+    fake
+}
+
+/// A named install of `build`, held to `expect_root` when given, its memo kept.
+const fn named(build: u64, expect_root: Option<&str>) -> NamedAsk<'_> {
+    NamedAsk {
+        build,
+        expect_root,
+        retry: false,
+    }
+}
+
+const AY: InstallRequest<'static> = InstallRequest {
+    channel: "stable",
+    program: "ay",
+    triple: TRIPLE,
+    installed: None,
+};
+
+/// A BUILD NAMED BY NUMBER IS STAGED BESIDE `current`, WHICH STAYS (A14): ay 18 is installed and
+/// current; ay 17, which no channel pins, is downloaded, verified and staged with its tree-root
+/// record, while `current` and the `ay` shim still run 18; asking again finds it present.
+/// NEGATIVE CONTROL: a plain install of the pin does move `current` (the first install here).
+#[test]
+fn a_named_build_is_staged_beside_current_which_stays() {
+    let dir = scratch("named-build");
+    let (fake, root17) = fixture_with_unpinned_17(&dir);
+    let layout = layout(&dir);
+    install(&fake, &layout, &anchor(), &AY, fl(0), 0).unwrap();
+    let current = || std::fs::read_link(layout.program_current("ay")).unwrap();
+    assert_eq!(current(), layout.build_dir("ay", 18));
+
+    let got = install_build(
+        &fake,
+        &layout,
+        &anchor(),
+        fl(0),
+        0,
+        &AY,
+        named(17, Some(&root17)),
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        NamedBuild::Staged {
+            tree_root: root17.clone()
+        }
+    );
+    assert_eq!(current(), layout.build_dir("ay", 18), "current stays");
+    assert_eq!(
+        crate::ops::which(&layout, "ay").unwrap(),
+        tool_bin(&layout.build_dir("ay", 18), "ay"),
+        "the shim still runs 18"
+    );
+    let staged = layout.build_dir("ay", 17);
+    assert!(tool_bin(&staged, "ay").is_file());
+    assert_eq!(
+        crate::trust_lock::recorded_root_at(&staged).as_deref(),
+        Some(root17.as_str())
+    );
+    assert_eq!(
+        install_build(&fake, &layout, &anchor(), fl(0), 0, &AY, named(17, None)).unwrap(),
+        NamedBuild::Present { tree_root: root17 }
+    );
+}
+
+/// A named build is refused, with nothing staged, when the channel withdrew it, holds it below
+/// its floor, or signs another tree than the one asked for; and a store copy that is not the
+/// signed tree is never taken for it: the signed pack is staged over it.
+#[test]
+fn a_named_build_withdrawn_floored_or_not_the_tree_asked_for_is_refused() {
+    let dir = scratch("named-refused");
+    let layout = layout(&dir);
+    let index = |extra: &str| {
+        format!(
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+             [programs.ay]\nrepo = \"ay\"\n\
+             [[channels]]\nname = \"stable\"\nchannel_build = 1\n{extra}\
+             pin = {{ ay = 18 }}\n",
+            attr = attribution()
+        )
+    };
+    for (extra, why) in [
+        ("min_build = 0\nyanked = [\"ay@17\"]\n", "withdrawn"),
+        ("min_build = 18\n", "floored"),
+    ] {
+        let (fake, root17) = fixture_with_unpinned_17(&dir);
+        let fake = with_index(fake, &index(extra));
+        let err = install_build(
+            &fake,
+            &layout,
+            &anchor(),
+            fl(0),
+            0,
+            &AY,
+            named(17, Some(&root17)),
+        )
+        .expect_err(why);
+        assert!(matches!(err, FlowError::NamedBuild(_)), "{why}: {err}");
+        assert!(
+            !layout.build_dir("ay", 17).exists(),
+            "{why}: nothing staged"
+        );
+    }
+
+    let (fake, root17) = fixture_with_unpinned_17(&dir);
+    let err = install_build(
+        &fake,
+        &layout,
+        &anchor(),
+        fl(0),
+        0,
+        &AY,
+        named(17, Some(&"e".repeat(64))),
+    )
+    .expect_err("another tree");
+    assert!(err.to_string().contains(&root17), "{err}");
+    assert!(
+        !layout.build_dir("ay", 17).exists(),
+        "nothing downloaded or staged"
+    );
+
+    let held = layout.build_dir("ay", 17);
+    std::fs::create_dir_all(held.join("bin")).unwrap();
+    std::fs::write(held.join("bin/ay"), b"not the signed bytes").unwrap();
+    crate::store::mark_build_ready(&held).unwrap();
+    assert_eq!(
+        install_build(&fake, &layout, &anchor(), fl(0), 0, &AY, named(17, None)).unwrap(),
+        NamedBuild::Staged {
+            tree_root: root17.clone()
+        },
+        "a store copy of another tree is staged over from the signed pack"
+    );
+    assert_ne!(
+        std::fs::read(held.join("bin/ay")).unwrap(),
+        b"not the signed bytes"
+    );
+    assert_eq!(
+        crate::trust_lock::recorded_root_at(&held).as_deref(),
+        Some(root17.as_str())
+    );
+}
+
+/// A NAMED BUILD'S STAGE REFUSAL IS REMEMBERED, as the update lane's is: a pack whose bytes fail
+/// their signed digest is retried once, and once that fails too, asking again refuses from the
+/// memo with no further download. Its memo stands for its build, apart from the update lane's:
+/// the lane's memo for the pinned build, recorded between the attempts, neither wipes it nor is
+/// wiped by it. NEGATIVE CONTROL: each of the first two asks downloads.
+#[test]
+fn a_named_build_whose_pack_fails_its_digest_is_not_downloaded_again() {
+    let dir = scratch("named-memo");
+    let layout = layout(&dir);
+    let (fake, root17) = fixture_with_unpinned_17(&dir);
+    poison(&fake.archives["ay-17.tar.zst"]);
+    let fake = Counting::of(fake);
+    let ask = || {
+        install_build(
+            &fake,
+            &layout,
+            &anchor(),
+            fl(0),
+            0,
+            &AY,
+            named(17, Some(&root17)),
+        )
+    };
+    let pinned = layout.build_dir("ay", 18);
+    for n in 1..=2 {
+        let failed = ask().expect_err("a poisoned pack");
+        assert!(matches!(failed, FlowError::Stage(_)), "{n}: {failed}");
+        assert_eq!(fake.count("ay-17.tar.zst"), n);
+        if n == 1 {
+            crate::store::record_stage_refusal(
+                &pinned,
+                (crate::manifest::DigestAlg::Sha256, "ab"),
+                "cd",
+                "the update lane's own refusal",
+                1,
+            )
+            .unwrap();
+        }
+    }
+    let again = ask().expect_err("the memo refuses");
+    assert!(matches!(again, FlowError::StageRefused(_)), "{again}");
+    assert_eq!(fake.count("ay-17.tar.zst"), 2, "no third download");
+    assert!(!layout.build_dir("ay", 17).exists());
+    assert!(crate::store::stage_refusal(&layout.build_dir("ay", 17)).is_some_and(|m| m.named));
+    assert!(
+        crate::store::stage_refusal(&pinned).is_some(),
+        "the named memo left the lane's"
+    );
+}
+
+/// A NAMED SYSROOT BUNDLE WHOSE RESOLVE CHECK FAILS IS DISCARDED AND REMEMBERED (A14): a lock's
+/// build that cannot run here is refused and discarded with its tree-root record, and from that
+/// first verdict asking again refuses with no download and names the retry of that build
+/// (`install ay --build 17 --retry`), not a pinned install's; `retry` downloads it again now.
+/// Its tool is an image the kernel will not execute, shipped without an execute bit or with one
+/// (which is not run as a shell script instead, [`aterm_uds::spawnfd::NativeImage`]).
+/// NEGATIVE CONTROL: the first ask downloads.
+#[cfg(unix)]
+#[test]
+fn a_named_bundle_that_does_not_resolve_is_discarded_and_remembered() {
+    for (shipped, mode) in [("plain", NO_EXEC_MODE), ("exec", b"0000755\0")] {
+        let dir = scratch(&format!("named-unresolved-{shipped}"));
+        let layout = layout(&dir);
+        let (fake, root17) =
+            fixture_with_unpinned_17_as(&dir, "sysroot-bundle", BROKEN_NATIVE_BIN, mode);
+        let fake = Counting::of(fake);
+        let ask = |retry| {
+            install_build(
+                &fake,
+                &layout,
+                &anchor(),
+                fl(0),
+                0,
+                &AY,
+                NamedAsk {
+                    build: 17,
+                    expect_root: Some(&root17),
+                    retry,
+                },
+            )
+        };
+        let b17 = layout.build_dir("ay", 17);
+        let failed = ask(false).expect_err("a bundle that does not resolve");
+        assert!(
+            matches!(failed, FlowError::Activate(_)),
+            "{shipped}: {failed}"
+        );
+        assert_eq!(fake.count("ay-17.tar.zst"), 1);
+        assert!(!b17.exists(), "the refused build is discarded");
+        assert!(
+            crate::trust_lock::recorded_root_at(&b17).is_none(),
+            "and its record"
+        );
+        let again = ask(false).expect_err("the memo refuses");
+        let FlowError::StageRefused(note) = &again else {
+            panic!("{again}")
+        };
+        assert!(
+            note.contains("now: aterm pkg install ay --build 17 --retry"),
+            "{note}"
+        );
+        assert!(!note.contains("new build is published"), "{note}");
+        assert_eq!(fake.count("ay-17.tar.zst"), 1, "no second download");
+
+        let retried = ask(true).expect_err("it still does not resolve");
+        assert!(matches!(retried, FlowError::Activate(_)), "{retried}");
+        assert_eq!(
+            fake.count("ay-17.tar.zst"),
+            2,
+            "retry downloads it again now"
+        );
+        assert!(
+            matches!(ask(false), Err(FlowError::StageRefused(_))),
+            "and its verdict binds again"
+        );
+        assert_eq!(fake.count("ay-17.tar.zst"), 2);
+    }
+}
+
+/// A REFUSED NAMED BUILD A FIRST-EXEC HOLD KEEPS IS OUT OF A LOCK'S REACH (A14): its resolve check
+/// failed while another process's hold stands on it, so its tree stays, but its ready marker and
+/// tree-root record go and the lock's standing reads it absent (a hop reinstalls it rather than
+/// run it), and the refusal is remembered; once the hold lets go, gc sweeps the tree and the memo
+/// stays, so the next install does not download the pack again. NEGATIVE CONTROL: before the
+/// refusal the same build stands present by its record.
+#[cfg(unix)]
+#[test]
+fn a_held_refused_named_build_stands_absent() {
+    let dir = scratch("named-held-refused");
+    let layout = layout(&dir);
+    seed_build(&layout, "trust", 16387, false);
+    let b = layout.build_dir("trust", 16387);
+    std::fs::write(b.join("bin/targo"), b"#!/bin/true\n").unwrap();
+    std::fs::set_permissions(b.join("bin/targo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = crate::trust_lock::fold_and_record(&b).unwrap().unwrap();
+    let lock = crate::trust_lock::TrustLock {
+        build: 16387,
+        tree_root: root,
+        compiler_commit: "2".repeat(40),
+        receipt: "SEED-MINT sha256:00".to_string(),
+        stock_toolchain: "1.99.1".to_string(),
+    };
+    assert!(matches!(
+        crate::trust_lock::standing(&layout.prefix, &lock),
+        crate::trust_lock::LockedBuild::Present { .. }
+    ));
+    let awake = aterm_uds::process::awake_ms().expect("the awake clock");
+    crate::store::write_sidecar_durably(
+        &b,
+        crate::store::UNPROVEN_SUFFIX,
+        awake.to_string().as_bytes(),
+    )
+    .unwrap();
+    assert!(crate::store::held_unproven(&b), "another process's hold");
+
+    let killed = crate::sysroot::Unresolved {
+        why: "resolve check: killed by a signal".to_string(),
+        verdict: true,
+    };
+    let _ = settle_resolve(&b, &crate::vendor::testkit::row(), Err(killed), false);
+    assert!(b.join("bin").is_dir(), "the hold keeps the tree");
+    assert!(!crate::store::build_is_complete(&b));
+    assert!(
+        !crate::trust_lock::tree_root_record(&layout.prefix, 16387).exists(),
+        "its record goes"
+    );
+    assert_eq!(
+        crate::trust_lock::standing(&layout.prefix, &lock),
+        crate::trust_lock::LockedBuild::Absent
+    );
+    assert!(
+        crate::store::stage_refusal(&b).is_some_and(|m| m.named && m.held),
+        "the verdict is remembered"
+    );
+
+    std::fs::remove_file(crate::store::sidecar_path(&b, crate::store::UNPROVEN_SUFFIX).unwrap())
+        .unwrap();
+    let _ = crate::gc::run(&layout, None);
+    assert!(!b.exists(), "gc sweeps the tree once the hold lets go");
+    assert!(
+        crate::store::stage_refusal(&b).is_some_and(|m| m.named),
+        "and the memo stays"
+    );
+}
+
+/// A RESOLVE CHECK THAT FAILED FOR A FAULT OF THIS RUN IS NO VERDICT ON THE BUILD: a hold that
+/// could not be written, or a spawn short of resources, says nothing of whether the build runs
+/// here, so its named memo cools down as a stage failure does (the first attempt binds nothing,
+/// the second waits out the cooldown) rather than holding the build until `--retry`; the
+/// attempts add up because only an accepted build forgets its memo. NEGATIVE CONTROL: the same
+/// refusal as a verdict binds from the first attempt, and an accepted settle forgets either.
+#[test]
+fn a_resolve_fault_of_this_run_is_no_verdict() {
+    let row = crate::vendor::testkit::row();
+    let digest = row.digest().expect("the row's digest");
+    for verdict in [false, true] {
+        let dir = scratch(&format!("named-resolve-fault-{verdict}"));
+        let layout = layout(&dir);
+        seed_build(&layout, "trust", 16388, false);
+        let b = layout.build_dir("trust", 16388);
+        let unresolved = || crate::sysroot::Unresolved {
+            why: "resolve check: cannot hold the program folder".to_string(),
+            verdict,
+        };
+        let _ = settle_resolve(&b, &row, Err(unresolved()), false);
+        let memo = crate::store::stage_refusal(&b).expect("a memo");
+        assert!(memo.named && memo.held == verdict && memo.attempts == 1);
+        let now = memo.at;
+        assert_eq!(memo.binds(digest, &row.tree_root, now), verdict);
+        let _ = settle_resolve(&b, &row, Err(unresolved()), false);
+        let memo = crate::store::stage_refusal(&b).expect("a memo");
+        assert!(memo.attempts == 2 && memo.binds(digest, &row.tree_root, now));
+        assert_eq!(
+            memo.binds(digest, &row.tree_root, memo.retry_after()),
+            verdict,
+            "a fault's memo lets go once its cooldown is over"
+        );
+        settle_resolve(&b, &row, Ok(()), false).expect("an accepted build");
+        assert!(
+            crate::store::stage_refusal(&b).is_none(),
+            "accepted, forgotten"
+        );
+    }
+}
+
+/// A NAMED INSTALL THAT RE-STAGES THE LIVE BUILD AND FAILS ITS RESOLVE CHECK DISCARDS NOTHING
+/// `current` NAMES, AND LEAVES NOTHING A LOCK TAKES FOR IT: ay 17 is current with another tree
+/// than the signed one, the named install stages the signed bundle over it, the check fails, and
+/// `current` still names a tree on disk (for repair, as an aborted update leaves a live build)
+/// that reads incomplete and unrecorded, and asking again refuses from the memo. A `current` that
+/// names a build with no tree, or a link to an aside that is gone, keeps nothing live: that
+/// refused build is discarded.
+#[cfg(unix)]
+#[test]
+fn a_named_install_over_the_live_build_keeps_it_unmarked() {
+    let dir = scratch("named-unresolved-live");
+    let layout = layout(&dir);
+    seed_build(&layout, "ay", 17, true);
+    let (fake, root17) =
+        fixture_with_unpinned_17_as(&dir, "sysroot-bundle", BROKEN_NATIVE_BIN, NO_EXEC_MODE);
+    let fake = Counting::of(fake);
+    let b17 = layout.build_dir("ay", 17);
+    let ask = || {
+        install_build(
+            &fake,
+            &layout,
+            &anchor(),
+            fl(0),
+            0,
+            &AY,
+            named(17, Some(&root17)),
+        )
+    };
+    let failed = ask().expect_err("a bundle that does not resolve");
+    assert!(matches!(failed, FlowError::Activate(_)), "{failed}");
+    assert_eq!(
+        std::fs::read_link(layout.program_current("ay")).unwrap(),
+        b17
+    );
+    assert!(b17.join("bin").is_dir(), "current names a tree on disk");
+    assert!(!crate::store::build_is_complete(&b17), "unmarked");
+    assert!(
+        crate::trust_lock::recorded_root_at(&b17).is_none(),
+        "unrecorded"
+    );
+    assert!(matches!(ask(), Err(FlowError::StageRefused(_))));
+    assert_eq!(fake.count("ay-17.tar.zst"), 1, "no second download");
+
+    // `current` names 17, whose tree is gone: nothing is live.
+    crate::store::clear_stage_refusal(&b17);
+    std::fs::remove_dir_all(&b17).unwrap();
+    let failed = ask().expect_err("a bundle that does not resolve");
+    assert!(matches!(failed, FlowError::Activate(_)), "{failed}");
+    assert!(!b17.exists(), "the refused build is discarded");
+
+    // `current` names 17, a link to its aside, which is gone: nothing is live either.
+    crate::store::clear_stage_refusal(&b17);
+    let aside = aterm_toolchain::layout::aside_of(&b17).unwrap();
+    std::os::unix::fs::symlink(aside.file_name().unwrap(), &b17).unwrap();
+    assert!(aterm_toolchain::layout::is_linked_aside(&b17) && !aside.exists());
+    let failed = ask().expect_err("a bundle that does not resolve");
+    assert!(matches!(failed, FlowError::Activate(_)), "{failed}");
+    assert!(
+        crate::store::tree_absent(&b17),
+        "the refused build is discarded, its aside too"
+    );
+}
+
+/// A HELD BUILD SURVIVES AN UPDATE THAT RE-STAGES IT AND ABORTS: ay 18 sits in the store beside
+/// `current` (17), as a build a `trust.lock` names and `install --build` staged; the group's
+/// update stages 18 again, trust's download fails, and the abort leaves 18 complete.
+/// NEGATIVE CONTROL: with no held copy the same abort discards the 18 it extracted.
+#[test]
+fn an_aborted_update_keeps_a_build_it_did_not_create() {
+    for held in [false, true] {
+        let dir = scratch(&format!("abort-held-{held}"));
+        let mut fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 17, true);
+        if held {
+            seed_build(&layout, "ay", 18, false);
+        }
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        fake.archives.remove("trust-4821.tar.zst").unwrap();
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Aborted { .. }),
+            "{:?}",
+            report.groups[0].1
+        );
+        assert_eq!(
+            crate::store::build_is_complete(&layout.build_dir("ay", 18)),
+            held,
+            "held={held}"
+        );
+        assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&17));
+    }
 }

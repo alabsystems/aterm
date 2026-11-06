@@ -347,33 +347,6 @@ pub(super) struct Partition {
     pub(super) git_waits: Vec<String>,
 }
 
-impl Partition {
-    /// Read back the repositories in `touched`, which a pass just cloned: each that reads as its
-    /// own worktree moves from missing to present; the others stay missing. Nothing else is read
-    /// again.
-    pub(super) fn read_back(&mut self, sys: &dyn System, user: &User, touched: &[Repo]) {
-        let home = Path::new(&user.home);
-        for repo in touched {
-            let path = home.join(&repo.name);
-            if verify_existing(sys, user, &repo.owner, repo, &path).is_err() {
-                continue;
-            }
-            match super::dependencies::ready(sys, user, &path, repo) {
-                Ok(true) => {
-                    self.missing.retain(|missing| missing.name != repo.name);
-                    self.dependencies
-                        .retain(|(pending, _)| pending.name != repo.name);
-                    self.present.push((repo.clone(), path));
-                }
-                Err(super::dependencies::Unready::Git(why)) => {
-                    self.git_waits.push(format!("~/{}: {why}", repo.name));
-                }
-                Ok(false) | Err(super::dependencies::Unready::Preserved(_)) => {}
-            }
-        }
-    }
-}
-
 /// `lines` joined, the first [`NAMED`] of them and how many more; `None` when there are none.
 pub(super) fn named(lines: &[String]) -> Option<String> {
     if lines.is_empty() {

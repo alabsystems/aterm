@@ -116,7 +116,7 @@ impl Fixture {
     }
 
     fn command(&self, argv: &[OsString], env: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
         cmd.args(argv)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
@@ -345,7 +345,7 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
             "#!/bin/sh\ncase \"$1\" in\n  update|upgrade|install)\n    __atpkg={atpkg}\n    \
              if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" __selfupdate 'claude' {prefix} -- \
              \"$@\"; fi\n    ;;\nesac\nexec {store} \"$@\"\n",
-            atpkg = q(Path::new(env!("CARGO_BIN_EXE_atpkg"))),
+            atpkg = q(&aterm_tempfile::bin_exe("atpkg")),
             prefix = q(&fx.prefix),
             store = q(&store),
         ),
@@ -395,7 +395,7 @@ fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     fx.fake_shim("claude");
     let elsewhere = fx.root.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+    let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
     cmd.arg(atpkg::selfupdate::HIDDEN_VERB)
         .arg("claude")
         .arg(&elsewhere)

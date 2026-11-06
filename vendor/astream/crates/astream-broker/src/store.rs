@@ -668,7 +668,6 @@ impl Told {
 pub type ToldPage = (Vec<Arc<BrokerRecord>>, u64, Option<crate::proto::Gap>);
 
 struct RebuiltIndices {
-    records: Vec<BrokerRecord>,
     dedup: crate::dedup::DedupIndex,
     last: BTreeMap<String, Offset>,
     subject_charges: HashMap<String, u64>,
@@ -686,6 +685,397 @@ struct RebuiltIndices {
     group_commits: HashMap<String, u64>,
     producer_last_bt: HashMap<u64, u64>,
     max_bt: u64,
+}
+
+/// The open's indices FOLDED record by record, in offset order, from the carried state: what
+/// an open rebuilds of exactly-once ingest, retained state, wills, bindings, relay marks and
+/// group commits from the records it recovers. The open's scan folds each record as it
+/// passes it (`OpenFold`), so the open never holds its records in a vector; a replica's
+/// truncation folds the records it keeps ([`BrokerLog::rebuild_open_indices`]).
+struct IndexFold {
+    dedup: crate::dedup::DedupIndex,
+    group_commits: HashMap<String, u64>,
+    last: BTreeMap<String, Offset>,
+    subject_charges: HashMap<String, u64>,
+    subjects_per_producer: HashMap<u64, usize>,
+    durable_latest_wills: HashMap<u64, DurableWillEntry>,
+    durable_wills_by_subject: HashMap<String, HashSet<u64>>,
+    bind: HashMap<u64, (String, Offset)>,
+    high_water: HashMap<u64, u64>,
+    carried_wills: HashMap<u64, (Offset, WillRecord)>,
+    carried_last: BTreeMap<String, Arc<BrokerRecord>>,
+    carried_last_bt: BTreeMap<String, u64>,
+    carried_charges: BTreeMap<String, u64>,
+    uncarried_cut_tainted: bool,
+    relay_floors: crate::relay_floor::RelayFloors,
+    /// The carried charges no retained record of the subject has taken over yet.
+    pending_carried_charges: BTreeMap<String, u64>,
+    producer_last_bt: HashMap<u64, u64>,
+    max_bt: u64,
+}
+
+impl IndexFold {
+    /// The indices of the carried state alone, before any retained record is folded.
+    fn new(compacted: CompactedState) -> IndexFold {
+        let mut fold = IndexFold {
+            dedup: crate::dedup::DedupIndex::new(),
+            group_commits: compacted.group_commits,
+            last: BTreeMap::new(),
+            subject_charges: HashMap::new(),
+            subjects_per_producer: HashMap::new(),
+            durable_latest_wills: HashMap::new(),
+            durable_wills_by_subject: HashMap::new(),
+            bind: compacted.bind,
+            high_water: compacted.high_water,
+            carried_wills: compacted.carried_wills,
+            carried_last: compacted.carried_last,
+            carried_last_bt: compacted.carried_last_bt,
+            pending_carried_charges: compacted.carried_charges.clone(),
+            carried_charges: compacted.carried_charges,
+            uncarried_cut_tainted: compacted.uncarried_cut_tainted,
+            relay_floors: compacted.relay_floors,
+            producer_last_bt: HashMap::new(),
+            max_bt: 0,
+        };
+        for (&pid, (off, will)) in &fold.carried_wills {
+            let hidden_target = is_hidden_subject(&will.subject);
+            if !hidden_target {
+                fold.durable_wills_by_subject
+                    .entry(will.subject.clone())
+                    .or_default()
+                    .insert(pid);
+            }
+            fold.durable_latest_wills.insert(
+                pid,
+                DurableWillEntry {
+                    offset: *off,
+                    will: will.clone(),
+                    settled_above: hidden_target,
+                },
+            );
+        }
+        for (subj, rec) in &fold.carried_last {
+            if let Some(&bt) = fold.carried_last_bt.get(subj) {
+                fold.max_bt = broker_bt_advance(fold.max_bt, bt);
+                if !is_hidden_record(rec) {
+                    let slot = fold.producer_last_bt.entry(rec.producer_id).or_insert(bt);
+                    *slot = broker_bt_advance(*slot, bt);
+                }
+            }
+            let owner = fold
+                .pending_carried_charges
+                .remove(subj)
+                .unwrap_or(rec.producer_id);
+            if fold.last.insert(subj.clone(), rec.seq).is_none() {
+                fold.subject_charges.insert(subj.clone(), owner);
+                let c = fold.subjects_per_producer.entry(owner).or_insert(0);
+                *c = c.saturating_add(1);
+            }
+        }
+        fold
+    }
+
+    /// Fold the next retained record, `r`, whose broker time is `r_bt`.
+    fn fold(&mut self, r: &BrokerRecord, r_bt: Option<u64>) {
+        if let Some(bt) = r_bt {
+            self.max_bt = broker_bt_advance(self.max_bt, bt);
+        }
+        update_durable_wills_on_record(
+            &mut self.durable_latest_wills,
+            &mut self.durable_wills_by_subject,
+            r,
+        );
+        if r.subject == BIND_SUBJECT {
+            if let Ok(principal) = std::str::from_utf8(&r.body) {
+                if !self.bind.contains_key(&r.producer_id) {
+                    self.bind
+                        .insert(r.producer_id, (principal.to_string(), r.seq));
+                }
+            }
+        }
+        if r.subject == RELAY_MARK_SUBJECT {
+            self.relay_floors.mark(r.producer_id);
+        }
+        if let Some(target) = retire_target(r) {
+            self.pending_carried_charges.remove(target);
+            apply_retire_target(
+                &mut self.last,
+                &mut self.carried_last,
+                &mut self.carried_last_bt,
+                &mut self.subject_charges,
+                &mut self.subjects_per_producer,
+                r.producer_id,
+                target,
+            );
+        }
+        // The broker's own hidden records (commits, wills, producer bindings) are
+        // not produces: they never enter the dedup map and never enter the
+        // last-value index. Rebuilding both here is what makes exactly-once ingest
+        // AND retained state survive a restart.
+        if !is_hidden_record(r) {
+            self.dedup.insert(r.producer_id, r.producer_seq, r.seq);
+            let carried_owner = self.pending_carried_charges.remove(&r.subject);
+            self.carried_last.remove(&r.subject);
+            self.carried_last_bt.remove(&r.subject);
+            if let Some(bt) = r_bt {
+                let slot = self.producer_last_bt.entry(r.producer_id).or_insert(bt);
+                *slot = broker_bt_advance(*slot, bt);
+            }
+            if self.last.insert(r.subject.clone(), r.seq).is_none() {
+                let owner = carried_owner.unwrap_or(r.producer_id);
+                self.subject_charges.insert(r.subject.clone(), owner);
+                let c = self.subjects_per_producer.entry(owner).or_insert(0);
+                *c = c.saturating_add(1);
+            }
+            // The reserved ack half never enters the fence's high water — the
+            // same rule `index_last` applies, applied here, so the fence a
+            // restart rebuilds is the fence the log had before it.
+            if r.producer_seq < ACK_SEQ_BASE {
+                let hw = self
+                    .high_water
+                    .entry(r.producer_id)
+                    .or_insert(r.producer_seq);
+                *hw = crate::proto::high_water_monotone(*hw, r.producer_seq);
+            }
+        }
+        if let Some(c) = &r.commit {
+            let e = self.group_commits.entry(c.group.clone()).or_insert(0);
+            *e = crate::proto::group_commit_monotone(*e, c.upto);
+        }
+    }
+
+    /// The indices, every retained record folded.
+    fn finish(self) -> RebuiltIndices {
+        let mut dedup = self.dedup;
+        // Built whole from every retained record: give back what its growth left spare.
+        dedup.shrink_to_fit();
+        RebuiltIndices {
+            dedup,
+            last: self.last,
+            subject_charges: self.subject_charges,
+            subjects_per_producer: self.subjects_per_producer,
+            durable_latest_wills: self.durable_latest_wills,
+            durable_wills_by_subject: self.durable_wills_by_subject,
+            high_water: self.high_water,
+            carried_wills: self.carried_wills,
+            carried_last: self.carried_last,
+            carried_last_bt: self.carried_last_bt,
+            carried_charges: self.carried_charges,
+            uncarried_cut_tainted: self.uncarried_cut_tainted,
+            relay_floors: self.relay_floors,
+            bind: self.bind,
+            group_commits: self.group_commits,
+            producer_last_bt: self.producer_last_bt,
+            max_bt: self.max_bt,
+        }
+    }
+}
+
+/// The decoded bytes ([`crate::tier::resident_cost`]) of a unit's records the open holds
+/// before it folds them though the unit has not ended ([`OpenFold`]).
+const OPEN_PENDING: usize = 4 << 20;
+
+/// How a test's open reads the log ([`OpenOptions`]'s `read`): by default as the shipped
+/// open does, streamed through [`open_scan::WINDOW`]-byte windows and folded as it goes.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReadOpen {
+    /// THE REFERENCE: the whole log in one buffer and every record of it decoded before the
+    /// tier and the indices are built, as every open read it before the scan streamed (aterm
+    /// F16), kept for the tests that hold the streaming open to it (`open_scan_tests.rs`).
+    pub(crate) whole: bool,
+    /// The scan's window, in bytes (`None`: [`open_scan::WINDOW`]).
+    pub(crate) window: Option<usize>,
+    /// The bytes of an unended unit's records held before they are folded anyway (`None`:
+    /// [`OPEN_PENDING`]).
+    pub(crate) pending: Option<usize>,
+    /// Negative control: the scan passes over a record whose frame straddles its window.
+    pub(crate) drop_straddle: bool,
+    /// Negative control: the tier keeps its window from the head of the log, not the tail.
+    pub(crate) window_from_head: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times an open on this thread folded the log again up to its recovery's cut
+    /// (a test's count, `open_scan_tests.rs`).
+    pub(crate) static REFOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every record of a log's intact prefix decoded, with its broker time and the byte its frame
+/// starts at: what the reference open (`ReadOpen::whole`) builds the tier and the indices from.
+#[cfg(test)]
+type Decoded = (Vec<BrokerRecord>, Vec<Option<u64>>, Vec<u64>);
+
+/// THE OPEN'S FOLD of the records its scan passes (`open_scan.rs`): each into the residency
+/// tier being built ([`crate::tier::Opening`]) and into the indices ([`IndexFold`]), in
+/// offset order, so the open holds decoded only the tier's window and the records of the unit
+/// the scan is in.
+///
+/// A unit's records wait in `pending` until the record that ends it, because the recovery
+/// may cut a unit that never ended (`recover::classify`, whose cuts keep every record up to
+/// the last one of the intact prefix that ends a unit, or more). Past [`OPEN_PENDING`] bytes
+/// of them they are folded anyway, so a log written as one long unit is folded as it is read
+/// too; an open whose recovery then cuts below what it folded folds the log again, up to the
+/// cut ([`BrokerLog::open_core`]).
+struct OpenFold {
+    indices: IndexFold,
+    tier: crate::tier::Opening,
+    /// The records since the last that ends a unit, not folded yet, each with its broker time
+    /// and the byte its frame starts at.
+    pending: Vec<(BrokerRecord, Option<u64>, u64)>,
+    /// Sum of [`crate::tier::resident_cost`] over `pending`.
+    pending_bytes: usize,
+    pending_cap: usize,
+    /// How many records the scan handed on.
+    seen: usize,
+    /// A refold's: fold exactly the first this many records, and end the scan there.
+    limit: Option<usize>,
+    /// The place of the newest record the last open saw ([`Prior::newest_place`]) and, once
+    /// the scan passes it, its frame as stored.
+    named_place: Option<usize>,
+    named: Option<Vec<u8>>,
+    /// The reference's records (a test's `ReadOpen::whole`).
+    #[cfg(test)]
+    whole: Option<Decoded>,
+}
+
+impl OpenFold {
+    fn new(
+        compacted: CompactedState,
+        (budget, expect): (usize, crate::tier::Expect),
+        named_place: Option<usize>,
+        opts: &OpenOptions,
+    ) -> OpenFold {
+        let tier = crate::tier::Tier::opening(budget, expect);
+        #[cfg(test)]
+        let tier = tier.windowed_from_head(opts.read.window_from_head);
+        #[cfg(test)]
+        let pending_cap = opts.read.pending.unwrap_or(OPEN_PENDING);
+        #[cfg(not(test))]
+        let pending_cap = {
+            let _ = opts;
+            OPEN_PENDING
+        };
+        OpenFold {
+            indices: IndexFold::new(compacted),
+            tier,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            pending_cap,
+            seen: 0,
+            limit: None,
+            named_place,
+            named: None,
+            #[cfg(test)]
+            whole: None,
+        }
+    }
+
+    /// Fold record `rec` into the indices and the tier.
+    fn fold_one(&mut self, rec: BrokerRecord, bt: Option<u64>, at: u64) {
+        self.indices.fold(&rec, bt);
+        self.tier.push(rec, bt, at);
+    }
+
+    /// Fold every pending record (the vector keeps its capacity for the next unit).
+    fn commit(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending);
+        for (rec, bt, at) in pending.drain(..) {
+            self.fold_one(rec, bt, at);
+        }
+        self.pending = pending;
+        self.pending_bytes = 0;
+    }
+
+    /// The tier and the indices over the first `kept` records the scan passed, and where the
+    /// newest of them starts, the tier's window read again through `reread` when the fold let
+    /// its records go ([`crate::tier::Opening::finish`]): `None` when the fold already folded
+    /// more than that, and the log must be folded again up to the cut.
+    ///
+    /// # Errors
+    ///
+    /// The tier's refusal of its window read again.
+    fn finish(
+        mut self,
+        kept: usize,
+        reread: crate::tier::Reread<'_>,
+    ) -> io::Result<Option<(crate::tier::Tier, RebuiltIndices, Option<u64>)>> {
+        #[cfg(test)]
+        if let Some(whole) = self.whole.take() {
+            return Ok(Some(self.finish_whole(whole, kept)));
+        }
+        let folded = self.tier.len();
+        let Some(more) = kept.checked_sub(folded) else {
+            return Ok(None);
+        };
+        self.pending.truncate(more);
+        self.commit();
+        let newest_at = self.tier.newest_at();
+        Ok(Some((
+            self.tier.finish(reread)?,
+            self.indices.finish(),
+            newest_at,
+        )))
+    }
+
+    /// The reference's build over the first `kept` of `whole`'s records: the indices folded
+    /// over them, and the tier built from them whole ([`crate::tier::Tier::from_parts`], the
+    /// window decided from their tail).
+    #[cfg(test)]
+    fn finish_whole(
+        mut self,
+        (mut records, mut bts, mut at): Decoded,
+        kept: usize,
+    ) -> (crate::tier::Tier, RebuiltIndices, Option<u64>) {
+        records.truncate(kept);
+        bts.truncate(kept);
+        at.truncate(kept);
+        for (i, r) in records.iter().enumerate() {
+            self.indices.fold(r, bts.get(i).copied().flatten());
+        }
+        let newest_at = at.last().copied();
+        let budget = self.tier.budget();
+        let tier = crate::tier::Tier::from_parts(records, bts, at, budget);
+        (tier, self.indices.finish(), newest_at)
+    }
+}
+
+impl open_scan::Sink for OpenFold {
+    fn record(
+        &mut self,
+        rec: BrokerRecord,
+        bt: Option<u64>,
+        at: u64,
+        frame: &[u8],
+        ends_unit: bool,
+    ) -> bool {
+        if let Some(limit) = self.limit {
+            if self.seen < limit {
+                self.seen = self.seen.saturating_add(1);
+                self.fold_one(rec, bt, at);
+            }
+            return self.seen < limit;
+        }
+        if self.named_place == Some(self.seen) {
+            self.named = Some(frame.to_vec());
+        }
+        self.seen = self.seen.saturating_add(1);
+        // A record that ends a unit with nothing pending (every record of a log written a
+        // record at a time) is folded at once.
+        if ends_unit && self.pending.is_empty() {
+            self.fold_one(rec, bt, at);
+            return true;
+        }
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(crate::tier::resident_cost(&rec));
+        self.pending.push((rec, bt, at));
+        if ends_unit || self.pending_bytes > self.pending_cap {
+            self.commit();
+        }
+        true
+    }
 }
 
 /// A durable, single-writer message log with exactly-once ingest and durable
@@ -835,6 +1225,10 @@ pub struct BrokerLog {
     /// open knows it before anyone has said its key again.
     #[cfg(feature = "relay")]
     relay_origin_ids: HashSet<u64>,
+    /// Producers that continue others' sequences, successor -> predecessors
+    /// ([`set_producer_lineage`](Self::set_producer_lineage)): a produce under a successor's key
+    /// is answered from a predecessor's record at the same sequence.
+    lineage: HashMap<u64, Vec<u64>>,
     /// The path this log was opened from: the log's own name, the stem the replica
     /// marker beside it is derived from, and what the retention compaction rewrites
     /// (with its base sidecar).
@@ -1129,6 +1523,16 @@ pub use offline_seal::SealedLog;
 /// log, judged without writing a byte: `check_open.rs`.
 #[path = "check_open.rs"]
 mod check_open;
+
+/// The open's streaming scan: the log read through a bounded window, each record folded as
+/// it is decoded (`open_scan.rs`, aterm F16).
+#[path = "open_scan.rs"]
+mod open_scan;
+
+/// The streaming open held to the whole-buffer reference (`open_scan_tests.rs`).
+#[cfg(test)]
+#[path = "open_scan_tests.rs"]
+mod open_scan_tests;
 pub use check_open::{InterruptedStep, OpenCheck};
 
 /// The path of a log's per-log cryptographic at-rest binding sidecar, `<log>.seal`. Beside a
@@ -2229,8 +2633,8 @@ fn sidecar_absent(path: &Path, suffix: &str) -> io::Result<bool> {
 /// True when `path` is a newly pre-created empty file (`NamedTempFile::new()`, say)
 /// with no broker sidecar history beside it.
 #[cfg(feature = "at-rest")]
-fn is_virgin_empty_log(path: &Path, existing: &[u8]) -> io::Result<bool> {
-    if !existing.is_empty() {
+fn is_virgin_empty_log(path: &Path, empty: bool) -> io::Result<bool> {
+    if !empty {
         return Ok(false);
     }
     for suffix in &[
@@ -2266,7 +2670,7 @@ fn resolve_at_rest_key(
     path: &Path,
     file: &Backing,
     created: bool,
-    existing: &[u8],
+    empty: bool,
     at_rest_key: Option<[u8; 32]>,
     anti_rollback: AntiRollbackMode,
     require_bound: bool,
@@ -2318,7 +2722,7 @@ fn resolve_at_rest_key(
                 at_rest_version_advance(AT_REST_VER_LEGACY, AT_REST_VER_BOUND),
             ),
             None => {
-                if is_virgin_empty_log(path, existing)? {
+                if is_virgin_empty_log(path, empty)? {
                     let id = mint_seal_id(path, &key);
                     write_seal(path, &key, id, perms.as_ref())?;
                     (Some(id), at_rest_version_advance(0, AT_REST_VER_BOUND))
@@ -2358,7 +2762,7 @@ fn resolve_at_rest_key(
     _path: &Path,
     _file: &Backing,
     _created: bool,
-    _existing: &[u8],
+    _empty: bool,
     at_rest_key: Option<[u8; 32]>,
     _anti_rollback: AntiRollbackMode,
     _require_bound: bool,
@@ -3431,6 +3835,9 @@ pub struct OpenOptions {
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
+    /// How the open reads the log: as the shipped open does unless a test says otherwise.
+    #[cfg(test)]
+    pub(crate) read: ReadOpen,
 }
 
 impl OpenOptions {
@@ -4204,35 +4611,6 @@ const fn subject_owner_of(_subject: &str, _producer_id: u64) -> Option<&str> {
     None
 }
 
-/// A filter's answer for each subject a scan passes, asked once a run of records naming one
-/// subject. The tier holds each subject once and every summary names it by that one string,
-/// so a record whose subject is the very string the last one's was has the last one's answer
-/// (the same address and length is the same text while the scan borrows the tier); any other
-/// asks the filter. A refill's scan over a backlog of one subject asks it each time the subject
-/// changes, where it asked once a record (aterm D10f).
-struct Matches<'f, 's> {
-    filter: &'f Filter,
-    last: Option<(&'s str, bool)>,
-}
-
-impl<'f, 's> Matches<'f, 's> {
-    fn of(filter: &'f Filter) -> Self {
-        Matches { filter, last: None }
-    }
-
-    /// Whether the filter matches `subject`.
-    fn subject(&mut self, subject: &'s str) -> bool {
-        if let Some((name, hit)) = self.last {
-            if std::ptr::eq(name, subject) {
-                return hit;
-            }
-        }
-        let hit = self.filter.matches_str(subject);
-        self.last = Some((subject, hit));
-        hit
-    }
-}
-
 impl BrokerLog {
     /// Open (creating if absent) the log at `path` with Strict durability.
     pub fn open(path: impl AsRef<Path>) -> io::Result<BrokerLog> {
@@ -4532,7 +4910,7 @@ impl BrokerLog {
         mode: AntiRollbackMode,
         path: &Path,
         key: Option<AtRestRef<'_>>,
-        durable: &[u8],
+        log_id: [u8; 16],
         base: u64,
         head: u64,
     ) -> io::Result<Option<PathBuf>> {
@@ -4546,7 +4924,6 @@ impl BrokerLog {
             ));
         };
         let hw = watermark_path(path);
-        let log_id = log_identity(durable);
         match read_watermark(&hw, key)? {
             Some((persisted_id, persisted_base, persisted_head)) => {
                 if head < persisted_head {
@@ -4619,7 +4996,7 @@ impl BrokerLog {
         _mode: AntiRollbackMode,
         _path: &Path,
         _key: Option<AtRestRef<'_>>,
-        _durable: &[u8],
+        _log_id: [u8; 16],
         _base: u64,
         _head: u64,
     ) -> io::Result<Option<PathBuf>> {
@@ -4830,15 +5207,41 @@ impl BrokerLog {
             }
             marker.exists()
         };
-        let mut existing = Vec::new();
-        file.read_to_end(&mut existing)?;
+        // The log is read through the scan's window (`open_scan.rs`), never whole: its length
+        // and its first frame here, which the binding and an interrupted compaction are judged
+        // by, and the rest as the scan passes it.
+        let Ok(len) = usize::try_from(file.len()?) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: the log is longer than this platform addresses",
+                    path.display()
+                ),
+            ));
+        };
+        // The reference a test may ask for: the whole log in one buffer.
+        #[cfg(test)]
+        let whole_bytes = if opts.read.whole {
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            Some(existing)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let first = match &whole_bytes {
+            Some(existing) => logid::first_frame(existing).map(<[u8]>::to_vec),
+            None => open_scan::first_frame(&file, len as u64)?,
+        };
+        #[cfg(not(test))]
+        let first = open_scan::first_frame(&file, len as u64)?;
         let mut raw_at_rest = at_rest_key;
         let at_rest_res = resolve_at_rest_key(
             &dir,
             &path,
             &file,
             created,
-            &existing,
+            len == 0,
             raw_at_rest,
             anti_rollback,
             opts.require_bound(),
@@ -4866,7 +5269,7 @@ impl BrokerLog {
         if dir.is_os() && !created {
             crate::compact::recover(
                 &path,
-                &existing,
+                first.as_deref(),
                 at_rest_ref,
                 anti_rollback != AntiRollbackMode::Off,
             )?;
@@ -4905,11 +5308,64 @@ impl BrokerLog {
             Prepared::Unclean(why) => prior.unclean(Some(why), boot),
             Prepared::Nothing => prior.unclean(None, boot),
         };
-        let scanned = scan_from(&existing, at_rest_ref, base.0, floor, mutation);
+        // The scan folds each record into the tier and the indices as it passes it
+        // (`OpenFold`), and keeps the frame the last open's newest record had for the
+        // identity rules.
+        let budget = opts
+            .resident_budget
+            .unwrap_or(crate::tier::Tier::RESIDENT_ALL);
+        #[cfg(test)]
+        let reading = open_scan::Reading {
+            window: opts.read.window.unwrap_or(open_scan::WINDOW),
+            drop_straddle: opts.read.drop_straddle,
+        };
+        #[cfg(not(test))]
+        let reading = open_scan::Reading::shipped();
+        // The records the last open saw, no more than the file holds frames, which the tier's
+        // pages and columns are allocated for: at once when a clean close recorded them, and
+        // otherwise as the least the file's length predicts (`Opening::push`).
+        let named_place = prior.newest_place(base.0);
+        let expect = crate::tier::Expect {
+            records: named_place
+                .map_or(0, |p| p.saturating_add(1))
+                .min(len / astream_wire::HEADER_SIZE),
+            exact: prior.closed_clean(),
+            end: len as u64,
+        };
+        let mut fold = OpenFold::new(compacted, (budget, expect), named_place, opts);
+        #[cfg(test)]
+        let streamed = match &whole_bytes {
+            Some(existing) => {
+                let w = scan_from(existing, at_rest_ref, base.0, floor, mutation);
+                let rest = existing.get(w.scan.valid_len..).unwrap_or(&[]).to_vec();
+                fold.whole = Some((w.records, w.record_bts, w.record_at));
+                open_scan::Streamed { scan: w.scan, rest }
+            }
+            None => open_scan::scan(
+                &file,
+                reading,
+                at_rest_ref,
+                base.0,
+                floor,
+                mutation,
+                &mut fold,
+            )?,
+        };
+        #[cfg(not(test))]
+        let streamed = open_scan::scan(
+            &file,
+            reading,
+            at_rest_ref,
+            base.0,
+            floor,
+            mutation,
+            &mut fold,
+        )?;
+        let open_scan::Streamed { scan, rest } = streamed;
         let classified = recover::classify(
-            &scanned,
+            &scan,
             &recover::Judge {
-                bytes: &existing,
+                rest: &rest,
                 key: at_rest_ref,
                 base: base.0,
                 floor,
@@ -4919,6 +5375,7 @@ impl BrokerLog {
                 mutation,
             },
         );
+        drop(rest);
         let (keep, kept_records, written, repair_cut) = match classified {
             Classified::Keep {
                 keep,
@@ -4933,13 +5390,13 @@ impl BrokerLog {
             } => {
                 Self::refuse_or_repair(
                     &path,
-                    &existing,
+                    len,
                     (repair, at_rest_ref.is_some()),
                     (offset, at_byte),
                     &reason,
                     repair_at,
                 )?;
-                (at_byte, scanned.records.len(), true, true)
+                (at_byte, scan.count, true, true)
             }
             // A record in a NEWER format than this build reads was WRITTEN, not damaged:
             // its payload passed the frame CRC (and, at rest, authentication) before its
@@ -4954,23 +5411,111 @@ impl BrokerLog {
                 return Err(newer_record(&path, offset, at_byte, version));
             }
         };
-        let pre_cut_head = base.0.saturating_add(scanned.records.len() as u64);
-        let valid_len = scanned.valid_len;
-        let mut records = scanned.records;
-        records.truncate(kept_records);
-        let mut record_bts = scanned.record_bts;
-        record_bts.truncate(kept_records);
-        let mut record_at = scanned.record_at;
-        record_at.truncate(kept_records);
-        let kept_head = base.0.saturating_add(records.len() as u64);
-        let dropped = existing.len().saturating_sub(keep) as u64;
+        let pre_cut_head = base.0.saturating_add(scan.count as u64);
+        let kept_head = base.0.saturating_add(kept_records as u64);
+        let dropped = len.saturating_sub(keep) as u64;
+        let named = fold.named.take();
+        #[cfg(test)]
+        let named = match (&whole_bytes, prior.newest_place(base.0)) {
+            (Some(existing), Some(place)) => {
+                let pre_cut = existing.get(..scan.valid_len).unwrap_or(&[]);
+                logid::nth_frame(pre_cut, place).map(<[u8]>::to_vec)
+            }
+            (Some(_), None) => None,
+            (None, _) => named,
+        };
+        // The tier and the indices over the records the recovery kept, the tier's window read
+        // again from the file once the scan let its records go. A fold that already folded
+        // records the recovery cut (a unit longer than `OPEN_PENDING` that never ended) folds
+        // the log again, up to the cut.
+        let mut reread =
+            |at: u64,
+             first: u64,
+             count: usize,
+             each: &mut dyn FnMut(BrokerRecord) -> io::Result<()>| {
+                open_scan::decode_run(
+                    &file,
+                    reading.window,
+                    at_rest_ref,
+                    mutation,
+                    (at, first, count),
+                    each,
+                )
+            };
+        let (tier, rebuilt, newest_at) = match fold.finish(kept_records, &mut reread)? {
+            Some(built) => built,
+            None => {
+                let compacted = if dir.is_os() {
+                    read_state(&path, at_rest_ref, base.0)?
+                } else {
+                    CompactedState::default()
+                };
+                #[cfg(test)]
+                REFOLDS.with(|n| n.set(n.get().saturating_add(1)));
+                let exactly = crate::tier::Expect {
+                    records: kept_records,
+                    exact: true,
+                    end: len as u64,
+                };
+                let mut again = OpenFold::new(compacted, (budget, exactly), None, opts);
+                again.limit = Some(kept_records);
+                if kept_records > 0 {
+                    open_scan::scan(
+                        &file,
+                        reading,
+                        at_rest_ref,
+                        base.0,
+                        floor,
+                        mutation,
+                        &mut again,
+                    )?;
+                }
+                match again.finish(kept_records, &mut reread)? {
+                    Some(built) => built,
+                    None => return Err(io::Error::other("the open's refold passed its cut")),
+                }
+            }
+        };
+        if tier.len() != kept_records {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: the open folded {} records where its recovery kept {kept_records}",
+                    path.display(),
+                    tier.len()
+                ),
+            ));
+        }
+        // The first and the newest kept frames, as stored: what the identity rules read of
+        // what the open keeps. The newest is read where the fold says it starts.
+        #[cfg(test)]
+        let newest = match &whole_bytes {
+            Some(existing) => {
+                logid::ends(existing.get(..keep).unwrap_or(&[])).map(|(_, n)| n.to_vec())
+            }
+            None => match newest_at {
+                Some(at) => Some(open_scan::frame_at(&file, at)?),
+                None => None,
+            },
+        };
+        #[cfg(not(test))]
+        let newest = match newest_at {
+            Some(at) => Some(open_scan::frame_at(&file, at)?),
+            None => None,
+        };
+        #[cfg(test)]
+        drop(whole_bytes);
+        let kept_ends = match (&first, &newest) {
+            (Some(f), Some(n)) if kept_records > 0 => Some((f.as_slice(), n.as_slice())),
+            _ => None,
+        };
         let (serving, served) = Self::settle_and_flush_open(
             &mut file,
             &dir,
             &path,
             &prior,
-            &existing,
-            valid_len,
+            named.as_deref(),
+            kept_ends,
             keep,
             base.0,
             pre_cut_head,
@@ -4985,19 +5530,16 @@ impl BrokerLog {
             boot,
             boot_volume,
         )?;
-        existing.truncate(keep);
         let durable_len = keep as u64;
-        let log_id = log_identity(&existing);
-        let newest_at = match logid::last_frame_start(&existing) {
-            Some(at) => Some(at as u64),
-            None => None,
+        let log_id = match kept_ends {
+            Some((first, _)) => log_identity(first),
+            None => [0u8; 16],
         };
-        let next = Offset(base.0.saturating_add(records.len() as u64));
+        let next = Offset(kept_head);
         // Anti-rollback: verify (or establish) the authenticated head watermark against
         // the recovered head, refusing a log that was truncated below it.
         let head_watermark =
-            Self::open_watermark(anti_rollback, &path, at_rest_ref, &existing, base.0, next.0)?;
-        drop(existing);
+            Self::open_watermark(anti_rollback, &path, at_rest_ref, log_id, base.0, next.0)?;
         // The cut the held store's read found, and the retention stamps read back cut to the
         // head recovered, once nothing refuses the open: read without its key a sealed store can
         // read as owing a cut (`held.rs`), and a crash lost the records past the head a tick had
@@ -5007,7 +5549,7 @@ impl BrokerLog {
         #[cfg(feature = "retention")]
         hold.opened_at(&path, at_rest_ref, base.0, next.0)?;
         #[cfg_attr(not(feature = "retention"), allow(unused_mut))]
-        let mut rebuilt = Self::rebuild_open_indices(compacted, records, &record_bts);
+        let mut rebuilt = rebuilt;
         #[cfg(feature = "retention")]
         for h in hold.entries.values() {
             if let Some(bt) = h.bt_ms {
@@ -5032,13 +5574,7 @@ impl BrokerLog {
             durable_len,
             newest_at,
             log_id,
-            tier: crate::tier::Tier::from_parts(
-                rebuilt.records,
-                record_bts,
-                record_at,
-                opts.resident_budget
-                    .unwrap_or(crate::tier::Tier::RESIDENT_ALL),
-            ),
+            tier,
             base,
             next,
             dedup: rebuilt.dedup,
@@ -5059,6 +5595,7 @@ impl BrokerLog {
             relay_floors: rebuilt.relay_floors,
             #[cfg(feature = "relay")]
             relay_origin_ids: HashSet::new(),
+            lineage: HashMap::new(),
             bind: rebuilt.bind,
             producer_last_bt: rebuilt.producer_last_bt,
             group_commits: rebuilt.group_commits,
@@ -5119,8 +5656,8 @@ impl BrokerLog {
         dir: &Dir,
         path: &Path,
         prior: &Prior,
-        existing: &[u8],
-        valid_len: usize,
+        named: Option<&[u8]>,
+        kept: Option<(&[u8], &[u8])>,
         keep: usize,
         base: u64,
         pre_cut_head: u64,
@@ -5135,15 +5672,13 @@ impl BrokerLog {
         boot: Option<[u8; 16]>,
         boot_volume: bool,
     ) -> io::Result<(logid::Sidecar, Served)> {
-        let pre_cut_slice = existing.get(..valid_len).unwrap_or(existing);
-        let kept_slice = existing.get(..keep).unwrap_or(existing);
         let settled = logid::settle(
             prior,
             &logid::Facts {
                 replica,
-                pre_cut: pre_cut_slice,
+                named,
                 pre_cut_head,
-                kept: kept_slice,
+                kept,
                 base,
                 kept_head,
                 unclean: unclean.is_some(),
@@ -5185,7 +5720,10 @@ impl BrokerLog {
             settled: &settled,
             base,
             head: kept_head,
-            kept: kept_slice,
+            kept: match kept {
+                Some((_, newest)) => newest,
+                None => &[],
+            },
             served: served_code(durability.tier()),
             boot,
             boot_volume,
@@ -5276,156 +5814,25 @@ impl BrokerLog {
         res.map(|()| (serving, served))
     }
 
+    /// The indices over `records` (in offset order, with their broker times `record_bts`)
+    /// from the carried state: [`IndexFold`] over each.
     fn rebuild_open_indices(
         compacted: CompactedState,
-        records: Vec<BrokerRecord>,
+        records: &[BrokerRecord],
         record_bts: &[Option<u64>],
     ) -> RebuiltIndices {
-        let mut dedup = crate::dedup::DedupIndex::new();
-        let mut group_commits: HashMap<String, u64> = compacted.group_commits;
-        let mut last: BTreeMap<String, Offset> = BTreeMap::new();
-        let mut subject_charges: HashMap<String, u64> = HashMap::new();
-        let mut subjects_per_producer: HashMap<u64, usize> = HashMap::new();
-        let mut durable_latest_wills: HashMap<u64, DurableWillEntry> = HashMap::new();
-        let mut durable_wills_by_subject: HashMap<String, HashSet<u64>> = HashMap::new();
-        let mut bind: HashMap<u64, (String, Offset)> = compacted.bind;
-        let mut high_water: HashMap<u64, u64> = compacted.high_water;
-        let carried_wills: HashMap<u64, (Offset, WillRecord)> = compacted.carried_wills;
-        let mut carried_last: BTreeMap<String, Arc<BrokerRecord>> = compacted.carried_last;
-        let mut carried_last_bt: BTreeMap<String, u64> = compacted.carried_last_bt;
-        let carried_charges: BTreeMap<String, u64> = compacted.carried_charges;
-        let uncarried_cut_tainted: bool = compacted.uncarried_cut_tainted;
-        let mut relay_floors = compacted.relay_floors;
-        let mut pending_carried_charges: BTreeMap<String, u64> = carried_charges.clone();
-        let mut producer_last_bt: HashMap<u64, u64> = HashMap::new();
-        let mut max_bt: u64 = 0;
-        for (&pid, (off, will)) in &carried_wills {
-            let hidden_target = is_hidden_subject(&will.subject);
-            if !hidden_target {
-                durable_wills_by_subject
-                    .entry(will.subject.clone())
-                    .or_default()
-                    .insert(pid);
-            }
-            durable_latest_wills.insert(
-                pid,
-                DurableWillEntry {
-                    offset: *off,
-                    will: will.clone(),
-                    settled_above: hidden_target,
-                },
-            );
-        }
-        for (subj, rec) in &carried_last {
-            if let Some(&bt) = carried_last_bt.get(subj) {
-                max_bt = broker_bt_advance(max_bt, bt);
-                if !is_hidden_record(rec) {
-                    let slot = producer_last_bt.entry(rec.producer_id).or_insert(bt);
-                    *slot = broker_bt_advance(*slot, bt);
-                }
-            }
-            let owner = pending_carried_charges
-                .remove(subj)
-                .unwrap_or(rec.producer_id);
-            if last.insert(subj.clone(), rec.seq).is_none() {
-                subject_charges.insert(subj.clone(), owner);
-                let c = subjects_per_producer.entry(owner).or_insert(0);
-                *c = c.saturating_add(1);
-            }
-        }
+        let mut fold = IndexFold::new(compacted);
         for (idx, r) in records.iter().enumerate() {
-            let r_bt = record_bts.get(idx).copied().flatten();
-            if let Some(bt) = r_bt {
-                max_bt = broker_bt_advance(max_bt, bt);
-            }
-            update_durable_wills_on_record(
-                &mut durable_latest_wills,
-                &mut durable_wills_by_subject,
-                r,
-            );
-            if r.subject == BIND_SUBJECT {
-                if let Ok(principal) = std::str::from_utf8(&r.body) {
-                    if !bind.contains_key(&r.producer_id) {
-                        bind.insert(r.producer_id, (principal.to_string(), r.seq));
-                    }
-                }
-            }
-            if r.subject == RELAY_MARK_SUBJECT {
-                relay_floors.mark(r.producer_id);
-            }
-            if let Some(target) = retire_target(r) {
-                pending_carried_charges.remove(target);
-                apply_retire_target(
-                    &mut last,
-                    &mut carried_last,
-                    &mut carried_last_bt,
-                    &mut subject_charges,
-                    &mut subjects_per_producer,
-                    r.producer_id,
-                    target,
-                );
-            }
-            // The broker's own hidden records (commits, wills, producer bindings) are
-            // not produces: they never enter the dedup map and never enter the
-            // last-value index. Rebuilding both here is what makes exactly-once ingest
-            // AND retained state survive a restart.
-            if !is_hidden_record(r) {
-                dedup.insert(r.producer_id, r.producer_seq, r.seq);
-                let carried_owner = pending_carried_charges.remove(&r.subject);
-                carried_last.remove(&r.subject);
-                carried_last_bt.remove(&r.subject);
-                if let Some(bt) = r_bt {
-                    let slot = producer_last_bt.entry(r.producer_id).or_insert(bt);
-                    *slot = broker_bt_advance(*slot, bt);
-                }
-                if last.insert(r.subject.clone(), r.seq).is_none() {
-                    let owner = carried_owner.unwrap_or(r.producer_id);
-                    subject_charges.insert(r.subject.clone(), owner);
-                    let c = subjects_per_producer.entry(owner).or_insert(0);
-                    *c = c.saturating_add(1);
-                }
-                // The reserved ack half never enters the fence's high water — the
-                // same rule `index_last` applies, applied here, so the fence a
-                // restart rebuilds is the fence the log had before it.
-                if r.producer_seq < ACK_SEQ_BASE {
-                    let hw = high_water.entry(r.producer_id).or_insert(r.producer_seq);
-                    *hw = crate::proto::high_water_monotone(*hw, r.producer_seq);
-                }
-            }
-            if let Some(c) = &r.commit {
-                let e = group_commits.entry(c.group.clone()).or_insert(0);
-                *e = crate::proto::group_commit_monotone(*e, c.upto);
-            }
+            fold.fold(r, record_bts.get(idx).copied().flatten());
         }
-        // Built whole from every retained record: give back what its growth left spare.
-        dedup.shrink_to_fit();
-        RebuiltIndices {
-            records,
-            dedup,
-            last,
-            subject_charges,
-            subjects_per_producer,
-            durable_latest_wills,
-            durable_wills_by_subject,
-            high_water,
-            carried_wills,
-            carried_last,
-            carried_last_bt,
-            carried_charges,
-            uncarried_cut_tainted,
-            relay_floors,
-            bind,
-            group_commits,
-            producer_last_bt,
-            max_bt,
-        }
+        fold.finish()
     }
 
     /// A refused classification: the error the open returns, or — on an explicit
     /// repair, where the point may be cut — `Ok`, the caller cutting there.
     fn refuse_or_repair(
         path: &Path,
-        existing: &[u8],
+        len: usize,
         (repair, keyed): (bool, bool),
         (offset, at_byte): (u64, usize),
         reason: &str,
@@ -5461,8 +5868,8 @@ impl BrokerLog {
                     "corrupt record at offset {offset} (byte {at_byte} of {}): {reason}; \
                      refusing to open — the {} bytes from there may be acked data \
                      ({way_out})",
-                    existing.len(),
-                    existing.len().saturating_sub(at_byte)
+                    len,
+                    len.saturating_sub(at_byte)
                 ),
             ));
         }
@@ -6338,7 +6745,7 @@ impl BrokerLog {
         }
 
         #[cfg_attr(not(feature = "retention"), allow(unused_mut))]
-        let mut rebuilt = Self::rebuild_open_indices(compacted, kept_records_vec, &kept_bts_vec);
+        let mut rebuilt = Self::rebuild_open_indices(compacted, &kept_records_vec, &kept_bts_vec);
         #[cfg(feature = "retention")]
         for h in self.hold.entries.values() {
             if let Some(bt) = h.bt_ms {
@@ -6360,7 +6767,7 @@ impl BrokerLog {
         self.log_id = new_log_id;
         self.tier = self
             .tier
-            .rebuilt(rebuilt.records, kept_bts_vec, kept_at_vec);
+            .rebuilt(kept_records_vec, kept_bts_vec, kept_at_vec);
         self.next = target_head;
         self.durable_head = target_head.0;
         self.held_from = None;
@@ -6816,7 +7223,7 @@ impl BrokerLog {
         if is_hidden_subject(&subject) {
             return Err(reserved_err(&subject));
         }
-        if let Some(off) = self.dedup.get(producer_id, producer_seq) {
+        if let Some(off) = self.durable_produced_dup(producer_id, producer_seq) {
             self.cover_resent(off, &subject, producer_id, None)?;
             return Ok((off, true));
         }
@@ -6858,7 +7265,7 @@ impl BrokerLog {
         body: Vec<u8>,
     ) -> Result<(Offset, bool), CheckedPublishError> {
         self.check_poisoned()?;
-        if let Some(offset) = self.dedup.get(producer_id, producer_seq) {
+        if let Some(offset) = self.durable_produced_dup(producer_id, producer_seq) {
             let record = self
                 .read_range(offset, 1)
                 .into_iter()
@@ -6946,7 +7353,7 @@ impl BrokerLog {
         if is_hidden_subject(&out_subject) {
             return Err(reserved_err(&out_subject));
         }
-        if let Some(off) = self.dedup.get(producer_id, producer_seq) {
+        if let Some(off) = self.durable_produced_dup(producer_id, producer_seq) {
             // The commit was already applied at first append.
             self.cover_resent(off, &out_subject, producer_id, Some(&group))?;
             return Ok((off, true));
@@ -7033,6 +7440,56 @@ impl BrokerLog {
         } else {
             self.staged_dedup.get(&key).copied()
         }
+    }
+
+    /// [`staged_or_durable_dup`](Self::staged_or_durable_dup) for a produce: under
+    /// `(producer_id, producer_seq)` itself or, for a producer that continues others' sequences
+    /// ([`set_producer_lineage`](Self::set_producer_lineage)), under a predecessor's id at the same
+    /// sequence. A relayed record keeps its origin's key on every broker and a will its own
+    /// producer's, so neither asks this.
+    fn produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
+        self.continued(producer_id, |id| {
+            self.staged_or_durable_dup((id, producer_seq))
+        })
+    }
+
+    /// [`produced_dup`](Self::produced_dup) for the un-batched paths, which read the durable map
+    /// alone.
+    fn durable_produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
+        self.continued(producer_id, |id| self.dedup.get(id, producer_seq))
+    }
+
+    /// `dup` under `producer_id`, then under each producer it continues.
+    fn continued(&self, producer_id: u64, dup: impl Fn(u64) -> Option<Offset>) -> Option<Offset> {
+        dup(producer_id).or_else(|| {
+            self.lineage
+                .get(&producer_id)?
+                .iter()
+                .find_map(|&pred| dup(pred))
+        })
+    }
+
+    /// Say which producers continue others' sequences: for each `successor -> predecessors`, a
+    /// produce under `(successor, seq)` is the record a predecessor already holds at
+    /// `(predecessor, seq)`, answered from it as its own resend is, and appended only when none
+    /// holds one. Replaces the lineage given before; a log keeps none across an open, so its owner
+    /// says it again before it takes the successor's writes.
+    ///
+    /// It is the owner's claim that the two producers number one sequence: a federation mirror's
+    /// sequence is its source's offset, so a source that changes the producer it pushes under
+    /// (its key rotated) and resends a burst the destination took under the old one, but whose
+    /// commit the source never wrote, appends nothing twice. A successor that numbered its own
+    /// records afresh would have a new record answered as an old one. A self-lineage is ignored.
+    pub fn set_producer_lineage(&mut self, lineage: impl IntoIterator<Item = (u64, Vec<u64>)>) {
+        self.lineage = lineage
+            .into_iter()
+            .filter_map(|(succ, mut preds)| {
+                preds.retain(|&p| p != succ);
+                preds.sort_unstable();
+                preds.dedup();
+                (!preds.is_empty()).then_some((succ, preds))
+            })
+            .collect();
     }
 
     /// The `(latest_offset, charged_producer_id)` of `subject` after folding the
@@ -7234,7 +7691,7 @@ impl BrokerLog {
         if is_hidden_subject(&subject) {
             return Err(StageErr::Reserved(subject));
         }
-        if let Some(off) = self.staged_or_durable_dup((producer_id, producer_seq)) {
+        if let Some(off) = self.produced_dup(producer_id, producer_seq) {
             self.note_dedup(off, &subject, producer_id, None);
             return Ok((off, true));
         }
@@ -7288,7 +7745,7 @@ impl BrokerLog {
         if is_hidden_subject(&out_subject) {
             return Err(StageErr::Reserved(out_subject));
         }
-        if let Some(off) = self.staged_or_durable_dup((producer_id, producer_seq)) {
+        if let Some(off) = self.produced_dup(producer_id, producer_seq) {
             self.note_dedup(off, &out_subject, producer_id, Some(&group));
             return Ok((off, true));
         }
@@ -9187,36 +9644,35 @@ impl BrokerLog {
         // retained record, as `read_from` does, so a pruned range costs no budget.
         let start = start.max(self.base.0);
         let limit = start.saturating_add(budget as u64).min(visible);
-        let mut next = start;
-        let mut off = start;
-        // The summaries from `start`, one an offset, read page by page; past the records
-        // held the scan ends, as a summary there answers none.
-        let index = |o: u64| usize::try_from(o.saturating_sub(self.base.0)).unwrap_or(usize::MAX);
-        let mut rows = self.tier.scan(index(start), index(limit));
-        let mut matches = Matches::of(filter);
-        while off < limit {
-            next = off.saturating_add(1);
-            let Some(Some(s)) = rows.next() else {
-                next = off;
-                break;
+        if start >= limit {
+            return (out, start);
+        }
+        // The records from `start` the filter matches, met page by page, a page that names no
+        // subject the filter matches passed whole; past the records held the scan ends.
+        let base = self.base.0;
+        let index = |o: u64| usize::try_from(o.saturating_sub(base)).unwrap_or(usize::MAX);
+        let hi = index(limit).min(self.tier.len());
+        let passing = self
+            .tier
+            .passing(index(start), hi, |s| filter.matches_str(s));
+        for met in passing {
+            let off = base.saturating_add(met.index() as u64);
+            let rec = match met {
+                crate::tier::Met::Wanted(_) => self.record_at(off),
+                crate::tier::Met::Unread(_) => None,
             };
-            if s.is_hidden() || !matches.subject(s.subject()) {
-                off = next;
-                continue;
-            }
-            let Some(rec) = self.record_at(off) else {
+            let Some(rec) = rec else {
                 // A retained offset that cannot be read now: the page ends before it,
                 // so the next read starts there again instead of skipping it.
-                next = off;
-                break;
+                return (out, off);
             };
             out.push(rec);
             if out.len() >= max {
-                break;
+                return (out, off.saturating_add(1));
             }
-            off = next;
         }
-        (out, next)
+        // Every record below the limit was passed, or the records held end below it.
+        (out, start.max(base.saturating_add(hi as u64)))
     }
 
     /// THE OLDEST offset of `filter`: the offset AT AND ABOVE WHICH THE FILTER IS COMPLETE,
@@ -9342,34 +9798,58 @@ impl BrokerLog {
         let from = (*cursor).saturating_sub(self.base.0).min(len as u64) as usize;
         let end_rel = head.saturating_sub(self.base.0).min(len as u64) as usize;
         let to = from.saturating_add(max_scan).min(end_rel);
+        let base = self.base.0;
         let mut out = Vec::new();
-        let mut scanned_to = *cursor;
-        let mut rows = self.tier.scan(from, to);
-        let mut matches = Matches::of(filter);
-        for i in from..to {
-            let off = self.base.0.saturating_add(i as u64);
-            // One summary an index, read whether or not `also_at` decides this one.
-            let summary = rows.next().flatten();
-            let want = match also_at {
-                Some(a) if a == off => true,
-                _ => match summary {
-                    Some(s) => !s.is_hidden() && matches.subject(s.subject()),
-                    None => true,
-                },
+        // `also_at`'s record is read in its place whatever the filter says of it.
+        let mut also = also_at
+            .and_then(|a| usize::try_from(a.checked_sub(base)?).ok())
+            .filter(|a| (from..to).contains(a));
+        // The records the filter matches, a page that names no subject it matches passed
+        // whole; a record whose summary cannot be read is wanted too, and its read decides.
+        let mut met = self
+            .tier
+            .passing(from, to, |s| filter.matches_str(s))
+            .map(crate::tier::Met::index)
+            .peekable();
+        loop {
+            let i = match (also, met.peek().copied()) {
+                (Some(a), Some(m)) if a <= m => {
+                    also = None;
+                    if a == m {
+                        met.next();
+                    }
+                    a
+                }
+                (Some(a), None) => {
+                    also = None;
+                    a
+                }
+                (_, Some(m)) => {
+                    met.next();
+                    m
+                }
+                (None, None) => break,
             };
-            if !want {
-                scanned_to = off.saturating_add(1);
-                continue;
-            }
+            let off = base.saturating_add(i as u64);
             let Some(rec) = self.record_arc(i) else {
                 if out.is_empty() {
                     return TailStep::Unreadable(off);
                 }
-                break;
+                // The step ends before the record it cannot read, which the next one reads
+                // again.
+                return TailStep::Chunk {
+                    records: out,
+                    scanned_to: off,
+                };
             };
             out.push(rec);
-            scanned_to = off.saturating_add(1);
         }
+        // Every record of the step's range was passed.
+        let scanned_to = if from < to {
+            base.saturating_add(to as u64)
+        } else {
+            *cursor
+        };
         if out.is_empty() {
             *cursor = scanned_to;
         }
@@ -10700,11 +11180,10 @@ pub(crate) enum RepairAt {
     NeedsKey,
 }
 
+/// What the open's scan found: how the intact prefix ends and what the recovery judges it by.
 pub(crate) struct Scan {
-    pub(crate) records: Vec<BrokerRecord>,
-    pub(crate) record_bts: Vec<Option<u64>>,
-    /// Byte at which each record's frame starts, aligned with `records`.
-    pub(crate) record_at: Vec<u64>,
+    /// How many records the intact prefix holds.
+    pub(crate) count: usize,
     /// Byte length of the intact prefix.
     pub(crate) valid_len: usize,
     pub(crate) tail: Tail,
@@ -10766,11 +11245,22 @@ pub(crate) fn later_record_exists(rest: &[u8], key: Option<&[u8; 32]>) -> bool {
     false
 }
 
+/// The reference scan's whole decode: the scan, and every record of the intact prefix with
+/// its broker time and the byte its frame starts at, in order.
+#[cfg(test)]
+pub(crate) struct Whole {
+    pub(crate) scan: Scan,
+    pub(crate) records: Vec<BrokerRecord>,
+    pub(crate) record_bts: Vec<Option<u64>>,
+    /// Byte at which each record's frame starts, aligned with `records`.
+    pub(crate) record_at: Vec<u64>,
+}
+
 /// Scan stored bytes into the longest intact, in-order (`seq == expected`) prefix
 /// of records, its byte length, and HOW the bytes end (clean / torn / corrupt — the
 /// distinction that decides whether recovery may truncate). Pure and panic-free.
 #[cfg(test)]
-fn scan(bytes: &[u8], key: Option<AtRestRef<'_>>, base: u64) -> Scan {
+fn scan(bytes: &[u8], key: Option<AtRestRef<'_>>, base: u64) -> Whole {
     scan_from(bytes, key, base, None, Mutation::Off)
 }
 
@@ -10786,13 +11276,18 @@ fn all_zero_bytes(rest: &[u8]) -> bool {
 /// [`scan`], noting what the batch seals and the durable `floor` say about the intact
 /// prefix ([`Scan::seal_end`], [`Scan::floor_at`]) for the recovery that judges damage
 /// by them, and taking the crash simulation's `mutation` (always `Off` outside it).
+///
+/// THE REFERENCE the open's streaming scan (`open_scan.rs`) is held to: the whole log in
+/// one buffer and every record of it decoded, as every open read it before the stream, kept
+/// for the tests that compare the two (`open_scan_tests.rs`) and for the recovery's own.
+#[cfg(test)]
 pub(crate) fn scan_from(
     bytes: &[u8],
     key: Option<AtRestRef<'_>>,
     base: u64,
     floor: Option<u64>,
     mutation: Mutation,
-) -> Scan {
+) -> Whole {
     let mut out: Vec<BrokerRecord> = Vec::new();
     let mut out_bts: Vec<Option<u64>> = Vec::new();
     let mut out_at: Vec<u64> = Vec::new();
@@ -10981,14 +11476,17 @@ pub(crate) fn scan_from(
             }
         }
     };
-    Scan {
+    Whole {
+        scan: Scan {
+            count: out.len(),
+            valid_len: pos,
+            tail,
+            seal_end,
+            floor_at,
+        },
         records: out,
         record_bts: out_bts,
         record_at: out_at,
-        valid_len: pos,
-        tail,
-        seal_end,
-        floor_at,
     }
 }
 
@@ -13095,8 +13593,12 @@ mod tests {
             ("intact record behind it", &followed),
         ] {
             let s = scan(bytes, None, 0);
-            assert_eq!((s.records.len(), s.valid_len), (2, good.len()), "{name}");
-            match &s.tail {
+            assert_eq!(
+                (s.records.len(), s.scan.valid_len),
+                (2, good.len()),
+                "{name}"
+            );
+            match &s.scan.tail {
                 Tail::Corrupt { offset, reason, .. } => assert!(
                     *offset == 2 && reason.contains("an empty frame: a torn header, or damage"),
                     "{name}: {reason}"
@@ -13106,7 +13608,7 @@ mod tests {
         }
         let mut zeros = good.clone();
         zeros.extend_from_slice(&[0u8; 64]);
-        assert_eq!(scan(&zeros, None, 0).tail, Tail::Torn);
+        assert_eq!(scan(&zeros, None, 0).scan.tail, Tail::Torn);
     }
 
     /// On a real file whose durable floor is UNKNOWN (no identity sidecar: the rules that

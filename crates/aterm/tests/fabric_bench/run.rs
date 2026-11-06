@@ -2211,10 +2211,13 @@ fn tier_report(backlogs: &[Backlog], md: &mut Vec<String>) {
         "**What each restart ran through the broker's residency tier** (D10f): astream's \
          `Broker::tier_tally`, read where the cold reads are. Pushes are the records promoted; \
          lookups the one-record reads by index (a cold read takes two); walks the reads of a \
-         range of summaries a page at a time (a filtered read's scan is one, `Tier::scan`, and \
-         takes no lookup) and rows the records they read; subject walks (the pending wills) and \
-         the pages naming the subject they read; wide the values read from the tier's maps of \
-         values no column holds.\n"
+         range of summaries a page at a time (a filtered read's pass is one, `Tier::passing`, \
+         and takes no lookup) and rows the records they read; subject walks (the pending wills) \
+         and the pages naming the subject they read; pages passed the pages a filtered read \
+         passed whole, wanting none of their subjects (F11c), and verdicts the times it asked \
+         its filter of a subject (at most once a page a subject, and again in a later page once \
+         another subject took its slot of 256, so not the backlog's distinct subjects); wide the \
+         values read from the tier's maps of values no column holds.\n"
             .to_string(),
     );
     if backlogs

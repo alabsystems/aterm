@@ -8,6 +8,8 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+use super::wake_deadline::WakeDeadline;
+
 pub(super) const EXPIRED: &str = "OAuth operation deadline expired";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +30,9 @@ impl Expired {
 pub(super) struct Deadline<'a> {
     end: Instant,
     clock: &'a dyn Fn() -> Instant,
+    /// The sign-in's deadline, which counts the time the host slept, where it was made from one
+    /// ([`Deadline::waking`]): it has passed once this has, whatever `end` says.
+    waking: Option<WakeDeadline>,
 }
 
 impl<'a> Deadline<'a> {
@@ -36,21 +41,54 @@ impl<'a> Deadline<'a> {
         Self {
             end: now.checked_add(within).unwrap_or(now),
             clock,
+            waking: None,
+        }
+    }
+
+    /// `deadline`, which counts the time the host slept, on `clock`: what it leaves now, from
+    /// `clock`'s now, and it has passed once `deadline` has, so a wait that looks at it after the
+    /// host slept past `deadline` ends.
+    pub(super) fn waking(deadline: WakeDeadline, clock: &'a dyn Fn() -> Instant) -> Self {
+        Self {
+            waking: Some(deadline),
+            ..Self::new(deadline.remaining(), clock)
         }
     }
 
     pub(super) fn now(self) -> Instant {
         (self.clock)()
     }
-    pub(super) fn end(self) -> Instant {
-        self.end
+
+    /// Whether it counts the time the host slept: it was made from a [`WakeDeadline`] that does
+    /// ([`WakeDeadline::counts_sleep`]).
+    pub(super) fn counts_sleep(self) -> bool {
+        self.waking.is_some_and(WakeDeadline::counts_sleep)
     }
+
+    /// When it ends on `clock`, for a leaf whose API takes an [`Instant`]: where it was made from
+    /// a [`WakeDeadline`], no later than `clock`'s now plus what that leaves now, so a leaf that
+    /// starts after the host slept gets no more than what was left of the budget. Such a leaf
+    /// then measures it on `clock` alone.
+    pub(super) fn end(self) -> Instant {
+        match self.waking {
+            Some(deadline) => {
+                let now = self.now();
+                self.end
+                    .min(now.checked_add(deadline.remaining()).unwrap_or(self.end))
+            }
+            None => self.end,
+        }
+    }
+
     pub(super) fn expired(self) -> bool {
-        self.now() >= self.end
+        self.remaining().is_err()
     }
 
     pub(super) fn remaining(self) -> Result<Duration, Expired> {
         let left = self.end.saturating_duration_since(self.now());
+        let left = self
+            .waking
+            .map_or(left, |deadline| left.min(deadline.remaining()));
         if left.is_zero() {
             Err(Expired)
         } else {
@@ -70,7 +108,7 @@ impl<'a> Deadline<'a> {
         let now = self.now();
         Self {
             end: self.end.min(now.checked_add(ceiling).unwrap_or(now)),
-            clock: self.clock,
+            ..self
         }
     }
 

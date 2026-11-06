@@ -6,19 +6,13 @@
 use aterm_render::{FaceId, MISSING_FONT_CLASS_EMOJI, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
 
 fn dejavu() -> Vec<u8> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/DejaVuSansMono.ttf"
-    ))
-    .expect("bundled DejaVu asset")
+    std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+        .expect("bundled DejaVu asset")
 }
 
 fn nerd_symbols() -> Vec<u8> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/SymbolsNerdFontMono-Regular.ttf"
-    ))
-    .expect("bundled Nerd Symbols asset")
+    std::fs::read(aterm_tempfile::manifest_dir().join("assets/SymbolsNerdFontMono-Regular.ttf"))
+        .expect("bundled Nerd Symbols asset")
 }
 
 fn renderer() -> Renderer {

@@ -32,6 +32,8 @@ mod directory;
 mod held;
 #[cfg(test)]
 mod hook_tests;
+#[cfg(unix)]
+mod pending;
 #[cfg(test)]
 mod recovery_tests;
 mod replay;
@@ -1375,6 +1377,16 @@ impl Store {
         &mut self,
         session: &Session<'_>,
         payload: &[u8],
+        merge: impl FnMut() -> Result<Vec<u8>>,
+    ) -> Result<Receipt> {
+        self.wait_for_rotation(session, pending::Shape::Catalog, payload)?;
+        self.commit_catalog_now(session, payload, merge)
+    }
+
+    fn commit_catalog_now(
+        &mut self,
+        session: &Session<'_>,
+        payload: &[u8],
         mut merge: impl FnMut() -> Result<Vec<u8>>,
     ) -> Result<Receipt> {
         let projection = self.catalog_projection(session)?;
@@ -1544,6 +1556,11 @@ impl Store {
         session: &Session<'_>,
         payload: &[u8],
     ) -> Result<Receipt> {
+        self.wait_for_rotation(session, pending::Shape::Liability, payload)?;
+        self.commit_liability_now(session, payload)
+    }
+
+    fn commit_liability_now(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
         let retained = self
             .liability_evidence(session)?
             .iter()
@@ -1577,8 +1594,93 @@ impl Store {
         )
     )]
     pub(crate) fn commit_own(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
+        self.wait_for_rotation(session, pending::Shape::Own, payload)?;
+        self.commit_own_now(session, payload)
+    }
+
+    fn commit_own_now(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
         let projection = self.catalog_projection(session)?;
         self.commit_from(session, payload, &projection.ordered, BTreeSet::new())
+    }
+
+    /// The writer's wait for a removal's rotation (one-mesh M4, §11 B11), before any write:
+    /// writes kept pending earlier are sealed first, in order, once the rotation has arrived; and
+    /// while it has not, this write joins them, named for the epoch it waited on, and the caller
+    /// is told so ([`Error::is_write_pending`]). Nothing is sealed under an epoch that still
+    /// wraps a Mac the log removed.
+    fn wait_for_rotation(
+        &mut self,
+        session: &Session<'_>,
+        shape: pending::Shape,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.seal_pending(session)?;
+        if !session.waits_for_rotation() {
+            return Ok(());
+        }
+        self.check(session)?;
+        session.writer()?;
+        if payload.len() > crypto::MAX_BODY {
+            return Err(Error::new("table operation exceeds its bound"));
+        }
+        let key = session.pending_key(&self.scope)?;
+        let mut writes = pending::load(&self.data_dir, &key)?;
+        let write = pending::Pending {
+            shape,
+            epoch: session.secret_basis(),
+            payload: zeroize::Zeroizing::new(payload.to_vec()),
+        };
+        if !writes.contains(&write) {
+            writes.push(write);
+            pending::save(&self.data_dir, &key, &writes)?;
+        }
+        Err(Error::write_pending())
+    }
+
+    /// Seal every write this table keeps pending for a removal's rotation, in the order they
+    /// were written, under the epoch `session` seals under now; how many were sealed. Nothing is
+    /// sealed while the rotation is still due. Each write leaves the set once its operation is
+    /// durable, so an interruption seals the rest on the next call (a crash between the two
+    /// can seal one write twice, which a table command's own idempotence absorbs, never lose
+    /// it).
+    ///
+    /// # Errors
+    /// The pending set does not open, or a write fails as a direct write would; the writes not
+    /// yet sealed stay pending.
+    pub fn seal_pending(&mut self, session: &Session<'_>) -> Result<usize> {
+        if session.waits_for_rotation() || !pending::path(&self.data_dir).exists() {
+            return Ok(0);
+        }
+        let key = session.pending_key(&self.scope)?;
+        let writes = pending::load(&self.data_dir, &key)?;
+        let mut sealed = 0;
+        for (i, write) in writes.iter().enumerate() {
+            match write.shape {
+                pending::Shape::Catalog => self.commit_catalog_now(session, &write.payload, || {
+                    Err(Error::new(
+                        "table frontier requires a bounded merge before writing",
+                    ))
+                }),
+                pending::Shape::Own => self.commit_own_now(session, &write.payload),
+                pending::Shape::Liability => self.commit_liability_now(session, &write.payload),
+            }?;
+            pending::save(&self.data_dir, &key, &writes[i + 1..])?;
+            sealed += 1;
+        }
+        Ok(sealed)
+    }
+
+    /// The epochs this table's pending writes wait on, in order: what a test, and the per-seat
+    /// view, read of a wait.
+    ///
+    /// # Errors
+    /// The pending set does not open.
+    pub fn pending_epochs(&self, session: &Session<'_>) -> Result<Vec<Digest>> {
+        let key = session.pending_key(&self.scope)?;
+        Ok(pending::load(&self.data_dir, &key)?
+            .into_iter()
+            .map(|write| write.epoch)
+            .collect())
     }
 
     /// The records and wire bytes this replica retains, in all and authored by `actor`: withheld

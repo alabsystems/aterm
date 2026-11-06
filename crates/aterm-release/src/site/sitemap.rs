@@ -141,8 +141,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/site/public/sitemap.xml");
+        let path = aterm_tempfile::manifest_dir().join("tests/fixtures/site/public/sitemap.xml");
         std::fs::read_to_string(path).unwrap()
     }
 

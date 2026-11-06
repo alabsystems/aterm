@@ -525,6 +525,10 @@ impl Lab for Strip {
     fn images(&self) -> PathBuf {
         PathBuf::new()
     }
+
+    fn aterm_pid(&self) -> Option<i32> {
+        None
+    }
 }
 
 #[test]
@@ -550,6 +554,109 @@ fn the_typing_take_needs_one_recording_that_outlasts_its_burst() {
     assert!(recording_held("ERR video: keys is owner-only\n", false).is_err());
     assert!(recording_held("OK video /x/keys.mov frames=600\n", false).is_err());
     assert!(recording_held("ERR video: the recording failed\n", true).is_err());
+}
+
+#[test]
+fn a_takes_cost_is_aterms_cpu_and_instructions_per_rendered_frame() {
+    // Apple silicon's 24 MHz ticks (125/3 ns each): 24,000,000 ticks is one second.
+    let tb = Some((125, 3));
+    let at = |ticks, insn| {
+        Some(Spent {
+            ticks,
+            insn,
+            main: None,
+        })
+    };
+    // The main thread (id `tid`), its CPU time in ns and its instructions.
+    let main_at = |ticks, insn, tid, ns, main_insn| {
+        Some(Spent {
+            ticks,
+            insn,
+            main: Some(MainSpent {
+                tid,
+                ns,
+                insn: main_insn,
+            }),
+        })
+    };
+    // The main thread ran 0.4 of the take's second and retired a quarter of its instructions.
+    assert_eq!(
+        spent_words(
+            main_at(1_000, 7, 9, 5, Some(50_000_000)),
+            main_at(24_001_000, 400_000_007, 9, 400_000_005, Some(150_000_000)),
+            Some(400),
+            tb
+        ),
+        "cpu_ms=1000.0 cpu_us_per_render=2500.0 kinsn_per_render=1000.0 \
+         main_us_per_render=1000.0 main_kinsn_per_render=250.0"
+    );
+    // A third of a frame's microseconds kept to the tenth, not rounded up.
+    assert_eq!(
+        spent_words(at(0, 0), at(24_000, 30_000), Some(3), tb),
+        "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=10.0 main_us_per_render=- \
+         main_kinsn_per_render=-"
+    );
+    // Nothing guessed: no reading, no timebase, no frame, no retired-instruction count, a
+    // counter that went backwards (the pid named another process), or a main thread that is
+    // not the one read first reads `-`.
+    let none = "cpu_ms=- cpu_us_per_render=- kinsn_per_render=- main_us_per_render=- \
+                main_kinsn_per_render=-";
+    assert_eq!(spent_words(None, at(24_000, 1), Some(3), tb), none);
+    assert_eq!(spent_words(at(0, 0), at(24_000, 0), Some(0), None), none);
+    assert_eq!(spent_words(at(24_000, 5), at(1_000, 9), Some(3), tb), none);
+    assert_eq!(
+        spent_words(at(0, 0), at(24_000, 0), Some(3), tb),
+        "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=- main_us_per_render=- \
+         main_kinsn_per_render=-"
+    );
+    assert_eq!(
+        spent_words(
+            main_at(0, 0, 9, 0, Some(0)),
+            main_at(24_000, 30_000, 10, 900, Some(3_000)),
+            Some(3),
+            tb
+        ),
+        "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=10.0 main_us_per_render=- \
+         main_kinsn_per_render=-"
+    );
+    // The main thread's time read where its counters were not (an older macOS).
+    assert_eq!(
+        spent_words(
+            main_at(0, 0, 9, 0, None),
+            main_at(24_000, 30_000, 9, 900, Some(3_000)),
+            Some(3),
+            tb
+        ),
+        "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=10.0 main_us_per_render=0.3 \
+         main_kinsn_per_render=-"
+    );
+    // One counter of the same main thread backwards, or its instructions flat over frames it
+    // drew, reads `-` for that word alone; the process's ticks forward with its instructions
+    // backwards reads `-` for every word.
+    assert_eq!(
+        spent_words(
+            main_at(0, 0, 9, 900, Some(0)),
+            main_at(24_000, 30_000, 9, 100, Some(3_000)),
+            Some(3),
+            tb
+        ),
+        "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=10.0 main_us_per_render=- \
+         main_kinsn_per_render=1.0"
+    );
+    for (from, to) in [(3_000, 3_000), (5_000, 3_000)] {
+        assert_eq!(
+            spent_words(
+                main_at(0, 0, 9, 0, Some(from)),
+                main_at(24_000, 30_000, 9, 900, Some(to)),
+                Some(3),
+                tb
+            ),
+            "cpu_ms=1.0 cpu_us_per_render=333.3 kinsn_per_render=10.0 main_us_per_render=0.3 \
+             main_kinsn_per_render=-",
+            "the main thread's instructions {from} then {to}"
+        );
+    }
+    assert_eq!(spent_words(at(0, 30_000), at(24_000, 5), Some(3), tb), none);
 }
 
 fn frame(w: usize, h: usize, px: [u8; 4]) -> Frame {

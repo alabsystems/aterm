@@ -96,10 +96,10 @@ pub trait Packer {
     /// Any gate's refusal.
     fn pack(&self, ctx: &Ctx, request: &PackRequest) -> Result<PackOutcome>;
 
-    /// Whether the upstream GNU target's C compiler, SDK and execution route work.
+    /// Whether this program's upstream build and native qualification route work.
     /// # Errors
     /// An unsupported packer or unavailable target SDK.
-    fn can_pack_bottle(&self, _triple: Triple) -> std::result::Result<(), String> {
+    fn can_pack_bottle(&self, _program: &str, _triple: Triple) -> std::result::Result<(), String> {
         Err("this packer cannot build upstream source archives".into())
     }
 

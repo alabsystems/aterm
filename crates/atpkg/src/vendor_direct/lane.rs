@@ -1030,7 +1030,7 @@ fn agree(lane: &Lane<'_>, pending: &Pending) -> Result<Option<Agreement>, FlowEr
         spec.program,
         c.version.build_id(),
         art,
-        false,
+        crate::flow::Retry::Program,
     ) {
         return Err(FlowError::StageRefused(note));
     }

@@ -1923,3 +1923,93 @@ fn a_refused_mac_counts_in_fleet_coverage_and_works_nowhere() {
         "a refused roster runs nothing"
     );
 }
+
+/// `aterm ai [status] [--json]` TAKES ITS TWO WORDS ONCE EACH, IN EITHER ORDER, AND NOTHING ELSE: a
+/// mistyped word is a usage error (exit 2) that reads nothing, not a status that dropped it. A
+/// review takes what to look for inline or on stdin, never both. CONTROLS: bare `aterm ai` is the
+/// text look, `--json status` and `status --json` the JSON one, and a review's `-` alone or its
+/// words alone parse.
+#[test]
+fn status_and_review_refuse_words_they_do_not_take() {
+    let b = machine(&["codex"]);
+    let env = env_of(&b, ONLY_CODEX, &[], false);
+    let runner = FakeRunner::quiet();
+    for bad in [
+        &["status", "--bogus"][..],
+        &["status", "extra"][..],
+        &["status", "status"][..],
+        &["--json", "--bogus"][..],
+        &["--json", "--json"][..],
+        &["--json", "status", "--fleet"][..],
+    ] {
+        let (code, out, err) = run_cli(&env, &runner, bad);
+        assert_eq!(code, 2, "{bad:?}: {out}{err}");
+        assert!(out.is_empty(), "{bad:?}: nothing is read: {out}");
+        assert!(err.contains("aterm ai [status] [--json]"), "{bad:?}: {err}");
+    }
+    // The parse alone: a review that took both would go on to read this test's own stdin.
+    for inline in [&["-", "inline"][..], &["-", "--", "x"][..]] {
+        let args: Vec<String> = inline.iter().map(|a| (*a).to_string()).collect();
+        let why = parse_review(&args).expect_err("refused");
+        assert!(why.contains("not both"), "{inline:?}: {why}");
+    }
+    for words in [&["-"][..], &["look", "here"][..]] {
+        let args: Vec<String> = words.iter().map(|a| (*a).to_string()).collect();
+        assert!(parse_review(&args).is_ok(), "CONTROL: {words:?}");
+    }
+    let (code, text, err) = run_cli(&env, &runner, &[]);
+    assert_eq!(code, 0, "CONTROL: {err}");
+    assert!(text.starts_with("preferred:  codex"), "CONTROL: {text}");
+    for good in [
+        &["--json", "status"][..],
+        &["status", "--json"][..],
+        &["--json"][..],
+    ] {
+        let (code, json, err) = run_cli(&env, &runner, good);
+        assert_eq!(code, 0, "CONTROL {good:?}: {err}");
+        let v: Value = aterm_json::from_str(json.trim()).expect("CONTROL: json");
+        assert_eq!(
+            v.get("kind").and_then(Value::as_str),
+            Some("ai"),
+            "{good:?}"
+        );
+    }
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+}
+
+/// WHAT TO LOOK FOR ON STDIN IS READ WHOLE OR NOT AT ALL: a read that fails after part of the text
+/// arrived refuses the review instead of starting it on that part. CONTROLS: text read to its end
+/// is the words; over the cap, or not UTF-8, is refused as before.
+#[test]
+fn a_review_whose_stdin_fails_part_way_is_refused() {
+    struct Breaks(Option<&'static [u8]>);
+    impl std::io::Read for Breaks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.take() {
+                Some(part) => {
+                    buf[..part.len()].copy_from_slice(part);
+                    Ok(part.len())
+                }
+                None => Err(std::io::Error::other("the pipe broke")),
+            }
+        }
+    }
+    let why = words_read_from(Breaks(Some(b"look at the cache "))).expect_err("refused");
+    assert!(
+        why.contains("could not be read") && why.contains("the pipe broke"),
+        "{why}"
+    );
+    assert_eq!(
+        words_read_from(&b"look at the cache key"[..]).as_deref(),
+        Ok("look at the cache key"),
+        "CONTROL"
+    );
+    assert!(
+        words_read_from(&vec![b'a'; WORDS_MAX + 1][..]).is_err_and(|w| w.contains("KiB")),
+        "CONTROL: over the cap"
+    );
+    assert!(
+        words_read_from(&[0xff, 0xfe][..]).is_err_and(|w| w.contains("UTF-8")),
+        "CONTROL: not text"
+    );
+}

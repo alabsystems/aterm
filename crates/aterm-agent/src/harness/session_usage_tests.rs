@@ -1549,7 +1549,7 @@ fn unread_is_said_with_no_tokens_shown() {
 }
 
 fn measured(name: &str) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("src/harness/testdata/flight")
         .join(name);
     fs::read_to_string(path)
@@ -1562,7 +1562,7 @@ fn measured(name: &str) -> Vec<String> {
 
 fn testdata(name: &str) -> String {
     fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        aterm_tempfile::manifest_dir()
             .join("src/harness/testdata/flight")
             .join(name),
     )

@@ -118,7 +118,8 @@ impl Provider for KimiOauth {
                 )
                 .map_err(ObservationError::Unavailable)?
             {
-                let deadline = std::time::Instant::now() + AUTH_CHECK_BUDGET;
+                let deadline =
+                    crate::harness::wake_deadline::WakeDeadline::after(AUTH_CHECK_BUDGET);
                 if let Some(proof) = journal.observe_existing(&request, home, deadline)? {
                     return Ok(Some(Box::new(proof)));
                 }

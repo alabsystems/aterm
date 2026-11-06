@@ -16,9 +16,12 @@ pub mod layout;
 pub mod lease;
 pub mod named_lock;
 pub mod record_lock;
+pub mod release_env;
+pub mod rustc_movers;
 pub mod rustup;
 pub mod stall;
 pub mod stat_digest;
+pub mod trust_lock;
 pub mod waits;
 
 pub use discovery::*;

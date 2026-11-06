@@ -1814,17 +1814,14 @@ impl TrailAudio {
     /// Whether cues pushed here can ever reach a device.
     pub const fn is_live(&self) -> bool {
         #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
-        if self.capture.is_some() {
-            return true;
-        }
+        let capturing = self.capture.is_some();
+        #[cfg(not(any(test, all(unix, feature = "bench-support", debug_assertions))))]
+        let capturing = false;
         #[cfg(target_os = "macos")]
-        {
-            self.tx.is_some()
-        }
+        let bound = self.tx.is_some();
         #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        let bound = false;
+        capturing || bound
     }
 
     /// `Some(elapsed)` when the worker's current platform call has outlived its
@@ -1943,17 +1940,11 @@ impl TrailAudio {
     pub(crate) fn is_inert_for_test(&self) -> bool {
         // A capturing host accepts cues, so it is not inert; this stays the
         // complement of `is_live`'s capture arm.
-        if self.capture.is_some() {
-            return false;
-        }
         #[cfg(target_os = "macos")]
-        {
-            self.tx.is_none() && self.worker.is_none()
-        }
+        let unbound = self.tx.is_none() && self.worker.is_none();
         #[cfg(not(target_os = "macos"))]
-        {
-            true
-        }
+        let unbound = true;
+        self.capture.is_none() && unbound
     }
 
     #[cfg(all(test, target_os = "macos"))]

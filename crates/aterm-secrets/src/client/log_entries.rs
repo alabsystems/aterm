@@ -4918,6 +4918,8 @@ pub(super) fn draft_retire_in_log_with(
             "this machine is not an active bound member in the membership log",
         ));
     };
+    // The fold's adoption gate: once on, a removal rotates `[everyone]` alone (one-mesh M6).
+    let fold = crate::commons::fold::on(paths);
     if targets.contains(&actor) {
         return Err(Error::new("a member does not remove itself"));
     }
@@ -5006,7 +5008,8 @@ pub(super) fn draft_retire_in_log_with(
             None,
             |audience, _, _| match audience {
                 EpochAudience::Everyone | EpochAudience::Commons
-                    if opens_newest(&opened, audience) =>
+                    if opens_newest(&opened, audience)
+                        && !(fold && *audience == EpochAudience::Commons) =>
                 {
                     super::remove::Mints::Surely
                 }
@@ -5068,6 +5071,7 @@ pub(super) fn draft_retire_in_log_with(
                     authored_ms,
                 },
                 exclude_recipients,
+                fold,
                 &mut minted,
             )?;
         }
@@ -5260,6 +5264,7 @@ fn rotate_epochs_after_remove(
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
+    fold: bool,
     minted: &mut Vec<Record>,
 ) -> crate::Result<()> {
     rotate_after_removal(
@@ -5267,7 +5272,10 @@ fn rotate_epochs_after_remove(
         opened,
         author,
         exclude_recipients,
-        &Rotation::default(),
+        &Rotation {
+            fold,
+            ..Rotation::default()
+        },
         minted,
     )
     .map(|_| ())
@@ -5282,6 +5290,10 @@ pub(super) struct Rotation<'a> {
     /// Also rotate each host list this Mac opens whose newest epoch wraps a Mac the log removed
     /// (F16: a removal mints a new epoch for every audience the Mac was in, §3.3.7).
     pub(super) hosts: bool,
+    /// The fold is on here (`commons::fold`, one-mesh M6): `[everyone]` is the one keyed audience
+    /// that gets new epochs, so the Commons arm mints nothing; tables derive their key from the
+    /// new `[everyone]` epoch.
+    pub(super) fold: bool,
 }
 
 /// Mint a new epoch for `[everyone]` and for Commons, each where the log has one and this Mac
@@ -5423,7 +5435,8 @@ pub(super) fn rotate_after_removal(
         )?);
     }
 
-    if !opened.max_generation.contains_key(&EpochAudience::Commons)
+    if rotation.fold
+        || !opened.max_generation.contains_key(&EpochAudience::Commons)
         || !opens_newest(opened, &EpochAudience::Commons)
     {
         return Ok(rotated);

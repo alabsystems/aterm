@@ -167,6 +167,26 @@ pub(crate) fn started_of(pid: u32) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
+/// Record the line's lifetime independently of any resource reservation. This is a journal
+/// observation, never a release gate. The injected admission keeps tests off the live ledger.
+pub(crate) fn line_priority_with(
+    admit: impl FnOnce(
+        aterm_capacity::Need,
+        aterm_capacity::Admit,
+    ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
+) -> Option<aterm_capacity::Claim> {
+    match admit(
+        aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
+        aterm_capacity::Admit::Wait,
+    ) {
+        Ok(priority) => Some(priority),
+        Err(why) => {
+            eprintln!("release line priority could not be recorded: {why}");
+            None
+        }
+    }
+}
+
 /// The release state below HOME: its logs, its build times and its kept build-inputs seal
 /// (`inputs-seal/`, [`crate::build_inputs::arm`]).
 pub(crate) const RELEASE_STATE: &str = ".local/state/aterm-release";
@@ -201,6 +221,7 @@ pub struct Real {
     scanner_probe: scanner_tools::Probe,
     /// The release's one disk claim ([`Backend::claim_disk`]), named to every child it starts.
     disk_claim: Option<atpkg::admit_disk::Whole>,
+    fleet_line: Option<crate::line_claim::Claim>,
 }
 
 struct Forwarded {
@@ -293,6 +314,7 @@ impl Real {
             scanner_tools: None,
             scanner_probe: scanner_tools::run,
             disk_claim: None,
+            fleet_line: None,
         })
     }
 
@@ -1595,7 +1617,7 @@ impl Real {
         log: &Path,
         cmd: &mut Command,
     ) -> std::io::Result<std::process::Output> {
-        scrub(cmd);
+        scrub_fixture_command(cmd);
         cmd.env("TRUST_STAGE2_BIN", &prover.bin);
         let (out, record) = self.output_accounted(step, cmd)?;
         append_output(log, &out);
@@ -1980,14 +2002,15 @@ impl Arrivals {
     }
 
     fn read(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if byte != b'\n' {
-                if self.line.len() < Self::HEAD {
-                    self.line.push(byte);
-                }
-                continue;
-            }
-            let text = String::from_utf8_lossy(&self.line);
+        let mut rest = bytes;
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            let text = if self.line.is_empty() {
+                String::from_utf8_lossy(&rest[..pos.min(Self::HEAD)])
+            } else {
+                let take = Self::HEAD.saturating_sub(self.line.len()).min(pos);
+                self.line.extend_from_slice(&rest[..take]);
+                String::from_utf8_lossy(&self.line)
+            };
             let _ = writeln!(
                 self.file,
                 "release-event: {}",
@@ -1996,7 +2019,10 @@ impl Arrivals {
                 })
             );
             self.line.clear();
+            rest = &rest[pos + 1..];
         }
+        let take = Self::HEAD.saturating_sub(self.line.len()).min(rest.len());
+        self.line.extend_from_slice(&rest[..take]);
     }
 }
 
@@ -2074,53 +2100,23 @@ fn local_stamp(unix: u64, offset: i64) -> String {
 }
 
 /// The variables cleared from every child, so every step builds what the operator's shell would: each `RUST*` and `CARGO*` (target-directory overrides included) but the inert knobs (job count, incremental, logging, backtraces, cargo's terminal output), and the C toolchain's (the `cc` crate's names, also as `<NAME>_<target>`, `TARGET_<NAME>`, `HOST_<NAME>`).
-pub(crate) fn clears(name: &str) -> bool {
-    const INERT: [&str; 8] = [
-        "CARGO_BUILD_JOBS",
-        "CARGO_MAKEFLAGS",
-        "CARGO_INCREMENTAL",
-        "CARGO_LOG",
-        "RUST_BACKTRACE",
-        "RUST_LIB_BACKTRACE",
-        "RUST_LOG",
-        "RUST_TEST_THREADS",
-    ];
-    const NATIVE: [&str; 8] = [
-        "CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "ARFLAGS",
-    ];
-    if name.starts_with("RUST") || name.starts_with("CARGO") {
-        return !INERT.contains(&name) && !name.starts_with("CARGO_TERM_");
-    }
-    if matches!(
-        name,
-        "MACOSX_DEPLOYMENT_TARGET" | "SDKROOT" | "CRATE_CC_NO_DEFAULTS"
-    ) {
-        return true;
-    }
-    let bare = name
-        .strip_prefix("TARGET_")
-        .or_else(|| name.strip_prefix("HOST_"))
-        .unwrap_or(name);
-    NATIVE.iter().any(|n| {
-        bare == *n
-            || bare
-                .strip_prefix(n)
-                .is_some_and(|rest| rest.starts_with('_'))
-    })
-}
-
-/// What `targo run` handed this process as its launcher (`CARGO`, `CARGO_PRIMARY_PACKAGE`, `CARGO_MANIFEST_*`, `CARGO_PKG_*`, their `TARGO_*` twins, `TRUST_TARGO_FRONTEND`, `DYLD_FALLBACK_LIBRARY_PATH`): cleared too, silently, so every step runs as from the operator's shell, never as a child of the alias.
-pub(crate) fn launcher_env(name: &str) -> bool {
-    matches!(
-        name,
-        "CARGO" | "CARGO_PRIMARY_PACKAGE" | "TRUST_TARGO_FRONTEND" | "DYLD_FALLBACK_LIBRARY_PATH"
-    ) || ["CARGO_MANIFEST_", "CARGO_PKG_", "TARGO_"]
-        .iter()
-        .any(|p| name.starts_with(p))
-}
+pub(crate) use aterm_toolchain::release_env::{clears, launcher_env};
 
 fn scrub(cmd: &mut Command) {
     scrub_names(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+/// A direct generator has an explicit runtime manifest from the checked artifact.
+/// Keep that value after removing the launcher's inherited Cargo environment.
+fn scrub_fixture_command(cmd: &mut Command) {
+    let manifest = cmd
+        .get_envs()
+        .find(|(name, _)| *name == "CARGO_MANIFEST_DIR")
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned));
+    scrub(cmd);
+    if let Some(manifest) = manifest {
+        cmd.env("CARGO_MANIFEST_DIR", manifest);
+    }
 }
 
 /// Remove from `cmd` each of `inherited` (the names of this process's environment) that a step
@@ -2214,11 +2210,9 @@ fn append_output(log: &Path, out: &std::process::Output) {
 
 fn tail(path: &Path, n: usize) -> Vec<String> {
     let text = crate::durable::read_text(path).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..]
-        .iter()
-        .map(|l| (*l).to_string())
-        .collect()
+    let mut out: Vec<String> = text.lines().rev().take(n).map(str::to_string).collect();
+    out.reverse();
+    out
 }
 
 /// Each kept audit row put back in time order (the pub-sync pattern).
@@ -2234,9 +2228,9 @@ pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
             })
             .unwrap_or_default()
     };
-    let mut rows: Vec<(String, String)> = text.lines().map(|r| (at(r), r.to_string())).collect();
+    let mut rows: Vec<(String, &str)> = text.lines().map(|r| (at(r), r)).collect();
     for row in kept {
-        if rows.iter().any(|(_, r)| r == row) {
+        if rows.iter().any(|(_, r)| *r == row.as_str()) {
             continue;
         }
         let when = at(row);
@@ -2244,9 +2238,10 @@ pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
             .iter()
             .position(|(row_at, _)| row_at > &when)
             .unwrap_or(rows.len());
-        rows.insert(i, (when, row.clone()));
+        rows.insert(i, (when, row.as_str()));
     }
-    let mut out = String::new();
+    let cap: usize = rows.iter().map(|(_, r)| r.len() + 1).sum::<usize>().max(1);
+    let mut out = String::with_capacity(cap);
     for (idx, (_, row)) in rows.iter().enumerate() {
         if idx > 0 {
             out.push('\n');
@@ -2688,7 +2683,8 @@ fn keep_reports(out: &Path, to: &Path) {
     }
     for entry in std::fs::read_dir(out).into_iter().flatten().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_file()) {
-            let _ = crate::durable::copy_regular_fresh(entry.path(), to.join(entry.file_name()));
+            let name = entry.file_name();
+            let _ = crate::durable::copy_regular_fresh(out.join(&name), to.join(&name));
         }
     }
 }
@@ -3008,7 +3004,7 @@ fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
 #[must_use]
 pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> {
     const MAX_DMG_BYTES: u64 = 200 * 1000 * 1000;
-    let mut assets: std::collections::BTreeMap<String, Option<u64>> = Default::default();
+    let mut assets: std::collections::BTreeMap<&str, Option<u64>> = Default::default();
     for a in release
         .get("assets")
         .and_then(aterm_json::Value::as_array)
@@ -3019,15 +3015,12 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
             .get("name")
             .and_then(aterm_json::Value::as_str)
             .unwrap_or("");
-        assets.insert(
-            name.to_string(),
-            a.get("size").and_then(aterm_json::Value::as_u64),
-        );
+        assets.insert(name, a.get("size").and_then(aterm_json::Value::as_u64));
     }
     let mut bad = Vec::new();
     let dmg = format!("aterm-{version}.dmg");
     let zip = format!("aterm-{version}-mac.zip");
-    match assets.get(&dmg) {
+    match assets.get(dmg.as_str()) {
         None => bad.push(format!(
             "{dmg} is missing — the download the site links and the updater binds"
         )),
@@ -3039,7 +3032,7 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
         )),
         Some(Some(_)) => {}
     }
-    if !assets.contains_key(&zip) {
+    if !assets.contains_key(zip.as_str()) {
         bad.push(format!(
             "{zip} is missing — the updater, the Homebrew cask and install.sh all consume it"
         ));
@@ -3057,10 +3050,12 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
         }
     }
     for name in [dmg.as_str(), zip.as_str(), "aterm.dmg", "aterm-mac.zip"] {
-        let side = format!("{name}.sha256");
-        if !assets.contains_key(&side) {
+        if !assets
+            .keys()
+            .any(|k| k.strip_prefix(name).is_some_and(|s| s == ".sha256"))
+        {
             bad.push(format!(
-                "{side} is missing — `shasum -a 256 -c` matches on the embedded name, so each \
+                "{name}.sha256 is missing — `shasum -a 256 -c` matches on the embedded name, so each \
                  container and twin needs its own sidecar"
             ));
         }
@@ -3073,7 +3068,7 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
     bad.extend(source_attestation_findings(release));
     let retired: Vec<&str> = assets
         .keys()
-        .map(String::as_str)
+        .copied()
         .filter(|n| {
             n.ends_with("-x86_64.dmg") || n.ends_with("-lite.dmg") || *n == "aterm-offline.dmg"
         })
@@ -3114,14 +3109,14 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
 }
 
 fn linux_inventory(
-    assets: &std::collections::BTreeMap<String, Option<u64>>,
+    assets: &std::collections::BTreeMap<&str, Option<u64>>,
     version: &str,
 ) -> Vec<String> {
     const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
     let mut bad = Vec::new();
     let mut native = Vec::new();
     let (mut tars, mut sides) = (Vec::new(), Vec::new());
-    for (name, size) in assets {
+    for (&name, size) in assets {
         let Some(rest) = name.strip_prefix("aterm-") else {
             continue;
         };
@@ -3140,7 +3135,7 @@ fn linux_inventory(
                 "Linux asset {name} names another version — this release is {version}"
             ));
             continue;
-        }
+        };
         if !ARCHES.contains(&arch) {
             bad.push(format!(
                 "Linux asset {name} is named for an unsupported or noncanonical architecture — \
@@ -3149,10 +3144,10 @@ fn linux_inventory(
             continue;
         }
         match kind {
-            "side" => sides.push(arch.to_string()),
-            "tar" => tars.push(arch.to_string()),
+            "side" => sides.push(arch),
+            "tar" => tars.push(arch),
             _ => {
-                native.push(arch.to_string());
+                native.push(arch);
                 if !size.is_some_and(|n| (64..=512 * 1024 * 1024).contains(&n)) {
                     bad.push(format!(
                         "{name} has invalid native ELF size {size:?} (expected 64..536870912 bytes)"
@@ -3233,9 +3228,11 @@ fn pointer_hop_problem(
 #[must_use]
 pub fn appcast_problems(text: &str, slug: &str, tag: &str, version: &str) -> Vec<String> {
     let field = |key: &str| {
-        let prefix = format!("{key} = \"");
-        text.lines()
-            .find_map(|l| l.strip_prefix(&prefix).and_then(|v| v.strip_suffix('"')))
+        text.lines().find_map(|l| {
+            l.strip_prefix(key)?
+                .strip_prefix(" = \"")?
+                .strip_suffix('"')
+        })
     };
     if field("version") != Some(version) {
         return vec![format!(
@@ -3267,6 +3264,9 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
 }
 
 impl Backend for Real {
+    fn line_priority(&mut self) -> Option<aterm_capacity::Claim> {
+        line_priority_with(aterm_capacity::admit)
+    }
     fn now(&mut self) -> u64 {
         now()
     }
@@ -3339,6 +3339,41 @@ impl Backend for Real {
         {
             self.say(&format!("release status: cannot record log path: {error}"));
         }
+    }
+
+    fn fleet_line(&mut self, line: &Line, handed: bool) -> Result<Line, String> {
+        let claim = crate::line_claim::Claim::take(&self.repo, line, &self.logs, handed)?;
+        let selected = claim.line.clone();
+        self.fleet_line = Some(claim);
+        Ok(selected)
+    }
+
+    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, String> {
+        let line = crate::line_claim::existing(&self.repo, version)?;
+        if let Some(line) = &line {
+            self.fetch().map_err(|r| r.why)?;
+            crate::line::verify(&self.git(), line).map_err(|e| e.to_string())?;
+        }
+        Ok(line)
+    }
+
+    fn fleet_boundary(&mut self, line: &Line, step: Step) -> Result<(), String> {
+        let history = self.times();
+        if let Some(claim) = &mut self.fleet_line {
+            claim.boundary(line, step.name(), &history)?;
+        }
+        Ok(())
+    }
+
+    fn fleet_audit(&mut self) -> Result<(), String> {
+        self.fleet_line
+            .as_mut()
+            .ok_or("no fleet line claim")?
+            .audit()
+    }
+
+    fn fleet_hand(&mut self) {
+        self.fleet_line.take();
     }
 
     fn observe_operational(&mut self) {
@@ -4126,21 +4161,18 @@ impl Backend for Real {
 
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let git = self.git();
-        let answer = |yes: bool, words: String| {
-            if yes {
-                Answer::yes(words)
-            } else {
-                Answer::no(words)
-            }
-        };
         let built = built_answer(&self.repo, artifact, prover);
-        let verified = match artifact.filter(|_| built.yes) {
-            None => Answer::no("its bundle is not built yet (step 5)"),
-            Some(a) => match crate::gates::verified(&git, &c.commit, &a.macho_sha256) {
-                Ok((yes, words)) => answer(yes, words),
-                Err(e) => Answer::unanswered(format!("the verified judge did not answer: {e}")),
-            },
-        };
+        // The tree's records need no bundle; the bundle's need its executable. The seal is the
+        // run's, rechecked by stat, and read only once a record of this tree is there.
+        let executable = artifact
+            .filter(|_| built.yes)
+            .map(|a| a.macho_sha256.as_str());
+        let checks = crate::check_record::checks(&git, &c.commit, executable, self.build_inputs)
+            .unwrap_or_else(|e| {
+                crate::check_record::Checks::unanswered(format!(
+                    "the check records' judge did not answer: {e}"
+                ))
+            });
         let attestation =
             crate::durable::read_text(&self.repo.join("publish/.out/attestation.json")).ok();
         let attested = attestation
@@ -4165,7 +4197,7 @@ impl Backend for Real {
             attested,
             staged_by,
             built,
-            verified,
+            checks,
             fixtures,
         }
     }
@@ -4466,6 +4498,7 @@ impl Backend for Real {
         c: &Candidate,
         prover: &Prover,
         artifact: &Artifact,
+        run: &crate::check_record::VerifyRun,
     ) -> Result<Ran, Refusal> {
         let r = short(&c.commit).to_string();
         let fix = format!(
@@ -4480,54 +4513,138 @@ impl Backend for Real {
             .detail(off)
             .could_not_run());
         }
-        let inputs = (self.build_inputs)()
-            .map_err(|error| Refusal::new(error, "restore the release build inputs and retry"))?;
-        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
-        cmd.args(crate::release::VERIFY_ARGS)
-            .arg("--app")
-            .arg(&artifact.app);
-        let mut ran = self.logged_to(Step::Verify, &mut cmd, true);
-        if let Some(off) = self.off_tree(&c.commit) {
-            return Err(Refusal::new(
-                format!(
-                    "the clone moved during `verify release`, so its pass is not {r}'s — \
-                     nothing was recorded"
-                ),
-                fix,
+        let unsealed = |error: String| {
+            Refusal::new(
+                format!("{error} — nothing was recorded"),
+                "restore the release build inputs and retry",
             )
-            .detail(off)
-            .could_not_run());
+            .could_not_run()
+        };
+        let seal = (self.build_inputs)().map_err(unsealed)?;
+        let tree = self
+            .git_out(&["rev-parse", &format!("{}^{{tree}}", c.commit)])
+            .ok_or_else(|| {
+                Refusal::new(
+                    format!("git cannot name {r}'s tree — nothing ran"),
+                    fix.clone(),
+                )
+                .could_not_run()
+            })?;
+        let side = |what: &str| {
+            self.logs.join(format!(
+                "{:02}-{}.{what}",
+                Step::Verify.number(),
+                Step::Verify.name()
+            ))
+        };
+        let cannot = |path: &Path, e: std::io::Error| {
+            Refusal::new(
+                format!("write {}: {e} — nothing ran", path.display()),
+                format!("check {}, then {RELEASE_COMMAND}", self.logs.display()),
+            )
+            .could_not_run()
+        };
+        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        cmd.args(crate::release::VERIFY_ARGS);
+        if run.strict_subset() {
+            cmd.arg("--checks").arg(run.checks.join(","));
         }
-        if (self.build_inputs)()
-            .map_err(|error| Refusal::new(error, "restore the release build inputs and retry"))?
-            != inputs
-        {
-            return Err(Refusal::new(
-                "compiler or SDK bytes changed during release verification",
-                "restore the build inputs and rerun verification",
-            ));
+        if !run.passed_binaries.is_empty() {
+            let path = side("passed-binaries");
+            let text: String = run
+                .passed_binaries
+                .iter()
+                .map(|(spec, sha256)| format!("{sha256} {spec}\n"))
+                .collect();
+            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+                .map_err(|e| cannot(&path, e))?;
+            cmd.arg("--passed-binaries").arg(&path);
+        }
+        // The records are read from verify's own events file, which no child and no other writer
+        // shares, never from its output; it starts empty, so it holds this run's alone.
+        let events = side("events");
+        crate::durable::write_atomic_durable(&events, b"", 0o600)
+            .map_err(|e| cannot(&events, e))?;
+        cmd.arg("--events").arg(&events);
+        // `--app` goes with the check that reads it, and verify refuses it beside none.
+        if run.reads_the_bundle() {
+            cmd.arg("--app").arg(&artifact.app);
         }
         let log = self.step_log(Step::Verify);
-        crate::accepted_measure::record_attempt(
-            &log,
-            &inputs,
-            ran.code,
-            &c.commit,
-            &artifact.macho_sha256,
-        )
-        .map_err(|error| {
+        let root = self.release.join(crate::check_record::DIR);
+        let run_id = self
+            .logs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let facts = crate::check_record::RunFacts {
+            commit: &c.commit,
+            tree: &tree,
+            seal: &seal,
+            executable: &artifact.macho_sha256,
+            log: &log,
+            run: &run_id,
+            asked: &run.checks,
+        };
+        // From here until every FAIL it shows is kept, the run reads as a FAIL of R's tree.
+        crate::check_record::begin_run(&root, &facts).map_err(|e| {
             Refusal::new(
-                format!("record verification inputs: {error}"),
-                "restore the verification log and retry",
+                format!("cannot record that `verify release` begins: {e} — nothing ran"),
+                format!("fix what it names, then {RELEASE_COMMAND}"),
             )
+            .could_not_run()
         })?;
-        if ran.code != 0 {
-            return Ok(ran);
+        let mut ran = self.logged_to(Step::Verify, &mut cmd, true);
+        // Records are kept only for R's tree, clean throughout, under the seal the run began
+        // with: either moving makes the run COULD NOT RUN, and it keeps nothing.
+        let abandoned = |refusal: Refusal| match crate::check_record::abandon_run(&root, &facts) {
+            Ok(()) => refusal,
+            Err(e) => refusal.detail([format!("its begun record stays: {e}")]),
+        };
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(abandoned(
+                Refusal::new(
+                    format!(
+                        "the clone moved during `verify release`, so its records are not {r}'s — \
+                         nothing was recorded"
+                    ),
+                    fix,
+                )
+                .detail(off)
+                .could_not_run(),
+            ));
         }
-        if let Err(e) =
-            crate::gates::record_verified(&self.git(), &c.commit, &artifact.macho_sha256, &inputs)
-        {
-            ran.detail.push(format!("its record was not written: {e}"));
+        match (self.build_inputs)() {
+            Ok(now) if now == seal => {}
+            Ok(_) => {
+                return Err(abandoned(unsealed(
+                    "compiler or SDK bytes changed during release verification".into(),
+                )));
+            }
+            Err(e) => return Err(abandoned(unsealed(e))),
+        }
+        let log_sha256 = crate::artifact::file_sha256(&log).unwrap_or_else(|e| {
+            ran.detail.push(format!("its log could not be hashed: {e}"));
+            String::new()
+        });
+        let read = crate::check_record::events(&events)
+            .map_err(|e| format!("read {}: {e}", events.display()));
+        let written = crate::check_record::write_run(
+            &root,
+            &facts,
+            crate::check_record::RunEnd {
+                exit: ran.code,
+                log_sha256: &log_sha256,
+                events: read.as_ref().map_err(String::as_str),
+            },
+        );
+        match written {
+            Ok(lines) => ran
+                .detail
+                .extend(lines.into_iter().map(|line| format!("record: {line}"))),
+            Err(e) => ran
+                .detail
+                .push(format!("its records were not all written: {e}")),
         }
         Ok(ran)
     }
@@ -4820,7 +4937,8 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     crate::release::run_with(&mut real, &opts, &home).code
 }
 
-/// What `ship check` asks: of which commit, with which engine, and which of its three sections — `--cut`, `--export`, `--wasm32`; none named is all three.
+/// What `ship check` asks: the commit, engine, selected sections and optional stable compile.
+/// With no section named, it asks cut, export and wasm32; compat is explicit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckOptions {
     pub commit: Option<String>,
@@ -4828,13 +4946,17 @@ pub struct CheckOptions {
     pub cut: bool,
     pub export: bool,
     pub wasm32: bool,
+    /// The exact stable x86_64 compile check used before staging.
+    pub compat: bool,
+    /// With `--cut`, ask only commit gates; bundle provenance belongs to the cut.
+    pub source: bool,
 }
 
 impl CheckOptions {
     /// The sections asked: `(cut, export, wasm32)`.
     #[must_use]
     pub const fn sections(&self) -> (bool, bool, bool) {
-        if self.cut || self.export || self.wasm32 {
+        if self.cut || self.export || self.wasm32 || self.compat {
             (self.cut, self.export, self.wasm32)
         } else {
             (true, true, true)
@@ -4868,7 +4990,11 @@ fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
     let git = GitCli::new(repo);
     let (cut, export, wasm32) = opts.sections();
     let found = if cut {
-        crate::gates::precheck(&git, rev)
+        if opts.source {
+            crate::gates::precheck_source(&git, rev)
+        } else {
+            crate::gates::precheck(&git, rev)
+        }
     } else {
         Precheck::of(&git, rev)
     };
@@ -4883,6 +5009,19 @@ fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
         let _ = std::io::stdout().flush();
         found.gates.push(gate);
     };
+    if opts.compat {
+        std::fs::create_dir_all(repo.join("dist")).map_err(|e| e.to_string())?;
+        let outcome = match crate::buildplan::compat_available().map(|()| {
+            crate::buildplan::compat_check(repo, &found.commit, &repo.join("dist/watch-compat.log"))
+        }) {
+            Ok(Ok(why)) => Outcome::Pass(why),
+            Ok(Err(why)) => Outcome::Refuse(Refusal::new(why, "fix the stable compat slice")),
+            Err(why) => {
+                Outcome::CouldNotRun(Refusal::new(why, "provide the compat compiler and std"))
+            }
+        };
+        add(&mut found, "stable-x86_64", outcome);
+    }
     if !(export || wasm32) {
         return Ok(found);
     }
@@ -4939,8 +5078,10 @@ fn bump_nested_locks(
 /// it after a bump; `None` when no line moves. A registry package carries a
 /// `source` line and keeps its version, whatever it is.
 fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
-    let old = format!("version = \"{from}\"");
-    let mut lines: Vec<String> = lock.split_inclusive('\n').map(str::to_string).collect();
+    let mut lines: Vec<std::borrow::Cow<'_, str>> = lock
+        .split_inclusive('\n')
+        .map(std::borrow::Cow::Borrowed)
+        .collect();
     let mut moved = false;
     let mut version_line: Option<usize> = None;
     let mut sourced = false;
@@ -4949,11 +5090,15 @@ fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
         if i == lines.len() || line.starts_with('[') {
             if let (Some(at), false) = (version_line.take(), sourced) {
                 let ending = &lines[at][lines[at].trim_end().len()..];
-                lines[at] = format!("version = \"{to}\"{ending}");
+                lines[at] = std::borrow::Cow::Owned(format!("version = \"{to}\"{ending}"));
                 moved = true;
             }
             sourced = false;
-        } else if line == old {
+        } else if line
+            .strip_prefix("version = \"")
+            .and_then(|s| s.strip_suffix('"'))
+            == Some(from)
+        {
             version_line = Some(i);
         } else if line.starts_with("source = ") {
             sourced = true;
@@ -4973,6 +5118,32 @@ mod public_reads_http_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_direct_fixtures_runtime_manifest_survives_the_launcher_scrub() {
+        let mut cmd = aterm_uds::spawnfd::command("generator");
+        cmd.env("CARGO_MANIFEST_DIR", "/candidate/crates/aterm-gui");
+        super::scrub_fixture_command(&mut cmd);
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == "CARGO_MANIFEST_DIR")
+                .and_then(|(_, v)| v),
+            Some(std::ffi::OsStr::new("/candidate/crates/aterm-gui"))
+        );
+        // The inherited launcher value is still stripped; only an explicit artifact
+        // manifest can be restored by the fixture path.
+        let mut inherited = aterm_uds::spawnfd::command("generator");
+        super::scrub_names(
+            &mut inherited,
+            [std::ffi::OsString::from("CARGO_MANIFEST_DIR")],
+        );
+        assert_eq!(
+            inherited
+                .get_envs()
+                .find(|(k, _)| *k == "CARGO_MANIFEST_DIR")
+                .and_then(|(_, v)| v),
+            None
+        );
+    }
     use super::*;
 
     #[cfg(unix)]
@@ -6318,6 +6489,9 @@ mod tests {
         let gib = 1u64 << 30;
         let dir = aterm_tempfile::tempdir().unwrap();
         let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        // `Real::new` keeps its record under `$HOME`; once a real release on this Mac passed
+        // and kept one there, "a run that did not pass keeps nothing" below read that record.
+        real.state = dir.path().join("state");
         let marker = |cmd: &Command| {
             cmd.get_envs()
                 .find(|(k, _)| *k == std::ffi::OsStr::new(aterm_capacity::DISK_COVER_ENV))

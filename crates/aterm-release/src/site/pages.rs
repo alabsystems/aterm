@@ -551,10 +551,9 @@ mod tests {
     use crate::site::releases::{LinuxDownload, LinuxKind, MacDownload};
     use crate::site::toolchain::Coverage;
     use std::collections::BTreeMap;
-    use std::path::Path;
 
     fn page(name: &str) -> String {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site/public");
+        let dir = aterm_tempfile::manifest_dir().join("tests/fixtures/site/public");
         std::fs::read_to_string(dir.join(name)).unwrap()
     }
 

@@ -416,8 +416,10 @@ pub enum Act {
     Give,
     /// Its consumer's check passes after the delivery.
     Apply,
-    /// The requester withdraws it, or its consumer's check passes without a delivery.
+    /// Its consumer's check passes without a delivery.
     Unneeded,
+    /// A person withdraws it by hand on this Mac (`aterm secrets need retire`), with their note.
+    Withdraw(String),
     /// The person declines to give it.
     Decline(String),
     /// Its consumer needs it again after `not-needed`.
@@ -614,6 +616,15 @@ fn changed(retirement: &Retirement, facts: &Facts) -> bool {
         | Reason::RequesterGone
         | Reason::Superseded => false,
     }
+}
+
+/// A person's note as a `Retired` record carries it (§5): at most 160 characters, each control
+/// character read as a space, since the table refuses a record that holds one.
+fn note_of(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(160)
+        .collect()
 }
 
 fn retire_with(need: &Need, retirement: Retirement, line: String, now: u64) -> Need {
@@ -901,7 +912,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
             updated: now,
             ..need.clone()
         }),
-        Act::Unneeded => {
+        Act::Unneeded | Act::Withdraw(_) => {
             let waiting = matches!(
                 need.state,
                 State::Local
@@ -910,27 +921,52 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     | State::Published
                     | State::AwaitingPerson
             );
-            (waiting && need.needed).then(|| Need {
-                needed: false,
-                ..retire_with(
-                    need,
-                    Retirement {
-                        reason: Reason::NotNeeded,
-                        evidence: "the requester's own check".to_owned(),
-                        note: String::new(),
-                        generation: None,
-                    },
-                    format!(
-                        "not needed: {}'s check no longer lacks {}",
-                        need.purpose.id(),
-                        need.want.title()
-                    ),
-                    now,
-                )
+            (waiting && need.needed).then(|| {
+                // A withdrawal rests on a person's word, not a check: the want may still be
+                // absent, so its evidence and line say who withdrew it and where.
+                let (evidence, note, line) = if let Act::Withdraw(note) = act {
+                    let host = facts.sight.as_ref().map(|sight| sight.host.as_str());
+                    (
+                        format!(
+                            "withdrawn by hand on {}",
+                            host.unwrap_or("the requesting Mac")
+                        ),
+                        note_of(note),
+                        format!(
+                            "not needed: withdrawn by hand on this Mac{}; raising {} again asks again",
+                            host.map_or_else(String::new, |host| format!(" ({host})")),
+                            need.want.title()
+                        ),
+                    )
+                } else {
+                    (
+                        "the requester's own check".to_owned(),
+                        String::new(),
+                        format!(
+                            "not needed: {}'s check no longer lacks {}",
+                            need.purpose.id(),
+                            need.want.title()
+                        ),
+                    )
+                };
+                Need {
+                    needed: false,
+                    ..retire_with(
+                        need,
+                        Retirement {
+                            reason: Reason::NotNeeded,
+                            evidence,
+                            note,
+                            generation: None,
+                        },
+                        line,
+                        now,
+                    )
+                }
             })
         }
         Act::Decline(note) => (need.state == State::AwaitingPerson).then(|| {
-            let note: String = note.chars().take(160).collect();
+            let note = note_of(note);
             retire_with(
                 need,
                 Retirement {

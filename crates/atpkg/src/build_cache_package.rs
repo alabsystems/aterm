@@ -1242,7 +1242,12 @@ fn compatible_on(home: &Path, driver: &Path, registrar: Option<&Path>, in_proces
         .any(|magic| head.starts_with(*magic));
     let supported = if raw {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let discovered = crate::toolchain::Toolchain::discover(None, home, &path, Some("trust"));
+        // The driver a locked tree's hop runs is the build its trust.lock names.
+        let lock = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::trust_lock::find(&cwd));
+        let discovered =
+            crate::toolchain::Toolchain::discover(None, home, &path, Some("trust"), lock.as_ref());
         let Some(registrar) = registrar.filter(|path| path.is_absolute()) else {
             return false;
         };

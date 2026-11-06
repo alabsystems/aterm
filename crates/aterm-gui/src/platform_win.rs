@@ -1503,7 +1503,8 @@ mod tests {
 
     #[test]
     fn the_windows_installer_asks_for_a_session_save_before_it_force_kills() {
-        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let package = aterm_tempfile::manifest_dir();
+        let scripts = package
             .parent()
             .and_then(|p| p.parent())
             .expect("the aterm-gui manifest dir has a workspace-root grandparent")

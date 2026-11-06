@@ -37,7 +37,6 @@ pub mod network_state;
 pub mod private_edit;
 #[cfg(not(target_family = "wasm"))]
 pub mod reach;
-pub mod version;
 
 mod cursor;
 

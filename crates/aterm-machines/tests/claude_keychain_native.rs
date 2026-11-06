@@ -82,7 +82,8 @@ fn security_created_item_does_not_grant_the_no_ui_child_access() {
         "private creation changed search preferences"
     );
 
-    let program = Path::new(env!("CARGO_BIN_EXE_aterm-machines-dev"));
+    let program = aterm_tempfile::bin_exe("aterm-machines-dev");
+    let program = program.as_path();
     assert!(read(program, &stage).unwrap().is_none());
     let (service, account) = test_vendor_scope(&stage).unwrap();
     let inserted = security(&[
@@ -143,7 +144,8 @@ fn precreated_access_survives_the_native_update_command() {
     let stage = logins.join("synthetic+1");
     aterm_uds::private_file::create_private_dir(&stage).unwrap();
     let keychain = create_keychain(&stage);
-    let program = Path::new(env!("CARGO_BIN_EXE_aterm-machines-dev"));
+    let program = aterm_tempfile::bin_exe("aterm-machines-dev");
+    let program = program.as_path();
     let metadata =
         || std::fs::symlink_metadata(&keychain.0).map(|m| (m.dev(), m.ino(), m.mode(), m.nlink()));
     let before_seed = metadata();
@@ -217,7 +219,8 @@ fn stage_preparer_resumes_only_its_owned_item_without_replacing_credentials() {
     let stage = logins.join("owned+1");
     aterm_uds::private_file::create_private_dir(&stage).unwrap();
     let keychain = create_keychain(&stage);
-    let program = Path::new(env!("CARGO_BIN_EXE_aterm-machines-dev"));
+    let program = aterm_tempfile::bin_exe("aterm-machines-dev");
+    let program = program.as_path();
     let prepare = |stage: &Path| {
         test_prepare_private_keychain(program, stage, Instant::now() + Duration::from_secs(60))
     };
@@ -302,7 +305,8 @@ fn stage_preparer_leaves_an_unowned_native_item_unchanged() {
     let stage = logins.join("foreign+1");
     aterm_uds::private_file::create_private_dir(&stage).unwrap();
     let keychain = create_keychain(&stage);
-    let program = Path::new(env!("CARGO_BIN_EXE_aterm-machines-dev"));
+    let program = aterm_tempfile::bin_exe("aterm-machines-dev");
+    let program = program.as_path();
     let (service, account) = test_vendor_scope(&stage).unwrap();
     let inserted = security(&[
         "add-generic-password".as_ref(),

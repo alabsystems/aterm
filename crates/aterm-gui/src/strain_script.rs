@@ -148,7 +148,12 @@ fn set_soak(row: &mut ResourceView, soak: f32) {
     }
     let n = cells.len();
     for (i, cell) in cells.iter_mut().enumerate() {
-        cell.over = i + over >= n;
+        if i + over >= n {
+            cell.n = cell.n.max(1.0);
+            cell.over_n = cell.n;
+        } else {
+            cell.over_n = 0.0;
+        }
     }
     row.ring = cells.into();
 }

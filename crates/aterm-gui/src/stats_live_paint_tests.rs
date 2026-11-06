@@ -88,7 +88,8 @@ fn px(v: f64, s: f64) -> f32 {
     (v * s + 0.5).floor() as f32
 }
 
-/// The `(x, w)` spans of the filled multi-scale cells of `d`'s first row, sorted left to right.
+/// The `(x, w)` spans of the read multi-scale boxes of `d`'s first row, their plates in
+/// `track` ([`crate::stats_skyline::skyline_box`]), sorted left to right.
 fn row_cells_xw(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<(f32, f32)> {
     let strip = &d.strip;
     let (x0, x1, top, cell_h) = (
@@ -98,14 +99,17 @@ fn row_cells_xw(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<(f32, f32)> {
         px(d.cell, s),
     );
     let pitch = px(strip.pitch, s);
+    let plate = rgba(super::tests::dark_inks().track, 0xFF);
     let mut xs: Vec<(f32, f32)> = prims
         .iter()
         .filter_map(|p| match *p {
-            DrawPrim::Panel { x, y, w, h, .. }
-                if (y - top).abs() < 0.01
-                    && (h - cell_h).abs() < 0.01
-                    && x + w > x0 - pitch - 0.01
-                    && x < x1 + pitch + 0.01 =>
+            DrawPrim::Panel {
+                x, y, w, h, fill, ..
+            } if fill == plate
+                && (y - top).abs() < 0.01
+                && (h - cell_h).abs() < 0.01
+                && x + w > x0 - pitch - 0.01
+                && x < x1 + pitch + 0.01 =>
             {
                 Some((x, w))
             }
@@ -116,7 +120,36 @@ fn row_cells_xw(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<(f32, f32)> {
     xs
 }
 
-/// The left edges of the filled cells of `d`'s first row, sorted.
+/// The ink of the heat column of the box `(x, w)` on a row from `top`, `cell_h` tall, device px:
+/// the panel standing on the box's foot that is not its plate, `plate`
+/// ([`crate::stats_skyline::skyline_box`]).
+fn column_ink(
+    prims: &[DrawPrim],
+    (x, w): (f32, f32),
+    (top, cell_h): (f32, f32),
+    plate: [u8; 4],
+) -> Option<[u8; 4]> {
+    prims.iter().find_map(|p| match *p {
+        DrawPrim::Panel {
+            x: px0,
+            y,
+            w: pw,
+            h,
+            fill,
+            ..
+        } if fill != plate
+            && (px0 - x).abs() < 0.01
+            && (pw - w).abs() < 0.01
+            && y >= top - 0.01
+            && (y + h - (top + cell_h)).abs() < 0.01 =>
+        {
+            Some(fill)
+        }
+        _ => None,
+    })
+}
+
+/// The left edges of the read boxes of `d`'s first row, sorted.
 fn row_cells(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<f32> {
     row_cells_xw(prims, d, s)
         .into_iter()
@@ -139,14 +172,20 @@ fn row_hollow(prims: &[DrawPrim], d: &Drawn, s: f64) -> Vec<f32> {
         .iter()
         .filter_map(|p| match *p {
             DrawPrim::Stroke {
-                x, y, w, h, color, ..
-            } if color == hollow
-                && (y - 0.5 - top).abs() < 0.01
-                && (h - (cell_h - 1.0)).abs() < 0.01
-                && x + w > x0 - pitch - 0.01
-                && x < x1 + pitch + 0.01 =>
-            {
-                Some(x - 0.5)
+                x,
+                y,
+                w,
+                h,
+                radius,
+                width,
+                color,
+            } if color == hollow => {
+                let (x, y, w, h) = crate::tray_raster::stroke_px((x, y, w, h), radius, width);
+                ((y - top).abs() < 0.01
+                    && (h - cell_h).abs() < 0.01
+                    && x + w > x0 - pitch - 0.01
+                    && x < x1 + pitch + 0.01)
+                    .then_some(x)
             }
             DrawPrim::Panel {
                 x, y, w, h, fill, ..
@@ -628,26 +667,8 @@ fn the_box_entering_the_band_shows_its_own_oldest_data() {
         phase.map_or(DeckLive::STILL, |p| flowing(f64::from(p))),
     );
     let (top, cell_h) = (px(d.top, s), px(d.cell, s));
-    let fill_at = |x: f32, w: f32| {
-        prims.iter().find_map(|p| match *p {
-            DrawPrim::Panel {
-                x: px0,
-                y,
-                w: pw,
-                h,
-                fill,
-                ..
-            } if (px0 - x).abs() < 0.01
-                && (pw - w).abs() < 0.01
-                && (y - top).abs() < 0.01
-                && (h - cell_h).abs() < 0.01 =>
-            {
-                Some(fill)
-            }
-            _ => None,
-        })
-    };
     let inks = super::tests::dark_inks();
+    let fill_at = |x: f32, w: f32| column_ink(&prims, (x, w), (top, cell_h), ink(inks.track, 0xFF));
     let cold = ink(inks.heat[usize::from(ink::heat_step(0.0))], 0xFF);
     let &(_, ox, ow, _) = rects
         .iter()
@@ -677,28 +698,15 @@ fn a_folded_strip_draws_each_seconds_reading() {
     let (form, w) = (DeckForm::Folded, 550.0);
     let d = strips(form, w)[0];
     let at = OPEN + 300;
+    let plate = ink(super::tests::dark_inks().track, 0xFF);
     let hist_cells_of = |snap: &Snapshot, s: f64| -> Vec<[u8; 4]> {
         let prims = paint(snap, form, w, s, DeckLive::STILL);
         let rects = multi_scale_slot_rects(&d.strip, s, 0.0);
-        let top = px(d.top, s);
-        let cell_h = px(d.cell, s);
+        let row = (px(d.top, s), px(d.cell, s));
         rects
             .into_iter()
             .filter(|r| !r.3)
-            .filter_map(|(_, rx, rw, _)| {
-                prims.iter().find_map(|p| match *p {
-                    DrawPrim::Panel {
-                        x, y, w, h, fill, ..
-                    } if (x - rx).abs() < 0.01
-                        && (w - rw).abs() < 0.01
-                        && (y - top).abs() < 0.01
-                        && (h - cell_h).abs() < 0.01 =>
-                    {
-                        Some(fill)
-                    }
-                    _ => None,
-                })
-            })
+            .filter_map(|(_, rx, rw, _)| column_ink(&prims, (rx, rw), row, plate))
             .collect()
     };
     let painted = |hot_last: bool, s: f64| -> Vec<[u8; 4]> {
@@ -1869,7 +1877,8 @@ fn deck_live_gallery() {
                 aterm_vitals::Cell {
                     mean: Some(v),
                     max: Some(v),
-                    over: ri == 0 && i >= 352,
+                    n: 10.0,
+                    over_n: if ri == 0 && i >= 352 { 10.0 } else { 0.0 },
                 }
             })
             .collect::<Vec<_>>()
@@ -2044,21 +2053,13 @@ fn the_live_now_box_steps_through_the_heat_ramp_with_no_halo_and_patches_byte_fo
             let (prims_dwc, _, _) = paint_blend(DeckLive::STILL, true);
 
             let live_fill = |prims: &[DrawPrim]| -> [u8; 4] {
-                prims
-                    .iter()
-                    .find_map(|p| match *p {
-                        DrawPrim::Panel {
-                            x, y, w, h, fill, ..
-                        } if (x - live_x).abs() < 0.01
-                            && (w - live_w).abs() < 0.01
-                            && y >= top - 0.01
-                            && (y + h - (top + cell_h)).abs() < 0.01 =>
-                        {
-                            Some(fill)
-                        }
-                        _ => None,
-                    })
-                    .expect("live now panel")
+                column_ink(
+                    prims,
+                    (live_x, live_w),
+                    (top, cell_h),
+                    rgba(inks.track, 0xFF),
+                )
+                .expect("live now column")
             };
             let glow_strokes = |prims: &[DrawPrim]| -> usize {
                 prims
@@ -2253,8 +2254,9 @@ fn the_now_box_draws_the_strip_cells_ink_at_every_load_on_every_theme() {
         let d = strips(form, w)[0];
         let rects = multi_scale_slot_rects(&d.strip, s, 0.0);
         let (top, cell_h) = (px(d.top, s), px(d.cell, s));
+        // A box's column: the last fill on its foot across its width, drawn over its plate.
         let fill_at = |prims: &[DrawPrim], (bx, bw): (f32, f32)| {
-            prims.iter().find_map(|p| match *p {
+            prims.iter().rev().find_map(|p| match *p {
                 DrawPrim::Panel {
                     x, y, w, h, fill, ..
                 } if (x - bx).abs() < 0.01

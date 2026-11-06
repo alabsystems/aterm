@@ -448,7 +448,7 @@ pub fn install(
         schema: crate::SCHEMA,
         admin: args.admin.clone(),
         payload_sha256: args.payload_sha.clone(),
-        agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        agent_version: aterm_stamp::app_version().to_owned(),
         executable: Path::new("agent").join(&rel).to_string_lossy().into_owned(),
         installed: sys.now(),
         upgraded: 0,
@@ -487,7 +487,7 @@ pub fn install(
     let _ = writeln!(
         out,
         "installed aterm's helper {}",
-        env!("CARGO_PKG_VERSION")
+        aterm_stamp::app_version()
     );
     Ok(())
 }

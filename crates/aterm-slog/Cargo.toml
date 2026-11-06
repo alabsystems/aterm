@@ -7,7 +7,7 @@ name = "aterm-slog"
 # of the one `slog_suite` binary. With autotests off a `tests/*.rs` file listed
 # nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -41,6 +41,9 @@ aterm-models-session = { workspace = true }
 # The vocabularies the box and wall words mirror (`PromptKind::name`,
 # `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
 aterm-phase = { workspace = true }
+# The `.seq` replay corpus is found from the package directory when the tests run
+# (`aterm_tempfile::manifest_dir`).
+aterm-tempfile = { workspace = true }
 
 [[test]]
 name = "slog_suite"

@@ -141,6 +141,22 @@ pub(crate) const ARGS: [&str; 3] = ["init", "--only", "base.clt"];
 /// The tab's fixed title, which the page names ([`crate::system_state::TOOLS_PASSWORD_HEADLINE`]).
 pub(crate) const TAB_TITLE: &str = "Mac Setup";
 
+/// What holds the automatic tab while another macOS dialog this process started is up
+/// ([`App::developer_tools_install_held`]): that dialog's end wakes the window
+/// ([`App::wake_when_no_access_dialog`]).
+const DIALOG_UP: &str = "a macOS dialog this process started is up";
+
+/// What holds the automatic tab while a network watch just started has not read Low Data Mode
+/// ([`App::developer_tools_wait_network`]).
+const FIRST_NETWORK_READING: &str = "the network watch's first reading";
+
+/// What holds the automatic tab while nobody wants it: a launch on a Mac with the tools wants it
+/// once the elevation's reading says a root step is owed ([`App::root_steps_owed`]).
+const NO_WANT: &str = "no want";
+
+/// What holds the automatic tab while the tools are there and no root step reads owed.
+const NOTHING_OWED: &str = "nothing owed";
+
 /// How long the page keeps the GitHub repositories row calm after the tools were found installed
 /// (the tab's program said so, or the watch found them), while the row's next reading has not
 /// landed ([`Settling`]): a reading that says the same as before past it is the truth again.
@@ -167,7 +183,11 @@ const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]) keeps it, as a closed tab does,
 /// and so does Apple's installer window closed without installing them
 /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]: Not Now, Cancel, or Done
-/// on Apple's own failure): each is a person's press.
+/// on Apple's own failure): each is a person's press. A tab gone with no window to read how it
+/// ended (its window went before the PTY keeper held it, or it ended while no window was up) is
+/// read by the next launch of its build from the tab's receipt, as an opening that installed
+/// nothing: that launch takes back the line the tab's own claim added ([`Mark::launched`]), since
+/// nothing can tell whether a person pressed anything in it.
 #[derive(Debug, Default)]
 pub(crate) struct Mark {
     path: Option<std::path::PathBuf>,
@@ -186,7 +206,8 @@ fn never_ran(code: i32) -> bool {
 
 impl Mark {
     /// This account's record, read once at launch for this build
-    /// ([`aterm_types::version::build_id`]). A record that cannot be read counts as naming it:
+    /// ([`aterm_stamp::build_id`]), once each tab gone with its end unread gave back what
+    /// its claim added ([`Self::launched`]). A record that cannot be read counts as naming it:
     /// aterm asks no one twice for want of a reading. Tests read none.
     pub(crate) fn for_launch() -> Self {
         #[cfg(test)]
@@ -195,9 +216,49 @@ impl Mark {
         }
         #[cfg(not(test))]
         {
-            let path = aterm_types::clt_mark::path();
-            let opened = path.as_deref().is_some_and(Self::names_this_build);
-            Self { path, opened }
+            aterm_types::clt_mark::path()
+                .map_or_else(Self::default, |path| Self::launched(path, receipt::alive))
+        }
+    }
+
+    /// The record at `path` as a launch of this build reads it, once each receipt beside it whose
+    /// tab is gone with its end unread ([`receipt::Receipt::orphans`], `alive` saying whether a
+    /// process runs) gave back what that tab's own claim added on this build: the line goes
+    /// ([`aterm_types::clt_mark::forget`]), and the receipt with it, so this launch opens the tab
+    /// by itself again where setup still owes this Mac its step. Such a tab's window went before
+    /// the PTY keeper held it (a crash in a new Mac's first seconds, before the keeper answers),
+    /// or it ended while no window was up. A receipt whose claim added another build's line is
+    /// that build's to read; one whose claim added none goes, taking back nothing. A line that
+    /// cannot be taken back keeps its receipt for a later launch, and says why in the log.
+    #[cfg(any(not(test), unix))]
+    fn launched(path: std::path::PathBuf, alive: impl Fn(i32, u64) -> bool) -> Self {
+        let build = aterm_stamp::build_id();
+        for orphan in receipt::Receipt::orphans(&path, alive) {
+            match orphan.claimed() {
+                Some(claimed) if claimed != build => continue,
+                Some(_) => {
+                    if let Err(error) =
+                        aterm_types::clt_mark::forget(&aterm_types::clt_mark::Live, &path, &build)
+                    {
+                        aterm_log::warn!(
+                            "System State: the Mac Setup tab's mark was not taken back for a tab \
+                             gone with its end unread: {error}"
+                        );
+                        continue;
+                    }
+                    aterm_log::info!(
+                        "System State: a Mac Setup tab an earlier launch of this build opened is \
+                         gone with its end unread: its ask is taken back"
+                    );
+                }
+                None => {}
+            }
+            orphan.remove_if_matching();
+        }
+        let opened = Self::names_this_build(&path);
+        Self {
+            path: Some(path),
+            opened,
         }
     }
 
@@ -221,7 +282,7 @@ impl Mark {
         aterm_types::clt_mark::opened_on_build(
             &aterm_types::clt_mark::Live,
             path,
-            &aterm_types::version::build_id(),
+            &aterm_stamp::build_id(),
         )
     }
 
@@ -255,7 +316,7 @@ impl Mark {
         match aterm_types::clt_mark::claim(
             &aterm_types::clt_mark::Live,
             path,
-            &aterm_types::version::build_id(),
+            &aterm_stamp::build_id(),
         ) {
             Ok(added) => added,
             Err(error) => {
@@ -277,7 +338,7 @@ impl Mark {
             && let Err(error) = aterm_types::clt_mark::forget(
                 &aterm_types::clt_mark::Live,
                 path,
-                &aterm_types::version::build_id(),
+                &aterm_stamp::build_id(),
             )
         {
             aterm_log::warn!("System State: the Mac Setup tab's mark was not removed: {error}");
@@ -630,8 +691,8 @@ pub(crate) fn root_steps_owed_by(
 
 /// Read, on a thread of its own, whether setup's one early elevation owes this Mac anything
 /// beside the tools ([`root_steps_owed_by`]), and wake the window with it
-/// ([`App::root_steps_owed`]).
-pub(crate) fn read_root_steps() {
+/// ([`App::root_steps_owed`]). `false` when the thread could not start: no answer comes.
+pub(crate) fn read_root_steps() -> bool {
     let read = std::thread::Builder::new()
         .name("aterm-root-steps".to_owned())
         .spawn(|| {
@@ -666,8 +727,12 @@ pub(crate) fn read_root_steps() {
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
         });
-    if let Err(error) = read {
-        aterm_log::warn!("System State: the elevation's steps were not read: {error}");
+    match read {
+        Ok(_) => true,
+        Err(error) => {
+            aterm_log::warn!("System State: the elevation's steps were not read: {error}");
+            false
+        }
     }
 }
 
@@ -776,7 +841,7 @@ impl App {
         let Some(child) = self.pool.get(session) else {
             return;
         };
-        let build = aterm_types::version::build_id();
+        let build = aterm_stamp::build_id();
         let recovery = self
             .workstation_setup
             .developer_tools_mark
@@ -902,7 +967,7 @@ impl App {
             return;
         };
         let finished = child_ended(child);
-        let build = aterm_types::version::build_id();
+        let build = aterm_stamp::build_id();
         let own_line = receipt.claimed() == Some(build.as_str());
         let mut spent_mark = false;
         if !finished {
@@ -1196,6 +1261,7 @@ impl App {
                 return true;
             }
             self.workstation_setup.developer_tools = Install::PressedQueued { wanted: None };
+            self.wake_when_no_access_dialog();
             aterm_log::info!(
                 "System State: the Mac Setup tab Install… asked for waits for the dialog slot"
             );
@@ -1617,6 +1683,7 @@ impl App {
     pub(crate) fn root_steps_owed(&mut self, owed: bool) {
         let setup = &mut self.workstation_setup;
         setup.developer_tools_root_owed = owed;
+        setup.root_steps_awaited = false;
         if owed {
             if setup.developer_tools == Install::Unasked {
                 setup.developer_tools = Install::Wanted(LAUNCH_WANT);
@@ -1779,9 +1846,42 @@ impl App {
     }
 
     /// What holds the automatic tab ([`Self::developer_tools_install_due`]), in the order the
-    /// gates are read: `None` when it is due. The window logs each new answer while a want stands
-    /// ([`Self::begin_developer_tools_install`]), so a tab that never opens says why.
+    /// gates are read: `None` when it is due ([`DIALOG_UP`] while another macOS dialog of this
+    /// process is up, whose end wakes the window, [`Self::begin_developer_tools_install`]). The
+    /// window logs each new answer while a want stands ([`Self::begin_developer_tools_install`]),
+    /// so a tab that never opens says why.
     fn developer_tools_install_held(&self, dialog_up: bool) -> Option<&'static str> {
+        self.developer_tools_install_gate(dialog_up, true)
+    }
+
+    /// Whether the automatic Mac Setup tab is, or may yet be, this window's next macOS ask: its
+    /// shell is booked ([`Install::Opening`] for a want), or nothing holds it but what passes by
+    /// itself ([`Self::developer_tools_install_held`]): a key typed in the last 2.5 s, another
+    /// macOS dialog of this process, the network watch's first reading, or, while the launch's
+    /// reading of the elevation's other steps is out
+    /// ([`crate::workstation_setup::Host::root_steps_awaited`]), no want yet or nothing yet owed.
+    /// A walk that would start by itself yields to it (`App::look_for_walk_start`), and so do
+    /// System State's access steps and a control verb's page (`App::no_gesture_up`): a helper
+    /// panel, alert or page nobody answers would hold setup's one password for as long as it
+    /// stands. Reads memory alone. Only a window that opens tabs ever wants the tab (the
+    /// launch's want comes from its reading of this Mac), so a headless one never yields.
+    pub(crate) fn mac_setup_tab_comes_next(&self) -> bool {
+        if matches!(
+            self.workstation_setup.developer_tools,
+            Install::Opening { wanted: Some(_) }
+        ) {
+            return true;
+        }
+        match self.developer_tools_install_gate(false, false) {
+            None | Some(FIRST_NETWORK_READING) => true,
+            Some(NO_WANT | NOTHING_OWED) => self.workstation_setup.root_steps_awaited,
+            Some(_) => false,
+        }
+    }
+
+    /// [`Self::developer_tools_install_held`]'s gates in order, reading the keyboard's rest only
+    /// when `keys` says so.
+    fn developer_tools_install_gate(&self, dialog_up: bool, keys: bool) -> Option<&'static str> {
         let setup = &self.workstation_setup;
         if setup.developer_tools_scratch_world {
             Some("a scratch world (a check's bundle asks for no password)")
@@ -1790,19 +1890,25 @@ impl App {
         } else if setup.developer_tools_not_admin {
             Some("this account is no administrator")
         } else if self.developer_tools_wait_network() {
-            Some("Low Data Mode, or the network watch's first reading")
-        } else if !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now()) {
+            Some(if setup.developer_tools_low_data == Some(true) {
+                "Low Data Mode"
+            } else {
+                FIRST_NETWORK_READING
+            })
+        } else if keys
+            && !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
+        {
             Some("a key typed in the last 2.5 s")
         } else if !matches!(setup.developer_tools, Install::Wanted(_)) {
-            Some("no want")
+            Some(NO_WANT)
         } else if !matches!(setup.developer_tools, Install::Wanted(revision)
             if self.developer_tools_install_authorized(revision))
         {
             Some("no admitted run, or setup held")
         } else if !setup.developer_tools.due(dialog_up) {
-            Some("a macOS dialog this process started is up")
+            Some(DIALOG_UP)
         } else if !self.elevation_owed() {
-            Some("nothing owed")
+            Some(NOTHING_OWED)
         } else if self.developer_tools_tab_adopted() {
             Some("an earlier aterm's tab runs on")
         } else if self.developer_tools_installing_known() {
@@ -1882,6 +1988,10 @@ impl App {
         }
         let kept = wanted.filter(|_| missing);
         self.workstation_setup.developer_tools = kept.map_or(Install::Unasked, Install::Wanted);
+        if kept.is_some() && self.access_dialog_up() {
+            // Deferred behind another macOS dialog: its end wakes the window to look again.
+            self.wake_when_no_access_dialog();
+        }
         aterm_log::info!(
             "System State: Command Line Tools install {}",
             if kept.is_some() {
@@ -1980,9 +2090,14 @@ impl App {
                 return None;
             }
             // A queued press is no longer this moment's, and its tab takes the window's keys:
-            // it also waits for 2.5 s of quiet keyboard, as the automatic tab does.
+            // it also waits for 2.5 s of quiet keyboard, as the automatic tab does. One behind
+            // another macOS dialog is woken at that dialog's end.
+            let dialog_up = self.access_dialog_up();
+            if dialog_up {
+                self.wake_when_no_access_dialog();
+            }
             if self.developer_tools_install_active()
-                || self.access_dialog_up()
+                || dialog_up
                 || self.developer_tools_installing_known()
                 || !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             {
@@ -2000,6 +2115,11 @@ impl App {
             return Some((window, ask, then));
         }
         let held = self.developer_tools_install_held(self.access_dialog_up());
+        if held == Some(DIALOG_UP) {
+            // The dialog's end publishes nothing the window reads, and the setup run may be
+            // parked on this tab, so no status read comes either: be woken then.
+            self.wake_when_no_access_dialog();
+        }
         if matches!(self.workstation_setup.developer_tools, Install::Wanted(_))
             && self.workstation_setup.developer_tools_held_said.get() != held
         {

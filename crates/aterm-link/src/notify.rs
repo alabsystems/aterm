@@ -1008,16 +1008,12 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Replace `path` with `bytes`, owner-only, whole by a rename and flushed by nothing: the dev
+/// seams' files, among which no power loss falls. The bench reads the exec stamps and the flush
+/// tally (which a flush would add to) while this notifier runs; `fault-fired` is read after
+/// [`Fault::fire`] has killed it, by a later notifier's [`Fault::from_env`] and by the test.
 fn write_unflushed_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let (tmp, mut f) = crate::enable::create_temp_beside(path, 0o600)?;
-    let res = f.write_all(bytes).and_then(|()| {
-        drop(f);
-        std::fs::rename(&tmp, path)
-    });
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    res
+    aterm_uds::atomic_file::write_flushed(path, bytes, 0o600, None)
 }
 
 /// Everything the verb was told.

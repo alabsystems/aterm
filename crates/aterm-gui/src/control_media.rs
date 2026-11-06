@@ -2395,6 +2395,9 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
             crate::menu::MenuAction::ChangeNickname => {
                 "the machine menu \u{25b8} Change Nickname\u{2026}; from a shell, `aterm name nick`"
             }
+            crate::menu::MenuAction::RenameMachine => {
+                "the machine menu \u{25b8} Rename This Mac\u{2026}; from a shell, `aterm name set`"
+            }
             _ => "Agents \u{25b8} Take Over This Tab / Hand Back This Tab",
         };
         format!("ERR denied: {name} is the person's own act at the window ({at})\n")
@@ -2900,12 +2903,14 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 }
 
 /// `spawn`'s usage reply, naming the worker words a spawn starts
-/// ([`aterm_agent::harness::worker::started_words`]).
+/// ([`aterm_agent::harness::worker::started_words`]) and a program worker's form
+/// ([`crate::program_worker`]).
 pub(crate) fn spawn_usage() -> String {
     format!(
         "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
          [connected=controlled|controller place=window|tab of=<sid> | agent=<{}> [model=<m>] \
-         [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n",
+         [autopilot=<land|cruise>] [from=<sid>] len=<n> | program=<pct> [arg=<pct>]... \
+         [from=<sid>] len=<n>]\n",
         aterm_agent::harness::worker::started_words()
     )
 }
@@ -2924,7 +2929,8 @@ pub(crate) fn spawn_refusal(refused: Option<&str>) -> String {
     }
 }
 
-/// Parsed `agent=<word>` worker specification for `spawn`.
+/// Parsed worker specification for `spawn`: an agent's (`agent=<word>`) or a program's
+/// (`program=<p> [arg=<a>]…`, [`crate::program_worker`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentSpec {
     Worker {
@@ -2933,6 +2939,32 @@ pub(crate) enum AgentSpec {
         autopilot: Option<aterm_agent::supervise::Autopilot>,
         from: Option<aterm_session::SessionId>,
     },
+    Program {
+        run: crate::program_worker::ProgramRun,
+        from: Option<aterm_session::SessionId>,
+    },
+}
+
+impl AgentSpec {
+    /// The word a `kind=spawn` telemetry row names the worker by: its agent's, or `program`.
+    const fn word(&self) -> &'static str {
+        match self {
+            Self::Worker { agent, .. } => agent.name(),
+            Self::Program { .. } => "program",
+        }
+    }
+}
+
+/// A `program=` or `arg=` value as the wire spells it, percent-decoded: `None` for one holding a
+/// control character or a NUL, which no line types. A `program=` is also refused empty, as an
+/// option (`-…`) and starting `~`, which a quoted line never expands.
+fn program_word(value: &str, program: bool) -> Option<String> {
+    let decoded = aterm_codec::pct::decode(value);
+    let typed = !decoded
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'));
+    let named = !program || !(decoded.is_empty() || decoded.starts_with(['-', '~']));
+    (typed && named).then_some(decoded)
 }
 
 fn agent_spec(word: &str) -> Option<AgentSpec> {
@@ -2986,6 +3018,7 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
     let (mut window, mut raise, mut theme) = (None, None, None);
     let (mut agent, mut model, mut from, mut framed) = (None, None, None, false);
     let mut autopilot = None;
+    let (mut program, mut args) = (None, Vec::new());
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(None);
     };
@@ -3036,7 +3069,17 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             }
             origin = Some(aterm_session::SessionId::new(v));
         } else if let Some(v) = tok.strip_prefix("agent=") {
+            if program.is_some() {
+                return Err(refused());
+            }
             agent = Some(agent_spec(v).ok_or_else(refused)?);
+        } else if let Some(v) = tok.strip_prefix("program=") {
+            if agent.is_some() || program.is_some() {
+                return Err(refused());
+            }
+            program = Some(program_word(v, true).ok_or_else(refused)?);
+        } else if let Some(v) = tok.strip_prefix("arg=") {
+            args.push(program_word(v, false).ok_or_else(refused)?);
         } else if let Some(v) = tok.strip_prefix("model=") {
             if !valid_model(v) {
                 return Err(refused());
@@ -3063,17 +3106,32 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             return Err(refused());
         }
     }
-    let agent = match agent {
-        Some(AgentSpec::Worker { agent, .. }) => Some(AgentSpec::Worker {
-            agent,
-            model,
-            autopilot,
-            from,
-        }),
-        None if model.is_some() || autopilot.is_some() || from.is_some() || framed => {
-            return Err(None);
+    let agent = match (agent, program) {
+        (Some(AgentSpec::Worker { agent, .. }), None) if args.is_empty() => {
+            Some(AgentSpec::Worker {
+                agent,
+                model,
+                autopilot,
+                from,
+            })
         }
-        None => None,
+        // A program worker has no model and no Autopilot: no harness of its reads either.
+        (None, Some(program)) if model.is_none() && autopilot.is_none() => {
+            Some(AgentSpec::Program {
+                run: crate::program_worker::ProgramRun { program, args },
+                from,
+            })
+        }
+        (None, None)
+            if model.is_none()
+                && autopilot.is_none()
+                && from.is_none()
+                && !framed
+                && args.is_empty() =>
+        {
+            None
+        }
+        _ => return Err(None),
     };
     match (kind, place, origin) {
         (None, None, None) => Ok(SpawnForm::Plain {
@@ -3161,13 +3219,39 @@ fn worker_order(
 }
 
 /// The form of a `spawn ...` line, or its refusal: a retired agent by name, else the usage line
-/// naming the word it refuses ([`spawn_refusal`]), else a folder that is not there.
+/// naming the word it refuses ([`spawn_refusal`]), else a program a harness here concludes
+/// ([`spawn_harnessed_refusal`]), else a folder that is not there.
 fn spawn_form(rest: &str) -> Result<SpawnForm, String> {
     if let Some(refusal) = spawn_retired_refusal(rest) {
         return Err(refusal);
     }
     let form = parse_spawn_args(rest).map_err(|refused| spawn_refusal(refused.as_deref()))?;
+    if let Some(refusal) = spawn_harnessed_refusal(&form) {
+        return Err(refusal);
+    }
     spawn_cwd_refusal(&form).map_or(Ok(form), Err)
+}
+
+/// The refusal of a program worker whose program is a CLI `spawn agent=` starts
+/// ([`aterm_agent::harness::worker::harness_of_program`]): under the program form its harness would
+/// supervise nothing of its task (a harness's mark on a program worker's task is refused,
+/// [`crate::task_record::PROGRAM_MARK_BY_HARNESS`]), so the reply names the agent form, under
+/// which it does.
+fn spawn_harnessed_refusal(form: &SpawnForm) -> Option<String> {
+    let SpawnForm::Plain {
+        agent: Some(AgentSpec::Program { run, .. }),
+        ..
+    } = form
+    else {
+        return None;
+    };
+    let cli = aterm_agent::harness::worker::harness_of_program(&run.program)?;
+    Some(format!(
+        "ERR spawn {}: {} has a harness here; spawn it as `agent={}`\n",
+        crate::task_launch::program_form(&run.program),
+        cli.agent.product(),
+        cli.word
+    ))
 }
 
 /// `spawn rest`, answered, with its `kind=spawn` telemetry row: the worker's program (`shell` for
@@ -3181,10 +3265,9 @@ pub(crate) fn cmd_spawn_metered(
     let began = std::time::Instant::now();
     let reply = cmd_spawn(proxy, rest, session, by);
     let (agent, cwd) = match parse_spawn_args(rest) {
-        Ok(SpawnForm::Plain { agent, cwd, .. }) => (
-            agent.map_or("shell", |AgentSpec::Worker { agent, .. }| agent.name()),
-            cwd,
-        ),
+        Ok(SpawnForm::Plain { agent, cwd, .. }) => {
+            (agent.as_ref().map_or("shell", AgentSpec::word), cwd)
+        }
         Ok(SpawnForm::Connected { cwd, .. }) => ("connected", cwd),
         Err(_) => ("-", None),
     };
@@ -3236,6 +3319,17 @@ pub(crate) fn cmd_spawn(
                     Ok(order) => Some(order),
                     Err(refusal) => return refusal,
                 },
+                Some(AgentSpec::Program { run, from }) => {
+                    match crate::task_launch::TaskOrder::of_program_frame(
+                        crate::task_launch::take_frame(),
+                        run,
+                        cwd.as_deref(),
+                        from,
+                    ) {
+                        Ok(order) => Some(order),
+                        Err(refusal) => return refusal,
+                    }
+                }
             };
             let shell = task
                 .is_none()
@@ -3315,9 +3409,9 @@ pub(crate) enum WorkerBlock {
 }
 
 impl WorkerBlock {
-    /// Formats the wire `ERR ...` line for this worker block reason.
-    pub(crate) fn refusal(self, agent: aterm_phase::Program) -> String {
-        let word = agent.name();
+    /// Formats the wire `ERR ...` line for this worker block reason, naming the spawn's `form`
+    /// (`agent=<word>` or `program=<p>`, [`crate::task_launch::spawn_form_word`]).
+    pub(crate) fn refusal(self, form: &str) -> String {
         match self {
             Self::Unhosted => {
                 "unsupervised: the aterm of the Mac asked to start it runs no window harness \
@@ -3325,15 +3419,15 @@ impl WorkerBlock {
                     .to_string()
             }
             Self::Unsupervised(switch) => format!("unsupervised: {switch}"),
-            Self::Unseen(why) => format!("spawn agent={word}: {why}"),
-            Self::NoIntegration => format!(
-                "spawn agent={word}: shell integration is off, so no prompt is marked to type at"
-            ),
+            Self::Unseen(why) => format!("spawn {form}: {why}"),
+            Self::NoIntegration => {
+                format!("spawn {form}: shell integration is off, so no prompt is marked to type at")
+            }
             Self::Shell(name) => {
-                format!("spawn agent={word}: the shell {name} is not zsh, bash or fish")
+                format!("spawn {form}: the shell {name} is not zsh, bash or fish")
             }
             Self::OldFish => format!(
-                "spawn agent={word}: the shell is a fish older than 3.4, which cannot take the \
+                "spawn {form}: the shell is a fish older than 3.4, which cannot take the \
                  task's operand"
             ),
         }
@@ -3718,12 +3812,7 @@ impl crate::App {
         ) {
             return Err(WorkerBlock::Unsupervised(switch));
         }
-        if !self.session_factory.integrate {
-            return Err(WorkerBlock::NoIntegration);
-        }
-        let shell =
-            crate::spawn::interactive_shell_program(self.session_factory.shell_override.as_deref());
-        let dialect = crate::task_launch::worker_dialect(&shell).map_err(WorkerBlock::Shell)?;
+        let (shell, dialect) = self.program_shell()?;
         if dialect == aterm_agent::harness::upgrade::Dialect::Fish
             && crate::task_launch::fish_known_old(&shell)
         {
@@ -3732,10 +3821,53 @@ impl crate::App {
         Ok((shell, dialect))
     }
 
+    /// Checks whether this instance can launch a program worker ([`crate::program_worker`]) and
+    /// returns its shell dialect: a hosted harness that supervises ([`harness_unsupervised`]),
+    /// whose looks reap its tab and whose startup deadline stalls a line that never ran, and a
+    /// shell whose integration marks its prompt and its program's exit status. No agent's switch
+    /// is read, since no harness supervises the program, and any fish takes its line, which reads
+    /// the task as a redirection.
+    ///
+    /// [`harness_unsupervised`]: crate::harness_host::harness_unsupervised
+    pub(crate) fn program_shell(
+        &self,
+    ) -> Result<(std::path::PathBuf, aterm_agent::harness::upgrade::Dialect), WorkerBlock> {
+        if self.harness.is_none() {
+            return Err(WorkerBlock::Unhosted);
+        }
+        if let Some(switch) = crate::harness_host::harness_unsupervised(
+            &self.harness_policy.get().policy,
+            self.headless,
+        ) {
+            return Err(WorkerBlock::Unsupervised(switch));
+        }
+        if !self.session_factory.integrate {
+            return Err(WorkerBlock::NoIntegration);
+        }
+        let shell =
+            crate::spawn::interactive_shell_program(self.session_factory.shell_override.as_deref());
+        let dialect = crate::task_launch::worker_dialect(&shell).map_err(WorkerBlock::Shell)?;
+        Ok((shell, dialect))
+    }
+
     fn worker_precheck(&self, order: crate::task_launch::TaskOrder) -> Result<WorkerStart, String> {
-        let (shell, dialect) = self
-            .worker_shell(order.agent)
-            .map_err(|block| block.refusal(order.agent))?;
+        let (shell, dialect) = match &order.program {
+            None => self
+                .worker_shell(order.agent)
+                .map_err(|block| block.refusal(&format!("agent={}", order.agent.name())))?,
+            Some(run) => {
+                let form = crate::task_launch::program_form(&run.program);
+                let (shell, dialect) =
+                    self.program_shell().map_err(|block| block.refusal(&form))?;
+                aterm_agent::harness::worker::program_line(
+                    dialect,
+                    std::path::Path::new(&run.program),
+                    &run.args,
+                )
+                .map_err(|why| format!("spawn {form}: its line cannot be written: {why}"))?;
+                (shell, dialect)
+            }
+        };
         let (from, caller) = match &order.caller {
             None => (crate::task_record::FROM_CTL.to_string(), None),
             Some(sid) => {
@@ -3800,13 +3932,16 @@ impl crate::App {
         let Some((local, term, ctx)) = newborn else {
             return Err("the worker did not register".to_string());
         };
-        crate::session_timeline::apply_autopilot(
-            &ctx,
-            Some(worker.order.autopilot.word().to_string()),
-            None,
-            aterm_slog::Actor::Aterm,
-            None,
-        );
+        // A program worker's tab keeps the Autopilot it opened with: no harness of its reads it.
+        if worker.order.program.is_none() {
+            crate::session_timeline::apply_autopilot(
+                &ctx,
+                Some(worker.order.autopilot.word().to_string()),
+                None,
+                aterm_slog::Actor::Aterm,
+                None,
+            );
+        }
         let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
         mark.from = Some(worker.from);
         crate::task_record::mark_session_task_within(&ctx, local, &mark, std::time::Duration::ZERO)
@@ -3831,6 +3966,7 @@ impl crate::App {
             caller,
             chrome: worker.order.chrome,
             approve: self.harness_policy.get().policy.approve,
+            program: worker.order.program,
             account_scope,
         })
     }
@@ -4404,6 +4540,91 @@ mod spawn_parse_tests {
         );
     }
 
+    /// `program=` IS A PROGRAM WORKER'S FORM: its program and each `arg=` percent-decoded, one
+    /// word each whatever it holds, with `from=`. NEGATIVE CONTROLS: a spawn naming no program
+    /// (none, an empty one, `arg=` alone) is the usage line, as are a program spelled as an option,
+    /// one starting `~`, a control character in a word, a second `program=`, and a program beside
+    /// `agent=`, `model=` or `autopilot=`; a program a harness here concludes is refused by name,
+    /// with its agent form named, and Grok Build and Kimi Code, which none concludes, run.
+    #[test]
+    fn program_parses_as_a_program_worker_and_a_spawn_naming_none_is_refused() {
+        use crate::program_worker::ProgramRun;
+        let program = |rest: &str| match parse_spawn_args(rest) {
+            Ok(SpawnForm::Plain {
+                agent: Some(AgentSpec::Program { run, from }),
+                ..
+            }) => Some((run, from)),
+            _ => None,
+        };
+        assert_eq!(
+            program("program=/bin/sh arg=-c arg=echo%20it%27s%20done from=s-ab12 len=9"),
+            Some((
+                ProgramRun {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "echo it's done".to_string()],
+                },
+                Some(aterm_session::SessionId::new("s-ab12")),
+            ))
+        );
+        assert_eq!(
+            program("cwd=/w program=/opt/my%20tools/run arg= len=1"),
+            Some((
+                ProgramRun {
+                    program: "/opt/my tools/run".to_string(),
+                    args: vec![String::new()],
+                },
+                None,
+            )),
+            "an empty argument is one"
+        );
+        for bad in [
+            "len=1",
+            "program= len=1",
+            "arg=x len=1",
+            "program=-x len=1",
+            "program=~/bin/x len=1",
+            "program=a%0Ab len=1",
+            "program=sh arg=a%07 len=1",
+            "program=sh program=sh len=1",
+            "agent=claude program=sh len=1",
+            "program=sh agent=claude len=1",
+            "program=sh model=m len=1",
+            "program=sh autopilot=land len=1",
+            "agent=claude arg=x len=1",
+        ] {
+            assert!(parse_spawn_args(bad).is_err(), "{bad}");
+            let reply = super::spawn_form(bad).expect_err(bad);
+            assert!(reply.starts_with("ERR usage: spawn"), "{bad}: {reply}");
+        }
+        for (word, agent) in [
+            ("claude", "claude"),
+            ("/usr/local/bin/codex", "codex"),
+            ("agy", "agy"),
+            ("muse", "muse"),
+        ] {
+            let rest = format!("program={word} len=1");
+            let reply = super::spawn_form(&rest).expect_err(&rest);
+            assert!(
+                reply.starts_with(&format!("ERR spawn program={word}: "))
+                    && reply.ends_with(&format!(
+                        "has a harness here; spawn it as `agent={agent}`\n"
+                    )),
+                "{reply}"
+            );
+        }
+        for free in [
+            "program=kimi len=1",
+            "program=grok len=1",
+            "program=/bin/sh len=1",
+        ] {
+            assert!(super::spawn_form(free).is_ok(), "{free}");
+        }
+        assert!(
+            super::spawn_usage().contains("| program=<pct> [arg=<pct>]... [from=<sid>] len=<n>]"),
+            "the usage line names the form"
+        );
+    }
+
     /// A SPAWN NAMING THE RETIRED GEMINI CLI IS REFUSED BY NAME, with agy, which
     /// replaces it, named; never the usage line and never another worker.
     #[test]
@@ -4963,6 +5184,7 @@ mod worker_start_app_tests {
                 fact_line: true,
                 autopilot: crate::task_launch::WORKER_AUTOPILOT,
                 chrome: false,
+                program: None,
             },
             from: crate::task_record::FROM_CTL.to_string(),
             caller: None,
@@ -5021,7 +5243,7 @@ mod worker_start_app_tests {
             matches!(&block, WorkerBlock::Unseen(why) if why.contains("Grok Build")),
             "{block:?}"
         );
-        let refusal = block.refusal(aterm_phase::Program::Grok);
+        let refusal = block.refusal("agent=grok");
         assert!(refusal.starts_with("spawn agent=grok: "), "{refusal}");
         assert!(refusal.contains("await task"), "{refusal}");
         let order = TaskOrder::of_frame(
@@ -5036,6 +5258,88 @@ mod worker_start_app_tests {
             panic!("a Grok Build worker was planned");
         };
         assert_eq!(why, refusal);
+    }
+
+    /// A PROGRAM WORKER NEEDS THE WINDOW HARNESS AND SHELL INTEGRATION, NOT AN AGENT'S SWITCHES:
+    /// with `[harness] enabled = false` an agent's worker is refused (the control) and a program's
+    /// passes the check; with no harness, or no integration, it is refused naming its form; a line
+    /// no terminal takes is refused at the spawn, before any tab opens.
+    #[test]
+    fn a_program_worker_is_checked_for_its_harness_and_shell_alone() {
+        use super::{SpawnAim, WorkerBlock};
+        let mut app = supervising_app();
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read(
+                "[harness]\nenabled = true\nheadless = true\nautopilot = \"off\"\n\
+                 [harness.generic]\nenabled = false\n",
+            ),
+        );
+        assert!(
+            matches!(
+                app.worker_shell(aterm_phase::Program::Muse),
+                Err(WorkerBlock::Unsupervised(_))
+            ),
+            "CONTROL: an agent's worker is refused under its harness's switches"
+        );
+        assert!(
+            app.program_shell().is_ok(),
+            "a program's reads no agent's switch and no Autopilot"
+        );
+        // NO HARNESS LOOKS AT ALL, NO DEADLINE JUDGES ITS START: a line that never ran would read
+        // `working` for ever, so a program's worker is refused as an agent's is.
+        for (policy, headless, switch) in [
+            (
+                "[harness]\nenabled = false\n",
+                false,
+                "[harness] enabled = false",
+            ),
+            (
+                "[harness]\nenabled = true\nheadless = false\n",
+                true,
+                "[harness] headless = false",
+            ),
+        ] {
+            let mut off = supervising_app();
+            off.headless = headless;
+            off.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read(policy),
+            );
+            assert_eq!(
+                off.program_shell().err(),
+                Some(WorkerBlock::Unsupervised(switch)),
+                "{policy}"
+            );
+        }
+        let order = |args: Vec<String>| {
+            TaskOrder::of_program_frame(
+                Some(b"exit 0".to_vec()),
+                crate::program_worker::ProgramRun {
+                    program: "/bin/sh".to_string(),
+                    args,
+                },
+                None,
+                None,
+            )
+            .expect("a well-formed order")
+        };
+        let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order(vec!["x".repeat(4096)])))
+        else {
+            panic!("a line no terminal takes was planned");
+        };
+        assert!(
+            why.starts_with("spawn program=/bin/sh: its line cannot be written: "),
+            "{why}"
+        );
+        app.session_factory.integrate = false;
+        let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order(Vec::new()))) else {
+            panic!("a program worker with no prompt marks was planned");
+        };
+        assert!(
+            why.starts_with("spawn program=/bin/sh: shell integration is off"),
+            "{why}"
+        );
+        app.harness = None;
+        assert_eq!(app.program_shell().err(), Some(WorkerBlock::Unhosted));
     }
 
     #[test]

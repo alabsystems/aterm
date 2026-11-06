@@ -1436,10 +1436,23 @@ fn the_pairing_reads_the_records_aterm_min_and_names_no_floor_of_its_own() {
     ] {
         assert_eq!(parse_aterm_version(bad), None, "{bad:?}");
     }
+    let of = |app_version: &'static str| {
+        aterm_of(&aterm_stamp::Stamp {
+            app_version,
+            ..aterm_stamp::Stamp::UNSTAMPED
+        })
+    };
+    assert_eq!(of("0.157.0+g0123456789ab"), (0, 157, 0));
+    assert_eq!(of("0.157.0-dev.1"), (0, 157, 0));
     assert_eq!(
-        Some(this_aterm()),
-        parse_aterm_version(env!("CARGO_PKG_VERSION")),
-        "this aterm is the workspace's version"
+        of("soon"),
+        (0, 0, 0),
+        "a version that does not read is none"
+    );
+    assert_eq!(
+        this_aterm(),
+        (0, 0, 0),
+        "a process that installed no identity is no release"
     );
 }
 

@@ -397,7 +397,8 @@ pub fn edit(
                 let fresh = if filters.is_empty() {
                     export(&cells, &[])?.base
                 } else {
-                    let matching = export(&cells, filters)?;
+                    let matching =
+                        grid::export(compiled.table, collection, &cells, filters, reveal)?;
                     let mut keep: std::collections::BTreeSet<&str> = matching
                         .base
                         .rows

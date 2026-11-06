@@ -8,13 +8,16 @@ use std::path::{Path, PathBuf};
 use crate::jobs::RunState;
 use crate::jobs::linux::parse_stat;
 use crate::machine::{
-    Capacity, Commit, LinkCounters, LinkKind, LinkReading, MAX_LINKS, TcpCounts, Throttle,
-    ThrottleLevel, kind_by_name, layout_by_rank, level_names,
+    Capacity, Commit, LinkCounters, LinkKind, LinkReading, MAX_LINKS, Throttle, ThrottleLevel,
+    kind_by_name, layout_by_rank, level_names,
 };
 use crate::procs::{MAX_PROCESSES, ProcessReading, Sweep, parse_statm_resident};
 use crate::{
     Cap, CapSource, Caps, Cluster, CoreTicks, CpuLayout, GpuReading, MemoryDetail, MemoryLevel, Why,
 };
+
+#[path = "linux_tcp.rs"]
+pub mod tcp;
 
 /// Complete lines only: a text cut mid-line (at the 4 KiB cap) loses its
 /// last, torn line rather than parsing half a number.
@@ -157,12 +160,14 @@ pub fn proc_stat_cores(text: &str, cut: bool) -> Option<Vec<CoreTicks>> {
     (!cores.is_empty()).then_some(cores)
 }
 
-/// The reader behind [`crate::Probe::core_ticks`] on Linux.
+/// The reader behind [`crate::Probe::core_ticks`] and [`crate::Probe::forks`] on Linux: one
+/// read of `/proc/stat` gives both.
 #[derive(Debug)]
 pub struct StatReader {
     path: PathBuf,
     buf: Vec<u8>,
     present: usize,
+    forks: Option<u64>,
 }
 
 impl StatReader {
@@ -173,18 +178,46 @@ impl StatReader {
             path: root.join("proc/stat"),
             buf: vec![0; STAT_CAP],
             present: present.min(MAX_CPUS),
+            forks: None,
         }
     }
 
-    /// One reading; `None` when the file cannot be read or parsed.
+    /// One reading; `None` when the file cannot be read or parsed. The same read's `processes`
+    /// line is kept for [`Self::forks`].
     pub fn sample(&mut self) -> Option<Vec<CoreTicks>> {
+        self.forks = None;
         let (n, cut) = crate::read_into(&self.path, &mut self.buf).ok()?;
-        let mut cores = proc_stat_cores(crate::utf8_prefix(&self.buf[..n]), cut)?;
+        let text = crate::utf8_prefix(&self.buf[..n]);
+        self.forks = proc_stat_forks(text);
+        let mut cores = proc_stat_cores(text, cut)?;
         if cores.len() < self.present {
             cores.resize(self.present, CoreTicks::default());
         }
         Some(cores)
     }
+
+    /// Every `fork` and `clone` since boot as the last [`Self::sample`] read them
+    /// ([`proc_stat_forks`]); `None` before one, or where that read held no whole `processes`
+    /// line.
+    #[must_use]
+    pub const fn forks(&self) -> Option<u64> {
+        self.forks
+    }
+}
+
+/// `/proc/stat`'s `processes` line: every `fork` and `clone` since boot. Only a whole line
+/// counts, so a read cut inside it gives `None`.
+#[must_use]
+pub fn proc_stat_forks(text: &str) -> Option<u64> {
+    whole_lines(text).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "processes")
+            .then(|| {
+                let n = crate::parse_uint(fields.next()?)?;
+                fields.next().is_none().then_some(n)
+            })
+            .flatten()
+    })
 }
 
 /// A kernel CPU list (`0-3,5,8-11`, as `/sys/devices/system/cpu/present` holds it) as ascending, distinct ids.
@@ -440,33 +473,6 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
     }
 }
 
-/// Maximum bytes read from `/proc/net/tcp` or `/proc/net/tcp6`.
-const NET_TCP_CAP: usize = 512 * 1024;
-
-/// TCP connection state counts under `root` ([`crate::tcp_counts_into`] on Linux, with root `/`).
-/// A clipped table is unread, even if the other protocol table was complete.
-#[must_use]
-pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCounts> {
-    if scratch.len() < NET_TCP_CAP {
-        scratch.resize(NET_TCP_CAP, 0);
-    }
-    let buf = &mut scratch[..NET_TCP_CAP];
-    let mut counts = TcpCounts::default();
-    let mut any = false;
-    for (rel, v6) in [("proc/net/tcp", false), ("proc/net/tcp6", true)] {
-        if let Ok((n, clipped)) = crate::read_into(&root.join(rel), buf) {
-            if clipped {
-                return None;
-            }
-            any = true;
-            for row in crate::jobs::linux::parse_net_tcp(crate::utf8_prefix(&buf[..n]), v6) {
-                counts.record(row.state);
-            }
-        }
-    }
-    any.then_some(counts)
-}
-
 /// `nlmsghdr`'s size, `NLMSG_HDRLEN` (`linux/netlink.h`).
 const NLMSG_HDRLEN: usize = 16;
 /// `NLMSG_NOOP` (`linux/netlink.h`): a message to skip.
@@ -496,7 +502,6 @@ const INET_DIAG_INFO_ATTR: u16 = 2;
 const TCPI_RTT_AT: usize = 68;
 const LINUX_AF_INET: u8 = 2;
 const LINUX_AF_INET6: u8 = 10;
-const LINUX_TCP_ESTABLISHED: u8 = 1;
 /// `AF_UNIX` (`linux/socket.h`), the family a unix dump names and every record of it carries.
 const LINUX_AF_UNIX: u8 = 1;
 /// `TCP_LISTEN` (`net/tcp_states.h`), the state a listening `AF_UNIX` socket is in.
@@ -631,159 +636,6 @@ fn inet_diag_remote_peer(family: u8, dst: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-/// Parse one `NETLINK_SOCK_DIAG` datagram of `SOCK_DIAG_BY_FAMILY` messages, appending positive
-/// non-loopback `tcpi_rtt` readings (converted from microseconds to milliseconds) into `rtts`.
-/// Returns `Some(true)` once `NLMSG_DONE` is seen, `Some(false)` when more datagrams follow, and
-/// `None` on `NLMSG_ERROR` or malformed framing.
-pub fn parse_inet_diag_rtts(buf: &[u8], rtts: &mut Vec<f32>) -> Option<bool> {
-    parse_inet_diag_rtts_seq(buf, None, rtts)
-}
-
-/// Like [`parse_inet_diag_rtts`], filtering messages to `expected_seq` when `Some` so a stale frame
-/// from another dump sequence never injects readings or terminates the active dump early.
-pub fn parse_inet_diag_rtts_seq(
-    buf: &[u8],
-    expected_seq: Option<u32>,
-    rtts: &mut Vec<f32>,
-) -> Option<bool> {
-    let mut batch = Vec::new();
-    let mut done = false;
-    for message in nl_messages(buf) {
-        let message = message.ok()?;
-        if expected_seq.is_some_and(|want| message.seq != want) {
-            continue;
-        }
-        if message.flags & NLM_F_DUMP_INTR != 0 {
-            return None;
-        }
-        let msg = message.payload;
-        match message.kind {
-            NLMSG_NOOP => {}
-            NLMSG_DONE => {
-                let raw = msg.get(..4)?;
-                let errno = i32::from_ne_bytes(raw.try_into().ok()?);
-                if errno < 0 {
-                    return None;
-                }
-                done = true;
-                break;
-            }
-            NLMSG_ERROR | NLMSG_OVERRUN => return None,
-            SOCK_DIAG_BY_FAMILY => {
-                if msg.len() < INET_DIAG_MSG_LEN {
-                    return None;
-                }
-                let family = msg[0];
-                let state = msg[1];
-                let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
-                if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
-                    for attr in nl_attributes(&msg[INET_DIAG_MSG_LEN..]) {
-                        let (kind, info) = attr.ok()?;
-                        if kind == INET_DIAG_INFO_ATTR
-                            && let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4)
-                        {
-                            let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
-                            if rtt_us > 0 {
-                                let ms = (rtt_us as f32) / 1_000.0;
-                                if ms.is_finite() && ms > 0.0 {
-                                    batch.push(ms);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    rtts.append(&mut batch);
-    Some(done)
-}
-
-/// Median RTT in milliseconds over `rtts` (sorts `rtts` in place), or `None` when empty.
-#[must_use]
-pub fn median_rtt_ms(rtts: &mut [f32]) -> Option<f32> {
-    if rtts.is_empty() {
-        return None;
-    }
-    rtts.sort_by(f32::total_cmp);
-    let n = rtts.len();
-    Some((rtts[(n - 1) / 2] + rtts[n / 2]) * 0.5)
-}
-
-/// Read median passive kernel TCP smoothed RTT (`tcpi_rtt`, milliseconds) across established
-/// non-loopback IPv4 and IPv6 sockets via `NETLINK_SOCK_DIAG`, or `None` if unavailable/empty.
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn tcp_srtt_ms() -> Option<f32> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    const REQ_LEN: usize = NLMSG_HDRLEN + 56;
-    let mut rtts = Vec::new();
-    let mut recv_buf = [0u8; 32 * 1024];
-    for (seq, family) in [(1u32, LINUX_AF_INET), (2u32, LINUX_AF_INET6)] {
-        // Open an isolated socket per address family so a >64-datagram IPv4 dump never leaves
-        // `cb_running` (`EBUSY`) or unread frames queued ahead of IPv6.
-        // SAFETY: Plain integer flags; non-blocking + close-on-exec datagram netlink socket owned by `OwnedFd`.
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                libc::NETLINK_SOCK_DIAG,
-            )
-        };
-        if raw < 0 {
-            continue;
-        }
-        // SAFETY: `raw` is a freshly created file descriptor >= 0.
-        let sock = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut req = sock_diag_dump_request::<REQ_LEN>(seq);
-        req[NLMSG_HDRLEN] = family;
-        req[NLMSG_HDRLEN + 1] = libc::IPPROTO_TCP as u8;
-        req[NLMSG_HDRLEN + 2] = 1u8 << (INET_DIAG_INFO_ATTR - 1);
-        req[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8]
-            .copy_from_slice(&(1u32 << LINUX_TCP_ESTABLISHED).to_ne_bytes());
-        // SAFETY: `sock` is valid and `req` is `REQ_LEN` readable bytes.
-        let sent = unsafe { libc::send(sock.as_raw_fd(), req.as_ptr().cast(), REQ_LEN, 0) };
-        if sent != REQ_LEN as isize {
-            continue;
-        }
-        let mut family_rtts = Vec::new();
-        let mut completed = false;
-        for _ in 0..64 {
-            // SAFETY: `sock` is valid and `recv_buf` is writable for `recv_buf.len()` bytes.
-            let n = unsafe {
-                libc::recv(
-                    sock.as_raw_fd(),
-                    recv_buf.as_mut_ptr().cast(),
-                    recv_buf.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            match parse_inet_diag_rtts_seq(&recv_buf[..n as usize], Some(seq), &mut family_rtts) {
-                Some(true) => {
-                    completed = true;
-                    break;
-                }
-                None => break,
-                Some(false) => {}
-            }
-        }
-        if completed {
-            rtts.append(&mut family_rtts);
-        }
-    }
-    median_rtt_ms(&mut rtts)
 }
 
 /// The request for a dump of every listening `AF_UNIX` socket with its name and bound file
@@ -943,17 +795,28 @@ pub fn unix_diag_listeners(
     Ok(dump)
 }
 
-/// Count `socket:[...]` symlinks inside a `/proc/<pid>/fd` directory (at most 4096 descriptors).
+/// One network namespace's TCP sockets by inode.
+pub type TcpSockets = std::sync::Arc<std::collections::HashMap<u64, crate::jobs::linux::TcpRow>>;
+
+/// Count the descriptors inside a `/proc/<pid>/fd` directory (at most 4096) that link to one of
+/// `sockets`, the TCP sockets of the newest dump ([`tcp::TcpDump::sockets`]): a Unix or netlink
+/// socket is no network socket. The dump names this network namespace's sockets alone, the same
+/// namespace as the machine total the counts are shares of, so a socket of a process in another
+/// namespace counts in neither.
 #[must_use]
-pub fn open_sockets_in_fd_dir(fd_dir: &Path) -> Option<u32> {
+pub fn tcp_sockets_in_fd_dir(
+    fd_dir: &Path,
+    sockets: &std::collections::HashMap<u64, crate::jobs::linux::TcpRow>,
+) -> Option<u32> {
     let entries = std::fs::read_dir(fd_dir).ok()?;
     let mut count = 0u32;
     for entry in entries.flatten().take(4096) {
         if let Ok(target) = std::fs::read_link(entry.path())
-            && target
-                .as_os_str()
-                .as_encoded_bytes()
-                .starts_with(b"socket:[")
+            && let Some(inode) = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:[")?.strip_suffix(']'))
+                .and_then(crate::parse_uint::<u64>)
+            && sockets.contains_key(&inode)
         {
             count = count.saturating_add(1);
         }
@@ -1314,20 +1177,44 @@ fn gpu_unread(driver: &str) -> Why {
     }
 }
 
-/// Reads one NVIDIA card's device-wide busy percent (at most 100) by its PCI slot name (`000f:01:00.0`), or says why it cannot.
-pub type NvidiaBusy = fn(&str) -> Result<u8, Why>;
-
-/// The inert [`NvidiaBusy`] of a fixture root (and of the system root off Linux): never asks NVML, and answers [`Why::NotRead`].
-pub const fn no_nvml(_slot: &str) -> Result<u8, Why> {
-    Err(Why::NotRead)
+/// One NVIDIA card as NVML reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NvidiaCard {
+    /// Its device-wide busy percent (at most 100), or why it is unread.
+    pub busy: Result<u8, Why>,
+    /// NVML's own name for it (`NVIDIA GB10`), where NVML gave one.
+    pub name: Option<String>,
+    /// Whether it works in the system's memory ([`GpuReading::unified`]).
+    pub unified: bool,
 }
 
-/// [`Root::system`]'s [`NvidiaBusy`]: NVML on Linux.
+impl NvidiaCard {
+    /// A card NVML did not read, for `why`: no busy figure, no name, no memory fact.
+    #[must_use]
+    pub const fn unread(why: Why) -> Self {
+        Self {
+            busy: Err(why),
+            name: None,
+            unified: false,
+        }
+    }
+}
+
+/// Reads one NVIDIA card by its PCI slot name (`000f:01:00.0`).
+pub type NvidiaRead = fn(&str) -> NvidiaCard;
+
+/// The inert [`NvidiaRead`] of a fixture root (and of the system root off Linux): never asks NVML, and answers [`Why::NotRead`].
+#[must_use]
+pub const fn no_nvml(_slot: &str) -> NvidiaCard {
+    NvidiaCard::unread(Why::NotRead)
+}
+
+/// [`Root::system`]'s [`NvidiaRead`]: NVML on Linux.
 #[cfg(target_os = "linux")]
-const SYSTEM_NVIDIA: NvidiaBusy = crate::nvml::device_pct;
-/// [`Root::system`]'s [`NvidiaBusy`]: no NVIDIA driver to ask off Linux.
+const SYSTEM_NVIDIA: NvidiaRead = crate::nvml::card;
+/// [`Root::system`]'s [`NvidiaRead`]: no NVIDIA driver to ask off Linux.
 #[cfg(not(target_os = "linux"))]
-const SYSTEM_NVIDIA: NvidiaBusy = no_nvml;
+const SYSTEM_NVIDIA: NvidiaRead = no_nvml;
 
 /// Whether reading an awake card's sysfs figures leaves its runtime power management where it was, from its device's `power/runtime_status`, `power/control` and `boot_vga`.
 pub(crate) fn pm_settled(runtime_status: &str, control: &str, boot_vga: &str) -> bool {
@@ -1390,7 +1277,7 @@ pub fn parse_uptime_ns(text: &str) -> Option<u64> {
 #[derive(Clone, Debug)]
 pub struct Root {
     base: PathBuf,
-    nvidia: NvidiaBusy,
+    nvidia: NvidiaRead,
     wall_ms: WallMs,
 }
 
@@ -1417,7 +1304,7 @@ impl Root {
     /// This root with `nvidia` reading its NVIDIA cards: the test arm a fixture tree's NVIDIA card answers through.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_nvidia(self, nvidia: NvidiaBusy) -> Self {
+    pub(crate) fn with_nvidia(self, nvidia: NvidiaRead) -> Self {
         Self { nvidia, ..self }
     }
 
@@ -1489,16 +1376,47 @@ impl Root {
             .unwrap_or_else(|| (0..crate::machine::parallelism()).collect())
     }
 
-    /// Count open socket descriptors for `pid` under `<root>/proc/<pid>/fd`.
+    /// Count `pid`'s descriptors under `<root>/proc/<pid>/fd` that are one of `sockets`
+    /// ([`tcp_sockets_in_fd_dir`]).
     #[must_use]
-    pub fn open_socket_count(&self, pid: u32) -> Option<u32> {
-        open_sockets_in_fd_dir(&self.at(&format!("proc/{pid}/fd")))
+    pub fn open_socket_count(
+        &self,
+        pid: u32,
+        sockets: &std::collections::HashMap<u64, crate::jobs::linux::TcpRow>,
+    ) -> Option<u32> {
+        tcp_sockets_in_fd_dir(&self.at(&format!("proc/{pid}/fd")), sockets)
     }
 
     /// Every thread on the machine (`/proc/loadavg`, [`loadavg_tasks`]), the count `kernel/pid_max` and `threads-max` bound.
     #[must_use]
     pub fn tasks(&self) -> Option<u64> {
         self.read("proc/loadavg", loadavg_tasks).flatten()
+    }
+
+    /// The machine's task tables ([`crate::room::TaskRoom`]): every task against the smaller of
+    /// `kernel/pid_max` and `threads-max` (each thread takes a pid) and against `threads-max`,
+    /// `fs/file-nr`'s open files against `fs/file-max`, and one user's limit `nproc` (its
+    /// `RLIMIT_NPROC`, which the caller reads); no per-user count.
+    #[must_use]
+    pub fn task_room(&self, nproc: Option<u64>) -> crate::room::TaskRoom {
+        let count = |rel: &str| {
+            self.read(rel, |t| crate::parse_uint::<u64>(t.trim()))
+                .flatten()
+        };
+        let tasks = self.tasks();
+        let threads_max = count("proc/sys/kernel/threads-max");
+        crate::room::TaskRoom {
+            procs: tasks,
+            procs_max: crate::machine::smaller(count("proc/sys/kernel/pid_max"), threads_max),
+            user_procs: None,
+            user_procs_max: nproc,
+            threads: tasks,
+            threads_max,
+            files: self
+                .read("proc/sys/fs/file-nr", crate::room::file_nr_open)
+                .flatten(),
+            files_max: count("proc/sys/fs/file-max"),
+        }
     }
 
     /// The cores the OS took away: present but not online.
@@ -1752,6 +1670,7 @@ impl Root {
                     .unwrap_or_default()
             };
             let status = word("power/runtime_status");
+            let mut card = None;
             let busy = if status == "suspended" {
                 Err(Why::Asleep)
             } else if driver != "amdgpu" && driver != "nvidia" {
@@ -1766,14 +1685,19 @@ impl Root {
                 .map(|p| u8::try_from(p.min(100)).unwrap_or(100))
                 .ok_or(Why::Unsupported)
             } else {
-                slot.as_deref()
-                    .map_or(Err(Why::NotRead), |slot| (self.nvidia)(slot))
-                    .map(|p| p.min(100))
+                let read = slot
+                    .as_deref()
+                    .map_or(NvidiaCard::unread(Why::NotRead), self.nvidia);
+                let busy = read.busy.map(|p| p.min(100));
+                card = Some(read);
+                busy
             };
+            let (named, unified) = card.map_or((None, false), |c| (c.name, c.unified));
             readings.push(GpuReading {
                 device_pct: busy.ok(),
                 unread: busy.err(),
-                name: Some(driver),
+                name: named.or(Some(driver)),
+                unified,
                 ..GpuReading::default()
             });
         }
@@ -1868,6 +1792,7 @@ impl Root {
                 resident,
                 disk_read: None,
                 disk_written: None,
+                energy_nj: None,
                 name: crate::procs::whole_name(
                     stat.name.as_bytes(),
                     COMM_CUT,

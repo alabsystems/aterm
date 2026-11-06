@@ -6,7 +6,7 @@ name = "aterm-shell-integration"
 # Integration tests are declared below: with autotests off, an unlisted `tests/*.rs` never
 # compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

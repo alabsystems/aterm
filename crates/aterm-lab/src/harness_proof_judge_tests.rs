@@ -327,7 +327,7 @@ fn the_relaunch_judge_fails_a_harness_that_never_relaunches_or_relaunches_wrong(
             &after(Some(&next), (500, 500), held_claim()),
             true,
         ),
-        "built-in relaunch lane stood down",
+        "no act of its built-in relaunch lane",
     );
 }
 
@@ -459,7 +459,7 @@ fn the_move_judge_wants_the_new_build_on_the_same_session_under_the_same_harness
             &after(Some(&onto), (500, 500), claimed("muse-alab@500")),
             true,
         ),
-        "built-in upgrade lane stood down",
+        "no act of its built-in upgrade lane",
     );
 }
 
@@ -605,7 +605,15 @@ fn the_negative_control_wants_a_pass_through_the_built_in_lanes_take() {
         holder: None,
         proven: false,
     };
-    let good = passed_through("muse", &through, Some(700), Some(&standin));
+    const HOST: &str = "aterm-harness@71465";
+    let good = passed_through("muse", &through, Some(700), Some(&standin), HOST);
+    assert!(passed(&good), "{good:?}");
+    // aterm's built-in lanes take the tab under its own host's name: no harness claimed it.
+    let hosted = ClaimSeen {
+        holder: Some(HOST.to_string()),
+        ..through.clone()
+    };
+    let good = passed_through("muse", &hosted, Some(700), Some(&standin), HOST);
     assert!(passed(&good), "{good:?}");
 
     let stayed = ClaimSeen {
@@ -613,35 +621,60 @@ fn the_negative_control_wants_a_pass_through_the_built_in_lanes_take() {
         ..ClaimSeen::default()
     };
     fails_on(
-        &passed_through("muse", &stayed, Some(500), Some(&standin)),
+        &passed_through("muse", &stayed, Some(500), Some(&standin), HOST),
         "program muse",
     );
     fails_on(
-        &passed_through("muse", &through, Some(500), Some(&standin)),
+        &passed_through("muse", &through, Some(500), Some(&standin), HOST),
         "took the harness's place",
     );
-    let claimed_anyway = ClaimSeen {
-        holder: Some("muse-alab@700".to_string()),
-        ..through.clone()
-    };
+    for holder in ["muse-alab@700", "aterm-harness@1"] {
+        let claimed_anyway = ClaimSeen {
+            holder: Some(holder.to_string()),
+            ..through.clone()
+        };
+        fails_on(
+            &passed_through("muse", &claimed_anyway, Some(700), Some(&standin), HOST),
+            "no harness claimed",
+        );
+    }
     fails_on(
-        &passed_through("muse", &claimed_anyway, Some(700), Some(&standin)),
-        "nothing claimed",
-    );
-    fails_on(
-        &passed_through("muse", &through, Some(700), None),
+        &passed_through("muse", &through, Some(700), None, HOST),
         "took the harness's place",
     );
 
     let back = frame(V1, 701, S1, 2);
-    assert!(passed(&builtin_took(&standin, true, Some(&back))));
+    assert!(passed(&builtin_took(&standin, true, true, Some(&back))));
     fails_on(
-        &builtin_took(&standin, false, Some(&back)),
+        &builtin_took(&standin, false, true, Some(&back)),
+        "recorded the vendor's launch",
+    );
+    fails_on(
+        &builtin_took(&standin, true, false, Some(&back)),
         "typed the resume line",
     );
     fails_on(
-        &builtin_took(&standin, true, Some(&frame(V1, 701, S2, 1))),
+        &builtin_took(&standin, true, true, Some(&frame(V1, 701, S2, 1))),
         "same session",
     );
-    fails_on(&builtin_took(&standin, true, None), "same session");
+    fails_on(&builtin_took(&standin, true, true, None), "same session");
+}
+
+/// The built-in relaunch lane's record of a launch is read by its pid off aterm's own line: the
+/// tab and the pid must both be the stand-in's, and a record with no conversation (a launch the
+/// lane cannot resume) is no record.
+#[test]
+fn the_relaunch_lanes_record_is_read_by_tab_and_pid() {
+    let log = "1793909933.756 9 INFO aterm_gui::harness_host: harness @s-a: supervising\n\
+               1793909934.100 9 INFO aterm_gui::harness_host: harness @s-a: the relaunch snapshot kept names pid 17282 and its conversation\n\
+               1793909934.200 9 INFO aterm_gui::harness_host: harness @s-b: the relaunch snapshot kept names pid 900, no conversation\n";
+    assert!(snapshot_kept(log, "s-a", 17282));
+    assert!(!snapshot_kept(log, "s-a", 1728), "a pid is read whole");
+    assert!(!snapshot_kept(log, "s-a", 172820));
+    assert!(!snapshot_kept(log, "s-b", 17282), "another tab's record");
+    assert!(
+        !snapshot_kept(log, "s-b", 900),
+        "no conversation, nothing to resume"
+    );
+    assert!(!snapshot_kept("", "s-a", 17282));
 }

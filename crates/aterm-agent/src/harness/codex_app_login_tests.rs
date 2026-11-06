@@ -194,19 +194,23 @@ fn callback_listener_uses_fallback_without_contacting_an_occupied_port() {
     let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     occupied.set_nonblocking(true).unwrap();
     let port = occupied.local_addr().unwrap().port();
-    let fallback =
-        bind_callback_listener(&[port, 0], Instant::now() + aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let fallback = bind_callback_listener(
+        &[port, 0],
+        WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+    )
+    .unwrap();
     assert_ne!(fallback.local_addr().unwrap().port(), port);
     assert!(
         matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
-    let refused = bind_callback_listener(&[port], Instant::now() + aterm_spec::wait::MUST_HAPPEN)
-        .unwrap_err();
+    let refused =
+        bind_callback_listener(&[port], WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
     assert!(
         matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
-    let expired = bind_callback_listener(&[0], Instant::now()).unwrap_err();
+    let expired = bind_callback_listener(&[0], WakeDeadline::after(Duration::ZERO)).unwrap_err();
     assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
 }
 
@@ -225,7 +229,7 @@ fn callback_listener_ignores_a_bare_cancel_and_keeps_its_active_flow() {
             Arc::new(AtomicBool::new(false)),
             server_done,
             tx,
-            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
         );
     });
     let base = format!("http://127.0.0.1:{port}");
@@ -364,7 +368,7 @@ pub(crate) fn mock_login_in_home(
     inner: &mut dyn Approver,
     hosts: &[&str],
     expected_email: Option<&str>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Drove {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock token server");
     let port = listener.local_addr().expect("addr").port();
@@ -375,7 +379,7 @@ pub(crate) fn mock_login_in_home(
 
     let server = std::thread::spawn(move || {
         let _ = listener.set_nonblocking(true);
-        while Instant::now() < deadline {
+        while !deadline.passed() {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
@@ -475,6 +479,60 @@ pub(crate) fn mock_login_in_home(
 
 type Handed = Vec<(Option<String>, Option<String>, Completion)>;
 
+/// A CODEX SIGN-IN ITS HOST SLEPT PAST WHILE IT WAITED FOR THE CALLBACK ENDS OUT OF TIME
+/// (KI-1105-14): an hour's sign-in whose host slept two hours once its page was handed over, and
+/// to which no callback came, ends `Hung` as soon as the approver returns, which it does once the
+/// callback server, on its own thread, saw the deadline pass, stopped (`finished`) and closed its
+/// port. NEGATIVE CONTROLS: a server that dropped its channel unsaid at the deadline made the
+/// sign-in `Failed`, as if the provider had refused it; a server that measured the hour on the
+/// clock that stops in sleep alone was still listening when the one-minute hang detector reported
+/// it.
+#[cfg(unix)]
+#[test]
+fn a_codex_sign_in_its_host_slept_past_awaiting_its_callback_ends_hung() {
+    struct SleepsThenWaits;
+    impl Approver for SleepsThenWaits {
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            let redirect = query_map(handoff.url)
+                .into_iter()
+                .find_map(|(key, value)| (key == "redirect_uri").then_some(value))
+                .expect("redirect_uri");
+            let port: u16 = redirect
+                .strip_prefix("http://127.0.0.1:")
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|port| port.parse().ok())
+                .expect("the callback port");
+            super::super::wake_deadline::host_slept(Duration::from_secs(2 * 3600));
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the callback server saw the deadline its host slept past and closed its port",
+                || {
+                    ((handoff.finished)() && TcpStream::connect(("127.0.0.1", port)).is_err())
+                        .then_some(())
+                },
+            );
+            Approval::Approved { page: false }
+        }
+    }
+    let _seam = super::super::wake_deadline::SleepSeam::hold();
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("login");
+    let drove = login_with(
+        &home,
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.into(),
+            token_url: "http://127.0.0.1:1/oauth/token".into(),
+            callback_ports: vec![0],
+        },
+        &mut SleepsThenWaits,
+        HOSTS,
+        Some("codex-one@example.com"),
+        WakeDeadline::after(Duration::from_secs(3600)),
+    );
+    assert_eq!(drove.outcome, Outcome::Hung);
+    assert!(!home.join("auth.json").exists());
+}
+
 #[test]
 fn unavailable_browser_stops_native_pkce_without_requesting_a_person() {
     struct Unavailable;
@@ -495,7 +553,7 @@ fn unavailable_browser_stops_native_pkce_without_requesting_a_person() {
         &mut Unavailable,
         HOSTS,
         Some("codex-one@example.com"),
-        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
     );
     assert_eq!(
         drove.outcome,
@@ -531,7 +589,7 @@ fn native_pkce_login_verifies_s256_writes_private_auth_json_and_reads_account() 
         &mut &seen,
         HOSTS,
         Some("codex-one@example.com"),
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
     );
     assert_eq!(
         drove,
@@ -611,7 +669,7 @@ fn native_pkce_login_verifies_s256_writes_private_auth_json_and_reads_account() 
         &mut &seen,
         HOSTS,
         Some("codex-two@example.com"),
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
     );
     assert!(matches!(drove_explicit.outcome, Outcome::SignedIn { .. }));
     assert!(explicit_auth.is_file());
@@ -898,7 +956,7 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
         &mut &seen,
         HOSTS,
         Some("codex-one@example.com"),
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
     );
     assert_eq!(drove.outcome, Outcome::OffPin);
     assert!(seen.handed.borrow().is_empty(), "nothing was opened");
@@ -977,7 +1035,7 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
         &mut probe,
         HOSTS,
         Some("codex-one@example.com"),
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
     );
     assert!(
         !bad_state_finished,
@@ -999,7 +1057,7 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
         &mut refuse,
         HOSTS,
         Some("codex-one@example.com"),
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
     );
     assert_eq!(drove.outcome, Outcome::Refused("policy refusal".to_owned()));
     assert!(!home_refused.exists());
@@ -2959,7 +3017,7 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
     }
 
     let seen = Seen::default();
-    let expired = Instant::now();
+    let expired = WakeDeadline::after(Duration::ZERO);
     let mut approver = &seen;
     let hung = login_with(
         &home,
@@ -3007,7 +3065,7 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
         &mut approver,
         HOSTS,
         None,
-        Instant::now() + Duration::from_secs(30),
+        WakeDeadline::after(Duration::from_secs(30)),
     );
     assert_eq!(off_pin_token.outcome, Outcome::OffPin);
     assert_eq!(
@@ -3030,7 +3088,7 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
         &mut approver,
         HOSTS,
         None,
-        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
     );
     assert!(
         matches!(

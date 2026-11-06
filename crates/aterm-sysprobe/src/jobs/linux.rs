@@ -3,16 +3,15 @@
 
 //! The job probe's Linux arm: `/proc/<pid>/…` read under a root.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{
     Counters, FdKind, FdReading, Knote, KnoteFilter, MAX_FD_DETAILS, MAX_FDS, MAX_KNOTES,
     MAX_THREADS, ProcFacts, RunState, TcpState, ThreadReading,
 };
-
-/// The most of one `net/tcp` table read: about 1,700 sockets.
-pub const NET_TCP_CAP: usize = 256 * 1024;
+use crate::linux::tcp::TcpDump;
 
 /// The kernel's clock ticks per second (`_SC_CLK_TCK`), 100 where unread.
 #[must_use]
@@ -319,7 +318,7 @@ pub fn parse_fdinfo(text: &str) -> FdInfo {
     info
 }
 
-/// One row of `/proc/<pid>/net/tcp` or `tcp6`.
+/// One TCP socket, as an all-states dump names it ([`TcpDump::sockets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpRow {
     /// The socket's inode.
@@ -332,64 +331,6 @@ pub struct TcpRow {
     pub remote: Option<SocketAddr>,
     /// Bytes received, not read.
     pub rx_queue: u64,
-}
-
-fn parse_addr(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
-    let (addr, port) = field.split_once(':')?;
-    if !addr.bytes().all(|b| b.is_ascii_hexdigit()) || !port.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let port = u16::from_str_radix(port, 16).ok()?;
-    let ip = if v6 {
-        if addr.len() != 32 {
-            return None;
-        }
-        let mut b = [0u8; 16];
-        for (i, chunk) in b.chunks_mut(4).enumerate() {
-            let w = u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok()?;
-            chunk.copy_from_slice(&w.to_ne_bytes());
-        }
-        IpAddr::V6(Ipv6Addr::from(b))
-    } else {
-        let w = u32::from_str_radix(addr, 16).ok()?;
-        IpAddr::V4(Ipv4Addr::from(w.to_ne_bytes()))
-    };
-    Some((ip, port))
-}
-
-/// Parse a `net/tcp` (or, with `v6`, `net/tcp6`) table.
-#[must_use]
-pub fn parse_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
-    let whole = match text.rfind('\n') {
-        Some(e) => &text[..=e],
-        None => "",
-    };
-    whole
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            let (_, local_port) = parse_addr(f.get(1)?, v6)?;
-            let (rip, rport) = parse_addr(f.get(2)?, v6)?;
-            let st_str = *f.get(3)?;
-            if !st_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
-            let state = TcpState::from_linux(u8::from_str_radix(st_str, 16).ok()?);
-            let (_, rx) = f.get(4)?.split_once(':')?;
-            if !rx.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
-            Some(TcpRow {
-                inode: crate::parse_uint(f.get(9)?)?,
-                state,
-                local_port,
-                remote: (rport != 0).then(|| SocketAddr::new(rip, rport)),
-                rx_queue: u64::from_str_radix(rx, 16).ok()?,
-            })
-        })
-        .collect()
 }
 
 /// `Max processes`' soft limit in a `/proc/<pid>/limits`; `None` for `unlimited` or where absent.
@@ -417,12 +358,6 @@ pub fn event_wait(wchan: &str) -> bool {
 
 fn read_text(path: &Path) -> Option<String> {
     crate::read_bounded(path)
-}
-
-fn read_big(path: &Path, cap: usize) -> Option<String> {
-    let mut buf = vec![0u8; cap];
-    let (n, _) = crate::read_into(path, &mut buf).ok()?;
-    Some(crate::utf8_prefix(&buf[..n]).to_owned())
 }
 
 fn ticks_ns(ticks: u64, hz: u64) -> u64 {
@@ -454,17 +389,17 @@ fn threads(dir: &Path, hz: u64) -> Option<(Vec<ThreadReading>, bool)> {
     Some((out, truncated))
 }
 
-fn tcp_rows(dir: &Path) -> Vec<TcpRow> {
-    let mut rows = Vec::new();
-    for (name, v6) in [("tcp", false), ("tcp6", true)] {
-        if let Some(text) = read_big(&dir.join("net").join(name), NET_TCP_CAP) {
-            rows.extend(parse_net_tcp(&text, v6));
-        }
-    }
-    rows
-}
-
-fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
+/// `dir`'s descriptors. A socket is TCP when `tcp`'s dump names its inode: the newest dump, shared
+/// by every TCP reader in the process ([`crate::linux::tcp::newest_within`]), never this
+/// namespace's `net/tcp` table, which walks the whole established hash for each process that holds
+/// a socket. A process in another network namespace, whose sockets that dump cannot name, has
+/// them named from its namespace's own tables, while a dump is held
+/// ([`crate::linux::tcp::namespace_sockets`]).
+fn fds(
+    dir: &Path,
+    sleeping: Option<bool>,
+    tcp: &dyn Fn() -> Option<Arc<TcpDump>>,
+) -> Option<(Vec<FdReading>, bool)> {
     let mut nums: Vec<i32> = std::fs::read_dir(dir.join("fd"))
         .ok()?
         .flatten()
@@ -473,7 +408,8 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
     nums.sort_unstable();
     let mut truncated = nums.len() > MAX_FDS;
     nums.truncate(MAX_FDS);
-    let mut tcp: Option<Vec<TcpRow>> = None;
+    let mut dump: Option<Option<Arc<TcpDump>>> = None;
+    let mut theirs: Option<Option<crate::linux::TcpSockets>> = None;
     let mut out = Vec::with_capacity(nums.len());
     for (i, fd) in nums.into_iter().enumerate() {
         if i >= MAX_FD_DETAILS {
@@ -502,8 +438,16 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
                 write_end: Some(info().write_only()),
             },
             FdLink::Socket(ino) => {
-                let rows = tcp.get_or_insert_with(|| tcp_rows(dir));
-                match rows.iter().find(|r| r.inode == ino) {
+                let dump = dump.get_or_insert_with(tcp);
+                let row = dump.as_ref().and_then(|d| {
+                    d.sockets.get(&ino).or_else(|| {
+                        theirs
+                            .get_or_insert_with(|| crate::linux::tcp::namespace_sockets(dir))
+                            .as_deref()
+                            .and_then(|t| t.get(&ino))
+                    })
+                });
+                match row {
                     Some(r) => FdKind::Tcp {
                         state: r.state,
                         remote: r.remote,
@@ -561,9 +505,16 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
     Some((out, truncated))
 }
 
-/// Read one process under `root` (`/proc`, or a fixture tree), with `hz` clock ticks per second.
+/// Read one process under `root` (`/proc`, or a fixture tree), with `hz` clock ticks per second,
+/// its TCP sockets named by `tcp`'s dump ([`fds`]).
 #[must_use]
-pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts> {
+pub fn read(
+    root: &Path,
+    pid: u32,
+    want_fds: bool,
+    hz: u64,
+    tcp: &dyn Fn() -> Option<Arc<TcpDump>>,
+) -> Option<ProcFacts> {
     let dir = root.join(pid.to_string());
     let stat = parse_stat(&read_text(&dir.join("stat"))?)?;
     let state = RunState::from_linux(stat.state);
@@ -611,7 +562,7 @@ pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts>
     }
     if want_fds {
         let sleeping = facts.wchan.as_deref().map(event_wait);
-        if let Some((list, cut)) = fds(&dir, sleeping) {
+        if let Some((list, cut)) = fds(&dir, sleeping, tcp) {
             facts.fds = Some(list);
             facts.fds_truncated = cut;
         }

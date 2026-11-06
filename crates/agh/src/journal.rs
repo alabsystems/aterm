@@ -1453,6 +1453,57 @@ pub(crate) fn path_of(dirs: &Dirs, slug: &Slug) -> PathBuf {
         .join(format!("{}.steps", slug.repo().to_ascii_lowercase()))
 }
 
+/// Read the latest intent from a bounded private-file snapshot without opening
+/// a journal for writing, taking its write lock, repairing a tail or raising a
+/// stale need. A concurrent or damaged tail refuses this advisory dry run.
+///
+/// # Errors
+/// The private-file admission or frame/record validation errors.
+#[cfg(unix)]
+pub(crate) fn peek_latest(
+    dirs: &Dirs,
+    slug: &Slug,
+    op: WriteOp,
+    key: &str,
+) -> Result<Option<IntentView>> {
+    use aterm_uds::private_file::{PrivateFileError, read_private};
+    let path = path_of(dirs, slug);
+    let parent = path.parent().expect("a journal has an owner directory");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a journal name is UTF-8");
+    let bytes = match read_private(parent, name, JOURNAL_MAX as usize) {
+        Ok(bytes) => bytes,
+        Err(PrivateFileError::Missing) => return Ok(None),
+        Err(error) => {
+            return Err(Error::local(format!(
+                "the write journal {} cannot be inspected: {error}",
+                path.display(),
+            )));
+        }
+    };
+    let scanned = astream_wire::steps::scan_steps_from(&bytes, 0);
+    if !matches!(scanned.end, astream_wire::steps::StepEnd::Clean) {
+        return Err(
+            Error::local("the write journal snapshot has an incomplete or damaged tail")
+                .with_repo(slug.to_string()),
+        );
+    }
+    let records = scanned
+        .steps
+        .into_iter()
+        .map(|(step, range)| {
+            let at = range.start.saturating_sub(FRAME_OVERHEAD) as u64;
+            decode(at, step, &bytes[range]).map(|record| (step, record))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(views(&records)
+        .into_iter()
+        .rev()
+        .find(|view| view.intent.op == op && view.intent.key == key))
+}
+
 /// Every journal under `dirs.journal()`, by slug: the `*.steps` files two levels down, in
 /// slug order. A name that is not a slug is skipped.
 ///

@@ -2,7 +2,7 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-mesh"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -45,6 +45,7 @@ aterm-uds = { workspace = true }
 # Lowercase hex for the node key's file and the grants a Bus stream carries.
 aterm-codec = { workspace = true }
 # The one switch's negative-control reader (`negative_control::on`).
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # The node service's journal lines.
 aterm-log = { workspace = true }

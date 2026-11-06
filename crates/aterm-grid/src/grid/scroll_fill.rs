@@ -23,20 +23,17 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
         row.set_wrapped(line.is_wrapped());
         return extras;
     };
-    let (deferred, filled) = fill_row_cells(row, text, line, cols);
-    row.set_wrapped(line.is_wrapped());
-    for d in deferred {
-        match d {
-            DeferredExtra::CombiningMarks(col, marks) => {
-                extras
-                    .combining
-                    .push((col, aterm_alloc::SmallVec::from_slice(&marks)));
-            }
-            DeferredExtra::ComplexChar(col, s) => extras.complex_chars.push((col, s)),
-            DeferredExtra::RgbFg(col, rgb) => extras.rgb_fg.push((col, rgb)),
-            DeferredExtra::RgbBg(col, rgb) => extras.rgb_bg.push((col, rgb)),
+    let filled = fill_row_cells(row, text, line, cols, &mut |_, extra| match extra {
+        RestoredExtra::CombiningMarks(col, marks) => {
+            extras
+                .combining
+                .push((col, aterm_alloc::SmallVec::from_slice(&marks)));
         }
-    }
+        RestoredExtra::ComplexChar(col, s) => extras.complex_chars.push((col, s)),
+        RestoredExtra::RgbFg(col, rgb) => extras.rgb_fg.push((col, rgb)),
+        RestoredExtra::RgbBg(col, rgb) => extras.rgb_bg.push((col, rgb)),
+    });
+    row.set_wrapped(line.is_wrapped());
     if let Some(spans) = line.hyperlinks() {
         for span in spans {
             let held = filled_span_cols(span.start_col, span.end_col, filled);
@@ -121,46 +118,45 @@ impl Grid {
 
     /// Fills visible row `row_idx` and its `CellExtras` from `line`.
     pub(crate) fn fill_row_from_line(&mut self, row_idx: u16, line: &Line, cols: u16) {
+        if self.row(row_idx).is_none() {
+            return;
+        }
+        self.storage.extras.clear_row_retaining_capacity(row_idx);
+        self.fill_row_from_line_cleared(row_idx, line, cols);
+        self.storage.extras.maybe_shrink();
+    }
+
+    /// Fill a row whose old extras have already been removed by its caller.
+    pub(super) fn fill_row_from_line_cleared(&mut self, row_idx: u16, line: &Line, cols: u16) {
         let Some(text) = line.as_str() else {
             if let Some(row) = self.row_mut(row_idx) {
                 row.clear();
                 row.set_wrapped(line.is_wrapped());
-                self.storage.extras.clear_row(row_idx);
             }
             return;
         };
 
-        let (deferred, filled) = {
-            let Some(row) = self.row_mut(row_idx) else {
+        let filled = {
+            if row_idx >= self.storage.visible_rows {
+                return;
+            }
+            let Some(idx) = self.storage.row_index(row_idx) else {
                 return;
             };
+            let Some(row) = self.storage.rows.get_mut(idx) else {
+                return;
+            };
+            let extras = &mut self.storage.cursor_state.extras;
             row.clear();
-            let result = fill_row_cells(row, text, line, cols);
-            row.set_wrapped(line.is_wrapped());
-            result
-        };
-        self.storage.extras.clear_row(row_idx);
-
-        let deferred_cols: aterm_alloc::SmallVec<u16, 4> = deferred
-            .iter()
-            .map(|d| match d {
-                DeferredExtra::CombiningMarks(col, _)
-                | DeferredExtra::ComplexChar(col, _)
-                | DeferredExtra::RgbFg(col, _)
-                | DeferredExtra::RgbBg(col, _) => *col,
-            })
-            .collect();
-        apply_deferred_extras(&mut self.storage.extras, row_idx, deferred);
-        if !deferred_cols.is_empty()
-            && let Some(idx) = self.storage.row_index(row_idx)
-            && let Some(r) = self.storage.rows.get_mut(idx)
-        {
-            for col in deferred_cols {
-                if let Some(cell) = r.get_mut(col) {
+            let filled = fill_row_cells(row, text, line, cols, &mut |row, extra| {
+                if let Some(cell) = row.get_mut(extra.col()) {
                     cell.set_has_extras(true);
                 }
-            }
-        }
+                apply_row_extra(extras, row_idx, extra);
+            });
+            row.set_wrapped(line.is_wrapped());
+            filled
+        };
 
         if let Some(spans) = line.hyperlinks() {
             let mut any_hyperlink = false;
@@ -338,7 +334,7 @@ impl Grid {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
-enum DeferredExtra {
+enum RestoredExtra {
     /// Combining marks on a BMP base, attached via `add_combining`.
     CombiningMarks(u16, aterm_alloc::SmallVec<char, 4>),
     /// Non-BMP / ZWJ sequence: store as complex char string.
@@ -349,11 +345,30 @@ enum DeferredExtra {
     RgbBg(u16, [u8; 3]),
 }
 
-fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<DeferredExtra>, u16) {
-    if let Some(filled) = fill_ascii_row_cells(row, text, line, cols) {
+impl RestoredExtra {
+    const fn col(&self) -> u16 {
+        match self {
+            Self::CombiningMarks(col, _)
+            | Self::ComplexChar(col, _)
+            | Self::RgbFg(col, _)
+            | Self::RgbBg(col, _) => *col,
+        }
+    }
+}
+
+/// Lay out cells, emitting each extra after its cell is written so the consumer
+/// can mark that cell and store the payload without retaining a batch.
+fn fill_row_cells(
+    row: &mut Row,
+    text: &str,
+    line: &Line,
+    cols: u16,
+    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+) -> u16 {
+    if let Some(filled) = fill_ascii_row_cells(row, text, line, cols, sink) {
         return filled;
     }
-    fill_row_cells_general(row, text, line, cols)
+    fill_row_cells_general(row, text, line, cols, sink)
 }
 
 /// Printable ASCII with ordinary cell widths needs no grapheme walk. Restrict
@@ -364,7 +379,8 @@ fn fill_ascii_row_cells(
     text: &str,
     line: &Line,
     cols: u16,
-) -> Option<(Vec<DeferredExtra>, u16)> {
+    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+) -> Option<u16> {
     use crate::{CellFlags, PackedColor, PackedColors};
     use aterm_scrollback::CellAttrs;
 
@@ -389,7 +405,6 @@ fn fill_ascii_row_cells(
         return None;
     }
 
-    let mut deferred = Vec::new();
     let mut cursor = line.attr_cursor();
     let mut current = CellAttrs::DEFAULT;
     let mut colors = PackedColors::DEFAULT;
@@ -414,15 +429,15 @@ fn fill_ascii_row_cells(
         let col = row_u16(index);
         row.set(col, Cell::from_ascii_styled(byte, colors, flags));
         if let Some(rgb) = fg_rgb {
-            deferred.push(DeferredExtra::RgbFg(col, rgb));
+            sink(row, RestoredExtra::RgbFg(col, rgb));
         }
         if let Some(rgb) = bg_rgb {
-            deferred.push(DeferredExtra::RgbBg(col, rgb));
+            sink(row, RestoredExtra::RgbBg(col, rgb));
         }
     }
     let col = row_u16(text.len());
     finish_row_cells(row, col, cols);
-    Some((deferred, col))
+    Some(col)
 }
 
 fn fill_row_cells_general(
@@ -430,10 +445,10 @@ fn fill_row_cells_general(
     text: &str,
     line: &Line,
     cols: u16,
-) -> (Vec<DeferredExtra>, u16) {
+    sink: &mut impl FnMut(&mut Row, RestoredExtra),
+) -> u16 {
     use crate::{CellFlags, PackedColor};
 
-    let mut deferred = Vec::new();
     let mut col: u16 = 0;
     for cell in super::scroll_materialize::StoredCells::new(line, text, cols) {
         let style = LineCellStyle {
@@ -447,20 +462,20 @@ fn fill_row_cells_general(
         );
         debug_assert!(new_col > cell.col, "the walk lays out only cells that fit");
         if let Some(e) = extra {
-            deferred.push(e);
+            sink(row, e);
         }
         if style.fg.is_rgb() {
             let (r, g, b) = style.fg.rgb_components();
-            deferred.push(DeferredExtra::RgbFg(cell.col, [r, g, b]));
+            sink(row, RestoredExtra::RgbFg(cell.col, [r, g, b]));
         }
         if style.bg.is_rgb() {
             let (r, g, b) = style.bg.rgb_components();
-            deferred.push(DeferredExtra::RgbBg(cell.col, [r, g, b]));
+            sink(row, RestoredExtra::RgbBg(cell.col, [r, g, b]));
         }
         col = new_col;
     }
     finish_row_cells(row, col, cols);
-    (deferred, col)
+    col
 }
 
 fn finish_row_cells(row: &mut Row, col: u16, cols: u16) {
@@ -483,7 +498,7 @@ fn place_line_cell(
     chars_consumed: usize,
     style: &LineCellStyle,
     is_wide: bool,
-) -> (u16, Option<DeferredExtra>) {
+) -> (u16, Option<RestoredExtra>) {
     let c = super::scroll_materialize::char_at(unit_str, 0);
     let base_is_bmp = (c as u32) <= Cell::MAX_DIRECT_CODEPOINT;
 
@@ -499,7 +514,7 @@ fn place_line_cell(
         let new_col = set_cell(row, col, cols, c, style, is_wide);
         let extra = if new_col > col {
             let marks: aterm_alloc::SmallVec<char, 4> = unit_str[c.len_utf8()..].chars().collect();
-            Some(DeferredExtra::CombiningMarks(col, marks))
+            Some(RestoredExtra::CombiningMarks(col, marks))
         } else {
             None
         };
@@ -538,7 +553,7 @@ fn set_complex_cell(
     unit_str: &str,
     s: &LineCellStyle,
     is_wide: bool,
-) -> (u16, Option<DeferredExtra>) {
+) -> (u16, Option<RestoredExtra>) {
     use crate::CellFlags;
     let flags = if is_wide {
         s.flags.union(CellFlags::WIDE)
@@ -556,7 +571,7 @@ fn set_complex_cell(
         );
         (
             col.saturating_add(2),
-            Some(DeferredExtra::ComplexChar(col, Arc::from(unit_str))),
+            Some(RestoredExtra::ComplexChar(col, Arc::from(unit_str))),
         )
     } else if is_wide {
         (col, None)
@@ -564,35 +579,33 @@ fn set_complex_cell(
         row.set(col, cell);
         (
             col.saturating_add(1),
-            Some(DeferredExtra::ComplexChar(col, Arc::from(unit_str))),
+            Some(RestoredExtra::ComplexChar(col, Arc::from(unit_str))),
         )
     }
 }
 
-fn apply_deferred_extras(extras: &mut CellExtras, row_idx: u16, deferred: Vec<DeferredExtra>) {
-    for extra in deferred {
-        match extra {
-            DeferredExtra::CombiningMarks(col, marks) => {
-                let entry = extras.get_or_create(CellCoord::new(row_idx, col));
-                for mark in marks {
-                    entry.add_combining(mark);
-                }
+fn apply_row_extra(extras: &mut CellExtras, row_idx: u16, extra: RestoredExtra) {
+    match extra {
+        RestoredExtra::CombiningMarks(col, marks) => {
+            let entry = extras.get_or_create(CellCoord::new(row_idx, col));
+            for mark in marks {
+                entry.add_combining(mark);
             }
-            DeferredExtra::ComplexChar(col, s) => {
-                extras
-                    .get_or_create(CellCoord::new(row_idx, col))
-                    .set_complex_char(Some(s));
-            }
-            DeferredExtra::RgbFg(col, rgb) => {
-                extras
-                    .get_or_create(CellCoord::new(row_idx, col))
-                    .set_fg_rgb(Some(rgb));
-            }
-            DeferredExtra::RgbBg(col, rgb) => {
-                extras
-                    .get_or_create(CellCoord::new(row_idx, col))
-                    .set_bg_rgb(Some(rgb));
-            }
+        }
+        RestoredExtra::ComplexChar(col, s) => {
+            extras
+                .get_or_create(CellCoord::new(row_idx, col))
+                .set_complex_char(Some(s));
+        }
+        RestoredExtra::RgbFg(col, rgb) => {
+            extras
+                .get_or_create(CellCoord::new(row_idx, col))
+                .set_fg_rgb(Some(rgb));
+        }
+        RestoredExtra::RgbBg(col, rgb) => {
+            extras
+                .get_or_create(CellCoord::new(row_idx, col))
+                .set_bg_rgb(Some(rgb));
         }
     }
 }
@@ -606,19 +619,112 @@ mod tests {
         let mut fast = Grid::new(1, cols.max(1));
         let mut reference = Grid::new(1, cols.max(1));
         let text = line.as_str().expect("text fixture");
-        let direct = fill_ascii_row_cells(fast.row_mut(0).unwrap(), text, line, cols);
+        let mut actual = Vec::new();
+        let direct = fill_ascii_row_cells(
+            fast.row_mut(0).unwrap(),
+            text,
+            line,
+            cols,
+            &mut |_, extra| actual.push(extra),
+        );
         assert_eq!(direct.is_some(), expect_fast, "{text:?}, cols={cols}");
-        let actual =
-            direct.unwrap_or_else(|| fill_row_cells(fast.row_mut(0).unwrap(), text, line, cols));
-        let expected = fill_row_cells_general(reference.row_mut(0).unwrap(), text, line, cols);
+        if direct.is_none() {
+            assert!(
+                actual.is_empty(),
+                "a rejected fast path must emit no extras"
+            );
+        }
+        let filled = direct.unwrap_or_else(|| {
+            fill_row_cells(
+                fast.row_mut(0).unwrap(),
+                text,
+                line,
+                cols,
+                &mut |_, extra| actual.push(extra),
+            )
+        });
+        let mut expected = Vec::new();
+        let expected_filled = fill_row_cells_general(
+            reference.row_mut(0).unwrap(),
+            text,
+            line,
+            cols,
+            &mut |_, extra| expected.push(extra),
+        );
+        assert_eq!(filled, expected_filled);
         assert_eq!(
             actual, expected,
-            "deferred extras for {text:?}, cols={cols}"
+            "restored extras for {text:?}, cols={cols}"
         );
         let (actual, expected) = (fast.row(0).unwrap(), reference.row(0).unwrap());
         assert_eq!(actual.as_slice(), expected.as_slice());
         assert_eq!(actual.len(), expected.len());
         assert_eq!(actual.flags(), expected.flags());
+    }
+
+    #[test]
+    fn replacing_a_styled_row_with_plain_text_releases_excess_storage() {
+        let cols = 80_u16;
+        let attrs = CellAttrs::new(
+            crate::PackedColor::rgb(12, 34, 56).0,
+            crate::PackedColor::rgb(65, 43, 21).0,
+            crate::CellFlags::BOLD.bits(),
+        );
+        let styled = Line::with_attrs(
+            &"x".repeat(usize::from(cols)),
+            Rle::with_value(attrs, u32::from(cols)),
+        );
+        let mut grid = Grid::new(1, cols);
+        grid.restore_visible_from_lines(&[styled]);
+        let full_capacity = grid.storage.extras.capacity();
+        assert!(full_capacity >= usize::from(cols));
+
+        grid.restore_visible_from_lines(&[Line::from("plain")]);
+        assert_eq!(grid.storage.extras.len(), 0);
+        assert!(grid.storage.extras.capacity() < full_capacity);
+        let restored = grid.checkpoint_visible_lines();
+        assert_eq!(restored[0].as_str(), Some("plain"));
+        let mut attrs = restored[0].attr_cursor();
+        for col in 0..5 {
+            assert_eq!(attrs.attr_at(col), CellAttrs::DEFAULT);
+        }
+    }
+
+    #[test]
+    fn streamed_visible_extras_match_detached_restoration() {
+        let attrs = CellAttrs::new(
+            crate::PackedColor::rgb(12, 34, 56).0,
+            crate::PackedColor::rgb(65, 43, 21).0,
+            crate::CellFlags::BOLD.bits(),
+        );
+        for text in [
+            "ASCII",
+            "e\u{301}日👩‍💻Z",
+            "日e\u{301}\u{302}\u{303}\u{304}\u{305}X",
+        ] {
+            let mut line = Line::with_attrs(text, Rle::with_value(attrs, 32));
+            line.set_wrapped(true);
+            for cols in [1, 2, 3, 7, 16] {
+                let mut detached = Grid::new(1, cols);
+                let row = detached.row_mut(0).expect("fresh row");
+                let extras = fill_row_into(row, &line, cols);
+                let expected = Grid::row_to_line_with_stored_extras(row, &extras);
+                let mut visible = Grid::new(1, cols);
+                visible.restore_visible_from_lines(std::slice::from_ref(&line));
+                let actual = visible.checkpoint_visible_lines();
+                assert_eq!(actual[0].as_str(), expected.as_str(), "{text:?}, {cols}");
+                assert_eq!(actual[0].is_wrapped(), expected.is_wrapped());
+                let mut actual_attrs = actual[0].attr_cursor();
+                let mut expected_attrs = expected.attr_cursor();
+                for col in 0..usize::from(cols) {
+                    assert_eq!(
+                        actual_attrs.attr_at(col),
+                        expected_attrs.attr_at(col),
+                        "{text:?}, width {cols}, column {col}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

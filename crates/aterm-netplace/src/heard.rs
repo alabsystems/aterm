@@ -450,7 +450,7 @@ pub(crate) fn read_counted_in(
 
 /// How many lines a refused read of `name` in `dir` passed over: one where the file is there,
 /// or `dir` is a symbolic link, and cannot be read (not private); none where it is missing.
-fn refused(dir: &Path, name: &str) -> usize {
+pub(crate) fn refused(dir: &Path, name: &str) -> usize {
     let dir_is_symlink =
         std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
     let file_present = !matches!(
@@ -582,19 +582,25 @@ pub fn write_book(
     network: Option<&NetworkId>,
 ) -> io::Result<()> {
     let held = read_book(dir).unwrap_or_default();
+    let mut held_by_member: HashMap<String, (Option<u64>, Option<NetworkId>)> =
+        HashMap::with_capacity(held.members.len());
+    for row in held.members {
+        held_by_member
+            .entry(row.member)
+            .or_insert((row.answered_ms, row.network));
+    }
     let network = network.filter(|network| network.is_strong());
     let book = Book {
         members: members
             .into_iter()
             .map(|(node, addr, answered_ms)| {
                 let member = member_key(Lane::Fleet, &node);
-                let booked = held
-                    .members
-                    .iter()
-                    .find(|row| row.member == member && row.answered_ms == answered_ms)
+                let booked = held_by_member
+                    .get(&member)
+                    .filter(|(held_ms, _)| *held_ms == answered_ms)
                     .map_or_else(
-                        || answered_ms.and(network.cloned()),
-                        |row| row.network.clone(),
+                        || answered_ms.and_then(|_| network.cloned()),
+                        |(_, booked_net)| booked_net.clone(),
                     );
                 BookMember {
                     member,
@@ -627,13 +633,16 @@ fn stay_start(dir: &Path) -> Option<u64> {
 
 /// Whether a note for `key` at `now` is written now: never noted, noted [`COALESCE_MS`] or more
 /// ago, or noted before the current stay began (the first after a move).
-fn due(noted: &Noted, dir: &Path, key: &str, now: u64, stay: Option<u64>) -> bool {
+fn due(noted: &Noted, dir: &Path, key: &str, now: u64, stay: &mut Option<Option<u64>>) -> bool {
     noted
         .last
         .get(dir)
         .and_then(|by_key| by_key.get(key))
         .is_none_or(|last| {
-            now.saturating_sub(*last) >= COALESCE_MS || stay.is_some_and(|start| *last < start)
+            now.saturating_sub(*last) >= COALESCE_MS
+                || stay
+                    .get_or_insert_with(|| stay_start(dir))
+                    .is_some_and(|start| *last < start)
         })
 }
 
@@ -687,7 +696,7 @@ pub fn note_answer(
 ) {
     let key = member_key(lane, member);
     let noted_key = format!("{} {key}", lane.word());
-    let stay = stay_start(dir);
+    let mut stay = None;
     {
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         if !due(
@@ -695,7 +704,7 @@ pub fn note_answer(
             dir,
             &noted_key,
             at_ms,
-            stay,
+            &mut stay,
         ) {
             return;
         }
@@ -732,7 +741,10 @@ pub fn note_answer(
 /// answer already carries the local address of its authenticated socket. Coalesces
 /// repeated members and waits for the evidence lock at most once for the batch.
 pub fn note_answers(dir: &Path, answers: Vec<Answer>) {
-    let stay = stay_start(dir);
+    if answers.is_empty() {
+        return;
+    }
+    let mut stay = None;
     let mut notes = compact(Evidence {
         answers,
         ..Evidence::default()
@@ -744,7 +756,7 @@ pub fn note_answers(dir: &Path, answers: Vec<Answer>) {
         let noted = guard.get_or_insert_with(Noted::default);
         notes.answers.retain(|answer| {
             let key = format!("{} {}", answer.lane.word(), answer.member);
-            if !due(noted, dir, &key, answer.at_ms, stay) {
+            if !due(noted, dir, &key, answer.at_ms, &mut stay) {
                 return false;
             }
             keys.push(key);
@@ -792,7 +804,7 @@ pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &st
     } else {
         ("internet down", "internet ok")
     };
-    let stay = stay_start(dir);
+    let mut stay = None;
     {
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         let noted = guard.get_or_insert_with(Noted::default);
@@ -804,7 +816,7 @@ pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &st
                     .and_then(|by_key| by_key.get(noted_key))
                     .is_none_or(|this_at| other_at > this_at)
             });
-        if !changed && !due(noted, dir, noted_key, at_ms, stay) {
+        if !changed && !due(noted, dir, noted_key, at_ms, &mut stay) {
             return;
         }
     }
@@ -1148,23 +1160,25 @@ static BOOKED: Mutex<Option<HashMap<PathBuf, HashSet<Booking>>>> = Mutex::new(No
 /// writes a ledger it read in part counts the seed as run where it read no mark of it
 /// ([`seed_days`]).
 pub fn note_days(dir: &Path, answers: &[Answer]) {
-    let mut wanted: Vec<Booking> = answers
-        .iter()
-        .filter(|answer| answer.lane == Lane::Fleet && answer.logged)
-        .filter_map(|answer| {
-            Some((
-                answer.network.clone().filter(NetworkId::is_strong)?,
-                answer.at_ms / DAY_MS,
-                answer.member.clone(),
-            ))
-        })
-        .collect();
-    {
+    let mut wanted: Vec<Booking> = {
         let guard = BOOKED.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(set) = guard.as_ref().and_then(|booked| booked.get(dir)) {
-            wanted.retain(|booking| !set.contains(booking));
-        }
-    }
+        let set = guard.as_ref().and_then(|booked| booked.get(dir));
+        answers
+            .iter()
+            .filter(|answer| answer.lane == Lane::Fleet && answer.logged)
+            .filter_map(|answer| {
+                let network = answer.network.as_ref().filter(|n| n.is_strong())?;
+                let day = answer.at_ms / DAY_MS;
+                if set.is_some_and(|s| {
+                    s.iter()
+                        .any(|(n, d, m)| n == network && *d == day && m == &answer.member)
+                }) {
+                    return None;
+                }
+                Some((network.clone(), day, answer.member.clone()))
+            })
+            .collect()
+    };
     wanted.sort();
     wanted.dedup();
     if wanted.is_empty() {

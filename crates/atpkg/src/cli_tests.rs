@@ -1,5 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+#[test]
+fn which_json_takes_one_tool_and_one_optional_flag() {
+    let args = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
+    for words in [&["--json", "targo"][..], &["targo", "--json"][..]] {
+        let words = args(words);
+        assert_eq!(super::which_args(&words), Ok(("targo", true)));
+    }
+    assert_eq!(super::which_args(&args(&["targo"])), Ok(("targo", false)));
+    for words in [
+        &[][..],
+        &["--json"],
+        &["--json", "targo", "--json"],
+        &["targo", "trustc"],
+        &["--unknown", "targo"],
+    ] {
+        assert!(super::which_args(&args(words)).is_err());
+    }
+}
+
 #[path = "vendor_plan_effects_tests.rs"]
 mod vendor_plan_effects;
 
@@ -999,6 +1018,60 @@ use std::os::unix::fs::PermissionsExt;
 fn install_takes_one_operand() {
     let two = std::process::ExitCode::from(2);
     assert_eq!(cmd_install_argv(&["ay".to_string(), "ny".to_string()]), two);
+}
+
+/// `install <program> --build <N> [--retry]` names one build, its refusal memo forgotten first
+/// with `--retry`; any other shape around the flags, a build that is no number, and a program
+/// other than Trust are usage errors that touch no store.
+#[test]
+fn install_takes_a_build_by_number_for_trust_only() {
+    let argv = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+    let trust = "trust".to_string();
+    assert_eq!(
+        parse_install_argv(&argv(&["trust", "--build", "16387"])),
+        Ok(InstallArgs {
+            program: Some(&trust),
+            build: Some(16387),
+            retry: false,
+        })
+    );
+    assert_eq!(
+        parse_install_argv(&argv(&["trust", "--build", "16387", "--retry"])),
+        Ok(InstallArgs {
+            program: Some(&trust),
+            build: Some(16387),
+            retry: true,
+        })
+    );
+    assert_eq!(
+        parse_install_argv(&argv(&["trust"])),
+        Ok(InstallArgs {
+            program: Some(&trust),
+            build: None,
+            retry: false,
+        })
+    );
+    let two = std::process::ExitCode::from(2);
+    for refused in [
+        &["trust", "--build"][..],
+        &["trust", "--build", "eighty"],
+        &["--build", "16387", "trust"],
+        &["trust", "--bild", "16387"],
+        &["trust", "--build", "16387", "more"],
+        &["trust", "--build", "16387", "--retry", "--retry"],
+        &["trust", "--retry", "--build", "16387"],
+        &["trust", "--retry"],
+        &["ay", "--build", "18"],
+        &["ay", "--build", "18", "--retry"],
+        &["-x", "--build", "18"],
+    ] {
+        assert_eq!(parse_install_argv(&argv(refused)), Err(two), "{refused:?}");
+    }
+    // Refused by the verb's row, before dispatch takes the store lock.
+    assert_eq!(
+        arity_refusal(&argv(&["ay", "--build", "18"]), "install"),
+        Some(two)
+    );
 }
 
 #[test]
@@ -13832,7 +13905,7 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
 fn which_amacs_is_built_in() {
     let l = temp_layout("which-built-in");
     let amacs = crate::builtin::builtin("amacs").unwrap();
-    let version = aterm_types::version::app_version();
+    let version = aterm_stamp::app_version();
     let alias_dir = crate::builtin::alias_dir();
     let path = empty_path(&l);
     assert_eq!(
@@ -13873,7 +13946,7 @@ fn which_amacs_is_built_in() {
 
 #[test]
 fn list_human_shows_built_in_row_and_porcelain_is_unchanged() {
-    let section = crate::builtin::list_human_lines(aterm_types::version::app_version());
+    let section = crate::builtin::list_human_lines(aterm_stamp::app_version());
     assert!(
         section
             .iter()
@@ -13953,7 +14026,7 @@ fn remove_amacs_refuses_naming_the_setting() {
         "uninstall",
         &["amacs".to_string()],
         &[],
-        aterm_types::version::app_version(),
+        aterm_stamp::app_version(),
     )
     .unwrap();
     assert!(answer.refused);
@@ -13996,7 +14069,10 @@ fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
         "a refusing compiler is filed only where an install fixes it, and never as missing"
     );
     assert_eq!(
-        super::c_toolchain_marker(&CcVerdict::Unanswered { driver: cc.clone() }),
+        super::c_toolchain_marker(&CcVerdict::Unanswered {
+            driver: cc.clone(),
+            bound: crate::prereq::PROBE_TIMEOUT,
+        }),
         ready
     );
     assert_eq!(

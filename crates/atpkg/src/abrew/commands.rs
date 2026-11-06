@@ -5303,7 +5303,7 @@ pub(super) fn list_index(api: &Api, casks: bool) -> ExitCode {
 }
 
 pub(super) fn cmd_config(prefix: &Prefix) -> ExitCode {
-    println!("ABREW_VERSION: {} (aterm)", env!("CARGO_PKG_VERSION"));
+    println!("ABREW_VERSION: {} (aterm)", aterm_stamp::app_version());
     println!("ABREW_PREFIX: {}", prefix.root.display());
     println!("ABREW_CELLAR: {}", prefix.cellar().display());
     println!("ABREW_CASKROOM: {}", prefix.caskroom().display());

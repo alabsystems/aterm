@@ -119,6 +119,9 @@ fn order(opts: &Options) -> Vec<(usize, Arm)> {
 pub(crate) fn gui_rlib(log: &str) -> Option<std::path::PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     for line in log.lines() {
+        if !line.contains("aterm_gui") || !line.contains("compiler-artifact") {
+            continue;
+        }
         let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
@@ -215,7 +218,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         let inspection = inspect_symbols(&copied, &root, false)?;
         let (sha256, bytes) = crate::dmg::sha256_and_size(&copied)?;
         let report = aterm_json::json!({"binary":copied,"binary_bytes":bytes,"sha256":sha256,"inspection":inspection});
-        std::fs::write(out.join("inspection.json"), report.to_string())
+        crate::durable::write_fresh(&out.join("inspection.json"), report.to_string())
             .map_err(|e| e.to_string())?;
         println!("profile-pilot-inspection: {report}");
         return Ok(());
@@ -267,7 +270,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
                 "vm_rows": "not run: Q4 profile runtime qualification is not integrated", "linux_rows": "not run",
                 "library_benches": "pending", "wasm_ceilings": "pending"});
-            std::fs::write(root.join("report.json"), report.to_string())
+            crate::durable::write_fresh(&root.join("report.json"), report.to_string())
                 .map_err(|e| e.to_string())?;
             if let Some(error) = inspection_error {
                 return Err(format!(
@@ -288,8 +291,8 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
         buildplan::pilot_host_checks(&take, arm, &dir, build, hint.as_deref())?;
     }
-    std::fs::write(
-        root.join("host-checks-completed"),
+    crate::durable::write_fresh(
+        &root.join("host-checks-completed"),
         b"vte-engine vte-marks wasm\n",
     )
     .map_err(|e| e.to_string())?;
@@ -298,7 +301,8 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         "linux_rows": if cfg!(target_os = "linux") { "recorded" } else { "not run: invoke on native Linux" },
         "library_benches": "commands completed with exit 0; judgments in per-arm host-checks-{1,2}/vte-engine.log and vte-marks.log",
         "wasm_ceilings": "commands completed with exit 0; judgments in per-arm host-checks-{1,2}/wasm.log"});
-    std::fs::write(root.join("report.json"), report.to_string()).map_err(|e| e.to_string())?;
+    crate::durable::write_fresh(&root.join("report.json"), report.to_string())
+        .map_err(|e| e.to_string())?;
     println!(
         "profile-pilot: reproducible host artifacts; report {}",
         root.join("report.json").display()
@@ -448,7 +452,7 @@ fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_js
     }
     let dwarf = dsym.join("Contents/Resources/DWARF/aterm");
     let (dsym_sha256, dsym_bytes) = crate::dmg::sha256_and_size(&dwarf)?;
-    let image = std::fs::read(binary).map_err(|e| e.to_string())?;
+    let image = crate::durable::read_file(binary).map_err(|e| e.to_string())?;
     let sections = sections(&image)?;
     let cpu = image.get(4..8).ok_or("Mach-O CPU type is absent")?;
     let arch = match u32::from_le_bytes(cpu.try_into().map_err(|_| "Mach-O CPU type")?) {
@@ -474,7 +478,7 @@ fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_js
     // Capture addresses before the cut's -x strip removes local symbol names.
     // The dSYM keeps those names; code/data must survive the strip unchanged.
     tool("strip", &["-x".as_ref(), binary.as_os_str()])?;
-    let stripped = std::fs::read(binary).map_err(|e| e.to_string())?;
+    let stripped = crate::durable::read_file(binary).map_err(|e| e.to_string())?;
     if self::sections(&stripped)? != sections {
         return Err("release strip changed code/data sections".into());
     }
@@ -496,7 +500,7 @@ fn inspect_symbols(binary: &Path, root: &Path, extract: bool) -> Result<aterm_js
             .filter(|line| line.contains("Line info:"))
             .map(str::trim)
             .collect();
-        if !resolved.iter().any(|line| line.contains("Line info:")) {
+        if resolved.is_empty() {
             continue;
         }
         let symbolicated = tool(

@@ -961,6 +961,10 @@ pub const TASK_OPERAND: &str = r#"-- "$(command cat -- "$ATERM_TASK_FILE")""#;
 pub const TASK_PROMPT_INTERACTIVE: &str =
     r#""--prompt-interactive=$(command cat -- "$ATERM_TASK_FILE")""#;
 
+/// The operand of a program worker's line ([`super::worker::program_line`]): the task file as the
+/// program's standard input, a redirection every dialect spells alike.
+pub const TASK_STDIN: &str = r#"< "$ATERM_TASK_FILE""#;
+
 /// Builds the initial launch command line for a spawned worker with `env`.
 pub fn task_line_env(
     dialect: Dialect,

@@ -152,6 +152,8 @@ impl Deleted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum WriteOp {
+    /// POST a public repository for the authenticated owner. One-shot.
+    RepoCreate,
     /// POST a draft release. One-shot.
     ReleaseCreate,
     /// PATCH a release's name, body or prerelease flag.
@@ -181,7 +183,8 @@ pub enum WriteOp {
 }
 
 /// Every op, in declaration order: `parse` reads its slugs from here.
-const WRITE_OPS: [WriteOp; 13] = [
+const WRITE_OPS: [WriteOp; 14] = [
+    WriteOp::RepoCreate,
     WriteOp::ReleaseCreate,
     WriteOp::ReleaseUpdate,
     WriteOp::ReleasePublish,
@@ -198,12 +201,13 @@ const WRITE_OPS: [WriteOp; 13] = [
 ];
 
 impl WriteOp {
-    /// `release.create`, `release.update`, `release.publish`, `release.delete`,
+    /// `repo.create`, `release.create`, `release.update`, `release.publish`, `release.delete`,
     /// `asset.upload`, `asset.delete`, `asset.rename`, `ref.create`, `ref.delete`, `ref.update-atomic`,
     /// `key.add`, `key.delete`, `api`.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
+            WriteOp::RepoCreate => "repo.create",
             WriteOp::ReleaseCreate => "release.create",
             WriteOp::ReleaseUpdate => "release.update",
             WriteOp::ReleasePublish => "release.publish",

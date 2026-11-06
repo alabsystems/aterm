@@ -135,9 +135,10 @@ fn hinted_faces() -> Vec<Loaded> {
         .filter(|f| f.roles & corpus::HINT != 0)
         .filter_map(|face| {
             let path = match face.origin {
-                Origin::Repo(rel) => {
-                    format!("{}/../aterm-render/{rel}", env!("CARGO_MANIFEST_DIR"))
-                }
+                Origin::Repo(rel) => format!(
+                    "{}/../aterm-render/{rel}",
+                    aterm_tempfile::manifest_dir().display()
+                ),
                 Origin::System(abs) => abs.to_string(),
             };
             let bytes = match std::fs::read(&path) {
@@ -157,10 +158,8 @@ fn hinted_faces() -> Vec<Loaded> {
 }
 
 fn corpus_lines() -> Vec<Line> {
-    let path = format!(
-        "{}/../aterm-render/tests/fixtures/font-oracle/hinting.txt",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = aterm_tempfile::manifest_dir()
+        .join("../aterm-render/tests/fixtures/font-oracle/hinting.txt");
     let text = std::fs::read_to_string(&path).expect("the hinting corpus");
     text.lines()
         .filter(|t| !t.is_empty() && !t.starts_with('#'))

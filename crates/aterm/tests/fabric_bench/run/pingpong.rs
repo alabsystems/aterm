@@ -831,11 +831,11 @@ struct RequestSplit {
 
 impl RequestSplit {
     fn outside_us(&self) -> Option<f64> {
-        (self.calls > 0).then(|| self.outside_ns as f64 / self.calls as f64 / 1e3)
+        (self.calls > 0).then_some(self.outside_ns as f64 / self.calls as f64 / 1e3)
     }
 
     fn handler_us(&self) -> Option<f64> {
-        (self.handled > 0).then(|| self.handler_ns as f64 / self.handled as f64 / 1e3)
+        (self.handled > 0).then_some(self.handler_ns as f64 / self.handled as f64 / 1e3)
     }
 
     fn share(&self) -> Option<f64> {

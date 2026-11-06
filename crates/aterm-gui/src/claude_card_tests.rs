@@ -2253,7 +2253,7 @@ fn capture_cols(name: &str, text: &str, rows: &[String]) -> usize {
 
 #[test]
 fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .map(|e| e.expect("a fixture").path())

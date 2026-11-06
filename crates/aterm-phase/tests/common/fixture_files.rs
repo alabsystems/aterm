@@ -41,12 +41,12 @@ fn dir_screens(crate_dir: &Path, dir: &Path, into: &mut Vec<(String, Vec<String>
 
 /// Loads all fixture screens from `src/fixtures` and sibling policy fixtures when present.
 pub fn fixture_screens(sweep: &str) -> Vec<(String, Vec<String>)> {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = aterm_tempfile::manifest_dir();
     let mut out = Vec::new();
-    dir_screens(crate_dir, &crate_dir.join("src/fixtures"), &mut out);
+    dir_screens(&crate_dir, &crate_dir.join("src/fixtures"), &mut out);
     let agent = crate_dir.join("../aterm-agent/src/supervise/policy/fixtures");
     if agent.is_dir() {
-        dir_screens(crate_dir, &agent, &mut out);
+        dir_screens(&crate_dir, &agent, &mut out);
     } else {
         eprintln!(
             "{sweep}: {} absent (not in the aterm workspace): its captures are not swept",

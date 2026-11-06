@@ -43,7 +43,7 @@ pub const SEAL_ENV: &str = "ATERM_RELEASE_INPUTS_SEAL";
 
 /// The seal's own schema, part of the identity: a seal of another schema is no seal here.
 #[cfg(any(test, target_os = "macos"))]
-const SEAL_SCHEMA: &str = "aterm-release-inputs-seal-v1";
+const SEAL_SCHEMA: &str = "aterm-release-inputs-seal-v2";
 
 /// The largest kept seal read: one is about a kilobyte per root.
 #[cfg(any(test, target_os = "macos"))]
@@ -191,9 +191,10 @@ struct Sources<'a> {
 }
 
 /// What the machine adds to the inputs' content: an OS update or another Mac is another
-/// identity, though every input's bytes are the same. When A14's trust.lock lands, the Trust
-/// build it names (its build and tree root) joins here as one more fact; the Trust roots stay in
-/// the status walk, so a store build relinked or repaired mid-run is still caught.
+/// identity, though every input's bytes are the same. The Trust build the seal covers (its build
+/// number and tree root, which a locked tree's discovery holds to its trust.lock) is one more
+/// fact; the Trust roots stay in the status walk, so a store build relinked or repaired mid-run
+/// is still caught.
 #[cfg(any(test, target_os = "macos"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Facts {
@@ -203,6 +204,9 @@ struct Facts {
     model: Option<String>,
     /// [`sdk_settings`] of the `macos-sdk` root.
     sdk_settings: Option<String>,
+    /// [`selected_trust_build`] of the `trust/selected-bin` root: `None` for a toolchain outside the
+    /// store. Not a fact [`Facts::complete`] waits on, since such a toolchain has none.
+    trust_build: Option<String>,
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -221,6 +225,7 @@ impl Facts {
             ("OS build", &self.os_build, &now.os_build),
             ("model", &self.model, &now.model),
             ("SDK settings", &self.sdk_settings, &now.sdk_settings),
+            ("Trust build", &self.trust_build, &now.trust_build),
         ]
         .into_iter()
         .filter(|(_, was, is)| was != is)
@@ -240,7 +245,42 @@ fn machine_facts(roots: &[Root]) -> Facts {
             .iter()
             .find(|(label, _)| label == "macos-sdk")
             .map(|(_, sdk)| sdk_settings(sdk)),
+        trust_build: roots
+            .iter()
+            .find(|(label, _)| label == TRUST_SELECTED)
+            .and_then(|(_, bin)| {
+                let home = aterm_types::dirs::home_dir();
+                let configured = atpkg::config::load().prefix_path(home.as_deref());
+                let layout = atpkg::store::resolve(configured.as_deref())?;
+                selected_trust_build(&layout.prefix, bin)
+            }),
     }
+}
+
+/// The `machine_roots` label of the Trust toolchain the process selected.
+#[cfg(target_os = "macos")]
+const TRUST_SELECTED: &str = "trust/selected-bin";
+
+/// `<build> <tree root>` of the store's Trust build whose `bin` is `selected` (canonical, as
+/// [`crate::gates::trust_stage2_bin`] gives it), the root as recorded for the tree there now, or
+/// `<build> unrecorded` with no such record; `None` when `selected` is not a Trust build in the
+/// store at `prefix` (a dev-linked checkout, an explicit `TRUST_STAGE2_BIN` elsewhere).
+#[cfg(target_os = "macos")]
+fn selected_trust_build(prefix: &Path, selected: &Path) -> Option<String> {
+    let prefix = prefix.canonicalize().ok()?;
+    let (program, build) = atpkg::ops::store_build_of(&prefix, selected)?;
+    let build_dir = selected.parent()?;
+    if program != atpkg::trust_lock::PROGRAM
+        || selected.file_name()? != "bin"
+        || build_dir.parent()? != prefix.join("store").join(&program)
+    {
+        return None;
+    }
+    let root = atpkg::trust_lock::recorded_root_at(build_dir);
+    Some(format!(
+        "{build} {}",
+        root.as_deref().unwrap_or("unrecorded")
+    ))
 }
 
 /// SHA-256 of the SDK's `SDKSettings.json` and `SDKSettings.plist`, each by its bytes, or by why
@@ -409,7 +449,12 @@ fn identity_under(schema: &[u8], digest: &str, facts: &Facts) -> String {
     field(&mut sha, SEAL_SCHEMA.as_bytes());
     field(&mut sha, schema);
     field(&mut sha, digest.as_bytes());
-    for fact in [&facts.os_build, &facts.model, &facts.sdk_settings] {
+    for fact in [
+        &facts.os_build,
+        &facts.model,
+        &facts.sdk_settings,
+        &facts.trust_build,
+    ] {
         match fact {
             Some(value) => {
                 field(&mut sha, b"some");
@@ -790,7 +835,7 @@ fn machine_roots() -> Result<Vec<Root>, String> {
         "macOS SDK",
     )?;
     let mut roots = vec![
-        ("trust/selected-bin".to_string(), trust),
+        (TRUST_SELECTED.to_string(), trust),
         ("trust/bin".to_string(), trust_root.join("bin")),
         ("stable/proxies".to_string(), shim),
         ("stable/bin".to_string(), stable_root.join("bin")),
@@ -923,12 +968,9 @@ fn output_host(command: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<
 
 #[cfg(any(test, target_os = "macos"))]
 fn host_from_text(text: &str) -> Result<String, String> {
-    let hosts: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("host: "))
-        .collect();
-    match hosts.as_slice() {
-        [host] if valid_rust_target(host) => Ok((*host).to_owned()),
+    let mut hosts = text.lines().filter_map(|line| line.strip_prefix("host: "));
+    match (hosts.next(), hosts.next()) {
+        (Some(host), None) if valid_rust_target(host) => Ok(host.to_owned()),
         _ => Err("compiler did not name one valid host target".into()),
     }
 }
@@ -1499,6 +1541,8 @@ mod tests {
         /// A release state's `inputs-seal/`.
         kept: PathBuf,
         os_build: Option<String>,
+        /// [`Facts::trust_build`].
+        trust_build: Option<String>,
         /// Take a new seal on every call, as every call did before seals.
         fresh: bool,
         /// Whether the inputs were last changed long before each call (an hour, by its clock), as
@@ -1528,6 +1572,7 @@ mod tests {
                 kept: dir.path().join("state/inputs-seal"),
                 _dir: dir,
                 os_build: Some("25B78".into()),
+                trust_build: Some(format!("16387 {}", "4".repeat(64))),
                 fresh: false,
                 settled: true,
                 opened: 0,
@@ -1540,6 +1585,7 @@ mod tests {
             let Self {
                 root,
                 os_build,
+                trust_build,
                 fresh,
                 settled,
                 opened,
@@ -1551,6 +1597,7 @@ mod tests {
                 os_build: os_build.clone(),
                 model: Some("Mac0,0".into()),
                 sdk_settings: None,
+                trust_build: trust_build.clone(),
             };
             let mut open = |path: &Path| {
                 *opened += 1;
@@ -1652,6 +1699,7 @@ mod tests {
             os_build: Some(os_build.into()),
             model: Some("Mac0,0".into()),
             sdk_settings: None,
+            trust_build: Some(format!("16387 {}", "4".repeat(64))),
         }
     }
 
@@ -1818,6 +1866,66 @@ mod tests {
         assert_ne!(after, before);
         assert_eq!(bench.counts(), (2, 1));
         assert!(bench.opened > opened, "it read the inputs again");
+    }
+
+    /// Another Trust build is another identity, hashed again though no input's status moved: a
+    /// seal names the build it covers. CONTROL: the same build holds. NEGATIVE CONTROL: drop
+    /// [`Facts::trust_build`] from [`identity_under`], and both builds read one identity.
+    #[cfg(unix)]
+    #[test]
+    fn another_trust_build_hashes_again_into_another_identity() {
+        let mut bench = Bench::new();
+        let mut process = process(None, None);
+        let before = bench.ask(&mut process).unwrap();
+        assert_eq!(bench.ask(&mut process).unwrap(), before);
+        assert_eq!(bench.counts(), (1, 1));
+        bench.trust_build = Some(format!("16500 {}", "5".repeat(64)));
+        let after = bench.ask(&mut process).unwrap();
+        assert_ne!(after, before);
+        assert_eq!(bench.counts(), (2, 1));
+        assert!(
+            bench
+                .said
+                .iter()
+                .any(|line| line.contains("Trust build (16387 ")),
+            "{:?}",
+            bench.said
+        );
+    }
+
+    /// The Trust build of a selected toolchain is the store build its `bin` is, with the tree
+    /// root recorded for that tree, `unrecorded` without one. NEGATIVE CONTROLS: a `bin` outside
+    /// the store, another program's build, and a directory below a build's `bin` name none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_selected_toolchain_names_the_store_build_it_is() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let prefix = dir.path().canonicalize().unwrap();
+        let laid = prefix.join("store/trust/16387.noindex");
+        std::fs::create_dir_all(laid.join("bin/deeper")).unwrap();
+        let ay = prefix.join("store/ay/18/bin");
+        std::fs::create_dir_all(&ay).unwrap();
+        let elsewhere = prefix.join("checkout/bin");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let bin = laid.join("bin");
+        assert_eq!(
+            selected_trust_build(&prefix, &bin).as_deref(),
+            Some("16387 unrecorded")
+        );
+        let root = "4".repeat(64);
+        atpkg::trust_lock::write_tree_root_record(&laid, &root).unwrap();
+        assert_eq!(
+            selected_trust_build(&prefix, &bin),
+            Some(format!("16387 {root}"))
+        );
+        for none in [elsewhere, ay, bin.join("deeper")] {
+            assert_eq!(
+                selected_trust_build(&prefix, &none),
+                None,
+                "{}",
+                none.display()
+            );
+        }
     }
 
     /// A machine whose OS build could not be read keeps no seal and adopts none: its process

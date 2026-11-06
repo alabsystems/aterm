@@ -57,7 +57,7 @@ impl Fixture {
     }
 
     fn seed_with(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
         cmd.arg("seed")
             .args(args)
             .envs(envs.iter().copied())
@@ -626,7 +626,7 @@ fn a_whole_update_ends_the_promise_it_was_spawned_on() {
     let seed = fx.seed_with(&flags, &[(atpkg::cli::SPAWNER_PID_ENV, &me)]);
     assert!(seed.status.success(), "{}", describe(&seed));
     assert!(fx.layout.pass_owed_file().is_file(), "{}", describe(&seed));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let mut child = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .arg("update")
         .args(flags)
         .env(atpkg::cli::SPAWNER_PID_ENV, &me)
@@ -696,7 +696,7 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
         })
     };
     let seed = |extra: &[&str]| -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        let mut child = Command::new(aterm_tempfile::bin_exe("atpkg"))
             .arg("seed")
             .args(extra)
             .env("HOME", &fx.home)
@@ -753,7 +753,7 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
 }
 
 fn update_with(fx: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let mut child = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .arg("update")
         .args(args)
         .envs(envs.iter().copied())
@@ -952,7 +952,7 @@ fn a_hosts_pass_says_an_unparsed_aterm_toml_by_its_position() {
     )
     .unwrap();
     let seed = |copied: bool| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
         cmd.arg("seed")
             .env("HOME", &fx.home)
             .env("XDG_CONFIG_HOME", &config)

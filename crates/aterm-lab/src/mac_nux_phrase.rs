@@ -26,12 +26,19 @@
 //!   its own sheet (§3.3.5) and the lane reads no window, so the phrase is read there, as `lab
 //!   swarm partition` presses Allow in its own process.
 //! - The joiner is the build's own CLI: `aterm members join --no-wait` (install.sh's windowless
-//!   ask), then `aterm members join` on a terminal with the phrase typed at its prompt
-//!   ([`super::DRIVE`]'s `$NUX_PHRASE`), then its own subscriber (`aterm secrets watch`), as a
-//!   joined Mac's agent runs it. It is named no member (`--at`): each run finds the member as a
+//!   ask), then `aterm members join <phrase>` on a terminal, the phrase typed with the command as
+//!   the member's words say (its shell expands `$NUX_PHRASE`, so the lane's command lines never
+//!   hold it; a join with no phrase has proved and asked by itself, never prompted, since
+//!   `f5eabf5697`), then its own subscriber (`aterm secrets watch`), as a joined Mac's agent runs
+//!   it. The ask is named no member (`--at`): each run finds the member as a
 //!   new Mac does, by `discover::browse_members` (`dns-sd -B`, `parse_browse_members_of`, `dns-sd
 //!   -L` of each instance, `parse_reached`), and asks it over the guest's network at the address
-//!   that resolve gives.
+//!   that resolve gives. The join with the phrase names the member at the address it listens at
+//!   (`--at <guest address>:<port>`, [`join_cmd`]): one that browsed again looked the member's
+//!   `.local` name up in aterm's own process, which macOS holds while its Local Network question
+//!   for aterm stands unanswered, and nobody at this console answers it (E3, 2026-11-05: the join
+//!   waited out its 5 s, `dscacheutil` resolving the same name at once). macOS does not hold
+//!   aterm's connect to the guest's own address.
 //!
 //! Isolation, which is why the browse runs on a lab service. This Mac is a live ALab member, and
 //! mDNSResponder announces its own registrations (its members desk's `_alab._tcp`, its vault's
@@ -68,6 +75,19 @@
 //! loopback but the member's, a registration but the member's lab one, a real-service advert
 //! that is not this Mac's own, or a browse whose transcript shows it never looked).
 //!
+//! The lab's table ([`joiner_table`]): once the member is in, the seed founds the lab's
+//! membership log (Genesis v2, through the guest helper's `genesis`, as `lab mesh churn` founds
+//! its lab), whose first `[everyone]` epoch the table's digest is keyed by: `secrets create`
+//! mints none, and a digest on the seed without it said "this Mac holds no [everyone] key" (E3,
+//! 2026-11-05). The seed then imports a one-row synthetic emails sheet ([`TABLE_ADDRESS`]) and
+//! seals a password of random bytes into it with the owner's own verb (`aterm db emails set …
+//! password --stdin`, the value on stdin from a mode-600 file in the guest, never printed)
+//! before the joiner asks, so the table is older than the joiner, as the owner's is older than
+//! any new Mac. Once the joiner reads In, the guest helper's `repair` moves
+//! the seed's Commons tables to it and each look compares the two `aterm db emails --digest`s
+//! ([`table_verdict`]): one `[everyone]` epoch, the row with its password, one keyed digest. The
+//! record shows epochs, counts and digest prefixes, never a value.
+//!
 //! The member's Commons enrolment stays the guest helper's in-process exchange over loopback
 //! (the row's `enrolled by the runtime` cell says NOT MEASURED). The Commons runtime finds its
 //! peers by beacons to one multicast group and port (`aterm_db::runtime`'s transport), which a
@@ -77,6 +97,7 @@
 //! release-shaped app the row runs. Running it over the guest's network needs a lab port the
 //! runtime keeps apart from the live one on the LAN, in `aterm-db`'s transport.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -341,6 +362,224 @@ fn enrol(helper: &str, member: &str, seed: &str) -> String {
     format!("/usr/bin/env HOME={member} {helper} enrol {member} {seed}")
 }
 
+/// The guest command that signs the seed's Genesis v2 into `seed/genesis.v2` (the guest helper's
+/// `genesis`): the lab's first `[everyone]` epoch, wrapped to each Mac its vault and Commons
+/// list, which `secrets create` does not mint and the table's digest is keyed by.
+fn genesis(helper: &str, seed: &str) -> String {
+    format!("/usr/bin/env HOME={seed} {helper} genesis {seed} {seed}/genesis.v2")
+}
+
+/// What [`genesis`] printed, for its cell: `<n> members, digest <8 hex>`, else its words.
+#[must_use]
+pub fn genesis_said(out: &str) -> String {
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("genesis "))
+        .unwrap_or_default();
+    let word = |key: &str| {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(key))
+            .map(str::to_owned)
+    };
+    match (word("members="), word("digest=")) {
+        (Some(members), Some(digest)) => format!("{members} members, digest {digest}"),
+        _ => format!("said {}", squeeze(out.trim(), 120)),
+    }
+}
+
+/// The one row of the lab's synthetic emails table: an address no mail reaches.
+pub const TABLE_ADDRESS: &str = "nux-proof@example.invalid";
+
+/// The rounds of each guest-helper `repair` the joiner's table look runs (`guest::steps`).
+const REPAIR_ROUNDS: usize = 8;
+
+/// The guest commands that write the seed's synthetic emails sheet and a password beside it,
+/// under `seed/sheet` (never `seed/seed`, which `secrets create --import` publishes), mode 600:
+/// the sheet is one row, [`TABLE_ADDRESS`], whose Password column it leaves out (a sheet's is a
+/// has-password flag), and the password is 24 random bytes from the guest's own `/dev/urandom`,
+/// written to its file and never printed.
+fn sheet(seed: &str) -> String {
+    format!(
+        "set -e; umask 077; mkdir -p {seed}/sheet; \
+         printf 'Email Address,Status\\n{TABLE_ADDRESS},active\\n' > {seed}/sheet/emails.csv; \
+         head -c 24 /dev/urandom | base64 | tr -d '\\n' > {seed}/sheet/pw"
+    )
+}
+
+/// The guest command that imports the seed's sheet into its registry (`aterm db alab import
+/// --emails … --apply`, the one verb that declares the registry), as the lab's first Mac with no
+/// peer yet; what it printed when it fails.
+fn import_table(aterm: &str, seed: &str) -> String {
+    format!(
+        "{} db alab import --emails {seed}/sheet/emails.csv --apply > {seed}/import.out 2>&1 \
+         || {{ cat {seed}/import.out; exit 1; }}",
+        as_home(aterm, seed)
+    )
+}
+
+/// The guest command that seals the seed's password into [`TABLE_ADDRESS`]'s `password` cell
+/// from its file on stdin, as the owner sets one (`aterm db emails set … password --stdin`); what
+/// it printed when it fails (its words, never the value, which is never on argv).
+fn seal(aterm: &str, seed: &str) -> String {
+    format!(
+        "{} db emails set {TABLE_ADDRESS} password --stdin < {seed}/sheet/pw > {seed}/seal.out 2>&1 \
+         || {{ cat {seed}/seal.out; exit 1; }}",
+        as_home(aterm, seed)
+    )
+}
+
+/// The marker between the two outputs [`table_now`] prints.
+const TABLE_MARK: &str = "--nux-table--";
+
+/// The guest command that prints, as `me`, the emails view (whose `complete` [`read_table`]
+/// reads; every password in it masked) and then its keyed digest, a [`TABLE_MARK`] line between.
+fn table_now(me: &str) -> String {
+    format!("{me} db emails 2>&1; echo '{TABLE_MARK}'; {me} db emails --digest 2>&1")
+}
+
+/// The guest command that runs the guest helper's `repair` of the joiner from the seed:
+/// [`REPAIR_ROUNDS`] Commons rounds over loopback, the joiner enrolled by the seed first if it is
+/// still pending in Commons.
+fn repair(helper: &str, joiner: &str, seed: &str) -> String {
+    format!(
+        "/usr/bin/env HOME={joiner} {helper} repair {joiner} {seed} {REPAIR_ROUNDS} {seed} 2>&1"
+    )
+}
+
+/// One identity's emails table, value-free: whether its history reads complete, and its keyed
+/// digest's epoch (eight hex digits), rows, rows with a password and digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRead {
+    pub complete: bool,
+    pub epoch: String,
+    pub rows: u64,
+    pub with_password: u64,
+    pub digest: String,
+}
+
+/// [`table_now`]'s output read.
+///
+/// # Errors
+/// No [`TABLE_MARK`], or a side that is no view or digest: what it said instead, shortened.
+pub fn read_table(text: &str) -> Result<TableRead, String> {
+    let (view, digest) = text
+        .split_once(&format!("{TABLE_MARK}\n"))
+        .or_else(|| text.split_once(TABLE_MARK))
+        .ok_or_else(|| format!("no table read ({})", squeeze(text.trim(), 160)))?;
+    let json = |side: &str| {
+        side.lines()
+            .rev()
+            .find_map(|l| aterm_json::from_str::<aterm_json::Value>(l.trim()).ok())
+            .filter(aterm_json::Value::is_object)
+    };
+    let view_said = || squeeze(view.trim(), 160);
+    let complete = json(view)
+        .and_then(|v| v.get("complete").and_then(aterm_json::Value::as_bool))
+        .ok_or_else(|| format!("the emails view said {}", view_said()))?;
+    let d = json(digest)
+        .filter(|d| d.get("digest").is_some())
+        .ok_or_else(|| format!("its digest said {}", squeeze(digest.trim(), 160)))?;
+    let text_of = |key: &str| {
+        d.get(key)
+            .and_then(aterm_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("its digest has no {key}"))
+    };
+    let count = |key: &str| {
+        d.get(key)
+            .and_then(aterm_json::Value::as_u64)
+            .ok_or_else(|| format!("its digest has no {key}"))
+    };
+    Ok(TableRead {
+        complete,
+        epoch: text_of("epoch")?,
+        rows: count("rows")?,
+        with_password: count("with_password")?,
+        digest: text_of("digest")?,
+    })
+}
+
+/// What the joiner's table look saw, for [`table_verdict`]: the seed's table and the joiner's as
+/// they read at its last look (why not, where one did not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSaw {
+    pub seed: Result<TableRead, String>,
+    pub joiner: Result<TableRead, String>,
+}
+
+/// Why the joiner does not read the lab's table, each reason once: none when it reads the seed's
+/// table, a password among its rows, under the same epoch's key. Digests compare only under one
+/// epoch, so another epoch is unproven rather than a match; a history that is not complete is
+/// not the table.
+#[must_use]
+pub fn table_verdict(t: &TableSaw) -> Vec<String> {
+    let mut why = Vec::new();
+    let seed = match &t.seed {
+        Ok(seed) => Some(seed),
+        Err(e) => {
+            why.push(format!("the seed's table did not read: {e}"));
+            None
+        }
+    };
+    if let Some(seed) = seed {
+        if seed.rows == 0 {
+            why.push("the seed's table has no row".to_owned());
+        }
+        if seed.with_password == 0 {
+            why.push(
+                "the seed's table holds no password, so the joiner opening one is unproven"
+                    .to_owned(),
+            );
+        }
+    }
+    match (&t.joiner, seed) {
+        (Err(e), _) => why.push(format!("the joiner's table did not read: {e}")),
+        (Ok(joiner), _) if !joiner.complete => {
+            why.push("the joiner's table history is not complete".to_owned());
+        }
+        (Ok(joiner), Some(seed)) if joiner.epoch != seed.epoch => why.push(format!(
+            "the joiner digested under epoch {}, the seed under {}, so the tables are unproven",
+            joiner.epoch, seed.epoch
+        )),
+        (Ok(joiner), Some(seed))
+            if (joiner.rows, joiner.with_password, &joiner.digest)
+                != (seed.rows, seed.with_password, &seed.digest) =>
+        {
+            why.push(format!(
+                "the joiner's table is not the seed's ({} row(s), {} with a password, digest \
+                 {}…; the seed's {}, {}, {}…)",
+                joiner.rows,
+                joiner.with_password,
+                prefix(&joiner.digest),
+                seed.rows,
+                seed.with_password,
+                prefix(&seed.digest)
+            ));
+        }
+        (Ok(_), _) => {}
+    }
+    why
+}
+
+/// A digest's first eight characters, all a record shows of it.
+fn prefix(digest: &str) -> &str {
+    digest.get(..8).unwrap_or(digest)
+}
+
+/// What one guest-helper `repair` printed: `repaired <ms> standing=… rounds=… control=… rows=…
+/// keys=…`, its words by name; `None` for any other line (its refusal).
+#[must_use]
+pub fn read_repair(line: &str) -> Option<BTreeMap<String, String>> {
+    let rest = line.trim().strip_prefix("repaired ")?;
+    let mut words = rest.split_whitespace();
+    let at = words.next()?.parse::<u64>().ok()?;
+    let mut fields: BTreeMap<String, String> = words
+        .filter_map(|w| w.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .collect();
+    fields.insert("at".to_owned(), at.to_string());
+    Some(fields)
+}
+
 /// The signer `secrets create` printed in its `aterm secrets join <url>#<signer>` line, which a
 /// Mac joining the vault pins.
 #[must_use]
@@ -409,15 +648,22 @@ struct Lab {
     service: String,
 }
 
-/// The seed and the member, ready: the seed's homes, server (answering within [`HANG`]), vault
-/// and approver; the member asked, approved by the seed, In (within [`HANG`]) and enrolled in the
-/// seed's Commons; and the member's desk serving at `lab`'s address under its service (within
+/// The seed and the member, ready: the seed's homes, server (answering within [`HANG`]) and
+/// vault; the member asked, approved by the seed, In (within [`HANG`]) and enrolled in the seed's
+/// Commons; the seed's Genesis v2 and table ([`genesis`], [`sheet`], [`import_table`], [`seal`]:
+/// `Err` says why they are not there) and approver; and the member's desk serving at `lab`'s address under its service (within
 /// [`HANG`]). Each step is its own guest command, so a failure names the step and its output or
 /// log; the member's steps are timed in `row`.
 ///
 /// # Errors
 /// A step failed, or a wait's detector fired: the row cannot go on.
-fn setup(g: &Guest, h: &Homes, record: &str, lab: &Lab, row: &mut Row) -> Result<Desk, Fail> {
+fn setup(
+    g: &Guest,
+    h: &Homes,
+    record: &str,
+    lab: &Lab,
+    row: &mut Row,
+) -> Result<(Desk, Result<(), String>), Fail> {
     let helper = format!("{GUEST_NUX}/{GUEST_HELPER}");
     let Homes { seed, member, .. } = h;
     g.sh(&homes(h, record), STEP)?;
@@ -484,6 +730,28 @@ fn setup(g: &Guest, h: &Homes, record: &str, lab: &Lab, row: &mut Row) -> Result
         Value::Ms(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
     );
 
+    // The lab's founding and its table, before the joiner asks: the seed signs Genesis v2, whose
+    // first `[everyone]` epoch wraps to the seed and the member, then imports the table and seals
+    // its password. A step that fails is the table check's to report, never the rest of the
+    // row's.
+    let made = Instant::now();
+    let seeded = g
+        .sh(&genesis(&helper, seed), STEP)
+        .and_then(|signed| {
+            row.cell("seed: Genesis v2", Value::Text(genesis_said(&signed)));
+            g.sh(&sheet(seed), STEP)
+        })
+        .and_then(|_| g.sh(&import_table(&g.aterm, seed), STEP))
+        .and_then(|_| g.sh(&seal(&g.aterm, seed), STEP))
+        .map_err(|fail| squeeze(fail.msg.as_deref().unwrap_or("a guest step failed"), 300));
+    row.cell(
+        "seed: founded, table imported and its password sealed",
+        match &seeded {
+            Ok(_) => Value::Ms(u64::try_from(made.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            Err(why) => Value::Text(format!("failed: {why}")),
+        },
+    );
+
     g.sh(&watch(&as_home(&g.aterm, seed), seed), STEP)?;
     g.sh(
         &desk(&helper, member, &lab.listen, record, &lab.service),
@@ -504,7 +772,7 @@ fn setup(g: &Guest, h: &Homes, record: &str, lab: &Lab, row: &mut Row) -> Result
         }) => Err(Fail::die(format!(
             "the member's desk refused to serve: {why}"
         ))),
-        Some(at) => Ok(at),
+        Some(at) => Ok((at, seeded.map(|_| ()))),
     }
 }
 
@@ -972,6 +1240,8 @@ pub struct Saw {
     pub files: Vec<Arrived>,
     /// Where the joiner stood last.
     pub standing: Standing,
+    /// The lab's table as the seed and the joiner read it ([`joiner_table`]).
+    pub table: TableSaw,
     /// The run's lab members service (the joiner's `ATERM_LAB_MEMBER_SERVICE`).
     pub service: String,
     /// The guest's own addresses ([`inet_addresses`]).
@@ -1002,7 +1272,7 @@ pub struct Saw {
 /// Why the run fails the acceptance test, each reason once: none for a pass. It passes only when
 /// the phrase came from [`MEMBER_NAME`] (a member that is no admin, never the seed), every
 /// [`CREDENTIALS`] file is in the joiner's `~/.secrets` with the seed's value, the joiner reads
-/// In, the joiner's own browse found the member and nothing else ([`browse_verdict`]), and
+/// In, the joiner reads the lab's table with its password ([`table_verdict`]), the joiner's own browse found the member and nothing else ([`browse_verdict`]), and
 /// nothing reached beyond the guest ([`isolation_verdict`]).
 #[must_use]
 pub fn verdict(saw: &Saw) -> Vec<String> {
@@ -1030,6 +1300,7 @@ pub fn verdict(saw: &Saw) -> Vec<String> {
     if saw.standing != Standing::In {
         why.push(format!("the joiner stayed {}, never In", saw.standing));
     }
+    why.extend(table_verdict(&saw.table));
     why.extend(browse_verdict(saw));
     why.extend(isolation_verdict(saw));
     why
@@ -1413,10 +1684,14 @@ fn ask_cmd(me: &str) -> String {
     format!("{me} members join --no-wait")
 }
 
-/// The joiner's join, the phrase typed at its prompt, `me` its command line ([`as_joiner`]):
-/// named no member, so it browses for one.
-fn join_cmd(me: &str) -> String {
-    format!("{me} members join")
+/// The joiner's join with the phrase, `me` its command line ([`as_joiner`]), named the member at
+/// `at`, the guest address it listens at (the module doc says why the join does not browse
+/// again). A shell expands the phrase from `$NUX_PHRASE`, so this command line never holds it.
+fn join_cmd(me: &str, at: &str) -> String {
+    format!(
+        "/bin/sh -c {}",
+        crate::util::shell_quote(&format!("{me} members join --at {at} \"$NUX_PHRASE\""))
+    )
 }
 
 /// The guest's browse of the lab members service `service` read again until it hears the
@@ -1449,6 +1724,122 @@ fn await_lab(
         (None, Ok(adverts)) => Ok(adverts),
         (None, Err(why)) => Err(format!("{why} ({} s on)", HANG.as_secs())),
     })
+}
+
+/// The joiner reads the lab's table: once it reads In, the guest helper's `repair` moves the
+/// seed's Commons tables to it ([`repair`]; the joiner enrolled by the seed first while it is
+/// pending), and each look reads both tables ([`table_now`]) until the joiner's is the seed's
+/// ([`table_verdict`]), under the [`HANG`] detector, a repair before each look. Cells: the
+/// joiner's Commons standing, what the repairs moved, the time from In and from the ask to the
+/// table, and the verdict, which shows epochs, counts and digest prefixes, never a value.
+///
+/// # Errors
+/// The guest could not be read, or the run was stopped.
+fn joiner_table(
+    g: &Guest,
+    h: &Homes,
+    helper: &str,
+    me: &str,
+    seeded: Result<(), String>,
+    asked: Option<u64>,
+    row: &mut Row,
+) -> Result<TableSaw, Fail> {
+    if let Err(why) = seeded {
+        let saw = TableSaw {
+            seed: Err(format!("the seed made no table: {why}")),
+            joiner: Err("the seed made no table to read".to_owned()),
+        };
+        row.cell(
+            "joiner reads the lab's table",
+            verdict_cell(&table_verdict(&saw), String::new),
+        );
+        return Ok(saw);
+    }
+    let from = g.clock_ms()?;
+    let seed_me = as_home(&g.aterm, &h.seed);
+    let mut repairs: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut refused = None;
+    let mut last = TableSaw {
+        seed: Err("never read".to_owned()),
+        joiner: Err("never read".to_owned()),
+    };
+    let equal = within_hang(|| {
+        let said = g.run(&repair(helper, &h.joiner, &h.seed), STEP)?;
+        match said.lines().find_map(read_repair) {
+            Some(fields) => repairs.push(fields),
+            None => refused = Some(squeeze(said.trim(), 200)),
+        }
+        last = TableSaw {
+            seed: read_table(&g.run(&table_now(&seed_me), STEP)?),
+            joiner: read_table(&g.run(&table_now(me), STEP)?),
+        };
+        Ok(table_verdict(&last).is_empty().then_some(()))
+    })?;
+    let read_at = match equal {
+        Some(()) => Some(g.clock_ms()?),
+        None => None,
+    };
+    row.cell(
+        "joiner's Commons standing",
+        or_missing(
+            repairs.first().and_then(|r| r.get("standing").cloned()),
+            Value::Text,
+            &format!(
+                "no repair ran: {}",
+                refused.as_deref().unwrap_or("it printed nothing")
+            ),
+        ),
+    );
+    let sum = |key: &str| -> u64 {
+        repairs
+            .iter()
+            .filter_map(|r| r.get(key)?.parse::<u64>().ok())
+            .sum()
+    };
+    row.cell(
+        "repairs to the joiner",
+        Value::Text(format!(
+            "{} run(s) of {REPAIR_ROUNDS} rounds: {} control record(s), {} table operation(s), \
+             {} historical key(s){}",
+            repairs.len(),
+            sum("control"),
+            sum("rows"),
+            sum("keys"),
+            refused
+                .as_deref()
+                .map_or_else(String::new, |why| format!("; last refusal: {why}"))
+        )),
+    );
+    row.cell(
+        "In to the joiner's table",
+        or_missing(
+            since(read_at, Some(from)),
+            Value::Ms,
+            &format!("not the seed's after {} s", HANG.as_secs()),
+        ),
+    );
+    row.cell(
+        "ask to the joiner's table",
+        or_missing(
+            since(read_at, asked),
+            Value::Ms,
+            "not read, or no ask start",
+        ),
+    );
+    row.cell(
+        "joiner reads the lab's table",
+        verdict_cell(&table_verdict(&last), || match &last.joiner {
+            Ok(t) => format!(
+                "epoch {}, {} row(s), {} with a password, digest {}… equal to the seed's",
+                t.epoch,
+                t.rows,
+                t.with_password,
+                prefix(&t.digest)
+            ),
+            Err(_) => String::new(),
+        }),
+    );
+    Ok(last)
 }
 
 /// `vault-phrase` (the module docs).
@@ -1500,7 +1891,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
         service,
     };
     let service = lab.service.as_str();
-    let served = setup(g, &h, &record, &lab, row)?;
+    let (served, seeded) = setup(g, &h, &record, &lab, row)?;
     let me = as_joiner(&g.aterm, joiner, service);
 
     // The member's registration, heard in the guest before the joiner browses, and nothing else
@@ -1584,28 +1975,19 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
         or_missing(since(Some(shown.at), asked), Value::Ms, "no ask start"),
     );
 
-    // The phrase typed at the joiner's prompt, as a person types what the member shows. Its
-    // `wait_for_allow` has no deadline of its own, so the driver's limit is the hang detector.
+    // The phrase typed with the join, as a person types what the member shows; the driver's
+    // limit is the hang detector.
     let (join, join_out) = g.drive_within(
         "phrase-join",
         &format!("NUX_PHRASE={}", crate::util::shell_quote(&shown.words)),
-        &join_cmd(&me),
+        &join_cmd(&me, &lab.listen),
         HANG,
     )?;
     drive_cells_within(row, "join: ", &join, HANG);
-    let typed = join
-        .prompts
-        .iter()
-        .find(|(_, _, text)| text.contains("The phrase"))
-        .zip(join.start_epoch_ms)
-        .map(|(p, start)| start.saturating_add(p.0));
+    let typed = join.start_epoch_ms;
     row.cell(
         "ask to the phrase typed",
-        or_missing(
-            since(typed, asked),
-            Value::Ms,
-            "the joiner asked for no phrase",
-        ),
+        or_missing(since(typed, asked), Value::Ms, "the join did not start"),
     );
     // Its `Joined ALab` line (`Allowed into ALab` while the vault lists it as pending), else its
     // last refusal: never another line, as the terminal echoed the phrase on the prompt's.
@@ -1677,6 +2059,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
             last
         }
     };
+    let table = joiner_table(g, &h, &helper, &me, seeded, asked, row)?;
     let desk = read_desk(&g.read(&record)?);
     row.cell(
         "member: let in",
@@ -1798,6 +2181,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
         allowed_by,
         files,
         standing,
+        table,
         service: service.to_owned(),
         guest,
         member_at: lab.listen.clone(),
@@ -1828,9 +2212,10 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     row.cell(
         "enrolled by the runtime",
         Value::Missing(
-            "open: the member enrols through the guest helper's in-process exchange over \
-             loopback; a Commons runtime on the guest's network would beacon on the live \
-             fleet's group and port (module docs)"
+            "open: the member enrols, and the joiner's tables move, through the guest helper's \
+             in-process exchange over loopback; a Commons runtime on the guest's network would \
+             beacon on the live fleet's group and port, and two homes in one guest share its \
+             address, whose beacons a runtime drops as its own (module docs)"
                 .into(),
         ),
     );
@@ -1853,7 +2238,8 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
             "acceptance",
             Value::Text(format!(
                 "pass: found by its browse of {service}, allowed by {MEMBER_NAME}, {n} of {n} \
-                 files the seed's, In, nothing beyond the guest",
+                 files the seed's, In, the lab's table the seed's with its password, nothing \
+                 beyond the guest",
                 n = CREDENTIALS.len()
             )),
         );
@@ -1920,6 +2306,10 @@ mod tests {
                 })
                 .collect(),
             standing: Standing::In,
+            table: TableSaw {
+                seed: Ok(table_read()),
+                joiner: Ok(table_read()),
+            },
             service: LAB.into(),
             guest: ["127.0.0.1", "::1", "fe80::1", "192.168.64.5"]
                 .iter()
@@ -1947,6 +2337,146 @@ mod tests {
                 .map(|s| ((*s).to_owned(), Ok(Split::default())))
                 .collect(),
         }
+    }
+
+    /// The lab's one-row table as either identity reads it once the tables moved.
+    fn table_read() -> TableRead {
+        TableRead {
+            complete: true,
+            epoch: "1a2b3c4d".into(),
+            rows: 1,
+            with_password: 1,
+            digest: "9f".repeat(32),
+        }
+    }
+
+    /// What `table_now` prints: the view (compact JSON, every password masked) and the digest.
+    const TABLE_OUT: &str = "{\"complete\":true,\"emails\":[{\"ad\":\"ad-0123456789abcdef\",\"password\":\"\u{2022}\u{2022}\"}],\"table\":\"emails\"}\n--nux-table--\n{\"digest\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"epoch\":\"1a2b3c4d\",\"rows\":1,\"table\":\"emails\",\"with_password\":1}\n";
+
+    #[test]
+    fn a_table_read_is_its_view_and_its_digest_value_free() {
+        assert_eq!(read_table(TABLE_OUT), Ok(table_read()));
+        // A digest refusal, a view that is not one, and a run that printed no mark each say why.
+        let no_key = TABLE_OUT.replace(
+            &TABLE_OUT[TABLE_OUT.find("--nux-table--\n").unwrap() + 14..],
+            "aterm db: this Mac holds no [everyone] key, so the table cannot be digested\n",
+        );
+        let why = read_table(&no_key).unwrap_err();
+        assert!(why.contains("no [everyone] key"), "{why}");
+        let undeclared =
+            "{\"next\":\"x\",\"registry\":\"not imported\",\"why\":\"y\"}\n--nux-table--\n{}";
+        let why = read_table(undeclared).unwrap_err();
+        assert!(why.starts_with("the emails view said"), "{why}");
+        assert!(read_table("aterm: command not found").is_err());
+    }
+
+    #[test]
+    fn a_repair_line_reads_its_words_and_a_refusal_reads_none() {
+        let line = "repaired 1793900000000 standing=enrolled-now rounds=8 control=5 rows=24 keys=2";
+        let fields = read_repair(line).unwrap();
+        assert_eq!(fields["standing"], "enrolled-now");
+        assert_eq!(fields["rows"], "24");
+        assert_eq!(fields["at"], "1793900000000");
+        assert_eq!(
+            read_repair("aterm-lab-guest: /j is pending in Commons"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_whose_joiner_does_not_read_the_labs_table_fails() {
+        assert_eq!(table_verdict(&passing().table), Vec::<String>::new());
+        let with = |seed: Result<TableRead, String>, joiner: Result<TableRead, String>| {
+            let mut saw = passing();
+            saw.table = TableSaw { seed, joiner };
+            verdict(&saw)
+        };
+        let t = table_read;
+        // Another digest under the same epoch: the joiner holds another table.
+        let other = TableRead {
+            digest: "00".repeat(32),
+            ..t()
+        };
+        assert_eq!(
+            with(Ok(t()), Ok(other)),
+            [
+                "the joiner's table is not the seed's (1 row(s), 1 with a password, digest \
+              00000000…; the seed's 1, 1, 9f9f9f9f…)"
+            ]
+        );
+        // The same digest text under another epoch proves nothing: unproven, never a match.
+        let moved = TableRead {
+            epoch: "ffffffff".into(),
+            ..t()
+        };
+        assert_eq!(
+            with(Ok(t()), Ok(moved)),
+            [
+                "the joiner digested under epoch ffffffff, the seed under 1a2b3c4d, so the tables \
+              are unproven"
+            ]
+        );
+        let partial = TableRead {
+            complete: false,
+            ..t()
+        };
+        assert_eq!(
+            with(Ok(t()), Ok(partial)),
+            ["the joiner's table history is not complete"]
+        );
+        // A seed table with no password, or no row, cannot show the joiner opening one.
+        let bare = TableRead {
+            with_password: 0,
+            ..t()
+        };
+        assert_eq!(
+            with(Ok(bare.clone()), Ok(bare)),
+            ["the seed's table holds no password, so the joiner opening one is unproven"]
+        );
+        assert_eq!(
+            with(Ok(t()), Err("no [everyone] key".into())),
+            ["the joiner's table did not read: no [everyone] key"]
+        );
+        assert_eq!(
+            with(
+                Err("the seed made no table: import".into()),
+                Err("none".into())
+            ),
+            [
+                "the seed's table did not read: the seed made no table: import",
+                "the joiner's table did not read: none"
+            ]
+        );
+        // NEGATIVE CONTROL (2026-11-05): with the epoch arm removed from `table_verdict`, the
+        // `moved` case above passes (left: []), as a digest compared across epochs would.
+    }
+
+    #[test]
+    fn the_seeds_sheet_holds_no_password_and_its_password_never_reaches_argv() {
+        let made = sheet("/n/phrase-seed");
+        assert!(made.contains("umask 077"), "{made}");
+        assert!(made.contains("/n/phrase-seed/sheet/emails.csv"), "{made}");
+        assert!(
+            !made.contains("/n/phrase-seed/seed/"),
+            "never the published folder: {made}"
+        );
+        assert!(made.contains("Email Address,Status"), "{made}");
+        assert!(
+            !made.contains("Password"),
+            "the sheet's flag column is left out: {made}"
+        );
+        let sealed = seal("/A/aterm", "/n/phrase-seed");
+        assert!(
+            sealed.contains("password --stdin < /n/phrase-seed/sheet/pw"),
+            "the value comes on stdin from its file: {sealed}"
+        );
+        assert!(import_table("/A/aterm", "/n/phrase-seed").contains(
+            "HOME=/n/phrase-seed /A/aterm db alab import --emails /n/phrase-seed/sheet/emails.csv --apply"
+        ));
+        assert_eq!(
+            repair("/n/aterm-lab-guest", "/n/j", "/n/s"),
+            "/usr/bin/env HOME=/n/j /n/aterm-lab-guest repair /n/j /n/s 8 /n/s 2>&1"
+        );
     }
 
     #[test]
@@ -2516,31 +3046,23 @@ mod tests {
              gh_access_token_alabsystems ai-accounts.csv"
         );
 
-        // The prompt `aterm members join` prints (`members_cli.rs`'s `read_phrase`), answered
-        // with `$NUX_PHRASE` before any rule that answers Enter.
-        let drive = super::super::DRIVE;
-        let rule = drive
-            .lines()
-            .find(|l| l.contains("$phrase }"))
-            .expect("a rule answers with the phrase");
-        let pattern = rule
-            .trim()
-            .strip_prefix("-re {")
-            .and_then(|r| r.split_once("} {"))
-            .map(|(p, _)| p)
-            .unwrap();
-        let re = aterm_regex::Regex::new(pattern).unwrap();
-        assert!(re.is_match("The phrase nux-seed shows: "), "{pattern}");
-        assert!(!re.is_match("Vault join password: "), "{pattern}");
-        let at = |needle: &str| drive.find(needle).unwrap();
-        assert!(at("$phrase }") < at("[Pp]assword"), "{drive}");
-        assert!(drive.contains("set phrase $env(NUX_PHRASE)"), "{drive}");
+        // The seed founds the lab as the other labs do, into a new file beside its homes.
+        assert_eq!(
+            genesis("/n/helper", "/n/seed"),
+            "/usr/bin/env HOME=/n/seed /n/helper genesis /n/seed /n/seed/genesis.v2"
+        );
+        assert_eq!(
+            genesis_said("genesis 1793898071123 members=2 digest=3ba9f999\n"),
+            "2 members, digest 3ba9f999"
+        );
+        assert!(genesis_said("x: genesis: no vault configured").starts_with("said "));
     }
 
     /// Every command of the joiner's (its ask, its join, its subscriber, its status) runs with
-    /// `ATERM_LAB_MEMBER_SERVICE` naming the run's lab service and is named no member, so each
-    /// finds the member by its own browse of that service, never of `_alab._tcp`; the seed's
-    /// commands carry neither.
+    /// `ATERM_LAB_MEMBER_SERVICE` naming the run's lab service, so each that browses finds the
+    /// member by its own browse of that service, never of `_alab._tcp`; the seed's commands
+    /// carry neither. Only the join names the member (`--at`, the address it listens at), since
+    /// the ask's browse already found it (the module doc says why).
     ///
     /// NEGATIVE CONTROL (2026-10-29): `as_joiner` without its `ATERM_LAB_MEMBER_SERVICE=` word
     /// (the joiner then browses the live fleet's `_alab._tcp`) fails here at the ask.
@@ -2548,7 +3070,7 @@ mod tests {
     fn every_command_of_the_joiners_browses_the_runs_lab_service_alone() {
         let me = as_joiner("/A/aterm", "/n/joiner", LAB);
         let ask = ask_cmd(&me);
-        let join = join_cmd(&me);
+        let join = join_cmd(&me, "192.168.64.17:7486");
         let watching = watch(&me, "/n/joiner");
         let status = status_now(&me);
         for cmd in [&ask, &join, &watching, &status] {
@@ -2558,10 +3080,17 @@ mod tests {
                     && words.contains(&"HOME=/n/joiner"),
                 "{cmd}"
             );
-            assert!(!words.contains(&"--at"), "{cmd}");
+            // The ask browses; only the join names the member, at the address it listens at.
+            assert_eq!(words.contains(&"--at"), cmd == &join, "{cmd}");
         }
         assert!(ask.ends_with(" members join --no-wait"), "{ask}");
-        assert!(join.ends_with(" members join"), "{join}");
+        // The phrase reaches the join as its argument from the joiner's own shell, so the lane's
+        // command line names the variable, never a phrase.
+        assert!(join.starts_with("/bin/sh -c '"), "{join}");
+        assert!(
+            join.ends_with(" members join --at 192.168.64.17:7486 \"$NUX_PHRASE\"'"),
+            "{join}"
+        );
         assert_eq!(
             watching,
             "(/usr/bin/env HOME=/n/joiner ATERM_LAB_MEMBER_SERVICE=_alab-lab-k3x9q2._tcp \

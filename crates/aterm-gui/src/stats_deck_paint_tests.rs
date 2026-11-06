@@ -6,13 +6,14 @@
 use super::*;
 use crate::stats_paint::HitKind;
 use crate::stats_paint::tests::{job_row, zombies};
+use crate::tray_raster::stroke_px;
 use aterm_vitals::explain::WhyFacts;
 use aterm_vitals::explain::fixtures::{self, spotlight_1032};
 use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
-    Hog, LinkKind, LinkSample, MemSample, MemView, NoFigure, PlanFact, Pressure, ProcLimits,
-    ProcScope, ScopeFig, Series, TabView, Thermal, Throttle, VolumeSample,
+    Hog, LinkKind, LinkSample, MemSample, MemView, NoFigure, PlanFact, Pressure, ProcScope,
+    ScopeFig, Series, TabView, TaskRoom, Thermal, Throttle, VolumeSample,
 };
 use aterm_vitals::{Cell, Filling, Rates, Reading, TrendView};
 
@@ -189,7 +190,7 @@ pub(crate) fn readings_of(ring: &[Cell], at: i64) -> Arc<[Reading]> {
             Some(Reading {
                 at_ms: t,
                 v: cell.mean?,
-                over: cell.over,
+                over: cell.over_n > 0.0,
             })
         })
         .collect()
@@ -212,10 +213,12 @@ fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig)
         .zip(over)
         .map(|(h, &o)| {
             let v = h.map(|h| h * cap);
+            let n = if v.is_some() { 10.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                over: o && v.is_some(),
+                n,
+                over_n: if o { n } else { 0.0 },
             }
         })
         .collect();
@@ -589,14 +592,12 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     };
     procs.heat_now = procs.now.zip(procs.capacity).map(|(n, c)| (n / c) as f32);
     s.resources[6] = procs;
-    f.pid_counts = if worst {
-        (Some(999_999), Some(999_999))
-    } else {
-        (Some(897), Some(578))
-    };
-    f.proc_limits = ProcLimits {
-        system: Some(if worst { 9_999_999 } else { 16_000 }),
-        per_user: Some(if worst { 4_194_304 } else { 10_666 }),
+    f.room = TaskRoom {
+        procs: Some(if worst { 999_999 } else { 897 }),
+        procs_max: Some(if worst { 9_999_999 } else { 16_000 }),
+        user_procs: Some(if worst { 999_999 } else { 578 }),
+        user_procs_max: Some(if worst { 4_194_304 } else { 10_666 }),
+        ..TaskRoom::default()
     };
     let view = match sc {
         Scene::Worst | Scene::Costly => jobs(
@@ -1922,9 +1923,11 @@ fn a_gap_is_never_drawn_as_step_zero() {
                             );
                         }
                     }
+                    // The outline inks the box's own edge px, the px its plate covers read.
                     let outline = laid.prims.iter().any(|p| {
-                        matches!(p, DrawPrim::Stroke { x: sx, y: sy, color, width, .. }
-                            if *sx == x + 0.5 && *sy == y + 0.5 && *color == hollow && *width == 1.0)
+                        matches!(*p, DrawPrim::Stroke { x: sx, y: sy, w: sw, h: sh, radius, color, width }
+                            if color == hollow && width == 1.0
+                                && stroke_px((sx, sy, sw, sh), radius, width) == (x, y, cw, h))
                     });
                     let tick = laid.prims.iter().any(|p| {
                         matches!(p, DrawPrim::Panel { x: tx, y: ty, w: tw, h: th, fill, .. }
@@ -1950,38 +1953,79 @@ fn a_gap_is_never_drawn_as_step_zero() {
     );
 }
 
-/// The scale-band gridlines (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4: the gridline in the
-/// gap before each band's first box marks every size's start): on each preset, at the narrowest
-/// width each form lays it, at 1× and 2×, one 1 px column in the grid ink stands in the gap
-/// before every band's first box past the live box, the live box's own edge included, at that
-/// box's left edge less the gap, down every history surface unbroken (no row captions its strip,
-/// `docs/DESIGN-stats-deck-flow-2026-11-02.md` §3), and none stands elsewhere on the strip.
-/// The bands come from the spec, so neighbouring bands whose boxes share a width keep theirs:
-/// the 6 h preset's 10 s and 1 min blocks, the 4 h one's 1 s, 10 s and 1 min blocks and its
-/// 10 min and 1 h ones, and the 6 min one's 1 s and 10 s blocks.
+/// The strip presets with the widths each lays from, pt ([`Strip::spec_for`]).
+const PRESET_RANGES: [(MultiScaleSpec, f64, f64); 4] = [
+    (MultiScaleSpec::FULL_6H, 239.0, 1600.0),
+    (MultiScaleSpec::FOLD_4H, 129.0, 238.0),
+    (MultiScaleSpec::COMPACT_6M, 79.0, 128.0),
+    (MultiScaleSpec::MINI_1M, 59.0, 78.0),
+];
+
+/// `form` at `w` pt draws only its ground.
+fn ground_only(w: f64, form: DeckForm, m: &FaceMetrics) -> bool {
+    match form {
+        DeckForm::Full => plan::plan_full(w, m).ground_only,
+        DeckForm::Folded => plan::plan_folded(w, m).ground_only,
+    }
+}
+
+/// A strip `w` pt wide from `x`, its preset the one its width takes.
+fn strip_of(x: f64, w: f64) -> Strip {
+    Strip {
+        x,
+        cols: 1,
+        period_s: 10,
+        pitch: w + 1.0,
+        cell: w,
+        spec: Strip::spec_for(w),
+    }
+}
+
+/// Every row's history area on `w` pt of `form` at `s`, device px `(x0, y0, x1, y1)`: the strip's
+/// span, from `above` px over the row's top (its over caps) to its foot.
+fn strip_areas(
+    w: f64,
+    s: f64,
+    form: DeckForm,
+    m: &FaceMetrics,
+    above: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    strips(w, form, m)
+        .into_iter()
+        .flat_map(|(strip, rows, at)| {
+            at.into_iter().map(move |(r, _)| {
+                let y = px(rows.top(r), s);
+                (
+                    px(strip.x, s),
+                    y - above,
+                    px(strip.end(), s),
+                    y + px(rows.cell, s),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The gates (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): on each preset, at the first width
+/// each form lays it, at 1× and 2×, two boxes of one band stand 1 pt apart (1 device px at 1×, 2
+/// at 2×) and two bands 3 pt (3 px at 1×, 6 at 2×), whatever [`BOX_GAP`] and [`plan::GATE`]
+/// say; nothing but the card's ground draws in a gate down any row's history; and no column in
+/// the grid ink stands on a strip. The record's gridlines
+/// (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4) are retired: the gate's ground tells the
+/// bands apart.
 #[test]
-fn a_gridline_stands_before_every_bands_first_box() {
+fn every_gate_is_a_three_point_ground_gap_and_no_gridline_is_drawn() {
     let m = FaceMetrics::helvetica_neue();
     let snap = scene(Scene::Calm);
     assert!(
-        DECK_RESOURCES
-            .iter()
-            .all(|&res| words::strip_words(res, &snap).is_none()),
-        "CONTROL: every Calm row draws its history"
+        snap.time_gaps.is_empty() && snap.strip_events.is_empty(),
+        "CONTROL: no gap mark or event line crosses a gate"
     );
-    let grid = rgba(super::tests::dark_inks().grid, 0xFF);
-    let presets = [
-        MultiScaleSpec::FULL_6H,
-        MultiScaleSpec::FOLD_4H,
-        MultiScaleSpec::COMPACT_6M,
-        MultiScaleSpec::MINI_1M,
-    ];
-    let size = |ms: i64| match ms {
-        ms if ms >= 3_600_000 => format!("{} h", ms / 3_600_000),
-        ms if ms >= 60_000 => format!("{} min", ms / 60_000),
-        ms => format!("{} s", ms / 1_000),
-    };
-    let (mut failed, mut columns, mut laid_presets) = (Vec::new(), [0_usize; 4], [false; 4]);
+    let inks = super::tests::dark_inks();
+    let (ground, grid) = (rgba(inks.ground, 0xFF), rgba(inks.grid, 0xFF));
+    assert_ne!(grid, ground, "CONTROL: a gridline would show on the ground");
+    let presets = PRESET_RANGES.map(|(spec, ..)| spec);
+    let (mut failed, mut gates, mut laid_presets) = (Vec::new(), [0_usize; 4], [false; 4]);
     for form in [DeckForm::Full, DeckForm::Folded] {
         let mut seen = [false; 4];
         for w in sweep_widths() {
@@ -2008,136 +2052,113 @@ fn a_gridline_stands_before_every_bands_first_box() {
                 let words = DeckWords::new(&input, &m);
                 let laid = lay(&geom(w, s, form), &input, &words, &m, true);
                 for (bi, (strip, rows, at)) in strips(w, form, &m).into_iter().enumerate() {
-                    let at_str = format!(
-                        "{form:?} {w} pt at {s}×, strip {bi} ({} back)",
-                        size(strip.spec.horizon_ms())
-                    );
-                    let (x0, x1) = (px(strip.x, s), px(strip.end(), s));
-                    // Read the rendered history surfaces: a strip's note can include an overflow
-                    // cap above the row's history.
-                    let histories: Vec<_> = at
-                        .iter()
-                        .map(|&(r, res)| {
-                            let surfaces: Vec<_> = laid
-                                .boxes
-                                .iter()
-                                .filter(|b| {
-                                    b.kind == BoxKind::Strip
-                                        && b.r[0] == strip.x
-                                        && b.r[2] == strip.end()
-                                        && b.r[3] > rows.top(r)
-                                        && b.r[3] <= rows.top(r + 1)
-                                })
-                                .collect();
-                            assert_eq!(
-                                surfaces.len(),
-                                1,
-                                "CONTROL {at_str}: {res:?} has its whole time axis"
-                            );
-                            let surface = surfaces[0];
-                            let top = surface.r[1].max(rows.top(r));
-                            assert!(
-                                px(surface.r[3], s) > px(top, s),
-                                "CONTROL {at_str}: {res:?} has positive history height"
-                            );
-                            (r, top, surface.r[3])
-                        })
-                        .collect();
-                    let y0 = px(rows.top(0), s);
-                    let y1 = px(histories.last().expect("resource rows").2, s);
-                    let coverage = vec![1_usize; (y1 - y0) as usize];
-                    let gap = px(1.0, s).max(1.0);
+                    let at_str = format!("{form:?} {w} pt at {s}×, strip {bi}");
                     let rects = multi_scale_slot_rects(&strip, s, 0.0);
                     let slots = strip.spec.slots();
-                    let left = |ix: usize| rects.iter().find(|r| r.0 == ix).map(|r| (r.1, r.2));
-                    // Each band's first box past the live box, read off the spec's bands.
-                    let mut want = Vec::new();
-                    let mut first = 0;
-                    for band in strip.spec.bands {
-                        let ix = first;
-                        first += usize::from(band.slots);
-                        if band.live_now || band.slots == 0 {
-                            continue;
-                        }
-                        let slot = slots[ix];
-                        assert!(
-                            !slot.is_live_now && slot.age_hi_ms - slot.age_lo_ms == band.period_ms,
-                            "CONTROL {at_str}: slot {ix} is the {} band's first",
-                            size(band.period_ms)
-                        );
-                        let (Some((bx, _)), Some((prev_x, prev_w))) =
-                            (left(ix), ix.checked_sub(1).and_then(left))
-                        else {
-                            panic!("CONTROL {at_str}: slots {ix} and the one before it are laid");
-                        };
-                        let gx = bx - gap;
-                        assert!(
-                            prev_x + prev_w <= gx && gx + 1.0 <= bx,
-                            "CONTROL {at_str}: {gx} px is in the gap before slot {ix}"
-                        );
-                        want.push((gx, band.period_ms));
-                    }
-                    columns[pi] += want.len();
-                    let mut drawn: Vec<(f32, f32, f32)> = laid
-                        .prims
+                    let (x0, x1) = (px(strip.x, s), px(strip.end(), s));
+                    let ys: Vec<(f32, f32)> = at
                         .iter()
-                        .filter_map(|p| match *p {
-                            DrawPrim::Panel {
-                                x, y, w, h, fill, ..
-                            } if fill == grid
-                                && w == 1.0
-                                && (x0..x1).contains(&x)
-                                && y < y1
-                                && y + h > y0 =>
-                            {
-                                Some((x, y, h))
-                            }
-                            _ => None,
+                        .map(|&(r, _)| {
+                            let y = px(rows.top(r), s);
+                            (y, y + px(rows.cell, s))
                         })
                         .collect();
-                    for (gx, period) in want {
-                        let mut actual = vec![0_usize; coverage.len()];
-                        let mut found = false;
-                        drawn.retain(|&(x, y, h)| {
-                            if x != gx {
-                                return true;
-                            }
-                            found = true;
-                            if y < y0
-                                || y + h > y1
-                                || h <= 0.0
-                                || y.fract() != 0.0
-                                || h.fract() != 0.0
-                            {
-                                failed.push(format!(
-                                    "{at_str}: gridline at {gx} px has invalid span {y}..{}",
-                                    y + h
-                                ));
-                            } else {
-                                for n in &mut actual[(y - y0) as usize..(y + h - y0) as usize] {
-                                    *n += 1;
-                                }
-                            }
-                            false
-                        });
-                        if !found {
+                    for pair in rects.windows(2) {
+                        let ((i, ax, aw, _), (j, bx, ..)) = (pair[0], pair[1]);
+                        let a_end = ax + aw;
+                        let gate = slots[i].band != slots[j].band;
+                        // The rule's own widths, pt, not the constants that lay them.
+                        let gap_pt: f64 = if gate { 3.0 } else { 1.0 };
+                        let want = (gap_pt * s) as f32;
+                        if bx - a_end != want {
                             failed.push(format!(
-                                "{at_str}: no gridline at {gx} px, before the {} band's first box",
-                                size(period)
+                                "{at_str}: slots {i} and {j} stand {} px apart, not {want}",
+                                bx - a_end
                             ));
+                        }
+                        if !gate {
                             continue;
                         }
-                        if actual != coverage {
+                        gates[pi] += 1;
+                        for &(y0, y1) in &ys {
+                            for p in &laid.prims {
+                                let (qx, qy, qw, qh, fill) = match *p {
+                                    DrawPrim::Panel {
+                                        x, y, w, h, fill, ..
+                                    } => (x, y, w, h, fill),
+                                    DrawPrim::Stroke {
+                                        x,
+                                        y,
+                                        w,
+                                        h,
+                                        radius,
+                                        width,
+                                        color,
+                                    } => {
+                                        let (x, y, w, h) = stroke_px((x, y, w, h), radius, width);
+                                        (x, y, w, h, color)
+                                    }
+                                    DrawPrim::Dashed {
+                                        x,
+                                        y,
+                                        w,
+                                        h,
+                                        width,
+                                        color,
+                                        ..
+                                    } => (x, y, w.max(width), h.max(width), color),
+                                    _ => continue,
+                                };
+                                if fill != ground
+                                    && qx < bx
+                                    && qx + qw > a_end
+                                    && qy < y1
+                                    && qy + qh > y0
+                                {
+                                    failed.push(format!(
+                                        "{at_str}: {p:?} draws in the gate {a_end}..{bx} px"
+                                    ));
+                                }
+                            }
+                            // The box after the gate: its plate, or an unread box's outline.
+                            let boxed = laid.prims.iter().any(|p| match *p {
+                                DrawPrim::Panel { x, y, fill, .. } => {
+                                    x == bx && y == y0 && fill != ground
+                                }
+                                DrawPrim::Stroke {
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                    radius,
+                                    width,
+                                    ..
+                                } => {
+                                    let (sx, sy, _, _) = stroke_px((x, y, w, h), radius, width);
+                                    sx == bx && sy == y0
+                                }
+                                _ => false,
+                            });
+                            if !boxed {
+                                failed.push(format!(
+                                    "CONTROL {at_str}: no box at {bx} px, after the gate"
+                                ));
+                            }
+                        }
+                    }
+                    for p in &laid.prims {
+                        if let DrawPrim::Panel {
+                            x, y, w, h, fill, ..
+                        } = *p
+                            && fill == grid
+                            && (x0..x1).contains(&x)
+                            && ys.iter().any(|&(y0, y1)| y < y1 && y + h > y0)
+                        {
                             failed.push(format!(
-                                "{at_str}: gridline at {gx} px does not cover every history \
-                                 exactly once: actual {actual:?}, wanted {coverage:?}, rows \
-                                 {y0}..{y1}"
+                                "{at_str}: a {w} px column in the grid ink at {x} px"
                             ));
                         }
                     }
-                    failed.extend(drawn.into_iter().map(|(x, ..)| {
-                        format!("{at_str}: a gridline at {x} px, before no band's first box")
-                    }));
                 }
             }
             if seen.iter().all(|&s| s) {
@@ -2150,11 +2171,845 @@ fn a_gridline_stands_before_every_bands_first_box() {
         "CONTROL: some form lays every preset ({laid_presets:?})"
     );
     assert!(
+        gates.iter().all(|&g| g > 0),
+        "CONTROL: every preset's gates were read ({gates:?})"
+    );
+    assert!(
         failed.is_empty(),
-        "{} faults over {columns:?} band starts (6 h, 4 h, 6 min, 1 min):\n{}",
+        "{} faults over {gates:?} gates (6 h, 4 h, 6 min, 1 min):\n{}",
         failed.len(),
         failed.join("\n")
     );
+}
+
+/// The header's ticks and the boxes come from one geometry ([`Strip::box_edges`]): at every
+/// width a plan lays, at 1× and 2×, every band's first age ([`MultiScaleSpec::ticks`]) puts its
+/// tick ([`tick_px`] of [`Strip::x_at_age_ms`]) inside the gate before that band's first box, a
+/// pixel at most off its middle; and every tick a laid header draws stands in a gate or at the
+/// strip's old end. CONTROL: an age inside a box puts its x inside that box, not a gate.
+#[test]
+fn header_ticks_and_box_rects_come_from_one_geometry() {
+    let m = FaceMetrics::helvetica_neue();
+    let (mut failed, mut ticks) = (Vec::new(), 0_usize);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in sweep_widths().step_by(3) {
+            if ground_only(w, form, &m) {
+                continue;
+            }
+            for (strip, ..) in strips(w, form, &m) {
+                let slots = strip.spec.slots();
+                for s in [1.0, 2.0] {
+                    let rects = multi_scale_slot_rects(&strip, s, 0.0);
+                    let at_str = format!("{form:?} {w} pt at {s}×, {} pt strip", strip.width());
+                    for &(age_ms, _) in strip.spec.ticks {
+                        let Some(j) = slots.iter().position(|sl| sl.age_hi_ms == age_ms) else {
+                            continue;
+                        };
+                        if j + 1 >= rects.len() {
+                            continue;
+                        }
+                        let Some(x) = strip.x_at_age_ms(age_ms) else {
+                            failed.push(format!("{at_str}: no x for {age_ms} ms"));
+                            continue;
+                        };
+                        let (tx, tw) = tick_px(x, s);
+                        let (a, b) = (rects[j].1 + rects[j].2, rects[j + 1].1);
+                        ticks += 1;
+                        if !(tx >= a && tx + tw <= b && ((tx - a) - (b - tx - tw)).abs() <= 1.0) {
+                            failed.push(format!(
+                                "{at_str}: the {age_ms} ms tick at {tx}+{tw} px, its gate {a}..{b}"
+                            ));
+                        }
+                        let (_, bx, bw, _) = rects[j + 1];
+                        let lo = slots[j + 1].age_lo_ms;
+                        let mid = lo + (slots[j + 1].age_hi_ms - lo) / 2;
+                        let inside = strip.x_at_age_ms(mid).map(|x| (x * s) as f32);
+                        assert!(
+                            bw < 4.0 || inside.is_some_and(|ix| ix > bx && ix < bx + bw),
+                            "CONTROL {at_str}: {mid} ms is inside its box {bx}+{bw}: {inside:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let snap = scene(Scene::Calm);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for (w, s) in [(1119.0, 2.0), (1119.0, 1.0), (560.0, 1.0), (300.0, 2.0)] {
+            let input = scene_input(&snap, form);
+            let words = DeckWords::new(&input, &m);
+            let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+            let Some(head) = laid.head.as_ref() else {
+                continue;
+            };
+            let Some((strip, ..)) = strips(w, form, &m).into_iter().next() else {
+                continue;
+            };
+            let rects = multi_scale_slot_rects(&strip, s, 0.0);
+            let gates: Vec<(f32, f32)> = rects
+                .windows(2)
+                .filter(|p| strip.spec.slots()[p[0].0].band != strip.spec.slots()[p[1].0].band)
+                .map(|p| (p[0].1 + p[0].2, p[1].1))
+                .collect();
+            for tick in &head.ruler {
+                let (tx, tw) = tick_px(tick.x, s);
+                ticks += 1;
+                if !gates.iter().any(|&(a, b)| tx >= a && tx + tw <= b) {
+                    failed.push(format!(
+                        "{form:?} {w} pt at {s}×: the header's {} tick at {tx} px stands in no gate \
+                         {gates:?}",
+                        tick.text
+                    ));
+                }
+            }
+            if let Some(x) = head.time_tick {
+                assert!(
+                    (x - strip.end()).abs() < 1e-9,
+                    "{form:?} {w} pt: the time tick at the strip's old end"
+                );
+            }
+        }
+    }
+    assert!(ticks > 1000, "CONTROL: ticks were read ({ticks})");
+    assert!(
+        failed.is_empty(),
+        "{} faults over {ticks} ticks:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// The rising weights hold at device px (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): from
+/// the one-second band up, no box is narrower than a box of a finer band, at every quarter point
+/// of each preset's range (FULL_6H to 1600 pt), from eight offsets an eighth of a point apart, at
+/// 1× and 2×, and on every strip a plan lays. Edges on a half pixel are where `f32` fractions
+/// rounded both ways ([`Strip::box_edges`]).
+#[test]
+fn from_one_second_up_no_box_is_narrower_than_a_box_of_a_finer_band() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut failed = Vec::new();
+    let mut checked = 0_usize;
+    let mut check = |strip: Strip, s: f64, failed: &mut Vec<String>| {
+        let slots = strip.spec.slots();
+        let mut bands: Vec<(f32, f32)> = vec![(f32::INFINITY, 0.0); strip.spec.bands.len()];
+        for (i, _, w, live) in multi_scale_slot_rects(&strip, s, 0.0) {
+            if live {
+                continue;
+            }
+            let b = &mut bands[usize::from(slots[i].band)];
+            *b = (b.0.min(w), b.1.max(w));
+        }
+        checked += 1;
+        let read: Vec<(usize, (f32, f32))> = bands
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (lo, _))| lo.is_finite())
+            .collect();
+        for (k, &(fine, (_, fine_max))) in read.iter().enumerate() {
+            for &(coarse, (coarse_min, _)) in &read[k + 1..] {
+                if coarse_min < fine_max {
+                    failed.push(format!(
+                        "{} pt from {} at {s}×: band {coarse}'s {coarse_min} px box under band \
+                         {fine}'s {fine_max} px",
+                        strip.width(),
+                        strip.x
+                    ));
+                }
+            }
+        }
+    };
+    for (spec, lo, hi) in PRESET_RANGES {
+        let mut w = lo;
+        while w <= hi {
+            for x in (0..8).map(|k| f64::from(k) / 8.0) {
+                let strip = strip_of(x, w);
+                assert_eq!(strip.spec, spec, "CONTROL: {w} pt lays its preset");
+                for s in [1.0, 2.0] {
+                    check(strip, s, &mut failed);
+                }
+            }
+            w += 0.25;
+        }
+    }
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in sweep_widths() {
+            for (strip, ..) in strips(w, form, &m) {
+                for s in [1.0, 2.0] {
+                    check(strip, s, &mut failed);
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "CONTROL: strips were read ({checked})");
+    failed.dedup();
+    assert!(
+        failed.is_empty(),
+        "{} faults:\n{}",
+        failed.len(),
+        failed[..failed.len().min(40)].join("\n")
+    );
+}
+
+/// A box's column is its mean and its tick its largest reading, on the deck as painted: on every
+/// strip of Full and Folded at 1× and 2×, each read box's column stands on its foot `mean · H`
+/// px tall (at least one), in the heat of its mean; its tick one px tall at `max · H`, in the heat
+/// of its max, where that clears the column by two px, and none where it does not.
+#[test]
+fn a_box_column_is_its_mean_and_its_tick_its_max() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let (mut columns, mut ticks, mut heights) =
+        (0_usize, 0_usize, std::collections::BTreeSet::new());
+    for (form, w, s) in [
+        (DeckForm::Full, 1119.0, 2.0),
+        (DeckForm::Full, 1119.0, 1.0),
+        (DeckForm::Full, 350.0, 1.0),
+        (DeckForm::Folded, 1119.0, 2.0),
+        (DeckForm::Folded, 550.0, 1.0),
+    ] {
+        let input = scene_input(&snap, form);
+        let inks = input.inks;
+        let ic = input.contrast;
+        let words = DeckWords::new(&input, &m);
+        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+        let heat_inks: Vec<[u8; 4]> = inks
+            .heat
+            .iter()
+            .chain(&inks.heat_ic)
+            .map(|&c| rgba(c, 0xFF))
+            .collect();
+        for (strip, rows, at) in strips(w, form, &m) {
+            let rects = multi_scale_slot_rects(&strip, s, 0.0);
+            for (r, res) in at {
+                let row = words
+                    .rows
+                    .iter()
+                    .find(|row| row.res == res)
+                    .expect("its row");
+                if row.strip_text.is_some() {
+                    continue;
+                }
+                let slots = row.multi_scale_slots(&strip);
+                let (y, h) = (px(rows.top(r), s), px(rows.cell, s));
+                for &(i, x, cw, live) in &rects {
+                    let Some(slot) = slots.get(i).filter(|_| !live) else {
+                        continue;
+                    };
+                    let Some(mean) = slot.cell.heat.filter(|_| slot.cell.gap.is_none()) else {
+                        continue;
+                    };
+                    let tag = format!("{form:?} {w} pt at {s}×, {res:?} slot {i}");
+                    let found: Vec<(f32, f32, [u8; 4])> = laid
+                        .prims
+                        .iter()
+                        .filter_map(|p| match *p {
+                            DrawPrim::Panel {
+                                x: qx,
+                                y: qy,
+                                w: qw,
+                                h: qh,
+                                fill,
+                                ..
+                            } if qx >= x
+                                && qx + qw <= x + cw
+                                && qy >= y
+                                && qy + qh <= y + h
+                                && heat_inks.contains(&fill) =>
+                            {
+                                Some((qy, qh, fill))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let want = (mean.max(0.0) * h).round().clamp(1.0, h);
+                    let column = found.iter().find(|f| f.0 + f.1 == y + h);
+                    assert_eq!(
+                        column.map(|c| (c.1, c.2)),
+                        Some((want, rgba(inks.cell_at(mean, ic), 0xFF))),
+                        "{tag}: the column at its mean {mean}"
+                    );
+                    columns += 1;
+                    heights.insert(want as u32);
+                    let tick = found.iter().find(|f| f.1 == 1.0 && f.0 + 1.0 < y + h);
+                    let th = slot
+                        .cell
+                        .max
+                        .filter(|v| v.is_finite())
+                        .map(|v| ((v.max(0.0) * h).round().clamp(1.0, h), v));
+                    match th {
+                        Some((th, v)) if th >= want + 2.0 => {
+                            assert_eq!(
+                                tick.map(|t| (t.0, t.2)),
+                                Some((y + h - th, rgba(inks.cell_at(v, ic), 0xFF))),
+                                "{tag}: the tick at its max {v}"
+                            );
+                            ticks += 1;
+                        }
+                        _ => assert!(
+                            tick.is_none(),
+                            "{tag}: a tick that does not clear: {tick:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        columns > 100 && ticks > 0 && heights.len() >= 3,
+        "CONTROL: {columns} columns of {heights:?} px and {ticks} ticks were read"
+    );
+}
+
+/// The over cap stands outside its box's plate, 1 device px clear of the plate's top and 2 px tall
+/// at 2×, flush and 1 px tall at 1× (A1 §3; the rule's px, not [`skyline::cap_px`]'s), and keeps
+/// at least a device px of ground under the row above (v2 defect 8: a 1× cap touched or entered
+/// it). Row 0's caps stand under the header's axis rail and ticks, which end on one foot: a
+/// device px of ground between at 2×, flush at 1× (A1 §3 as built: the rail cannot rise into the
+/// header words' descenders). On every read box of every strip, every box over, of Full and
+/// Folded at five widths, at 1× and 2×.
+#[test]
+fn the_over_cap_sits_outside_the_plate_and_clear_of_the_row_above() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let mut caps = [0_usize; 2];
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in [1119.0, 700.0, 420.0, 250.0, 180.0] {
+            if ground_only(w, form, &m) {
+                continue;
+            }
+            for s in [1.0, 2.0] {
+                let input = scene_input(&snap, form);
+                let over = rgba(input.inks.over, 0xFF);
+                let mut words = DeckWords::new(&input, &m);
+                for row in &mut words.rows {
+                    row.live_over = 1.0;
+                    for slots in &mut row.multi_scale {
+                        for slot in slots {
+                            slot.cell.over = 1.0;
+                        }
+                    }
+                }
+                let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+                let (clear, cap_h): (f32, f32) = if s > 1.0 { (1.0, 2.0) } else { (0.0, 1.0) };
+                let grid = rgba(input.inks.grid, 0xFF);
+                for (strip, rows, at) in strips(w, form, &m) {
+                    let rects = multi_scale_slot_rects(&strip, s, 0.0);
+                    let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
+                    // The axis rail's foot, where the ticks end too.
+                    let rail = laid.prims.iter().find_map(|p| match *p {
+                        DrawPrim::Panel {
+                            x, y, w, h, fill, ..
+                        } if fill == grid && h == 1.0 && x == sx0 && x + w == sx1 => Some(y + 1.0),
+                        _ => None,
+                    });
+                    let rail = rail.unwrap_or_else(|| {
+                        panic!("CONTROL {form:?} {w} pt at {s}×: the strip's axis rail")
+                    });
+                    for &(r, res) in &at {
+                        let row = words
+                            .rows
+                            .iter()
+                            .find(|row| row.res == res)
+                            .expect("its row");
+                        if row.strip_text.is_some() {
+                            continue;
+                        }
+                        let slots = row.multi_scale_slots(&strip);
+                        let (y, _) = (px(rows.top(r), s), px(rows.cell, s));
+                        // The foot of what stands above and the ground the cap keeps under it.
+                        let above = match r.checked_sub(1) {
+                            Some(ra) => (px(rows.top(ra), s) + px(rows.cell, s), 1.0),
+                            None => (rail, if s > 1.0 { 1.0 } else { 0.0 }),
+                        };
+                        for &(i, x, cw, live) in &rects {
+                            let slot = slots.get(i).copied().unwrap_or_default();
+                            let read = slot.cell.gap.is_none()
+                                && if live {
+                                    row.heat_now.or(slot.cell.heat).is_some()
+                                } else {
+                                    slot.cell.heat.is_some()
+                                };
+                            let tag = format!("{form:?} {w} pt at {s}×, {res:?} slot {i}");
+                            let found: Vec<(f32, f32)> = laid
+                                .prims
+                                .iter()
+                                .filter_map(|p| match *p {
+                                    DrawPrim::Panel {
+                                        x: qx,
+                                        y: qy,
+                                        w: qw,
+                                        h: qh,
+                                        fill,
+                                        ..
+                                    } if fill == over
+                                        && qx >= x
+                                        && qx + qw <= x + cw
+                                        && qy + qh <= y
+                                        && qy >= y - clear - cap_h - 2.0 =>
+                                    {
+                                        Some((qy, qh))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            assert_eq!(found.len(), usize::from(read), "{tag}: {found:?}");
+                            let Some(&(cy, ch)) = found.first() else {
+                                continue;
+                            };
+                            assert_eq!(ch, cap_h, "{tag}: its height");
+                            assert_eq!(cy + ch, y - clear, "{tag}: outside the plate");
+                            let (b, keep) = above;
+                            assert!(
+                                cy >= b + keep,
+                                "{tag}: the cap at {cy} px keeps {} px under what stands above, \
+                                 its foot at {b}, not {keep}",
+                                cy - b
+                            );
+                            caps[usize::from(s > 1.0)] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        caps.iter().all(|&n| n > 100),
+        "CONTROL: caps were read ({caps:?})"
+    );
+}
+
+/// The live box (A1 §3, "Live box"; `ResourceView::live_box`), as the deck paints it: its tick
+/// is the last 10 s's largest reading, one device px tall at `round(peak·H)` from its foot where
+/// that clears the 10 s mean's column by 2 px, not its slot's own max (CONTROL: the slot's max
+/// stands elsewhere and draws nothing); a stale deck mixes the tick toward the ground by 0.55,
+/// as it does the column (CONTROL: a fresh deck draws both in their heat); and a deck whose only
+/// over reading is in a live box's 10 s keys "over max" (CONTROL: with that reading not over, no
+/// key). Row 0's live box, Full and Folded at 1119 pt, at 1× and 2×.
+#[test]
+fn the_live_box_ticks_its_ten_second_peak_dims_it_stale_and_keys_its_over() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let (mean, peak, slot_max) = (0.3_f32, 0.7_f32, 0.95_f32);
+    let w = 1119.0;
+    let mut ticks = 0;
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for s in [1.0, 2.0] {
+            let tag = format!("{form:?} {w} pt at {s}×");
+            let (strip, rows, at) = strips(w, form, &m).swap_remove(0);
+            let res = at[0].1;
+            let (_, x, cw, _) = multi_scale_slot_rects(&strip, s, 0.0)
+                .into_iter()
+                .find(|r| r.3)
+                .expect("the live box");
+            let (y, h) = (px(rows.top(0), s), px(rows.cell, s));
+            let rise = |v: f32| (v * h).round().clamp(1.0, h);
+            assert!(
+                rise(peak) >= rise(mean) + 2.0 && rise(slot_max) != rise(peak),
+                "CONTROL {tag}: the peak clears the column and the slot's max stands apart"
+            );
+            let inset = if cw >= 5.0 { 1.0 } else { 0.0 };
+            let tick_at = |prims: &[DrawPrim], v: f32| -> Vec<[u8; 4]> {
+                prims
+                    .iter()
+                    .filter_map(|p| match *p {
+                        DrawPrim::Panel {
+                            x: qx,
+                            y: qy,
+                            w: qw,
+                            h: qh,
+                            fill,
+                            ..
+                        } if qh == 1.0
+                            && qx == x + inset
+                            && qw == cw - 2.0 * inset
+                            && qy == y + h - rise(v) =>
+                        {
+                            Some(fill)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let column_at = |prims: &[DrawPrim]| -> Vec<[u8; 4]> {
+                let ch = rise(mean);
+                prims
+                    .iter()
+                    .filter_map(|p| match *p {
+                        DrawPrim::Panel {
+                            x: qx,
+                            y: qy,
+                            w: qw,
+                            h: qh,
+                            fill,
+                            ..
+                        } if qx == x && qw == cw && qy == y + h - ch && qh == ch => Some(fill),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let paint = |live: crate::stats_live::DeckLive, over: f32| {
+                let mut input = scene_input(&snap, form);
+                input.live = live;
+                let mut words = DeckWords::new(&input, &m);
+                for row in &mut words.rows {
+                    row.live_over = 0.0;
+                    for slots in &mut row.multi_scale {
+                        for slot in slots {
+                            slot.cell.over = 0.0;
+                            if slot.slot.is_live_now {
+                                slot.cell.max = Some(slot_max);
+                            }
+                        }
+                    }
+                    if row.res == res {
+                        row.heat_now = Some(mean);
+                        row.live_peak = Some(peak);
+                        row.live_over = over;
+                    }
+                }
+                lay(&geom(w, s, form), &input, &words, &m, true)
+            };
+            let inks = super::tests::dark_inks();
+            let (hot, warm) = (
+                inks.heat[usize::from(ink::heat_step(peak))],
+                inks.heat[usize::from(ink::heat_step(mean))],
+            );
+            let fresh = paint(crate::stats_live::DeckLive::STILL, 0.0);
+            assert_eq!(
+                tick_at(&fresh.prims, peak),
+                [rgba(hot, 0xFF)],
+                "{tag}: the live box's tick at its 10 s peak, in its heat"
+            );
+            assert!(
+                tick_at(&fresh.prims, slot_max).is_empty(),
+                "CONTROL {tag}: nothing at the slot's own max"
+            );
+            assert_eq!(column_at(&fresh.prims), [rgba(warm, 0xFF)], "CONTROL {tag}");
+            let stale = paint(crate::stats_live::DeckLive::STALE, 0.0);
+            assert_eq!(
+                tick_at(&stale.prims, peak),
+                [rgba(ink::mix(inks.ground, hot, 0.55), 0xFF)],
+                "{tag}: a stale live box dims its tick"
+            );
+            assert_eq!(
+                column_at(&stale.prims),
+                [rgba(ink::mix(inks.ground, warm, 0.55), 0xFF)],
+                "{tag}: as it dims its column"
+            );
+            assert_ne!(hot, inks.ground, "CONTROL: the dim moves the ink");
+            ticks += 1;
+            let keyed = |laid: &Laid| {
+                laid.boxes
+                    .iter()
+                    .any(|b| b.kind == BoxKind::Text && b.text == "over max")
+            };
+            assert!(
+                keyed(&paint(crate::stats_live::DeckLive::STILL, 0.4)),
+                "{tag}: the live box's 10 s alone is over, and the key says over max"
+            );
+            assert!(!keyed(&fresh), "CONTROL {tag}: nothing over, no over max");
+        }
+    }
+    assert_eq!(ticks, 4, "CONTROL: both forms at both scales");
+}
+
+/// A sleep is `hollow`, nothing read, never `stuck`, the colour of a stuck process
+/// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, "States"): its gap's boxes fill toward
+/// `hollow` with `hollow` rails, its wake's line is `hollow`, and nothing on the strips draws
+/// in `stuck`; each event line keeps a device px of ground each side. CONTROL: a crash's gap
+/// draws in its own ink beside it, so the kinds are told apart.
+#[test]
+fn a_sleep_gap_is_hollow_not_stuck() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut snap = scene(Scene::Calm);
+    snap.time_gaps = vec![
+        aterm_vitals::TimeGap {
+            start_ms: AT - 500_000,
+            end_ms: AT - 320_000,
+            kind: aterm_vitals::GapKind::Sleep,
+        },
+        aterm_vitals::TimeGap {
+            start_ms: AT - 150_000,
+            end_ms: AT - 80_000,
+            kind: aterm_vitals::GapKind::Crash,
+        },
+    ];
+    snap.strip_events = vec![
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 320_000,
+            kind: aterm_vitals::StripEventKind::SleepWake,
+            label: "wake".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: AT - 150_000,
+            kind: aterm_vitals::StripEventKind::Crash,
+            label: "aterm crash".into(),
+        },
+    ];
+    let inks = super::tests::dark_inks();
+    assert_ne!(inks.stuck, inks.hollow, "CONTROL: the two inks differ");
+    let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+    let sleep_fill = ink::mix(inks.ground, inks.hollow, 0.14);
+    let stuck_fill = ink::mix(inks.ground, inks.stuck, 0.14);
+    let crash_fill = ink::mix(inks.ground, inks.critical_text, 0.14);
+    let ground = rgba(inks.ground, 0xFF);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        let (w, s) = (1119.0, 2.0);
+        let input = scene_input(&snap, form);
+        let words = DeckWords::new(&input, &m);
+        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+        let fills = |want: Rgb| {
+            laid.prims
+                .iter()
+                .filter(|p| matches!(**p, DrawPrim::Panel { fill, .. } if rgb(fill) == want))
+                .count()
+        };
+        assert!(
+            fills(sleep_fill) > 0,
+            "{form:?}: the sleep's boxes fill toward hollow"
+        );
+        assert!(
+            fills(crash_fill) > 0,
+            "CONTROL {form:?}: the crash's boxes keep their ink"
+        );
+        let areas = strip_areas(w, s, form, &m, (3.0 * s) as f32);
+        let on_strip = |x: f32, y: f32| {
+            areas
+                .iter()
+                .any(|a| x >= a.0 && x < a.2 && y >= a.1 && y < a.3)
+        };
+        let stuck = laid.prims.iter().find(|p| match **p {
+            DrawPrim::Panel { x, y, fill, .. } => {
+                on_strip(x, y) && (rgb(fill) == inks.stuck || rgb(fill) == stuck_fill)
+            }
+            DrawPrim::Dashed { x, y, color, .. } | DrawPrim::Stroke { x, y, color, .. } => {
+                on_strip(x, y) && rgb(color) == inks.stuck
+            }
+            _ => false,
+        });
+        assert!(stuck.is_none(), "{form:?}: stuck ink on a strip: {stuck:?}");
+        let rails = laid
+            .prims
+            .iter()
+            .filter(|p| {
+                matches!(**p, DrawPrim::Dashed { w, h, color, .. }
+                    if w > 0.0 && h == 0.0 && rgb(color) == inks.hollow)
+            })
+            .count();
+        assert!(rails > 0, "{form:?}: the sleep's rails are hollow");
+        let strip = match form {
+            DeckForm::Full => plan::plan_full(w, &m).strip,
+            DeckForm::Folded => plan::plan_folded(w, &m).blocks[0].strip,
+        };
+        for (age, want) in [(320_000, inks.hollow), (150_000, inks.critical_text)] {
+            let ex = (strip.x_at_age_ms(age).expect("on the strip") * s) as f32;
+            let lines: Vec<(f32, f32, f32, f32)> = laid
+                .prims
+                .iter()
+                .filter_map(|p| match *p {
+                    DrawPrim::Dashed {
+                        x,
+                        y,
+                        w,
+                        h,
+                        width,
+                        color,
+                        ..
+                    } if w == 0.0 && h > 15.0 && (x - ex).abs() <= 2.0 && rgb(color) == want => {
+                        Some((x, y, width, h))
+                    }
+                    DrawPrim::Panel {
+                        x, y, w, h, fill, ..
+                    } if w <= 3.0
+                        && h > 15.0
+                        && (x + w / 2.0 - ex).abs() <= 2.0
+                        && rgb(fill) == want =>
+                    {
+                        Some((x, y, w, h))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !lines.is_empty(),
+                "{form:?}: the {age} ms event's line in its ink"
+            );
+            for (lx, ly, lw, lh) in lines {
+                for kx in [lx - 1.0, lx + lw] {
+                    let keyline = laid.prims.iter().any(|p| {
+                        matches!(*p, DrawPrim::Panel { x, y, w, h, fill, .. }
+                            if x == kx && y == ly && w == 1.0 && h == lh && fill == ground)
+                    });
+                    assert!(
+                        keyline,
+                        "{form:?}: a ground keyline at {kx} px by the {age} ms line"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The three gap kinds paint apart (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §6): one gap over
+/// the same span, drawn as a crash, a sleep and a pause, paints three different frames with
+/// Increase Contrast off and on, both forms at 1× and 2×. Increase Contrast lifts sleep to its
+/// `hollow` (`words2`) and paused from `words2` to `words`, so the two never meet in one ink
+/// (A1 §3 as built). CONTROL: a kind painted twice paints the same frame, and a gap paints a
+/// frame the deck without it does not.
+#[test]
+fn the_three_gap_kinds_paint_apart_with_increase_contrast_off_and_on() {
+    use aterm_vitals::GapKind;
+    let m = FaceMetrics::helvetica_neue();
+    let base = scene(Scene::Calm);
+    let w = 1119.0;
+    let frame = |kind: Option<GapKind>, form: DeckForm, s: f64, contrast: bool| {
+        let mut snap = base.clone();
+        snap.time_gaps = kind
+            .map(|kind| aterm_vitals::TimeGap {
+                start_ms: AT - 500_000,
+                end_ms: AT - 320_000,
+                kind,
+            })
+            .into_iter()
+            .collect();
+        let mut input = scene_input(&snap, form);
+        input.contrast = contrast;
+        let words = DeckWords::new(&input, &m);
+        format!(
+            "{:?}",
+            lay(&geom(w, s, form), &input, &words, &m, true).prims
+        )
+    };
+    let kinds = [GapKind::Crash, GapKind::Sleep, GapKind::Paused];
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for s in [1.0, 2.0] {
+            for contrast in [false, true] {
+                let tag = format!("{form:?} {w} pt at {s}×, contrast {contrast}");
+                let frames = kinds.map(|k| frame(Some(k), form, s, contrast));
+                for (i, a) in frames.iter().enumerate() {
+                    for (j, b) in frames.iter().enumerate().skip(i + 1) {
+                        assert_ne!(
+                            a, b,
+                            "{tag}: a {:?} gap paints as a {:?} one",
+                            kinds[i], kinds[j]
+                        );
+                    }
+                }
+                assert_eq!(
+                    frames[1],
+                    frame(Some(GapKind::Sleep), form, s, contrast),
+                    "CONTROL {tag}: a frame paints the same twice"
+                );
+                assert_ne!(
+                    frames[1],
+                    frame(None, form, s, contrast),
+                    "CONTROL {tag}: the gap paints"
+                );
+            }
+        }
+    }
+}
+
+/// The lowest heat step stands apart from the plate it draws on: in every built-in theme, and
+/// the deck's own dark and light inks, `heat[0]` and `heat_ic[0]` are 0.04 or more of OkLab
+/// lightness from `track` (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3), so a read zero's
+/// one-pixel foot shows on its plate.
+#[test]
+fn the_lowest_heat_step_stands_apart_from_the_plate_in_every_theme() {
+    let dl =
+        |a: Rgb, b: Rgb| (aterm_vitals::ink::to_lab(a).l - aterm_vitals::ink::to_lab(b).l).abs();
+    let probe = super::tests::dark_inks();
+    assert!(
+        dl(probe.track, probe.track) == 0.0 && dl(probe.ground, probe.track) >= 0.04,
+        "CONTROL: the measure tells the plate from the ground"
+    );
+    let names = aterm_types::scheme::builtin_names();
+    assert!(
+        names.len() > 10,
+        "CONTROL: the built-in themes ({})",
+        names.len()
+    );
+    let mut all: Vec<(String, VitalsInks)> = names
+        .iter()
+        .map(|name| ((*name).to_owned(), theme_inks(name)))
+        .collect();
+    all.push(("deck dark".into(), probe));
+    all.push(("deck light".into(), light_inks()));
+    let mut faults = Vec::new();
+    for (name, inks) in &all {
+        for (ramp, step0) in [("heat", inks.heat[0]), ("heat_ic", inks.heat_ic[0])] {
+            let d = dl(step0, inks.track);
+            if d < 0.04 {
+                faults.push(format!(
+                    "{name}: {ramp}[0] {step0:?} is {d:.3} from track {:?}",
+                    inks.track
+                ));
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} of {} themes:\n{}",
+        faults.len(),
+        all.len(),
+        faults.join("\n")
+    );
+}
+
+/// A strip reads by height alone: the strips draw the same boxes with Differentiate Without
+/// Color on as off (the strip's DWC branch is retired: every box's value is already its height),
+/// and with one ink for the whole heat ramp; and those heights carry the reading.
+#[test]
+fn a_strip_reads_by_height_alone_without_colour() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    for (form, w, s) in [
+        (DeckForm::Full, 1119.0, 2.0),
+        (DeckForm::Folded, 1119.0, 1.0),
+    ] {
+        let areas = strip_areas(w, s, form, &m, (3.0 * s) as f32);
+        let boxes = |input: &DeckInput<'_>| -> Vec<(f32, f32, f32, f32)> {
+            let words = DeckWords::new(input, &m);
+            let laid = lay(&geom(w, s, form), input, &words, &m, true);
+            laid.prims
+                .iter()
+                .filter_map(|p| match *p {
+                    DrawPrim::Panel { x, y, w, h, .. }
+                        if areas
+                            .iter()
+                            .any(|a| x >= a.0 && x + w <= a.2 && y >= a.1 && y + h <= a.3) =>
+                    {
+                        Some((x, y, w, h))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let plain = scene_input(&snap, form);
+        let mut dwc = scene_input(&snap, form);
+        dwc.dwc = true;
+        let mut mono = scene_input(&snap, form);
+        let one = mono.inks.words2;
+        mono.inks.heat = [one; 7];
+        mono.inks.heat_ic = [one; 7];
+        let drawn = boxes(&plain);
+        assert_eq!(
+            drawn,
+            boxes(&dwc),
+            "{form:?}: DWC draws the strips as they are"
+        );
+        assert_eq!(
+            drawn,
+            boxes(&mono),
+            "{form:?}: one ink draws the same boxes"
+        );
+        let heights: std::collections::BTreeSet<u32> = drawn.iter().map(|b| b.3 as u32).collect();
+        assert!(
+            drawn.len() > 100 && heights.len() >= 4,
+            "CONTROL {form:?}: {} boxes of {heights:?} px",
+            drawn.len()
+        );
+    }
 }
 
 fn full_width(kind: FullKind, m: &FaceMetrics) -> f64 {
@@ -2906,10 +3761,12 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
                     .x_at_age_ms(AT - ev.at_unix_ms)
                     .expect("event within 15m/1h horizon");
                 let ex = (x_pt * s) as f32;
+                // A wake is `hollow`, as its sleep is; Increase Contrast's `hollow` is `words2`.
+                let hollow = if contrast { inks.words2 } else { inks.hollow };
                 let want_rgb = match ev.kind {
                     aterm_vitals::StripEventKind::Crash => inks.critical_text,
                     aterm_vitals::StripEventKind::Restart => inks.warn_text,
-                    aterm_vitals::StripEventKind::SleepWake => inks.stuck,
+                    aterm_vitals::StripEventKind::SleepWake => hollow,
                     aterm_vitals::StripEventKind::PressureSpike => inks.warn_text,
                 };
                 // Cap pip on the X-axis rail.
@@ -2924,7 +3781,7 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
                 });
                 assert!(
                     has_pip,
-                    "{form:?}: {:?} missing X-axis cap pip at {ex}",
+                    "{form:?}, contrast {contrast}: {:?} missing X-axis cap pip at {ex}",
                     ev.kind
                 );
 

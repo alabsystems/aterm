@@ -458,6 +458,64 @@ fn outcome(run: io::Result<std::process::Output>) -> Outcome {
     .map_err(|e| (e.kind(), e.raw_os_error()))
 }
 
+/// A NATIVE-IMAGE SPAWN REFUSES WHAT THE KERNEL WILL NOT EXECUTE ([`super::NativeImage`]): an
+/// executable file of Mach-O magic and nothing else fails the spawn with `ENOEXEC`, on every
+/// platform. NEGATIVE CONTROL: by default macOS's spawn runs that file as a shell script, so a
+/// child starts and exits with a code of its own.
+#[test]
+fn a_native_image_spawn_refuses_what_the_kernel_will_not_execute() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("native-image");
+    let garbage = scratch.join("garbage");
+    std::fs::write(&garbage, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).expect("write fixture");
+    std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let refused = command(&garbage)
+        .native_image(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    assert_eq!(
+        refused.err().and_then(|e| e.raw_os_error()),
+        Some(libc::ENOEXEC)
+    );
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut by_shell = command(&garbage)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the shell runs it");
+        assert!(by_shell.wait().expect("its exit").code().is_some());
+    }
+}
+
+/// A NATIVE-IMAGE SPAWN REFUSES WHAT IT COULD NOT START AS ITS OWN IMAGE: a tethered command
+/// (whose helper is what the spawn starts) and, on Linux, a bare name started in another
+/// directory (searched before the fork, against this one). NEGATIVE CONTROL: the same commands
+/// without the flag start.
+#[test]
+fn a_native_image_spawn_refuses_what_it_could_not_start_as_its_image() {
+    let mut tethered = command("/usr/bin/true");
+    tethered.tether();
+    let refused = tethered.native_image(true).spawn();
+    assert_eq!(
+        refused.err().map(|e| e.kind()),
+        Some(io::ErrorKind::Unsupported)
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let refused = command("true").current_dir("/").native_image(true).spawn();
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::Unsupported)
+        );
+        let mut started = command("true").current_dir("/").spawn().expect("starts");
+        assert!(started.wait().expect("its exit").success());
+    }
+    let mut started = tethered.native_image(false).spawn().expect("starts");
+    assert!(started.wait().expect("its exit").success());
+}
+
 #[test]
 fn programs_arguments_environments_and_directories_match_std() {
     let scratch = Scratch::new("parity");

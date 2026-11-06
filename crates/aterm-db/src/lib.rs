@@ -131,6 +131,9 @@ enum FailureKind {
     /// A record names a writer grant or a roster this Mac's membership view does not hold yet.
     #[cfg(unix)]
     AwaitingMembership,
+    /// A table write a held `Remove` keeps pending until its rotation arrives (one-mesh M4).
+    #[cfg(unix)]
+    WritePending,
 }
 
 impl fmt::Debug for Error {
@@ -153,9 +156,9 @@ impl Error {
             FailureKind::Repair(cause) => cause,
             FailureKind::Busy | FailureKind::SnapshotChanged => RepairCause::NotReady,
             #[cfg(unix)]
-            FailureKind::EnrollmentPending | FailureKind::AwaitingMembership => {
-                RepairCause::NotReady
-            }
+            FailureKind::EnrollmentPending
+            | FailureKind::AwaitingMembership
+            | FailureKind::WritePending => RepairCause::NotReady,
             FailureKind::Other => RepairCause::Other,
         }
     }
@@ -190,6 +193,28 @@ impl Error {
             return Self::new(reason);
         }
         Self(reason.into(), FailureKind::AwaitingMembership)
+    }
+    /// A table write kept pending, sealed to this Mac, until the removal's rotation it waits on
+    /// arrives (one-mesh M4): nothing is lost, and nothing was published.
+    #[cfg(unix)]
+    pub(crate) fn write_pending() -> Self {
+        Self(
+            "the table write is kept pending until the removal's rotation arrives".into(),
+            FailureKind::WritePending,
+        )
+    }
+    /// Whether a table write was kept pending for a removal's rotation ([`Self::write_pending`]):
+    /// the store seals it under the new epoch once that arrives.
+    #[must_use]
+    pub fn is_write_pending(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self.1, FailureKind::WritePending)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
     /// Whether a record waits for this Mac's membership view: its writer is not a seat it knows
     /// at the record's epoch, or its roster is one this Mac has not seen. A later membership

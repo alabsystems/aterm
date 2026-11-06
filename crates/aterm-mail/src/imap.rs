@@ -371,11 +371,8 @@ impl Reader {
         }
         self.session.wire.remaining()?;
         self.session.wire.renew(std::time::Duration::from_secs(60));
-        self.session.tag += 1;
-        let tag = format!("a{}", self.session.tag);
-        self.session
-            .wire
-            .write(format!("{tag} IDLE\r\n").as_bytes())?;
+        let tag = self.session.next_tag();
+        self.session.write_command(tag.as_str(), "IDLE")?;
         let mut notified = false;
         let mut continued = false;
         for _ in 0..256 {
@@ -387,7 +384,7 @@ impl Reader {
             if !ready.starts_with(b"* ") || ready.starts_with(b"* BYE") {
                 return Err("IMAP server refused IDLE".into());
             }
-            notified |= mailbox_change(&String::from_utf8_lossy(&ready), true);
+            notified |= mailbox_change_bytes(&ready, true);
         }
         if !continued {
             return Err("IMAP IDLE continuation exceeded limit".into());
@@ -398,14 +395,13 @@ impl Reader {
                 let Some(line) = self.session.wire.idle_line()? else {
                     break;
                 };
-                let line = String::from_utf8_lossy(&line);
                 if line
                     .get(..5)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("* BYE"))
+                    .is_some_and(|p| p.eq_ignore_ascii_case(b"* BYE"))
                 {
                     return Err("IMAP server closed its idle session".into());
                 }
-                if mailbox_change(&line, true) {
+                if mailbox_change_bytes(&line, true) {
                     notified = true;
                     break;
                 }
@@ -413,7 +409,7 @@ impl Reader {
         }
         self.session.wire.renew(std::time::Duration::from_secs(60));
         self.session.wire.write(b"DONE\r\n")?;
-        let final_reply = self.session.receive(&tag)?;
+        let final_reply = self.session.receive(tag.as_str())?;
         let changed = std::mem::take(&mut self.session.changed);
         Ok(changed
             || notified
@@ -421,6 +417,17 @@ impl Reader {
                 .lines
                 .iter()
                 .any(|line| mailbox_change(line, true)))
+    }
+}
+
+struct TagBuf {
+    bytes: [u8; 21],
+    len: usize,
+}
+
+impl TagBuf {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
     }
 }
 
@@ -436,6 +443,36 @@ struct Reply {
 }
 
 impl Session {
+    fn next_tag(&mut self) -> TagBuf {
+        self.tag += 1;
+        let mut bytes = [0u8; 21];
+        bytes[0] = b'a';
+        let mut cursor = std::io::Cursor::new(&mut bytes[1..]);
+        let _ = std::io::Write::write_fmt(&mut cursor, format_args!("{}", self.tag));
+        let len = 1 + cursor.position() as usize;
+        TagBuf { bytes, len }
+    }
+
+    fn write_command(&mut self, tag: &str, command: &str) -> Result<(), String> {
+        let total = tag.len() + 1 + command.len() + 2;
+        if total <= 512 {
+            let mut buf = [0u8; 512];
+            buf[..tag.len()].copy_from_slice(tag.as_bytes());
+            buf[tag.len()] = b' ';
+            let cmd_end = tag.len() + 1 + command.len();
+            buf[tag.len() + 1..cmd_end].copy_from_slice(command.as_bytes());
+            buf[cmd_end..total].copy_from_slice(b"\r\n");
+            self.wire.write(&buf[..total])
+        } else {
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(tag.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(command.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            self.wire.write(&buf)
+        }
+    }
+
     fn connect(config: &Imap) -> Result<Self, ConnectError> {
         Self::connect_until(config, None)
     }
@@ -463,20 +500,20 @@ impl Session {
         match authentication {
             Authentication::Password { username, password } => {
                 self.wire.renew(std::time::Duration::from_secs(60));
-                self.tag += 1;
-                let tag = format!("a{}", self.tag);
+                let tag_buf = self.next_tag();
+                let tag = tag_buf.as_str();
                 let quoted_user = quoted(username)?;
                 let quoted_pw = zeroize::Zeroizing::new(quoted(password.expose())?);
                 let cap = tag.len() + 7 + quoted_user.len() + 1 + quoted_pw.len() + 2;
                 let mut login = zeroize::Zeroizing::new(String::with_capacity(cap));
-                login.push_str(&tag);
+                login.push_str(tag);
                 login.push_str(" LOGIN ");
                 login.push_str(&quoted_user);
                 login.push(' ');
                 login.push_str(&quoted_pw);
                 login.push_str("\r\n");
                 self.wire.write(login.as_bytes())?;
-                self.receive_status(&tag).map_err(|error| match error {
+                self.receive_status(tag).map_err(|error| match error {
                     ReceiveError::Status(status) => auth_status_error(&status),
                     ReceiveError::Other(message) => ConnectError::Other(message),
                 })?;
@@ -489,10 +526,9 @@ impl Session {
                 );
                 drop(raw_xoauth2);
                 self.wire.renew(std::time::Duration::from_secs(60));
-                self.tag += 1;
-                let tag = format!("a{}", self.tag);
-                self.wire
-                    .write(format!("{tag} AUTHENTICATE XOAUTH2\r\n").as_bytes())?;
+                let tag_buf = self.next_tag();
+                let tag = tag_buf.as_str();
+                self.write_command(tag, "AUTHENTICATE XOAUTH2")?;
                 let mut challenged = false;
                 for _ in 0..256 {
                     let line = self.wire.line()?;
@@ -503,7 +539,7 @@ impl Session {
                     let raw = String::from_utf8_lossy(&line);
                     let text = raw.trim_end_matches(['\r', '\n']);
                     if let Some(status) = text
-                        .strip_prefix(&tag)
+                        .strip_prefix(tag)
                         .and_then(|rest| rest.strip_prefix(' '))
                     {
                         if status
@@ -536,7 +572,7 @@ impl Session {
                 line.extend_from_slice(encoded.as_bytes());
                 line.extend_from_slice(b"\r\n");
                 self.wire.write(&line)?;
-                self.receive_status(&tag).map_err(|error| match error {
+                self.receive_status(tag).map_err(|error| match error {
                     ReceiveError::Status(status) => auth_status_error(&status),
                     ReceiveError::Other(message) => ConnectError::Other(message),
                 })?;
@@ -547,10 +583,9 @@ impl Session {
 
     fn command(&mut self, command: &str) -> Result<Reply, String> {
         self.wire.renew(std::time::Duration::from_secs(60));
-        self.tag += 1;
-        let tag = format!("a{}", self.tag);
-        self.wire.write(format!("{tag} {command}\r\n").as_bytes())?;
-        self.receive(&tag)
+        let tag = self.next_tag();
+        self.write_command(tag.as_str(), command)?;
+        self.receive(tag.as_str())
     }
 
     fn receive(&mut self, tag: &str) -> Result<Reply, String> {
@@ -618,13 +653,36 @@ impl Session {
     fn try_select(&mut self, folder: &str, writable: bool) -> Result<(), SelectError> {
         let quoted_folder = quoted(folder).map_err(|_| SelectError::UnknownFolder)?;
         self.wire.renew(std::time::Duration::from_secs(60));
-        self.tag += 1;
-        let tag = format!("a{}", self.tag);
+        let tag_buf = self.next_tag();
+        let tag = tag_buf.as_str();
         let verb = if writable { "SELECT" } else { "EXAMINE" };
-        self.wire
-            .write(format!("{tag} {verb} {quoted_folder}\r\n").as_bytes())
-            .map_err(SelectError::Other)?;
-        self.receive_status(&tag)
+        let total = tag.len() + 1 + verb.len() + 1 + quoted_folder.len() + 2;
+        if total <= 512 {
+            let mut buf = [0u8; 512];
+            let mut at = 0;
+            buf[at..at + tag.len()].copy_from_slice(tag.as_bytes());
+            at += tag.len();
+            buf[at] = b' ';
+            at += 1;
+            buf[at..at + verb.len()].copy_from_slice(verb.as_bytes());
+            at += verb.len();
+            buf[at] = b' ';
+            at += 1;
+            buf[at..at + quoted_folder.len()].copy_from_slice(quoted_folder.as_bytes());
+            at += quoted_folder.len();
+            buf[at..at + 2].copy_from_slice(b"\r\n");
+            self.wire.write(&buf[..total]).map_err(SelectError::Other)?;
+        } else {
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(tag.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(verb.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(quoted_folder.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            self.wire.write(&buf).map_err(SelectError::Other)?;
+        }
+        self.receive_status(tag)
             .map(|_| ())
             .map_err(|error| match error {
                 ReceiveError::Status(status) => select_status_error(&status),
@@ -657,18 +715,25 @@ impl Session {
     }
 }
 
-fn mailbox_change(line: &str, flags: bool) -> bool {
-    let mut words = line.split_whitespace();
-    words.next() == Some("*")
+fn mailbox_change_bytes(line: &[u8], flags: bool) -> bool {
+    let mut words = line
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|w| !w.is_empty());
+    words.next() == Some(b"*")
         && words
             .next()
+            .and_then(|number| std::str::from_utf8(number).ok())
             .is_some_and(|number| number.parse::<u32>().is_ok())
         && words.next().is_some_and(|kind| {
-            ["EXISTS", "EXPUNGE", "RECENT"]
+            [b"EXISTS".as_slice(), b"EXPUNGE", b"RECENT"]
                 .iter()
                 .any(|name| kind.eq_ignore_ascii_case(name))
-                || flags && kind.eq_ignore_ascii_case("FETCH")
+                || flags && kind.eq_ignore_ascii_case(b"FETCH")
         })
+}
+
+fn mailbox_change(line: &str, flags: bool) -> bool {
+    mailbox_change_bytes(line.as_bytes(), flags)
 }
 
 struct FetchPart {
@@ -891,18 +956,24 @@ impl Mailbox for Imap {
 
 fn string_token(text: &str) -> Result<(String, &str), String> {
     if let Some(rest) = text.strip_prefix('"') {
-        let mut out = String::new();
+        let mut out: Option<String> = None;
         let mut escaped = false;
         for (at, ch) in rest.char_indices() {
             if escaped {
-                out.push(ch);
+                out.as_mut().expect("escape initialized out").push(ch);
                 escaped = false;
             } else if ch == '\\' {
+                out.get_or_insert_with(|| {
+                    let mut buf = String::with_capacity(rest.len());
+                    buf.push_str(&rest[..at]);
+                    buf
+                });
                 escaped = true;
             } else if ch == '"' {
-                return Ok((out, &rest[at + 1..]));
-            } else {
-                out.push(ch);
+                let decoded = out.unwrap_or_else(|| rest[..at].to_owned());
+                return Ok((decoded, &rest[at + 1..]));
+            } else if let Some(buf) = out.as_mut() {
+                buf.push(ch);
             }
         }
         Err("Unterminated IMAP string".into())

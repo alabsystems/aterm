@@ -13,7 +13,8 @@
 //! on aterm's screen, `status`, `who`'s foreground group, aterm's log and the tab's command blocks.
 //! On an aterm serving contract 3:
 //! 1. the proven scoped claim (`<id>@<leader> contract=3 scope=relaunch,upgrade`);
-//! 2. a crash relaunch, by the harness, on the same session, aterm's built-in lane standing down;
+//! 2. a crash relaunch, by the harness, on the same session, with no act of aterm's built-in lane
+//!    logged (no stand-down shown: [`judge::relaunch`]);
 //! 3. no move while a draft is present, none while a person types (`key|send as=person`), then
 //!    the move onto the second build at a safe point, under the same harness pid;
 //! 4. the harness's own re-exec onto a second build of itself: same pid, claimed again;
@@ -610,6 +611,22 @@ impl Rig {
         log.get(from..).unwrap_or_default().to_string()
     }
 
+    /// Whether aterm's built-in relaunch lane records stand-in `pid` in `sid` within [`MUST`]
+    /// ([`judge::snapshot_kept`]): a crash before its record is one that lane leaves, so the
+    /// negative control crashes the vendor only once the lane could take it.
+    fn recorded(&self, sid: &str, pid: u32) -> Result<bool, Stopped> {
+        Self::wait_for(MUST, || judge::snapshot_kept(&self.aterm_log(), sid, pid))
+    }
+
+    /// The holder aterm's built-in lanes take a tab under in this instance
+    /// ([`aterm_agent::harness::upgrade_drive::hand_name_of`] of its pid).
+    fn host(&self) -> String {
+        u32::try_from(self.inst.pid).map_or_else(
+            |_| "-".to_string(),
+            aterm_agent::harness::upgrade_drive::hand_name_of,
+        )
+    }
+
     /// How many starts the stand-in has logged.
     fn starts(&self) -> usize {
         judge::starts_of(&crate::util::scratch_text(&self.standin_log)).len()
@@ -1037,15 +1054,21 @@ fn control_legs(rig: &Rig, r: &mut Report) -> Result<(), Fail> {
         None => Err("the stand-in run bare never showed its frame".to_string()),
         Some(f) => {
             let program = rig.seen(&cal).program;
+            let recorded = rig.recorded(&cal, f.pid)?;
             rig.type_line(&cal, "/crash")?;
             let back = rig.wait_frame(&cal, MUST, |g| g.pid != f.pid)?;
             let typed = judge::resume_typed(&rig.blocks(&cal), &f.session);
-            if program.as_deref() == Some(s.vendor) && typed && back.is_some() {
+            if program.as_deref() == Some(s.vendor) && recorded && typed && back.is_some() {
                 Ok(())
             } else {
                 Err(format!(
-                    "aterm named it {} and its built-in lane {} the bare stand-in",
+                    "aterm named it {}, {} its launch, and its built-in lane {} the bare stand-in",
                     program.as_deref().unwrap_or("-"),
+                    if recorded {
+                        "recorded"
+                    } else {
+                        "never recorded"
+                    },
                     if typed && back.is_some() {
                         "relaunched"
                     } else {
@@ -1081,14 +1104,21 @@ fn control_legs(rig: &Rig, r: &mut Report) -> Result<(), Fail> {
     };
     let through = r.leg(
         CONTROL[0],
-        &judge::passed_through(s.vendor, &rig.seen(&sid), rig.leader(&sid), Some(&first)),
+        &judge::passed_through(
+            s.vendor,
+            &rig.seen(&sid),
+            rig.leader(&sid),
+            Some(&first),
+            &rig.host(),
+        ),
     );
+    let recorded = rig.recorded(&sid, first.pid)?;
     rig.type_line(&sid, "/crash")?;
     let back = rig.wait_frame(&sid, MUST, |f| f.pid != first.pid)?;
     let typed = judge::resume_typed(&rig.blocks(&sid), &first.session);
     let took = r.leg(
         CONTROL[1],
-        &judge::builtin_took(&first, typed, back.as_ref()),
+        &judge::builtin_took(&first, recorded, typed, back.as_ref()),
     );
     if !(through && took) {
         rig.diagnose(&sid);

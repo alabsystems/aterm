@@ -6,6 +6,15 @@
 
 mod rig {
     pub(crate) use crate::trail_rig::{TrailFrame, TrailRig};
+
+    /// The font every dump draws, so glyph pixels never move with the host: the repo's fixture
+    /// face beside this package.
+    pub(crate) fn fixture_font() -> Result<std::path::PathBuf, String> {
+        Ok(
+            aterm_tempfile::manifest_dir()
+                .join("../aterm-render/tests/fixtures/jetbrains-mono.ttf"),
+        )
+    }
 }
 
 #[path = "../examples/support/trail_script.rs"]
@@ -196,8 +205,8 @@ fn pet_words_before(dump: &str, until_ms: f64) -> Vec<String> {
 fn the_pet_sweep_s_pointer_moves_its_pet() {
     // The live present ticks the pet with the pointer, as the event loop's redraw does: the
     // windowless capture path ticked it blind and still, so the corpus's sweep moved nothing.
-    let text =
-        std::fs::read_to_string(format!("{CORPUS}/dark/pet-sweep.trail")).expect("read the script");
+    let text = std::fs::read_to_string(corpus_dir().join("dark/pet-sweep.trail"))
+        .expect("read the script");
     let blind: String = text
         .lines()
         .filter(|l| !l.contains(" pointer "))
@@ -866,10 +875,9 @@ fn present_costs_shed_only_under_auto_motion() {
 }
 
 /// The corpus `lab trail-diff` runs when no script is named (aterm-lab's `trail_diff::CORPUS`).
-const CORPUS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-effects/tests/fixtures/trail-diff"
-);
+fn corpus_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-effects/tests/fixtures/trail-diff")
+}
 
 /// Every `*.trail` file under `dir`.
 fn corpus_scripts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -888,7 +896,8 @@ fn corpus_scripts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// `lab trail-diff` with no script named dumps the whole corpus.
 #[test]
 fn every_corpus_script_parses_and_each_pass_has_a_run() {
-    let root = std::path::Path::new(CORPUS);
+    let root = corpus_dir();
+    let root = root.as_path();
     let mut scripts = Vec::new();
     corpus_scripts(root, &mut scripts);
     for part in ["dark", "light", "flip"] {

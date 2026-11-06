@@ -267,7 +267,7 @@ fn a_pwsh_keeps_the_shim_ahead_of_usr_bin_after_its_profile() {
     let pwsh = need_pwsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     for (named, wanted) in [(true, true), (true, false), (false, true)] {
         let fx = LiveFixture::new();

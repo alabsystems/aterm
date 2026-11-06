@@ -510,6 +510,7 @@ fn admit(by: &Paths, joiner_home: &Path, name: &str, way: Way) -> Result<String,
     let proof = desk::Proof {
         decide: &decide,
         refuses: &refuses,
+        authority: None,
         fleet: None,
     };
     let mut serve = |stream: &mut UnixStream| {

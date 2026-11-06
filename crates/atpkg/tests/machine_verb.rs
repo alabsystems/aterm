@@ -27,7 +27,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> (bool, Vec<String>, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        let out = Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))

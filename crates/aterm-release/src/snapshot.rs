@@ -401,7 +401,12 @@ fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
         _ => return None,
     };
     let mut hash = ring::digest::Context::new(algorithm);
-    hash.update(format!("{kind} {}\0", data.len()).as_bytes());
+    hash.update(kind.as_bytes());
+    let mut header_tail = [0u8; 24];
+    let mut cursor = std::io::Cursor::new(&mut header_tail[..]);
+    let _ = write!(cursor, " {}\0", data.len());
+    let tail_len = cursor.position() as usize;
+    hash.update(&header_tail[..tail_len]);
     hash.update(data);
     Some(aterm_codec::hex::encode_lower(hash.finish().as_ref()))
 }
@@ -731,10 +736,11 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
         let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
         let stdout = child.stdout.take().ok_or("git cat-file has no stdout")?;
         let read = std::thread::scope(|scope| {
-            let requests: Vec<u8> = mine
-                .iter()
-                .flat_map(|e| e.oid.bytes().chain(std::iter::once(b'\n')))
-                .collect();
+            let mut requests = Vec::with_capacity(mine.iter().map(|e| e.oid.len() + 1).sum());
+            for e in &mine {
+                requests.extend_from_slice(e.oid.as_bytes());
+                requests.push(b'\n');
+            }
             let writer = scope.spawn(move || {
                 let written = stdin.write_all(&requests);
                 drop(stdin);
@@ -1086,11 +1092,11 @@ impl Syncer {
         for entry in entries {
             let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
             let here = rel.join(entry.file_name());
-            let path = entry.path();
             let kind = entry
                 .file_type()
-                .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+                .map_err(|e| format!("inspect {}: {e}", entry.path().display()))?;
             if !self.keep.contains(&here) {
+                let path = entry.path();
                 if kind.is_dir() {
                     fs::remove_dir_all(&path)
                 } else {
@@ -1099,7 +1105,7 @@ impl Syncer {
                 .map_err(|e| format!("remove {}: {e}", path.display()))?;
                 self.removed(&here);
             } else if kind.is_dir() {
-                self.prune(&path, &here)?;
+                self.prune(&entry.path(), &here)?;
             }
         }
         Ok(())

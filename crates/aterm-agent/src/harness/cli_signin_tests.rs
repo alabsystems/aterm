@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::*;
 use crate::harness::login_drive::{self, Approval, Approver, Drove, Handoff, Request};
@@ -252,7 +252,7 @@ impl AccountsHost for SignInHost {
                 &mut approver,
                 req.hosts,
                 req.row.email.as_deref(),
-                Instant::now() + Duration::from_secs(60),
+                crate::harness::wake_deadline::WakeDeadline::after(Duration::from_secs(60)),
             ),
         }
     }
@@ -1636,14 +1636,14 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
 }
 
 /// A renewal whose page met Cloudflare's bot check, which did not clear, ends as a failure on
-/// record naming Cloudflare (design R-13): no NEEDS YOU line and no person's sign-in task, and
-/// its ledger row says `bot-check`. CONTROL: a stop on the vendor's sign-in still names one.
+/// record naming Cloudflare, with a durable human login task and no NEEDS YOU prompt.
+/// An unrelated failure must not replace that task or create a new human action.
 ///
 /// Unix only, as the overlay staging home it signs in to is; off Unix,
 /// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
 #[cfg(unix)]
 #[test]
-fn a_renewal_on_a_bot_check_fails_on_record_and_asks_no_one() {
+fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     let (tmp, env) = kimi_env("bot-check-renew");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
@@ -1665,10 +1665,22 @@ fn a_renewal_on_a_bot_check_fails_on_record_and_asks_no_one() {
     );
     let ledger = read(&store.ledger_path());
     assert!(ledger.contains("www.kimi.ai device bot-check"), "{ledger}");
-    let logins = read(&store.dir.join("logins.json"));
-    assert!(
-        !logins.contains("sign_in_task"),
-        "no person's task: {logins}"
+    let roster_path = tmp.path().join("accounts-kimi.toml");
+    let records = store
+        .read_account_records(Some(&roster_path), env.now)
+        .unwrap();
+    let tasks = accounts::sign_in_tasks(&records.raw_roster, &records.logins);
+    assert_eq!(tasks, [("kimi-one".into(), accounts::SignInAction::Login)]);
+    assert!(out.contains("human browser challenge recorded"), "{out}");
+    assert!(out.contains("accounts login kimi-one --cli kimi"), "{out}");
+    let before = records.logins.get("kimi-one").cloned();
+    let failed = SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home);
+    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
+    assert!(!out.contains("human browser challenge"), "{out}");
+    assert!(!out.contains("NEEDS YOU"), "{out}");
+    assert_eq!(
+        store.load_logins(env.now).unwrap().0.get("kimi-one"),
+        before.as_ref()
     );
 
     let signed_out = SignInHost::new(

@@ -28,6 +28,11 @@ fn args(words: &[&str]) -> Vec<OsString> {
     words.iter().map(OsString::from).collect()
 }
 
+/// The vault of a scratch home under `root`, which holds none: not in a fleet.
+fn vault(root: &std::path::Path) -> aterm_secrets::client::Paths {
+    aterm_secrets::client::Paths::locate_for_home(&root.join("home"))
+}
+
 fn no_roster() -> io::Result<Option<String>> {
     Ok(None)
 }
@@ -41,7 +46,7 @@ fn name_takes_json_or_help_and_refuses_every_other_word() {
     assert_eq!(parse(&args(&["--help", "set"])), Ok(Mode::Help));
     for refused in [
         &["--json", "--json"][..],
-        &["set", "m8"],
+        &["set", "m0"],
         &["--jsonx"],
         &["json"],
     ] {
@@ -56,6 +61,123 @@ fn name_takes_json_or_help_and_refuses_every_other_word() {
 }
 
 #[test]
+fn set_takes_a_number_and_optional_exact_nickname_with_preview_flags() {
+    use super::Name;
+    use aterm_types::machine_name::Number;
+    assert_eq!(
+        parse(&args(&[
+            "set",
+            "86",
+            "--nick",
+            "MissBunny",
+            "--dry-run",
+            "--json"
+        ])),
+        Ok(Mode::Set {
+            to: Name {
+                num: Number::new(86).expect("a number"),
+                nick: Some(nickname("MissBunny"))
+            },
+            dry_run: true,
+            json: true,
+        })
+    );
+    assert_eq!(
+        parse(&args(&["set", "m86"])),
+        Ok(Mode::Set {
+            to: Name {
+                num: Number::new(86).expect("a number"),
+                nick: None
+            },
+            dry_run: false,
+            json: false,
+        })
+    );
+    assert_eq!(parse(&args(&["set", "m0", "--help"])), Ok(Mode::Help));
+    for refused in [
+        &["set"][..],
+        &["set", "m0"],
+        &["set", "m086"],
+        &["set", "m1000000"],
+        &["set", "m86", "m7"],
+        &["set", "m86", "--nick"],
+        &["set", "m86", "--nick", "m7"],
+        &["set", "m86", "--nick", "Otter", "--nick", "Heron"],
+        &["set", "m86", "--dry-run", "--dry-run"],
+        &["set", "m86", "--json", "--json"],
+        &["set", "m86", "--take"],
+    ] {
+        assert!(parse(&args(refused)).is_err(), "{refused:?}");
+        assert_eq!(main_entry(args(refused)), ExitCode::from(2), "{refused:?}");
+    }
+}
+
+#[test]
+fn set_reports_the_exact_name_and_previews_without_changing_it() {
+    use super::unix::{NameAsk, Note, rename};
+    use crate::machine_name::NameTo;
+    use aterm_net::fleet_member::name_record::ByKind;
+    use aterm_types::machine_name::Number;
+    let root = state(0o700);
+    report(
+        root.path(),
+        Some(&vault(root.path())),
+        false,
+        || Ok(Some("m7".to_owned())),
+        NOW,
+    )
+    .expect("an initial name");
+    let before = file::read(root.path()).expect("reads");
+    let to = NameTo {
+        num: Number::new(86).expect("a number"),
+        nick: Some(nickname("MissBunny")),
+    };
+    let (preview, notes) = rename(
+        root.path(),
+        Some(&vault(root.path())),
+        &NameAsk {
+            to: &to,
+            kind: ByKind::Person,
+            dry_run: true,
+        },
+        false,
+        no_roster,
+        NOW,
+    )
+    .expect("previews");
+    assert!(
+        preview.starts_with("m86 MissBunny  class=chosen fleet=out"),
+        "{preview}"
+    );
+    assert_eq!(notes, [Note::NameDryRun]);
+    assert_eq!(file::read(root.path()).expect("reads"), before);
+    let (json, notes) = rename(
+        root.path(),
+        Some(&vault(root.path())),
+        &NameAsk {
+            to: &to,
+            kind: ByKind::Person,
+            dry_run: false,
+        },
+        true,
+        no_roster,
+        NOW,
+    )
+    .expect("renames");
+    let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
+    assert_eq!(json["name"].as_str(), Some("m86"));
+    assert_eq!(json["nick"].as_str(), Some("MissBunny"));
+    assert!(notes.is_empty());
+    assert_eq!(
+        file::read(root.path())
+            .expect("reads")
+            .expect("a name")
+            .title(),
+        "m86 MissBunny"
+    );
+}
+
+#[test]
 fn a_first_read_makes_the_name_and_a_later_one_reads_it_back_with_no_roster_read() {
     let root = state(0o700);
     let asked = Cell::new(0);
@@ -63,7 +185,8 @@ fn a_first_read_makes_the_name_and_a_later_one_reads_it_back_with_no_roster_read
         asked.set(asked.get() + 1);
         Ok(None)
     };
-    let (line, narrowed) = report(root.path(), false, roster, NOW).expect("reports");
+    let (line, narrowed) =
+        report(root.path(), Some(&vault(root.path())), false, roster, NOW).expect("reports");
     assert_eq!(
         (narrowed, asked.get()),
         (None, 1),
@@ -79,6 +202,7 @@ fn a_first_read_makes_the_name_and_a_later_one_reads_it_back_with_no_roster_read
 
     let again = report(
         root.path(),
+        Some(&vault(root.path())),
         false,
         || -> io::Result<Option<String>> { unreachable!("no roster read for a name already made") },
         NOW,
@@ -91,7 +215,8 @@ fn a_first_read_makes_the_name_and_a_later_one_reads_it_back_with_no_roster_read
 fn a_roster_that_cannot_be_read_makes_no_name() {
     let root = state(0o700);
     let busy = || -> io::Result<Option<String>> { Err(io::Error::other("the roster is busy")) };
-    let refused = report(root.path(), false, busy, NOW).expect_err("an unread roster");
+    let refused = report(root.path(), Some(&vault(root.path())), false, busy, NOW)
+        .expect_err("an unread roster");
     assert!(refused.contains("busy"), "{refused}");
     assert_eq!(
         file::read(root.path()).expect("reads"),
@@ -107,7 +232,14 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
     let key = format!("{}\n", "ab".repeat(32));
     write_private(root.path(), KEY_FILE, key.as_bytes()).expect("writes a fleet key");
 
-    let (json, _) = report(root.path(), true, || Ok(Some("m8".to_owned())), NOW).expect("reports");
+    let (json, _) = report(
+        root.path(),
+        Some(&vault(root.path())),
+        true,
+        || Ok(Some("m8".to_owned())),
+        NOW,
+    )
+    .expect("reports");
     let name = file::read(root.path())
         .expect("reads")
         .expect("made by the report");
@@ -116,29 +248,44 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
     assert_eq!(
         json,
         format!(
-            "{{\"class\":\"seeded\",\"fleet\":true,\"made\":\"evidence\",\"migration\":\"pending\",\
+            "{{\"class\":\"seeded\",\"fleet\":\"in\",\"made\":\"evidence\",\"migration\":\"pending\",\
              \"name\":\"m8\",\"nick\":\"{nick}\",\"nick_class\":\"auto\",\"node\":\"{node}\",\
              \"number\":8,\"rev\":0,\"since\":{IMPLIED_SINCE},\"title\":\"m8 {shown}\"}}\n"
         ),
         "the roster's NAME at the implied rank, pending migration"
     );
-    let (line, _) = report(root.path(), false, no_roster, NOW).expect("reports");
+    let (line, _) = report(
+        root.path(),
+        Some(&vault(root.path())),
+        false,
+        no_roster,
+        NOW,
+    )
+    .expect("reports");
     assert_eq!(
         line,
         format!("m8 {shown}  class=seeded fleet=in migration=pending node={node}\n")
     );
-    let (json, _) = report(root.path(), true, no_roster, NOW).expect("reports");
+    let (json, _) =
+        report(root.path(), Some(&vault(root.path())), true, no_roster, NOW).expect("reports");
     assert!(json.contains("\"made\":\"kept\""), "{json}");
 
     let fresh = state(0o700);
-    let (json, _) = report(fresh.path(), true, no_roster, NOW).expect("reports");
+    let (json, _) = report(
+        fresh.path(),
+        Some(&vault(fresh.path())),
+        true,
+        no_roster,
+        NOW,
+    )
+    .expect("reports");
     for field in [
         "\"made\":\"drawn\"",
         "\"migration\":null",
         "\"name\":\"m0\"",
         "\"node\":null",
         "\"number\":null",
-        "\"fleet\":false",
+        "\"fleet\":\"out\"",
     ] {
         assert!(json.contains(field), "{field} in {json}");
     }
@@ -155,7 +302,8 @@ fn a_first_read_brings_back_this_nodes_own_record() {
     )
     .expect("writes the book");
     let unread = || -> io::Result<Option<String>> { unreachable!("Floor names the claim") };
-    let (json, _) = report(root.path(), true, unread, NOW).expect("reports");
+    let (json, _) =
+        report(root.path(), Some(&vault(root.path())), true, unread, NOW).expect("reports");
     for field in [
         "\"made\":\"floor\"",
         "\"title\":\"m9 Heron\"",
@@ -164,7 +312,14 @@ fn a_first_read_brings_back_this_nodes_own_record() {
     ] {
         assert!(json.contains(field), "{field} in {json}");
     }
-    let (line, _) = report(root.path(), false, no_roster, NOW).expect("reports");
+    let (line, _) = report(
+        root.path(),
+        Some(&vault(root.path())),
+        false,
+        no_roster,
+        NOW,
+    )
+    .expect("reports");
     assert_eq!(
         line,
         format!("m9 Heron  class=chosen fleet=out node={}\n", me.node())
@@ -172,9 +327,81 @@ fn a_first_read_brings_back_this_nodes_own_record() {
 }
 
 #[test]
+fn a_report_keeps_a_known_name_when_identity_is_damaged_but_refuses_uncertain_names() {
+    use super::unix::{NickAsk, renick};
+    use crate::machine_name::NickTo;
+    use aterm_net::fleet_member::name_record::ByKind;
+    use aterm_net::fleet_member::{NODE_FILE, NODE_KEY_FILE};
+    use aterm_types::machine_name::{Class, Number};
+
+    for damaged in [NODE_FILE, NODE_KEY_FILE] {
+        let root = state(0o700);
+        node_identity(root.path()).expect("a node");
+        let mut known = file::MachineName::unnumbered(nickname("MissBunny"), NOW);
+        known.num = Number::new(86);
+        known.class = Class::Chosen;
+        known.rev = 1;
+        file::read_or_create(root.path(), || Ok(known.clone())).expect("a valid local name");
+        write_private(root.path(), damaged, b"damaged-identity\n").expect("damages identity");
+        let unread = || -> io::Result<Option<String>> { unreachable!("the name is already known") };
+        let (json, _) = report(root.path(), None, true, unread, NOW).expect("reports the name");
+        let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
+        assert_eq!(json["title"].as_str(), Some("m86 MissBunny"));
+        assert_eq!(json["number"].as_u64(), Some(86));
+        assert_eq!(json["rev"].as_u64(), Some(1));
+        assert!(json["node"].is_null(), "an unread identity is not a node");
+        let (line, _) = report(root.path(), None, false, unread, NOW).expect("reports text");
+        assert_eq!(line, "m86 MissBunny  class=chosen fleet=out\n");
+        assert!(
+            renick(
+                root.path(),
+                None,
+                &NickAsk {
+                    to: &NickTo::Word(nickname("Heron")),
+                    kind: ByKind::Agent,
+                    dry_run: false,
+                },
+                false,
+                unread,
+                NOW,
+            )
+            .is_err(),
+            "an edit still requires its actor identity"
+        );
+        assert_eq!(
+            file::read(root.path()).expect("reads the local file"),
+            Some(known)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(damaged)).expect("reads the damaged identity"),
+            b"damaged-identity\n",
+            "a report never replaces identity"
+        );
+
+        std::fs::remove_file(root.path().join(file::FILE)).expect("removes the name");
+        assert!(report(root.path(), None, true, no_roster, NOW).is_err());
+        assert_eq!(file::read(root.path()).expect("reads absent name"), None);
+        write_private(root.path(), file::FILE, b"no valid name\n").expect("a corrupt name");
+        assert!(report(root.path(), None, true, no_roster, NOW).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join(file::FILE)).expect("reads the corrupt name"),
+            b"no valid name\n",
+            "a report never replaces a damaged name"
+        );
+    }
+}
+
+#[test]
 fn a_state_directory_open_to_others_is_narrowed_before_the_name_is_made() {
     let root = state(0o755);
-    let (_, narrowed) = report(root.path(), false, no_roster, NOW).expect("reports");
+    let (_, narrowed) = report(
+        root.path(),
+        Some(&vault(root.path())),
+        false,
+        no_roster,
+        NOW,
+    )
+    .expect("reports");
     assert_eq!(narrowed, Some(0o755));
     let mode = std::fs::metadata(root.path())
         .expect("stats")
@@ -257,16 +484,19 @@ fn the_caller_is_an_agent_whose_session_status_names_an_agent_program() {
 
 #[test]
 fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
-    use super::unix::{Note, renick};
+    use super::unix::{NickAsk, Note, renick};
     use crate::machine_name::NickTo;
     use aterm_net::fleet_member::name_record::{ByKind, NickClass, node_word};
     let root = state(0o700);
     let heron = NickTo::Word(nickname("Blue Heron"));
     let (line, notes) = renick(
         root.path(),
-        &heron,
-        ByKind::Person,
-        false,
+        Some(&vault(root.path())),
+        &NickAsk {
+            to: &heron,
+            kind: ByKind::Person,
+            dry_run: false,
+        },
         false,
         no_roster,
         NOW,
@@ -294,9 +524,12 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
 
     let (_, notes) = renick(
         root.path(),
-        &heron,
-        ByKind::Agent,
-        false,
+        Some(&vault(root.path())),
+        &NickAsk {
+            to: &heron,
+            kind: ByKind::Agent,
+            dry_run: false,
+        },
         false,
         unread,
         NOW,
@@ -311,10 +544,13 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
 
     let (json, notes) = renick(
         root.path(),
-        &NickTo::Random,
-        ByKind::Agent,
+        Some(&vault(root.path())),
+        &NickAsk {
+            to: &NickTo::Random,
+            kind: ByKind::Agent,
+            dry_run: false,
+        },
         true,
-        false,
         unread,
         NOW,
     )
@@ -336,10 +572,13 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     let before = std::fs::read(root.path().join(file::FILE)).expect("reads");
     let (line, notes) = renick(
         root.path(),
-        &heron,
-        ByKind::Person,
+        Some(&vault(root.path())),
+        &NickAsk {
+            to: &heron,
+            kind: ByKind::Person,
+            dry_run: true,
+        },
         false,
-        true,
         unread,
         NOW,
     )
@@ -355,7 +594,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
 
 #[test]
 fn a_nickname_another_machine_in_view_carries_is_set_and_said() {
-    use super::unix::{Note, renick};
+    use super::unix::{NickAsk, Note, renick};
     use crate::machine_name::NickTo;
     use aterm_net::fleet::NodeIdentity;
     use aterm_net::fleet_member::name_record::ByKind;
@@ -370,9 +609,12 @@ fn a_nickname_another_machine_in_view_carries_is_set_and_said() {
     .expect("writes the book");
     let (line, notes) = renick(
         root.path(),
-        &NickTo::Word(nickname("Puffin")),
-        ByKind::Person,
-        false,
+        Some(&vault(root.path())),
+        &NickAsk {
+            to: &NickTo::Word(nickname("Puffin")),
+            kind: ByKind::Person,
+            dry_run: false,
+        },
         false,
         no_roster,
         NOW,

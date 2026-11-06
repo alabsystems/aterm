@@ -113,10 +113,12 @@ fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) ->
         .iter()
         .map(|&(h, over)| {
             let v = h.map(|h| h * cap);
+            let n = if v.is_some() { 10.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                over: over && v.is_some(),
+                n,
+                over_n: if over { n } else { 0.0 },
             }
         })
         .collect();
@@ -141,10 +143,12 @@ fn series(now: f64, cap: f64, cells: &[Bucket], binds: bool) -> Series {
         .iter()
         .map(|&(h, over)| {
             let v = h.map(|h| h * cap);
+            let n = if v.is_some() { 10.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                over,
+                n,
+                over_n: if over { n } else { 0.0 },
             }
         })
         .collect();
@@ -521,10 +525,12 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
     let mut procs = view(all, 16_000.0, &steps(strip), fig(aterm), fig(tab));
     procs.second = Some(series(yours, 10_666.0, &[], false));
     s.resources[6] = procs;
-    f.pid_counts = (Some(all as u64), Some(yours as u64));
-    f.proc_limits = ProcLimits {
-        system: Some(16_000),
-        per_user: Some(10_666),
+    f.room = TaskRoom {
+        procs: Some(all as u64),
+        procs_max: Some(16_000),
+        user_procs: Some(yours as u64),
+        user_procs_max: Some(10_666),
+        ..TaskRoom::default()
     };
     s
 }
@@ -702,7 +708,7 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                                 &scene.time_gaps,
                             )
                             .iter()
-                            .any(|s| s.cell.over)
+                            .any(|s| s.cell.over > 0.0)
                     }),
                 DeckForm::Folded => form_strips.iter().enumerate().any(|(bi, strip)| {
                     scene.resources[..DECK_RESOURCES.len()]
@@ -719,7 +725,7 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                                     &scene.time_gaps,
                                 )
                                 .iter()
-                                .any(|s| s.cell.over)
+                                .any(|s| s.cell.over > 0.0)
                         })
                 }),
             };
@@ -785,9 +791,10 @@ fn the_folded_key_follows_the_block_whose_cells_draw_over_max() {
         for (ri, row) in words.rows.iter_mut().enumerate() {
             for slots in &mut row.multi_scale {
                 for slot in slots {
-                    slot.cell.over = over[ri / 4]
+                    let on = over[ri / 4]
                         && slot.cell.gap.is_none()
                         && slot.cell.heat.is_some_and(|heat| !heat.is_nan());
+                    slot.cell.over = if on { 1.0 } else { 0.0 };
                 }
             }
         }

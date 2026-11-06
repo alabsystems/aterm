@@ -7,7 +7,7 @@ name = "aterm-agent"
 # the one `agent_suite` binary, except the two that count process-wide allocations.
 # With autotests off, a `tests/*.rs` file listed nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -88,6 +88,7 @@ aterm-durable = { workspace = true }
 # `gen` may go back as the `if-gen=` fence on a typed act — the fence a `key`
 # or `send` carries. Plus the state/home directories and the RFC 3339 calendar.
 # Not a new edge in the BUILD graph: `aterm-ctl` above already pulls aterm-types.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }

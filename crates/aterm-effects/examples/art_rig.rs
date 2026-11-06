@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let art = Path::new(env!("CARGO_MANIFEST_DIR")).join("art");
+    let art = aterm_tempfile::manifest_dir().join("art");
     let done = match args.as_slice() {
         [rig] if rig == "dogs" => dogs::main(&art.join("dogs")),
         [rig, out] if rig == "pet" => pet::main(&PathBuf::from(out)),

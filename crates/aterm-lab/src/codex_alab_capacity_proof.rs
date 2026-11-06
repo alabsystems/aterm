@@ -138,6 +138,11 @@ impl Case {
         }
     }
 
+    /// Whether only codex-alab's quota recovery can pass the case ([`holds_quota_recovery`]).
+    const fn needs_quota_recovery(self) -> bool {
+        matches!(self, Self::QuotaResetRecovery | Self::QuotaNoResetRecovery)
+    }
+
     /// Whether the turn must fail at the wall, asked once (else it must recover from it).
     pub(super) fn refused(self) -> bool {
         !matches!(
@@ -743,7 +748,10 @@ pub(super) fn judge(
         }
     } else {
         if exit != Some(0) || taken.len() != 3 {
-            return Err(format!("{name}: did not recover in three requests"));
+            return Err(format!(
+                "{name}: did not recover in three requests ({} request(s), exit {exit:?})",
+                taken.len()
+            ));
         }
         if count("turn.completed") != 1 || count("turn.failed") != 0 {
             return Err(format!("{name}: turn did not recover"));
@@ -1262,7 +1270,45 @@ fn run_case(
     Ok(checks)
 }
 
-/// THE LANE: the package's records and CLI, then every case ([`CASES`]), each under the jail
+/// What codex-alab's quota recovery tells the turn while it waits (`alab-core` glue
+/// `responses_quota_retry.rs`). A package without these words predates that recovery: a quota wall
+/// ends its turn, so the cases that need it have nothing to observe. The package installed on
+/// 2026-11-05 (built 2026-11-02 from `ef71b0aa49`) is one.
+const QUOTA_WAIT_WORDS: &[u8] = b"Waiting for account quota";
+
+/// Whether `program`'s bytes hold [`QUOTA_WAIT_WORDS`].
+fn holds_quota_recovery(program: &[u8]) -> bool {
+    program
+        .windows(QUOTA_WAIT_WORDS.len())
+        .any(|window| window == QUOTA_WAIT_WORDS)
+}
+
+/// Whether the package's CLI holds its quota recovery. One that cannot be read is judged on every
+/// case, so it fails rather than going unobserved.
+fn cli_holds_quota_recovery(exe: &Path) -> bool {
+    crate::util::read_program(exe).map_or(true, |program| holds_quota_recovery(&program))
+}
+
+/// The cases [`lane`] runs on a package: all of them, less those only a recovery it lacks can pass.
+fn cases_for(holds_recovery: bool) -> impl Iterator<Item = Case> {
+    CASES
+        .into_iter()
+        .filter(move |case| holds_recovery || !case.needs_quota_recovery())
+}
+
+/// The wants [`lane`] cannot observe on the package at `pkg`, for the run's verdict. A package
+/// whose records do not agree names none: the lane fails it on its records.
+pub(super) fn unobservable(pkg: &Path) -> Vec<String> {
+    match package_records(pkg) {
+        Ok((version, _, exe)) if !cli_holds_quota_recovery(&exe) => vec![format!(
+            "capacity: quota recovery (package {version} holds none, so its recovery cases did \
+             not run)"
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// THE LANE: the package's records and CLI, then each case it can observe ([`cases_for`]), each under the jail
 /// `profile_for(port)` makes for its model's port, every output kept in `out`. The checks it
 /// made, `(label, held)`.
 /// # Errors
@@ -1350,7 +1396,7 @@ pub(super) fn lane(
         println!("  {} {label}", if held { "ok  " } else { "FAIL" });
         checks.push((label, held));
     }
-    for case in CASES {
+    for case in cases_for(cli_holds_quota_recovery(&exe)) {
         checks.extend(run_case(&exe, out, case, profile_for)?);
     }
     Ok(checks)
@@ -2084,6 +2130,31 @@ mod tests {
                 "{at}"
             );
         }
+    }
+
+    /// A package's bytes decide: words an older package also holds do not count. CONTROL: a package
+    /// that holds the recovery is judged on every case, so it still fails if it does not recover.
+    #[test]
+    fn a_package_with_no_quota_recovery_skips_only_the_cases_that_need_it() {
+        assert!(holds_quota_recovery(b"a Waiting for account quota b"));
+        assert!(
+            !holds_quota_recovery(b"usage_limit_reached resets_at"),
+            "an older package parses the quota body too; that is not the recovery"
+        );
+        let names = |holds| cases_for(holds).map(Case::name).collect::<Vec<_>>();
+        assert_eq!(
+            names(true).len(),
+            CASES.len(),
+            "CONTROL: it is judged on all"
+        );
+        let without = names(false);
+        assert_eq!(without.len(), CASES.len() - 2, "{without:?}");
+        assert!(
+            without.contains(&"capacity-recovery".to_owned()),
+            "{without:?}"
+        );
+        assert!(!without.contains(&"quota-reset-recovery".to_owned()));
+        assert!(!without.contains(&"quota-no-reset-recovery".to_owned()));
     }
 
     /// EVERY REFUSAL'S ROWS AND EVERY RECOVERY'S, case by case: a refused case passes with one

@@ -424,10 +424,25 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
         metadata
             .build_args
             .iter()
-            .filter(|arg| harness.is_none() || arg.as_str() != "--locked")
+            // This lane owns --locked, including for ordinary programs whose metadata
+            // also supplies it for the plain packer's build.
+            .filter(|arg| arg.as_str() != "--locked")
             .map(OsString::from),
     );
     for b in &bins {
+        // Plain packs use the checkout's bin selection verbatim. Keep it here too, and
+        // supplement it only for declared binaries it does not already select.
+        if metadata
+            .build_args
+            .windows(2)
+            .any(|args| args[0] == "--bin" && &args[1] == b)
+            || metadata
+                .build_args
+                .iter()
+                .any(|arg| arg.strip_prefix("--bin=") == Some(b.as_str()))
+        {
+            continue;
+        }
         args.extend([OsString::from("--bin"), OsString::from(b)]);
     }
     let (cache_freshness, analysis_session) =

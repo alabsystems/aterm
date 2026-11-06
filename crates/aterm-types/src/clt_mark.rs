@@ -23,7 +23,10 @@
 //! bare `opened`, the record an aterm that kept no builds wrote, names none. An ask that installed
 //! nothing and that no person declined (a failed install, Low Data Mode holding the download back,
 //! a tab whose program never started) takes its build's line back ([`forget`]), so the next launch
-//! or run asks again; only the caller whose claim added the line takes it back. A person's press of
+//! or run asks again; only the caller whose claim added the line takes it back. So does a tab gone
+//! with no window to read how it ended (its window went before aterm's PTY keeper held it), which
+//! the next launch of its build reads from the tab's receipt: nothing can tell whether a person
+//! pressed anything in it. A person's press of
 //! Install Command Line Tools… and an `aterm init` they type ask every time, whatever it says.
 //!
 //! A record that cannot be read, one too long or malformed to be one, and a build no line could

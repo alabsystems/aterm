@@ -32,7 +32,7 @@ pub fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_pending_stub(path: &Path) -> bool {
+pub(crate) fn is_pending_stub(path: &Path) -> bool {
     use std::io::Read as _;
     const HEAD: u64 = 256;
     const MARKER: &str = "atpkg pending-program stub";
@@ -75,7 +75,7 @@ pub fn tool_file(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-fn strip_unquoted_comment(line: &str) -> &str {
+pub(crate) fn strip_unquoted_comment(line: &str) -> &str {
     let mut in_double = false;
     let mut in_single = false;
     let mut escaped = false;
@@ -104,7 +104,7 @@ fn strip_unquoted_comment(line: &str) -> &str {
     line
 }
 
-fn table_header(line: &str) -> Option<&str> {
+pub(crate) fn table_header(line: &str) -> Option<&str> {
     let head = strip_unquoted_comment(line).trim_end();
     if head.starts_with("[[") {
         return Some("");
@@ -130,7 +130,7 @@ fn take_hex_scalar(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<cha
     char::from_u32(code)
 }
 
-fn parse_toml_string(rhs: &str) -> Option<String> {
+pub(crate) fn parse_toml_string(rhs: &str) -> Option<String> {
     let (value, rest) = take_toml_string(rhs)?;
     let tail = rest.trim_start();
     (tail.is_empty() || tail.starts_with('#')).then_some(value)
@@ -226,7 +226,7 @@ pub fn pinned_channel_in(toml: &str) -> Option<String> {
     None
 }
 
-fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
+pub(crate) fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
     use std::io::Read as _;
     let sentinel = u64::try_from(max_bytes).ok()?.checked_add(1)?;
     let mut options = std::fs::OpenOptions::new();
@@ -285,6 +285,33 @@ fn pinned_sysroot(dir: &Path, channel: &str, probe: &mut Probe<'_>) -> Option<Pa
     let sysroot = sysroot.trim();
     (!sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir())
         .then(|| PathBuf::from(sysroot))
+}
+
+/// Why the locked build in `dir` is not the compiler `found` names: its `trustc -vV` reports no
+/// `commit-hash`, or another than the lock's `compiler_commit`. `None` when they agree. The tree
+/// root already names the build's bytes; this holds the lock's own two facts to each other, so a
+/// lock whose commit was never that build's compiles nothing.
+fn locked_commit_refusal(
+    dir: &Path,
+    found: &crate::trust_lock::Found,
+    locked: &crate::trust_lock::TrustLock,
+    probe: &mut Probe<'_>,
+) -> Option<String> {
+    let trustc = dir.join(tool_file("trustc"));
+    let reported = probe
+        .stdout(&trustc, &["-vV"], probe_bound())
+        .and_then(|text| crate::trust_lock::commit_hash_line(&text));
+    if reported.as_deref() == Some(locked.compiler_commit.as_str()) {
+        return None;
+    }
+    Some(format!(
+        "{} names Trust build {} with compiler commit {}, and that build's trustc reports {}:          the lock does not describe its build. Fix: rewrite it with `atpkg-publish adopt trust={}`",
+        found.path.display(),
+        locked.build,
+        locked.compiler_commit,
+        reported.map_or_else(|| "no commit".to_string(), |c| format!("commit {c}")),
+        locked.build
+    ))
 }
 
 /// Resolve the `atpkg` install prefix from `[packages].prefix` in `aterm.toml`.
@@ -365,7 +392,7 @@ pub fn configured_prefix_in(toml: &str, home: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `<prefix>/store/trust/current/bin`.
+/// `<prefix>/store/trust/current/bin`: the build a tree with no `trust.lock` compiles with.
 #[must_use]
 pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
     prefix
@@ -376,18 +403,29 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
 
 const STORE_CHANNEL: &str = "trust";
 
-/// The `bin` holding the build atpkg's shim for `tool` runs: the directory of `tool` in the
-/// checkout `<prefix>/links/trust` dev-links (`aterm pkg which targo` says `dev-linked`), when
-/// the marker links `tool` (one of its `bins`) from an absolute checkout outside the prefix that
-/// has a `lib`, else [`store_stage2_bin`]. A dev link moves the shims of the bins it names and
-/// pauses the store's updates, leaving `current` on a build those shims no longer run, so
-/// discovery reads this rather than `current` alone.
+/// The `bin` holding the build atpkg's shim for `tool` runs in a tree: the directory of `tool` in
+/// the checkout `<prefix>/links/trust` dev-links (`aterm pkg which targo` says `dev-linked`),
+/// when the marker links `tool` (one of its `bins`) from an absolute checkout outside the prefix
+/// that has a `lib`; else the build the tree's `trust.lock` names (`lock`,
+/// [`crate::trust_lock::build_dir`], whether or not the store holds it); else
+/// [`store_stage2_bin`]. A dev link moves the shims of the bins it names and pauses the store's
+/// updates, leaving `current` on a build those shims no longer run, so discovery reads this
+/// rather than `current` alone.
 #[must_use]
-pub fn answering_bin(prefix: &Path, tool: &str) -> PathBuf {
-    linked_tool_bin(prefix, tool).unwrap_or_else(|| store_stage2_bin(prefix))
+pub fn answering_bin(
+    prefix: &Path,
+    tool: &str,
+    lock: Option<&crate::trust_lock::TrustLock>,
+) -> PathBuf {
+    linked_tool_bin(prefix, tool).unwrap_or_else(|| match lock {
+        Some(lock) => crate::trust_lock::build_dir(prefix, lock.build).join("bin"),
+        None => store_stage2_bin(prefix),
+    })
 }
 
-fn linked_tool_bin(prefix: &Path, tool: &str) -> Option<PathBuf> {
+/// The `bin` of `tool` in the checkout `<prefix>/links/trust` dev-links, if it links `tool`.
+#[must_use]
+pub fn linked_tool_bin(prefix: &Path, tool: &str) -> Option<PathBuf> {
     let marker = read_bounded_text(&prefix.join("links").join(STORE_CHANNEL), 64 << 10)?;
     let mut checkout = None;
     let mut bins = None;
@@ -446,7 +484,7 @@ pub fn set_probe_bound_for_test(bound: Duration) {
 }
 
 /// `DATE_PROBE_BOUND`, or the bound a test set with [`set_probe_bound_for_test`].
-fn probe_bound() -> Duration {
+pub(crate) fn probe_bound() -> Duration {
     #[cfg(any(test, debug_assertions))]
     match PROBE_BOUND_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {}
@@ -556,7 +594,7 @@ impl Probe<'_> {
     }
 }
 
-fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
     use std::io::Read as _;
     use std::process::Stdio;
     const MAX_STDOUT: u64 = 64 << 10;
@@ -627,7 +665,7 @@ fn view_presents(entry: &Path, store_prefix: &Path) -> Option<PathBuf> {
     if !resolved.starts_with(&views) {
         return None;
     }
-    Some(answering_bin(store_prefix, "targo"))
+    Some(answering_bin(store_prefix, "targo", None))
 }
 
 /// Resolved Trust toolchain paths and discovery diagnostics.
@@ -653,18 +691,30 @@ pub struct Toolchain {
     pub store_bin: Option<PathBuf>,
     /// Rustup `trust` entry demoted below the store when another candidate won.
     pub demoted: Option<Demoted>,
+    /// The `trust.lock` of the tree this toolchain was resolved for ([`crate::trust_lock::find`]),
+    /// if it has one: a locked tree resolves the build the lock names, by number and tree root,
+    /// and never the store's `current`, the rustup view or `PATH`.
+    pub lock: Option<crate::trust_lock::Found>,
+    /// Why the tree's lock resolves no toolchain here: it does not read, no store holds its build,
+    /// or the store holds that build number with another tree. `None` when it resolved, or when
+    /// there is no lock.
+    pub lock_refusal: Option<String>,
+    /// What took the lock's place, said: `TRUST_STAGE2_BIN` or a dev-linked checkout.
+    pub lock_override: Option<String>,
 }
 
 impl Toolchain {
-    /// Discover the toolchain using environment `XDG_CONFIG_HOME` and `RUSTUP_HOME`.
+    /// Discover the toolchain using environment `XDG_CONFIG_HOME` and `RUSTUP_HOME`, for a tree
+    /// whose `trust.lock` is `lock` ([`crate::trust_lock::find`]; `None`: the tree has none).
     #[must_use]
     pub fn discover(
         stage2_bin: Option<&Path>,
         home: &Path,
         path_env: &OsStr,
         pinned: Option<&str>,
+        lock: Option<&crate::trust_lock::Found>,
     ) -> Self {
-        Self::discover_guarded(stage2_bin, home, path_env, pinned, &mut |_| Ok(()))
+        Self::discover_guarded(stage2_bin, home, path_env, pinned, lock, &mut |_| Ok(()))
             .expect("unguarded discovery cannot refuse a probe")
     }
 
@@ -677,6 +727,7 @@ impl Toolchain {
         home: &Path,
         path_env: &OsStr,
         pinned: Option<&str>,
+        lock: Option<&crate::trust_lock::Found>,
         before_probe: &mut dyn FnMut(&Path) -> Result<(), String>,
     ) -> Result<Self, String> {
         let xdg = {
@@ -694,11 +745,18 @@ impl Toolchain {
             Some(&prefix),
             path_env,
             pinned,
+            lock,
             before_probe,
         )
     }
 
-    /// Discover the toolchain across `stage2_bin`, `rustup_home`, `store_prefix`, and `path_env`.
+    /// Discover the toolchain across `stage2_bin`, `rustup_home`, `store_prefix`, and `path_env`,
+    /// for a tree whose `trust.lock` is `lock` (`None`: the tree has none).
+    ///
+    /// The order: an explicit `stage2_bin` (`TRUST_STAGE2_BIN`); a dev-linked checkout
+    /// ([`linked_tool_bin`]); for a locked tree, the build its lock names, whose recorded tree
+    /// root must be the lock's ([`crate::trust_lock::locked_build`]), and nothing else; for a tree
+    /// with no lock, the rustup view, the store's `current` and `PATH`, as before locks.
     #[must_use]
     pub fn discover_with_store(
         stage2_bin: Option<&Path>,
@@ -706,6 +764,7 @@ impl Toolchain {
         store_prefix: Option<&Path>,
         path_env: &OsStr,
         pinned: Option<&str>,
+        lock: Option<&crate::trust_lock::Found>,
     ) -> Self {
         Self::discover_with_store_guarded(
             stage2_bin,
@@ -713,6 +772,7 @@ impl Toolchain {
             store_prefix,
             path_env,
             pinned,
+            lock,
             &mut |_| Ok(()),
         )
         .expect("unguarded discovery cannot refuse a probe")
@@ -728,6 +788,7 @@ impl Toolchain {
         store_prefix: Option<&Path>,
         path_env: &OsStr,
         pinned: Option<&str>,
+        lock: Option<&crate::trust_lock::Found>,
         before_probe: &mut dyn FnMut(&Path) -> Result<(), String>,
     ) -> Result<Self, String> {
         let mut probe = Probe {
@@ -738,6 +799,10 @@ impl Toolchain {
         let targo = tool_file("targo");
         let mut refused = None;
         let mut demoted = None;
+        let mut lock_refusal = None;
+        let mut lock_override = None;
+        // The lock whose `compiler_commit` the resolved build's compiler must report.
+        let mut commit_of: Option<&crate::trust_lock::TrustLock> = None;
         let (tool_dir, store_bin) = if let Some(explicit) = stage2_bin {
             let dir = physical(explicit.to_path_buf());
             let driver = dir.join(&targo);
@@ -747,7 +812,88 @@ impl Toolchain {
             {
                 refused = Some(dir.clone());
             }
+            if let Some(found) = lock {
+                lock_override = Some(format!(
+                    "TRUST_STAGE2_BIN={} overrides {}",
+                    dir.display(),
+                    found.path.display()
+                ));
+            }
             (dir, None)
+        } else if let Some(found) = lock {
+            let linked = store_prefix.and_then(|prefix| linked_tool_bin(prefix, "targo"));
+            let candidate = match (&found.lock, store_prefix, linked) {
+                (lock, _, Some(linked)) => {
+                    lock_override = Some(format!(
+                        "the dev-linked checkout ({}) overrides {} ({})",
+                        linked.display(),
+                        found.path.display(),
+                        lock.as_ref().map_or_else(
+                            |why| format!("which does not read: {why}"),
+                            |locked| format!("build {}", locked.build)
+                        )
+                    ));
+                    Some(linked)
+                }
+                (Err(why), _, None) => {
+                    lock_refusal = Some(format!(
+                        "{why}: a tree whose trust.lock does not read compiles with no \
+                         toolchain. Fix: restore it from git (`git checkout -- {}`), or rewrite \
+                         it with `atpkg-publish adopt`",
+                        found.path.display()
+                    ));
+                    None
+                }
+                (Ok(_), None, None) => {
+                    lock_refusal = Some(format!(
+                        "{} names a Trust build of the atpkg store, and no store is configured \
+                         here",
+                        found.path.display()
+                    ));
+                    None
+                }
+                (Ok(locked), Some(prefix), None) => {
+                    let standing = crate::trust_lock::locked_build(prefix, locked);
+                    lock_refusal = standing.refusal(found, locked);
+                    match standing {
+                        crate::trust_lock::LockedBuild::Present { bin } => {
+                            commit_of = Some(locked);
+                            Some(bin)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            let reported = match (&found.lock, store_prefix) {
+                (Ok(locked), Some(prefix)) => answering_bin(prefix, "targo", Some(locked)),
+                _ => store_prefix.map_or_else(
+                    || {
+                        rustup_home
+                            .join("toolchains")
+                            .join(pinned.unwrap_or(STORE_CHANNEL))
+                            .join("bin")
+                    },
+                    store_stage2_bin,
+                ),
+            };
+            let store_bin = Some(reported.clone());
+            match candidate {
+                Some(dir) => {
+                    let dir = physical(dir);
+                    let driver = dir.join(&targo);
+                    if is_executable_file(&driver)
+                        && !is_pending_stub(&driver)
+                        && !is_pinned_toolchain(&dir, pinned, &mut probe)
+                    {
+                        refused = Some(dir.clone());
+                    }
+                    if let Some(locked) = commit_of.filter(|_| refused.is_none()) {
+                        lock_refusal = locked_commit_refusal(&dir, found, locked, &mut probe);
+                    }
+                    (dir, store_bin)
+                }
+                None => (reported, store_bin),
+            }
         } else {
             let entry = rustup_home
                 .join("toolchains")
@@ -755,7 +901,7 @@ impl Toolchain {
             let rustup = store_prefix
                 .and_then(|prefix| view_presents(&entry, prefix))
                 .unwrap_or_else(|| entry.join("bin"));
-            let store_bin = store_prefix.map(|prefix| answering_bin(prefix, "targo"));
+            let store_bin = store_prefix.map(|prefix| answering_bin(prefix, "targo", None));
             let rustup_targo = rustup.join(&targo);
             let stale = store_prefix
                 .filter(|_| pinned.unwrap_or(STORE_CHANNEL) == STORE_CHANNEL)
@@ -796,14 +942,16 @@ impl Toolchain {
             let reported = chosen.unwrap_or_else(|| store_bin.clone().unwrap_or(rustup));
             (reported, store_bin)
         };
-        let explicit = stage2_bin.is_some();
+        // An explicit override is never fallen back from, and a locked tree takes every tool from
+        // the one build it names: a formatter or lint of another build would judge it.
+        let borrows = stage2_bin.is_none() && lock.is_none();
         let mut borrowed = Vec::new();
         let mut tool = |name: &'static str| {
             let own = tool_dir.join(tool_file(name));
             if is_executable_file(&own) && !is_pending_stub(&own) {
                 return Some(own);
             }
-            if explicit {
+            if !borrows {
                 return None;
             }
             let found = managed_tool_guarded(name, store_prefix, path_env, pinned, &mut probe)?;
@@ -822,6 +970,9 @@ impl Toolchain {
             refused,
             store_bin,
             demoted,
+            lock: lock.cloned(),
+            lock_refusal,
+            lock_override,
         };
         match probe.error {
             Some(error) => Err(error),
@@ -859,7 +1010,10 @@ impl Toolchain {
     /// True when an executable `targo` matching the pinned channel was found.
     #[must_use]
     pub fn have_targo(&self) -> bool {
-        self.refused.is_none() && is_executable_file(&self.targo) && !is_pending_stub(&self.targo)
+        self.refused.is_none()
+            && self.lock_refusal.is_none()
+            && is_executable_file(&self.targo)
+            && !is_pending_stub(&self.targo)
     }
 
     /// True when `trustdoc` is an executable file in `stage2_dir`.
@@ -904,6 +1058,9 @@ impl Toolchain {
     /// The diagnostic for no usable toolchain: none found, or one found and refused.
     #[must_use]
     pub fn missing_targo_label(&self) -> String {
+        if let Some(why) = &self.lock_refusal {
+            return why.clone();
+        }
         let explicit = self.store_bin.is_none();
         match (&self.refused, &self.store_bin) {
             (Some(dir), _) if explicit => format!(
@@ -955,6 +1112,14 @@ impl Toolchain {
     }
 
     fn missing_tool(&self, name: &str) -> String {
+        if let Some(found) = self.lock.as_ref().filter(|_| self.lock_override.is_none()) {
+            return format!(
+                "no {name} in {}, the build {} names; a locked tree takes no tool from another \
+                 build",
+                self.stage2_dir.display(),
+                found.path.display()
+            );
+        }
         if self.store_bin.is_none() {
             format!(
                 "no {name} in TRUST_STAGE2_BIN={}, which is never fallen back from — fix: {}",
@@ -1004,7 +1169,7 @@ fn managed_tool_guarded(
     probe: &mut Probe<'_>,
 ) -> Option<PathBuf> {
     store_prefix
-        .map(|prefix| answering_bin(prefix, name))
+        .map(|prefix| answering_bin(prefix, name, None))
         .into_iter()
         .chain(std::env::split_paths(path_env))
         .find_map(|dir| {
@@ -1111,6 +1276,7 @@ mod tests {
             Some(&prefix),
             OsStr::new(""),
             None,
+            None,
         );
         assert_eq!(t.targo, store_stage2_bin(&prefix).join(tool_file("targo")));
         assert_eq!(
@@ -1124,6 +1290,7 @@ mod tests {
             &rustup_home(None, home),
             None,
             OsStr::new(""),
+            None,
             None,
         );
         assert_eq!(
@@ -1157,6 +1324,7 @@ mod tests {
                 Some(&prefix),
                 &path,
                 pinned,
+                None,
             );
             assert_eq!(t.targo, real.join("targo"), "pinned={pinned:?}");
             assert!(t.have_targo(), "pinned={pinned:?}");
@@ -1166,6 +1334,7 @@ mod tests {
                 Some(&prefix),
                 stubs.as_os_str(),
                 pinned,
+                None,
             );
             assert_eq!(
                 t.targo,
@@ -1179,6 +1348,7 @@ mod tests {
                 Some(&prefix),
                 OsStr::new(""),
                 pinned,
+                None,
             );
             assert!(!explicit.have_targo(), "explicit pending stub is not targo");
             assert!(
@@ -1225,6 +1395,7 @@ mod tests {
                 Some(&prefix),
                 path,
                 Some("trust"),
+                None,
             )
         };
 
@@ -1276,7 +1447,7 @@ mod tests {
         std::os::unix::fs::symlink(home.join("sealed"), relocated.join("toolchains/trust"))
             .expect("ln rustup");
         let found = |rustup: &Path| {
-            Toolchain::discover_with_store(None, rustup, None, OsStr::new(""), Some("trust"))
+            Toolchain::discover_with_store(None, rustup, None, OsStr::new(""), Some("trust"), None)
         };
         let t = found(&rustup_home(Some(relocated.as_os_str()), &home));
         assert!(t.have_targo(), "{}", t.stage2_dir.display());
@@ -1308,6 +1479,7 @@ mod tests {
             Some(&prefix),
             OsStr::new(real.to_string_lossy().as_ref()),
             Some("trust"),
+            None,
         );
         assert!(t.have_targo(), "PATH still wins past a refused store");
         assert_eq!(t.stage2_dir, fs::canonicalize(&real).expect("canonicalize"));
@@ -1318,6 +1490,7 @@ mod tests {
             Some(&prefix),
             OsStr::new(""),
             Some("trust"),
+            None,
         );
         assert!(!t.have_targo(), "fail-closed: the impostor is not adopted");
         assert_eq!(
@@ -1386,7 +1559,7 @@ mod tests {
         let absent_rustup = root.join("no-rustup");
         // Negative control: the same executable really runs without a refusing guard.
         let unguarded =
-            Toolchain::discover_with_store(None, &absent_rustup, None, &path, Some("trust"));
+            Toolchain::discover_with_store(None, &absent_rustup, None, &path, Some("trust"), None);
         assert_eq!(unguarded.stage2_dir, first);
         assert!(root.join("first/probes").is_file());
         for name in ["first/probes", "second/probes"] {
@@ -1399,6 +1572,7 @@ mod tests {
             None,
             &path,
             Some("trust"),
+            None,
             &mut |dir| {
                 called.push(dir.to_path_buf());
                 Err("lease denied".into())
@@ -1460,6 +1634,7 @@ mod tests {
             Some(&prefix),
             OsStr::new(""),
             Some("trust"),
+            None,
             &mut |dir| {
                 guarded.insert(dir.to_path_buf());
                 fs::write(dir.parent().unwrap().join("guarded"), "held").unwrap();
@@ -1510,6 +1685,7 @@ mod tests {
                 Some(&prefix),
                 OsStr::new(""),
                 Some("trust"),
+                None,
             )
         };
 
@@ -1570,6 +1746,7 @@ mod tests {
             Some(&prefix),
             on_path.as_os_str(),
             Some("trust"),
+            None,
         );
         assert_eq!(
             t.stage2_dir, tree,
@@ -1620,6 +1797,7 @@ mod tests {
                 Some(&prefix),
                 OsStr::new(""),
                 Some("trust"),
+                None,
             )
         };
 
@@ -1676,6 +1854,179 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// A store build `build` under `prefix` whose `trustc` answers `--print sysroot` and `-vV`
+    /// (commit `commit`), with `targo`, `targo-tippy` and `trustfmt`, and its tree root recorded
+    /// as `root`; its `bin`.
+    #[cfg(unix)]
+    fn locked_store_build(prefix: &Path, build: u64, commit: &str, root: &str) -> PathBuf {
+        let dir = crate::trust_lock::build_dir(prefix, build);
+        let bin = dir.join("bin");
+        fs::create_dir_all(dir.join("lib/rustlib")).expect("mkdir rustlib");
+        fs::create_dir_all(&bin).expect("mkdir bin");
+        for tool in ["targo", TIPPY, TRUSTFMT] {
+            exec_stub(&bin.join(tool));
+        }
+        let trustc = bin.join("trustc");
+        fs::write(
+            &trustc,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in -vV) printf 'rustc 1.0\\ncommit-hash: {commit}\\n' ;; \
+                 *) echo '{}' ;; esac\n",
+                dir.display()
+            ),
+        )
+        .expect("write trustc");
+        make_runnable(&trustc);
+        crate::trust_lock::write_tree_root_record(&dir, root).expect("record");
+        fs::write(crate::trust_lock::ready_marker(prefix, build), "ok\n").expect("ready");
+        fs::canonicalize(bin).expect("canonicalize")
+    }
+
+    /// A LOCKED TREE RESOLVES THE BUILD ITS LOCK NAMES AND NOTHING ELSE (A14): over a rustup
+    /// entry, the store's `current` and `PATH`, all of which answer, it takes the lock's build and
+    /// every tool from it; a build the store lacks, holds with another tree, or whose compiler is
+    /// another commit resolves nothing (no fallback); `TRUST_STAGE2_BIN` and a dev-linked checkout
+    /// take its place, said. NEGATIVE CONTROL: with no lock the rustup entry answers.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_tree_resolves_its_build_and_nothing_else() {
+        let home = mktemp_dir("atv-locked").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let commit = "29ebb403de7a102850d6cb10a62d5cc3baf723ed";
+        let root = "4".repeat(64);
+        let locked = locked_store_build(&prefix, 16387, commit, &root);
+        let current = locked_store_build(&prefix, 16500, &"b".repeat(40), &"5".repeat(64));
+        std::os::unix::fs::symlink(
+            crate::trust_lock::build_dir(&prefix, 16500),
+            prefix.join("store/trust/current"),
+        )
+        .expect("ln current");
+        let sealed = pinned_bin(&home.join("sealed/bin"));
+        fs::create_dir_all(home.join(".rustup/toolchains")).expect("mkdir");
+        std::os::unix::fs::symlink(home.join("sealed"), home.join(".rustup/toolchains/trust"))
+            .expect("ln rustup");
+        let on_path = pinned_bin(&home.join("onpath/bin"));
+        let tree = home.join("checkout");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let lock = |build: u64, root: &str, commit: &str| {
+            let lock = crate::trust_lock::TrustLock {
+                build,
+                tree_root: root.to_string(),
+                compiler_commit: commit.to_string(),
+                receipt: "SEED-MINT sha256:00".to_string(),
+                stock_toolchain: "1.99.1".to_string(),
+            };
+            fs::write(
+                tree.join(crate::trust_lock::LOCK_FILE),
+                crate::trust_lock::render_body(&lock),
+            )
+            .expect("write lock");
+            crate::trust_lock::find(&tree).expect("the lock")
+        };
+        let found = |stage2: Option<&Path>, lock: Option<&crate::trust_lock::Found>| {
+            Toolchain::discover_with_store(
+                stage2,
+                &home.join(".rustup"),
+                Some(&prefix),
+                on_path.as_os_str(),
+                Some("trust"),
+                lock,
+            )
+        };
+
+        let t = found(None, None);
+        assert_eq!(t.stage2_dir, sealed, "no lock: the rustup entry answers");
+
+        let named = lock(16387, &root, commit);
+        let t = found(None, Some(&named));
+        assert!(t.have_targo(), "{}", t.missing_targo_label());
+        assert_eq!(
+            t.stage2_dir, locked,
+            "the lock's build, over rustup, current and PATH"
+        );
+        assert_eq!(t.tippy, Some(locked.join(TIPPY)));
+        assert_eq!(t.trustfmt, Some(locked.join(TRUSTFMT)));
+        assert!(t.borrowed.is_empty(), "{:?}", t.borrowed);
+        assert_eq!(
+            t.store_bin,
+            Some(crate::trust_lock::build_dir(&prefix, 16387).join("bin"))
+        );
+        assert!(t.lock_override.is_none() && t.lock_refusal.is_none());
+
+        fs::remove_file(locked.join(TRUSTFMT)).expect("rm trustfmt");
+        let t = found(None, Some(&named));
+        assert_eq!(
+            t.trustfmt, None,
+            "a locked tree borrows no formatter of another build"
+        );
+        assert!(t.borrowed.is_empty(), "{:?}", t.borrowed);
+
+        for (named, why, says) in [
+            (lock(16999, &root, commit), "absent", "does not hold"),
+            (
+                lock(16387, &"e".repeat(64), commit),
+                "another tree",
+                "another build",
+            ),
+            (
+                lock(16387, &root, &"c".repeat(40)),
+                "another compiler",
+                "reports commit",
+            ),
+        ] {
+            let t = found(None, Some(&named));
+            assert!(!t.have_targo(), "{why}");
+            let label = t.missing_targo_label();
+            assert!(label.contains(says), "{why}: {label}");
+            for fallback in [&sealed, &on_path, &current] {
+                assert_ne!(&t.stage2_dir, fallback, "{why}: no fallback");
+            }
+        }
+
+        let named = lock(16387, &root, commit);
+        let t = found(Some(&on_path), Some(&named));
+        assert_eq!(t.stage2_dir, on_path);
+        assert!(t.have_targo());
+        assert!(
+            t.lock_override
+                .as_deref()
+                .is_some_and(|o| o.starts_with("TRUST_STAGE2_BIN=")),
+            "{:?}",
+            t.lock_override
+        );
+
+        // A dev-linked checkout takes the place of a lock, readable or not, as the shim's hop
+        // runs it.
+        let dev = pinned_bin(&home.join("devlink/bin"));
+        fs::create_dir_all(prefix.join("links")).expect("mkdir links");
+        fs::write(
+            prefix.join("links/trust"),
+            format!(
+                "schema = 1\nprogram = \"trust\"\ncheckout = \"{}\"\nbins = [\"bin/targo\", \
+                 \"bin/trustc\"]\n",
+                home.join("devlink").display()
+            ),
+        )
+        .expect("marker");
+        let unreadable = {
+            fs::write(tree.join(crate::trust_lock::LOCK_FILE), "version = 2\n").expect("lock");
+            crate::trust_lock::find(&tree).expect("the lock")
+        };
+        for (named, why) in [(&named, "a lock"), (&unreadable, "an unreadable lock")] {
+            let t = found(None, Some(named));
+            assert!(t.have_targo(), "{why}: {}", t.missing_targo_label());
+            assert_eq!(t.stage2_dir, dev, "{why}");
+            assert!(
+                t.lock_override
+                    .as_deref()
+                    .is_some_and(|o| o.starts_with("the dev-linked checkout")),
+                "{why}: {:?}",
+                t.lock_override
+            );
+        }
+        fs::remove_dir_all(&home).ok();
+    }
+
     /// An `atpkg` rustup view resolves through to the store build or dev-linked checkout it
     /// presents.
     #[cfg(unix)]
@@ -1700,6 +2051,7 @@ mod tests {
                 Some(&prefix),
                 OsStr::new(""),
                 Some("trust"),
+                None,
             )
         };
         let t = found();
@@ -1851,7 +2203,13 @@ mod tests {
         std::os::unix::fs::symlink(tmp.join("aarch64-apple-darwin"), tmp.join("host")).expect("ln");
 
         let via_link = tmp.join("host/stage2/bin");
-        let t = Toolchain::discover(Some(&via_link), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(
+            Some(&via_link),
+            Path::new("/unused"),
+            OsStr::new(""),
+            None,
+            None,
+        );
         assert!(t.have_targo());
         assert_eq!(t.stage2_dir, fs::canonicalize(&real).expect("canonicalize"));
         assert!(
@@ -1866,14 +2224,14 @@ mod tests {
         let tmp = mktemp_dir("atv-tippy").expect("mktemp");
         let real = fs::canonicalize(&tmp).expect("canonicalize");
         exec_stub(&tmp.join("targo-clippy"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None, None);
         assert_eq!(
             t.tippy, None,
             "the retired pre-rebrand name is not a tippy: the lane is NOT RUN"
         );
 
         exec_stub(&tmp.join("targo-tippy"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None, None);
         assert_eq!(
             t.tippy.as_deref(),
             Some(real.join(tool_file("targo-tippy")).as_path())
@@ -1915,6 +2273,7 @@ mod tests {
                 Some(&prefix),
                 path,
                 Some("trust"),
+                None,
             )
         };
         let t = found(None, OsStr::new(""));
@@ -2009,14 +2368,14 @@ mod tests {
     #[test]
     fn path_is_only_rewritten_when_a_targo_is_really_there() {
         let tmp = mktemp_dir("atv-path").expect("mktemp");
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None, None);
         assert_eq!(
             t.path_with_stage2_first(OsStr::new("/usr/bin")),
             OsString::from("/usr/bin")
         );
 
         exec_stub(&tmp.join("targo"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None, None);
         let want =
             std::env::join_paths([t.stage2_dir.as_os_str(), OsStr::new("/usr/bin")]).expect("join");
         assert_eq!(t.path_with_stage2_first(OsStr::new("/usr/bin")), want);
@@ -2096,6 +2455,7 @@ mod tests {
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
+            None,
         );
         assert!(!t.have_targo(), "fail-closed: not the pinned toolchain");
         assert!(t.refused.is_some());
@@ -2109,6 +2469,7 @@ mod tests {
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
+            None,
         );
         assert!(
             !t.have_targo(),
@@ -2125,6 +2486,7 @@ mod tests {
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
+            None,
         );
         assert!(t.have_targo());
         assert!(t.refused.is_none());
@@ -2134,6 +2496,7 @@ mod tests {
             Path::new("/unused"),
             OsStr::new(""),
             Some("stable"),
+            None,
         );
         assert!(t.have_targo(), "upstream channels are a passthrough");
         fs::remove_dir_all(&tmp).ok();
@@ -2158,6 +2521,7 @@ mod tests {
                 Some(&default_atpkg_prefix(home)),
                 path,
                 Some("trust"),
+                None,
             )
         };
 
@@ -2178,7 +2542,7 @@ mod tests {
     fn a_directory_named_targo_is_not_a_driver() {
         let tmp = mktemp_dir("atv-dir").expect("mktemp");
         fs::create_dir_all(tmp.join("targo")).expect("mkdir");
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None, None);
         assert!(
             !t.have_targo(),
             "fail-closed: a directory is not the verified driver"
@@ -2197,8 +2561,13 @@ mod tests {
             fs::set_permissions(&fifo, fs::Permissions::from_mode(0o755)).expect("chmod fifo");
             assert!(!is_executable_file(&fifo));
             assert!(!is_pending_stub(&fifo));
-            let t =
-                Toolchain::discover(Some(&fifo_dir), Path::new("/unused"), OsStr::new(""), None);
+            let t = Toolchain::discover(
+                Some(&fifo_dir),
+                Path::new("/unused"),
+                OsStr::new(""),
+                None,
+                None,
+            );
             assert!(
                 !t.have_targo(),
                 "fail-closed: an executable FIFO is not a driver and must not hang discovery"

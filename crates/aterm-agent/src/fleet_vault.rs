@@ -153,7 +153,7 @@ impl Vault {
 pub enum Tenure {
     /// They admit: the fleet state was taken under the vault configured now, or no take recorded
     /// one (a fleet an older build or no vault took, adopted as the vault configured now), or
-    /// this process reads no vault (a test, a lab's scratch state, CI).
+    /// this process reads no vault (under a private state root: a test, a lab's scratch state).
     Here,
     /// They admit no Mac: the fleet state was taken under the vault `taken` names, and the one
     /// it is read against (configured now, or the one a take is decided under: [`tenure_under`])

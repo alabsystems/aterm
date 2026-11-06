@@ -5,6 +5,10 @@
 //! A concluded task keeps both its pane and any program still running there. A seamless update
 //! protects every worker before any signal or task mark. Open claim workers alone retain their
 //! execution budget; their processes end and their task records become exited.
+//!
+//! A program worker's open task whose program ended where no launcher of this process watched it
+//! (a seamless update carried it, a restore brought it back) is concluded on that end at each look
+//! ([`crate::App::conclude_unwatched_program`]); its pane stays, as every concluded worker's does.
 
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
@@ -272,6 +276,9 @@ impl crate::App {
             let Some(look) = look else {
                 continue;
             };
+            if crate::program_worker::awaits_its_end(&look.record) {
+                self.conclude_unwatched_program(&handle, &look.record);
+            }
             if look.worker && look.limited {
                 continue;
             }
@@ -304,6 +311,53 @@ impl crate::App {
             self.settle_retired_windows(&aged);
         }
         steps
+    }
+
+    /// A PROGRAM WORKER's end where no launcher of this process may watch it
+    /// ([`crate::program_worker::watch`]: a seamless update carried it, a restore brought it back),
+    /// read off its tab's blocks from the one its launcher typed into
+    /// ([`crate::program_worker::unwatched_end`], its shell asked for a stopped job only where a
+    /// stop's status ended that block) and concluded as its
+    /// launcher would ([`crate::program_worker::conclude`]), with no wait on an update's fence and
+    /// no wait on a terminal another thread holds: a later look reads it again. Where its launcher
+    /// does watch it, whichever reads the end first marks it, and the record's rev keeps the other
+    /// from marking it again.
+    fn conclude_unwatched_program(
+        &self,
+        handle: &crate::session_store::SessionHandle,
+        read: &TaskRecord,
+    ) {
+        let stand = crate::program_worker::Unwatched {
+            restored: read.why == Some(crate::task_record::WHY_RESTORED),
+            job: self.session_foreground_busy(handle.local_id),
+        };
+        let shell = handle.shell_identity.pid;
+        let stopped = || shell > 0 && crate::program_worker::holds_stopped_job(shell);
+        let end = match handle.term.try_lock() {
+            Ok(term) => crate::program_worker::unwatched_end(&term, read, stand, stopped),
+            Err(std::sync::TryLockError::Poisoned(term)) => {
+                crate::program_worker::unwatched_end(&term.into_inner(), read, stand, stopped)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let Some(end) = end else {
+            return;
+        };
+        let marked = crate::program_worker::conclude(
+            &handle.ctx,
+            handle.local_id,
+            handle.sid.as_str(),
+            read,
+            &end,
+            Duration::ZERO,
+        );
+        if let Ok(Some(record)) = marked {
+            aterm_log::info!(
+                "workers: @{}: its program ended where no launcher watched it; its task is {}",
+                handle.sid.as_str(),
+                record.state.as_str()
+            );
+        }
     }
 
     /// One step for an expired claim worker. Concluded workers keep their Autopilot and pane.

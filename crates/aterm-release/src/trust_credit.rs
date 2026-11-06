@@ -290,10 +290,17 @@ pub fn tally(text: &str) -> Result<Tally, String> {
         let Some(key) = l.key else {
             continue; // a function's `fn` line
         };
-        if let Some(first) = keys.insert(key.clone(), n) {
-            return Err(format!(
-                "line {n}: key {key:?} was written on line {first} too, and Trust writes one line per key"
-            ));
+        match keys.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "line {n}: key {:?} was written on line {} too, and Trust writes one line per key",
+                    entry.key(),
+                    entry.get()
+                ));
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(n);
+            }
         }
         let status = l
             .status
@@ -353,14 +360,16 @@ fn check_grade(status: &str, e: &str, d: &str, p: &[String]) -> Result<bool, Str
     if !DISCHARGES.contains(&d) {
         return Err(format!("unknown discharge {d:?}"));
     }
-    let mut at = Vec::with_capacity(p.len());
+    let mut prev = None;
+    let mut ordered = true;
     for premise in p {
         let Some(i) = PREMISES.iter().position(|known| known == premise) else {
             return Err(format!("unknown grade premise {premise:?}"));
         };
-        at.push(i);
+        ordered &= prev.is_none_or(|last| last < i);
+        prev = Some(i);
     }
-    if !at.windows(2).all(|pair| pair[0] < pair[1]) {
+    if !ordered {
         return Err(format!(
             "grade premises {p:?} are not in Trust's declaration order without repeats"
         ));
@@ -444,16 +453,22 @@ impl Credit {
         } else {
             "graded".to_string()
         };
+        use std::fmt::Write as _;
         let mut s = format!("proved (calculus): {} of {} proved [", t.calculus, t.proved);
         match epoch {
-            Some(e) => s.push_str(&format!(
-                "credit epoch {}, floor {}; {grading}",
-                e.id, e.calculus_floor
-            )),
-            None => s.push_str(&format!("no credit epoch; {grading}")),
+            Some(e) => {
+                let _ = write!(
+                    s,
+                    "credit epoch {}, floor {}; {grading}",
+                    e.id, e.calculus_floor
+                );
+            }
+            None => {
+                let _ = write!(s, "no credit epoch; {grading}");
+            }
         }
         if !self.absent.is_empty() {
-            s.push_str(&format!("; no record: {}", self.absent.join(", ")));
+            let _ = write!(s, "; no record: {}", self.absent.join(", "));
         }
         s.push(']');
         s

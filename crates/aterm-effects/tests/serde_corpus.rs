@@ -56,7 +56,11 @@ graphic = { collection = "cats" }
 
 #[test]
 fn custom_word_fragments_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "custom-words");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(
+        dir.to_str().expect("a UTF-8 package directory"),
+        "custom-words",
+    );
     let read = |doc: &str| parse_custom_toml(doc).map(|entries| format!("{entries:?}"));
     corpus.record("base", read(CUSTOM));
     corpus.record("empty", read(""));
@@ -208,7 +212,8 @@ graphic = { collection = "cats", dwell_ms = [2300, 3400] }
 
 #[test]
 fn toy_packs_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "toy-pack");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(dir.to_str().expect("a UTF-8 package directory"), "toy-pack");
     let read =
         |doc: &str| compile_toy_pack_toml(doc).map(|pack| sorted_overrides(&format!("{pack:?}")));
     corpus.record(

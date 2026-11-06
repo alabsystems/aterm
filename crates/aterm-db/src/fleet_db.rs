@@ -675,23 +675,23 @@ fn credential_field(key: &str) -> bool {
         "backupcode",
         "backupcodes",
     ];
-    if key
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    {
-        return SUFFIXES.iter().any(|suffix| key.ends_with(suffix));
+    let mut buf = [0u8; 16];
+    let mut start = buf.len();
+    for b in key.bytes().rev().filter(u8::is_ascii_alphanumeric).take(16) {
+        start -= 1;
+        buf[start] = b.to_ascii_lowercase();
     }
-    let key: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect();
-    SUFFIXES.iter().any(|suffix| key.ends_with(suffix))
+    let tail = &buf[start..];
+    SUFFIXES
+        .iter()
+        .any(|suffix| tail.ends_with(suffix.as_bytes()))
 }
 
 fn sensitive_field(key: &str, value: &Value) -> bool {
-    let presence_flag = key == "has_password" && value.as_bool().is_some();
-    credential_field(key) && !presence_flag && !value.is_null()
+    if value.is_null() || (key == "has_password" && value.as_bool().is_some()) {
+        return false;
+    }
+    credential_field(key)
 }
 
 fn credential_fields(object: &Map) -> bool {
@@ -793,10 +793,10 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
     {
         return Ok(Some(projected));
     }
-    let rows = scan_table(view, logical_table)?;
+    let mut rows = scan_table(view, logical_table)?;
     let canonical = normalize_natural_key(logical_table, key)?;
-    if let Some(val) = rows.get(&canonical) {
-        return Ok(Some(val.clone()));
+    if let Some(val) = rows.remove(&canonical) {
+        return Ok(Some(val));
     }
     for (k, v) in &rows {
         if k.eq_ignore_ascii_case(&canonical) {
@@ -805,7 +805,7 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
     }
     if collection == "computers" {
         let mut matches = Vec::new();
-        for v in rows.values() {
+        for v in rows.into_values() {
             let nick_match = v
                 .get("nickname")
                 .and_then(Value::as_str)
@@ -827,7 +827,7 @@ pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Val
                         .any(|a| a.eq_ignore_ascii_case(&canonical))
                 });
             if nick_match || alias_match || nick_alias_match {
-                matches.push(v.clone());
+                matches.push(v);
             }
         }
         return match matches.len() {
@@ -976,24 +976,18 @@ fn transactions(changes: Vec<Change>) -> Result<Vec<Vec<Change>>> {
     let mut current_bytes = 64usize;
 
     for change in changes {
-        let change_bytes = change
-            .value
-            .as_ref()
-            .and_then(|v| aterm_json::to_vec(v).ok())
-            .map_or(0, |b| b.len())
-            + change.collection.len()
-            + change.key.len()
-            + 48;
         // A row `put` accepted has to load too: alone in a transaction it may use all of one.
         let alone = Command::Write {
             request: [0; 16],
             changes: vec![change],
         };
-        if alone.encode()?.len() > crypto::MAX_BODY {
+        let alone_len = alone.encode()?.len();
+        if alone_len > crypto::MAX_BODY {
             return Err(Error::new(
                 "single row exceeds maximum operation payload limit",
             ));
         }
+        let change_bytes = alone_len.saturating_sub(67);
         let Command::Write { mut changes, .. } = alone else {
             unreachable!()
         };

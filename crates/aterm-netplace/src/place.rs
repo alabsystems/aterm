@@ -263,6 +263,32 @@ impl Facts {
     }
 }
 
+const fn hex16_bytes(val: u64) -> [u8; 16] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let bytes = val.to_be_bytes();
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        let b = bytes[i];
+        out[2 * i] = DIGITS[(b >> 4) as usize];
+        out[2 * i + 1] = DIGITS[(b & 0x0f) as usize];
+        i += 1;
+    }
+    out
+}
+
+const fn prefixed_hex16(prefix: u8, val: u64) -> [u8; 17] {
+    let hex = hex16_bytes(val);
+    let mut out = [0u8; 17];
+    out[0] = prefix;
+    let mut i = 0;
+    while i < 16 {
+        out[i + 1] = hex[i];
+        i += 1;
+    }
+    out
+}
+
 /// A network's id: a short hash of its gateway's hardware address and its subnet (strong), or,
 /// before ARP gives that address, of its subnet and gateway address (weak). The hash is for tidy
 /// display, not secrecy.
@@ -270,16 +296,23 @@ impl Facts {
 pub struct NetworkId(String);
 
 impl NetworkId {
-    /// The strong id of `route`: `None` before its gateway's hardware address is read.
-    #[must_use]
-    pub fn of(route: &RouteFacts) -> Option<Self> {
+    fn strong_bytes(route: &RouteFacts) -> Option<[u8; 17]> {
         let hw = route.gateway_hw.as_deref()?;
         let mut h = aterm_hash::Fnv1a64::new();
         h.write(b"aterm-netplace/1 strong\0");
         h.write(hw);
         h.write_u8(0);
         route.with_subnet_words(|subnet| h.write(subnet.as_bytes()));
-        Some(Self(format!("n{:016x}", h.finish())))
+        Some(prefixed_hex16(b'n', h.finish()))
+    }
+
+    /// The strong id of `route`: `None` before its gateway's hardware address is read.
+    #[must_use]
+    pub fn of(route: &RouteFacts) -> Option<Self> {
+        let buf = Self::strong_bytes(route)?;
+        Some(Self(
+            std::str::from_utf8(&buf).unwrap_or_default().to_owned(),
+        ))
     }
 
     /// The weak id of `route`: its subnet and gateway address, never remembered.
@@ -292,7 +325,8 @@ impl NetworkId {
         if let Some(gateway) = route.gateway {
             h.write(&gateway.octets());
         }
-        Self(format!("w{:016x}", h.finish()))
+        let buf = prefixed_hex16(b'w', h.finish());
+        Self(std::str::from_utf8(&buf).unwrap_or_default().to_owned())
     }
 
     /// Whether this id came from the gateway's hardware address.
@@ -324,14 +358,19 @@ impl NetworkId {
     }
 }
 
-/// A member's key in the evidence: a short hash of its lane and id, so the file holds no node id.
-#[must_use]
-pub fn member_key(lane: Lane, id: &str) -> String {
+pub(crate) fn member_key_bytes(lane: Lane, id: &str) -> [u8; 16] {
     let mut h = aterm_hash::Fnv1a64::new();
     h.write(lane.word().as_bytes());
     h.write_u8(0);
     h.write(id.as_bytes());
-    format!("{:016x}", h.finish())
+    hex16_bytes(h.finish())
+}
+
+/// A member's key in the evidence: a short hash of its lane and id, so the file holds no node id.
+#[must_use]
+pub fn member_key(lane: Lane, id: &str) -> String {
+    let buf = member_key_bytes(lane, id);
+    std::str::from_utf8(&buf).unwrap_or_default().to_owned()
 }
 
 /// The kind of a network this Mac is on.
@@ -637,8 +676,8 @@ impl Stay {
         let Some(route) = facts.route.as_ref() else {
             return self.subnet.is_none();
         };
-        match (NetworkId::of(route), &self.network) {
-            (Some(id), Some(network)) if network.is_strong() => *network == id,
+        match (NetworkId::strong_bytes(route), &self.network) {
+            (Some(id), Some(network)) if network.is_strong() => network.0.as_bytes() == id,
             _ => {
                 self.gateway == route.gateway
                     && route.with_subnet_words(|subnet| self.subnet.as_deref() == Some(subnet))
@@ -865,32 +904,37 @@ fn counts(answer: &Answer, stay: &Stay, route: &RouteFacts, now: u64) -> bool {
 }
 
 /// The distinct members answering in `stay` on `route`, the larger of the two lanes' counts
-/// (their ids are separate spaces), and the same within `fresh` of `now`.
-fn members_in(
+/// (their ids are separate spaces), and the same within `REACH_FRESH_MS` of `now`.
+fn members_and_reachable_in(
     evidence: &Evidence,
     stay: &Stay,
     route: &RouteFacts,
     now: u64,
-    fresh: Option<u64>,
-) -> usize {
-    [Lane::Fleet, Lane::Commons]
-        .into_iter()
-        .map(|lane| {
-            let mut members: Vec<&str> = evidence
-                .answers
-                .iter()
-                .filter(|answer| answer.lane == lane && counts(answer, stay, route, now))
-                .filter(|answer| {
-                    fresh.is_none_or(|fresh| now.saturating_sub(answer.at_ms) <= fresh)
-                })
-                .map(|answer| answer.member.as_str())
-                .collect();
-            members.sort_unstable();
-            members.dedup();
-            members.len()
-        })
-        .max()
-        .unwrap_or(0)
+) -> (usize, usize) {
+    let mut all_max = 0;
+    let mut fresh_max = 0;
+    let mut all_members: Vec<&str> = Vec::new();
+    let mut fresh_members: Vec<&str> = Vec::new();
+    for lane in [Lane::Fleet, Lane::Commons] {
+        all_members.clear();
+        fresh_members.clear();
+        for answer in &evidence.answers {
+            if answer.lane == lane && counts(answer, stay, route, now) {
+                let m = answer.member.as_str();
+                all_members.push(m);
+                if now.saturating_sub(answer.at_ms) <= REACH_FRESH_MS {
+                    fresh_members.push(m);
+                }
+            }
+        }
+        all_members.sort_unstable();
+        all_members.dedup();
+        fresh_members.sort_unstable();
+        fresh_members.dedup();
+        all_max = all_max.max(all_members.len());
+        fresh_max = fresh_max.max(fresh_members.len());
+    }
+    (all_max, fresh_max)
 }
 
 /// Fleet rounds in `stay` that heard no member and met only silence ([`Round::blocked`] none):
@@ -1008,15 +1052,13 @@ fn observe(mut record: Record, facts: &Facts, now: u64, keeper_start: Option<u64
     };
     match record.stays.last_mut() {
         Some(stay) if stay.end_ms.is_none() && stay.continues(facts) => {
-            if let Some(route) = facts.route.as_ref() {
-                match (NetworkId::of(route), &stay.network) {
-                    (Some(id), network) if network.as_ref().is_none_or(|n| !n.is_strong()) => {
-                        stay.network = Some(id);
-                    }
-                    (None, None) if now.saturating_sub(stay.start_ms) > SETTLE_MS => {
-                        stay.network = Some(NetworkId::weak(route));
-                    }
-                    _ => {}
+            if let Some(route) = facts.route.as_ref()
+                && stay.network.as_ref().is_none_or(|n| !n.is_strong())
+            {
+                if let Some(id) = NetworkId::of(route) {
+                    stay.network = Some(id);
+                } else if stay.network.is_none() && now.saturating_sub(stay.start_ms) > SETTLE_MS {
+                    stay.network = Some(NetworkId::weak(route));
                 }
             }
         }
@@ -1095,9 +1137,9 @@ pub fn step(
     if let Some(path) = facts.path {
         record.path = Some(path);
     }
-    let stay = record.current().cloned();
+    let stay = record.current();
     let path = facts.path;
-    let internet = internet_in(evidence, stay.as_ref(), path, now);
+    let internet = internet_in(evidence, stay, path, now);
     let known = book.map(|book| book.members.len());
     let last_answer = evidence
         .answers
@@ -1106,23 +1148,34 @@ pub fn step(
         .max_by_key(|answer| answer.at_ms)
         .map(|answer| (answer.at_ms, answer.lane));
     let kind = facts.route.as_ref().map(|_| facts.kind());
-    let (members_here, reachable, silent) = match (stay.as_ref(), facts.route.as_ref()) {
-        (Some(stay), Some(route)) => (
-            members_in(evidence, stay, route, now, None),
-            members_in(evidence, stay, route, now, Some(REACH_FRESH_MS)),
-            silent_rounds(evidence, stay, now) >= SILENT_ROUNDS,
-        ),
+    let (members_here, reachable, silent) = match (stay, facts.route.as_ref()) {
+        (Some(stay), Some(route)) => {
+            let (all, reach) = members_and_reachable_in(evidence, stay, route, now);
+            (
+                all,
+                reach,
+                silent_rounds(evidence, stay, now) >= SILENT_ROUNDS,
+            )
+        }
         _ => (0, 0, false),
     };
-    let network = stay.as_ref().and_then(|stay| stay.network.clone());
+    let (has_stay, since_ms, since_before, network) = match stay {
+        Some(stay) => (
+            true,
+            Some(stay.start_ms),
+            stay.from_start,
+            stay.network.clone(),
+        ),
+        None => (false, None, false, None),
+    };
     let mut recognised = None;
     let mut once_alab = false;
-    let at = match (facts.route.as_ref(), stay.as_ref()) {
+    let at = match (facts.route.as_ref(), has_stay) {
         (None, _) => match path.and_then(|path| path.usable) {
             Some(true) => Where::Checking(Checking::NoIpv4),
             _ => Where::Offline,
         },
-        (Some(_), Some(stay)) if stay.network.is_none() => Where::Checking(Checking::Moved),
+        (Some(_), true) if network.is_none() => Where::Checking(Checking::Moved),
         (Some(route), _) => {
             let network = network.as_ref();
             let remembered = network.is_some_and(|network| record.remembers(network));
@@ -1208,8 +1261,8 @@ pub fn step(
         route: facts.route.clone(),
         tunnel: facts.tunnel.clone(),
         path,
-        since_ms: stay.as_ref().map(|stay| stay.start_ms),
-        since_before: stay.as_ref().is_some_and(|stay| stay.from_start),
+        since_ms,
+        since_before,
         internet,
         alab,
         reachable,

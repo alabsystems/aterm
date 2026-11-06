@@ -7,7 +7,7 @@
 use super::*;
 
 fn pack_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/themes/pack/")
+    aterm_tempfile::manifest_dir().join("../../contrib/themes/pack/")
 }
 
 fn upstream_of(theme: &PackTheme) -> String {

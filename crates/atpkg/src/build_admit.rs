@@ -2003,7 +2003,7 @@ pub fn run_if_claimed_at(
     match admit(&build, cwd, seat, &mut say) {
         Admission::Claimed(held) => {
             let mut command = aterm_uds::spawnfd::transparent(target).into_command();
-            command.args(args);
+            command.args(args).current_dir(cwd);
             for (k, v) in env {
                 command.env(k, v);
             }
@@ -2042,7 +2042,11 @@ pub fn run_if_claimed(
 
 /// `atpkg __build_admit [--shim <tool> <placed>] <target> [args…]`: what a `targo` or
 /// `targo-tippy` shim's hop runs once its block has placed the build ([`VERB`]); `atpkg
-/// __build_admit --capabilities` answers [`HOP_CAPABILITY`] and runs nothing. The shim's form
+/// __build_admit --capabilities` answers [`HOP_CAPABILITY`] and runs nothing, and
+/// `--lock-capabilities` answers [`crate::trust_lock::LOCK_CAPABILITY`]. In the shim's form, a
+/// tree whose `trust.lock` names a build runs that build's tool in place of `target`
+/// ([`crate::trust_lock::shim_target`]; a lock that does not read, or a build this store does not
+/// hold as it names it, is exit 75 with no build started). The shim's form
 /// first registers the call's build cache as the shim's own registration call did
 /// ([`crate::build_cache::registered::observe_shim_call`]: a refusal is exit 75, no build
 /// started); `<placed>` says what the block changed (`-` nothing, `config` its two leading words,
@@ -2058,6 +2062,12 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
         && only == "--capabilities"
     {
         println!("{HOP_CAPABILITY}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let [only] = argv
+        && only == crate::trust_lock::LOCK_CAPABILITY_FLAG
+    {
+        println!("{}", crate::trust_lock::LOCK_CAPABILITY);
         return std::process::ExitCode::SUCCESS;
     }
     let (shim, argv) = match argv.split_first() {
@@ -2077,7 +2087,23 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     let Some((target, rest)) = argv.split_first() else {
         return usage();
     };
-    let target = Path::new(target);
+    // A shim's target is the build it was laid for; in a tree whose trust.lock names another,
+    // the hop runs that one, so plain `targo` and verify compile with one compiler.
+    let locked = match (shim, std::env::current_dir()) {
+        (Some(_), Ok(cwd)) => match crate::trust_lock::shim_target(
+            Path::new(target),
+            &cwd,
+            &mut crate::trust_lock::install_named,
+        ) {
+            Ok(locked) => locked,
+            Err(why) => {
+                eprintln!("atpkg: {why}; no build started");
+                return std::process::ExitCode::from(75);
+            }
+        },
+        _ => None,
+    };
+    let target = locked.as_deref().unwrap_or_else(|| Path::new(target));
     let words = rest
         .iter()
         .map(|a| a.to_str().map(str::to_owned))

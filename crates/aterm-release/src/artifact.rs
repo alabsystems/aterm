@@ -494,12 +494,10 @@ fn prune(store: &Path, keep: &[&str]) {
         if keep.iter().any(|k| name.as_os_str() == *k) {
             continue;
         }
-        if !name.to_str().is_some_and(|name| {
-            name.len() == 64
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        }) {
+        if !name
+            .to_str()
+            .is_some_and(|name| aterm_codec::hex::is_lower(name, 64))
+        {
             continue;
         }
         let path = entry.path();

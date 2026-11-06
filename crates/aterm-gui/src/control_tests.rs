@@ -6327,6 +6327,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         "ToggleStatsLens",
         "RecordUnseenKeys",
         "ChangeNickname",
+        "RenameMachine",
     ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
@@ -15359,7 +15360,7 @@ fn fabric_attach_body() {
     let post = || crate::fabric::cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 on?", None);
     let unattached = format!(
         "build={} bridge_lane=- bridge_build=- lane_faults=0",
-        aterm_types::version::build_id()
+        aterm_stamp::build_id()
     );
 
     assert_eq!(
@@ -15483,7 +15484,7 @@ fn fabric_attach_body() {
         format!(
             "OK state=absent supervised=0 command=- argv=- reason=- rtt_ms=- link_age_ms=- build={} \
              bridge_lane=- bridge_build=- lane_faults=0\n",
-            aterm_types::version::build_id()
+            aterm_stamp::build_id()
         )
     );
     assert_eq!(
@@ -15616,7 +15617,7 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
         } = control_request::head(line);
         dispatch_bridge_verb(verb, rest, selector.as_ref(), Scope::Bridge, &store)
     };
-    let own = aterm_types::version::build_id();
+    let own = aterm_stamp::build_id();
     let lane = aterm_types::control_verbs::BRIDGE_LANE;
     let ghost = crate::fabric::next_bridge_generation();
     let generation = crate::fabric::next_bridge_generation();
@@ -18320,7 +18321,7 @@ fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
             .map(|c| c.holder.clone())
     };
     let rostered = "set supervisor grok-alab@4242 contract=3 scope=relaunch,upgrade";
-    let foreign = "set supervisor muse-alab@4242 contract=3 scope=relaunch,upgrade";
+    let foreign = "set supervisor kimi-alab@4242 contract=3 scope=relaunch,upgrade";
     for line in [rostered, foreign] {
         let refused = sup(false, 7, line);
         assert!(
@@ -18338,7 +18339,7 @@ fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
         "OK\n",
         "a foreign v3 claim, unproven"
     );
-    assert_eq!(holder().as_deref(), Some("muse-alab@4242"));
+    assert_eq!(holder().as_deref(), Some("kimi-alab@4242"));
     release_connection_claims_of(&h, 7);
     assert_eq!(holder(), None);
     assert_eq!(sup(false, 8, "set supervisor sup-a"), "OK\n", "a v2 claim");

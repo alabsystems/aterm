@@ -283,6 +283,7 @@ impl Fx {
                 unproven: AtomicBool::new(held.unproven),
                 lacks: Mutex::new(held.lacks.clone()),
                 upstream: AtomicBool::new(false),
+                upstream_programs: Mutex::new(BTreeSet::new()),
             },
             indexer: FakeIndexer {
                 requests: Mutex::new(indexes),
@@ -532,6 +533,8 @@ pub struct FakePacker {
     pub lacks: Mutex<Option<String>>,
     /// The fixture owns the complete C source SDK.
     pub upstream: AtomicBool,
+    /// Individually available upstream packages when the source SDK is absent.
+    pub upstream_programs: Mutex<BTreeSet<String>>,
 }
 
 impl FakePacker {
@@ -561,8 +564,14 @@ impl FakePacker {
 }
 
 impl Packer for FakePacker {
-    fn can_pack_bottle(&self, _triple: Triple) -> std::result::Result<(), String> {
-        if self.upstream.load(Ordering::SeqCst) {
+    fn can_pack_bottle(&self, program: &str, _triple: Triple) -> std::result::Result<(), String> {
+        if self.upstream.load(Ordering::SeqCst)
+            || self
+                .upstream_programs
+                .lock()
+                .expect("program capabilities")
+                .contains(program)
+        {
             Ok(())
         } else {
             Err("fixture has no upstream SDK".into())

@@ -20,7 +20,7 @@
 [package]
 name = "aterm-serde"
 description = "First-party serde for aterm: the Serialize/Deserialize traits, the std impls aterm's models use, and the support surface the derive targets. Derived from serde 1.0.228; MIT OR Apache-2.0 upstream."
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

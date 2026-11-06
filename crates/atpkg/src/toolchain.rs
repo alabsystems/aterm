@@ -6,5 +6,6 @@
 //! home beside it ([`rustup`](crate::toolchain::rustup)).
 
 pub use aterm_toolchain::discovery::*;
+pub use aterm_toolchain::rustc_movers;
 pub use aterm_toolchain::rustup;
 pub use aterm_toolchain::trust_recreate_bootstrap_cmd;

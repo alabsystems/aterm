@@ -998,6 +998,7 @@ pub fn runner_text(r: &Run, tb: (u32, u32)) -> String {
             cores,
             name,
             unread,
+            unified,
         }) = g
         else {
             put(which, "-".to_owned());
@@ -1016,6 +1017,7 @@ pub fn runner_text(r: &Run, tb: (u32, u32)) -> String {
             &format!("{which}.unread"),
             escape(unread.as_ref().map(ToString::to_string).as_deref()),
         );
+        put(&format!("{which}.unified"), u8::from(*unified).to_string());
     }
     for n in notes {
         put("note", escape(Some(n)));
@@ -1088,6 +1090,11 @@ impl Fields<'_> {
             cores: self.num(&k("cores"))?,
             name: self.text(&k("name"))?,
             unread,
+            unified: match self.raw(&k("unified"))? {
+                "0" => false,
+                "1" => true,
+                v => return Err(format!("{which}.unified={v} is neither 0 nor 1")),
+            },
         }))
     }
 }

@@ -479,7 +479,7 @@ pub fn parse_packages_with(text: &str, dev_seams: bool) -> PackagesConfig {
 #[must_use]
 pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> PackagesConfig {
     match aterm_toml::from_str::<PackagesOnly>(text) {
-        Ok(root) => admit_packages(root.packages.unwrap_or_default(), dev_seams, home),
+        Ok(root) => admit_packages(root.packages.unwrap_or_default(), dev_seams, home, true),
         Err(e) => {
             // Said once per process wherever its unasked notices go ([`crate::notice`]):
             // every layout resolution reads the file again. A file that is not TOML at all
@@ -522,12 +522,17 @@ fn not_toml_note(text: &str) -> Option<(String, String)> {
 }
 
 /// The per-key admission a well-formed `[packages]` table gets, once, at load.
-fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>) -> PackagesConfig {
+fn admit_packages(
+    mut cfg: PackagesConfig,
+    dev_seams: bool,
+    home: Option<&Path>,
+    report: bool,
+) -> PackagesConfig {
     for (key, present) in [
         ("channel", cfg.channel.is_some()),
         ("include", cfg.include.is_some()),
     ] {
-        if present {
+        if present && report {
             crate::notice::say_spelling(&retired_key_note(key));
         }
     }
@@ -563,10 +568,10 @@ fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>)
             ));
         }
     }
-    for note in &cfg.admission_notes {
+    for note in cfg.admission_notes.iter().filter(|_| report) {
         crate::notice::say_spelling(note);
     }
-    if let Some(ignored) = cfg.ignored_prefix.as_deref() {
+    if report && let Some(ignored) = cfg.ignored_prefix.as_deref() {
         crate::notice::say_spelling_with_log(
             &ignored_prefix_note(ignored),
             &ignored_prefix_note_logged(ignored),
@@ -628,6 +633,32 @@ pub fn load() -> PackagesConfig {
         return PackagesConfig::default();
     };
     load_from_path(&path)
+}
+
+/// Read package settings for a read-only lookup, without notices or host-log writes.
+/// A malformed or unreadable file refuses the lookup instead of silently selecting defaults.
+pub(crate) fn load_for_lookup() -> Result<PackagesConfig, &'static str> {
+    let Some(path) = config_path() else {
+        return Ok(PackagesConfig::default());
+    };
+    let text = match crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
+        &path,
+        MAX_PACKAGES_CONFIG_BYTES,
+    ) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PackagesConfig::default());
+        }
+        Err(_) => return Err("package configuration is unreadable"),
+    };
+    let root: PackagesOnly =
+        aterm_toml::from_str(&text).map_err(|_| "package configuration is malformed")?;
+    Ok(admit_packages(
+        root.packages.unwrap_or_default(),
+        DEV_SEAMS,
+        aterm_types::dirs::home_dir().as_deref(),
+        false,
+    ))
 }
 
 /// Load the `[machine]` table from the real config file, under [`load`]'s rules.

@@ -745,8 +745,16 @@ impl Fault {
         }
     }
 
+    /// Mark the fault spent, for [`Fault::from_env`] of a later bridge of this state dir and for
+    /// the test that armed it: a dev seam's marker, whole by its rename and flushed by nothing,
+    /// as `notify`'s is, since no power loss falls inside a test.
     fn fired(self, state: &StateDir) {
-        let _ = aterm_uds::atomic_file::write(&state.root().join("fault-fired"), b"1\n", 0o600);
+        let _ = aterm_uds::atomic_file::write_flushed(
+            &state.root().join("fault-fired"),
+            b"1\n",
+            0o600,
+            None,
+        );
         stderr_line!("aterm-link: ATERM_LINK_FAULT={self:?} fired");
     }
 }
@@ -1007,7 +1015,7 @@ fn release_tokens() -> String {
     format!(
         "proto={} aterm={}",
         astream_broker::proto::PROTO_VERSION,
-        crate::pct::encode(&aterm_types::version::build_id())
+        crate::pct::encode(&aterm_stamp::build_id())
     )
 }
 
@@ -1384,6 +1392,14 @@ pub struct Bridge {
     /// Why the last route [`Bridge::resolve_to`] refused was refused, when the hand-off refused
     /// it ([`NoHandoff`]).
     unrouted: Option<NoHandoff>,
+    /// The nodes this Mac held before a key rotation, by the hand-off this attach read (§11
+    /// C3b): mail its sessions wrote under one is this Mac's own, and the node service moves the
+    /// mail this log held unread for one to this node's inbox (`federate::Lane::Inbox`).
+    old_nodes: BTreeSet<String>,
+    /// The reads of those nodes' mail lanes the node service minted this bridge
+    /// (`federate::OLD_READS_FILE`), each one `federate::old_reads` names and no other: where the
+    /// record each moved one came from lies ([`Bridge::wire_re`]).
+    old_reads: Vec<Cap>,
     /// With the mesh on, the held topics this bridge last named on its node's topics face
     /// ([`Bridge::say_held_topics`]); `None` until it names them on this attach.
     topics_said: Option<BTreeSet<String>>,
@@ -1835,10 +1851,19 @@ impl Bridge {
             None => node_for(&state, &caps)?,
         };
         let producer_id = astream_cap::producer_id_of(&node);
-        let _ = aterm_uds::atomic_file::write(
+        // The pid file is whole by its rename, and flushed by nothing: every reader takes it
+        // as advisory (`StateDir::holder` names it in the state lock's refusal, which the lock
+        // itself decides; the lab and the tests read it in a state dir made for their run, and
+        // no power loss falls inside one), and no process it names outlives a power loss, so a
+        // file that rolled back or lost its bytes there is no worse than a durable one naming
+        // the dead bridge. A durable write's two full flushes sat on every restart's and
+        // handoff's way to an attached bridge: the temporary's before the rename, inside
+        // kill -> new pid, and the directory's after it, inside new pid -> node row acked.
+        let _ = aterm_uds::atomic_file::write_flushed(
             &state.root().join("pid"),
             format!("{}\n", std::process::id()).as_bytes(),
             0o600,
+            None,
         );
         let fault = Fault::from_env(&state);
         let waits = Recorder::from_env(state.root());
@@ -1858,6 +1883,8 @@ impl Bridge {
             producer_id,
             handoff: HandoffSeen::default(),
             unrouted: None,
+            old_nodes: BTreeSet::new(),
+            old_reads: Vec::new(),
             topics_said: None,
             topics_refused: false,
             inc: 0,
@@ -3124,11 +3151,16 @@ impl Bridge {
                 exact_record = true;
                 let actual = publication_identity(&face, &bytes);
                 if candidates.contains(&actual) {
+                    #[cfg(test)]
+                    self.fx.reservation_tap(crate::fx::ReservationTap::Verified);
                     return Ok((off, true, Some(actual)));
                 }
             }
         }
         if exact_record && !legacy {
+            #[cfg(test)]
+            self.fx
+                .reservation_tap(crate::fx::ReservationTap::Collision);
             return Err(self.collision(pin.seq, off));
         }
         // A CUT VERIFIES NOTHING: retention gave up the record the answer named, and its dedup
@@ -3164,6 +3196,16 @@ impl Bridge {
                 "record is not readable at its original offset and pinned face".to_string()
             }
         };
+        #[cfg(test)]
+        self.fx
+            .reservation_tap(crate::fx::ReservationTap::Unverifiable(
+                match (legacy, untold, cut) {
+                    (true, _, _) => 2,
+                    (false, Some(_), _) => 3,
+                    (false, None, Some(_)) => 4,
+                    (false, None, None) => 5,
+                },
+            ));
         Err(self.unverified_publication(format!(
             "deduped reservation {} at @{off}: {reason}; left queued",
             pin.seq
@@ -3218,6 +3260,9 @@ impl Bridge {
     /// [`Bridge::unverified_publication`]'s case 1: the words aterm lists for `pin`'s post or
     /// receipt now are not those its attempt published ([`reconstructs`]).
     fn unreconstructed(&mut self, pin: &PublishPin) -> io::Error {
+        #[cfg(test)]
+        self.fx
+            .reservation_tap(crate::fx::ReservationTap::Unverifiable(1));
         self.unverified_publication(format!(
             "reservation {} cannot reconstruct its pinned attempt; left queued",
             pin.seq
@@ -4499,7 +4544,7 @@ impl Bridge {
         if self.committed_through(upto) {
             return;
         }
-        match self.state.set_inbox_owed(upto) {
+        match self.state.set_inbox_owed(&self.node, upto) {
             Ok(()) => stderr_line!(
                 "aterm-link: the inbox group's commit through {upto} is left for the next bridge \
                  (no broker connection to make it on)"
@@ -5022,6 +5067,9 @@ impl Bridge {
     /// the held one, and that covers only records accounted already, every one of them ahead of
     /// the queued rows.
     fn on_inbox_run(&mut self, first: &BrokerRecord) {
+        // Which nodes this Mac held before, as the node service's hand-off says now: mail it moved
+        // across a key rotation since this attach is this Mac's own (§11 C3b).
+        self.refresh_old_nodes();
         let run = if self.lane_pipelines() {
             self.mailbox
                 .take_inbox_run(self.fx.now(), DELIVER_RUN_MAX - 1)
@@ -5045,7 +5093,7 @@ impl Bridge {
     fn lane_pipelines(&self) -> bool {
         self.attachment == Attachment::Inherited
             && self.endpoint_lane == aterm_types::control_verbs::BRIDGE_LANE
-            && self.endpoint_build.as_deref() == Some(aterm_types::version::build_id().as_str())
+            && self.endpoint_build.as_deref() == Some(aterm_stamp::build_id().as_str())
     }
 
     /// Send what [`Bridge::deliver_record`] queued, in order and in as few writes as
@@ -5177,7 +5225,7 @@ impl Bridge {
         body: &Body,
     ) -> (WakeClass, Option<WakeClass>, bool) {
         let stray = if addr.kind == WakeClass::Expired {
-            addr.src != self.node
+            !self.is_my_node(&addr.src)
         } else {
             ANSWER_KINDS.contains(&addr.kind.as_str())
                 && body.re.is_some_and(|re| {
@@ -5249,7 +5297,7 @@ impl Bridge {
                 if addr.src.starts_with("n-")
                     && sid.starts_with("s-")
                     && subject::is_principal(sid)
-                    && (addr.src == self.node || self.may_speak_for(&addr.src, sid)) =>
+                    && (self.is_my_node(&addr.src) || self.may_speak_for(&addr.src, sid)) =>
             {
                 format!("{sid}@{}", addr.src)
             }
@@ -6177,6 +6225,41 @@ impl Bridge {
                     continue;
                 }
             }
+            // A KEYED RE-POST'S ENTRY, its own words not read back on the bus: its key's winner,
+            // read back where its key pin says it landed, of that winner's words
+            // ([`Bridge::keyed_winner_at`]), which binds it on whatever log the entry was
+            // journaled. Past a cut that carried that record and dropped its dedup key, the
+            // publish at the pin would land a second copy of the key; settled at the winner, the
+            // entry lands as astream's dedup at its pin would answer it.
+            if entry.pin.via_key {
+                match self.keyed_winner_at(&entry.pin) {
+                    Ok(Some(off)) => {
+                        stderr_line!(
+                            "aterm-link: the in-flight keyed record at sequence {seq} has its \
+                             key's winner on the bus at @{off}, read back; it is not published \
+                             again"
+                        );
+                        #[cfg(test)]
+                        self.fx
+                            .reservation_tap(crate::fx::ReservationTap::ReplayedAtTheWinner);
+                        let ours = entry
+                            .pin
+                            .original
+                            .as_ref()
+                            .is_none_or(|winner| self.on_own_lane(&winner.subject));
+                        self.land_replayed(seq, off, ours);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        stderr_line!(
+                            "aterm-link: the in-flight keyed record at sequence {seq} could not \
+                             read its key's winner back: {e}"
+                        );
+                        return false;
+                    }
+                }
+            }
             // BEHIND THE BROKER'S RATE LIMIT (critic item E06) the replay waits: astream refuses
             // for the rate ahead of its dedup, and the bridge's hold sends nothing, so neither
             // says whether an earlier attempt landed, and only the replay's own answer can. An
@@ -6399,10 +6482,11 @@ impl Bridge {
     /// `StateDir::publication_offset_resets`), or, for a pin whose file holds no head (a
     /// receipt's), from that of its record in flight while it stands. `None` for none; for a
     /// pin that names no head and has no record in flight on this log, which is published again
-    /// as before; for a keyed pin, whose winner may be another identity on another face
-    /// (`publish_reserved` reconciles it); and, with no read, for words the pin's attempt never
-    /// published (`reconstructs`), which no read finds its record by, and which the publish
-    /// refuses before it journals or sends anything (critic item F21's case 1).
+    /// as before; and, with no read, for words the pin's attempt never published
+    /// (`reconstructs`), which no read finds its record by, and which the publish refuses before
+    /// it journals or sends anything (critic item F21's case 1). A keyed re-post's pin, whose
+    /// winner may be another identity on another face, is read back by
+    /// [`Bridge::keyed_repost_landed`], not here.
     fn landed_at_its_pin(
         &mut self,
         pin: &PublishPin,
@@ -6453,6 +6537,72 @@ impl Bridge {
             .map_or(subject, |identity| identity.subject.as_str())
             .to_string();
         self.landed_since(&face, body, from, pin.seq)
+    }
+
+    /// WHERE A KEYED RE-POST'S KEY'S WINNER IS ON THE BUS, read back before the re-post is
+    /// published (the F23 sim's keyed world): the record the key pin says its winner landed at
+    /// (`PublishPin::original_off`, of the identity `PublishPin::original`), where retention
+    /// still holds it. A cut that carried that record below the base, unread, drops its dedup
+    /// key all the same (astream drops every key below the base), so astream's dedup at the pin
+    /// no longer answers with it, and the re-post, published, would land a second copy of its
+    /// key beside the one its reader is still handed. Answers the winner's offset, which the
+    /// drain retires the re-post at as astream's dedup would answer it (`dup=1`). `None` where
+    /// the pin names no winner's offset, or the read finds none of the winner's record there
+    /// (retention gave it up, its key with it, or a broker that does not tell fetches refused
+    /// the read below the face's oldest): the publish at the pin reconciles it, as before.
+    /// NEGATIVE CONTROL (`Mutant::KeyedRepostWithoutReadingBack`): every build before it
+    /// published the re-post with no read back.
+    ///
+    /// # Errors
+    /// The read's, as [`Bridge::read_at`] says them; a told read that could not be made, its
+    /// own connection's.
+    fn keyed_winner_at(&mut self, pin: &PublishPin) -> io::Result<Option<u64>> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::KeyedRepostWithoutReadingBack)
+        {
+            return Ok(None);
+        }
+        let (Some(off), Some(winner)) = (pin.original_off, pin.original.as_ref()) else {
+            return Ok(None);
+        };
+        Ok(match self.read_at(off, &winner.subject)? {
+            ReadAt::Rows(rows) => rows
+                .iter()
+                .any(|(at, face, bytes)| *at == off && publication_identity(face, bytes) == *winner)
+                .then_some(off),
+            ReadAt::Cut(_) | ReadAt::Untold(_) => None,
+            ReadAt::Unasked(e) => return Err(e),
+        })
+    }
+
+    /// WHERE A KEYED RE-POST'S RETRY AT ITS PIN LANDED, before it is published again, and
+    /// whether that record is its key's winner's (`true`) or its own attempt's (`false`). First
+    /// its own copy, which the attach's replay read back of its entry's words and holds for this
+    /// retry ([`Bridge::read_back_for_its_retry`]: an attempt that appended past a cut that
+    /// dropped its key, an older build's included), retired there as its own landing, which
+    /// moves the key to it and arms an ask's deadline; then, where its lane is not `held` by an
+    /// unverifiable reservation, its key's winner ([`Bridge::keyed_winner_at`]), retired there
+    /// as astream's dedup would answer it (`dup=1`). Read at the winner first, the re-post
+    /// would be told `dup=1` of a record that is not where it landed, while its own copy is
+    /// delivered, its key pin left at the winner and an ask on the bus never expiring (the F23
+    /// review).
+    ///
+    /// # Errors
+    /// [`Bridge::keyed_winner_at`]'s.
+    fn keyed_repost_landed(
+        &mut self,
+        pin: &PublishPin,
+        held: bool,
+    ) -> io::Result<Option<(u64, bool)>> {
+        if let Some(off) = self.read_back_for_its_retry(pin) {
+            return Ok(Some((off, false)));
+        }
+        if held {
+            return Ok(None);
+        }
+        Ok(self.keyed_winner_at(pin)?.map(|off| (off, true)))
     }
 
     fn arm_deadline_sweep(&mut self, replace: bool, retry_overdue: bool) {
@@ -6557,12 +6707,20 @@ impl Bridge {
         }
     }
 
-    fn reply_from(&self, off: u64, src: &str) -> Option<bool> {
-        self.asked
+    /// Whether a reply from `src` to the ask at `off` comes from where the ask went: the node it
+    /// went to, or the member a key rotation made of that node since, as the hand-off says
+    /// (§11 C3b), this Mac's own node for an ask of its sessions' that the node service moved
+    /// across its rotation; `None` where nothing says where the ask went.
+    fn reply_from(&mut self, off: u64, src: &str) -> Option<bool> {
+        let to = self
+            .asked
             .get(&off)
             .cloned()
-            .or_else(|| self.deadlines.get(&off).and_then(|d| d.to.clone()))
-            .map(|to| to == src)
+            .or_else(|| self.deadlines.get(&off).and_then(|d| d.to.clone()))?;
+        Some(
+            to == src
+                || (!src.is_empty() && matches!(self.member_for(&to), Ok(Some(now)) if now == src)),
+        )
     }
 
     fn read_where_asks_went(&mut self, off: u64) {
@@ -6769,7 +6927,7 @@ impl Bridge {
                     continue;
                 }
                 let from_right = if kind == "expired" {
-                    src == self.node
+                    self.is_my_node(src)
                 } else {
                     self.reply_from(off, src) != Some(false)
                 };
@@ -9190,26 +9348,32 @@ impl Bridge {
                 // A retry at a pin an earlier attempt took, read back first: past a cut
                 // astream's dedup no longer answers the pin with the record that attempt
                 // landed, which a reader can still be handed (carried below the base); the
-                // attach's replay may have landed it so (`Bridge::replay_in_flight`). A held
-                // keyed re-post the replay read back is retired there too, as astream's dedup at
-                // its pin would answer it (`Bridge::read_back_for_its_retry`); an unheld one is
-                // published at its pin, which reconciles its key's winner.
+                // attach's replay may have landed it so (`Bridge::replay_in_flight`). A keyed
+                // re-post is read back by [`Bridge::keyed_repost_landed`]: at its own copy the
+                // replay read back, held or not, and otherwise, unheld, at its key's winner.
                 if staged.is_none() {
-                    let read_back = if unsendable && pin.via_key {
-                        Ok(self.read_back_for_its_retry(&pin))
+                    let read_back = if pin.via_key {
+                        self.keyed_repost_landed(&pin, unsendable)
                     } else {
                         self.landed_at_its_pin(&pin, &subject, &encoded)
+                            .map(|found| found.map(|off| (off, false)))
                     };
                     match read_back {
-                        Ok(Some(off)) => {
+                        Ok(Some((off, winners))) => {
                             stderr_line!(
                                 "aterm-link: post {} of {} is on the bus at @{off}, read back; \
                                  it is not published again",
                                 post.id,
                                 post.sid
                             );
-                            self.claim(off, pin.seq);
-                            let actual = pin.identity.clone();
+                            // The key's winner is its key's record, not this attempt's: a keyed
+                            // re-post claims nothing, as its dedup answer claims nothing.
+                            let (deduped, actual) = if winners {
+                                (true, pin.original.clone())
+                            } else {
+                                self.claim(off, pin.seq);
+                                (false, pin.identity.clone())
+                            };
                             self.settle_a_retry_answered_ahead(&post, off);
                             let sid = post.sid.clone();
                             // The entry an earlier attempt left standing, its record held for
@@ -9222,7 +9386,7 @@ impl Bridge {
                                 subject,
                                 pin,
                                 off,
-                                deduped: false,
+                                deduped,
                                 actual,
                                 entry,
                             });
@@ -10226,11 +10390,97 @@ impl Bridge {
         Ok(handoff.current(node).map(str::to_owned))
     }
 
+    /// Read again which nodes this Mac held before ([`Bridge::old_nodes`]) and the reads of their
+    /// mail lanes ([`Bridge::old_reads`]): with the mesh on, the hand-off's retired nodes whose
+    /// seat is this node, and of the node service's reader's ring the reads of theirs; none while
+    /// either cannot be read. The hand-off is read again only where its file changed, and the
+    /// ring only where this Mac has retired nodes.
+    fn refresh_old_nodes(&mut self) {
+        let Some(root) = self.cfg.mesh.as_ref().map(|mesh| mesh.root.clone()) else {
+            self.old_nodes.clear();
+            self.old_reads.clear();
+            return;
+        };
+        let me = self.node.clone();
+        self.old_nodes = self
+            .handoff
+            .read(&root, &me)
+            .map(|handoff| handoff.retired(&me))
+            .unwrap_or_default();
+        if self.old_nodes.is_empty() {
+            self.old_reads.clear();
+            return;
+        }
+        let wanted = crate::federate::old_reads(&self.old_nodes);
+        let file = root.join(crate::federate::OLD_READS_FILE);
+        self.old_reads = read_cap_file(&file.to_string_lossy())
+            .map(|ring| {
+                ring.into_iter()
+                    .filter(|cap| wanted.contains(&cap.grant))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// Whether `node` is this Mac's: its node, or one it held before a key rotation.
+    fn is_my_node(&self, node: &str) -> bool {
+        node == self.node || self.old_nodes.contains(node)
+    }
+
+    /// The record at `off` of `filter` on this bus, and the origin it was published under, read
+    /// on a connection of its own, which holds `reads` beside the ring: `None` where none lies at
+    /// `off`, retention gave it up, no grant reads it (`reads` that do not attach, as a ring
+    /// minted under a secret the root no longer holds, among them), or the broker stamps no
+    /// origin.
+    fn record_origin(
+        &self,
+        off: u64,
+        filter: &str,
+        reads: &[Cap],
+    ) -> io::Result<Option<HeldOrigin>> {
+        let (mut reader, _closer) = self.connect()?;
+        if !reads.is_empty() && transport::attach_ring(&mut reader, reads).is_err() {
+            return Ok(None);
+        }
+        let rows = match reader.fetch(off, filter, 1) {
+            Ok((rows, _)) => rows,
+            Err(e) if astream_broker::broker_refusal(&e).is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some((at, subject, _)) = rows.into_iter().next().filter(|row| row.0 == off) else {
+            return Ok(None);
+        };
+        if !reader.origin_stamps()? {
+            return Ok(None);
+        }
+        let mut sub = reader.subscribe(off, &subject)?;
+        loop {
+            match sub.recv_event()? {
+                Some(astream_broker::Event::Delivery { offset, .. }) if offset == at => {
+                    return Ok(Some((subject, sub.last_origin())));
+                }
+                Some(astream_broker::Event::Mark { next, .. }) if next <= at => {}
+                _ => return Ok(None),
+            }
+        }
+    }
+
     /// The `re=` a record bound for the lane `prefix` carries (§11 C3). An offset on this bus
     /// means nothing on another Mac's, so with the mesh on, an answer or receipt to another Mac
     /// names the record it answers, when a push brought that record here from its sender, by the
     /// record's sequence number, which the push set to the offset the record has on the sender's
-    /// bus. Any other record keeps `off`: one this Mac wrote, and one retention gave up.
+    /// bus: under the sender's producer, or, for mail it wrote under a node it held before a key
+    /// rotation, under the producer of the node its seat holds now (§11 C3b). A record the node
+    /// service moved here across this Mac's own rotation (`federate::Lane::Inbox`: under this
+    /// node's producer, or an earlier node's of this Mac for one moved again at a later rotation,
+    /// numbered by the offset it had on this log, incarnation 0, below every sequence a bridge
+    /// numbers) answers as the record it was first moved from, read under the node service's
+    /// reader's ring ([`Bridge::old_reads`]), one rotation at a time: by that one's sender's
+    /// sequence, or by its offset here where this Mac wrote it, as an answer to this Mac's own
+    /// session does, whose asker waits on the offset its ask has here. Any other record keeps
+    /// `off`: one this Mac wrote, one retention gave up, and one moved from a record none of the
+    /// reads reaches, which another Mac's answer names by `off` and this Mac's by the offset it
+    /// was moved from.
     ///
     /// # Errors
     /// A broker that cannot be read.
@@ -10239,43 +10489,104 @@ impl Bridge {
             .strip_prefix(&format!("/f/{}/in/", self.cfg.fleet))
             .and_then(|rest| rest.split('/').next())
             .unwrap_or_default();
-        if self.cfg.mesh.is_none() || to == self.node || !to.starts_with("n-") {
+        if self.cfg.mesh.is_none() || !to.starts_with("n-") {
             return Ok(off);
         }
-        let inbox = format!("/f/{}/in/{}/>", self.cfg.fleet, self.node);
-        let (mut reader, _closer) = self.connect()?;
-        let rows = match reader.fetch(off, &inbox, 1) {
-            Ok((rows, _)) => rows,
-            Err(e) if astream_broker::broker_refusal(&e).is_some() => return Ok(off),
-            Err(e) => return Err(e),
-        };
-        let Some((at, subject, _)) = rows.into_iter().next() else {
-            return Ok(off);
-        };
-        let from = match subject::parse_in(&self.cfg.fleet, &self.node, &subject) {
-            Ok(addr) if at == off && addr.src != self.node && addr.src.starts_with("n-") => {
-                astream_cap::producer_id_of(&addr.src)
-            }
-            _ => return Ok(off),
-        };
-        if !reader.origin_stamps()? {
-            return Ok(off);
-        }
-        let mut sub = reader.subscribe(off, &subject)?;
-        loop {
-            match sub.recv_event()? {
-                Some(astream_broker::Event::Delivery { offset, .. }) if offset == off => {
-                    return Ok(match sub.last_origin() {
-                        Some((pid, seq)) if pid == from && seq < astream_broker::ACK_SEQ_BASE => {
-                            seq
-                        }
-                        _ => off,
-                    });
-                }
-                Some(astream_broker::Event::Mark { next, .. }) if next <= off => {}
-                _ => return Ok(off),
+        let local = to == self.node;
+        if local {
+            // Only a Mac that rotated its key holds moved mail of its own sessions.
+            self.refresh_old_nodes();
+            if self.old_nodes.is_empty() {
+                return Ok(off);
             }
         }
+        let fleet = self.cfg.fleet.clone();
+        let inbox = format!("/f/{fleet}/in/{}/>", self.node);
+        let Some((subject, origin)) = self.record_origin(off, &inbox, &[])? else {
+            return Ok(off);
+        };
+        let Ok(addr) = subject::parse_in(&fleet, &self.node, &subject) else {
+            return Ok(off);
+        };
+        let (mut off, mut origin) = (off, origin);
+        if self.moved_seq(origin).is_some() {
+            // The hand-off and the reader's ring as the node service wrote them for the move:
+            // this attach may have read them before it wrote them.
+            self.refresh_old_nodes();
+        }
+        let mut hops = 0;
+        while let Some(seq) = self.moved_seq(origin) {
+            hops += 1;
+            #[cfg(test)]
+            let followed = ONE_HOP.with(std::cell::Cell::get).then_some(1);
+            #[cfg(not(test))]
+            let followed = None;
+            if followed.is_some_and(|most| hops > most) {
+                break;
+            }
+            let found = if hops > crate::federate::RING_OLDS_MAX {
+                None
+            } else {
+                self.moved_origin(seq, &addr)?
+            };
+            let Some(was) = found else {
+                return Ok(if local { seq } else { off });
+            };
+            (off, origin) = (seq, was);
+        }
+        if local || self.is_my_node(&addr.src) || !addr.src.starts_with("n-") {
+            return Ok(off);
+        }
+        let now = match self.member_for(&addr.src) {
+            Ok(Some(now)) => Some(astream_cap::producer_id_of(&now)),
+            _ => None,
+        };
+        Ok(match origin {
+            Some((pid, seq))
+                if (pid == astream_cap::producer_id_of(&addr.src) || Some(pid) == now)
+                    && seq < astream_broker::ACK_SEQ_BASE =>
+            {
+                seq
+            }
+            _ => off,
+        })
+    }
+
+    /// The offset a record whose origin is `origin` was moved from, where the node service moved
+    /// it across a key rotation of this Mac ([`Bridge::wire_re`]): under the producer of this
+    /// node or of one it held before, at incarnation 0, which no bridge numbers.
+    fn moved_seq(&self, origin: Option<(u64, u64)>) -> Option<u64> {
+        let (pid, seq) = origin?;
+        let mine = std::iter::once(&self.node)
+            .chain(&self.old_nodes)
+            .any(|node| astream_cap::producer_id_of(node) == pid);
+        (mine && astream_broker::incarnation_of(seq) == Some(0)).then_some(seq)
+    }
+
+    /// The origin of the record a move put at `addr`'s lane from offset `at`: the same lane of
+    /// one of this Mac's old nodes, read under the reader's ring. `None` where none of them holds
+    /// a record at `at` its reads reach; `Some(None)` for one the broker stamps no origin on.
+    ///
+    /// # Errors
+    /// A broker that cannot be read.
+    fn moved_origin(
+        &self,
+        at: u64,
+        addr: &subject::InAddr,
+    ) -> io::Result<Option<Option<(u64, u64)>>> {
+        for old in self.old_nodes.iter().take(crate::federate::RING_OLDS_MAX) {
+            let lane = format!(
+                "/f/{}/in/{old}/{}/{}/{}",
+                self.cfg.fleet,
+                addr.sid,
+                addr.src,
+                addr.kind.as_str()
+            );
+            if let Some((_, was)) = self.record_origin(at, &lane, &self.old_reads)? {
+                return Ok(Some(was));
+            }
+        }
+        Ok(None)
     }
 
     fn pinned_node_for(&mut self, sid: &str) -> io::Result<Result<String, Route>> {
@@ -10966,9 +11277,11 @@ impl Bridge {
         if !self.refill_pending_admissions(false) {
             return false;
         }
+        // This node's alone: one a bridge of a node this Mac held before left is that node's
+        // group's ([`StateDir::inbox_owed`]), and stays for a bridge of it.
         let handed_over = self
             .state
-            .inbox_owed()
+            .inbox_owed(&self.node)
             .filter(|_| self.attachment != Attachment::Observer);
         if let Some(owed) = handed_over {
             self.inbox_pending = Some(self.inbox_pending.map_or(owed, |have| have.max(owed)));
@@ -10982,6 +11295,7 @@ impl Bridge {
                 stderr_line!("aterm-link: could not clear the inbox commit handed over: {e}");
             }
         }
+        self.refresh_old_nodes();
         if !self.subscribe_inbox() {
             return false;
         }
@@ -11663,7 +11977,7 @@ impl Bridge {
         if self.attachment != Attachment::Inherited {
             return;
         }
-        let own = aterm_types::version::build_id();
+        let own = aterm_stamp::build_id();
         let line = format!(
             "hello lane={} build={own} {HELLO_REFILL}{}",
             aterm_types::control_verbs::BRIDGE_LANE,
@@ -12857,6 +13171,14 @@ thread_local! {
     static TRUST_ANY_PERSON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The negative control of a record moved across two rotations of this Mac (§11 C3b): a
+    /// bridge on a thread where it is set follows a moved record back one rotation alone
+    /// ([`Bridge::wire_re`]).
+    pub(crate) static ONE_HOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The node service's hand-off as a bridge last read it (§11 C3): the file's identity, and what it
 /// said. Read again only when the file was replaced.
 struct HandoffSeen {
@@ -13044,6 +13366,10 @@ fn ring_refusal(fresh: &[Cap], held: &[Cap], node: &str) -> Option<String> {
     (ring_binds(held).contains(node) && !binds.contains(node))
         .then(|| format!("binds no write for this bridge's node {node}"))
 }
+
+/// A record's subject on the bus and the `(producer, sequence)` it was published under, when the
+/// broker stamps one ([`Bridge::record_origin`]).
+type HeldOrigin = (String, Option<(u64, u64)>);
 
 /// Outbound post parsed from an endpoint `outbox` drain frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19975,6 +20301,238 @@ mod tests {
         }
     }
 
+    /// **A KEYED RE-POST PAST A CUT THAT CARRIED ITS KEY'S WINNER IS RETIRED AT THE WINNER** (the
+    /// F23 sim's keyed world, [`Bridge::keyed_winner_at`]). The winner lands on the person's
+    /// lane, unread, and a cut under aterm's rules carries it below the base: astream drops its
+    /// dedup key all the same. The re-post under its key is read back at the winner's offset
+    /// first and retired there (`dup=1`), nothing published: by the drain, and by the attach's
+    /// replay where the re-post was in flight, its answer lost in a kill (`replay`), the drain
+    /// then retiring it at the winner. NEGATIVE CONTROL
+    /// (`Mutant::KeyedRepostWithoutReadingBack`): published with no read back, the dedup no
+    /// longer answers, and the re-post lands a second copy of its key beside the winner.
+    #[test]
+    fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() {
+        for (rule, replay) in [(true, false), (false, false), (true, true), (false, true)] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+            if !rule {
+                bridge.fx = crate::fx::Fx::os_without(
+                    crate::sim::world::Mutant::KeyedRepostWithoutReadingBack,
+                );
+            }
+            let socket = lane.dir.path().join("broker.sock");
+            let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+            broker.set_retention_interval(Duration::from_secs(3600));
+            crate::broker_rules::retain(&broker).unwrap();
+            let _server = broker.serve(&socket).unwrap();
+            bridge.cfg.broker = socket.to_string_lossy().into_owned();
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            let queue = |id: u64, text: &str| {
+                *lane.outbox.lock().unwrap() = Some(format!(
+                    "post sid=s-host id={id} to=h-a kind=note key=k len={}\n{text}",
+                    text.len()
+                ));
+            };
+            let off_of = |line: &str| -> u64 {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix("off="))
+                    .and_then(|off| off.parse().ok())
+                    .unwrap()
+            };
+            queue(1, "winner");
+            bridge.drain_outbox();
+            let winner = off_of(&lane.sent.lock().unwrap()[0]);
+            broker.retain_before_carrying_state(winner + 1).unwrap();
+            let face = bridge
+                .state
+                .key_pin("s-host", "k")
+                .unwrap()
+                .unwrap()
+                .identity
+                .unwrap()
+                .subject;
+            // The control's second copy is what says the cut dropped the winner's key.
+            assert!(
+                bridge
+                    .conn_now()
+                    .unwrap()
+                    .fetch(winner, &face, 1)
+                    .unwrap()
+                    .0
+                    .first()
+                    .is_some_and(|(at, _, _)| *at == winner),
+                "PRECONDITION: the cut carried the winner, unread"
+            );
+            if replay {
+                // The re-post's pin as its drain makes it, and its entry, journaled before a
+                // publish whose answer a kill lost.
+                let keyed = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+                let mut body = Body::new(1);
+                body.from = Some("s-host".to_string());
+                body.text = "again".to_string();
+                let encoded = body.encode();
+                let pin = PublishPin {
+                    seq: keyed.seq,
+                    via_key: true,
+                    identity: Some(publication_identity(&face, &encoded)),
+                    original: keyed.identity,
+                    original_off: keyed.original_off,
+                    owner: keyed.owner,
+                    at: keyed.at,
+                };
+                assert_eq!(
+                    pin.original_off,
+                    Some(winner),
+                    "PRECONDITION: the winner's offset"
+                );
+                bridge.state.set_post_pin("s-host", 2, &pin).unwrap();
+                bridge
+                    .state
+                    .set_in_flight(&InFlight {
+                        pin,
+                        subject: face.clone(),
+                        body: encoded,
+                        log: bridge.conn.as_ref().and_then(|c| c.seen_log_identity()),
+                        at: Some(head_of(&bridge)),
+                    })
+                    .unwrap();
+                queue(2, "again");
+                assert!(bridge.settle_in_flight(), "the replay settles the journal");
+            } else {
+                queue(2, "again");
+            }
+            bridge.drain_outbox();
+            let retired = lane.sent.lock().unwrap()[1].clone();
+            let copies = bridge
+                .conn_now()
+                .unwrap()
+                .fetch(winner + 1, &face, 8)
+                .unwrap()
+                .0
+                .len();
+            if rule {
+                assert!(
+                    retired.contains(&format!("off={winner} dup=1")) && copies == 0,
+                    "replay={replay}: the re-post is retired at its key's winner, nothing \
+                     published: {retired}, {copies} copies above it"
+                );
+            } else {
+                assert!(
+                    off_of(&retired) > winner && copies == 1,
+                    "CONTROL replay={replay}: the re-post lands a second copy of its key: \
+                     {retired}, {copies} copies above the winner"
+                );
+            }
+        }
+    }
+
+    /// **A KEYED RE-POST WHOSE OWN COPY THE REPLAY READ BACK IS RETIRED AT THAT COPY, NOT AT ITS
+    /// KEY'S WINNER** (the F23 review). An older build's state: the winner lands on the person's
+    /// lane, a cut under aterm's rules carries it below the base, unread, and drops its dedup
+    /// key; that build pins the re-post at the key's sequence, journals its entry, and publishes
+    /// it, which appends its own copy past the dropped key; a kill loses the answer. This build's
+    /// replay reads the re-post's own words back on the bus and holds that copy for the drain,
+    /// which retires the post there as its own landing (`off=<own>`, no `dup=1`): the key pin
+    /// moves to the re-post, and an ask's recipient and deadline are kept, so the copy its reader
+    /// is handed still expires. Retired at the winner instead, aterm would be told `dup=1` of a
+    /// record that is not where the re-post landed, and an ask on the bus would never expire.
+    #[test]
+    fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() {
+        for kind in ["note", "ask"] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+            let socket = lane.dir.path().join("broker.sock");
+            let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+            broker.set_retention_interval(Duration::from_secs(3600));
+            crate::broker_rules::retain(&broker).unwrap();
+            let _server = broker.serve(&socket).unwrap();
+            bridge.cfg.broker = socket.to_string_lossy().into_owned();
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            let queue = |id: u64, kind: &str, text: &str| {
+                let dl = if kind == "ask" { " dl=30000" } else { "" };
+                *lane.outbox.lock().unwrap() = Some(format!(
+                    "post sid=s-host id={id} to=h-a kind={kind}{dl} key=k len={}\n{text}",
+                    text.len()
+                ));
+            };
+            let off_of = |line: &str| -> u64 {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix("off="))
+                    .and_then(|off| off.parse().ok())
+                    .unwrap()
+            };
+            queue(1, "note", "winner");
+            bridge.drain_outbox();
+            let winner = off_of(&lane.sent.lock().unwrap()[0]);
+            broker.retain_before_carrying_state(winner + 1).unwrap();
+            let keyed = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+            let winner_face = keyed.identity.clone().unwrap().subject;
+            let face = format!(
+                "{}/{kind}",
+                winner_face.strip_suffix("/note").unwrap_or(&winner_face)
+            );
+            // The older build's re-post: pinned at its key's sequence, journaled, published.
+            let mut body = Body::new(1);
+            body.from = Some("s-host".to_string());
+            body.dl = (kind == "ask").then_some(30_000);
+            body.text = "again".to_string();
+            let encoded = body.encode();
+            let pin = PublishPin {
+                seq: keyed.seq,
+                via_key: true,
+                identity: Some(publication_identity(&face, &encoded)),
+                original: keyed.identity,
+                original_off: keyed.original_off,
+                owner: keyed.owner,
+                at: keyed.at,
+            };
+            assert_eq!(
+                pin.original_off,
+                Some(winner),
+                "PRECONDITION: the winner's offset"
+            );
+            bridge.state.set_post_pin("s-host", 2, &pin).unwrap();
+            // The entry names its log and head, as every build since read backs journals them.
+            let log = bridge.read_log_identity().unwrap();
+            assert_eq!(log, Some(broker.log_identity()), "PRECONDITION: its log");
+            bridge
+                .state
+                .set_in_flight(&InFlight {
+                    pin: pin.clone(),
+                    subject: face.clone(),
+                    body: encoded.clone(),
+                    log,
+                    at: Some(head_of(&bridge)),
+                })
+                .unwrap();
+            let (own, deduped) = bridge.publish_at(pin.seq, &face, &encoded).unwrap();
+            assert!(
+                !deduped && own > winner,
+                "PRECONDITION: the cut dropped the winner's key, so the re-post appended @{own}"
+            );
+            queue(2, kind, "again");
+            assert!(bridge.settle_in_flight(), "the replay settles the journal");
+            bridge.drain_outbox();
+            let retired = lane.sent.lock().unwrap()[1].clone();
+            assert!(
+                retired.contains(&format!("off={own}")) && !retired.contains("dup=1"),
+                "{kind}: the re-post is retired at its own copy @{own}, not at its key's winner \
+                 @{winner}: {retired}"
+            );
+            let moved = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+            assert_eq!(
+                (moved.original_off, moved.owner),
+                (Some(own), Some(2)),
+                "{kind}: the key pin names the re-post's own copy"
+            );
+            if kind == "ask" {
+                assert_eq!(bridge.asked.get(&own).map(String::as_str), Some("h-a"));
+                assert!(
+                    bridge.deadlines.contains_key(&own),
+                    "the ask on the bus at @{own} still expires"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_broadcast_with_no_topics_advances_the_head_without_decoding_its_body() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
@@ -21957,7 +22515,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_hello_reads_each_endpoints_lane_and_build_and_refuses_none() {
-        let own = aterm_types::version::build_id();
+        let own = aterm_stamp::build_id();
         let lane_now = aterm_types::control_verbs::BRIDGE_LANE;
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
         bridge.introduce();
@@ -26447,7 +27005,7 @@ mod tests {
             let ended = (
                 bridge.committed,
                 bridge.inbox_pending,
-                bridge.state.inbox_owed(),
+                bridge.state.inbox_owed(&bridge.node),
                 broker.group_start(&group),
             );
             if lands {
@@ -26608,7 +27166,7 @@ mod tests {
         bridge.conn = None;
         bridge.wind_down();
         assert_eq!(
-            bridge.state.inbox_owed(),
+            bridge.state.inbox_owed(&bridge.node),
             Some(records[0].0),
             "left for the next bridge"
         );
@@ -27086,7 +27644,7 @@ mod tests {
         );
         assert_eq!(bridge.inbox_commit_floor(), Some(records[1].0));
         assert_eq!(
-            bridge.state.inbox_owed(),
+            bridge.state.inbox_owed(&bridge.node),
             None,
             "nor is anything past it handed to the next bridge"
         );
@@ -27132,7 +27690,7 @@ mod tests {
         assert!(
             bridge
                 .state
-                .inbox_owed()
+                .inbox_owed(&bridge.node)
                 .is_none_or(|owed| owed < records[2].0),
             "nothing past it is handed over"
         );
@@ -27161,7 +27719,7 @@ mod tests {
                 burst_rig(&lane, &mut bridge, OK, 4);
             records[2].2 = b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x".to_vec();
             bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
-            bridge.endpoint_build = Some(aterm_types::version::build_id());
+            bridge.endpoint_build = Some(aterm_stamp::build_id());
             // No `link up` report falls due while the run is handled: it is a lane request,
             // which sends the queued rows ahead of the notice whatever the refusal does.
             bridge.link = LinkReport {
@@ -27353,7 +27911,11 @@ mod tests {
             old.state.set_seen_off(SID, burst[3].0).unwrap();
             old.conn = None;
             old.wind_down();
-            assert_eq!(old.state.inbox_owed(), Some(burst[3].0), "handed over");
+            assert_eq!(
+                old.state.inbox_owed(&old.node),
+                Some(burst[3].0),
+                "handed over"
+            );
             drop(old);
             if !handed {
                 old_bridge_forgets_the_hand_over(&state);
@@ -27367,7 +27929,11 @@ mod tests {
             if handed {
                 assert_eq!(first, sentinel, "the burst is committed, not offered again");
                 assert_eq!(next.committed, Some(burst[3].0));
-                assert_eq!(next.state.inbox_owed(), None, "and the hand-over forgotten");
+                assert_eq!(
+                    next.state.inbox_owed(&next.node),
+                    None,
+                    "and the hand-over forgotten"
+                );
             } else {
                 assert_eq!(first, burst[0].0, "the control: the whole burst again");
             }
@@ -27379,6 +27945,62 @@ mod tests {
     #[cfg(unix)]
     fn old_bridge_forgets_the_hand_over(state: &std::path::Path) {
         std::fs::remove_file(state.join("inbox-owed")).unwrap();
+    }
+
+    /// A commit a bridge of another node handed over, as the bridge of a node this Mac held
+    /// before its key rotated leaves one (§11 C3b), is that node's group's: the next bridge, of
+    /// the node this Mac holds now, makes none of it on its own group, so mail for its node that
+    /// landed below it is offered all the same; and the hand-over stays for a bridge of its node.
+    /// NEGATIVE CONTROL: a next bridge of the same node makes it
+    /// (`an_exit_with_no_connection_hands_the_bursts_commit_to_the_next_bridge`).
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_another_nodes_bridge_handed_over_is_not_made_on_this_nodes_group() {
+        const SID: &str = "s-burst";
+        const NOW: &str = "n-rotated";
+        let (lane, mut old) = FakeVerbLane::bridge(&[(1, SID)]);
+        let state = old.state.root().to_path_buf();
+        let (burst, mut writer, socket, _broker, _server) = burst_rig(&lane, &mut old, SID, 1);
+        let node = old.node.clone();
+        // Mail for the node this Mac holds next lands among the old node's, unread.
+        let face = format!("/f/f/in/{NOW}/{SID}/n-peer/note");
+        let (unread, _) = writer.publish(92, 1, &face, &burst[0].2).unwrap();
+        let mut taken = burst.clone();
+        for seq in 2..=3 {
+            let (off, _) = writer.publish(91, seq, &burst[0].1, &burst[0].2).unwrap();
+            taken.push((off, burst[0].1.clone(), burst[0].2.clone()));
+        }
+        let upto = taken.last().unwrap().0;
+        assert!(unread < upto);
+        old.in_round = true;
+        for rec in &taken {
+            old.on_inbox_record(rec);
+        }
+        old.in_round = false;
+        old.state.set_seen_off(SID, upto).unwrap();
+        old.conn = None;
+        old.wind_down();
+        assert_eq!(old.state.inbox_owed(&node), Some(upto), "handed over");
+        drop(old);
+
+        let (next_lane, mut next) = FakeVerbLane::bridge_with_state(&[(1, SID)], Some(&state));
+        next.node = NOW.to_owned();
+        next.cfg.broker = socket.clone();
+        assert!(next.attach_broker(), "the next bridge attached");
+        let (sentinel, _) = writer.publish(92, 2, &face, &burst[0].2).unwrap();
+        assert_eq!(
+            first_offered(&socket, NOW, "the new node's cursor"),
+            unread,
+            "the new node's mail below the old node's commit is offered, not {sentinel}"
+        );
+        assert_eq!(next.committed, None, "nothing made on this node's group");
+        assert_eq!(
+            next.state.inbox_owed(&node),
+            Some(upto),
+            "the hand-over stays for a bridge of its node"
+        );
+        next.close_subscriptions();
+        drop(next_lane);
     }
 
     #[cfg(unix)]
@@ -27433,7 +28055,7 @@ mod tests {
                 old.conn = None;
                 old.wind_down();
                 assert_eq!(
-                    old.state.inbox_owed(),
+                    old.state.inbox_owed(&old.node),
                     Some(burst[3].0),
                     "{case}: handed over"
                 );
@@ -27482,7 +28104,7 @@ mod tests {
                      {new_mail:?})"
                 );
                 assert_eq!(
-                    next.state.inbox_owed(),
+                    next.state.inbox_owed(&next.node),
                     None,
                     "{case}: the hand-over, above the fork, dropped"
                 );

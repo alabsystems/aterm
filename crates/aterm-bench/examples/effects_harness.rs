@@ -588,10 +588,12 @@ fn skip(why: impl std::fmt::Display) -> ! {
 
 impl Rig {
     fn new(knobs: &Knobs) -> Self {
-        let font = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-        );
+        let font = aterm_tempfile::manifest_dir()
+            .join("../aterm-render/tests/fixtures/jetbrains-mono.ttf")
+            .into_os_string()
+            .into_string()
+            .unwrap_or_else(|path| fail(format!("the fixture font's path {path:?} is not UTF-8")));
+        let font = font.as_str();
         let scheme = rig_scheme();
         let theme = Theme::from(&scheme);
         let ctx =

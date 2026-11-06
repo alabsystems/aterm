@@ -489,10 +489,11 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
         .map(|h| Some(session_row(h, level, facts, (now_us, now_unix_ms))))
         .collect();
     let host = word_token(here.host.as_deref());
-    let version = pct_encode(here.facts.as_ref().map_or_else(
-        || aterm_types::version::app_version(),
-        |f| f.version.as_str(),
-    ));
+    let version = pct_encode(
+        here.facts
+            .as_ref()
+            .map_or_else(|| aterm_stamp::app_version(), |f| f.version.as_str()),
+    );
     let node = here
         .facts
         .as_ref()

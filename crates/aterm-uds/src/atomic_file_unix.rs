@@ -317,15 +317,15 @@ impl ConfigEdit<'_> {
     /// the directory's flush after the rename failed other than as unavailable: the edit is in
     /// effect, and the error carries [`EditLanded`] under the flush's kind.
     pub fn replace(self, text: &str) -> io::Result<Option<PathBuf>> {
-        self.replace_flushing_dir(text, |dir| aterm_durable::Flush::Durable.dir(dir))
+        self.replace_flushing_dir(text, aterm_durable::Flush::dir)
     }
 
-    /// [`Self::replace`] with the directory's flush after the rename (`flush_dir`) handed in,
-    /// so a test can make it fail.
+    /// [`Self::replace`] with the directory's flush after the rename (`flush_dir`, handed the
+    /// durable flush it is to take) handed in, so a test can make it fail.
     fn replace_flushing_dir(
         self,
         text: &str,
-        flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+        flush_dir: impl FnOnce(aterm_durable::Flush, &Path) -> io::Result<()>,
     ) -> io::Result<Option<PathBuf>> {
         let file = self.file;
         file.unchanged()?;
@@ -346,6 +346,7 @@ impl ConfigEdit<'_> {
             text.as_bytes(),
             mode,
             || file.unchanged(),
+            Some(aterm_durable::Flush::Durable),
             flush_dir,
         )?
         .map_err(|flush| {

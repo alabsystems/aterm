@@ -345,7 +345,9 @@ impl Verb {
             Verb::Pkg => "aterm pkg <args>",
             Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
-            Verb::Name => "aterm name [nick <word>|--random [--dry-run]] [--json]",
+            Verb::Name => {
+                "aterm name [set <mN> [--nick <word>] | nick <word>|--random] [--dry-run] [--json]"
+            }
             Verb::Node => "aterm node [<cmd>]",
             Verb::Drive => "aterm drive <args>",
             Verb::Link => "aterm link <args>",
@@ -407,8 +409,8 @@ impl Verb {
             Verb::Name => &[
                 "This machine's name: its NAME (m8, or m0 until",
                 "it is numbered) and nickname, made by the first",
-                "read; `nick` sets the nickname, `--json` gives",
-                "one object. Unix only.",
+                "read; `set` chooses its number, `nick` its nickname.",
+                "`--json` gives one object. Unix only.",
             ],
             Verb::Node => &[
                 "The windowless fleet and Commons job: answers",
@@ -732,10 +734,7 @@ fn show_config_report() -> String {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let or = |s: String, dflt: &str| if s.is_empty() { dflt.to_string() } else { s };
     let mut out = String::new();
-    out.push_str(&format!(
-        "version={}\n",
-        aterm_types::version::app_version()
-    ));
+    out.push_str(&format!("version={}\n", aterm_stamp::app_version()));
     #[cfg(not(windows))]
     out.push_str(&format!("shell={}\n", or(env("SHELL"), "(unset)")));
     #[cfg(windows)]
@@ -2416,7 +2415,7 @@ fn permissions_hand_over_live(missing: &Missing) {
         .as_ref()
         .and_then(|facts| facts.subject.clone())
         .unwrap_or_default();
-    let version = aterm_types::version::app_version();
+    let version = aterm_stamp::app_version();
     let reach = DevtoolsReach {
         ask_walk: &ask_window_for_walk,
         ask_window: &ask_window_for_devtools,
@@ -3591,10 +3590,7 @@ fn render_doctor_rows(checks: &[DoctorRow]) -> String {
             out.push('\n');
         }
     }
-    out.push_str(&format!(
-        "version: {}\n\n",
-        aterm_types::version::app_version()
-    ));
+    out.push_str(&format!("version: {}\n\n", aterm_stamp::app_version()));
     out
 }
 
@@ -3768,18 +3764,16 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// `which_copy` lines, and the compiled update trust anchor fingerprint.
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
-    version_text_with_stamp(copy, aterm_types::version::installed())
+    version_text_with_stamp(copy, aterm_stamp::installed())
 }
 
-/// [`version_text`] over an explicit [`aterm_types::version::BuildStamp`].
+/// [`version_text`] over an explicit [`aterm_stamp::Stamp`].
 #[must_use]
 pub fn version_text_with_stamp(
     copy: Option<&aterm_update::which_copy::WhichCopy>,
-    stamp: Option<&aterm_types::version::BuildStamp>,
+    stamp: Option<&aterm_stamp::Stamp>,
 ) -> String {
-    let app_version = stamp
-        .unwrap_or(&aterm_types::version::BuildStamp::UNSTAMPED)
-        .app_version;
+    let app_version = stamp.unwrap_or(&aterm_stamp::Stamp::UNSTAMPED).app_version;
     let mut out = format!(
         "aterm {app_version}\n{}\n",
         aterm_types::identity::ORIGIN_LINE
@@ -3797,7 +3791,7 @@ pub fn version_text_with_stamp(
     out
 }
 
-fn running_build_from(stamp: Option<&aterm_types::version::BuildStamp>) -> Option<u64> {
+fn running_build_from(stamp: Option<&aterm_stamp::Stamp>) -> Option<u64> {
     let s = stamp?.build_number;
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -4230,7 +4224,7 @@ pub fn session_main(quiet: bool) -> ! {
         if !quiet && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
             eprintln!(
                 "aterm {} — session started · start with `aterm help` · `-q` hides this line",
-                aterm_types::version::app_version()
+                aterm_stamp::app_version()
             );
         }
     }
@@ -8325,11 +8319,11 @@ mod tests {
 
     #[test]
     fn version_text_names_the_running_copy_and_any_other() {
-        use aterm_types::version::BuildStamp;
+        use aterm_stamp::Stamp;
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
         let identity = format!(
             "aterm {}\n{}\n",
-            BuildStamp::UNSTAMPED.app_version,
+            Stamp::UNSTAMPED.app_version,
             aterm_types::identity::ORIGIN_LINE
         );
         assert!(identity.contains("by Andrew Yates") && identity.contains("alab.systems"));
@@ -8343,12 +8337,12 @@ mod tests {
             format!("{identity}{anchors}")
         );
         assert_eq!(
-            super::version_text_with_stamp(None, Some(&BuildStamp::UNSTAMPED)),
+            super::version_text_with_stamp(None, Some(&Stamp::UNSTAMPED)),
             format!("{identity}{anchors}")
         );
-        let stamp = BuildStamp {
+        let stamp = Stamp {
             build_number: "1789432052",
-            ..BuildStamp::UNSTAMPED
+            ..Stamp::UNSTAMPED
         };
         let build = "build: 1789432052\n";
         assert_eq!(

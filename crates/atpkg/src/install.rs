@@ -792,6 +792,15 @@ fn finish_stage(
     if let Err(e) = crate::store::write_declared_modes(build_dir, &modes) {
         return Err(io_step("record the declared modes beside the build", e));
     }
+    // The signed root this stage verified, bound to the tree now in place: a tree's trust.lock
+    // names its build by it (`crate::trust_lock`). The fold of a tree its aliases joined is not
+    // the signed root, so only an alias-free stage of a signed root records one.
+    if !artifact.tree_root.is_empty()
+        && hooks.aliases.is_empty()
+        && let Err(e) = crate::trust_lock::write_tree_root_record(build_dir, &root)
+    {
+        return Err(io_step("record the tree root beside the build", e));
+    }
 
     if let Purpose::Install(host) = purpose
         && let Err(e) = crate::store::mark_build_ready_on(build_dir, host)

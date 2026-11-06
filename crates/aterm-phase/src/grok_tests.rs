@@ -525,7 +525,7 @@ fn the_composers_box_is_found_on_the_measured_frames_and_nowhere_else() {
 /// programs'.
 #[test]
 fn its_composer_box_claims_no_other_programs_screen() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .flatten()

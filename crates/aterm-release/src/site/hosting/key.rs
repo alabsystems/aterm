@@ -54,17 +54,20 @@ impl std::fmt::Debug for Key {
 
 /// `bytes` as base64url without padding (RFC 7515 §2).
 fn base64url(bytes: &[u8]) -> Result<String, String> {
-    let standard =
-        aterm_codec::base64::encode(bytes).map_err(|e| format!("cannot encode base64: {e:?}"))?;
-    Ok(standard
-        .trim_end_matches('=')
-        .chars()
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            other => other,
-        })
-        .collect())
+    let mut out = aterm_codec::base64::encode(bytes)
+        .map_err(|e| format!("cannot encode base64: {e:?}"))?
+        .into_bytes();
+    while out.last() == Some(&b'=') {
+        out.pop();
+    }
+    for b in &mut out {
+        match *b {
+            b'+' => *b = b'-',
+            b'/' => *b = b'_',
+            _ => {}
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
 }
 
 impl Key {

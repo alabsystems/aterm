@@ -87,23 +87,20 @@ impl XConnection {
                  WINIT_X11_SCALE_FACTOR"
             )
         }
-        let dpi_env = env::var("WINIT_X11_SCALE_FACTOR").ok().map_or_else(
-            || EnvVarDPI::NotSet,
-            |var| {
-                if var.to_lowercase() == "randr" {
-                    EnvVarDPI::Randr
-                } else if let Ok(dpi) = f64::from_str(&var) {
-                    EnvVarDPI::Scale(dpi)
-                } else if var.is_empty() {
-                    EnvVarDPI::NotSet
-                } else {
-                    panic!(
-                        "`WINIT_X11_SCALE_FACTOR` invalid; DPI factors must be either normal \
+        let dpi_env = env::var("WINIT_X11_SCALE_FACTOR").ok().map_or(EnvVarDPI::NotSet, |var| {
+            if var.to_lowercase() == "randr" {
+                EnvVarDPI::Randr
+            } else if let Ok(dpi) = f64::from_str(&var) {
+                EnvVarDPI::Scale(dpi)
+            } else if var.is_empty() {
+                EnvVarDPI::NotSet
+            } else {
+                panic!(
+                    "`WINIT_X11_SCALE_FACTOR` invalid; DPI factors must be either normal \
                          floats greater than 0, or `randr`. Got `{var}`"
-                    );
-                }
-            },
-        );
+                );
+            }
+        });
 
         let scale_factor = match dpi_env {
             EnvVarDPI::Randr => calc_dpi_factor(

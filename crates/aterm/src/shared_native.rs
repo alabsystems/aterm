@@ -759,14 +759,17 @@ fn own_profile(provider: Provider, profile: &Path) -> Result<(), String> {
         .parent()
         .ok_or("native profile has no private parent")?;
     fsx::ensure_private_dir(parent).map_err(|e| e.to_string())?;
-    match std::fs::create_dir(profile) {
-        Ok(()) => fsx::ensure_private_dir(profile).map_err(|e| e.to_string())?,
+    let marker = profile.join(".aterm-native-owner");
+    let existing = match std::fs::create_dir(profile) {
+        Ok(()) => {
+            fsx::ensure_private_dir(profile).map_err(|e| e.to_string())?;
+            fsx::read_private(&marker, 256).map_err(|e| e.to_string())?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             aterm_uds::private_file::check_private_dir(profile)
                 .map_err(|_| "native profile is not an owned private directory")?;
-            if fsx::read_private(&profile.join(".aterm-native-owner"), 256)
-                .map_err(|e| e.to_string())?
-                .is_none()
+            let existing = fsx::read_private(&marker, 256).map_err(|e| e.to_string())?;
+            if existing.is_none()
                 && std::fs::read_dir(profile)
                     .map_err(|_| "native profile cannot be inspected")?
                     .next()
@@ -774,12 +777,12 @@ fn own_profile(provider: Provider, profile: &Path) -> Result<(), String> {
             {
                 return Err("native profile has unrelated existing data".into());
             }
+            existing
         }
         Err(_) => return Err("native profile could not be created".into()),
-    }
+    };
     let expected = format!("aterm-native-profile-1:{}\n", provider.name());
-    let marker = profile.join(".aterm-native-owner");
-    if let Some(bytes) = fsx::read_private(&marker, 256).map_err(|e| e.to_string())? {
+    if let Some(bytes) = existing {
         if bytes.as_slice() != expected.as_bytes() {
             return Err("native profile belongs to a different provider".into());
         }

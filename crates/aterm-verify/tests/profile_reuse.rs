@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 #[test]
 fn dev_and_test_resolve_the_same_dependency_profiles() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = aterm_tempfile::manifest_dir().join("../..");
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let manifest: aterm_toml::Value = aterm_toml::from_str(&manifest).unwrap();
     let mut profiles = aterm_toml::Table::new();

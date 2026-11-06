@@ -5,39 +5,24 @@
 //! `atpkg-publish hosts check` (§16.2): whether this builder's agh.toml is ready for
 //! `--host agh-staging` or `--host agh`, read-only.
 //!
-//! It reads agh.toml and each writer profile's own token file, and sends nothing: no client
-//! is built. A writer whose token is not in a token file fails its check: a lane unit carries
+//! It reads explicit configuration and recorded vault identities, and sends nothing. A
+//! writer whose token is not in a token file fails its check: a lane unit carries
 //! no token variable, and agh's git credential helper reads only token files, so a unit reads
 //! what this check read.
 
 use agh::config::Dirs;
-use agh::identity::ProcessEnv;
-use agh::policy::{Router, Tier};
+use agh::policy::Tier;
 
 use crate::ctx::{Ctx, HostChoice};
 use crate::error::{Error, Result};
-use crate::host::agh::{CALLER, ConfigRefusal, load_config};
+use crate::host::agh::{AghHost, CALLER};
 use crate::lane::install::Machine;
 
 /// The runbook every provisioning step points at.
 const RUNBOOK: &str = "docs/RUNBOOK-atpkg-republish.md";
 
 /// What the other four checks say when `config` fails.
-const NEEDS_CONFIG: &str = "needs a valid agh.toml";
-
-/// The step that provisions a missing agh.toml the lanes can use, from this builder's token
-/// files: agh's own (`agh::needs::CONFIG_PROVISION`, the `then` of `agh.config.missing`). A
-/// profile named `dev` or `release` starts a file that routes alone: `agh auth add` starts one
-/// beside a `~/.secrets` token with `vault = true` otherwise, which the lanes refuse
-/// ([`UNVAULT`]).
-pub(crate) const PROVISION: &str = agh::needs::CONFIG_PROVISION;
-
-/// The step that clears an agh.toml saying `vault = true`, which the lanes refuse whatever
-/// profiles it names: no agh verb unsets the line, so it is removed from the file.
-pub(crate) const UNVAULT: &str = "remove agh.toml's vault = true line, then agh auth add \
-                                  dev|release --file PATH --tier TIER --owner OWNER --write \
-                                  (with --drafts once that token has listed a draft) for each \
-                                  lane writer (docs/RUNBOOK-atpkg-republish.md)";
+const NEEDS_CONFIG: &str = "needs valid configured identity routing";
 
 /// One check's verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,20 +59,13 @@ pub fn program_repos() -> Vec<String> {
 }
 
 /// The router agh.toml under `dirs` builds, or the failing `config` detail.
-fn config(ctx: &Ctx, dirs: &Dirs) -> std::result::Result<Router, String> {
-    let shown = ctx.shown(&dirs.config_file());
-    match load_config(dirs) {
-        Ok(validated) => Ok(Router::from_validated(validated)),
-        Err(ConfigRefusal::Missing) => Err(format!(
-            "{}: {PROVISION}",
-            ConfigRefusal::Missing.detail(&shown)
-        )),
-        Err(refusal) => Err(refusal.detail(&shown)),
-    }
+fn config(dirs: &Dirs) -> std::result::Result<agh::Github, String> {
+    AghHost::configured_client(dirs, false)
 }
 
 /// Whether `owner`'s writer is present: `Ok(profile)` names it, `Err` says why not.
-fn writer(router: &Router, owner: &str) -> std::result::Result<String, String> {
+fn writer(client: &agh::Github, owner: &str) -> std::result::Result<String, String> {
+    let router = client.router();
     let Some(name) = router.writer_of(owner) else {
         return Err(format!(
             "no profile writes {owner}: agh auth add NAME --file PATH --tier TIER --owner \
@@ -105,7 +83,7 @@ fn writer(router: &Router, owner: &str) -> std::result::Result<String, String> {
              add NAME --file PATH --tier TIER --owner {owner} --write ({RUNBOOK})"
         ));
     }
-    let presence = router.presence(name, &ProcessEnv);
+    let presence = client.presence(name);
     match presence {
         agh::policy::Presence::Present => Ok(name.to_string()),
         other => Err(format!(
@@ -134,8 +112,8 @@ pub fn check(
     keyless: bool,
     programs: &[String],
 ) -> Vec<HostCheck> {
-    let router = match config(ctx, dirs) {
-        Ok(router) => router,
+    let client = match config(dirs) {
+        Ok(client) => client,
         Err(detail) => {
             let mut checks = vec![HostCheck::new("config", false, detail)];
             for name in ["staging_writer", "public_writer", "grants", "drafts"] {
@@ -148,11 +126,11 @@ pub fn check(
     let mut checks = vec![HostCheck::new(
         "config",
         true,
-        format!("{} is valid", ctx.shown(&dirs.config_file())),
+        "configured identities resolved from files and recorded vault state; no requests sent",
     )];
     let (staging, public) = (ctx.accounts.staging.as_str(), ctx.accounts.public.as_str());
     let mut present: Vec<String> = Vec::new();
-    let mut judge = |name: &'static str, owner: &str| match writer(&router, owner) {
+    let mut judge = |name: &'static str, owner: &str| match writer(&client, owner) {
         Ok(profile) => {
             let detail = format!("{profile} writes {owner}");
             if !present.contains(&profile) {
@@ -182,7 +160,7 @@ pub fn check(
     if public_written && !owners.iter().any(|o| o.eq_ignore_ascii_case(public)) {
         owners.push(public);
     }
-    owners.retain(|o| router.tier_of(o) == Tier::Release);
+    owners.retain(|o| client.router().tier_of(o) == Tier::Release);
     let mut slugs: Vec<String> = Vec::new();
     for owner in &owners {
         let repos =
@@ -198,7 +176,7 @@ pub fn check(
         .iter()
         .filter(|slug| {
             let granted = slug.split_once('/').is_some_and(|(owner, repo)| {
-                agh::Slug::new(owner, repo).is_ok_and(|s| router.grant(CALLER, &s).is_ok())
+                agh::Slug::new(owner, repo).is_ok_and(|s| client.router().grant(CALLER, &s).is_ok())
             });
             !granted
         })
@@ -234,16 +212,11 @@ pub fn check(
     // Drafts (design §6.4; the fail-closed gate stays, owner ruling 2026-10-26 (b)).
     let mut unproven: Vec<String> = Vec::new();
     for name in &present {
-        let Some(profile) = router.profile(name) else {
-            continue;
-        };
-        match agh::identity::lists_drafts(profile, &ProcessEnv) {
-            Ok(true) => {}
-            Ok(false) => unproven.push(format!(
+        if !client.drafts_vouched(name) {
+            unproven.push(format!(
                 "{name} is fine-grained and not vouched for drafts: re-add it from its token \
                  file with --drafts"
-            )),
-            Err(e) => unproven.push(format!("{name}: {}", e.slug())),
+            ));
         }
     }
     checks.push(if unproven.is_empty() {

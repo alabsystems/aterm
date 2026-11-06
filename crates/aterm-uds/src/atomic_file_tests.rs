@@ -104,7 +104,7 @@ fn a_write_is_whole_or_nothing_and_never_through_a_link() {
 
 /// The directory's flush after the rename: `EIO` there is returned (the bytes are in place, but
 /// their entry may not survive a power loss), and the volume's `ENOTSUP` (Darwin's 45, Linux's 95)
-/// is accepted. Either way the rename has landed, and the flush is asked of the file's own
+/// is accepted. Either way the rename has landed, and the durable flush is asked of the file's own
 /// directory.
 #[test]
 fn a_failed_directory_flush_is_returned_and_a_refused_one_is_not() {
@@ -122,8 +122,8 @@ fn a_failed_directory_flush_is_returned_and_a_refused_one_is_not() {
             format!("errno {errno}\n").as_bytes(),
             0o600,
             || Ok(()),
-            |dir| {
-                asked = Some(dir.to_path_buf());
+            |flush, dir| {
+                asked = Some((flush, dir.to_path_buf()));
                 Err(io::Error::from_raw_os_error(errno))
             },
         );
@@ -132,7 +132,11 @@ fn a_failed_directory_flush_is_returned_and_a_refused_one_is_not() {
             if fails { Err(Some(errno)) } else { Ok(()) },
             "errno {errno}"
         );
-        assert_eq!(asked.as_deref(), Some(scratch.0.as_path()), "errno {errno}");
+        assert_eq!(
+            asked,
+            Some((aterm_durable::Flush::Durable, scratch.0.clone())),
+            "errno {errno}"
+        );
         assert_eq!(
             std::fs::read(&path).expect("read"),
             format!("errno {errno}\n").as_bytes(),
@@ -240,7 +244,8 @@ fn an_edit_whose_directory_flush_fails_is_reported_as_in_effect() {
     let file = ConfigFile::open(&config).expect("open");
     let edit = file.lock().expect("lock");
     let landed = edit
-        .replace_flushing_dir("theme = \"Dracula\"\n", |dir| {
+        .replace_flushing_dir("theme = \"Dracula\"\n", |flush, dir| {
+            assert_eq!(flush, aterm_durable::Flush::Durable, "an edit is durable");
             assert_eq!(dir, scratch.0.as_path(), "the target's own directory");
             Err(io::Error::from_raw_os_error(libc::EIO))
         })
@@ -272,7 +277,7 @@ fn an_edit_whose_directory_flush_fails_is_reported_as_in_effect() {
     let file = ConfigFile::open(&config).expect("open");
     let edit = file.lock().expect("lock");
     let bak = edit
-        .replace_flushing_dir("theme = \"Gruvbox\"\n", |_| {
+        .replace_flushing_dir("theme = \"Gruvbox\"\n", |_, _| {
             Err(io::Error::from_raw_os_error(enotsup))
         })
         .expect("a directory the volume cannot flush is accepted");

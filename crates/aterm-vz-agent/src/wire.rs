@@ -383,7 +383,32 @@ impl Frame {
                     + r.state.len()
                     + r.failed_units.iter().map(|u| 4 + u.len()).sum::<usize>()
             }
-            _ => 64,
+            Self::Exec(e) => {
+                HEADER
+                    + 18
+                    + e.argv.iter().map(|a| 4 + a.len()).sum::<usize>()
+                    + e.cwd.len()
+                    + e.env
+                        .iter()
+                        .map(|(k, v)| 8 + k.len() + v.len())
+                        .sum::<usize>()
+            }
+            Self::Mount(shares) => {
+                HEADER
+                    + 4
+                    + shares
+                        .iter()
+                        .map(|s| 8 + s.name.len() + s.path.len())
+                        .sum::<usize>()
+            }
+            Self::Booting(jobs) => {
+                HEADER
+                    + 4
+                    + jobs
+                        .iter()
+                        .map(|j| 24 + j.unit.len() + j.kind.len() + j.state.len())
+                        .sum::<usize>()
+            }
         };
         let mut p = Put(Vec::with_capacity(cap));
         p.0.extend_from_slice(&[self.kind(), 0, 0, 0, 0]);

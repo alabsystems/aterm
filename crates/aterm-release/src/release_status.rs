@@ -148,76 +148,132 @@ fn failed(event: &aterm_json::Value) -> bool {
             .is_some_and(|rows| rows.iter().any(|row| failure(&row["outcome"])))
 }
 
-fn read_events(mut reader: impl Read) -> std::io::Result<Events> {
-    // A test may print an arbitrarily long line. Never retain its whole output
-    // just to inspect the verifier's small structured records.
-    const LIMIT: usize = 64 * 1024;
-    let mut result = Events::default();
+/// The longest log line [`event_lines`] reads: a test may print an arbitrarily long line, and
+/// the verifier's and the release's structured records are small.
+pub(crate) const LINE_LIMIT: usize = 64 * 1024;
+
+/// One line of a release or verify log, as [`event_lines`] hands it on.
+pub(crate) enum Line<'a> {
+    /// A `verify-event: ` line's JSON text.
+    Verify(&'a [u8]),
+    /// A `release-event: ` line's JSON text.
+    Release(&'a [u8]),
+    /// A line longer than [`LINE_LIMIT`], read past and never retained.
+    TooLong,
+}
+
+/// Read `reader`'s structured lines (`verify-event: `, `release-event: `) in bounded memory,
+/// handing each to `each`, every other line read past: the one reader of these lines that
+/// `ship status` and the check records ([`crate::check_record`]) share. Returns whether the read
+/// ended inside a line: a partly written last record is not a decision.
+///
+/// # Errors
+/// The read itself.
+pub(crate) fn event_lines(
+    mut reader: impl Read,
+    mut each: impl FnMut(Line<'_>),
+) -> std::io::Result<bool> {
     let mut line = Vec::new();
     let mut overflow = false;
     let mut bytes = [0; 8192];
     loop {
         let n = reader.read(&mut bytes)?;
         if n == 0 {
-            result.incomplete_tail = overflow || !line.is_empty();
-            return Ok(result); // A partially written final record is not a decision.
+            return Ok(overflow || !line.is_empty());
         }
-        for &byte in &bytes[..n] {
-            if byte != b'\n' {
-                if line.len() < LIMIT && !overflow {
-                    line.push(byte);
-                } else {
-                    overflow = true;
+        let mut rest = &bytes[..n];
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            let chunk = &rest[..pos];
+            rest = &rest[pos + 1..];
+            if line.is_empty() && !overflow {
+                if chunk.len() > LINE_LIMIT {
+                    each(Line::TooLong);
+                } else if let Some(json) = chunk.strip_prefix(b"verify-event: ") {
+                    each(Line::Verify(json));
+                } else if let Some(json) = chunk.strip_prefix(b"release-event: ") {
+                    each(Line::Release(json));
                 }
-                continue;
-            }
-            if overflow {
-                result.rejected_lines += 1;
-            } else if let Some(json) = line
-                .strip_prefix(b"verify-event: ")
-                .or_else(|| line.strip_prefix(b"release-event: "))
-            {
-                match aterm_json::from_slice::<aterm_json::Value>(json) {
-                    Ok(event)
-                        if event["schema"].as_u64() == Some(1)
-                            && matches!(
-                                event["event"].as_str(),
-                                Some(
-                                    "stage-started"
-                                        | "stage-finished"
-                                        | "test-binary-finished"
-                                        | "test-case-failed"
-                                        | "release-stage"
-                                        | "build-child-finished"
-                                        | "step-child-finished"
-                                        | "compile-finished"
-                                        | "inputs"
-                                        | "disk"
-                                        | "publish-line"
-                                )
-                            ) =>
-                    {
-                        if !result.observe_stage(&event) {
-                            result.rejected_lines += 1;
-                        }
-                        result.count += 1;
-                        result.observe_failure(&event);
-                        if event["event"].as_str() == Some("release-stage") {
-                            if event["stage"].as_str().is_some_and(valid_stage_title) {
-                                result.latest_release_stage = Some(event.clone());
-                            } else {
-                                result.rejected_lines += 1;
-                            }
-                        }
-                        result.latest = Some(event);
+            } else {
+                if !overflow {
+                    if line.len() + chunk.len() <= LINE_LIMIT {
+                        line.extend_from_slice(chunk);
+                    } else {
+                        overflow = true;
                     }
-                    _ => result.rejected_lines += 1,
                 }
+                if overflow {
+                    each(Line::TooLong);
+                } else if let Some(json) = line.strip_prefix(b"verify-event: ") {
+                    each(Line::Verify(json));
+                } else if let Some(json) = line.strip_prefix(b"release-event: ") {
+                    each(Line::Release(json));
+                }
+                line.clear();
+                overflow = false;
             }
-            line.clear();
-            overflow = false;
+        }
+        if !rest.is_empty() && !overflow {
+            let room = LINE_LIMIT.saturating_sub(line.len());
+            if rest.len() <= room {
+                line.extend_from_slice(rest);
+            } else {
+                line.extend_from_slice(&rest[..room]);
+                overflow = true;
+            }
         }
     }
+}
+
+fn read_events(reader: impl Read) -> std::io::Result<Events> {
+    let mut result = Events::default();
+    let incomplete_tail = event_lines(reader, |line| {
+        let json = match line {
+            Line::TooLong => {
+                result.rejected_lines += 1;
+                return;
+            }
+            Line::Verify(json) | Line::Release(json) => json,
+        };
+        match aterm_json::from_slice::<aterm_json::Value>(json) {
+            Ok(event)
+                if event["schema"].as_u64() == Some(1)
+                    && matches!(
+                        event["event"].as_str(),
+                        Some(
+                            "stage-started"
+                                | "stage-finished"
+                                | "check-finished"
+                                | "test-binary-finished"
+                                | "test-case-failed"
+                                | "release-stage"
+                                | "build-child-finished"
+                                | "step-child-finished"
+                                | "compile-finished"
+                                | "inputs"
+                                | "disk"
+                                | "publish-line"
+                        )
+                    ) =>
+            {
+                if !result.observe_stage(&event) {
+                    result.rejected_lines += 1;
+                }
+                result.count += 1;
+                result.observe_failure(&event);
+                if event["event"].as_str() == Some("release-stage") {
+                    if event["stage"].as_str().is_some_and(valid_stage_title) {
+                        result.latest_release_stage = Some(event.clone());
+                    } else {
+                        result.rejected_lines += 1;
+                    }
+                }
+                result.latest = Some(event);
+            }
+            _ => result.rejected_lines += 1,
+        }
+    })?;
+    result.incomplete_tail = incomplete_tail;
+    Ok(result)
 }
 
 struct Journals {
@@ -386,10 +442,11 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         .as_ref()
         .and_then(|journal| {
             journal.artifact.as_ref().map(|artifact| {
-                crate::accepted_measure::accepted(
+                crate::check_record::accepted(
                     &GitCli::new(repo),
                     &journal.commit,
                     &artifact.macho_sha256,
+                    crate::build_inputs::current,
                 )
             })
         })
@@ -754,6 +811,24 @@ mod tests {
         assert_eq!(read_events(unknown.as_bytes()).unwrap().rejected_lines, 1);
     }
 
+    /// A check's `check-finished` line (A19's record source) is an event of the run, and a
+    /// failed one is a reported failure. NEGATIVE CONTROL: without `check-finished` among the
+    /// known events it is a rejected line and the run's observations are incomplete.
+    #[test]
+    fn a_check_finished_line_is_an_event_of_the_run() {
+        let lines = "verify-event: {\"schema\":1,\"event\":\"check-finished\",\"check\":\"fmt\",\"outcome\":\"ok\",\"seconds\":2.5}\n\
+             verify-event: {\"schema\":1,\"event\":\"check-finished\",\"check\":\"lint\",\"outcome\":\"FAIL\",\"seconds\":9.0}\n";
+        let events = read_events(lines.as_bytes()).unwrap();
+        assert_eq!((events.rejected_lines, events.count), (0, 2));
+        assert_eq!(
+            events
+                .first_failure
+                .as_ref()
+                .and_then(|e| e["check"].as_str()),
+            Some("lint")
+        );
+    }
+
     #[test]
     fn malformed_activity_never_hides_a_reported_failure_or_prints_control_titles() {
         let rows = [
@@ -888,12 +963,26 @@ mod tests {
         };
         assert!(matches!(
             crate::cli::parse(&args(&["release", "status", "--json"])),
-            Ok(crate::cli::Cmd::ReleaseStatus { json: true })
+            Ok(crate::cli::Cmd::ReleaseStatus {
+                json: true,
+                fleet: false
+            })
         ));
         assert!(matches!(
             crate::cli::parse(&args(&["release", "status"])),
-            Ok(crate::cli::Cmd::ReleaseStatus { json: false })
+            Ok(crate::cli::Cmd::ReleaseStatus {
+                json: false,
+                fleet: false
+            })
         ));
+        assert!(matches!(
+            crate::cli::parse(&args(&["release", "status", "--fleet"])),
+            Ok(crate::cli::Cmd::ReleaseStatus {
+                json: false,
+                fleet: true
+            })
+        ));
+        assert!(crate::cli::parse(&args(&["release", "status", "--fleet", "--bump"])).is_err());
         for extra in ["--bump", "--forget", "--prepare"] {
             assert!(crate::cli::parse(&args(&["release", "status", extra])).is_err());
         }

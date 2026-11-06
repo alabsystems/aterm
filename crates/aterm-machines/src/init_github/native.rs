@@ -111,8 +111,8 @@ struct NativeRepositories {
     /// `aterm init`'s default, which nobody configured: no token on this Mac is no stage here,
     /// not a person's step.
     unasked: bool,
-    /// What the last probe or apply read, for the step after it: the apply reuses the probe's
-    /// inventory and verdicts, and the read-back reads again only what the apply cloned.
+    /// The apply reuses the probe's inventory and verdicts. Completion reuses only the
+    /// inventory: every checkout and required dependency is read again after the batch.
     carried: Mutex<Option<Carried>>,
     /// What the last apply's clones made of their hook installers ([`repos::Cloned::hooks`]),
     /// which the read-back's row says.
@@ -123,8 +123,8 @@ struct NativeRepositories {
 enum Carried {
     /// The probe's inventory and verdicts, for the apply.
     Probed(Plan, repos::Partition),
-    /// The apply's, with the repositories it cloned, which the read-back verifies.
-    Applied(Plan, repos::Partition, Vec<repos::Repo>),
+    /// The apply's inventory, whose current local readiness the read-back verifies.
+    Applied(Plan),
 }
 
 /// One local GitHub profile/token reading or its typed blocker, without contacting
@@ -383,22 +383,18 @@ impl NativeRepositories {
         Git::for_user(sys, &self.user).lookups(sys, &self.user, helper.as_ref(), &plan.token)
     }
 
-    /// The reading the probe answers from: the apply's, with what it cloned read back, or a
-    /// new one.
+    /// Read current local readiness against the apply's admitted inventory, or a new plan.
     fn read(&self, sys: &dyn System) -> Result<(Plan, repos::Partition), Block> {
-        match self.take() {
-            Some(Carried::Applied(plan, mut standing, touched)) => {
+        let plan = match self.take() {
+            Some(Carried::Applied(plan)) => {
                 self.ensure_current(sys).map_err(Block::from)?;
-                standing.read_back(sys, &self.user, &touched);
-                Ok((plan, standing))
+                plan
             }
-            _ => {
-                let plan = self.plan(sys)?;
-                let standing = repos::partition(sys, &self.user, &plan.repositories)
-                    .map_err(Block::of(Wait::InTheWay))?;
-                Ok((plan, standing))
-            }
-        }
+            _ => self.plan(sys)?,
+        };
+        let standing = repos::partition(sys, &self.user, &plan.repositories)
+            .map_err(Block::of(Wait::InTheWay))?;
+        Ok((plan, standing))
     }
 }
 
@@ -557,7 +553,7 @@ impl Item for NativeRepositories {
             return Err(why);
         }
         if standing.missing.is_empty() && standing.dependencies.is_empty() {
-            self.carry(Carried::Applied(plan, standing, Vec::new()));
+            self.carry(Carried::Applied(plan));
             return Ok(());
         }
         if let Lookups::Not(why) = self.lookups(sys, &plan)? {
@@ -581,9 +577,8 @@ impl Item for NativeRepositories {
                     &cloned.hooks,
                 ));
             }
-            match super::dependencies::repair(sys, &self.user, path, repo, &current) {
-                Ok(()) => cloned.cloned.push(repo.clone()),
-                Err(why) => cloned.failed.push(format!("~/{}: {why}", repo.name)),
+            if let Err(why) = super::dependencies::repair(sys, &self.user, path, repo, &current) {
+                cloned.failed.push(format!("~/{}: {why}", repo.name));
             }
         }
         let room = room(&cloned.left);
@@ -598,8 +593,9 @@ impl Item for NativeRepositories {
             ));
         }
         let mut failed = cloned.failed;
-        // What it cloned stays missing until the read-back reads it as its own worktree.
-        self.carry(Carried::Applied(plan, standing, cloned.cloned));
+        // A long batch can outlive changes to worktrees it did not touch. Completion reads
+        // every local destination and required dependency again against this same inventory.
+        self.carry(Carried::Applied(plan));
         if let Some(why) = room {
             // The failed row keeps the page's words for it (`init_observe::failure_note`).
             self.reading.set(Some(Reading::Waits(Wait::DiskSpace)));
@@ -2738,15 +2734,7 @@ pub(super) mod tests {
         let mut sequence = 0;
         for name in listed {
             let path = home.join(name);
-            if theirs.contains(&name.as_str()) {
-                sys.stat_of(path.to_str().unwrap(), stat(true, 0o700));
-                sys.on(
-                    &crate::checkout::git(&sys, &item.user, Some(&path))
-                        .args(["config", "--get-all", "remote.origin.url"])
-                        .display(),
-                    Ran::ok(&format!("https://github.com/someone/{name}.git\n")),
-                );
-            } else if present.contains(name) {
+            if theirs.contains(&name.as_str()) || present.contains(name) {
                 sys.stat_of(path.to_str().unwrap(), stat(true, 0o700));
             } else if !repos::HOME_FOLDERS
                 .iter()
@@ -2756,6 +2744,26 @@ pub(super) mod tests {
                 sequence += 1;
             }
             script_existing(&sys, &item.user, &path, name);
+        }
+        if !theirs.is_empty() {
+            let foreign: Vec<_> = theirs
+                .iter()
+                .map(|name| {
+                    (
+                        crate::checkout::git(&sys, &item.user, Some(&home.join(name)))
+                            .args(["config", "--get-all", "remote.origin.url"])
+                            .display(),
+                        format!("https://github.com/someone/{name}.git\n"),
+                    )
+                })
+                .collect();
+            sys.simulate(move |_, command| {
+                let key = command.display();
+                foreign
+                    .iter()
+                    .find(|(expected, _)| expected == &key)
+                    .map(|(_, origin)| Ran::ok(origin))
+            });
         }
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         script::alike(&sys, &item.user);
@@ -2777,12 +2785,11 @@ pub(super) mod tests {
     const TOP_LEVEL: &str = "rev-parse --is-inside-work-tree --show-prefix --show-toplevel";
 
     /// One whole pass over 50 repositories already in `~` and 10 to clone: private metadata is
-    /// read once, each present worktree is read once (one rev-parse, one origin), and
-    /// the read-back reads only the 10 clones. Each missing repository has one remote inventory
-    /// and one clone; local route admission is repeated before network operations.
+    /// captured once, and completion rechecks all worktrees locally after cloning. Each
+    /// missing repository has one remote inventory and one clone; local route admission is
+    /// repeated before network operations.
     #[test]
-    fn a_whole_pass_reads_private_inventory_and_each_worktree_once_and_reads_back_only_its_clones()
-    {
+    fn a_whole_pass_reuses_private_inventory_but_rechecks_all_local_worktrees() {
         let (present, missing) = (names("repo", 50), names("new", 10));
         let listed: Vec<String> = present.iter().chain(&missing).cloned().collect();
         let (sys, item) = listing(&listed, &present);
@@ -2811,10 +2818,10 @@ pub(super) mod tests {
         let home = Path::new(&item.user.home);
         for name in &present {
             let path = home.join(name);
-            assert_eq!(ran_in(&calls, &path, TOP_LEVEL), 1, "{name}");
+            assert_eq!(ran_in(&calls, &path, TOP_LEVEL), 2, "{name}");
             assert_eq!(
                 ran_in(&calls, &path, "config --get-all remote.origin.url"),
-                1,
+                2,
                 "{name}"
             );
         }
@@ -3004,8 +3011,8 @@ pub(super) mod tests {
     /// The most clones a pass runs at once.
     const LANES_SEEN: usize = 4;
 
-    /// The read-back reads again only what the pass cloned, and a clone that no longer reads as
-    /// the repository's own worktree there (another origin took its place once it was
+    /// A clone that no longer reads as the repository's own worktree there during read-back
+    /// (another origin took its place once it was
     /// published) is still missing: the row fails instead of counting it present or dropping it.
     #[test]
     fn a_clone_the_read_back_cannot_verify_is_still_missing() {
@@ -3026,8 +3033,14 @@ pub(super) mod tests {
             crate::model::Outcome::Failed,
             "{rows:?}"
         );
-        let why = stage(&rows).why.as_deref().unwrap_or_default();
-        assert!(why.contains("1 of 1 repositories missing"), "{why}");
+        assert_eq!(
+            Reading::of(stage(&rows)),
+            Some(Reading::Repositories {
+                present: 0,
+                count: 1,
+                signed_in: true,
+            })
+        );
         assert!(
             sys.calls()
                 .iter()
@@ -3035,6 +3048,101 @@ pub(super) mod tests {
             "the clone was published before the read-back: {:?}",
             sys.calls()
         );
+    }
+
+    #[test]
+    fn readback_rechecks_preexisting_worktrees_and_dependencies_after_a_clone_batch() {
+        use super::super::dependencies::tests::{PIN, existing};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for dependency in [false, true] {
+            let names = ["parent".to_owned(), "new".to_owned()];
+            let (sys, item) = listing(&names, &["parent".to_owned()]);
+            let home = Path::new(&item.user.home);
+            let parent = home.join("parent");
+            let child = parent.join("vendor/library");
+            if dependency {
+                required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+                let mut required = repository("alice", "parent", 1);
+                required.as_object_mut().unwrap().insert(
+                    "required_submodules".into(),
+                    aterm_json::json!(["vendor/library"]),
+                );
+                metadata(
+                    &sys,
+                    &item.user,
+                    aterm_json::json!([required, repository("alice", "new", 2),]),
+                );
+                sys.stat_of(parent.join("vendor").to_str().unwrap(), stat(true, 0o700));
+                sys.stat_of(child.to_str().unwrap(), stat(true, 0o700));
+                sys.file(child.join(".git").to_str().unwrap(), b"inert metadata")
+                    .stat_of(child.join(".git").to_str().unwrap(), stat(false, 0o600));
+                existing(&sys, &item.user, &child, "library", PIN);
+                super::super::dependencies::tests::download(
+                    &sys,
+                    &item.user,
+                    &parent,
+                    "vendor/library",
+                    1,
+                );
+            } else {
+                repos::tests::script_clone_named(&sys, &item.user, "parent", 1, false);
+            }
+            let changed = AtomicBool::new(false);
+            let removed = if dependency { child } else { parent };
+            sys.simulate(move |sys, command| {
+                if command.display().contains(" clone ") && !changed.swap(true, Ordering::SeqCst) {
+                    // Another local process removes an old checkout while a different
+                    // repository downloads. The credential and inventory do not change.
+                    if dependency {
+                        sys.remove(&removed.join(".git")).unwrap();
+                    }
+                    sys.remove(&removed).unwrap();
+                }
+                None
+            });
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let source = super::super::token_read(&sys, &ctx).unwrap().unwrap().mark;
+            let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Failed,
+                "dependency={dependency}: {rows:?}"
+            );
+            assert_eq!(
+                Reading::of(stage(&rows)),
+                Some(Reading::Repositories {
+                    present: 1,
+                    count: 2,
+                    signed_in: true,
+                }),
+                "dependency={dependency}: {rows:?}"
+            );
+            assert_eq!(
+                super::super::token_read(&sys, &ctx).unwrap().unwrap().mark,
+                source
+            );
+            let resumed = run(&sys, &ctx, Mode::Apply).unwrap();
+            assert_eq!(
+                stage(&resumed).outcome,
+                crate::model::Outcome::Changed,
+                "dependency={dependency}: {resumed:?}"
+            );
+            assert_eq!(
+                Reading::of(stage(&resumed)),
+                Some(Reading::Repositories {
+                    present: 2,
+                    count: 2,
+                    signed_in: true,
+                })
+            );
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| call.contains(" clone "))
+                    .count(),
+                2
+            );
+        }
     }
 
     /// Existing destinations stay untouched while the others clone. They remain part of the

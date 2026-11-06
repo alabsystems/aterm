@@ -83,6 +83,7 @@ impl Origin {
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("parent.toml"), "producer_version = \"0.5.0\"\n").unwrap();
         fs::write(rival.join("README.md"), "aterm\n").unwrap();
+        fs::write(rival.join(".gitignore"), "target/\n").unwrap();
         let answers = rival.join(fixtures::SHIPPED_STATE_CORPUS);
         fs::create_dir_all(answers.parent().unwrap()).unwrap();
         fs::write(&answers, corpus()).unwrap();
@@ -90,8 +91,9 @@ impl Origin {
         git(&rival, &["commit", "-q", "-m", "seed"]);
         git(&rival, &["push", "-q", "-u", "origin", "main"]);
         git(root, &["clone", "-q", "origin.git", "work"]);
-        let work = root.join("work");
+        let work = root.join("work").canonicalize().unwrap();
         identity(&work);
+        seed_index(&work, b"binary");
         Origin { dir, work, rival }
     }
 
@@ -107,6 +109,25 @@ impl Origin {
             .unwrap()
             .stdout
     }
+}
+
+fn artifact(root: &Path, binary: &Path) -> String {
+    aterm_json::json!({"reason":"compiler-artifact", "package_id":"aterm-gui", "manifest_path":root.join("crates/aterm-gui/Cargo.toml"), "target":{"kind":["lib"],"name":"aterm_gui"}, "profile":{"test":true}, "executable":binary}).to_string()
+}
+
+fn seed_index(root: &Path, bytes: &[u8]) {
+    seed_index_named(root, bytes, "aterm_gui-0123456789abcdef");
+}
+
+fn seed_index_named(root: &Path, bytes: &[u8], name: &str) {
+    let binary = root.join("target/debug/deps").join(name);
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::write(&binary, bytes).unwrap();
+    let (tree, compiler) = aterm_verify::test_index::identities(root, Path::new("targo")).unwrap();
+    aterm_verify::test_index::Index::from_messages(tree, compiler, &artifact(root, &binary))
+        .unwrap()
+        .write(&root.join("target/verify/test-executables.json"))
+        .unwrap();
 }
 
 fn exit(code: i32) -> std::process::ExitStatus {
@@ -140,6 +161,14 @@ fn generator<'a>(
     runs: &'a Cell<usize>,
 ) -> impl FnMut(&mut Command) -> std::io::Result<Output> + 'a {
     move |cmd: &mut Command| {
+        assert_eq!(
+            Path::new(cmd.get_program()).parent().unwrap(),
+            cmd.get_current_dir().unwrap().join("target/debug/deps")
+        );
+        assert_eq!(
+            PathBuf::from(env_of(cmd, "CARGO_MANIFEST_DIR").unwrap()),
+            cmd.get_current_dir().unwrap().join("crates/aterm-gui")
+        );
         let answers = PathBuf::from(env_of(cmd, fixtures::ANSWERS_OUT).unwrap());
         fs::write(answers, staged_answers(desks)).unwrap();
         runs.set(runs.get() + 1);
@@ -156,6 +185,9 @@ fn generator<'a>(
         let out = PathBuf::from(env_of(cmd, "ATERM_HANDOFF_FIXTURE_OUT").unwrap());
         let build = env_of(cmd, "SOURCE_DATE_EPOCH").unwrap();
         let short = env_of(cmd, "ATERM_BUILD_GIT_COMMIT").unwrap();
+        // The generator is a library test binary: it compiles no product version, so the
+        // release names the one it writes as.
+        let version = env_of(cmd, "ATERM_HANDOFF_FIXTURE_VERSION").unwrap();
         assert_eq!(
             env_of(cmd, "ATERM_BUILD_GIT_COMMIT_FULL").as_deref(),
             Some(RELEASE)
@@ -165,7 +197,7 @@ fn generator<'a>(
             fs::write(
                 out.join(desk).join("parent.toml"),
                 format!(
-                    "producer_version = \"0.6.0\"\nproducer_commit = \"{short}\"\n\
+                    "producer_version = \"{version}\"\nproducer_commit = \"{short}\"\n\
                      outgoing_build = {build}\n"
                 ),
             )
@@ -174,7 +206,7 @@ fn generator<'a>(
         }
         fs::write(
             out.join("rendezvous.toml"),
-            "producer_version = \"0.6.0\"\n",
+            format!("producer_version = \"{version}\"\n"),
         )
         .unwrap();
         Ok(Output {
@@ -186,26 +218,13 @@ fn generator<'a>(
 }
 
 #[test]
-fn the_generator_runs_once_per_reserved_identity() {
+fn the_indexed_generator_runs_once_per_reserved_identity() {
     let o = Origin::new();
     let runs = Cell::new(0);
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let compiled = target.join("debug/deps/compiled-unit");
-    let mut generate = generator(&["history"], &runs);
-    let mut run = |cmd: &mut Command| {
-        if runs.get() == 0 {
-            fs::create_dir_all(compiled.parent().unwrap()).unwrap();
-            fs::write(&compiled, b"retained compiler output").unwrap();
-        } else {
-            assert_eq!(fs::read(&compiled).unwrap(), b"retained compiler output");
-        }
-        generate(cmd)
-    };
+    let mut run = generator(&["history"], &runs);
     let root = o.stage_root();
     let first = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
-    assert!(first.fresh && first.rendezvous, "{first:?}");
-    assert_eq!(first.desks, ["history"]);
-    assert_eq!(first.dir, pins(7).staged_in(&root).join("v0.6.0"));
+    assert!(first.fresh && first.rendezvous);
     let again = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
     assert!(!again.fresh);
     assert_eq!(runs.get(), 1);
@@ -218,20 +237,69 @@ fn the_generator_runs_once_per_reserved_identity() {
             .unwrap()
             .contains("outgoing_build = 8")
     );
-    assert!(compiled.is_file(), "new fixtures retain compiler outputs");
-    assert!(!target.join(fixtures::UNJUDGED).exists());
-    assert!(!target.join(aterm_uds::deadline::EXEC_STAMP).exists());
 }
 
 #[test]
-fn a_retained_target_does_not_follow_a_replacement_symlink() {
+fn a_missing_or_changed_binary_compiles_only_the_generator_before_running_it() {
+    for changed in [false, true] {
+        let o = Origin::new();
+        let binary = o.work.join("target/debug/deps/aterm_gui-0123456789abcdef");
+        if changed {
+            fs::write(&binary, b"changed").unwrap();
+        } else {
+            fs::remove_file(&binary).unwrap();
+        }
+        let runs = Cell::new(0);
+        let compiles = Cell::new(0);
+        let mut generate = generator(&["history"], &runs);
+        let mut run = |cmd: &mut Command| {
+            if cmd.get_args().any(|arg| arg == "--no-run") {
+                let args: Vec<_> = cmd.get_args().collect();
+                assert!(args.iter().any(|a| *a == "--lib"));
+                assert!(args.iter().any(|a| *a == "aterm-gui"));
+                assert!(!args.iter().any(|a| *a == "--workspace"));
+                compiles.set(compiles.get() + 1);
+                fs::write(&binary, b"binary").unwrap();
+                return Ok(Output {
+                    status: exit(0),
+                    stdout: artifact(&o.work, &binary).into_bytes(),
+                    stderr: Vec::new(),
+                });
+            }
+            generate(cmd)
+        };
+        fixtures::stage(
+            Path::new("targo"),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut run,
+        )
+        .unwrap();
+        assert_eq!(compiles.get(), 1);
+        assert_eq!(runs.get(), 1);
+    }
+}
+
+#[test]
+fn an_interrupted_binary_holds_only_its_own_execution() {
+    use std::os::unix::process::ExitStatusExt as _;
     let o = Origin::new();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let outside = o.dir.path().join("outside");
-    fs::create_dir_all(&outside).unwrap();
-    fs::write(outside.join(aterm_uds::deadline::RAN), b"leave alone").unwrap();
-    fs::create_dir_all(target.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&outside, &target).unwrap();
+    let mut killed = |_: &mut Command| {
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    };
+    fixtures::stage(
+        Path::new("targo"),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut killed,
+    )
+    .unwrap_err();
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
     let error = fixtures::stage(
@@ -242,26 +310,28 @@ fn a_retained_target_does_not_follow_a_replacement_symlink() {
         &mut run,
     )
     .unwrap_err();
-    assert!(error.to_string().contains("is not a directory"));
+    assert!(error.to_string().contains("never showed it ran"));
     assert_eq!(runs.get(), 0);
-    assert_eq!(
-        fs::read(outside.join(aterm_uds::deadline::RAN)).unwrap(),
-        b"leave alone"
+    // A stale digest must not let a fallback compiler replace this held path.
+    fs::write(
+        o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+        b"changed",
+    )
+    .unwrap();
+    assert!(
+        fixtures::stage(
+            Path::new("targo"),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut run
+        )
+        .is_err()
     );
-    assert!(target.is_symlink());
-}
-
-#[test]
-fn renewing_a_retained_execution_stamp_never_overwrites_its_link_target() {
-    let o = Origin::new();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let outside = o.dir.path().join("outside-stamp");
-    let old_clock = u64::MAX.to_string();
-    fs::write(&outside, &old_clock).unwrap();
-    fs::create_dir_all(&target).unwrap();
-    std::os::unix::fs::symlink(&outside, target.join(aterm_uds::deadline::EXEC_STAMP)).unwrap();
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
+    assert_eq!(runs.get(), 0);
+    // Another executable path has its own hold, even with identical bytes in the
+    // same target directory.
+    seed_index_named(&o.work, b"binary", "aterm_gui-fedcba9876543210");
     fixtures::stage(
         Path::new("targo"),
         &o.work,
@@ -271,36 +341,6 @@ fn renewing_a_retained_execution_stamp_never_overwrites_its_link_target() {
     )
     .unwrap();
     assert_eq!(runs.get(), 1);
-    assert_eq!(fs::read_to_string(&outside).unwrap(), old_clock);
-    assert!(!target.join(aterm_uds::deadline::EXEC_STAMP).exists());
-}
-
-#[test]
-fn a_retained_success_marker_cannot_bypass_a_later_interrupted_run() {
-    use std::os::unix::process::ExitStatusExt as _;
-    let o = Origin::new();
-    let root = o.stage_root();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    fs::create_dir_all(&target).unwrap();
-    fs::write(target.join(aterm_uds::deadline::RAN), b"old proof").unwrap();
-    let mut killed = |_: &mut Command| -> std::io::Result<Output> {
-        assert!(!target.join(aterm_uds::deadline::RAN).exists());
-        fs::write(target.join("compiled-unit"), b"held").unwrap();
-        fs::write(target.join(aterm_uds::deadline::RAN), b"one child ran").unwrap();
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(9),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        })
-    };
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut killed).unwrap_err();
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
-    let error =
-        fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap_err();
-    assert!(error.to_string().contains("never showed they ran"));
-    assert_eq!(runs.get(), 0);
-    assert!(target.join("compiled-unit").is_file());
 }
 
 #[test]
@@ -326,6 +366,16 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
 
     let mut unanswered = |cmd: &mut Command| {
         let out = generator(&["history"], &runs)(cmd);
+        assert_eq!(
+            cmd.get_program(),
+            cmd.get_current_dir()
+                .unwrap()
+                .join("target/debug/deps/aterm_gui-0123456789abcdef")
+        );
+        assert_eq!(
+            PathBuf::from(env_of(cmd, "CARGO_MANIFEST_DIR").unwrap()),
+            cmd.get_current_dir().unwrap().join("crates/aterm-gui")
+        );
         let answers = PathBuf::from(env_of(cmd, fixtures::ANSWERS_OUT).unwrap());
         fs::write(answers, corpus()).unwrap();
         out
@@ -345,147 +395,6 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
         "{refused}"
     );
     assert!(fixtures::staged(&root, &pins(7)).is_none());
-}
-
-/// A generator a signal ended never showed that what it built ran: its target stays,
-/// stamped, and the next stage refuses and leaves it until the hold is spent (a restart
-/// here), then runs with the retained compiler outputs.
-#[test]
-fn a_generator_a_signal_ended_keeps_its_target_until_the_hold_is_spent() {
-    use std::os::unix::process::ExitStatusExt as _;
-    let o = Origin::new();
-    let root = o.stage_root();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let built = target.join("debug/deps/aterm_gui-0");
-    let mut killed = |_: &mut Command| -> std::io::Result<Output> {
-        fs::create_dir_all(built.parent().unwrap()).unwrap();
-        fs::write(&built, b"held").unwrap();
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(9),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        })
-    };
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut killed).unwrap_err();
-    assert!(built.is_file(), "what the killed run built stays");
-
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
-    let refused =
-        fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap_err();
-    assert!(
-        refused.to_string().contains("never showed they ran"),
-        "{refused}"
-    );
-    assert_eq!(runs.get(), 0, "nothing runs while the hold stands");
-    assert!(built.is_file());
-
-    fs::write(
-        target.join(aterm_uds::deadline::EXEC_STAMP),
-        u64::MAX.to_string(),
-    )
-    .unwrap();
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
-    assert_eq!(runs.get(), 1);
-    assert!(
-        built.is_file(),
-        "a completed retry retains compiler outputs"
-    );
-    assert!(!target.join(aterm_uds::deadline::EXEC_STAMP).exists());
-    assert!(!target.join(fixtures::UNJUDGED).exists());
-}
-
-/// A release killed while the generator ran never judged its target. Once the stamp written
-/// before the run is spent, the next stage still keeps the target: it holds it from when it
-/// finds it, refuses, and reuses it only once that hold is spent.
-#[test]
-fn a_target_a_killed_release_never_judged_is_held_from_when_it_is_found() {
-    use aterm_uds::deadline::{EXEC_STAMP, FIRST_EXEC_HANG};
-    let o = Origin::new();
-    let root = o.stage_root();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let built = target.join("debug/deps/aterm_gui-0");
-    let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut run = |_: &mut Command| -> std::io::Result<Output> {
-            fs::create_dir_all(built.parent().unwrap()).unwrap();
-            fs::write(&built, b"held").unwrap();
-            panic!("the release is killed while the generator runs");
-        };
-        fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run)
-    }));
-    assert!(killed.is_err(), "the release never got back from the run");
-    let hang = u64::try_from(FIRST_EXEC_HANG.as_millis()).unwrap();
-    let spent = aterm_uds::process::awake_ms()
-        .and_then(|awake| awake.checked_sub(hang + 1000))
-        .unwrap_or(u64::MAX);
-    fs::write(target.join(EXEC_STAMP), spent.to_string()).unwrap();
-
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
-    for stage in ["found", "held"] {
-        let refused =
-            fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap_err();
-        assert!(
-            refused.to_string().contains("never showed they ran"),
-            "{stage}: {refused}"
-        );
-        assert_eq!(runs.get(), 0, "{stage}: nothing runs while the hold stands");
-        assert!(
-            built.is_file(),
-            "{stage}: what the killed release built stays"
-        );
-    }
-
-    fs::write(target.join(EXEC_STAMP), u64::MAX.to_string()).unwrap();
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
-    assert_eq!(runs.get(), 1, "a restart spent the hold");
-    assert!(
-        built.is_file(),
-        "a completed retry retains compiler outputs"
-    );
-    assert!(!target.join(EXEC_STAMP).exists());
-    assert!(!target.join(fixtures::UNJUDGED).exists());
-}
-
-/// A `run` that failed and left nothing in the target but its stamp built nothing there:
-/// the next stage runs at once. One that failed after building there
-/// keeps it.
-#[test]
-fn a_run_that_failed_before_building_leaves_no_hold() {
-    let o = Origin::new();
-    let root = o.stage_root();
-    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
-    let mut not_started = |_: &mut Command| -> std::io::Result<Output> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "not started: the release was interrupted",
-        ))
-    };
-    fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &root,
-        &pins(7),
-        &mut not_started,
-    )
-    .unwrap_err();
-    assert!(!target.join(aterm_uds::deadline::EXEC_STAMP).exists());
-    assert!(!target.join(fixtures::UNJUDGED).exists());
-
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
-    assert_eq!(runs.get(), 1, "nothing holds the next stage");
-
-    let built = target.join("debug/deps/aterm_gui-0");
-    let mut lost = |_: &mut Command| -> std::io::Result<Output> {
-        fs::create_dir_all(built.parent().unwrap()).unwrap();
-        fs::write(&built, b"held").unwrap();
-        Err(std::io::Error::other("its output could not be read"))
-    };
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(8), &mut lost).unwrap_err();
-    assert!(built.is_file(), "what a failed run built stays");
-    assert!(target.join(aterm_uds::deadline::EXEC_STAMP).is_file());
 }
 
 #[test]

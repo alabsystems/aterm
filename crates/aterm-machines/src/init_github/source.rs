@@ -7,7 +7,159 @@
 use super::{Asked, Github, TOKEN_FILE, asked, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::System;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Local source and pinned-helper changes that can invalidate a completed repository stage.
+/// Observing this mark grants no authority over inputs or effects and runs no program.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RepositoryInputMark {
+    source: Result<Stamp, String>,
+    helper: Result<(PathBuf, [u8; 32]), std::io::ErrorKind>,
+    paths: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for RepositoryInputMark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositoryInputMark")
+            .finish_non_exhaustive()
+    }
+}
+
+fn account(sys: &dyn System) -> Result<User, String> {
+    let user = sys.identity()?.user;
+    if user.uid != sys.euid() || user.uid == 0 {
+        return Err("repository inputs belong to this login alone".into());
+    }
+    Ok(user)
+}
+
+/// Observe only this login's selected repository inputs and fixed credential helper. Missing
+/// or refused inputs remain stable observations, so removal and later repair each move it.
+///
+/// # Errors
+/// This process's own account cannot be identified.
+pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, String> {
+    let user = account(sys)?;
+    let helper = (|| {
+        let path = sys.canonicalize(&crate::git_credential::Helper::launcher(&user))?;
+        let version = sys.file_version(&path)?;
+        Ok::<_, std::io::Error>((path, version))
+    })()
+    .map_err(|why| why.kind());
+    Ok(RepositoryInputMark {
+        source: Stamp::read(sys, &user),
+        helper,
+        paths: watch_paths(sys, &user),
+    })
+}
+
+/// Files whose parent directories can notify a parked repository stage. Its own selected
+/// token is included; global credential helpers are excluded because every setup Git command
+/// pins aterm's helper instead. A malformed profile still watches the profile's repair.
+///
+/// # Errors
+/// This process's own account cannot be identified.
+pub fn repository_input_watch_paths(sys: &dyn System) -> Result<Vec<PathBuf>, String> {
+    let user = account(sys)?;
+    Ok(watch_paths(sys, &user))
+}
+
+fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
+    let home = Path::new(&user.home);
+    let launcher = crate::git_credential::Helper::launcher(user);
+    let mut paths = vec![home.join(".config/aterm/init.toml"), launcher.clone()];
+    if let Ok(resolved) = sys.canonicalize(&launcher) {
+        paths.push(resolved);
+    }
+    // A launcher can precede its installed target. Keep each declared target observable even
+    // when canonicalization cannot reach it yet, including a dangling link in a parent. This
+    // reads link metadata only and grants no permission to execute or read the target.
+    let mut link = launcher;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        if !seen.insert(link.clone()) {
+            break;
+        }
+        paths.push(link.clone());
+        let next = link.ancestors().find_map(|ancestor| {
+            let target = sys.read_link(ancestor).ok()?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                ancestor.parent()?.join(target)
+            };
+            let tail = link.strip_prefix(ancestor).ok()?;
+            Some(if tail.as_os_str().is_empty() {
+                target
+            } else {
+                target.join(tail)
+            })
+        });
+        let Some(next) = next else { break };
+        link = next;
+    }
+    match profile(sys, user).and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
+        Ok(Asked::Default) => {
+            paths.push(home.join(TOKEN_FILE));
+            paths.push(home.join(inventory::FILE));
+        }
+        Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
+        Ok(Asked::Off) | Err(_) => {}
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dangling_helper_keeps_its_declared_target_observable() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let home = root_path.join("home");
+        let alias = root_path.join("alias/aterm");
+        let user = User {
+            name: "fixture".into(),
+            uid: aterm_uds::peer::our_uid(),
+            gid: 0,
+            home: home.to_string_lossy().into_owned(),
+            shell: String::new(),
+            admin: false,
+        };
+        let launcher = crate::git_credential::Helper::launcher(&user);
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&alias, &launcher).unwrap();
+        let sys = crate::port::Live::new();
+        for package in ["first", "second"] {
+            if package == "second" {
+                std::fs::remove_file(&alias).unwrap();
+            }
+            let relative = PathBuf::from(format!("../{package}/bin/aterm"));
+            std::os::unix::fs::symlink(&relative, &alias).unwrap();
+            assert!(sys.canonicalize(&launcher).is_err(), "the target is absent");
+            let paths = watch_paths(&sys, &user);
+            assert!(paths.contains(&launcher));
+            assert!(paths.contains(&alias));
+            assert!(
+                paths.contains(&alias.parent().unwrap().join(relative)),
+                "arrival away from the unchanged launcher must stay observable: {paths:?}"
+            );
+        }
+        // A missing directory behind a parent link has the same arrival boundary.
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::remove_dir(launcher.parent().unwrap()).unwrap();
+        let package = root_path.join("third/bin");
+        std::os::unix::fs::symlink(&package, launcher.parent().unwrap()).unwrap();
+        assert!(sys.canonicalize(&launcher).is_err());
+        assert!(watch_paths(&sys, &user).contains(&package.join("aterm")));
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Stamp([u8; 32]);

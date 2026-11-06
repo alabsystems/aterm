@@ -2707,11 +2707,29 @@ fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
                 .into_iter()
                 .for_each(|w| push_word(w, out)),
         }
-        let in_trees: Vec<String> = out[start..]
-            .iter()
-            .filter_map(|w| w.split_once(':').map(|(_, p)| p.to_string()))
-            .filter(|p| !p.is_empty())
-            .collect();
+        // A git word holding a `:` is read whole and as the path past it ([`git_tree_path`]),
+        // but a pathspec's closed long magic (`:(icase)src`) as that path alone: its `(` is
+        // git's, never a glob the shell expands. Read whole, its other readings (a file of that
+        // name under `--literal-pathspecs` or `GIT_LITERAL_PATHSPECS`, each of which the secret
+        // and git checks refuse, or the index's entry `(icase)src` as a revision) name a path
+        // opening with `(magic)`, which meets a rule only where the path past it does, as no
+        // default rule's name holds `(` or `)`.
+        let mut in_trees = Vec::new();
+        for w in &mut out[start..] {
+            let Some(path) = git_tree_path(w)
+                .map(|(p, _)| p.to_string())
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            if w.strip_prefix(":(")
+                .is_some_and(|magic| magic.contains(')'))
+            {
+                *w = path;
+            } else {
+                in_trees.push(path);
+            }
+        }
         out.extend(in_trees);
         return;
     }
@@ -3164,6 +3182,73 @@ fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
         GrammarWord::Operand(First::Operand, a) if g.operands_read => out.push(a.to_string()),
         GrammarWord::Operand(..) => {}
     });
+}
+
+/// git grep's words `args` (those after `grep`, no redirect among them), read by its grammar: the
+/// operands before its `--` past its pattern (none taken for the pattern when an option supplies
+/// it), and the words past its `--` (`None` with no `--`).
+pub(crate) fn git_grep_operands<'a>(args: &[&'a str]) -> (Vec<&'a str>, Option<Vec<&'a str>>) {
+    let end = args.iter().position(|a| *a == "--");
+    let mut operands = Vec::new();
+    grammar_walk(&GIT_GREP, &args[..end.unwrap_or(args.len())], |w| {
+        if let GrammarWord::Operand(First::Operand, a) = w {
+            operands.push(a);
+        }
+    });
+    (operands, end.map(|k| args[k + 1..].to_vec()))
+}
+
+/// The operands of git log's grammar (`log`, `show`) in `args` (those after the subcommand, no
+/// redirect among them), an option's value none of them: those before its `--` (revisions, or
+/// paths), and the words past it.
+pub(crate) fn git_log_operands<'a>(args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let end = args.iter().position(|a| *a == "--");
+    let mut operands = Vec::new();
+    grammar_walk(&GIT_LOG, &args[..end.unwrap_or(args.len())], |w| {
+        if let GrammarWord::Operand(_, a) = w {
+            operands.push(a);
+        }
+    });
+    (
+        operands,
+        end.map_or_else(Vec::new, |k| args[k + 1..].to_vec()),
+    )
+}
+
+/// The path a git word `w` names in a tree, the index or a pathspec, past what leads it, and
+/// whether git reads that path from its repository's top: `REV:path` (from the top unless led by
+/// `./` or `../`, MEASURED 2026-11-05 with git 2.56.0: `git show HEAD:x` run in a subdirectory
+/// printed the top's `x`), `:N:path` and `:path` (the index, from the top), `:(magic)path` (from
+/// the top under its `top` magic), and `:` with the short magic `/`, `!` or `^` before `path`,
+/// a `:` ending it optional (from the top under `/`). `None` for a word holding no `:`. A long
+/// magic that never closes is read whole past its `:`, where its `(` may name any name.
+pub(crate) fn git_tree_path(w: &str) -> Option<(&str, bool)> {
+    let (lead, path) = w.split_once(':')?;
+    if !lead.is_empty() {
+        return Some((path, !(path.starts_with("./") || path.starts_with("../"))));
+    }
+    if let Some(long) = path.strip_prefix('(') {
+        return Some(match long.split_once(')') {
+            Some((magic, rest)) => (rest, magic.split(',').any(|m| m == "top")),
+            None => (path, false),
+        });
+    }
+    if let Some((stage, rest)) = path.split_once(':')
+        && matches!(stage, "0" | "1" | "2" | "3")
+    {
+        return Some((rest, true));
+    }
+    let n = path
+        .find(|c| !matches!(c, '/' | '!' | '^'))
+        .unwrap_or(path.len());
+    let rest = &path[n..];
+    if n == 0 && !rest.starts_with(':') {
+        return Some((rest, true));
+    }
+    Some((
+        rest.strip_prefix(':').unwrap_or(rest),
+        path[..n].contains('/'),
+    ))
 }
 
 /// Whether the grep-family or rg command at `seg[at]` names a file or tree to read, by its

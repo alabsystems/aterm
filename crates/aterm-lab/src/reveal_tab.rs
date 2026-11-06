@@ -17,7 +17,15 @@
 //! A17b: the window's accessibility tree, read as any process the person granted Accessibility
 //! reads it (the AX API, every string attribute of every element and each text element's
 //! characters), carries the grid (a `hidden value` cell) and every login, and no value. Where
-//! this process holds no Accessibility grant, those checks are a named skip, never a pass.
+//! the tree's reader holds no Accessibility grant, those checks are a named skip, never a pass.
+//!
+//! A17c: the reader is this process ([`TreeReader::Own`]), or with `--ax-helper` the guest
+//! helper's `ax-texts` verb ([`TreeReader::Helper`]), which `lab mac nux`'s `reveal-tab` rows use:
+//! there this run is the guest's, in a clone of the person base, whose helper holds Accessibility
+//! by its identifier. Its `--json` report carries the run's [`Evidence`] ([`evidence_json`],
+//! never a value), so the host judges it with [`judge`]. `--plain-publication` turns on the GUI's
+//! negative control in the instance (each Editor publishes as though nothing were concealed),
+//! which must fail "and no value".
 //!
 //! Nothing reads or writes this Mac's vault, registry or journal: every process runs in the
 //! world's environment, its home the fixture's, and the world goes when the run ends. The report
@@ -32,7 +40,8 @@ use aterm_secrets::commons::roster::Role;
 
 use crate::band::Job;
 use crate::instance::{
-    CONFIG_OFF, Instance, Launch, Reply, World, resolve_aterm, take_flag, terminal_request,
+    CONFIG_OFF, Instance, Launch, Reply, World, resolve_aterm, take_flag, take_value,
+    terminal_request,
 };
 use crate::{Fail, Res};
 
@@ -53,6 +62,16 @@ const OPENED: &str = "read-only Editor tab beside this one";
 
 /// What a read of the private front answers (`PRIVATE_VIEW_REFUSED`), in part.
 const REFUSED_VIEW: &str = "refused private view";
+
+/// The instance's window, in cells of aterm's own font. A grid publishes only the columns on
+/// its screen (`amacs::editor::grid::project_grid`), and the emails grid's password is the
+/// sixteenth of the address table's seventeen columns, each up to 40 cells wide: about 270 cells
+/// in all. The Editor tab draws in its own font whatever the terminal's (`--font-px` shrinks the
+/// window and not the grid's cells), so the window is wide in cells: at 320 columns of the 12 px
+/// default it is about 2,300 points wide, which the tree rows' guest display holds. Measured
+/// 2026-11-05 on m111: at aterm's own size in a 1024-point guest the tree carried the logins and
+/// no password cell; at 360 columns of a 7 px font, fifteen columns and one row.
+const WINDOW: [&str; 2] = ["--columns", "320"];
 
 /// What the run saw, as [`judge`] reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -193,7 +212,7 @@ fn private_doc(inst: &Instance) -> Option<String> {
 
 /// `text` with each line that holds a value withheld and each other cut to 160 bytes: what the
 /// report may say of a run.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(4096));
     for (i, line) in text.lines().enumerate() {
         if i > 0 {
@@ -246,11 +265,40 @@ fn outside(world: &World, aterm: &Path) -> Result<(bool, String), Fail> {
     ))
 }
 
+/// The GUI's negative control `--plain-publication` turns on: each Editor publishes its document as
+/// though nothing were concealed (`aterm-gui`'s `EditorApp::plain_for_negative_control`, which a
+/// debug build's Editor takes from `aterm_types::negative_control::on` of this name).
+const PLAIN_PUBLICATION: &str = "plain-publication";
+
+/// How a run reads the tree, and whether its instance publishes plainly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Ask {
+    pub(crate) reader: TreeReader,
+    /// The instance runs under [`PLAIN_PUBLICATION`]: the tree must carry the values.
+    pub(crate) plain: bool,
+}
+
+/// The instance's own environment: the world's with zsh, and with `plain` the negative control's
+/// variable naming [`PLAIN_PUBLICATION`], in a build that has the variable's reader
+/// (`aterm_types::negative_control::on`, under `any(test, debug_assertions)`; census
+/// `debug-seam` reads this function's own `cfg`, not the debug-only `mod` that mounts the file).
+#[cfg(any(test, debug_assertions))]
+fn instance_env(world: &World, plain: bool) -> Vec<(String, String)> {
+    let mut env = zsh_env(world);
+    if plain {
+        env.push((
+            crate::mesh_churn::NEGATIVE_CONTROL.to_owned(),
+            PLAIN_PUBLICATION.to_owned(),
+        ));
+    }
+    env
+}
+
 /// The run: the world and its registry, the outside print, then the instance.
 ///
 /// # Errors
 /// A step that has to work for the checks to mean anything failed.
-pub fn run(aterm: &Path) -> Result<Evidence, Fail> {
+pub(crate) fn run(aterm: &Path, ask: &Ask) -> Result<Evidence, Fail> {
     let mut ev = Evidence::default();
     let mut world = World::new(CONFIG_OFF).map_err(fail)?;
     let vaults = aterm_tempfile::Builder::new()
@@ -306,8 +354,8 @@ pub fn run(aterm: &Path) -> Result<Evidence, Fail> {
         Launch {
             aterm: aterm.to_path_buf(),
             headless: false,
-            args: Vec::new(),
-            env,
+            args: WINDOW.map(str::to_owned).to_vec(),
+            env: instance_env(&world, ask.plain),
             cwd: world.home.clone(),
             sandbox: None,
             reroute: false,
@@ -317,7 +365,14 @@ pub fn run(aterm: &Path) -> Result<Evidence, Fail> {
     let logins: Vec<String> = (1..=ROWS)
         .map(|i| format!("box{i:02}@proton.example"))
         .collect();
-    let observed = observe(&mut inst, &world, &[NEEDLE.to_owned()], &logins, &mut ev);
+    let observed = observe_with(
+        &mut inst,
+        &world,
+        &ask.reader,
+        &[NEEDLE.to_owned()],
+        &logins,
+        &mut ev,
+    );
     crate::instance::after_stop(observed, inst.stop())?;
     drop(lab);
     Ok(ev)
@@ -325,13 +380,28 @@ pub fn run(aterm: &Path) -> Result<Evidence, Fail> {
 
 /// Everything read of the running instance, `needles` being the values its command reveals and
 /// `shown` the cells not secret that the grid's first screen shows, which its accessibility tree
-/// must still carry.
+/// must still carry; the tree read by this process ([`TreeReader::Own`]).
 ///
 /// # Errors
-/// The Editor tab did not open, or could not be closed.
+/// As [`observe_with`].
 pub(crate) fn observe(
     inst: &mut Instance,
     world: &World,
+    needles: &[String],
+    shown: &[String],
+    ev: &mut Evidence,
+) -> Result<(), Fail> {
+    observe_with(inst, world, &TreeReader::Own, needles, shown, ev)
+}
+
+/// [`observe`], the tree read by `reader`.
+///
+/// # Errors
+/// The Editor tab did not open, could not be closed, or the tree's reader failed.
+pub(crate) fn observe_with(
+    inst: &mut Instance,
+    world: &World,
+    reader: &TreeReader,
     needles: &[String],
     shown: &[String],
     ev: &mut Evidence,
@@ -341,7 +411,7 @@ pub(crate) fn observe(
     ev.editor_opened = true;
     let folders = scratch_folders(world);
     ev.file_holds_values = folders.iter().any(|folder| folder_holds(folder, needles));
-    ev.ax = ax_tree(inst, needles, shown)?;
+    ev.ax = ax_tree(inst, reader, needles, shown)?;
 
     for verb in [
         &["text"][..],
@@ -399,24 +469,90 @@ pub(crate) fn observe(
 /// What a concealed grid cell reads as (`amacs::editor::HIDDEN_VALUE`).
 const HIDDEN_VALUE: &str = "hidden value";
 
+/// Who reads the window's accessibility tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TreeReader {
+    /// This process, through the AX API ([`ax`]): macOS judges the grant of the app it runs under.
+    Own,
+    /// The guest helper at this path, `aterm-lab-guest ax-texts PID` (`guest/main.rs`), which reads
+    /// the tree with the same [`ax`] code. It is started disclaimed, so it is its own responsible
+    /// process and tccd judges its own grant: a `lab mac nux` person base grants Accessibility to
+    /// that path and identifier, and to nothing this run is.
+    Helper(PathBuf),
+}
+
+/// What the guest helper's `ax-texts` printed (`{"trusted": bool, "texts": [string…]}`, its
+/// `tree_report`): the strings it read, `None` inside where it holds no Accessibility grant, and
+/// `None` outside for anything else.
+fn helper_reading(stdout: &str) -> Option<Option<Vec<String>>> {
+    let reading = aterm_json::from_str::<Value>(stdout.trim()).ok()?;
+    if !reading.get("trusted")?.as_bool()? {
+        return Some(None);
+    }
+    reading
+        .get("texts")?
+        .as_array()?
+        .iter()
+        .map(|text| text.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .map(Some)
+}
+
+/// One reading of `pid`'s windows by `reader`: every string they carry, `None` where the reader
+/// holds no Accessibility grant.
+///
+/// # Errors
+/// The helper did not start, did not end within [`HANG`], ended in failure, or printed no reading.
+fn read_tree(reader: &TreeReader, pid: i32) -> Result<Option<Vec<String>>, Fail> {
+    let helper = match reader {
+        TreeReader::Own => return Ok(ax::trusted().then(|| ax::texts(pid))),
+        TreeReader::Helper(helper) => helper,
+    };
+    let out = aterm_uds::deadline::output_within(
+        aterm_uds::spawnfd::command(helper)
+            .arg("ax-texts")
+            .arg(pid.to_string())
+            .disclaim_responsibility(true),
+        HANG,
+    )
+    .map_err(|e| fail(format!("the tree's reader {}: {e}", helper.display())))?;
+    if !out.status.success() {
+        return Err(fail(format!(
+            "the tree's reader {} ended {}: {}",
+            helper.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or_default()
+        )));
+    }
+    helper_reading(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+        fail(format!(
+            "the tree's reader {} printed no reading",
+            helper.display()
+        ))
+    })
+}
+
 /// The Editor tab's accessibility tree as a process with Accessibility reads it ([`AxEvidence`]),
-/// read until the grid's nodes are there (an adapter publishes once a reader attaches) or the
-/// hang detector ends the wait; `None` where this process holds no Accessibility grant.
+/// read by `reader` until the grid's nodes are there (an adapter publishes once a reader attaches)
+/// or the hang detector ends the wait; `None` where the reader holds no Accessibility grant.
 /// `needles` are the revealed values it must not carry, `shown` the cells it must.
 fn ax_tree(
     inst: &Instance,
+    reader: &TreeReader,
     needles: &[String],
     shown: &[String],
 ) -> Result<Option<AxEvidence>, Fail> {
-    if !ax::trusted() {
-        return Ok(None);
-    }
     let pid = inst
         .aterm_pid()
         .ok_or_else(|| fail("the instance's aterm has no pid"))?;
     let end = Instant::now() + HANG;
     loop {
-        let texts = ax::texts(pid);
+        let Some(texts) = read_tree(reader, pid)? else {
+            return Ok(None);
+        };
         let holds = |needle: &str| texts.iter().any(|text| text.contains(needle));
         let seen = AxEvidence {
             grid_read: holds(HIDDEN_VALUE),
@@ -430,232 +566,8 @@ fn ax_tree(
     }
 }
 
-/// Every string a running app's windows carry, read through the Accessibility API as any
-/// process the person granted Accessibility reads them.
-#[expect(
-    unsafe_code,
-    reason = "the Accessibility API: reading the tree another process can read"
-)]
-mod ax {
-    use std::ffi::c_void;
-
-    type CfRef = *const c_void;
-
-    #[repr(C)]
-    struct CfRange {
-        location: isize,
-        length: isize,
-    }
-
-    /// How deep a window's tree is read.
-    const DEPTH: usize = 32;
-    /// The most elements read in a pass.
-    const MOST: usize = 50_000;
-    /// The most characters read of one text element.
-    const CHARACTERS: i64 = 1 << 16;
-    /// `kAXValueCFRangeType`.
-    const RANGE: u32 = 4;
-    /// `kCFNumberSInt64Type`.
-    const SINT64: isize = 4;
-    const UTF8: u32 = 0x0800_0100;
-    /// Each element's string attributes read.
-    const STRINGS: [&str; 7] = [
-        "AXTitle",
-        "AXDescription",
-        "AXValue",
-        "AXHelp",
-        "AXSelectedText",
-        "AXPlaceholderValue",
-        "AXRoleDescription",
-    ];
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFRelease(cf: CfRef);
-        fn CFGetTypeID(cf: CfRef) -> usize;
-        fn CFStringGetTypeID() -> usize;
-        fn CFArrayGetTypeID() -> usize;
-        fn CFNumberGetTypeID() -> usize;
-        fn CFArrayGetCount(array: CfRef) -> isize;
-        fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
-        fn CFStringGetLength(string: CfRef) -> isize;
-        fn CFStringGetCharacters(string: CfRef, range: CfRange, buffer: *mut u16);
-        fn CFNumberGetValue(number: CfRef, kind: isize, out: *mut c_void) -> u8;
-        fn CFStringCreateWithBytes(
-            alloc: CfRef,
-            bytes: *const u8,
-            len: isize,
-            encoding: u32,
-            external: u8,
-        ) -> CfRef;
-    }
-
-    #[link(name = "ApplicationServices", kind = "framework")]
-    unsafe extern "C" {
-        fn AXIsProcessTrusted() -> bool;
-        fn AXUIElementCreateApplication(pid: i32) -> CfRef;
-        fn AXUIElementCopyAttributeValue(el: CfRef, attr: CfRef, out: *mut CfRef) -> i32;
-        fn AXUIElementCopyParameterizedAttributeValue(
-            el: CfRef,
-            attr: CfRef,
-            param: CfRef,
-            out: *mut CfRef,
-        ) -> i32;
-        fn AXUIElementSetMessagingTimeout(el: CfRef, secs: f32) -> i32;
-        fn AXValueCreate(kind: u32, value: *const c_void) -> CfRef;
-    }
-
-    /// A CF object this code owns one reference to (null: none).
-    struct Owned(CfRef);
-
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: non-null, and this value owns one reference to it.
-                unsafe { CFRelease(self.0) }
-            }
-        }
-    }
-
-    /// Whether this process (its responsible app) holds Accessibility, with no prompt.
-    pub(super) fn trusted() -> bool {
-        // SAFETY: a plain query.
-        unsafe { AXIsProcessTrusted() }
-    }
-
-    fn cf_string(text: &str) -> Owned {
-        // SAFETY: the bytes and length of a live UTF-8 string; the result is owned.
-        Owned(unsafe {
-            CFStringCreateWithBytes(
-                std::ptr::null(),
-                text.as_ptr(),
-                isize::try_from(text.len()).unwrap_or(0),
-                UTF8,
-                0,
-            )
-        })
-    }
-
-    fn text(cf: CfRef) -> Option<String> {
-        if cf.is_null() {
-            return None;
-        }
-        // SAFETY: `CFGetTypeID` reads any live CF object; a non-string is refused before it is
-        // read as one, and the buffer holds the string's whole length.
-        unsafe {
-            if CFGetTypeID(cf) != CFStringGetTypeID() {
-                return None;
-            }
-            let length = CFStringGetLength(cf);
-            let mut units = vec![0u16; usize::try_from(length).ok()?];
-            CFStringGetCharacters(
-                cf,
-                CfRange {
-                    location: 0,
-                    length,
-                },
-                units.as_mut_ptr(),
-            );
-            Some(String::from_utf16_lossy(&units))
-        }
-    }
-
-    fn number(cf: CfRef) -> Option<i64> {
-        if cf.is_null() {
-            return None;
-        }
-        let mut out = 0i64;
-        // SAFETY: a live CF object, read as a number only when it is one, into an i64.
-        unsafe {
-            (CFGetTypeID(cf) == CFNumberGetTypeID()
-                && CFNumberGetValue(cf, SINT64, (&raw mut out).cast()) != 0)
-                .then_some(out)
-        }
-    }
-
-    fn items(array: CfRef) -> Vec<CfRef> {
-        if array.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: a live CF object, read as an array only when it is one; its items are
-        // borrowed while the array lives.
-        unsafe {
-            if CFGetTypeID(array) != CFArrayGetTypeID() {
-                return Vec::new();
-            }
-            (0..CFArrayGetCount(array))
-                .map(|index| CFArrayGetValueAtIndex(array, index))
-                .collect()
-        }
-    }
-
-    fn attr(el: CfRef, name: &str) -> Owned {
-        let key = cf_string(name);
-        let mut out: CfRef = std::ptr::null();
-        // SAFETY: an AX element, an attribute name and an out pointer; the value is owned.
-        let err = unsafe { AXUIElementCopyAttributeValue(el, key.0, &raw mut out) };
-        Owned(if err == 0 { out } else { std::ptr::null() })
-    }
-
-    /// A text element's first [`CHARACTERS`] characters (`AXStringForRange`), as a reader asks
-    /// for the text it does not hold as a value.
-    fn characters(el: CfRef) -> Option<String> {
-        let count = number(attr(el, "AXNumberOfCharacters").0)?.min(CHARACTERS);
-        if count <= 0 {
-            return None;
-        }
-        let range = CfRange {
-            location: 0,
-            length: isize::try_from(count).ok()?,
-        };
-        // SAFETY: a CFRange of the kind named, copied into an owned AXValue.
-        let param = Owned(unsafe { AXValueCreate(RANGE, (&raw const range).cast()) });
-        if param.0.is_null() {
-            return None;
-        }
-        let key = cf_string("AXStringForRange");
-        let mut out: CfRef = std::ptr::null();
-        // SAFETY: an AX element, an attribute name, its parameter and an out pointer; the value
-        // is owned.
-        let err =
-            unsafe { AXUIElementCopyParameterizedAttributeValue(el, key.0, param.0, &raw mut out) };
-        let out = Owned(if err == 0 { out } else { std::ptr::null() });
-        text(out.0)
-    }
-
-    /// Every string `pid`'s windows' elements carry, depth first.
-    pub(super) fn texts(pid: i32) -> Vec<String> {
-        // SAFETY: an app element for a pid, owned.
-        let app = Owned(unsafe { AXUIElementCreateApplication(pid) });
-        if app.0.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: the element this code created; a busy app answers within the timeout or not.
-        unsafe { AXUIElementSetMessagingTimeout(app.0, 2.0) };
-        let windows = attr(app.0, "AXWindows");
-        let mut out = Vec::new();
-        let mut read = 0usize;
-        for window in items(windows.0) {
-            walk(window, 0, &mut read, &mut out);
-        }
-        out
-    }
-
-    fn walk(el: CfRef, depth: usize, read: &mut usize, out: &mut Vec<String>) {
-        if depth > DEPTH || *read >= MOST {
-            return;
-        }
-        *read += 1;
-        for name in STRINGS {
-            out.extend(text(attr(el, name).0).filter(|text| !text.is_empty()));
-        }
-        out.extend(characters(el));
-        let children = attr(el, "AXChildren");
-        for child in items(children.0) {
-            walk(child, depth + 1, read, out);
-        }
-    }
-}
+#[path = "ax_texts.rs"]
+mod ax;
 
 /// Whether a verb's first line is the private-view refusal: `ERR refused private view: …`, or
 /// the verb's own `ERR <verb…>: refused private view: …` (`video`, `pointer`).
@@ -747,49 +659,146 @@ pub fn judge_tab(ev: &Evidence) -> Vec<(String, bool)> {
         ),
     ]);
     if let Some(ax) = &ev.ax {
+        let [grid, logins, clean] = TREE_CHECKS;
         checks.extend([
-            (
-                "the window's accessibility tree carries the grid".to_owned(),
-                ax.grid_read,
-            ),
-            ("and every login".to_owned(), ax.logins_read),
-            ("and no value".to_owned(), ax.clean),
+            (grid.to_owned(), ax.grid_read),
+            (logins.to_owned(), ax.logins_read),
+            (clean.to_owned(), ax.clean),
         ]);
     }
     checks
 }
 
+/// The names of the three checks of the window's accessibility tree, as [`judge_tab`] gives them:
+/// it carries the grid ([`AxEvidence::grid_read`]), every login ([`AxEvidence::logins_read`]),
+/// and no value ([`AxEvidence::clean`]).
+pub(crate) const TREE_CHECKS: [&str; 3] = [
+    "the window's accessibility tree carries the grid",
+    "and every login",
+    "and no value",
+];
+
 /// The checks this run could not make, and why.
 pub(crate) fn skipped(ev: &Evidence) -> Vec<&'static str> {
     if ev.ax.is_none() {
         vec![
-            "the window's accessibility tree: this process holds no Accessibility grant \
-             (System Settings > Privacy & Security > Accessibility, for the app it runs under)",
+            "the window's accessibility tree: its reader holds no Accessibility grant \
+             (System Settings > Privacy & Security > Accessibility, for the app this lab runs \
+             under, or in a `lab mac nux` guest the guest helper's)",
         ]
     } else {
         Vec::new()
     }
 }
 
-/// `lab reveal-tab [--json] [<aterm>]`.
+/// `ev` as a report carries it: every field, each text [`scrub`]bed, so no value is in it.
+#[must_use]
+pub(crate) fn evidence_json(ev: &Evidence) -> Value {
+    let refusals: Vec<Value> = ev
+        .refusals
+        .iter()
+        .map(|(verb, first)| json!({"verb": verb.as_str(), "first": scrub(first)}))
+        .collect();
+    let ax = ev.ax.as_ref().map_or(
+        Value::Null,
+        |ax| json!({"grid_read": ax.grid_read, "logins_read": ax.logins_read, "clean": ax.clean}),
+    );
+    json!({
+        "imported": ev.imported,
+        "outside_printed": ev.outside_printed,
+        "outside_said": scrub(&ev.outside_said),
+        "editor_opened": ev.editor_opened,
+        "file_holds_values": ev.file_holds_values,
+        "refusals": refusals,
+        "doc_read": scrub(&ev.doc_read),
+        "tab_names_editor": ev.tab_names_editor,
+        "tab_text_clean": ev.tab_text_clean,
+        "blocks_hold_command": ev.blocks_hold_command,
+        "blocks_clean": ev.blocks_clean,
+        "log_clean": ev.log_clean,
+        "closed_ends_command": ev.closed_ends_command,
+        "folder_removed": ev.folder_removed,
+        "after_close_clean": ev.after_close_clean,
+        "ax": ax,
+    })
+}
+
+/// The [`Evidence`] a report's [`evidence_json`] carries: `None` when any field is missing or of
+/// another kind, so a report from another build is never read as a run with nothing found.
+#[must_use]
+pub(crate) fn evidence_from(v: &Value) -> Option<Evidence> {
+    let flag = |key: &str| v.get(key).and_then(Value::as_bool);
+    let text = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    let refusals = v
+        .get("refusals")?
+        .as_array()?
+        .iter()
+        .map(|r| {
+            Some((
+                r.get("verb")?.as_str()?.to_owned(),
+                r.get("first")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ax = match v.get("ax")? {
+        Value::Null => None,
+        ax => {
+            let flag = |key: &str| ax.get(key).and_then(Value::as_bool);
+            Some(AxEvidence {
+                grid_read: flag("grid_read")?,
+                logins_read: flag("logins_read")?,
+                clean: flag("clean")?,
+            })
+        }
+    };
+    Some(Evidence {
+        imported: flag("imported")?,
+        outside_printed: flag("outside_printed")?,
+        outside_said: text("outside_said")?,
+        editor_opened: flag("editor_opened")?,
+        file_holds_values: flag("file_holds_values")?,
+        refusals,
+        doc_read: text("doc_read")?,
+        tab_names_editor: flag("tab_names_editor")?,
+        tab_text_clean: flag("tab_text_clean")?,
+        blocks_hold_command: flag("blocks_hold_command")?,
+        blocks_clean: flag("blocks_clean")?,
+        log_clean: flag("log_clean")?,
+        closed_ends_command: flag("closed_ends_command")?,
+        folder_removed: flag("folder_removed")?,
+        after_close_clean: flag("after_close_clean")?,
+        ax,
+    })
+}
+
+/// `lab reveal-tab [--json] [--ax-helper HELPER] [--plain-publication] [<aterm>]`.
 ///
 /// # Errors
 /// Usage, or a step the checks rest on failed.
 pub fn cmd(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let as_json = take_flag(&mut args, "--json");
+    let plain = take_flag(&mut args, "--plain-publication");
+    let reader = match take_value(&mut args, "--ax-helper")? {
+        Some(helper) => TreeReader::Helper(PathBuf::from(crate::paths::from_caller(&helper))),
+        None => TreeReader::Own,
+    };
     if args.len() > 1 {
-        return Err(Fail::usage("reveal-tab takes --json and an aterm at most"));
+        return Err(Fail::usage(
+            "reveal-tab takes --json, --ax-helper HELPER, --plain-publication and an aterm at most",
+        ));
     }
     let aterm = resolve_aterm(args.pop()).map_err(|e| Fail::exit(3, e))?;
-    let ev = run(&aterm)?;
+    let ev = run(&aterm, &Ask { reader, plain })?;
     let checks = judge(&ev);
     let pass = checks.iter().all(|(_, held)| *held);
     let report: Value = json!({
         "lane": "reveal-tab",
         "pass": pass,
+        "plain_publication": plain,
         "checks": checks.iter().map(|(name, held)| json!({"check": name, "pass": held})).collect::<Vec<_>>(),
         "skipped": skipped(&ev).into_iter().map(|why| json!(why)).collect::<Vec<_>>(),
+        "evidence": evidence_json(&ev),
     });
     let text = if as_json {
         format!("{}\n", aterm_json::to_string(&report).map_err(fail)?)
@@ -896,6 +905,94 @@ mod tests {
                 .all(|(name, _)| !name.contains("accessibility"))
         );
         assert_eq!(skipped(&unread).len(), 1);
+    }
+
+    /// A report's evidence reads back as the run it was, the tree unread too, and a report missing
+    /// a field (another build's) reads as none rather than as a run that found nothing. A text
+    /// holding a value is withheld on the way, and a refusal withheld that way no longer reads as
+    /// one, so the host fails it as the guest would have.
+    #[test]
+    fn a_reports_evidence_reads_back_and_carries_no_value() {
+        let mut unread = passing();
+        unread.ax = None;
+        for ev in [passing(), unread] {
+            let wire = evidence_json(&ev);
+            assert_eq!(evidence_from(&wire), Some(ev.clone()));
+            let text = aterm_json::to_string(&wire).unwrap();
+            let parsed = aterm_json::from_str::<Value>(&text).unwrap();
+            assert_eq!(evidence_from(&parsed), Some(ev));
+        }
+        let mut wire = evidence_json(&passing());
+        if let Value::Object(map) = &mut wire {
+            map.remove("log_clean");
+        }
+        assert_eq!(evidence_from(&wire), None);
+
+        let mut leaked = passing();
+        leaked.refusals[0].1 = format!("{NEEDLE}01");
+        leaked.outside_said = format!("box01@proton.example {NEEDLE}01");
+        let wire = evidence_json(&leaked);
+        assert!(!aterm_json::to_string(&wire).unwrap().contains(NEEDLE));
+        let back = evidence_from(&wire).unwrap();
+        assert!(!refused_view(&back.refusals[0].1));
+        assert_eq!(judge(&back).iter().filter(|(_, held)| !*held).count(), 1);
+    }
+
+    /// The guest helper's reading is its strings, or no grant; anything else is no reading.
+    #[test]
+    fn the_helpers_reading_is_its_strings_or_no_grant() {
+        assert_eq!(
+            helper_reading(
+                "{\"trusted\":true,\"texts\":[\"hidden value\",\"box01@proton.example\"]}\n"
+            ),
+            Some(Some(vec![
+                "hidden value".to_owned(),
+                "box01@proton.example".to_owned()
+            ]))
+        );
+        assert_eq!(
+            helper_reading("{\"trusted\":false,\"texts\":[]}"),
+            Some(None)
+        );
+        for other in [
+            "",
+            "trusted=yes",
+            "{\"texts\":[]}",
+            "{\"trusted\":true}",
+            "{\"trusted\":true,\"texts\":[1]}",
+        ] {
+            assert_eq!(helper_reading(other), None, "{other}");
+        }
+    }
+
+    /// The negative control reaches the instance by name, and only when asked.
+    #[test]
+    fn the_plain_publication_is_the_instances_alone_and_only_when_asked() {
+        let world = World::new(CONFIG_OFF).unwrap();
+        let named = |env: &[(String, String)]| {
+            env.iter()
+                .filter(|(key, _)| key == crate::mesh_churn::NEGATIVE_CONTROL)
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named(&instance_env(&world, false)), Vec::<String>::new());
+        assert_eq!(named(&instance_env(&world, true)), [PLAIN_PUBLICATION]);
+        assert_eq!(named(&zsh_env(&world)), Vec::<String>::new());
+        assert!(
+            instance_env(&world, true)
+                .iter()
+                .any(|(key, value)| key == "SHELL" && value == "/bin/zsh")
+        );
+    }
+
+    /// The tree's three checks are judged under the names a host reads them by.
+    #[test]
+    fn the_trees_checks_are_named_as_judged() {
+        let names: Vec<String> = judge_tab(&passing())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names[names.len() - 3..], TREE_CHECKS.map(str::to_owned));
     }
 
     #[test]

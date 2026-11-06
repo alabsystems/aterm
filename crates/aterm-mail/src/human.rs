@@ -119,10 +119,7 @@ fn request(method: Method, path: &str) -> Result<Value, String> {
     let response = client
         .request(method, &format!("https://mail.proton.me/api{path}"))
         .header("x-pm-appversion", app_version)
-        .header(
-            "User-Agent",
-            concat!("aterm-mail/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", crate::user_agent())
         .header("Accept", "application/json")
         .limit(65536)
         .send(b"")

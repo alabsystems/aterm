@@ -664,7 +664,7 @@ fn a_header_round_trips() {
         }
     }
     let h = header(&["repo", "view", "fixture-dev/app"]);
-    assert_eq!(h.agh_version, agh::VERSION);
+    assert_eq!(h.agh_version, agh::version());
     assert_eq!(h.endpoints, TapeEndpoints::GithubCom);
     assert_eq!(
         h.render().lines().nth(2),
@@ -1719,7 +1719,7 @@ fn a_rerecording_keeps_the_old_exchanges_and_takes_this_runs_output() {
 
     let (new_header, new_records) =
         tape::parse(&std::fs::read_to_string(&new).expect("the new tape")).expect("a tape");
-    assert_eq!(new_header.agh_version, agh::VERSION);
+    assert_eq!(new_header.agh_version, agh::version());
     assert_eq!(new_header.argv, h.argv);
     assert_eq!(
         new_records,

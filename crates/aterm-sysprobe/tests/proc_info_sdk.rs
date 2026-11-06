@@ -3,12 +3,16 @@
 
 //! The job probe's Darwin layouts (`src/jobs/darwin.rs`), the process
 //! records' (`src/kproc.rs`), the code-signing flags and categories
-//! (`src/identity.rs`) and the holder scan's (`aterm_uds::holders`) held to
+//! (`src/identity.rs`), the usage record and the processor set's
+//! (`src/rusage.rs`, `src/room.rs`) and the holder scan's
+//! (`aterm_uds::holders`) held to
 //! the SDK headers on both arches: every row of `jobs::darwin::SDK_ROWS`,
-//! `kproc::SDK_ROWS`, `identity::SDK_ROWS` and `aterm_uds::holders::SDK_ROWS`
-//! (a flavor, a flag, a struct's size, a field's offset) becomes one
-//! `_Static_assert` that clang compiles against `sys/proc_info.h`,
-//! `sys/sysctl.h`, `sys/event.h`, `mach/machine.h`, `vis.h`, `xlocale.h` and
+//! `kproc::SDK_ROWS`, `identity::SDK_ROWS`, `rusage::SDK_ROWS` (the process
+//! readers' `rusage_info_v6`), `room::SDK_ROWS` (the processor set's load
+//! info) and `aterm_uds::holders::SDK_ROWS` (a flavor, a flag, a struct's
+//! size, a field's offset) becomes one `_Static_assert` that clang compiles
+//! against `sys/proc_info.h`, `sys/sysctl.h`, `sys/resource.h`,
+//! `mach/mach.h`, `sys/event.h`, `mach/machine.h`, `vis.h`, `xlocale.h` and
 //! `Kernel/kern/cs_blobs.h` for `arm64` and `x86_64`, through aterm-objc's
 //! shared probe
 //! (`crates/aterm-objc/tests/support/sdk_consts.rs`, mounted here). The
@@ -28,7 +32,7 @@
 )]
 mod sdk_consts;
 
-use aterm_sysprobe::{identity, jobs, kproc};
+use aterm_sysprobe::{identity, jobs, kproc, room, rusage};
 
 /// Every table's rows.
 fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
@@ -36,6 +40,8 @@ fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
         .iter()
         .chain(kproc::SDK_ROWS)
         .chain(identity::SDK_ROWS)
+        .chain(rusage::SDK_ROWS)
+        .chain(room::SDK_ROWS)
         .chain(aterm_uds::holders::SDK_ROWS)
 }
 
@@ -47,6 +53,8 @@ const HEADERS: &str = "#include <stddef.h>\n\
                        #include <sys/stat.h>\n\
                        #include <sys/event.h>\n\
                        #include <sys/sysctl.h>\n\
+                       #include <sys/resource.h>\n\
+                       #include <mach/mach.h>\n\
                        #include <sys/proc.h>\n\
                        #include <sys/proc_info.h>\n\
                        #include <mach/machine.h>\n\
@@ -87,11 +95,15 @@ fn every_layout_row_matches_the_sdk_on_both_arches() {
         jobs::darwin::SDK_ROWS.len() >= 66
             && kproc::SDK_ROWS.len() >= 15
             && identity::SDK_ROWS.len() >= 14
+            && rusage::SDK_ROWS.len() >= 25
+            && room::SDK_ROWS.len() >= 4
             && aterm_uds::holders::SDK_ROWS.len() >= 23,
-        "a table lost rows: {}, {}, {} and {}",
+        "a table lost rows: {}, {}, {}, {}, {} and {}",
         jobs::darwin::SDK_ROWS.len(),
         kproc::SDK_ROWS.len(),
         identity::SDK_ROWS.len(),
+        rusage::SDK_ROWS.len(),
+        room::SDK_ROWS.len(),
         aterm_uds::holders::SDK_ROWS.len()
     );
     let body = probe(None);

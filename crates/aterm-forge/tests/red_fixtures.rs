@@ -65,11 +65,10 @@ struct Fixture {
 
 impl Fixture {
     fn baseline(name: &str) -> Self {
-        let tmp = env!("CARGO_TARGET_TMPDIR");
-        std::fs::create_dir_all(tmp).expect("the target tmpdir");
+        let tmp = aterm_tempfile::target_tmpdir();
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("forge-red-{name}-"))
-            .tempdir_in(tmp)
+            .tempdir_in(&tmp)
             .expect("fixture root");
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("target")).expect("fixture root");
@@ -265,7 +264,7 @@ fn aterm_manifest(extra: &str) -> String {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .expect("crates/aterm-forge sits two levels under the workspace root")

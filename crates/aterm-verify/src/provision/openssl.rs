@@ -26,14 +26,14 @@ fn configure(src: &Path, prefix: &Path) -> Spawn {
     at.push(prefix);
     step(
         aterm_uds::os_path!("perl"),
-        [
-            OsString::from("./Configure"),
-            "no-shared".into(),
-            "no-dso".into(),
-            "no-module".into(),
-            at,
-        ]
-        .into(),
+        std::iter::once(OsString::from("./Configure"))
+            .chain(
+                aterm_uds::host::upstream::OPENSSL_CONFIGURE_OPTIONS
+                    .iter()
+                    .map(OsString::from),
+            )
+            .chain(std::iter::once(at))
+            .collect(),
         src,
     )
 }

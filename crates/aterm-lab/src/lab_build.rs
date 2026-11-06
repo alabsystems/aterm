@@ -7,13 +7,10 @@
 
 use crate::Fail;
 
-/// The build the lab's evaluator judges in and its bundles name.
-pub const LAB_BUILD: &str = concat!(
-    "aterm-lab ",
-    env!("CARGO_PKG_VERSION"),
-    "+g",
-    env!("ATERM_LAB_GIT_COMMIT")
-);
+/// The build the lab's evaluator judges in and its bundles name: the lab's commit. A dev runner
+/// carries no product version (no library compiles one in, `aterm_stamp`), and builds pair by
+/// their commit.
+pub const LAB_BUILD: &str = concat!("aterm-lab+g", env!("ATERM_LAB_GIT_COMMIT"));
 
 /// Refuses a build that names no commit.
 /// # Errors
@@ -38,14 +35,11 @@ mod tests {
 
     #[test]
     fn the_lab_build_names_its_commit_and_a_build_that_names_none_is_refused() {
-        assert!(
-            LAB_BUILD.starts_with(concat!("aterm-lab ", env!("CARGO_PKG_VERSION"), "+g")),
-            "{LAB_BUILD}"
-        );
+        assert!(LAB_BUILD.starts_with("aterm-lab+g"), "{LAB_BUILD}");
         if let Err(f) = check_build(LAB_BUILD) {
             panic!("{LAB_BUILD}: {:?}", f.msg);
         }
-        let v = env!("CARGO_PKG_VERSION");
+        let v = "0.157.0";
         for commit in [
             "0123456789ab",
             "0123456789ab-dirty",

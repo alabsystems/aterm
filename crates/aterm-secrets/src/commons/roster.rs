@@ -349,6 +349,15 @@ impl Access {
     pub const fn seals(&self) -> bool {
         self.seals
     }
+    /// Whether a table writer that waits for keys (`waits_for_key`) keeps its operation pending
+    /// rather than sealing it now (M4, docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B11): the
+    /// basis still wraps a Mac the log removed, so the removal's rotation is due. A table writer
+    /// never mints an epoch itself. PF6's `writer_waits` kernel decides it, the vault's wait's
+    /// own, and the 8,500 stop never judges the rotation it waits on (`stop_judges`).
+    #[must_use]
+    pub fn waits_for_rotation(&self, waits_for_key: bool) -> bool {
+        aterm_mesh_core::capacity::writer_waits(waits_for_key, false, !self.seals)
+    }
     pub fn members(&self) -> &[Member] {
         &self.members
     }
@@ -908,6 +917,7 @@ fn commons_log_state_digest(
         paths.dir.join("vault"),
         paths.dir.join("identity"),
         paths.dir.join("commons").join("device.age"),
+        crate::commons::fold::mark(paths),
         node_dir.join("node.key"),
         node_dir.join("node.id"),
     ] {
@@ -999,7 +1009,14 @@ pub(super) fn current_from_loaded_log(
         }
         return Ok(None);
     }
-    let Some(view) = log.commons_epoch_view(identity)? else {
+    // The fold's adoption gate (`commons::fold`) decides which audience this Mac writes under;
+    // readers open both whatever it says (`historical_from_history`).
+    let view = if crate::commons::fold::on(paths) {
+        log.fold_epoch_view(identity)?
+    } else {
+        log.commons_epoch_view(identity)?
+    };
+    let Some(view) = view else {
         if let Ok(mut cache) = ACCESS_CACHE.lock() {
             if cache.len() >= 16 {
                 cache.pop_front();

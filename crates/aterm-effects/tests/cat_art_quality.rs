@@ -57,7 +57,7 @@ struct Asset {
 }
 
 fn asset_path(id: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("art/glyphs")
         .join(format!("{id}.toml"))
 }

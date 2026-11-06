@@ -894,6 +894,73 @@ fn the_looks_delivered_sigterm_starts_the_time_its_sigkill_waits_for() {
     }
 }
 
+/// THE LOOK CONCLUDES A PROGRAM WORKER NO LAUNCHER WATCHES ON THE BLOCK ITS LAUNCHER TYPED INTO
+/// ([`crate::App::conclude_unwatched_program`]): its exit status and output tail, as its launcher
+/// would. NEGATIVE CONTROL: one whose launcher stalled before typing, in whose tab a person then ran
+/// a command, is left as its stall said.
+#[test]
+fn the_look_concludes_a_program_worker_on_its_typed_block_alone() {
+    let mut app = crate::App::headless_for_test();
+    let typed = worker_tab(&mut app);
+    let stalled = worker_tab(&mut app);
+    for session in [typed, stalled] {
+        let h = live(&app, session);
+        crate::task_record::mark_session_task(
+            &h.ctx,
+            h.local_id,
+            &TaskMark::new(TaskState::Working),
+        )
+        .expect("unfenced");
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_task_worker(aterm_phase::Program::Generic, None);
+        let mut term = h.term.lock().unwrap_or_else(PoisonError::into_inner);
+        term.process(b"\x1b]133;A\x07% \x1b]133;B\x07");
+        let block = term.all_blocks().last().expect("its prompt").id;
+        term.process(b"make\r\n\x1b]133;C\x07built\r\n\x1b]133;D;0\x07\x1b]133;A\x07% ");
+        drop(term);
+        if session == typed {
+            assert!(crate::task_record::note_program_block(
+                &h.ctx,
+                block,
+                Duration::ZERO
+            ));
+        } else {
+            let mut stall = TaskMark::new(TaskState::Stalled);
+            stall.why = Some("startup");
+            crate::task_record::mark_session_task(&h.ctx, h.local_id, &stall).expect("unfenced");
+        }
+    }
+    let _ = app.reap_workers(Instant::now());
+    let task = |session| {
+        live(&app, session)
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .task()
+            .cloned()
+            .expect("its record")
+    };
+    let done = task(typed);
+    assert_eq!(
+        (done.state, done.why, done.exit),
+        (TaskState::Done, Some("exit-status"), Some(0))
+    );
+    assert_eq!(
+        crate::task_record::cmd_result(&live(&app, typed).ctx, typed, ""),
+        "OK 1 source=output bytes=5\nbuilt\n"
+    );
+    let left = task(stalled);
+    assert_eq!(
+        (left.state, left.why),
+        (TaskState::Stalled, Some("startup")),
+        "CONTROL: a command its launcher never typed concludes nothing"
+    );
+}
+
 /// A quota wall protects even a claim worker past its execution budget. Negative control:
 /// a worker running after that budget is still ended, and its pane stays when the program exits.
 #[test]

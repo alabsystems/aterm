@@ -719,18 +719,18 @@ impl WindowRequests {
     }
 }
 
-impl TryFrom<&str> for Theme {
-    type Error = ();
+impl std::str::FromStr for Theme {
+    type Err = ();
 
     /// Parse `"dark"` or `"light"` case-insensitively into a [`Theme`].
     ///
     /// ```
     /// use aterm_window::window::Theme;
     ///
-    /// assert_eq!("dark".try_into(), Ok(Theme::Dark));
-    /// assert_eq!("lIghT".try_into(), Ok(Theme::Light));
+    /// assert_eq!("dark".parse(), Ok(Theme::Dark));
+    /// assert_eq!("lIghT".parse(), Ok(Theme::Light));
     /// ```
-    fn try_from(theme: &str) -> Result<Self, Self::Error> {
+    fn from_str(theme: &str) -> Result<Self, Self::Err> {
         if theme.eq_ignore_ascii_case("dark") {
             Ok(Self::Dark)
         } else if theme.eq_ignore_ascii_case("light") {

@@ -70,6 +70,7 @@ use astream_broker::{
     SubjectRewrite,
 };
 use aterm_link::state::StateDir;
+use aterm_mesh_core::relay_live;
 use aterm_net::fleet::FleetOp;
 use aterm_net::fleet::link::{Bell, Link, LinkStream};
 use aterm_types::MutexExt;
@@ -137,6 +138,29 @@ thread_local! {
 fn reused_incarnation() -> bool {
     REUSED_INCARNATION.with(std::cell::Cell::get)
         || aterm_types::negative_control::on("reused-incarnation")
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the lineage rule (`kept-on-a-moved-log`): while set on the thread
+    /// that opens a mesh, its relays read a neighbour's log that moved to a generation its lineage
+    /// carries as the same log, so they resume without the lineage exchange, and a record the
+    /// neighbour answered and then lost before its stores held it never reaches it again. A lab
+    /// instance turns it on for its whole process with `kept-on-a-moved-log` in
+    /// `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static KEPT_ON_A_MOVED_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`KEPT_ON_A_MOVED_LOG`] is on: set on this thread, or named for this process.
+#[cfg(any(test, debug_assertions))]
+fn kept_on_a_moved_log() -> bool {
+    KEPT_ON_A_MOVED_LOG.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("kept-on-a-moved-log")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+const fn kept_on_a_moved_log() -> bool {
+    false
 }
 
 /// What a relay or a publish did, for an observer beside the journal.
@@ -501,21 +525,36 @@ pub(crate) struct Relayed {
     dir: PathBuf,
     at: BTreeMap<String, (u64, Option<LogIdentity>)>,
     written: BTreeMap<String, (u64, Option<LogIdentity>)>,
+    /// [`KEPT_ON_A_MOVED_LOG`], as the thread that opened the mesh had it.
+    kept_on_moved: bool,
 }
 
 /// The file [`Relayed`] keeps.
 pub const RELAYED_FILE: &str = "relayed";
 
-/// What a relay does with the cursor it kept ([`Relayed::cursor`]).
+/// What a relay does with the cursor it kept ([`Relayed::cursor`]): the codes of
+/// `aterm_mesh_core::relay_live::cursor`, whose island proves the relay live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum Cursor {
     /// The same log: resume.
-    Kept,
+    Kept = relay_live::KEPT,
     /// A later generation of the same log, carried by its lineage: resume, after the newest rows
     /// again, as the fork may have taken the last ones the neighbour held.
-    Moved,
+    Moved = relay_live::MOVED,
     /// None, too old, or another log: start at the head, with the newest rows.
-    Gone,
+    Gone = relay_live::GONE,
+}
+
+impl Cursor {
+    /// The cursor the kernel's `code` names; a code outside the kernel's starts again.
+    const fn of(code: u8) -> Self {
+        match code {
+            relay_live::KEPT => Self::Kept,
+            relay_live::MOVED => Self::Moved,
+            _ => Self::Gone,
+        }
+    }
 }
 
 impl Relayed {
@@ -547,6 +586,7 @@ impl Relayed {
             dir: dir.to_path_buf(),
             written: at.clone(),
             at,
+            kept_on_moved: kept_on_a_moved_log(),
         }
     }
 
@@ -565,21 +605,16 @@ impl Relayed {
         now_ms: u64,
     ) -> Cursor {
         let kept = u64::try_from(CURSOR_KEPT.as_millis()).unwrap_or(u64::MAX);
-        let Some((at, was)) = self.at.get(peer) else {
-            return Cursor::Gone;
-        };
-        if now_ms.saturating_sub(*at) >= kept {
-            return Cursor::Gone;
-        }
-        match (*was, dest) {
-            (was, dest) if was == dest => Cursor::Kept,
-            (Some(was), Some(dest))
-                if lineage.is_some_and(|lineage| dest.continues(was, lineage).is_some()) =>
-            {
-                Cursor::Moved
+        let entry = self.at.get(peer);
+        let fresh = entry.is_some_and(|(at, _)| now_ms.saturating_sub(*at) < kept);
+        let continues = entry.is_some_and(|(_, was)| match (*was, dest) {
+            (Some(was), Some(dest)) => {
+                lineage.is_some_and(|lineage| dest.continues(was, lineage).is_some())
             }
-            _ => Cursor::Gone,
-        }
+            _ => false,
+        });
+        let same = entry.is_some_and(|(_, was)| *was == dest) || (self.kept_on_moved && continues);
+        Cursor::of(relay_live::cursor(entry.is_some(), fresh, same, continues))
     }
 
     /// This Mac relays to `peer`'s log `dest` at `now_ms`.
@@ -1199,6 +1234,7 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         dest: FederationEndpoint::stream(&slot.peer, dial).with_caps(grants),
         group,
         filter: slot.log.filter().to_owned(),
+        carry: Vec::new(),
         producer_id: 0,
         rewrite: SubjectRewrite::passthrough(),
         relay: true,
@@ -1232,12 +1268,15 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         .then(|| Live::new(mesh, &slot.peer, *slot.link.peer().key.bytes()));
     if let Some(inventory) = &inventory {
         inventory.linked(&slot.peer, &slot.link);
-        // What the relay cannot carry: the records before the head it starts at (no cursor), or
-        // the last ones a later generation of the neighbour's log may have lost.
-        match cursor {
-            Cursor::Kept => {}
-            Cursor::Moved => inventory.request(&slot.peer, &slot.link, Reason::Lineage),
-            Cursor::Gone => inventory.request(&slot.peer, &slot.link, Reason::NewLink),
+        // What the relay cannot carry (`relay_live::start_repair`): the last records a later
+        // generation of the neighbour's log may have lost, or those before the head it starts at
+        // (no cursor; any code outside the kernel's asks this widest exchange too).
+        match relay_live::start_repair(cursor as u8) {
+            relay_live::ASK_NONE => {}
+            relay_live::ASK_LINEAGE => {
+                inventory.request(&slot.peer, &slot.link, Reason::Lineage);
+            }
+            _ => inventory.request(&slot.peer, &slot.link, Reason::NewLink),
         }
     }
     let mut held = 0;

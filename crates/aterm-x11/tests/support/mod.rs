@@ -9,8 +9,10 @@ use std::collections::BTreeMap;
 
 /// Parses tab-separated rows from `tests/recorded/{name}`.
 pub fn rows(name: &str) -> Vec<Vec<String>> {
-    let path = format!("{}/tests/recorded/{name}", env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let path = aterm_tempfile::manifest_dir()
+        .join("tests/recorded")
+        .join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     text.lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.split('\t').map(str::to_owned).collect())

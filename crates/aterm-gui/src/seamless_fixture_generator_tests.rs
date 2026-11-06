@@ -16,6 +16,10 @@ fn fx_generator_in_child(output: &str) -> bool {
     } else {
         vars.extend([
             (
+                "ATERM_HANDOFF_FIXTURE_VERSION",
+                std::ffi::OsString::from(crate::build_info::version()),
+            ),
+            (
                 "ATERM_BUILD_GIT_COMMIT",
                 std::ffi::OsString::from(crate::build_info::git_commit()),
             ),
@@ -91,6 +95,7 @@ fn fx_install_release_stamp() {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| panic!("set {name} (tests/fixtures/handoff/README.md)"))
     };
+    let version = var("ATERM_HANDOFF_FIXTURE_VERSION");
     let commit = var("ATERM_BUILD_GIT_COMMIT");
     let full = var("ATERM_BUILD_GIT_COMMIT_FULL");
     let build = var("SOURCE_DATE_EPOCH");
@@ -104,8 +109,8 @@ fn fx_install_release_stamp() {
     let epoch = build.parse::<u64>().expect("the release's build number");
     let compiler = fx_release_compiler();
     let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
-    aterm_types::version::install(aterm_types::version::BuildStamp {
-        app_version: env!("CARGO_PKG_VERSION"),
+    let stamp = aterm_stamp::Stamp {
+        app_version: leak(version.clone()),
         git_commit: leak(commit.clone()),
         git_commit_full: leak(full),
         git_dirty: "false",
@@ -119,15 +124,21 @@ fn fx_install_release_stamp() {
         compiler_flavor: "t",
         build_profile: "release",
         trust_verify: "off",
+        index_hint: "",
         release_build: true,
-    });
+    };
+    // Installed the way the shipped binary installs its own: from the record its section holds.
+    let record = Box::leak(Box::new(
+        aterm_stamp::encode(&stamp).expect("the release's identity record"),
+    ));
+    aterm_stamp::install(record, stamp);
     assert_eq!(
         (
             crate::running_build_number(),
             crate::build_info::git_commit(),
             crate::build_info::version(),
         ),
-        (epoch, commit.as_str(), env!("CARGO_PKG_VERSION")),
+        (epoch, commit.as_str(), version.as_str()),
         "the release's stamp is the one this process reads"
     );
 }
@@ -692,7 +703,7 @@ fn fx_park_policy(
     let build = crate::running_build_number();
     let file = if want == CarryCeiling::Full {
         std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            aterm_tempfile::manifest_dir()
                 .join("../..")
                 .join(policy::SOURCE_PATH),
         )
@@ -4661,8 +4672,8 @@ fn fx_record_fields() {
         std::env::var_os("ATERM_HANDOFF_FIXTURE_OUT")
             .expect("set ATERM_HANDOFF_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
     );
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/handoff");
-    let baseline = newest_recorded(std::path::Path::new(root), &out);
+    let root = aterm_tempfile::manifest_dir().join("tests/fixtures/handoff");
+    let baseline = newest_recorded(&root, &out);
     let fields = DeskFields::of_release(&out);
     std::fs::write(out.join(FIELDS_FILE), fields.to_toml()).expect("write fields.toml");
     let off_macos: &[(&str, &str)] = if cfg!(target_os = "macos") {

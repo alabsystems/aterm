@@ -14,14 +14,14 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm-codec"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "astream-wire",
 ]
 
 [[package]]
 name = "aterm-dbus"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "aterm-codec",
  "aterm-uds",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-uds"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "libc",
 ]

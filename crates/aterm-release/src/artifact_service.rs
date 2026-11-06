@@ -81,23 +81,30 @@ impl Xml<'_> {
     }
 
     fn text(&mut self, tag: &str) -> Result<String, &'static str> {
-        if !self.take(&format!("<{tag}>")) {
+        let (open, close) = match tag {
+            "key" => ("<key>", "</key>"),
+            "string" => ("<string>", "</string>"),
+            "integer" => ("<integer>", "</integer>"),
+            "real" => ("<real>", "</real>"),
+            "data" => ("<data>", "</data>"),
+            "date" => ("<date>", "</date>"),
+            _ => return Err("unsupported value or XML syntax"),
+        };
+        if !self.take(open) {
             return Err("unsupported value or XML syntax");
         }
-        let closing = format!("</{tag}>");
-        let (text, rest) = self
-            .rest
-            .split_once(closing.as_str())
-            .ok_or("incomplete scalar")?;
+        let (text, rest) = self.rest.split_once(close).ok_or("incomplete scalar")?;
         self.rest = rest;
         if text.contains('<') || text.chars().any(char::is_control) {
             return Err("unsupported scalar text");
         }
-        let mut output = String::new();
-        let mut tail = text;
-        while let Some(at) = tail.find('&') {
-            output.push_str(&tail[..at]);
-            tail = &tail[at..];
+        let Some(first) = text.find('&') else {
+            return Ok(text.to_owned());
+        };
+        let mut output = String::with_capacity(text.len());
+        output.push_str(&text[..first]);
+        let mut tail = &text[first..];
+        loop {
             let (entity, decoded) = [
                 ("&amp;", '&'),
                 ("&lt;", '<'),
@@ -110,8 +117,13 @@ impl Xml<'_> {
             .ok_or("unsupported XML entity")?;
             output.push(decoded);
             tail = &tail[entity.len()..];
+            let Some(at) = tail.find('&') else {
+                output.push_str(tail);
+                break;
+            };
+            output.push_str(&tail[..at]);
+            tail = &tail[at..];
         }
-        output.push_str(tail);
         Ok(output)
     }
 

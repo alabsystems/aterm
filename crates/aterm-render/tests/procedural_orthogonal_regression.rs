@@ -66,13 +66,18 @@ fn corpus(chars: impl Iterator<Item = char> + Clone, hard: bool) -> String {
 }
 
 fn check_corpus(got: &str, name: &str) -> Option<String> {
-    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    let path = aterm_tempfile::manifest_dir()
+        .join("tests/fixtures")
+        .join(name);
     if std::env::var_os("ATERM_BLESS_GOLDEN").is_some() {
         std::fs::write(&path, got).expect("bless corpus");
         return None;
     }
     Some(std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("missing corpus {path}: {e}; generate with ATERM_BLESS_GOLDEN=1")
+        panic!(
+            "missing corpus {}: {e}; generate with ATERM_BLESS_GOLDEN=1",
+            path.display()
+        )
     }))
 }
 

@@ -576,19 +576,26 @@ impl Run<'_> {
             }
         }
         let mut source_caps = Vec::new();
+        let mut bottle_caps = BTreeSet::new();
         for target in &opts.triples {
-            let declared = programs::PROGRAMS.iter().any(|definition| matches!(definition.shape, Shape::Bottle(bottle) if bottle.linux.contains(target)));
-            if declared {
-                match self.deps.packer.can_pack_bottle(*target) {
-                    Ok(()) => source_caps.push(*target),
+            for definition in programs::PROGRAMS.iter().filter(|definition| matches!(definition.shape, Shape::Bottle(bottle) if bottle.linux.contains(target))) {
+                match self.deps.packer.can_pack_bottle(definition.name, *target) {
+                    Ok(()) => {
+                        bottle_caps.insert((definition.name, *target));
+                        if !source_caps.contains(target) {
+                            source_caps.push(*target);
+                        }
+                    },
                     Err(why) => self
                         .tx
-                        .say(format!("upstream C SDK unavailable for {target}: {why}")),
+                        .say(format!("upstream {} unavailable for {target}: {why}", definition.name)),
                 }
             }
         }
-        self.tx
-            .say(format!("upstream C SDK can pack {}", names(&source_caps)));
+        self.tx.say(format!(
+            "upstream packages can pack {}",
+            names(&source_caps)
+        ));
         self.tx.say(format!(
             "builder is {}; atpkg serves {}; this box can pack {}",
             opts.host,
@@ -654,8 +661,7 @@ impl Run<'_> {
         let pins = crate::pins::for_targets(&channel, &pin_can)?;
         self.state.check_pins(&pin_can, &pins, n, self.tx)?;
         let source_serves = |name: &str, build: Build, target: Triple| {
-            source_caps.contains(&target)
-                && programs::get(name).is_some_and(|definition| matches!(definition.shape, Shape::Bottle(bottle) if bottle.linux.contains(&target)))
+            bottle_caps.contains(&(name, target))
                 && channel.for_target(target.as_str()).pin.get(name) == Some(&build)
         };
         let can: Vec<_> = opts

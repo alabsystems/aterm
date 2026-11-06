@@ -6,7 +6,7 @@ name = "atpkg-publish"
 # Every test file is a module of the one `publish_suite` binary (declared below); with
 # autotests off, a `tests/*.rs` file listed nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -68,6 +68,8 @@ aterm-codec = { workspace = true }
 # Scratch dirs: new, mode 0700, random name, removed on drop (a predictable path in a
 # shared /tmp can be pre-created by another user).
 aterm-tempfile = { workspace = true }
+# The seal a generated file carries (`seal::line`, `stamp`, `check`): `adopt` writes trust.lock.
+aterm-census = { workspace = true }
 
 [dev-dependencies]
 # The loopback GitHub the read contract drives AghHost and RestHost against.

@@ -27,7 +27,7 @@ const MEASURED: [(&str, usize); 4] = [
 
 /// The slot rows of capture `name`: its quote-bar rows, then its hidden-count row if it has one.
 fn measured_slot(name: &str) -> Vec<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures")
         .join(name);
     let text = std::fs::read_to_string(&path).expect("the capture");
@@ -447,7 +447,7 @@ fn the_hidden_count_goes_with_the_slot_and_a_reader_presses_the_link() {
 #[test]
 fn the_launch_news_with_its_bar_off_wears_alabs_banner_too() {
     let name = "claude-2.1.280-box-bash-touch.txt";
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures")
         .join(name);
     let recorded =

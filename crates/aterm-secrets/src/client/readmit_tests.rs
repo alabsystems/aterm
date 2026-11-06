@@ -13,6 +13,9 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _};
 const DAY: u64 = 24 * 60 * 60 * 1000;
 const T0: u64 = 1_000 * DAY;
 
+#[path = "proof_admission_tests.rs"]
+mod proof_admission;
+
 /// A fleet book with nothing against the proving Mac, in which every member runs 0.148 or later.
 const CURRENT: Book = Book {
     node_id_held_out: false,
@@ -1424,6 +1427,7 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
                             Some(desk::Proof {
                                 decide,
                                 refuses: &refuses,
+                                authority: None,
                                 fleet,
                             }),
                         );
@@ -1589,6 +1593,7 @@ fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
                     Some(desk::Proof {
                         decide: &decide,
                         refuses: &refuses,
+                        authority: None,
                         fleet: None,
                     }),
                 );
@@ -1629,8 +1634,15 @@ fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
 /// NEGATIVE CONTROL: `prove_first` taking the bundle without writing it
 /// (`let report = Report::default();` for `client::write_from_log_bundle(paths, &bundle)?`): the
 /// fresh Mac's state is not `In` and the `Stored::In` assert fails.
+/// Calling `sync` or `ask_allowed` before returning the admission contacts the
+/// separate HTTP source, failing the zero-request assertion. The explicit
+/// deferred post then reaches it, so an inert request counter cannot pass.
 #[test]
 fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::fd::AsFd as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::members::desk::{self, Desk, Local};
     use crate::members::join::{self, Stream};
     use crate::members::joiner::Joining;
@@ -1677,9 +1689,52 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     };
     // A day past m7's last record (its `Node`), so the old seat is dark.
     let later = aterm_time::unix_millis().unwrap() + DARK_FOR_MS + 1;
-    let decide = |proving: &desk::Proving<'_>| prove_at_ms(m22, proving, CURRENT, later);
+    // The member already hands every record and key needed for admission. Its
+    // unrelated HTTP source may be unavailable: returning the admission must
+    // neither fetch it nor post the legacy approval queue synchronously.
+    let source = aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("separate vault source");
+    let source_url = format!("http://{}/v1/alab", source.local_addr().unwrap());
+    let requests = AtomicUsize::new(0);
+    let decide = |proving: &desk::Proving<'_>| {
+        let bytes = prove_at_ms(m22, proving, CURRENT, later)?;
+        let mut bundle = crate::members::Bundle::decode(bytes.as_slice())?;
+        bundle.servers = vec![source_url.clone()];
+        bundle.encode()
+    };
     let served = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
+        let (cancelled, cancel) = std::io::pipe().unwrap();
+        let requests = &requests;
+        let source = &source;
+        scope.spawn(move || {
+            loop {
+                let ready = aterm_uds::ready::either_until(
+                    source.as_fd(),
+                    cancelled.as_fd(),
+                    std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                )
+                .unwrap()
+                .expect("the proof completes or reaches its source");
+                if ready.second {
+                    break;
+                }
+                let (mut stream, _) = source.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&mut stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                requests.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        });
         let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
             let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
             for end in [&ours, &theirs] {
@@ -1695,6 +1750,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
                     Some(desk::Proof {
                         decide,
                         refuses: &|_| None,
+                        authority: None,
                         fleet: None,
                     }),
                 );
@@ -1726,7 +1782,20 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
         let zero = |_: &[u8]| [0u8; 64];
         let refused = join::prove_first(&other, &dial, &copier, &zero, &["m22:7".to_owned()]);
         assert!(refused.is_err(), "a copied public node key proves nothing");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "a locally verified admission waits for no HTTP vault or approval queue; the subscriber follows it"
+        );
+        assert_eq!(load_state(&fresh).unwrap().requested, 0);
+        assert!(crate::client::holds_allowed(&fresh));
+        assert!(crate::client::ask_allowed(&fresh).is_err());
+        drop(cancel);
     });
+    assert!(
+        requests.load(Ordering::SeqCst) > 0,
+        "the saved Allowed still supplies the subscriber's deferred post"
+    );
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
         std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
@@ -1907,6 +1976,7 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof() {
                     Some(desk::Proof {
                         decide: &decide,
                         refuses: &refuses,
+                        authority: None,
                         fleet: None,
                     }),
                 );
@@ -2654,6 +2724,7 @@ fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possessio
                     Some(desk::Proof {
                         decide: &decide,
                         refuses: &refuses,
+                        authority: None,
                         fleet: Some(desk::Fleet {
                             node: node(11),
                             current: true,
@@ -2733,6 +2804,7 @@ fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possessio
                     Some(desk::Proof {
                         decide: &decide,
                         refuses: &refuses,
+                        authority: None,
                         fleet: Some(desk::Fleet {
                             node: node(12),
                             current: true,
@@ -3178,6 +3250,7 @@ fn a_lab_identitys_proof_is_refused_on_the_live_genesis_and_let_in_on_another() 
                         Some(desk::Proof {
                             decide: &decide,
                             refuses: &refuses,
+                            authority: None,
                             fleet: None,
                         }),
                     );
@@ -3808,6 +3881,7 @@ fn a_proof_never_moves_a_mac_to_another_vault() {
                     Some(desk::Proof {
                         decide,
                         refuses: &|_| None,
+                        authority: None,
                         fleet: None,
                     }),
                 ));

@@ -22,6 +22,7 @@ use super::open_url::{
     decode_mime_base64_parts, decode_quoted_printable, email_matches_target, extract_login_hint,
     percent_decode, percent_encode,
 };
+use super::wake_deadline::WakeDeadline;
 
 /// Environment variable naming a Chromium / `chrome-headless-shell` binary to drive.
 pub const BROWSER_BIN_ENV: &str = "ATERM_BROWSER";
@@ -585,6 +586,15 @@ impl MailboxConfig {
             || has_pw
             || (target_email.is_none() && !self.passwords.is_empty())
             || (self.relay_enabled && target_email.is_some())
+    }
+
+    /// Whether a mailbox poll for `target_email` reads the fleet's relay: it is on, an email names
+    /// whose codes to ask it for, and this build has the relay's reader, which is unix's alone
+    /// ([`super::ai_signin::fetch_relay_mail_credential`]). Elsewhere a relay-only configuration
+    /// reads nothing, so a poll refuses at once instead of waiting out its timeout.
+    #[must_use]
+    pub fn reads_relay_for(&self, target_email: Option<&str>) -> bool {
+        cfg!(unix) && self.relay_enabled && target_email.is_some()
     }
 
     /// A configured Gmail endpoint can use a saved OAuth grant without an app password.
@@ -4202,10 +4212,12 @@ pub(super) fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
     })
 }
 
+/// `s` as the inside of an IMAP quoted string: `\\` and `"` escaped, and CR, LF and NUL, which
+/// no quoted string holds (RFC 3501 §9 `QUOTED-CHAR`), dropped.
 fn escape_imap_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if matches!(ch, '\r' | '\n') {
+        if matches!(ch, '\r' | '\n' | '\0') {
             continue;
         }
         if matches!(ch, '\\' | '"') {
@@ -5729,7 +5741,7 @@ fn network_poll_interval(cfg: &MailboxConfig, target_email: Option<&str>) -> Dur
         .effective_imap_url(target_email)
         .is_none_or(|url| parse_imap_url(&url).is_some_and(|imap| is_loopback_host(&imap.host)));
     let http_here = cfg.http_url.as_deref().is_none_or(is_loopback_http_url);
-    let relay = cfg.relay_enabled && target_email.is_some();
+    let relay = cfg.reads_relay_for(target_email);
     if imap_here && http_here && !relay {
         LOOPBACK_POLL
     } else {
@@ -5804,7 +5816,7 @@ fn poll_mailbox_config_by(
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
-    let has_relay = cfg.relay_enabled && target_email.is_some();
+    let has_relay = cfg.reads_relay_for(target_email);
     #[cfg(unix)]
     if let Some(result) = native_mail::poll(
         source_cfg,
@@ -5942,12 +5954,16 @@ pub fn split_nul_messages(pending: &mut Vec<u8>) -> Vec<Value> {
     out
 }
 
-fn pump_cdp_reader(mut from: std::io::PipeReader, tx: &Sender<Value>) {
+/// Sends each NUL-framed message the browser writes to `from` on `tx`, until the pipe ends, a read
+/// fails (an interrupted one is read again) or nobody receives.
+fn pump_cdp_reader(mut from: impl Read, tx: &Sender<Value>) {
     let mut pending = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match from.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
             Ok(n) => pending.extend_from_slice(&buf[..n]),
         }
         for msg in split_nul_messages(&mut pending) {
@@ -6098,6 +6114,69 @@ impl CdpClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, &'static str> {
+        let t0 = Instant::now();
+        self.call_with(
+            session,
+            method,
+            params,
+            &|| timeout.saturating_sub(t0.elapsed()),
+            timeout,
+        )
+    }
+
+    /// [`CdpClient::call`] within `deadline`, which counts the time the host slept: its waits
+    /// look at both clocks at least every [`super::wake_deadline::SLEEP_CHECK`], so a call the
+    /// host slept past ends within that of its waking.
+    pub fn call_until(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        deadline: WakeDeadline,
+    ) -> Result<Value, &'static str> {
+        let tick = if deadline.counts_sleep() {
+            super::wake_deadline::SLEEP_CHECK
+        } else {
+            Duration::MAX
+        };
+        self.call_with(session, method, params, &|| deadline.remaining(), tick)
+    }
+
+    /// [`CdpClient::call`] within `deadline`: its expiry's words where it has passed, and where it
+    /// counts the time the host slept ([`Deadline::waking`]) its waits look again at least every
+    /// [`super::wake_deadline::SLEEP_CHECK`], as [`CdpClient::call_until`]'s do.
+    fn call_by(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        deadline: Deadline<'_>,
+    ) -> Result<Value, &'static str> {
+        deadline.left()?;
+        let tick = if deadline.counts_sleep() {
+            super::wake_deadline::SLEEP_CHECK
+        } else {
+            Duration::MAX
+        };
+        self.call_with(
+            session,
+            method,
+            params,
+            &|| deadline.remaining().unwrap_or(Duration::ZERO),
+            tick,
+        )
+    }
+
+    /// Sends the command and waits for its response while `left` leaves time, at most `tick` per
+    /// wait before it reads `left` again.
+    fn call_with(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        left: &dyn Fn() -> Duration,
+        tick: Duration,
+    ) -> Result<Value, &'static str> {
         if self
             .work
             .as_ref()
@@ -6108,7 +6187,6 @@ impl CdpClient {
         if self.write_failed {
             return Err("browser DevTools pipe is unavailable");
         }
-        let t0 = Instant::now();
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -6122,11 +6200,13 @@ impl CdpClient {
             self.write_failed = true;
             return Err("browser DevTools pipe is unavailable");
         }
-        match receive_cdp(
-            &written,
-            timeout.saturating_sub(t0.elapsed()),
-            self.work.as_ref(),
-        ) {
+        let wrote = loop {
+            match receive_cdp(&written, left().min(tick), self.work.as_ref()) {
+                Err(CdpReceiveError::Timeout) if !left().is_zero() => {}
+                wrote => break wrote,
+            }
+        };
+        match wrote {
             Ok(true) => {}
             Err(CdpReceiveError::Cancelled) => {
                 return Err("browser DevTools account work is paused");
@@ -6141,11 +6221,11 @@ impl CdpClient {
             }
         }
         loop {
-            let remaining = timeout.saturating_sub(t0.elapsed());
+            let remaining = left();
             if remaining.is_zero() {
                 return Err("timed out waiting for browser DevTools response");
             }
-            match receive_cdp(&self.from, remaining, self.work.as_ref()) {
+            match receive_cdp(&self.from, remaining.min(tick), self.work.as_ref()) {
                 Ok(m) => {
                     if m.get("id").and_then(Value::as_u64) != Some(id) {
                         self.events.push(m);
@@ -6159,6 +6239,7 @@ impl CdpClient {
                 Err(CdpReceiveError::Cancelled) => {
                     return Err("browser DevTools account work is paused");
                 }
+                Err(CdpReceiveError::Timeout) if !left().is_zero() => {}
                 Err(CdpReceiveError::Timeout) => {
                     return Err("timed out waiting for browser DevTools response");
                 }
@@ -6983,24 +7064,22 @@ fn poll_webmail_until(
         return Err(super::mailbox_routes::refused_words(login));
     }
 
-    let step_timeout = || deadline.left();
-
-    let target = cdp.call(
+    let target = cdp.call_by(
         None,
         "Target.createTarget",
         json!({"url": "about:blank"}),
-        step_timeout()?,
+        deadline,
     )?;
     let target_id = target
         .get("targetId")
         .and_then(Value::as_str)
         .ok_or("browser created no webmail targetId")?
         .to_owned();
-    let attached = cdp.call(
+    let attached = cdp.call_by(
         None,
         "Target.attachToTarget",
         json!({"targetId": target_id, "flatten": true}),
-        step_timeout()?,
+        deadline,
     )?;
     let session = attached
         .get("sessionId")
@@ -7015,13 +7094,13 @@ fn poll_webmail_until(
     let mut signed_in = false;
     let result = (|| {
         for method in ["Page.enable", "Runtime.enable"] {
-            let _ = cdp.call(Some(&session), method, json!({}), step_timeout()?)?;
+            let _ = cdp.call_by(Some(&session), method, json!({}), deadline)?;
         }
-        let _ = cdp.call(
+        let _ = cdp.call_by(
             Some(&session),
             "Page.navigate",
             json!({"url": webmail_url}),
-            step_timeout()?,
+            deadline,
         )?;
 
         let mut user_submitted = false;
@@ -7068,7 +7147,7 @@ fn poll_webmail_until(
                 inbox_tick,
                 &cfg.senders,
             );
-            let eval = cdp.call(
+            let eval = cdp.call_by(
                 Some(&session),
                 "Runtime.evaluate",
                 json!({
@@ -7076,7 +7155,7 @@ fn poll_webmail_until(
                     "awaitPromise": true,
                     "returnByValue": true
                 }),
-                step_timeout()?,
+                deadline,
             )?;
             let _ = cdp.take_matching_event_url(&session, |_| false);
             let val = eval
@@ -7236,6 +7315,34 @@ pub fn poll_mailbox_or_webmail_for_credential(
     )
 }
 
+/// [`poll_mailbox_or_webmail_for_credential`] within `deadline`, which counts the time the host
+/// slept ([`Deadline::waking`]): the poll ends at its next look at its deadline after `deadline`
+/// passes, by sleep or awake time, and one asked for after that ends at once with the deadline's
+/// words, reading no mail. Its own pauses last at most two seconds, and its webmail browser's
+/// DevTools waits look at both clocks at least every [`super::wake_deadline::SLEEP_CHECK`]. A
+/// mail leaf whose API takes an [`Instant`] or a span (an IMAP or HTTP mailbox's read, an IMAP
+/// wait for new mail, a Google grant's renewal, a Proton mailbox's sign-in or read) is handed
+/// what is left of `deadline` when it starts, at most its own cap where it has one, and one in
+/// flight while the host sleeps measures that on the clock that stops in sleep.
+pub fn poll_mailbox_or_webmail_for_credential_by(
+    cdp: &mut CdpClient,
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: WakeDeadline,
+    poll_interval: Duration,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<MailboxCredential, &'static str> {
+    let clock = Instant::now;
+    poll_mailbox_or_webmail_until(
+        cdp,
+        cfg,
+        target_email,
+        Deadline::waking(deadline, &clock),
+        poll_interval,
+        seen_otps,
+    )
+}
+
 fn poll_mailbox_or_webmail_until(
     cdp: &mut CdpClient,
     cfg: &MailboxConfig,
@@ -7251,7 +7358,7 @@ fn poll_mailbox_or_webmail_until(
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
-    let has_relay = cfg.relay_enabled && target_email.is_some();
+    let has_relay = cfg.reads_relay_for(target_email);
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
         || cfg.http_url.is_some()
@@ -9570,7 +9677,8 @@ fn vendor_out_of_time(
 }
 
 /// Drives one vendor sign-in page in `cdp` from `start` ([`vendor_step`] each tick) until the
-/// page approves it, `finished` says the CLI is done, or `deadline`; `mailbox` answers a
+/// page approves it, `finished` says the CLI is done, or `deadline`, which counts the time the
+/// host slept ([`WakeDeadline`]); `mailbox` answers a
 /// [`Step::Mailbox`]. A page unchanged for [`VENDOR_STALL`] with nothing of aterm's on it ends
 /// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]); Cloudflare's bot check
 /// that has not cleared within it, or when `deadline` comes, ends it
@@ -9580,7 +9688,7 @@ pub fn drive_cdp_vendor(
     start: &str,
     gate: Gate<'_>,
     finished: &dyn Fn() -> bool,
-    deadline: Instant,
+    deadline: WakeDeadline,
     mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
 ) -> super::login_drive::Approval {
     drive_cdp_vendor_within(
@@ -9620,29 +9728,28 @@ pub(super) fn drive_cdp_vendor_within(
     cdp: &mut CdpClient,
     start: &str,
     gate: Gate<'_>,
-    (finished, deadline): (&dyn Fn() -> bool, Instant),
+    (finished, deadline): (&dyn Fn() -> bool, WakeDeadline),
     mut stall: PageStall,
     mut mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
 ) -> super::login_drive::Approval {
     use super::login_drive::Approval;
-    let step_timeout = || deadline.saturating_duration_since(Instant::now());
     let opened = (|| -> Result<(String, String), &'static str> {
-        let target = cdp.call(
+        let target = cdp.call_until(
             None,
             "Target.createTarget",
             json!({"url": "about:blank"}),
-            step_timeout(),
+            deadline,
         )?;
         let target_id = target
             .get("targetId")
             .and_then(Value::as_str)
             .ok_or("browser created no targetId")?
             .to_owned();
-        let attached = cdp.call(
+        let attached = cdp.call_until(
             None,
             "Target.attachToTarget",
             json!({"targetId": target_id, "flatten": true}),
-            step_timeout(),
+            deadline,
         )?;
         let session = attached
             .get("sessionId")
@@ -9650,13 +9757,13 @@ pub(super) fn drive_cdp_vendor_within(
             .ok_or("browser attached no sessionId")?
             .to_owned();
         for method in ["Page.enable", "Runtime.enable"] {
-            let _ = cdp.call(Some(&session), method, json!({}), step_timeout())?;
+            let _ = cdp.call_until(Some(&session), method, json!({}), deadline)?;
         }
-        let _ = cdp.call(
+        let _ = cdp.call_until(
             Some(&session),
             "Page.navigate",
             json!({"url": start}),
-            step_timeout(),
+            deadline,
         )?;
         Ok((target_id, session))
     })();
@@ -9679,14 +9786,14 @@ pub(super) fn drive_cdp_vendor_within(
             break Approval::Approved { page: page_proved };
         }
         let now = Instant::now();
-        if now >= deadline {
+        if deadline.passed() {
             break vendor_out_of_time(&stall, last_place.as_deref(), now);
         }
-        let eval = cdp.call(
+        let eval = cdp.call_until(
             Some(&session),
             "Runtime.evaluate",
             json!({"expression": VENDOR_PAGE_JS, "returnByValue": true}),
-            step_timeout(),
+            deadline,
         );
         let page = match eval {
             Ok(eval) => page_of(eval.pointer("/result/value").unwrap_or(&Value::Null)),
@@ -9724,7 +9831,7 @@ pub(super) fn drive_cdp_vendor_within(
         match &step {
             Step::Done => {
                 if gate.completion == crate::ai::connector::Completion::Device {
-                    while !finished() && Instant::now() < deadline {
+                    while !finished() && !deadline.passed() {
                         std::thread::sleep(VENDOR_TICK);
                     }
                 }
@@ -9771,11 +9878,11 @@ pub(super) fn drive_cdp_vendor_within(
                         if let Some(why) = gate.bound.and_then(|b| b.outside(&link, gate.hosts)) {
                             break Approval::Refused(format!("the sign-in mail's link: {why}"));
                         }
-                        let _ = cdp.call(
+                        let _ = cdp.call_until(
                             Some(&session),
                             "Page.navigate",
                             json!({"url": link}),
-                            step_timeout(),
+                            deadline,
                         );
                         gate.filled_otp = true;
                     }
@@ -9785,11 +9892,11 @@ pub(super) fn drive_cdp_vendor_within(
             Step::Press(_) | Step::FillCode | Step::FillEmail | Step::FillOtp => {
                 post_otp_wait_ticks = 0;
                 let acted = cdp
-                    .call(
+                    .call_until(
                         Some(&session),
                         "Runtime.evaluate",
                         json!({"expression": vendor_act_js(&step, value), "returnByValue": true}),
-                        step_timeout(),
+                        deadline,
                     )
                     .ok()
                     .and_then(|v| v.pointer("/result/value/ok").and_then(Value::as_bool))
@@ -9996,7 +10103,7 @@ impl super::login_drive::Approver for VendorApprover {
     fn resume(
         &mut self,
         request: &super::login_drive::Request<'_>,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<super::login_drive::Resume, String> {
         self.google_pending = None;
         self.google_recovery = None;
@@ -10052,7 +10159,7 @@ impl super::login_drive::Approver for VendorApprover {
         &mut self,
         request: &super::login_drive::Request<'_>,
         outcome: &super::login_drive::Outcome,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<(), String> {
         if !matches!(outcome, super::login_drive::Outcome::SignedIn { .. }) {
             self.google_pending = None;
@@ -10134,7 +10241,7 @@ impl super::login_drive::Approver for VendorApprover {
             &mut super::headless_fetch::Curl,
             &|| {
                 (handoff.finished)()
-                    || Instant::now() >= handoff.deadline
+                    || handoff.deadline.passed()
                     || self
                         .work
                         .as_ref()
@@ -10202,14 +10309,15 @@ impl VendorApprover {
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new_scoped(cmd_write, out_read, self.work.clone())
                 .map_err(|_| "could not start scoped CDP workers")?;
-            let make_up_now = Instant::now();
-            let make_up_until = make_up_now
-                .checked_add(super::browser_window::MAKE_UP_WITHIN)
-                .unwrap_or(handoff.deadline);
+            // The make-up's own waits take an `Instant`: [`MAKE_UP_WITHIN`] bounds them, so it
+            // gets its share of the deadline as one, read now.
             let _ = super::browser_window::make_up_tidy(
                 &mut cdp,
                 profile_dir,
-                handoff.deadline.min(make_up_until),
+                handoff
+                    .deadline
+                    .within(super::browser_window::MAKE_UP_WITHIN)
+                    .instant(),
             );
             let mut seen_otps = BTreeSet::new();
             let gate = Gate {
@@ -10246,11 +10354,11 @@ impl VendorApprover {
                         }
                         return Err(no_mailbox);
                     };
-                    poll_mailbox_or_webmail_for_credential(
+                    poll_mailbox_or_webmail_for_credential_by(
                         cdp_inner,
                         mb,
                         em,
-                        handoff.deadline.saturating_duration_since(Instant::now()),
+                        handoff.deadline,
                         Duration::from_millis(400),
                         &mut seen_otps,
                     )
@@ -10790,5 +10898,82 @@ pub(super) mod registry_tests {
             );
             assert_eq!(approver.mailbox_unready, None);
         });
+    }
+}
+
+#[cfg(test)]
+mod wire_hardening_tests {
+    use super::*;
+
+    /// AN IMAP QUOTED STRING HOLDS NO NUL: a NUL in a login or mailbox name is dropped as CR and
+    /// LF are, and `\` and `"` are escaped. CONTROL: plain text is written as it is.
+    #[test]
+    fn a_quoted_imap_string_drops_nul_cr_and_lf() {
+        assert_eq!(escape_imap_quoted("a\0b\""), "ab\\\"");
+        assert_eq!(escape_imap_quoted("x\r\ny\0\\z"), "xy\\\\z");
+        assert_eq!(
+            escape_imap_quoted("work@example.test"),
+            "work@example.test",
+            "CONTROL"
+        );
+    }
+
+    /// A pipe read the browser's reader takes once from its script, then the pipe's end.
+    struct Script(Vec<std::io::Result<&'static [u8]>>);
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let bytes = self.0.remove(0)?;
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// AN INTERRUPTED READ OF THE BROWSER'S PIPE IS READ AGAIN: the message after it is delivered,
+    /// not lost with the browser's whole session. CONTROL: a read that fails ends the pump, and
+    /// nothing after it is delivered.
+    #[test]
+    fn the_browser_reader_reads_again_after_an_interrupted_read() {
+        let pumped = |script: Script| {
+            let (tx, rx) = channel();
+            pump_cdp_reader(script, &tx);
+            drop(tx);
+            rx.iter().collect::<Vec<Value>>()
+        };
+        let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            pumped(Script(vec![Err(interrupted), Ok(b"{\"id\":1}\0")])),
+            vec![json!({"id": 1})]
+        );
+        let broke = std::io::Error::other("the pipe broke");
+        assert_eq!(
+            pumped(Script(vec![Err(broke), Ok(b"{\"id\":1}\0")])),
+            Vec::<Value>::new(),
+            "CONTROL"
+        );
+        assert_eq!(
+            pumped(Script(vec![Ok(b"{\"id\":2}\0")])),
+            vec![json!({"id": 2})],
+            "CONTROL: a plain read"
+        );
+    }
+
+    /// THE FLEET'S RELAY IS READ ONLY WHERE ITS READER IS BUILT, unix: on, for an email, there.
+    /// CONTROLS: no email, or the relay off, reads no relay anywhere.
+    #[test]
+    fn the_relay_is_read_for_an_email_where_its_reader_is_built() {
+        let relay = MailboxConfig {
+            relay_enabled: true,
+            ..MailboxConfig::default()
+        };
+        assert_eq!(relay.reads_relay_for(Some("work@example.test")), cfg!(unix));
+        assert!(!relay.reads_relay_for(None), "CONTROL: no email");
+        assert!(
+            !MailboxConfig::default().reads_relay_for(Some("work@example.test")),
+            "CONTROL: the relay off"
+        );
     }
 }

@@ -567,7 +567,11 @@ pub fn tcp_summary_of_pcblist64(buf: &[u8]) -> Option<TcpSummary> {
         let n = rtts.len();
         (rtts[(n - 1) / 2] + rtts[n / 2]) * 0.5
     });
-    Some(TcpSummary { counts, srtt_ms })
+    Some(TcpSummary {
+        counts,
+        counters_only: false,
+        srtt_ms,
+    })
 }
 
 #[cfg(test)]

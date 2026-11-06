@@ -326,11 +326,10 @@ impl<'a> Painter<'a> for Sweeps {
 
 #[test]
 fn a_colr_delta_index_past_u32_max_wraps_as_upstream_release_does() {
-    let path = format!(
-        "{}/../aterm-render/tests/fixtures/colr_1_variable.ttf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let seed = std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {path}: {e}"));
+    let path =
+        aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/colr_1_variable.ttf");
+    let seed =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {}: {e}", path.display()));
     let sweep = |base: Option<u32>| {
         let mut bytes = seed.clone();
         if let Some(base) = base {
@@ -674,7 +673,7 @@ fn crafted_table_edges_answer_as_upstream() {
 }
 
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
-    let render = format!("{}/../aterm-render", env!("CARGO_MANIFEST_DIR"));
+    let render = aterm_tempfile::manifest_dir().join("../aterm-render");
     let mut out = Vec::new();
     for (label, rel) in [
         ("glyf", "tests/fixtures/jetbrains-mono.ttf"),
@@ -688,8 +687,9 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         ("GSUB Arabic joining, rlig", "assets/DejaVuSansMono.ttf"),
         ("CFF", "tests/fixtures/NotoSansSunuwar-Regular.otf"),
     ] {
-        let path = format!("{render}/{rel}");
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {path}: {e}"));
+        let path = render.join(rel);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("committed face {}: {e}", path.display()));
         out.push((label, bytes));
     }
     let curve: &[u8] = &[n(5), n(5), 21, n(10), n(20), n(30), n(40), n(50), n(60), 8];

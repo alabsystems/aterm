@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-mail"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license = "Apache-2.0 AND MIT"
 repository.workspace = true
@@ -19,6 +19,7 @@ aterm-http = { workspace = true }
 aterm-json = { workspace = true }
 aterm-uds = { workspace = true }
 aterm-time = { workspace = true }
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 ring = { workspace = true }
 # The Ed25519 checks of the pinned modulus key and the address-token keys: astream's

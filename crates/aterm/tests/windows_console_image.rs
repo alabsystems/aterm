@@ -8,6 +8,14 @@
 use std::io::Read as _;
 use std::process::{Output, Stdio};
 
+/// This package's binary `name`, named when the test runs.
+fn image(name: &str) -> String {
+    aterm_tempfile::bin_exe(name)
+        .into_os_string()
+        .into_string()
+        .expect("a UTF-8 path")
+}
+
 fn subsystem(path: &str) -> u16 {
     let mut head = vec![0u8; 4096];
     std::fs::File::open(path)
@@ -29,7 +37,7 @@ fn bytes<const N: usize>(head: &[u8], offset: usize, path: &str) -> [u8; N] {
 }
 
 fn console_image(args: &[&str]) -> Output {
-    aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm"))
+    aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm"))
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -41,12 +49,12 @@ fn aterm_is_the_console_image_and_aterm_windowed_the_windowed_one() {
     const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
     const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
     assert_eq!(
-        subsystem(env!("CARGO_BIN_EXE_aterm")),
+        subsystem(&image("aterm")),
         IMAGE_SUBSYSTEM_WINDOWS_CUI,
         "aterm.exe must be waited for by the shell"
     );
     assert_eq!(
-        subsystem(env!("CARGO_BIN_EXE_aterm-windowed")),
+        subsystem(&image("aterm-windowed")),
         IMAGE_SUBSYSTEM_WINDOWS_GUI,
         "the windowed image must start without a console"
     );

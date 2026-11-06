@@ -56,9 +56,15 @@ pub struct Managed {
 /// [`Managed`] for `tool`, or `None` when no shim of it forwards to a build.
 #[must_use]
 pub fn managed(layout: &Layout, tool: &str) -> Option<Managed> {
+    managed_with_source(layout, tool).map(|(_, managed)| managed)
+}
+
+/// Read a shim once, retaining its payload path beside the possibly routed executable.
+pub(crate) fn managed_with_source(layout: &Layout, tool: &str) -> Option<(PathBuf, Managed)> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let read = crate::platform::read_shim(&shim);
-    managed_from_read(layout, &shim, &read)
+    let source = read.target.clone()?;
+    managed_from_read(layout, &shim, &read).map(|managed| (source, managed))
 }
 
 pub(crate) fn managed_from_read(

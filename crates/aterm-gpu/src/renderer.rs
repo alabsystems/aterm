@@ -14565,12 +14565,11 @@ mod tests {
 
     #[test]
     fn fitted_fallback_styles_reach_the_atlas_as_the_cpu_fit_them() {
-        const PRIMARY: &str = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf"
-        );
-        let mut cpu = Renderer::from_system_with_family(Some(PRIMARY), 18.0, Theme::default())
-            .unwrap_or_else(|| panic!("{PRIMARY} does not load"));
+        let primary = aterm_tempfile::manifest_dir()
+            .join("../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf");
+        let primary = primary.to_str().expect("a UTF-8 font path");
+        let mut cpu = Renderer::from_system_with_family(Some(primary), 18.0, Theme::default())
+            .unwrap_or_else(|| panic!("{primary} does not load"));
         cpu.debug_block_on_lazy_fallbacks();
         let warning = cpu.glyph_key('\u{26A0}');
         if !matches!(

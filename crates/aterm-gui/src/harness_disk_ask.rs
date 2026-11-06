@@ -160,6 +160,7 @@ impl crate::App {
             fact_line: false,
             autopilot: aterm_agent::supervise::Autopilot::Land,
             chrome: false,
+            program: None,
         };
         let booking = crate::control::control_media::SpawnBooking {
             cwd: folder.to_str().map(str::to_string),

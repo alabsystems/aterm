@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! GNU Git from pinned upstream source and digest-checked runtime bottles; no brew recipes.
+//! Pinned upstream source builds and prebuilt tools, prepared without signing or upload.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -319,11 +319,15 @@ pub fn collect(request: &Request, source: &dyn Source, dir: &Path) -> Result<Inp
     })
 }
 
-/// Acquire, build, relocate and prepare GNU Git without signing or publishing.
+/// Acquire, build, relocate and prepare a declared upstream program without publishing.
 ///
 /// # Errors
 /// Any metadata, digest, relocation, client staging or native qualification refusal.
 pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
+    let (_, definition) = super::bottle_row(&request.program, request.triple)?;
+    if let Some(recipe) = definition.pinned {
+        return super::pinned::pack(ctx, request, recipe);
+    }
     let work = crate::channel::Scratch::new("upstream-bottle")?;
     let inputs = collect(request, &Official, work.path())?;
     let tree = super::source::build(request, &inputs, work.path())?;
@@ -352,8 +356,13 @@ pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
     Ok(result)
 }
 
-pub(crate) fn can_build(triple: Triple) -> Result<()> {
-    super::source::can_build(triple)
+pub(crate) fn can_build(program: &str, triple: Triple) -> Result<()> {
+    let (_, definition) = super::bottle_row(program, triple)?;
+    if let Some(recipe) = definition.pinned {
+        super::pinned::can_pack(recipe, triple)
+    } else {
+        super::source::can_build(triple)
+    }
 }
 
 fn qualify(result: &BottleOutcome) -> Result<()> {

@@ -141,13 +141,15 @@ pub enum Selection {
 
 /// Repo-relative paths whose changes can replan or re-flag the workspace, or change what its lint
 /// denies: clippy reads the nearest config above a manifest, so a root one is the lint of every
-/// member without its own, which no member's files say. A rustfmt config is not here: no compile
-/// reads it, and `fmt` reads the whole tree whatever the selection.
-pub const REPLANNING_PATHS: [&str; 8] = [
+/// member without its own, which no member's files say; and `trust.lock` names the compiler of
+/// every member. A rustfmt config is not here: no compile reads it, and `fmt` reads the whole tree
+/// whatever the selection.
+pub const REPLANNING_PATHS: [&str; 9] = [
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain",
     "rust-toolchain.toml",
+    aterm_toolchain::trust_lock::LOCK_FILE,
     ".cargo/config",
     ".cargo/config.toml",
     "clippy.toml",
@@ -223,6 +225,18 @@ pub fn manifest_replan(base: Option<&str>, work: Option<&str>) -> Replan {
                     let (sb, sw) = (b.and_then(|t| t.get(sub)), w.and_then(|t| t.get(sub)));
                     match sub {
                         "default-members" => {}
+                        "package" => {
+                            for field in changed_keys_of(sb, sw) {
+                                if field != "version" {
+                                    return Replan::Everything(format!(
+                                        "[workspace.package] {field} changed"
+                                    ));
+                                }
+                                // The product version: only the `aterm` bin package, which
+                                // nothing depends on, inherits it (census `identity-read`).
+                                seeds.insert("aterm".to_string());
+                            }
+                        }
                         "dependencies" => {
                             for dep in changed_keys_of(sb, sw) {
                                 for row in [sb, sw].into_iter().flatten().filter_map(|t| t.get(dep))
@@ -1353,6 +1367,7 @@ default-members = ["crates/a"]
 
 [workspace.package]
 version = "0.1.0"
+edition = "2024"
 
 [workspace.dependencies]
 # TLS.
@@ -1420,9 +1435,18 @@ aterm-x = { path = \"crates/x\" }
             edit("opt-level = 2", "opt-level = 1"),
             packages(&["aterm-png"])
         );
+        assert_eq!(
+            edit(r#"version = "0.1.0""#, r#"version = "0.2.0""#),
+            packages(&["aterm"]),
+            "a bump reaches the one package that reads the product version"
+        );
         for (from, to) in [
             ("libc = { path", "libm = { path"),
-            (r#"version = "0.1.0""#, r#"version = "0.2.0""#),
+            (r#"edition = "2024""#, r#"edition = "2021""#),
+            (
+                r#"version = "0.1.0""#,
+                "version = \"0.2.0\"\nrust-version = \"1.90\"",
+            ),
             (r#"debug = "line-tables-only""#, "debug = false"),
             (
                 "[profile.dev.package.aterm-png]",
@@ -2107,6 +2131,7 @@ checksum = "aaa"
             Path::new("/nonexistent"),
             OsStr::new(""),
             None,
+            None,
         );
         tools.targo = env!("CARGO").into();
         tools.refused = None;
@@ -2343,6 +2368,15 @@ checksum = "aaa"
         assert!(!crate::checks::Check::Fmt.reads(&Scope::changed("main", Vec::new(), false)));
     }
 
+    /// A lock move compiles every member with another compiler: a change to the root
+    /// `trust.lock` replans everything, as `rust-toolchain.toml` does, and a file of that name
+    /// below the root, which verify's discovery (from the root) never reads, does not.
+    #[test]
+    fn a_trust_lock_change_replans_everything() {
+        assert!(replans_everything("trust.lock"));
+        assert!(!replans_everything("crates/x/trust.lock"));
+    }
+
     #[test]
     fn whatever_the_selection_cannot_answer_widens() {
         let m = members(&["aterm-grid", "aterm-link"]);
@@ -2402,6 +2436,7 @@ checksum = "aaa"
             Some(Path::new("/nonexistent")),
             Path::new("/nonexistent"),
             OsStr::new(""),
+            None,
             None,
         );
         cases.push((

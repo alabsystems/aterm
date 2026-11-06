@@ -11,7 +11,11 @@ fn ligature_test_font() -> Vec<u8> {
 
 /// The bundled DejaVu Sans Mono asset (always committed, so no skip).
 fn dejavu_path() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/DejaVuSansMono.ttf").to_string()
+    aterm_tempfile::manifest_dir()
+        .join("assets/DejaVuSansMono.ttf")
+        .into_os_string()
+        .into_string()
+        .expect("a UTF-8 package directory")
 }
 
 const BOLD_ITALIC: StyleBits = StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0);

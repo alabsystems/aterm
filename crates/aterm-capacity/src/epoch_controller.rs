@@ -810,8 +810,9 @@ impl EpochController {
             if end == 0 || end > wire::FRAME {
                 return Err(bad("helper frame exceeded bound"));
             }
-            let frame: Vec<_> = self.incoming.drain(..=end).collect();
-            self.receive(wire::decode(&frame[..end], &self.config.epoch)?)?;
+            let event = wire::decode(&self.incoming[..end], &self.config.epoch);
+            self.incoming.drain(..=end);
+            self.receive(event?)?;
         }
         if self.incoming.len() > wire::FRAME && !self.incoming.contains(&b'\n') {
             return Err(bad("unterminated helper frame exceeded bound"));

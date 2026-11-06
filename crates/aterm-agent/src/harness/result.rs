@@ -795,6 +795,9 @@ pub enum Source {
     },
     /// The screen of a harness whose reader alone reads its turns.
     Screen { program: String },
+    /// The output tail of a program no harness reads ([`snapshot_output`]), concluded on its exit
+    /// code.
+    Output,
     /// A Codex rollout ([`snapshot_rollout`]): the conversation, the turn the
     /// report is the last words of, and the rollout it was read from.
     Rollout {
@@ -820,6 +823,7 @@ pub enum Source {
 impl Source {
     /// The sidecar line: `source=transcript session=<pct> uuid=<pct>`, `source=none why=<word>`
     /// (with ` turn=<pct>` where it names the turn), `source=screen program=<word>`,
+    /// `source=output`,
     /// `source=rollout thread=<pct> turn=<pct>` (with ` rollout=<pct>`) or, for a rollout's
     /// missing result, `source=none why=<word> thread=<pct>` (with ` turn=<pct>`, ` rollout=<pct>`,
     /// ` home=<pct>` and ` landed=<ms>` where it has them), then ` transcript=<pct>` when a
@@ -857,6 +861,7 @@ impl Source {
             Source::Screen { program } => {
                 (format!("source=screen program={}", pct(program)), &none)
             }
+            Source::Output => ("source=output".to_string(), &none),
             Source::Rollout {
                 thread,
                 turn,
@@ -939,6 +944,7 @@ impl Source {
             "screen" => Some(Source::Screen {
                 program: field("program").filter(|w| is_word(w))?,
             }),
+            "output" => Some(Source::Output),
             "rollout" => Some(Source::Rollout {
                 thread: field("thread")?,
                 turn: field("turn")?,
@@ -1180,6 +1186,32 @@ pub fn snapshot_screen(
     write_snapshot(tasks, stem, said, &source, None, by)
 }
 
+/// Snapshots a program worker's result when its program exits: `output`, the tab's output tail
+/// its caller bounded and redacted, under [`Source::Output`]. An empty tail is no result
+/// (`empty`).
+///
+/// # Errors
+/// As [`snapshot`].
+pub fn snapshot_output(
+    tasks: &Path,
+    stem: &str,
+    output: &str,
+    by: DoneBy,
+) -> std::io::Result<Snapshot> {
+    check_stem(stem)?;
+    let output = output.trim_end();
+    if output.trim().is_empty() {
+        let why = "empty";
+        let source = Source::Unavailable {
+            why: why.to_string(),
+            transcript: None,
+            turn: None,
+        };
+        return write_snapshot(tasks, stem, "", &source, Some(why), by);
+    }
+    write_snapshot(tasks, stem, output, &Source::Output, None, by)
+}
+
 /// The words a screen's reader read of a turn, as [`snapshot_screen`] keeps them.
 #[must_use]
 pub fn screen_said(turn_said: Option<&str>, said_tail: &str) -> String {
@@ -1340,7 +1372,7 @@ fn answer_of(path: &Path, full: bool) -> String {
         Some(Source::Unavailable { why, .. } | Source::RolloutUnavailable { why, .. }) => {
             unavailable(&why)
         }
-        Some(Source::Screen { .. }) if full => unavailable("no-transcript"),
+        Some(Source::Screen { .. } | Source::Output) if full => unavailable("no-transcript"),
         Some(Source::Rollout {
             thread,
             turn,
@@ -1348,15 +1380,12 @@ fn answer_of(path: &Path, full: bool) -> String {
         }) => rollout_reply(&thread, &turn, rollout.as_deref(), path, full, || {
             super::footer::read_small(path, RESULT_READ_BYTES)
         }),
-        Some(Source::Screen { program }) => {
+        Some(source @ (Source::Screen { .. } | Source::Output)) => {
             let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
                 return unavailable("unreadable");
             };
             framed(
-                &format!(
-                    "source=screen program={}",
-                    aterm_codec::pct::encode(&program)
-                ),
+                &source.line(),
                 text.len(),
                 "",
                 &head_lines(&text, RESULT_MAX_CHARS, path),

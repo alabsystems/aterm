@@ -73,6 +73,7 @@ fn event_and_sample(
         Duration::from_millis(1250),
         Duration::from_millis(8500),
         3,
+        Some(&"ab".repeat(32)),
     );
     let event: aterm_json::Value =
         aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
@@ -83,6 +84,8 @@ fn event_and_sample(
     assert_eq!(event["waiting_s"].as_f64(), Some(1.25));
     assert_eq!(event["execution_s"].as_f64(), Some(8.5));
     assert_eq!(event["width"].as_u64(), Some(3));
+    assert_eq!(event["exe_sha256"].as_str(), Some("ab".repeat(32).as_str()));
+    assert_eq!(event["carried"].as_bool(), Some(false));
     if let Some(sample) = &sample {
         assert_eq!(sample.width, 3);
         assert_eq!(event["tests"].as_u64(), sample.tests);

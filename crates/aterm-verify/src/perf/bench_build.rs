@@ -25,10 +25,6 @@ use crate::perf::driver::CargoDriver;
 #[path = "../../../aterm/tests/fabric_bench/profile.rs"]
 pub(crate) mod bench_profile;
 
-/// The paths a build stamp is of, as aterm's build script asks git of them.
-#[path = "../../../aterm/stamp_paths.rs"]
-mod stamp_paths;
-
 pub(crate) mod flags;
 pub(crate) mod units;
 
@@ -85,15 +81,7 @@ pub(crate) fn prepare<'a>(
     if !removed.is_empty() {
         build.push_str(&format!(" (the caller's {} removed)", removed.join(", ")));
     }
-    let pins: Vec<String> = targo
-        .git_facts
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect();
-    build.push_str(&format!(
-        "; the build's git facts pinned for every run: {}",
-        pins.join(" ")
-    ));
+    build.push_str("; its identity record the constant one (no identity input reaches it)");
     eprintln!("  {build}");
     let load_before = load_average();
     let built = build_bench(&targo, build_args)?;
@@ -248,11 +236,11 @@ pub(crate) fn run_bench(
 }
 
 /// `targo` as a lane runs it: in the workspace's build directory, with the caller's rustflags
-/// sources removed and the build's git facts pinned for every command it runs.
+/// sources and identity inputs removed, so every run builds the constant identity record and no
+/// commit between the runs of one set reruns the `aterm` build script.
 pub(crate) struct Targo<'a> {
     driver: &'a CargoDriver,
     build_dir: Option<String>,
-    git_facts: Vec<(&'static str, String)>,
 }
 
 impl<'a> Targo<'a> {
@@ -260,10 +248,6 @@ impl<'a> Targo<'a> {
         Targo {
             driver,
             build_dir: crate::perf::driver::workspace_build_dir().map(str::to_string),
-            git_facts: git_facts(
-                |key| std::env::var(key).ok(),
-                || probe_git_facts(&workspace_root()),
-            ),
         }
     }
 
@@ -294,8 +278,8 @@ impl<'a> Targo<'a> {
                 cmd.env_remove(key);
             }
         }
-        for (key, value) in &self.git_facts {
-            cmd.env(key, value);
+        for key in aterm_stamp::input::ALL {
+            cmd.env_remove(key);
         }
     }
 
@@ -324,54 +308,6 @@ impl<'a> Targo<'a> {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
-}
-
-const GIT_FACTS: [&str; 3] = [
-    "ATERM_BUILD_GIT_COMMIT",
-    "ATERM_BUILD_GIT_COMMIT_FULL",
-    "ATERM_BUILD_DEV_COMMITS",
-];
-
-fn git_facts(
-    caller: impl Fn(&str) -> Option<String>,
-    probe: impl FnOnce() -> [String; 3],
-) -> Vec<(&'static str, String)> {
-    let pinned: Vec<String> = GIT_FACTS
-        .iter()
-        .filter_map(|key| caller(key).filter(|v| !v.trim().is_empty()))
-        .collect();
-    let values = match <[String; 3]>::try_from(pinned) {
-        Ok(all) => all,
-        Err(_) => probe(),
-    };
-    GIT_FACTS.into_iter().zip(values).collect()
-}
-
-/// The three facts as aterm's build script reads them of the work tree `dir` is in. The dirty
-/// test asks of the paths the stamp is of ([`stamp_paths::PATHSPEC`]), so the entries a lane
-/// writes into the measured ledger between the runs of one set leave the stamp, and so the
-/// next run's build, as they were.
-fn probe_git_facts(dir: &Path) -> [String; 3] {
-    let git = |args: &[&str]| {
-        arena::stdout_of(
-            aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-                .args(args)
-                .current_dir(dir),
-        )
-        .filter(|s| !s.is_empty())
-    };
-    let short = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&[&["status", "--porcelain"][..], &stamp_paths::PATHSPEC].concat()).is_some();
-    let commit = if short != "unknown" && dirty {
-        format!("{short}-dirty")
-    } else {
-        short
-    };
-    let full = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dev_commits = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
-        .and_then(|tag| git(&["rev-list", &format!("{}..HEAD", tag.trim()), "--count"]))
-        .unwrap_or_else(|| "0".into());
-    [commit, full, dev_commits]
 }
 
 pub(crate) fn audit(
@@ -615,124 +551,6 @@ impl Provenance<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_build_git_facts_are_the_callers_three_or_one_probe() {
-        let probe = || {
-            [
-                "0123456789ab-dirty".to_string(),
-                "0123456789abcdef".to_string(),
-                "7".to_string(),
-            ]
-        };
-        let pinned = git_facts(
-            |key| Some(format!("pinned {key}")),
-            || panic!("probed beside the caller's three pins"),
-        );
-        assert_eq!(
-            pinned.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-            GIT_FACTS
-        );
-        assert!(
-            pinned
-                .iter()
-                .all(|(key, value)| *value == format!("pinned {key}")),
-            "{pinned:?}"
-        );
-        let partials: [fn(&str) -> Option<String>; 3] = [
-            |key: &str| (key != "ATERM_BUILD_DEV_COMMITS").then(|| "x".to_string()),
-            |key: &str| {
-                Some(if key == "ATERM_BUILD_GIT_COMMIT" {
-                    " ".to_string()
-                } else {
-                    "x".to_string()
-                })
-            },
-            |_: &str| None,
-        ];
-        for partial in partials {
-            let facts = git_facts(partial, probe);
-            assert_eq!(
-                facts
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .collect::<Vec<_>>(),
-                probe(),
-                "short of three pins, all three are probed"
-            );
-        }
-    }
-
-    /// D10b's set (2026-11-04-fabric-1001 to -1004): run 1's entry, written into the ledger and
-    /// not yet committed, stamped run 2's build `-dirty`, so run 2 ran a rebuild. The lane's
-    /// own output, a new entry and an edit to the ledger's README, leaves the three facts as
-    /// they were, asked from the top or from a package's folder (where a build script runs);
-    /// the negative controls, an edited source file, a new one and a file beside the ledger
-    /// that only shares its name's start, each mark the stamp dirty.
-    #[test]
-    fn a_ledger_entry_leaves_the_stamp_and_a_source_change_dirties_it() {
-        let scratch = aterm_tempfile::tempdir().expect("tempdir");
-        let top = scratch.path();
-        let package = top.join("crates/a");
-        let git = |args: &[&str]| {
-            let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(top)
-                .output()
-                .expect("git runs");
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
-        let write = |path: &str, text: &str| {
-            let path = top.join(path);
-            std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
-            std::fs::write(path, text).expect("write");
-        };
-        write("crates/a/src/lib.rs", "pub fn a() {}\n");
-        write("docs/measured/fabric/README.md", "# fabric\n");
-        git(&["init", "-q"]);
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "base"]);
-        let clean = probe_git_facts(&package);
-        assert!(
-            clean[0].len() == 12 && clean[0].bytes().all(|b| b.is_ascii_hexdigit()),
-            "a committed tree's stamp is its commit alone: {clean:?}"
-        );
-
-        write("docs/measured/fabric/2026-11-04-fabric-1001.json", "{}\n");
-        write("docs/measured/fabric/2026-11-04-fabric-1001.md", "# 1001\n");
-        write(
-            "docs/measured/fabric/README.md",
-            "# fabric\n\nD10b's set.\n",
-        );
-        assert_eq!(
-            probe_git_facts(&package),
-            clean,
-            "the ledger's entries changed the stamp"
-        );
-        assert_eq!(probe_git_facts(top), clean, "asked from the top");
-
-        let dirty = [
-            format!("{}-dirty", clean[0]),
-            clean[1].clone(),
-            clean[2].clone(),
-        ];
-        let controls: [(&str, &str, bool); 3] = [
-            ("crates/a/src/lib.rs", "pub fn a() -> u8 { 1 }\n", true),
-            ("crates/a/src/new.rs", "pub fn b() {}\n", false),
-            ("docs/measured.md", "beside the ledger\n", false),
-        ];
-        for (path, text, tracked) in controls {
-            write(path, text);
-            assert_eq!(probe_git_facts(&package), dirty, "{path} changed");
-            if tracked {
-                git(&["checkout", "-q", "--", path]);
-            } else {
-                std::fs::remove_file(top.join(path)).expect("remove");
-            }
-            assert_eq!(probe_git_facts(&package), clean, "{path} restored");
-        }
-    }
 
     #[test]
     fn the_built_aterm_is_the_binary_cargo_reports() {

@@ -81,7 +81,7 @@ impl Demands {
                 priority.boost = Some(crate::qos::Boost::start(Some(worker)));
             }
         } else {
-            drop(priority.boost.take());
+            priority.boost = None;
         }
     }
 

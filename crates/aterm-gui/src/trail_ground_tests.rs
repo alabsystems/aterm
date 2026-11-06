@@ -18,10 +18,9 @@ use aterm_effects::rainbow_kitty::prism_glass::LIVE;
 use std::time::{Duration, Instant};
 
 /// The font the rig draws, as the dump draws it.
-const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
+fn fixture_font() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf")
+}
 
 /// The config every run admits, before its theme line.
 const BASE: &str =
@@ -47,7 +46,7 @@ fn rig_with(theme: &str, extra: &str) -> TrailRig {
 /// [`rig_with`] on a display of `scale`: 2, or the dump's own 1, whose face lays its thin glyphs
 /// with no pixel near the full ink (`host::PageFacts::glass`).
 fn rig_scaled(theme: &str, extra: &str, scale: f64) -> TrailRig {
-    let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
+    let mut rig = TrailRig::new(&fixture_font()).expect("the rig");
     let t0 = rig.t0();
     rig.configure(&format!("{BASE}theme = {theme:?}\n{extra}"), t0)
         .expect("the config admits");

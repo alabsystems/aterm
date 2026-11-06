@@ -202,13 +202,13 @@ impl<'a> Git<'a> {
                 .map_err(|e| e.with_repo(self.slug.to_string()))?;
         }
         let reference = match reference {
-            Some(reference) => reference.to_string(),
+            Some(reference) => std::borrow::Cow::Borrowed(reference),
             None => {
                 let repo = self.gh.repos().how(self.how.clone()).get(&self.slug)?;
-                repo.default_branch.ok_or_else(|| {
+                std::borrow::Cow::Owned(repo.default_branch.ok_or_else(|| {
                     Error::protocol(format!("GitHub names no default branch of {}", self.slug))
                         .with_repo(self.slug.to_string())
-                })?
+                })?)
             }
         };
         let rest = format!("/git/trees/{}", path::ref_path(&reference));

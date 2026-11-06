@@ -88,6 +88,92 @@ fn fake() -> (FakeGithub, String, String) {
 }
 
 #[test]
+fn user_repo_create_preserves_visibility_and_lands_before_a_lost_answer() {
+    let (fake, dev, _) = fake();
+    let body = json!({"name": "new-repo", "private": false, "auto_init": false});
+    fake.fault(
+        Match::api("/user/repos").method("POST"),
+        Fault::LandThenClose,
+    );
+    let lost = send_json(&fake, "POST", "/user/repos", &dev, &body);
+    assert_eq!(lost.status, 0);
+    let read = api("/repos/fixture-dev-bot/new-repo").send(fake.ports().api);
+    assert_eq!(read.status, 200);
+    assert_eq!(read.json()["full_name"], json!("fixture-dev-bot/new-repo"));
+    assert_eq!(read.json()["owner"]["type"], json!("User"));
+    assert_eq!(read.json()["visibility"], json!("public"));
+    assert_eq!(
+        send_json(&fake, "POST", "/user/repos", &dev, &body).status,
+        422
+    );
+    let private = send_json(
+        &fake,
+        "POST",
+        "/user/repos",
+        &dev,
+        &json!({"name": "private-repo", "private": true, "auto_init": false}),
+    );
+    assert_eq!(private.status, 201);
+    assert_eq!(private.json()["private"], json!(true));
+    assert_eq!(private.json()["permissions"]["push"], json!(true));
+    assert_eq!(
+        api("/repos/fixture-dev-bot/private-repo")
+            .send(fake.ports().api)
+            .status,
+        404
+    );
+    assert!(fake.violations().is_empty());
+}
+
+#[test]
+fn user_repo_create_requires_authentication_safe_name_and_explicit_flags() {
+    let (fake, dev, _) = fake();
+    let body = json!({"name": "new-repo", "private": false, "auto_init": false});
+    let anonymous = api("/user/repos")
+        .method("POST")
+        .body(body.to_string().as_bytes())
+        .send(fake.ports().api);
+    assert_eq!(anonymous.status, 401);
+    for bad in [
+        json!({"name": "../escape", "private": false, "auto_init": false}),
+        json!({"name": "..", "private": false, "auto_init": false}),
+        json!({"name": "new-repo", "auto_init": false}),
+        json!({"name": "new-repo", "private": false}),
+        json!({"name": "new-repo", "private": false, "auto_init": true}),
+    ] {
+        assert_eq!(
+            send_json(&fake, "POST", "/user/repos", &dev, &bad).status,
+            422
+        );
+    }
+    for method in ["PATCH", "DELETE"] {
+        assert_eq!(
+            send_json(&fake, method, "/user/repos", &dev, &body).status,
+            404
+        );
+    }
+    let listed = api("/user/repos").token(&dev).send(fake.ports().api);
+    assert_eq!(listed.status, 200);
+    assert!(
+        listed
+            .json()
+            .as_array()
+            .expect("repository list")
+            .iter()
+            .all(|repo| repo["full_name"] != json!("fixture-dev-bot/new-repo"))
+    );
+    assert_eq!(
+        api("/user/repos")
+            .method("HEAD")
+            .token(&dev)
+            .send(fake.ports().api)
+            .status,
+        200
+    );
+    assert!(fake.violations().is_empty());
+}
+
+#[test]
 fn a_push_login_creates_uploads_publishes_and_deletes() {
     let (fake, dev, _) = fake();
     let (api_port, uploads) = (fake.ports().api, fake.ports().uploads);
@@ -989,14 +1075,13 @@ fn a_malformed_ref_name_is_invalid() {
 }
 
 /// A write past the token's rate limit is refused 403 before it is applied. NEGATIVE
-/// CONTROL: the same POST one request earlier lands.
+/// CONTROL: the same POST one request earlier lands. The token stands one short of its limit
+/// by `set_rate_used`, so the test makes two requests where climbing there made 5,001, each
+/// a TIME_WAIT socket for 30 s (each request's own charge is `faults.rs`'s).
 #[test]
 fn a_write_past_the_limit_lands_nothing() {
     let (fake, dev, _) = fake();
-    let port = fake.ports().api;
-    for _ in 0..4999 {
-        api("/repos/fixture-dev/app").token(&dev).send(port);
-    }
+    fake.set_rate_used(&dev, 4999);
     let landed = create(&fake, &dev, &json!({"tag_name": "v1", "draft": true}));
     assert_eq!(landed.status, 201);
     assert_eq!(landed.header("x-ratelimit-remaining"), Some("0"));
@@ -1005,6 +1090,7 @@ fn a_write_past_the_limit_lands_nothing() {
     assert_eq!(refused.json()["message"], json!("API rate limit exceeded."));
     let tags: Vec<String> = fake.releases_of(SLUG).into_iter().map(|r| r.tag).collect();
     assert_eq!(tags, ["v1"]);
+    assert_eq!(fake.seen().len(), 2, "the test's own requests");
 }
 
 /// `make_latest:"false"` on a draft changes nothing, and a later publish with no

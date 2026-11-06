@@ -58,7 +58,8 @@ pub struct IdentityPaths {
 pub struct Ctx {
     /// `$HOME`.
     pub home: PathBuf,
-    /// The aterm checkout this binary was built from (for `build-local` and `lane install`).
+    /// The aterm checkout this run acts on (for `lane install`, and the local roster candidate
+    /// under its `dist/`): [`checkout_root`].
     pub repo_root: PathBuf,
     /// The lanes' state root (`$XDG_STATE_HOME/aterm-auto`, else `~/.local/state/aterm-auto`).
     pub state_dir: PathBuf,
@@ -132,54 +133,16 @@ impl HostChoice {
     }
 }
 
-/// The two config needs `from_home_hosts` raises and clears (design §10.3).
+/// Live routing clears both the current invalid need and the retired missing-file need.
 const CONFIG_NEEDS: [&str; 2] = ["agh.config.missing", "agh.config.invalid"];
 
-/// What `AghHost::production`'s refusal begins with when agh.toml does not validate.
-const INVALID: &str = "agh.toml is invalid: ";
-
-/// What `AghHost::production`'s refusal begins with when agh.toml is missing.
-const MISSING: &str = "agh.toml is missing";
-
-/// What `AghHost::production`'s refusal begins with when agh.toml says `vault = true`.
-const VAULT: &str = "agh.toml says vault = true";
-
-/// Why the lanes refuse an agh.toml that says `vault = true`: the fact alone, because naming
-/// writers beside the line never clears it (`production` refuses the line whatever profiles
-/// the file names), and [`crate::hosts_check::UNVAULT`] is the step that does.
-const VAULT_WHY: &str =
-    "vault adoption is not composed for atpkg-publish, whatever profiles agh.toml names";
-
-/// The need `from_home_hosts` raises for production's refusal `why`, at `at`. Each `then` is a
-/// step that clears that refusal: `agh.config.missing` is agh's own, whose `then` is the step
-/// that provisions agh.toml from token files ([`crate::hosts_check::PROVISION`] is the same
-/// constant), and a file that says `vault = true` is `agh.config.invalid` whose `why` is
-/// [`VAULT_WHY`] and whose `then` is [`crate::hosts_check::UNVAULT`], rather than
-/// `agh policy check`, which accepts the file.
+/// A live host's identity/configuration refusal, recorded for a later caller.
 fn config_need(why: &str, at: u64) -> agh::needs::Need {
-    use crate::hosts_check::UNVAULT;
-    if why.starts_with(MISSING) {
-        agh::needs::Need::config_missing(at)
-    } else if why.starts_with(VAULT) {
-        let mut need = agh::needs::Need::config_invalid(VAULT_WHY, at);
-        need.what = "agh.toml says vault = true on this builder".to_string();
-        need.then = UNVAULT.to_string();
-        need
-    } else {
-        agh::needs::Need::config_invalid(why.strip_prefix(INVALID).unwrap_or(why), at)
-    }
+    agh::needs::Need::config_invalid(why, at)
 }
 
-/// `from_home_hosts`' refusal for production's `why`, with `shown` the config file and `h`
-/// the choice. A `vault = true` refusal is spelled from [`VAULT_WHY`] and
-/// [`crate::hosts_check::UNVAULT`], the step that clears it, never from `production`'s own
-/// advice.
+/// Context for a shared identity-routing refusal.
 fn config_refusal(why: &str, shown: &str, h: &str) -> String {
-    let why = if why.starts_with(VAULT) {
-        format!("{VAULT}, and {VAULT_WHY}: {}", crate::hosts_check::UNVAULT)
-    } else {
-        why.to_string()
-    };
     format!("{why}: the lanes route their GitHub identities through it ({shown}, --host {h})")
 }
 
@@ -188,6 +151,40 @@ fn config_refusal(why: &str, shown: &str, h: &str) -> String {
 pub(crate) fn clear_config_needs(dirs: &agh::config::Dirs) {
     for key in CONFIG_NEEDS {
         let _ = agh::needs::clear(dirs, key);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_view_tests {
+    use super::*;
+
+    #[test]
+    fn a_preflight_refusal_does_not_write_identity_needs() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join(".config");
+        let state = home.join(".state");
+        let dirs = agh::config::Dirs::resolve(&home, Some(&config), Some(&state)).unwrap();
+        std::fs::create_dir_all(dirs.config.parent().unwrap()).unwrap();
+        aterm_uds::private_file::create_private_dir(&dirs.config).unwrap();
+        aterm_uds::private_file::write_private(&dirs.config, "agh.toml", b"bogus = true\n")
+            .unwrap();
+        let before = std::fs::read(dirs.config_file()).unwrap();
+        assert!(
+            Ctx::from_home_hosts_mode(
+                &home,
+                Some(&config),
+                Some(&state),
+                0,
+                HostChoice::Agh,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(before, std::fs::read(dirs.config_file()).unwrap());
+        assert!(!state.exists(), "a view must not raise or clear a need");
+        assert_eq!(std::fs::read_dir(&dirs.config).unwrap().count(), 1);
     }
 }
 
@@ -215,7 +212,7 @@ impl Ctx {
             xdg_state_home.map_or_else(|| home.join(".local/state"), Path::to_path_buf);
         Self {
             home: home.to_path_buf(),
-            repo_root: Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+            repo_root: checkout_root(),
             state_dir: state_root.join("aterm-auto"),
             pkg_prefix: atpkg::toolchain::atpkg_prefix(home, xdg_config_home),
             trust_repo: home.join("trust"),
@@ -244,12 +241,21 @@ impl Ctx {
     ///
     /// # Errors
     ///
-    /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run naming agh.toml when it is
-    /// missing or invalid (design §10.3's text), after raising the need (§4.6.15). Also
+    /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run for invalid configuration
+    /// or refused adopted identity, after recording the need. Also
     /// could-not-run when agh's directories cannot be resolved from `HOME`, `XDG_CONFIG_HOME`
     /// and `XDG_STATE_HOME` (a relative root), when an owner of `accounts` is no valid slug
-    /// owner, and when agh.toml says `vault = true` (its need is `agh.config.invalid`).
+    /// owner. A missing file uses vault routing; it grants no publication permission.
     pub fn from_env_hosts(hosts: HostChoice) -> Result<Self> {
+        Self::from_env_hosts_mode(hosts, true)
+    }
+
+    /// A preflight context: use only recorded identities and never edit identity needs.
+    pub(crate) fn from_env_hosts_view(hosts: HostChoice) -> Result<Self> {
+        Self::from_env_hosts_mode(hosts, false)
+    }
+
+    fn from_env_hosts_mode(hosts: HostChoice, learn: bool) -> Result<Self> {
         let home = non_empty_env("HOME").ok_or_else(|| {
             Error::cannot_run(
                 "HOME is unset — the machine key, the token files, the state root and the \
@@ -259,12 +265,13 @@ impl Ctx {
         let now = aterm_time::unix_secs()
             .and_then(|s| i64::try_from(s).ok())
             .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
-        Self::from_home_hosts(
+        Self::from_home_hosts_mode(
             &home,
             non_empty_env("XDG_CONFIG_HOME").as_deref(),
             non_empty_env("XDG_STATE_HOME").as_deref(),
             now,
             hosts,
+            learn,
         )
     }
 
@@ -283,6 +290,18 @@ impl Ctx {
         xdg_state_home: Option<&Path>,
         now_unix: i64,
         hosts: HostChoice,
+    ) -> Result<Self> {
+        Self::from_home_hosts_mode(home, xdg_config_home, xdg_state_home, now_unix, hosts, true)
+    }
+
+    /// The context over one resolved identity snapshot. View mode is read-only.
+    pub(crate) fn from_home_hosts_mode(
+        home: &Path,
+        xdg_config_home: Option<&Path>,
+        xdg_state_home: Option<&Path>,
+        now_unix: i64,
+        hosts: HostChoice,
+        learn: bool,
     ) -> Result<Self> {
         let tokens = Tokens::under(home);
         let gh = Hosts {
@@ -315,22 +334,25 @@ impl Ctx {
         };
         let (staging_home, public_home) =
             (slug(&ctx.accounts.staging)?, slug(&ctx.accounts.public)?);
-        let built = AghHost::production(&dirs, staging_home).and_then(|staging| {
+        let built = AghHost::configured_client(&dirs, learn).map(|client| {
+            let staging = AghHost::new(client.clone(), staging_home);
             let channel: crate::host::HostRef = match hosts {
-                HostChoice::Agh => Arc::new(AghHost::production(&dirs, public_home)?),
+                HostChoice::Agh => Arc::new(AghHost::new(client, public_home)),
                 _ => ctx.hosts.channel.clone(),
             };
-            Ok((staging, channel))
+            (staging, channel)
         });
         let (staging, channel) = match built {
             Ok(built) => built,
             Err(why) => {
-                // Nothing was sent: `production` returns before any client is built. The need
-                // is a fact for later; the refusal below names the file whatever it answers.
-                let need = config_need(&why, u64::try_from(now_unix).unwrap_or(0));
-                let _ = agh::needs::raise(&dirs, &need);
-                for key in CONFIG_NEEDS.iter().filter(|k| **k != need.key) {
-                    let _ = agh::needs::clear(&dirs, key);
+                // A view records nothing; a live adoption may have learned an identity.
+                // The need is a fact for later, never authority to add a profile or grant.
+                if learn {
+                    let need = config_need(&why, u64::try_from(now_unix).unwrap_or(0));
+                    let _ = agh::needs::raise(&dirs, &need);
+                    for key in CONFIG_NEEDS.iter().filter(|k| **k != need.key) {
+                        let _ = agh::needs::clear(&dirs, key);
+                    }
                 }
                 return Err(Error::cannot_run(config_refusal(
                     &why,
@@ -339,7 +361,9 @@ impl Ctx {
                 )));
             }
         };
-        clear_config_needs(&dirs);
+        if learn {
+            clear_config_needs(&dirs);
+        }
         ctx.hosts = Hosts {
             staging: Arc::new(staging),
             channel,
@@ -402,6 +426,19 @@ impl Ctx {
             .map(|token| token.is_some())
             .map_err(|why| why.replace(&path.display().to_string(), &self.shown(path)))
     }
+}
+
+/// The aterm checkout a run acts on, read when it runs: two levels above `CARGO_MANIFEST_DIR`,
+/// which `targo run` and `targo test` set for the process they start to this package in the
+/// checkout they built it from; else, for a process no Cargo started (a lane snapshot under its
+/// unit, a binary run by its path), the working directory: `lane install` snapshots the checkout
+/// it is run in, and a lane unit runs in `$HOME`, where a `dist/` roster is read only if one is
+/// there.
+fn checkout_root() -> PathBuf {
+    non_empty_env("CARGO_MANIFEST_DIR").map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        |package| package.join("../.."),
+    )
 }
 
 fn non_empty_env(name: &str) -> Option<PathBuf> {

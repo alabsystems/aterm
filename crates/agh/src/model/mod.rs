@@ -593,13 +593,21 @@ impl Sha256Digest {
 
 impl std::fmt::Display for Sha256Digest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sha256:{}", self.hex())
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 71];
+        buf[..7].copy_from_slice(b"sha256:");
+        for (i, &byte) in self.0.iter().enumerate() {
+            buf[7 + i * 2] = HEX[usize::from(byte >> 4)];
+            buf[7 + i * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        let text = std::str::from_utf8(&buf).expect("ASCII hex is valid UTF-8");
+        f.write_str(text)
     }
 }
 
 impl std::fmt::Debug for Sha256Digest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sha256:{}", self.hex())
+        std::fmt::Display::fmt(self, f)
     }
 }
 

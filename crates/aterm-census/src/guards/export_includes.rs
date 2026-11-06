@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{Bound, Corpus, Finding, Rule, SourceFile, Tree, hits};
+use super::{Bound, Corpus, Finding, Rule, SourceFile, Tree, hits, literal, open_delim, token};
 use crate::export::{ASTREAM, MANIFEST, Selection, astream_carries};
 
 pub(super) const EXPORT_INCLUDES: Rule = Rule {
@@ -169,29 +169,6 @@ fn argument(code: &str, text: &str, at: usize, close_delim: &str) -> Option<(boo
         path.push_str(part);
         at = next;
     }
-}
-
-/// The offset just past a macro's opening delimiter `(`, `[`, or `{`, paired with its closer.
-fn open_delim(code: &str, at: usize) -> Option<(usize, &'static str)> {
-    token(code, at, "(")
-        .map(|p| (p, ")"))
-        .or_else(|| token(code, at, "[").map(|p| (p, "]")))
-        .or_else(|| token(code, at, "{").map(|p| (p, "}")))
-}
-
-/// The offset just past `tok`, when it is the next thing after blanks from `at`.
-fn token(code: &str, at: usize, tok: &str) -> Option<usize> {
-    let rest = code.get(at..)?;
-    let start = at + (rest.len() - rest.trim_start().len());
-    code[start..].starts_with(tok).then_some(start + tok.len())
-}
-
-/// The string literal that is the next thing after blanks from `at` (the CODE view keeps
-/// only a one-line literal's two quotes): its text, and the offset just past it.
-fn literal<'a>(code: &str, text: &'a str, at: usize) -> Option<(&'a str, usize)> {
-    let open = token(code, at, "\"")?;
-    let close = open + code[open..].find('"')?;
-    Some((text.get(open..close)?, close + 1))
 }
 
 /// The nearest directory at or above `dir` that holds a `Cargo.toml`.

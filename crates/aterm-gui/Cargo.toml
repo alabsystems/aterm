@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-gui"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -205,7 +205,8 @@ path = "examples/objc_frame_clock_drive.rs"
 # at an injected clock) and prints each frame's stream, pixel, deadline, sound and state words.
 # Its script grammar and printer (`examples/support/trail_script.rs`) are tested by
 # `src/trail_dump_tests.rs`; by hand it is
-# `targo --unverified run -p aterm-gui --features bench-support --example trail_dump -- <script.trail>...`.
+# `targo --unverified run -p aterm-gui --features bench-support --example trail_dump -- <script.trail>...`,
+# run from the checkout's root.
 [[example]]
 name = "trail_dump"
 path = "examples/trail_dump.rs"
@@ -370,6 +371,7 @@ aterm-search = { workspace = true }
 aterm-hash = { workspace = true }
 # Keep this edge featureless: a feature enabled here turns on for every consumer of
 # aterm-types in the same resolve.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # Settings ▸ Themes ▸ Community: the community theme pack, embedded.
 aterm-theme-pack = { workspace = true }

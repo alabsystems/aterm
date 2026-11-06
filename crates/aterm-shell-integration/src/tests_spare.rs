@@ -1680,7 +1680,7 @@ fn a_fish_counts_the_prompt_handlers_defined_ahead_of_aterms_alone() {
     let fish = need_fish();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.fish",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let output = shell_command(fish)
         .arg("-i")
@@ -1751,7 +1751,7 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
         std::fs::copy(
             format!(
                 "{}/src/scripts/aterm_shell_integration.fish",
-                env!("CARGO_MANIFEST_DIR")
+                aterm_tempfile::manifest_dir().display()
             ),
             vendor.join("aterm_shell_integration.fish"),
         )

@@ -28,7 +28,7 @@ pub struct Paths {
     pub user: String,
     /// This program.
     pub exe: PathBuf,
-    /// The checkout this program was built from.
+    /// The checkout this program runs from, read when it runs ([`checkout`]).
     pub repo: PathBuf,
 }
 
@@ -87,10 +87,7 @@ impl Paths {
     /// [`Paths::resolve`] with the account database's home (`account`) and `$HOME` (`home`) given.
     #[must_use]
     pub fn resolve_with(account: Option<PathBuf>, home: Option<OsString>) -> Paths {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let repo = checkout();
         let fallback = || default_state(crate::sys::getuid(), &physical(&repo));
         let (state, state_relative, state_default) = match std::env::var_os("LAB_STATE") {
             Some(os) if !os.is_empty() => {
@@ -285,10 +282,10 @@ impl Paths {
             .map_or_else(|| PathBuf::from("/"), physical)
     }
 
-    /// This program's own source (`crates/aterm-lab`).
+    /// This program's own source (`crates/aterm-lab` in [`Self::repo`]).
     #[must_use]
     pub fn crate_dir(&self) -> PathBuf {
-        physical(Path::new(env!("CARGO_MANIFEST_DIR")))
+        physical(&self.repo.join(CRATE_DIR))
     }
 
     /// The aterm under test, or the refusal that says how to get one.
@@ -332,6 +329,37 @@ impl Paths {
     pub fn run_dir(&self, tag: &str) -> PathBuf {
         self.state.join("runs").join(tag)
     }
+}
+
+/// This crate's directory in a checkout.
+const CRATE_DIR: &str = "crates/aterm-lab";
+
+/// The checkout this program runs from, read when it runs (a build directory reused at another
+/// path serves that path's checkout): the nearest directory holding this crate's manifest
+/// ([`CRATE_DIR`]) at or above `CARGO_MANIFEST_DIR`, which `targo --unverified lab` (a `targo
+/// run`) and `targo test` set to this crate's directory; else at or above the working directory,
+/// where verify starts its lab lanes (the checkout's root, with `CARGO_MANIFEST_DIR` removed);
+/// else `.`.
+fn checkout() -> PathBuf {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    checkout_from(manifest.into_iter().chain(std::env::current_dir().ok()))
+}
+
+/// [`checkout`] from each of `starts` in turn: the first nearest directory at or above one that
+/// holds [`CRATE_DIR`]'s manifest, else `.`.
+fn checkout_from(starts: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+    let manifest_file = Path::new(CRATE_DIR).join("Cargo.toml");
+    starts
+        .into_iter()
+        .find_map(|start| {
+            start
+                .ancestors()
+                .find(|dir| dir.join(&manifest_file).is_file())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
@@ -541,6 +569,35 @@ pub fn profile_safe(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checkout is the nearest one holding the lab's crate above the package directory the
+    /// run names, else above the working directory, else `.`. NEGATIVE CONTROL: a start inside a
+    /// tree without the lab's crate (a second checkout's sibling, a scratch folder) names no
+    /// checkout and gives way to the next.
+    #[test]
+    fn the_checkout_is_the_nearest_one_holding_the_lab_above_where_the_run_starts() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
+        for checkout in [&first, &second] {
+            std::fs::create_dir_all(checkout.join(CRATE_DIR)).unwrap();
+            std::fs::write(checkout.join(CRATE_DIR).join("Cargo.toml"), "").unwrap();
+        }
+        let elsewhere = scratch.path().join("elsewhere/deep");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(checkout_from([second.join(CRATE_DIR)]), second);
+        assert_eq!(checkout_from([first.join("crates/other/src")]), first);
+        assert_eq!(
+            checkout_from([second.join(CRATE_DIR), first.clone()]),
+            second
+        );
+        assert_eq!(checkout_from([elsewhere.clone(), first.clone()]), first);
+        assert_eq!(checkout_from([elsewhere]), PathBuf::from("."));
+        assert_eq!(
+            checkout().join(CRATE_DIR),
+            aterm_tempfile::manifest_dir(),
+            "this run's checkout holds the package it runs"
+        );
+    }
 
     #[test]
     fn forgets_agent_and_aterm_variables_and_keeps_the_rest() {

@@ -414,11 +414,24 @@ pub fn current_report_json(s: &Snapshot) -> Jv {
     ])
 }
 
+/// The reason every reading of a CPU Stats sample gives on a platform with no source for it
+/// (`aterm_sysprobe::cpu_hardware`'s arm off macOS; macOS's own reasons name a cause after a
+/// colon, `unsupported:ioreport_library`): the clauses those sources feed are absent there, not
+/// unavailable.
+pub const NO_SOURCE: &str = "unsupported";
+
+/// Whether `r`'s source exists on this machine: every reading but [`NO_SOURCE`].
+fn here<T>(r: &crate::hardware::Reading<T>) -> bool {
+    !matches!(r, Err(why) if why == NO_SOURCE)
+}
+
 /// Report clauses shared by the control interface and the resource panel. The CPU Stats
 /// clauses (the IOReport window, online CPUs and the CLPC mask, power limits, channels, and the
 /// pointer to inspect and resample them) need a sample, which a snapshot holds only where a
 /// lens, the recorder or a pull took one (A2 §6.4); the thermal state, a prior process's report,
-/// saved underuse and the policy collection do not.
+/// saved underuse and the policy collection do not. Each CPU Stats clause prints only where its
+/// source exists on this machine ([`NO_SOURCE`]), and the pointer only beside one of them. An OS
+/// thermal level says it is the OS's; a heuristic one says it is an estimate, never an OS state.
 #[must_use]
 pub fn lines(s: &Snapshot) -> Vec<String> {
     let mut policy = Vec::new();
@@ -438,7 +451,9 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
     }
     let h = s.hardware.as_ref();
     let mut out = Vec::new();
-    if let Some(h) = h {
+    let mut sourced = false;
+    if let Some(h) = h.filter(|h| here(&h.channels)) {
+        sourced = true;
         out.push(format!(
             "CPU hardware: native IOReport, {} ms window; cause not established",
             h.window_ns / 1_000_000
@@ -448,8 +463,11 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
         out.push("A prior process's anomaly report is retained for export; it is historical, not a current diagnosis".into());
     }
     out.extend(policy);
-    if let Some(h) = h {
-        let controls = &h.controls;
+    if let Some(controls) = h
+        .map(|h| &h.controls)
+        .filter(|c| here(&c.active_cpus) || here(&c.requested_recommended_mask))
+    {
+        sourced = true;
         out.push(format!(
             "Online CPUs: {}; requested CLPC mask: {}; effective mask unavailable",
             controls
@@ -462,19 +480,30 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
                 .map_or_else(|e| format!("unavailable ({e})"), |v| format!("0x{v:x}"))
         ));
     }
-    if let Some(t) = s.thermal {
-        out.push(format!("OS thermal state {} ({}); low power {}; nominal thermal state does not exclude another limit",
-            t.raw, t.word(), t.low_power.map_or("unavailable", |v| if v { "on" } else { "off" })));
+    match s.thermal {
+        Some(t) if t.exact => out.push(format!("OS thermal state {} ({}); low power {}; nominal thermal state does not exclude another limit",
+            t.raw, t.word(), t.low_power.map_or("unavailable", |v| if v { "on" } else { "off" }))),
+        Some(t) => out.push(format!(
+            "thermal estimate: {} (from thermal-zone trips; this computer reports no thermal state)",
+            t.word()
+        )),
+        None => {}
     }
     if let Some(h) = h {
-        out.push(match &h.controls.power_limits {
-            Err(e) => format!("Public CPU power limits unavailable ({e}); no unrestricted claim"),
-            Ok(p) => format!(
-                "Public CPU speed/scheduler limits: {:?} / {:?}; other limits may exist",
-                p.speed_percent, p.scheduler_percent
-            ),
-        });
+        if here(&h.controls.power_limits) {
+            sourced = true;
+            out.push(match &h.controls.power_limits {
+                Err(e) => {
+                    format!("Public CPU power limits unavailable ({e}); no unrestricted claim")
+                }
+                Ok(p) => format!(
+                    "Public CPU speed/scheduler limits: {:?} / {:?}; other limits may exist",
+                    p.speed_percent, p.scheduler_percent
+                ),
+            });
+        }
         match &h.channels {
+            Err(why) if why == NO_SOURCE => {}
             Err(why) => out.push(format!("CPU frequency/residency unavailable ({why})")),
             Ok(channels) => {
                 for c in channels {
@@ -497,7 +526,7 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
             b.frames.len()
         ));
     }
-    if h.is_some() {
+    if sourced {
         out.push("Inspect/export: aterm ctl @self sys cores --json. Resample: aterm ctl @self sys cores fresh=0 --json. Administrator frequency/thermal trace may be needed; no reboot or policy change is automatic.".into());
     }
     out
@@ -507,6 +536,56 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::hardware::{Channel, State};
+
+    /// A3 L2 (D2): a heuristic thermal level (Linux's, from thermal-zone trips and, where the
+    /// CPUs have them, throttle counters) says at every level, in the design's words, that it is
+    /// an estimate from thermal-zone trips and that this computer reports no thermal state; it is
+    /// never called an OS thermal state, in `sys` or the CPU lens, which both print these lines.
+    /// NEGATIVE CONTROL: an exact level, the OS's own (macOS), keeps its OS thermal state line.
+    #[test]
+    fn a_heuristic_thermal_level_is_never_called_an_os_state() {
+        use crate::model::{Thermal, Throttle};
+        let said = |thermal: Thermal| {
+            lines(&Snapshot {
+                thermal: Some(thermal),
+                ..Snapshot::default()
+            })
+        };
+        for level in [
+            Throttle::None,
+            Throttle::Light,
+            Throttle::Heavy,
+            Throttle::Severe,
+        ] {
+            let heuristic = Thermal {
+                level,
+                raw: u8::try_from(level.rank()).unwrap_or(0),
+                low_power: None,
+                exact: false,
+            };
+            assert_eq!(
+                said(heuristic),
+                [format!(
+                    "thermal estimate: {} (from thermal-zone trips; this computer reports no \
+                     thermal state)",
+                    level.word()
+                )]
+            );
+        }
+        let os = Thermal {
+            level: Throttle::None,
+            raw: 0,
+            low_power: Some(false),
+            exact: true,
+        };
+        assert_eq!(
+            said(os),
+            [
+                "OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude \
+              another limit"
+            ]
+        );
+    }
     #[test]
     fn cpu_hardware_export_keeps_raw_bytes_and_unavailable_limits_distinct() {
         let mut h = Sample::unavailable("refused:ioreport_subscription");
@@ -555,7 +634,10 @@ mod tests {
                 ],
                 ..crate::model::CpuView::default()
             }),
-            thermal: Some(crate::model::Thermal::default()),
+            thermal: Some(crate::model::Thermal {
+                exact: true,
+                ..crate::model::Thermal::default()
+            }),
             cpu_counter_sample: Some(vec![
                 crate::model::Ticks {
                     busy: u64::MAX,

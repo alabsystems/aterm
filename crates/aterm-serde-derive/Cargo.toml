@@ -18,7 +18,7 @@
 [package]
 name = "aterm-serde-derive"
 description = "#[derive(Serialize, Deserialize)] for aterm-serde, on std proc_macro: aterm's closed set of #[serde] attributes. Derived from serde_derive 1.0.228; MIT OR Apache-2.0 upstream."
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

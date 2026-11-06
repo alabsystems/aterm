@@ -1386,8 +1386,8 @@ fn probe_opened(file: File, path: &Path, held: bool, reap: bool) -> io::Result<O
                 return Err(invalid("locked capacity record exceeds its size bound"));
             }
             let mut bytes = Vec::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0));
-            (&file).take(RECORD_MAX).read_to_end(&mut bytes)?;
-            if file.metadata()?.len() > RECORD_MAX {
+            (&file).take(RECORD_MAX + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > RECORD_MAX {
                 return Err(invalid("locked capacity record grew past its size bound"));
             }
             let text = std::str::from_utf8(&bytes)

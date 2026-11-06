@@ -20,7 +20,7 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
     let floors = state::floors_or_refuse(sys, layout).unwrap_or_default();
     Hello {
         schema: crate::SCHEMA,
-        agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        agent_version: aterm_stamp::app_version().to_owned(),
         agent_sha256: std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .ok()

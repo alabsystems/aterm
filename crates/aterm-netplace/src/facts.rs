@@ -112,6 +112,13 @@ pub fn compose(
     (route_facts(primary, interfaces), None)
 }
 
+fn live_routes_now() -> (Option<RouteFacts>, Option<String>) {
+    compose(
+        &aterm_uds::network::default_routes(),
+        &aterm_uds::network::interfaces().unwrap_or_default(),
+    )
+}
+
 /// The route facts now, read from the kernel's tables with no packet, or the scripted ones
 /// ([`scripted`]).
 #[must_use]
@@ -119,10 +126,7 @@ pub fn routes_now() -> (Option<RouteFacts>, Option<String>) {
     if let Some(script) = scripted() {
         return (script.facts.route, script.facts.tunnel);
     }
-    compose(
-        &aterm_uds::network::default_routes(),
-        &aterm_uds::network::interfaces().unwrap_or_default(),
-    )
+    live_routes_now()
 }
 
 /// The facts a reader that runs no path monitor reads now: the routes ([`routes_now`]), and the
@@ -132,7 +136,7 @@ pub fn reader_facts() -> Facts {
     if let Some(script) = scripted() {
         return script.facts;
     }
-    let (route, tunnel) = routes_now();
+    let (route, tunnel) = live_routes_now();
     Facts {
         route,
         tunnel,
@@ -397,8 +401,13 @@ fn parse_hw(text: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn parse_script(text: &str) -> Script {
     let mut script = Script::default();
+    let mut words = Vec::with_capacity(8);
     for line in text.lines().map(str::trim) {
-        let words: Vec<&str> = line.split_whitespace().collect();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        words.clear();
+        words.extend(line.split_whitespace());
         match words.as_slice() {
             ["route", interface, cidr, rest @ ..] => {
                 let Some((address, prefix)) = cidr.split_once('/') else {
@@ -600,7 +609,7 @@ impl Sense for Live {
         if let Some(script) = scripted() {
             return script.facts;
         }
-        let (route, tunnel) = routes_now();
+        let (route, tunnel) = live_routes_now();
         Facts {
             route,
             tunnel,

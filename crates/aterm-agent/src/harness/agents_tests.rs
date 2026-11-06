@@ -6,10 +6,9 @@
 use super::*;
 use crate::harness::footer::agents_panel_under;
 use aterm_phase::agents_panel::{one_cell, parse_row};
-use std::path::Path;
 
 fn fixture(name: &str) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures")
         .join(name);
     std::fs::read_to_string(path)
@@ -574,7 +573,7 @@ fn the_files_can_move_while_the_screen_does_not() {
 }
 
 fn flight_file(name: &str) -> FlightFold {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("src/harness/testdata/flight")
         .join(name);
     let mut fold = FlightFold::new();
@@ -608,7 +607,7 @@ fn the_measured_long_call_reads_tool_not_stuck() {
         fixture("claude-2.1.304-agents-panel-long-bash-8s-120col.txt"),
         fixture("claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt"),
     );
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("src/harness/testdata/flight/claude-2.1.304-long-bash.jsonl");
     let text = std::fs::read_to_string(path).unwrap();
     let mut long = FlightFold::new();
@@ -653,7 +652,7 @@ fn the_measured_workflow_reads_tool_not_stuck() {
         fixture("claude-2.1.304-agents-panel-workflow-long-bash-8s-120col.txt"),
         fixture("claude-2.1.304-agents-panel-workflow-long-bash-2m46s-120col.txt"),
     );
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("src/harness/testdata/flight/claude-2.1.304-workflow-long.jsonl");
     let text = std::fs::read_to_string(path).unwrap();
     let mut long = FlightFold::new();

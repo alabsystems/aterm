@@ -72,9 +72,10 @@ pub fn signed_release_appcast(
     if manifest.version != version {
         return Err("release tag/appcast version mismatch".into());
     }
-    let commit_ok = manifest.commit.as_deref().is_some_and(|c| {
-        c.len() == 40 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    });
+    let commit_ok = manifest
+        .commit
+        .as_deref()
+        .is_some_and(|c| aterm_codec::hex::is_lower(c, 40));
     if !commit_ok {
         return Err("invalid source commit".into());
     }

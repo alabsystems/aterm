@@ -23,7 +23,7 @@ pub struct BundleSpec {
     pub build_number: u64,
     /// CFBundleIdentifier ([`BUNDLE_ID`]).
     pub bundle_id: String,
-    /// ATermGitCommit stamp: short=12, the spelling the build pins as the binary's own ATERM_GIT_COMMIT, so plist and binary agree.
+    /// ATermGitCommit stamp: short=12, the spelling the build pins as the commit of the binary's identity record, so plist and binary agree.
     pub git_commit: String,
     /// The ship-ready (universal, stripped) binary from `buildplan::run`.
     pub aterm_bin: PathBuf,
@@ -146,7 +146,12 @@ pub fn staging_dir_name(build: u64) -> String {
 pub fn is_staging_dir_name(name: &str) -> bool {
     name.strip_prefix("cut-")
         .and_then(|rest| rest.strip_suffix(".noindex"))
-        .is_some_and(|n| n.parse::<u64>().is_ok_and(|k| k.to_string() == n))
+        .is_some_and(|n| {
+            !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && (n == "0" || !n.starts_with('0'))
+                && n.parse::<u64>().is_ok()
+        })
 }
 
 /// Where this cut's bundle is signed, notarized and packaged: `dist/cut-<build>.noindex/aterm.app`.
@@ -222,7 +227,7 @@ pub fn prune_staging_dirs(
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| is_staging_dir_name(&entry.file_name().to_string_lossy()))
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_staging_dir_name))
         .map(|entry| entry.path())
         .filter(|path| path != keep)
         .collect();

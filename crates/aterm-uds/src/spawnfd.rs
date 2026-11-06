@@ -1240,6 +1240,56 @@ mod platform {
         ExecImage, F_GETFD, F_SETFD, Image, InheritStrip, Placement, Source, exec_dispatch,
         exec_now_us, fcntl, off_the_targets, resolve, waitpid,
     };
+
+    /// A NATIVE IMAGE'S EXEC, PREPARED BEFORE A FORK for the child to run in its last hook
+    /// ([`super::NativeImage`]): `std`'s child runs `execvp`, which hands a file the
+    /// kernel will not execute (`ENOEXEC`) to the system shell; this `execve` returns that error.
+    pub(super) struct NativeExec(ExecImage);
+
+    // SAFETY: the pointer arrays address C strings the same value owns, which nothing mutates
+    // or frees while it lives; moving or sharing the value moves or shares their owner with them.
+    unsafe impl Send for NativeExec {}
+    // SAFETY: as for `Send`; the only use through a shared reference (`exec`) reads them.
+    unsafe impl Sync for NativeExec {}
+
+    impl NativeExec {
+        /// The image `program` names (a bare name searched for now, on the child's `PATH`),
+        /// with `args`, `argv[0]` replaced by `arg0` when given, and the environment `env`.
+        ///
+        /// # Errors
+        /// A NUL in a string, or a bare name the search does not find or may not run.
+        pub(super) fn prepare(
+            program: &std::ffi::OsStr,
+            arg0: Option<&std::ffi::OsStr>,
+            args: &[std::ffi::OsString],
+            env: &[(std::ffi::OsString, std::ffi::OsString)],
+        ) -> io::Result<Self> {
+            let mut image = Image::build(program, args, env)?;
+            if let Some(arg0) = arg0 {
+                image.argv[0] = super::c_string(arg0.as_bytes())?;
+            }
+            let path = resolve(
+                std::ffi::OsStr::from_bytes(image.program.as_bytes()),
+                image.search.as_deref(),
+            )?;
+            Ok(Self(ExecImage::new(image, path)))
+        }
+
+        /// Replace this process with the image; what returns is the exec's error. Calls only
+        /// `execve` and reads `errno`: no allocation or lock, so a forked child may call it.
+        pub(super) fn exec(&self) -> io::Error {
+            // SAFETY: `self` owns every C string and null-terminated pointer array through the
+            // call; the kernel retains none on a returned error.
+            unsafe {
+                execve(
+                    self.0.path.as_ptr(),
+                    self.0.argv.as_ptr(),
+                    self.0.envp.as_ptr(),
+                )
+            };
+            io::Error::last_os_error()
+        }
+    }
     use core::ffi::{c_char, c_void};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -1916,6 +1966,17 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 pub trait Tether {
     /// Tie the child to this process.
     fn tether(&mut self) -> &mut Self;
+}
+
+/// A spawn of THE PROGRAM'S OWN IMAGE: a file the kernel will not execute (`ENOEXEC`) fails the
+/// spawn with that error, where by default the spawn runs it as a script of the system shell, as
+/// `execvp` does, and the shell's exit stands for the program's. For a caller that asks whether
+/// the image itself runs here. A spawn on macOS or Linux; elsewhere, with a tether (whose
+/// helper is what the spawn starts), and on Linux for a bare name started in another directory
+/// (`current_dir`), the spawn refuses it (`Unsupported`).
+pub trait NativeImage {
+    /// Run the program's own image (`true`), never a shell over it.
+    fn native_image(&mut self, native: bool) -> &mut Self;
 }
 
 #[path = "spawnfd_transparent.rs"]

@@ -180,11 +180,16 @@ mod imp {
             let meta = file.metadata()?;
             let fflags = match kind {
                 Kind::Dir if meta.is_dir() => {
-                    libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE
+                    libc::NOTE_WRITE
+                        | libc::NOTE_ATTRIB
+                        | libc::NOTE_DELETE
+                        | libc::NOTE_RENAME
+                        | libc::NOTE_REVOKE
                 }
                 Kind::File if meta.is_file() => {
                     libc::NOTE_WRITE
                         | libc::NOTE_EXTEND
+                        | libc::NOTE_ATTRIB
                         | libc::NOTE_DELETE
                         | libc::NOTE_RENAME
                         | libc::NOTE_REVOKE
@@ -301,6 +306,7 @@ mod imp {
     const IN_IGNORED: u32 = 0x0000_8000;
 
     const DIR_MASK: u32 = libc::IN_CREATE
+        | libc::IN_ATTRIB
         | libc::IN_DELETE
         | libc::IN_MOVED_FROM
         | libc::IN_MOVED_TO
@@ -310,6 +316,7 @@ mod imp {
         | libc::IN_DONT_FOLLOW;
 
     const FILE_MASK: u32 = IN_MODIFY
+        | libc::IN_ATTRIB
         | IN_CLOSE_WRITE
         | libc::IN_DELETE_SELF
         | libc::IN_MOVE_SELF
@@ -606,6 +613,60 @@ mod tests {
         out.write_all(b"\n").unwrap();
         drop(out);
         assert_eq!(watcher.wait(NOW).unwrap(), [file]);
+    }
+
+    #[test]
+    fn permission_changes_name_the_watched_file_and_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::testdir::dir("atpkg-dirwatch-permissions-");
+        let parent = root.join("source");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("input");
+        std::fs::write(&path, b"inert input").unwrap();
+        let mode = |path: &Path, value| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(value)).unwrap();
+        };
+        mode(&parent, 0o700);
+        mode(&path, 0o600);
+        let watcher = Watcher::new().unwrap();
+        let directory = watcher.add_dir(&parent).unwrap();
+        let file = watcher.add_file(&path).unwrap();
+        for (path, value, expected) in [
+            (&path, 0o400, file),
+            (&path, 0o600, file),
+            (&parent, 0o500, directory),
+            (&parent, 0o700, directory),
+        ] {
+            mode(path, value);
+            assert_eq!(
+                watcher.wait(Some(aterm_spec::wait::MUST_HAPPEN)).unwrap(),
+                [expected],
+                "an input's permissions can change its availability without replacing it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_sample_does_not_notify_attribute_watchers() {
+        let root = crate::testdir::dir("atpkg-dirwatch-read-only-");
+        let path = root.join("input");
+        std::fs::write(&path, b"inert input").unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        let watcher = Watcher::new().unwrap();
+        watcher.add_dir(&root).unwrap();
+        watcher.add_file(&path).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"inert input");
+        assert!(
+            watcher.wait(NOW).unwrap().is_empty(),
+            "a local read must not keep waking its own input watch"
+        );
     }
 
     #[test]

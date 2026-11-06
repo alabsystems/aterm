@@ -15,20 +15,17 @@ use std::net::{IpAddr, SocketAddr};
 /// Network, since a dial of a LAN address would ask it then, nor once it was refused, and says
 /// which; none the fleet's guard refuses to dial ([`aterm_net::loopback::check`]: off an
 /// isolated debug drive's loopback, and every member from a private aterm, since the port is the
-/// person's); none while this Mac's deny list cannot be read.
+/// person's); none while this Mac's deny list cannot be read. The deny list and the membership
+/// log are those of the vault this process's fleet readers read ([`aterm_gui::vault_here`]), so
+/// a download and the window's archive server beside it read one.
 pub(crate) fn fleet() -> atpkg::peers::Fleet {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return atpkg::peers::Fleet::default();
     };
-    let isolated = cfg!(test)
-        || std::env::var_os("ATERM_STATE_HOME").is_some()
-        || std::env::var_os("CI").is_some();
-    // A live run with no home reads no vault, so no deny list: it dials no member, as with no
-    // state directory.
-    let paths = match (!isolated).then(aterm_secrets::client::Paths::live) {
-        None => None,
-        Some(Ok(paths)) => Some(paths),
-        Some(Err(_)) => return atpkg::peers::Fleet::default(),
+    // A run on the account's own state that cannot find its vault reads no deny list: it dials
+    // no member, as with no state directory.
+    let Ok(paths) = aterm_gui::vault_here() else {
+        return atpkg::peers::Fleet::default();
     };
     let log = paths
         .as_ref()
@@ -59,9 +56,10 @@ fn may_dial(at: SocketAddr) -> bool {
 }
 
 /// The fleet's addresses (`addrs` under a deny list) as this Mac's deny list in `vault` lets them
-/// in (`read`): an isolated run reads no vault (`None`), so its list names no one; a vault whose
-/// deny list cannot be read now (`Err`, or `Ok(None)`: a sync applying, a failed apply) lets no
-/// member's address in until it can.
+/// in (`read`): a process that reads no vault (`None`: under a private state root,
+/// [`aterm_gui::vault_here`]) has a list that names no one; a vault whose deny list cannot be
+/// read now (`Err`, or `Ok(None)`: a sync applying, a failed apply) lets no member's address in
+/// until it can.
 fn members_of(
     vault: Option<&aterm_secrets::client::Paths>,
     read: impl FnOnce(&aterm_secrets::client::Paths) -> aterm_secrets::Result<Option<Vec<String>>>,
@@ -154,8 +152,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     /// A download lets in no member's address while this Mac's deny list cannot be read (a failed
-    /// read, or a sync applying), only once it reads; an isolated run reads no vault, and so
-    /// names no one.
+    /// read, or a sync applying), only once it reads; a process under a private state root reads
+    /// no vault, and so names no one.
     ///
     /// NEGATIVE CONTROL (2026-11-01): with `members_of` reading an unread deny list as one that
     /// names no one (`.unwrap_or_default()`, the shape before), this fails (`no member while the
@@ -180,8 +178,40 @@ mod tests {
             vec![member]
         );
         assert_eq!(
-            members_of(None, |_| panic!("an isolated run reads no vault"), addrs),
+            members_of(
+                None,
+                |_| panic!("a private state root reads no vault"),
+                addrs
+            ),
             vec![member]
+        );
+    }
+
+    /// A download reads the vault the window's fleet readers read, by where this process's state
+    /// root resolved (`aterm_gui::vault_here`, ATERM-KI-1105-10): this test binary runs under its
+    /// scratch root, a private one, so it reads none, with `CI` set as without. Here aterm-gui
+    /// builds as a library, so its predicate decides alone; in aterm-gui's own tests `cfg!(test)`
+    /// counts every run as private, and none of them can hold it.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): aterm-gui's `state_root_is_private` put back to the reading
+    /// before 2026-11-05 (`cfg!(test)`, `ATERM_STATE_HOME` or `CI` set) fails with `CI` unset,
+    /// on the vault read's own panic ("a private state root reads no vault"), so no vault is read.
+    #[test]
+    fn a_download_reads_the_vault_its_state_root_resolved_to() {
+        assert!(
+            aterm_types::dirs::runs_under_private_state_root(),
+            "PRECONDITION: a test binary runs under its scratch root"
+        );
+        let reads = || aterm_gui::vault_reading(|| panic!("a private state root reads no vault"));
+        assert_eq!(
+            aterm_log::env::scoped_unset("CI", reads),
+            Ok(None),
+            "a test binary's scratch root reads no vault, `CI` unset"
+        );
+        assert_eq!(
+            aterm_log::env::scoped("CI", "1", reads),
+            Ok(None),
+            "nor with `CI` set"
         );
     }
 

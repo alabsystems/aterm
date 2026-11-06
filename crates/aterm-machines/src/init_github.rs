@@ -26,6 +26,7 @@ mod repos;
 mod source;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
+pub use source::{RepositoryInputMark, repository_input_mark, repository_input_watch_paths};
 
 /// The private vault entries that determine default repository acquisition. Other vault
 /// entries must not invalidate a clone whose source and credential remain unchanged.

@@ -36,6 +36,10 @@ const INSTALLERS: &str = "pgrep -lf 'Install Command Line Developer Tools|softwa
 /// How long `offline` keeps the guest's network down.
 const OFFLINE_S: u64 = 30;
 
+/// The guest's `route` and `ifconfig`, by path: the guest shell's PATH has no /sbin.
+const ROUTE: &str = "/sbin/route";
+const IFCONFIG: &str = "/sbin/ifconfig";
+
 /// The guest commands that run `aterm init` under a coding agent: a perl whose `argv[0]` is
 /// `claude` (what SAFE-1's ancestry walk reads) runs the command it is handed as its child, and
 /// exits with its status.
@@ -670,11 +674,20 @@ pub fn first_change_after(looks: &[Look], since_ms: u64) -> Option<u64> {
 /// by the same root step (so it returns even if `tart exec` rode it): whether `tart exec` answers
 /// while it is down, setup's first progress after it is back, and the rows left not in place.
 pub(super) fn offline(g: &Guest, row: &mut Row) -> Result<(), Fail> {
-    let route = g.run("route -n get default 2>/dev/null", STEP)?;
+    // `route` and `ifconfig` are in /sbin, which the guest shell's PATH leaves out: a bare
+    // `route` printed nothing, so every offline row read "no default route" while the table held
+    // one (E3, 2026-11-05).
+    let route = g.run(&format!("{ROUTE} -n get default 2>/dev/null"), STEP)?;
     let Some(iface) = default_interface(&route).map(str::to_owned) else {
+        let table = g.run(
+            &format!(
+                "/usr/sbin/netstat -rn -f inet 2>&1 | head -8; {IFCONFIG} -a inet 2>&1 | grep -E '^[a-z]|inet ' | head -12"
+            ),
+            STEP,
+        )?;
         row.fail(format!(
             "the guest has no default route: {}",
-            squeeze(route.trim(), 120)
+            squeeze(&format!("{} {}", route.trim(), table.trim()), 300)
         ));
         return Ok(());
     };
@@ -684,14 +697,16 @@ pub(super) fn offline(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         &format!(
             "({} </dev/null >/dev/null 2>&1 &); sleep 0.5",
             g.as_root(&format!(
-                "ifconfig {iface} down; sleep {OFFLINE_S}; ifconfig {iface} up"
+                "{IFCONFIG} {iface} down; sleep {OFFLINE_S}; {IFCONFIG} {iface} up"
             ))
         ),
         STEP,
     )?;
     let launched = open_app(g)?;
-    let answered =
-        g.vm.exec("route -n get default >/dev/null 2>&1; echo $?", STEP);
+    let answered = g.vm.exec(
+        &format!("{ROUTE} -n get default >/dev/null 2>&1; echo $?"),
+        STEP,
+    );
     row.cell(
         format!("tart exec with {iface} down"),
         Value::Text(match answered {
@@ -705,7 +720,10 @@ pub(super) fn offline(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let up_ms = down_ms + OFFLINE_S * 1000;
     let back = Instant::now();
     while !g
-        .run("route -n get default >/dev/null 2>&1 && echo up", STEP)?
+        .run(
+            &format!("{ROUTE} -n get default >/dev/null 2>&1 && echo up"),
+            STEP,
+        )?
         .contains("up")
     {
         if back.elapsed() >= ROW {

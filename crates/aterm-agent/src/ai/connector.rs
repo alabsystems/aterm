@@ -972,7 +972,8 @@ const KIMI_AUTH_WORDS: &[&str] = &[
 /// Kimi Code's words for a usage limit: its own quota classifier's (2.3.3's
 /// `KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS` and `_ERROR_CODES`, held as `kimi.wall.*` anchors),
 /// so a 429 kimi gives up on after its retries (`provider.rate_limit: 429 You exceeded your
-/// current quota, …`) is a limit.
+/// current quota, …`) is a limit. The message words are the server's: 2.5 matches none of them,
+/// but fails at once on a quota and shows the server's message (`[provider.api_error] …`).
 const KIMI_LIMIT_WORDS: &[&str] = &[
     "exceeded your current quota",
     "exceeded your current token quota",

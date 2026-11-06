@@ -1721,13 +1721,46 @@ fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
         Found::Refuses(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::Unanswered { driver: cc }, true),
+        super::clt_found(
+            &CcVerdict::Unanswered {
+                driver: cc,
+                bound: atpkg::prereq::PROBE_TIMEOUT
+            },
+            true
+        ),
         Found::Unknown(_)
     ));
     assert!(matches!(
         super::clt_found(&CcVerdict::NotProbed, true),
         Found::NotHere(_)
     ));
+}
+
+/// `base.clt`'s probe is one a person waits on: a compiler whose build answers only after the
+/// 5 s a status read waits (a new Mac's first compile behind macOS's first check of it, which a
+/// slow network stretches) reads as there, not unknown, so the Mac Setup tab goes on to setup's
+/// one password (E3's lossy row, 2026-11-05: 8.0 s for the first compile at 1 Mbit/s).
+/// NEGATIVE CONTROL: the probe with a status read's bound (`atpkg::prereq::probe`) reads it as
+/// unanswered.
+#[cfg(target_os = "macos")]
+#[test]
+fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let cc = root.path().join("cc");
+    std::fs::write(
+        &cc,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\n/bin/sleep {}\nprintf x > \"$2\"\n",
+            atpkg::prereq::PROBE_TIMEOUT.as_secs() + 1
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        super::base_clt_probe(Some(root.path().as_os_str())),
+        atpkg::prereq::CcVerdict::Ready { driver: cc }
+    );
 }
 
 /// A develop layer stand-in (macOS's is `aterm_machines::init::Doctor`): the rows its items
@@ -2626,7 +2659,13 @@ fn base_clt_wants_the_tools_git_beside_an_xcode_compiler() {
         Found::Missing(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::Unanswered { driver }, false),
+        super::clt_found(
+            &CcVerdict::Unanswered {
+                driver,
+                bound: atpkg::prereq::PROBE_TIMEOUT
+            },
+            false
+        ),
         Found::Unknown(_)
     ));
 }

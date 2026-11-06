@@ -363,12 +363,15 @@ impl Stamp {
         })
     }
 
-    fn pins(&self) -> [(&'static str, String); 4] {
+    /// The identity record's inputs (`aterm_stamp::input`), `commit` mode with this stamp's pins.
+    fn pins(&self) -> [(&'static str, String); 5] {
+        use aterm_stamp::input;
         [
-            ("SOURCE_DATE_EPOCH", self.build.to_string()),
-            ("ATERM_BUILD_GIT_COMMIT", self.commit.clone()),
-            ("ATERM_BUILD_GIT_COMMIT_FULL", self.commit_full.clone()),
-            ("ATERM_BUILD_DEV_COMMITS", self.dev_commits.to_string()),
+            (input::MODE, "commit".to_string()),
+            (input::EPOCH, self.build.to_string()),
+            (input::COMMIT, self.commit.clone()),
+            (input::FULL_COMMIT, self.commit_full.clone()),
+            (input::DEV_COMMITS, self.dev_commits.to_string()),
         ]
     }
 }
@@ -422,7 +425,9 @@ fn build_command(
         "CARGO_BUILD_RUSTC",
         "RUSTUP_TOOLCHAIN",
         "CARGO_BUILD_TARGET",
-        crate::buildplan::RELEASE_BUILD_MARKER,
+        // A dev app is no release product and carries no published index run.
+        aterm_stamp::input::RELEASE,
+        aterm_stamp::input::INDEX_HINT,
     ] {
         cmd.env_remove(key);
     }
@@ -724,7 +729,8 @@ fn copy_tree_kind(
             let ft = entry
                 .file_type()
                 .map_err(|e| format!("stat {}: {e}", src.display()))?;
-            copy_tree_kind(&entry.path(), &dst.join(entry.file_name()), ft, None)?;
+            let name = entry.file_name();
+            copy_tree_kind(&src.join(&name), &dst.join(&name), ft, None)?;
         }
         return atpkg::platform::set_mode(dst, atpkg::platform::permission_mode(meta) & 0o7777)
             .map_err(|e| format!("chmod {}: {e}", dst.display()));
@@ -1127,11 +1133,13 @@ mod tests {
             "CARGO_BUILD_RUSTC",
             "RUSTUP_TOOLCHAIN",
             "CARGO_BUILD_TARGET",
-            crate::buildplan::RELEASE_BUILD_MARKER,
+            aterm_stamp::input::RELEASE,
+            aterm_stamp::input::INDEX_HINT,
         ] {
             assert_eq!(envs.get(scrubbed), Some(&None), "{scrubbed}");
         }
         for (key, value) in [
+            ("ATERM_STAMP", "commit"),
             ("SOURCE_DATE_EPOCH", "1790000000"),
             ("ATERM_BUILD_GIT_COMMIT", "0123456789ab-dirty"),
             (
@@ -1330,7 +1338,7 @@ mod tests {
 
     #[test]
     fn the_dev_bundle_is_the_release_layout_under_its_own_identity() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = aterm_tempfile::manifest_dir().join("../..");
         let (_dir, out) = scratch();
         let bin = out.join("aterm-binary");
         std::fs::write(&bin, b"\xcf\xfa\xed\xfe not really a Mach-O").unwrap();
@@ -1367,7 +1375,7 @@ mod tests {
 
     #[test]
     fn a_rebuilt_binary_changes_the_dev_bundles_info_plist() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = aterm_tempfile::manifest_dir().join("../..");
         let (_dir, out) = scratch();
         let bin = out.join("aterm-binary");
         let stamp = stamp();

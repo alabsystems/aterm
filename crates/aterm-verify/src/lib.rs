@@ -20,6 +20,7 @@ mod compiler_message;
 pub mod disk;
 pub mod docdriver;
 pub mod docscan;
+pub mod event_log;
 pub mod exec;
 pub mod findings;
 pub mod fmt;
@@ -44,14 +45,19 @@ pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
 pub mod test_history;
+pub mod test_index;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
+#[cfg(unix)]
+pub mod judged;
 pub mod wasm_glue;
 mod wasm_page;
 pub mod wasm_smoke;
+#[cfg(unix)]
+pub mod watch;
 pub mod window_list;
 
 use std::cell::RefCell;
@@ -99,6 +105,9 @@ pub struct EnvSnapshot {
     pub build_slot_held: Option<OsString>,
     /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC`.
     pub rustdoc_override: Option<OsString>,
+    /// `RUSTC` and `CARGO_BUILD_RUSTC`, each when set: a compiler every compile child would take
+    /// in place of the one beside `targo` ([`lock_compiler_refusal`]).
+    pub rustc_vars: Vec<(&'static str, String)>,
     /// `CARGO_TARGET_DIR`, absolute.
     pub cargo_target_dir: Option<PathBuf>,
     /// The variables that choose cargo's layout, raw and only when set ([`CARGO_LAYOUT_VARS`]).
@@ -135,6 +144,10 @@ impl EnvSnapshot {
             build_slot_held: std::env::var_os("BUILD_SLOT_HELD"),
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
+            rustc_vars: aterm_toolchain::rustc_movers::RUSTC_VARS
+                .iter()
+                .filter_map(|k| Some((*k, std::env::var_os(k)?.to_string_lossy().into_owned())))
+                .collect(),
             cargo_target_dir: var_path("CARGO_TARGET_DIR")
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| std::path::absolute(&p).unwrap_or(p)),
@@ -533,6 +546,8 @@ pub struct Ctx {
     pub cached_lanes_dir: Option<PathBuf>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
     pub toolchain_lease: Option<String>,
+    /// What the run says of the tree's `trust.lock` beyond the build it names ([`lock_notes`]).
+    pub lock_notes: Vec<String>,
     /// HEAD, in full, when the run's selection was read ([`report::moved_checkout`]); unset, the
     /// run reads it as it begins.
     pub head_at_start: Option<String>,
@@ -564,6 +579,8 @@ pub struct Ctx {
     /// starts no timed callback. `None` is the caller's explicit untimed/outer-owned contract;
     /// it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
+    /// A repeatable watch sample yields before dispatching another stage.
+    pub background: bool,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
     /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
@@ -572,6 +589,11 @@ pub struct Ctx {
     /// Where the run keeps what each test binary took ([`test_history`]), planning data and
     /// never a verdict; `None` keeps nothing, as every run a test makes does.
     pub test_history: Option<PathBuf>,
+    /// The test binaries a release's resume carries ([`testrun::carry`], `--passed-binaries`).
+    pub passed_binaries: Option<testrun::Passed>,
+    /// Where a release writes each `check-finished` and `test-binary-finished` line whole,
+    /// apart from its output (`--events`), for its cutter's records (A19).
+    pub events: Option<event_log::EventLog>,
     /// A call of the run's test compile did not pass: every later call of it, and the test
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
@@ -623,7 +645,9 @@ pub const CHILD_ENV_REMOVED: [&str; 8] = {
     all
 };
 
-/// The run's toolchain, discovered once from `env` under the pin `root` declares and the atpkg prefix atpkg itself would read.
+/// The run's toolchain, discovered once from `env` under the pin `root` declares, the atpkg prefix
+/// atpkg itself would read and the `trust.lock` at or above `root` (`atpkg::trust_lock::found_for`:
+/// a locked tree compiles with the build its lock names, or not at all).
 #[must_use]
 pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
     let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
@@ -633,6 +657,7 @@ pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
         Some(&prefix),
         &env.path,
         toolchain::pinned_channel(root).as_deref(),
+        atpkg::trust_lock::found_for(root, Some(&prefix)).as_ref(),
     )
 }
 
@@ -698,6 +723,7 @@ impl Ctx {
             main_build_dir,
             cached_lanes_dir,
             toolchain_lease: None,
+            lock_notes: Vec::new(),
             head_at_start: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
@@ -709,9 +735,12 @@ impl Ctx {
             test_threads: pinned_threads,
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
+            background: false,
             runs: None,
             memory: None,
             test_history: None,
+            passed_binaries: None,
+            events: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
             checkers_compile_failed: std::sync::atomic::AtomicBool::new(false),
             halt: sched::Halt::off(),
@@ -957,11 +986,41 @@ impl Ctx {
         self
     }
 
+    /// What the run says of the tree's `trust.lock` ([`lock_notes`]).
+    #[must_use]
+    pub fn with_lock_notes(mut self, notes: Vec<String>) -> Self {
+        self.lock_notes = notes;
+        self
+    }
+
     /// HEAD when the run's selection was read ([`Ctx::head_at_start`]).
     #[must_use]
     pub fn with_head_at_start(mut self, head: Option<String>) -> Self {
         self.head_at_start = head;
         self
+    }
+
+    /// Carry the test binaries `passed` names into this release's test run, each whose
+    /// executable still hashes so ([`Ctx::passed_binaries`]).
+    #[must_use]
+    pub fn with_passed_binaries(mut self, passed: Option<testrun::Passed>) -> Self {
+        self.passed_binaries = passed;
+        self
+    }
+
+    /// Write each `check-finished` and `test-binary-finished` line to `events` too
+    /// ([`Ctx::events`]).
+    #[must_use]
+    pub fn with_events(mut self, events: Option<event_log::EventLog>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Write `line`, a `verify-event: ` line, to the release's events file, when it has one.
+    pub fn record_event(&self, line: &str) {
+        if let Some(events) = &self.events {
+            events.write(line);
+        }
     }
 
     /// Keep each test binary's run in the history at `path` ([`Ctx::test_history`]).
@@ -1793,6 +1852,11 @@ fn staged(
         }
     });
     let run = || {
+        #[cfg(unix)]
+        if ctx.background && watch::foreground_waiting(&ctx.root)? {
+            exec::group::stop_run();
+            return Err("background sample yielded to foreground work".into());
+        }
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
         let _reservation = holding_memory_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
         if let Some(why) = ended(ctx) {
@@ -2043,9 +2107,16 @@ fn run_with(
                         ctx.rerun(check),
                         ctx.halted(),
                     );
+                    // The check's record (A19) is read from this one line, written whole before
+                    // its rendered line, so the two are never split by another writer.
+                    let event = report::check_event(&result, &mine);
+                    ctx.record_event(&event);
                     let text = report::render(&result, width);
                     if let Ok(mut o) = out.lock() {
-                        let _ = o.write_all(text.as_bytes()).and_then(|()| o.flush());
+                        let _ = o
+                            .write_all(event.as_bytes())
+                            .and_then(|()| o.write_all(text.as_bytes()))
+                            .and_then(|()| o.flush());
                     }
                     if let Ok(mut r) = results.lock() {
                         r.push(result);
@@ -2124,6 +2195,12 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     if let Some(lease) = &ctx.toolchain_lease {
         s.push_str(&format!("toolchain lease: {lease}\n"));
     }
+    if let Some(line) = lock_line(&ctx.tools) {
+        s.push_str(&format!("toolchain lock: {line}\n"));
+    }
+    for note in &ctx.lock_notes {
+        s.push_str(&format!("toolchain note: {note}\n"));
+    }
     // Only the shim's cache has a verification cache in it ([`Ctx::cached_lanes_dir`]).
     let shared = ctx.cached_lanes_dir.is_some();
     match (&ctx.main_build_dir, shared) {
@@ -2152,6 +2229,101 @@ fn toolchain_lines(ctx: &Ctx) -> String {
         s.push_str(&format!("verification cache: {}\n", dir.display()));
     }
     s
+}
+
+/// The build the tree's `trust.lock` names, as the log states it; `None` with no lock, or one that
+/// does not read ([`lock_notes`] says so when something took its place and the run went on).
+#[must_use]
+pub fn lock_line(tools: &Toolchain) -> Option<String> {
+    let found = tools.lock.as_ref()?;
+    let lock = found.lock.as_ref().ok()?;
+    Some(format!(
+        "{} names Trust build {} (tree root {}, compiler {})",
+        found.path.display(),
+        lock.build,
+        lock.tree_root.get(..12).unwrap_or(&lock.tree_root),
+        lock.compiler_commit
+            .get(..12)
+            .unwrap_or(&lock.compiler_commit)
+    ))
+}
+
+/// THE COMPILER EVERY COMPILE CHILD GETS, HELD TO THE LOCK (A16): children run the locked build's
+/// `targo` by its path in `root`, with its `bin` first on `PATH`, and compile with the `trustc`
+/// beside it, whose commit discovery already held to the lock's, unless something names another
+/// compiler (`RUSTC`, `CARGO_BUILD_RUSTC`, a `build.rustc` in cargo's config from `root` up or in
+/// `CARGO_HOME`: `aterm_toolchain::rustc_movers`). With a lock in force (no override said) the first
+/// of those, resolved as cargo resolves it in the child, must answer the lock's `compiler_commit`.
+/// `None` when it does, when none is set, or with no lock.
+#[must_use]
+pub fn lock_compiler_refusal(env: &EnvSnapshot, tools: &Toolchain, root: &Path) -> Option<String> {
+    let found = tools
+        .lock
+        .as_ref()
+        .filter(|_| tools.lock_override.is_none())?;
+    let lock = found.lock.as_ref().ok()?;
+    let cargo_home = env
+        .cargo_home
+        .clone()
+        .unwrap_or_else(|| env.home.join(".cargo"));
+    let var = |key: &str| {
+        env.rustc_vars
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let movers = aterm_toolchain::rustc_movers::rustc_movers(Some(root), &var, Some(&cargo_home));
+    aterm_toolchain::rustc_movers::lock_refusal(
+        &movers,
+        &tools.path_with_stage2_first(&env.path),
+        &found.path,
+        lock,
+    )
+}
+
+/// THE TOOLCHAIN A RUN AT `root` COMPILES WITH, or why it compiles with none: [`run_toolchain`],
+/// refused when it has no runnable `targo` or when another compiler takes its place in the
+/// children ([`lock_compiler_refusal`]).
+///
+/// # Errors
+/// The refusal, for a COULD NOT RUN.
+pub fn preflight(env: &EnvSnapshot, root: &Path) -> Result<Toolchain, String> {
+    let tools = run_toolchain(env, root);
+    if !tools.have_targo() {
+        return Err(tools.missing_targo_label());
+    }
+    if let Some(why) = lock_compiler_refusal(env, &tools, root) {
+        return Err(why);
+    }
+    Ok(tools)
+}
+
+/// WHAT A RUN SAYS OF ITS TREE'S `trust.lock` (A14), on stderr and in the log: what took the
+/// lock's place (`TRUST_STAGE2_BIN`, a dev-linked checkout), a lock that does not read, and a
+/// `targo` shim on this Mac that runs another build than this run compiles with, so plain builds
+/// and verify compile alternate units (`atpkg::trust_lock::shim_mismatch`). Empty with no lock.
+#[must_use]
+pub fn lock_notes(env: &EnvSnapshot, tools: &Toolchain) -> Vec<String> {
+    let Some(found) = tools.lock.as_ref() else {
+        return Vec::new();
+    };
+    let mut notes: Vec<String> = tools.lock_override.iter().cloned().collect();
+    let lock = match found.lock.as_ref() {
+        Ok(lock) => lock,
+        Err(why) => {
+            notes.push(format!("{} does not read: {why}", found.path.display()));
+            return notes;
+        }
+    };
+    let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+    let shim = atpkg::trust_lock::shim_answer(&prefix);
+    notes.extend(atpkg::trust_lock::shim_mismatch(
+        &shim,
+        found,
+        lock,
+        &tools.stage2_dir,
+    ));
+    notes
 }
 
 /// THE RUN'S TOOLCHAIN LEASES (`aterm_toolchain::lease`).
@@ -2298,6 +2470,10 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "watch") {
+        return watch::run(&args[1..], cwd);
+    }
     // `perf`, `soak`, `glue`, `provision` and the browser lane's verbs
     // (`browser-site`, `browser-drive`) parse their own arguments, and none
     // needs targo to start: a host without Trust drives the browser lane, and
@@ -2359,6 +2535,25 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Ok(a) => a,
         Err(why) => return stop(exit::USAGE, format!("verify: {why}")),
     };
+    let passed_binaries = match parsed.passed_binaries.as_deref().map(|path| {
+        aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
+            .map_err(|e| e.to_string())
+            .and_then(|text| testrun::read_passed(&text))
+            .map_err(|why| format!("verify: --passed-binaries {}: {why}", path.display()))
+    }) {
+        Some(Err(why)) => return stop(exit::USAGE, why),
+        Some(Ok(passed)) => Some(passed),
+        None => None,
+    };
+    let events = match parsed
+        .events
+        .as_deref()
+        .map(|path| event_log::EventLog::open(&cwd.join(path)).map_err(|e| (path, e)))
+        .transpose()
+    {
+        Ok(events) => events,
+        Err((path, e)) => return could_not_run(format!("--events {}: {e}", path.display())),
+    };
     if let Some(note) = cli::ignored_selection(&parsed) {
         eprintln!("verify: {note}");
     }
@@ -2378,12 +2573,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if let Err(why) = test_workers::admitted_share(&env) {
         return stop(exit::USAGE, format!("verify: {why}; no check was run"));
     }
-    let tools = run_toolchain(&env, &root);
-    if !tools.have_targo() {
-        return could_not_run(tools.missing_targo_label());
-    }
+    let tools = match preflight(&env, &root) {
+        Ok(tools) => tools,
+        Err(why) => return could_not_run(why),
+    };
     if let Some(d) = &tools.demoted {
         eprintln!("verify: toolchain: {}", d.sentence());
+    }
+    let lock_said = lock_notes(&env, &tools);
+    for note in &lock_said {
+        eprintln!("verify: toolchain: {note}");
     }
     let scratch = match mktemp_dir("atv") {
         Ok(p) => p,
@@ -2439,7 +2638,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     } else {
         wanted
     };
-    let ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
+    let mut ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
         .with_checks(&wanted)
         .with_release(parsed.release)
         .with_checkers_in_tests(parsed.release || parsed.as_release)
@@ -2454,6 +2653,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
         .with_test_threads(parsed.test_threads)
+        .with_passed_binaries(passed_binaries)
+        .with_events(events)
         .with_quiet(Some(parsed.admit))
         .with_memory(memory::Book::live())
         .with_test_history(
@@ -2461,8 +2662,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
                 .map(|d| d.join(aterm_capacity::book::TEST_HISTORY)),
         )
         .with_toolchain_lease(lease_said)
+        .with_lock_notes(lock_said)
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
+    ctx.background = parsed.background;
     let ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
@@ -2518,7 +2721,11 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         let_disk_go(disk, code == exit::PASS, log_file.as_mut());
     }
     end_run(&ctx, &scratch);
-    code
+    if parsed.background && stopping() && code != exit::FAILED {
+        75
+    } else {
+        code
+    }
 }
 
 /// Let the run's disk claim `held` go, saying in `log` what it claimed and what the run grew:
@@ -2889,6 +3096,9 @@ mod tests {
             refused: None,
             store_bin: Some(prefix.join("store/trust/current/bin")),
             demoted: None,
+            lock: None,
+            lock_refusal: None,
+            lock_override: None,
         };
         let subject = Subject::of_dir(&prefix, &managed).expect("a store build");
         let (held, said) = hold_toolchain(&env, &tools, Path::new("/repo"));
@@ -2956,6 +3166,7 @@ mod tests {
                 Some(&prefix),
                 shims.as_os_str(),
                 Some("trust"),
+                None,
             );
             let (held, _) = hold_toolchain(&env, &discovered, Path::new("/repo"));
             assert!(
@@ -3585,6 +3796,88 @@ mod tests {
         assert!(DEPENDENT_RAN.load(Ordering::SeqCst));
     }
 
+    /// Each check's `check-finished` event is written once, whole, right before its own line and
+    /// before the verdict, with the word that line opens with, and the same line to the release's
+    /// events file, which its cutter keeps one record per check from (A19). Negative controls:
+    /// emitting the event after the rendered line fails the order assertion; one never recorded
+    /// leaves the events file empty.
+    #[test]
+    fn each_check_says_check_finished_once_before_its_line_and_the_verdict() {
+        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+            let mut report = Report::new(spec.title.clone());
+            if spec.id == plan::StageId::Census {
+                report.fail("a guard found a banned call");
+            } else {
+                report.pass("ran");
+            }
+            report
+        }
+        let ctx = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        )
+        .with_checks(&[Check::Fmt, Check::Census]);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let at = dir.path().join("06-verify.events");
+        let ctx = ctx.with_events(Some(event_log::EventLog::open(&at).unwrap()));
+        let mut out: Vec<u8> = Vec::new();
+        let code = run_with(
+            &ctx,
+            &mut out,
+            &mut std::io::sink(),
+            &Show::default(),
+            Seams { stage, ..LIVE },
+        )
+        .unwrap();
+        assert_eq!(code, exit::FAILED);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let verdict = lines
+            .iter()
+            .position(|l| l.starts_with("verify: FAIL"))
+            .expect("a verdict line");
+        for (name, word) in [("fmt", "ok"), ("census", "FAIL")] {
+            let events: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let json = l.strip_prefix("verify-event: ")?;
+                    let event: aterm_json::Value = aterm_json::from_slice(json.as_bytes()).ok()?;
+                    (event["event"].as_str() == Some("check-finished")
+                        && event["check"].as_str() == Some(name))
+                    .then(|| {
+                        assert_eq!(event["outcome"].as_str(), Some(word), "{l}");
+                        i
+                    })
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "{name}: {text}");
+            let own = lines
+                .iter()
+                .position(|l| l.starts_with(word) && l.split_whitespace().nth(1) == Some(name))
+                .expect("the check's own line");
+            assert_eq!(
+                events[0] + 1,
+                own,
+                "{name}'s event comes right before its line: {text}"
+            );
+            assert!(own < verdict, "{text}");
+        }
+        let said: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| {
+                l.strip_prefix("verify-event: ")
+                    .and_then(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
+                    .is_some_and(|event| event["event"].as_str() == Some("check-finished"))
+            })
+            .collect();
+        let kept = std::fs::read_to_string(&at).unwrap();
+        assert_eq!(kept.lines().collect::<Vec<_>>(), said, "{kept}");
+    }
+
     /// A run whose checkout's HEAD moves while its stages run ends COULD NOT RUN, its checks'
     /// own PASS beside it. Negative control: the same run with HEAD still ends PASS.
     #[test]
@@ -3683,5 +3976,173 @@ mod tests {
         assert!(!art("22cb72").built_from(head), "6 hex chars is too short");
         assert!(art("22cb722").built_from(head), "7 hex chars is valid");
         assert!(!art("22cb722z").built_from("22cb722zabcdef0123456789abcdef0123456789"));
+    }
+
+    /// A complete store build `build` under `prefix` whose `trustc` answers `--print sysroot` and
+    /// `-vV` (commit `commit`) and whose `targo` runs: its tree's fold.
+    #[cfg(unix)]
+    fn locked_build(prefix: &Path, build: u64, commit: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = atpkg::trust_lock::build_dir(prefix, build);
+        std::fs::create_dir_all(dir.join("lib/rustlib")).expect("rustlib");
+        std::fs::write(atpkg::trust_lock::ready_marker(prefix, build), "ok\n").expect("ready");
+        std::fs::create_dir_all(dir.join("bin")).expect("bin");
+        for (tool, body) in [
+            ("targo", "exit 0".to_string()),
+            (
+                "trustc",
+                format!(
+                    "case \"$1\" in -vV) printf 'commit-hash: {commit}\\n' ;; *) echo '{}' ;; esac",
+                    dir.display()
+                ),
+            ),
+        ] {
+            let path = dir.join("bin").join(tool);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("stand-in");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        // A store build's `rustc` is a hard link of its `trustc`.
+        std::fs::hard_link(dir.join("bin/trustc"), dir.join("bin/rustc")).expect("rustc");
+        atpkg::tree::tree_root(&dir).expect("fold")
+    }
+
+    /// A LOCKED CHECKOUT'S RUN COMPILES WITH THE LOCK'S BUILD (A14): the store's `current` names
+    /// another build, and the run takes the lock's, folding and recording a build installed before
+    /// records; it says so in its log, and says a `targo` shim laid for `current` makes plain
+    /// builds and the run alternate units; a `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` whose
+    /// compiler is not the lock's refuses the run's preflight. NEGATIVE CONTROL: without the lock
+    /// the run takes `current`, says no lock, notes nothing and takes any `RUSTC`.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_checkout_runs_the_locked_build_and_says_a_shim_that_does_not() {
+        toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let home = scratch.path().canonicalize().expect("canonical");
+        let env = EnvSnapshot {
+            home: home.clone(),
+            xdg_config_home: Some(home.join("xdg")),
+            ..EnvSnapshot::default()
+        };
+        let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+        let commit = "29ebb403de7a102850d6cb10a62d5cc3baf723ed";
+        let root_of_locked = locked_build(&prefix, 16387, commit);
+        locked_build(&prefix, 16500, &"b".repeat(40));
+        std::os::unix::fs::symlink(
+            atpkg::trust_lock::build_dir(&prefix, 16500),
+            prefix.join("store/trust/current"),
+        )
+        .expect("current");
+        std::fs::create_dir_all(prefix.join("bin")).expect("shims");
+        std::fs::write(
+            prefix.join("bin/targo"),
+            format!(
+                "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
+                atpkg::trust_lock::build_dir(&prefix, 16500)
+                    .join("bin/targo")
+                    .display()
+            ),
+        )
+        .expect("a shim laid for current");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        std::fs::write(
+            checkout.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"trust\"\n",
+        )
+        .expect("pin");
+
+        let unlocked = run_toolchain(&env, &checkout);
+        assert_eq!(
+            unlocked.stage2_dir,
+            atpkg::trust_lock::build_dir(&prefix, 16500).join("bin"),
+            "no lock: current"
+        );
+        assert_eq!(lock_line(&unlocked), None);
+        assert!(lock_notes(&env, &unlocked).is_empty());
+
+        let lock = atpkg::trust_lock::TrustLock {
+            build: 16387,
+            tree_root: root_of_locked,
+            compiler_commit: commit.to_string(),
+            receipt: "SEED-MINT sha256:00".to_string(),
+            stock_toolchain: "1.99.1".to_string(),
+        };
+        std::fs::write(
+            checkout.join(atpkg::trust_lock::LOCK_FILE),
+            atpkg::trust_lock::render_body(&lock),
+        )
+        .expect("lock");
+        let locked = run_toolchain(&env, &checkout);
+        assert!(locked.have_targo(), "{}", locked.missing_targo_label());
+        assert_eq!(
+            locked.stage2_dir,
+            atpkg::trust_lock::build_dir(&prefix, 16387).join("bin")
+        );
+        assert!(
+            lock_line(&locked).is_some_and(|l| l.contains("names Trust build 16387")),
+            "{:?}",
+            lock_line(&locked)
+        );
+        let notes = lock_notes(&env, &locked);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("plain `targo` resolves 16500"),
+            "{notes:?}"
+        );
+
+        // What names another compiler reaches every compile child: only the lock's compiler
+        // passes the run's preflight, wherever it is named, resolved as the child resolves it.
+        let trustc_of = |build| atpkg::trust_lock::build_dir(&prefix, build).join("bin/trustc");
+        let with = |vars: &[(&'static str, &Path)]| EnvSnapshot {
+            rustc_vars: vars
+                .iter()
+                .map(|(k, v)| (*k, v.display().to_string()))
+                .collect(),
+            ..env.clone()
+        };
+        let other = trustc_of(16500);
+        let same = trustc_of(16387);
+        assert!(preflight(&env, &checkout).is_ok(), "nothing names another");
+        for var in ["RUSTC", "CARGO_BUILD_RUSTC"] {
+            let refused = preflight(&with(&[(var, &other)]), &checkout).expect_err(var);
+            assert!(
+                refused.contains(&format!("commit {}", "b".repeat(40)))
+                    && refused.contains(&format!("Fix: unset {var}")),
+                "{refused}"
+            );
+            assert!(
+                preflight(&with(&[(var, &same)]), &checkout).is_ok(),
+                "{var}"
+            );
+        }
+        assert!(
+            preflight(&with(&[("RUSTC", Path::new("rustc"))]), &checkout).is_ok(),
+            "a bare name is the child's PATH's, whose first entry is the locked build"
+        );
+        let config = checkout.join(".cargo/config.toml");
+        std::fs::create_dir_all(checkout.join(".cargo")).expect(".cargo");
+        std::fs::write(
+            &config,
+            format!("[build]\nrustc = \"{}\"\n", other.display()),
+        )
+        .expect("config");
+        let refused = preflight(&env, &checkout).expect_err("build.rustc in the checkout's config");
+        assert!(
+            refused.contains(&format!(
+                "Fix: remove build.rustc from {}",
+                config.display()
+            )),
+            "{refused}"
+        );
+        assert!(
+            preflight(&with(&[("RUSTC", &same)]), &checkout).is_ok(),
+            "RUSTC outranks build.rustc"
+        );
+        std::fs::remove_file(&config).expect("rm config");
+        std::fs::remove_file(checkout.join(atpkg::trust_lock::LOCK_FILE)).expect("rm lock");
+        assert!(
+            preflight(&with(&[("RUSTC", &other)]), &checkout).is_ok(),
+            "no lock: RUSTC is the caller's"
+        );
     }
 }

@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-release"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,6 +27,9 @@ test = false
 
 [dependencies]
 # RFC3339 civil-calendar math (`aterm_types::rfc3339`).
+# The identity record's input names (`aterm_stamp::input`), which release_env and `ship dev-app`
+# set for the `aterm` package's build script.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
@@ -109,6 +112,7 @@ aterm-converge = { workspace = true }
 aterm-secrets = { workspace = true }
 # Early release observations reuse the authenticated control client, never a shell.
 aterm-agent = { workspace = true }
+aterm-ctl = { path = "../aterm-ctl" }
 
 # `ship site` uploads each file of the site as one gzip member around the PNG encoder's
 # deterministic DEFLATE (no clock, name or host in a member), so its SHA-256 names the

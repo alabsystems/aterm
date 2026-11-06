@@ -15,6 +15,92 @@ use crate::github::RepoListKind;
 use crate::policy::{Access, Named};
 use crate::slug::Slug;
 
+/// Create a public User-owned repository after literal/grant routing and owner proof.
+pub(crate) fn repo_create(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    use super::cmd_release_write::{Write, journaled, one_shot_answer};
+    use super::write_out::done;
+    use crate::github::repos::{CREATE_KEY, RepoVisibility};
+    use crate::write::WriteOp;
+
+    if !inv.has("--public") {
+        return Err(inv.usage("--public is required; only public User-owned creation is supported"));
+    }
+    let dry = inv.has("--dry-run");
+    let gh = if dry {
+        ctx.github_recorded()?
+    } else {
+        ctx.github()?
+    };
+    let (slug, named) = inv.repo(gh.router())?;
+    journaled(inv, WriteOp::RepoCreate, "repo", &slug.key())?;
+    let how = inv.how(Access::Write, named);
+    let w = Write {
+        inv,
+        gh,
+        slug,
+        how,
+        dry,
+    };
+    let report = w.report(WriteOp::RepoCreate, CREATE_KEY);
+    w.finish(report, |report| {
+        let repos = w.gh.repos();
+        let permit = repos.permit_create(
+            &w.how
+                .route(crate::policy::RouteTarget::Repo(w.slug.clone())),
+            RepoVisibility::Public,
+        )?;
+        if dry {
+            #[cfg(unix)]
+            let latest = if w.gh.fx().mode().is_taped() {
+                use crate::journal::IntentStore as _;
+                w.gh.journal(&w.slug)?
+                    .latest(WriteOp::RepoCreate, CREATE_KEY)?
+            } else {
+                w.gh.dirs()
+                    .map(|dirs| {
+                        crate::journal::peek_latest(dirs, &w.slug, WriteOp::RepoCreate, CREATE_KEY)
+                    })
+                    .transpose()?
+                    .flatten()
+            };
+            #[cfg(not(unix))]
+            let latest = None;
+            let found = repos.preview_create(&permit, latest.as_ref())?;
+            report.outcome = found
+                .as_ref()
+                .map_or("would_send", |found| found.effect.slug())
+                .into();
+            if let Some(found) = found {
+                let repo = found.object;
+                report.id = Some(repo.id);
+                report.url = repo
+                    .raw
+                    .get("html_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            return Ok(done(report.clone()));
+        }
+        let journal = w.gh.journal(&w.slug)?;
+        let outcome = repos.create(&permit, &journal)?;
+        Ok(one_shot_answer(
+            report,
+            WriteOp::RepoCreate,
+            &journal,
+            outcome,
+            |repo| {
+                (
+                    Some(repo.id),
+                    repo.raw
+                        .get("html_url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                )
+            },
+        ))
+    })
+}
+
 /// `agh repo view REPO`.
 ///
 /// # Errors
@@ -175,6 +261,52 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
         .notes
         .push(("as".into(), out.as_.unwrap_or_else(|| "anonymous".into())));
     receipt.notes.push(("ref".into(), INTO.into()));
+    Ok(Outcome {
+        answer: Answer::Nothing,
+        receipt,
+    })
+}
+
+/// Fetch one exact source into an agh-owned local ref; anonymous mode is a
+/// credential-free read, not a fallback from a failed authenticated operation.
+pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if inv.global.as_profile.is_some() {
+        return Err(inv.usage("repo fetch uses routed credentials or --anonymous, not --as"));
+    }
+    let reference = inv
+        .flag("--ref")
+        .ok_or_else(|| inv.usage("--ref is required"))?;
+    let into = inv
+        .flag("--into")
+        .ok_or_else(|| inv.usage("--into is required"))?;
+    if !(crate::path::is_sha(reference)
+        || (reference.starts_with("refs/") && crate::path::ref_name_ok(reference)))
+    {
+        return Err(inv.usage("--ref must be a full ref or forty lowercase hex digits"));
+    }
+    if !into.starts_with("refs/agh/") || !crate::path::ref_name_ok(into) {
+        return Err(inv.usage("--into must be a valid ref beneath refs/agh/"));
+    }
+    let dir = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("DIR is required"))?;
+    let dir = std::path::absolute(dir).map_err(|e| inv.usage(format!("DIR: {e}")))?;
+    if !dir.is_dir() {
+        return Err(inv.usage("DIR must be an existing Git repository directory"));
+    }
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let out = gh.run_git(
+        &GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous).with_named(named),
+    )?;
+    let mut receipt = Receipt::for_repo(inv, &gh, &slug);
+    receipt.as_ = None;
+    receipt
+        .notes
+        .push(("as".into(), out.as_.unwrap_or_else(|| "anonymous".into())));
+    receipt.notes.push(("ref".into(), into.into()));
+    receipt.notes.push(("source".into(), reference.into()));
     Ok(Outcome {
         answer: Answer::Nothing,
         receipt,

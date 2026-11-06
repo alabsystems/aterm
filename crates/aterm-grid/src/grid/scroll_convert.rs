@@ -275,6 +275,10 @@ impl DeferredLine {
         let len = row.written_len();
         scratch.clear();
         if len != 0 {
+            // This snapshot never grows after construction. Avoid geometric spare
+            // capacity (including Vec's four-cell minimum) when a pooled body is
+            // too small, while retaining any larger body already available.
+            scratch.reserve_exact(usize::from(len));
             scratch.extend_from_slice(&row.as_slice()[..len as usize]);
         }
         Self {

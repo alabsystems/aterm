@@ -299,13 +299,13 @@ impl Cost {
         let c = self.counted?;
         let share = c.pinstructions as f64 / c.instructions as f64;
         (c.instructions > 0 && share >= ON_PCORES)
-            .then(|| c.pcycles as f64 / c.pinstructions as f64 * c.instructions as f64)
+            .then_some(c.pcycles as f64 / c.pinstructions as f64 * c.instructions as f64)
     }
 
     /// The performance cores' clock across the sample, in GHz: their cycles per nanosecond.
     fn pcore_ghz(&self) -> Option<f64> {
         let c = self.counted?;
-        (c.pcpu_ns > 0.0 && self.pcore_cycles().is_some()).then(|| c.pcycles as f64 / c.pcpu_ns)
+        (c.pcpu_ns > 0.0 && self.pcore_cycles().is_some()).then_some(c.pcycles as f64 / c.pcpu_ns)
     }
 }
 
@@ -649,6 +649,7 @@ fn main() {
     );
     let grid = (args.rows, args.cols);
     for scenario in &mut scenarios {
+        scenario.costs.reserve(scenario.n);
         for _ in 0..WARMUP {
             let _ = sample(scenario, args.shape, grid);
         }

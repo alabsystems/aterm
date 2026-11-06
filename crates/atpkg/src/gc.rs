@@ -262,7 +262,7 @@ struct Debris {
     /// `(program, dir name, dir)` — `<build>.incoming-<pid>` / `<build>.superseded-<pid>`.
     scratch: Vec<(String, String, PathBuf)>,
     /// Stage sidecar files (`<build>.vendor`, `.shim-env`, `.modes`, `.exposes`) whose
-    /// `<build>` is gone.
+    /// `<build>` is gone, and a gone build's named refusal memo past a lock's keep window.
     orphan_sidecars: Vec<PathBuf>,
 }
 
@@ -328,6 +328,7 @@ fn interrupted_debris(
     in_scope: &dyn Fn(&str) -> bool,
 ) -> Debris {
     let mut out = Debris::default();
+    let now_unix = crate::flow::now_unix();
     let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) else {
         return out;
     };
@@ -342,6 +343,23 @@ fn interrupted_debris(
             continue;
         };
         for entry in entries.flatten() {
+            // A named build's refusal memo stands for a build no tree holds, until it is older
+            // than a lock's keep window ([`crate::store::is_stale_named_refusal`]).
+            if entry.file_type().is_ok_and(|t| t.is_file())
+                && let Some(build) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(crate::store::STAGE_REFUSAL_SUFFIX))
+                    .and_then(crate::store::parse_build_name)
+                && matches!(
+                    crate::store::presence(&prog.path().join(build.to_string())),
+                    crate::store::Presence::Absent
+                )
+                && crate::store::is_stale_named_refusal(&entry.path(), now_unix)
+            {
+                out.orphan_sidecars.push(entry.path());
+                continue;
+            }
             // A sidecar whose build is provably absent describes nothing. A build parked
             // mid-swap is absent too, but its sidecars belong to the parked tree and stay.
             if entry.file_type().is_ok_and(|t| t.is_file())
@@ -548,10 +566,17 @@ fn run_in(
                 }
         };
         let mut gone = Vec::new();
+        let now = std::time::SystemTime::now();
         for b in reclaimable(&installed, witness, &lands_on) {
             let Some(_gate) = lease_clear(layout, &program, b, &mut leased) else {
                 continue;
             };
+            // A build a tree's trust.lock resolved lately is that tree's compiler, current or not:
+            // read under the gate, which a resolver marks under its lease before it runs the build
+            // (`trust_lock::shim_target`), so a mark made after this pass began is seen.
+            if crate::trust_lock::locked_within_keep(&layout.build_dir(&program, b), now) {
+                continue;
+            }
             if in_use.holds(&program, &layout.build_dir(&program, b), Some(b)) {
                 continue;
             }
@@ -575,7 +600,9 @@ fn run_in(
         if in_use.holds(&program, &path, Some(build)) {
             continue;
         }
-        crate::store::discard_build(&path);
+        // A tree that never completed carries no verdict on its pack: the memo of a stage or
+        // resolve check that refused it stays, so the next install does not download it again.
+        crate::store::discard_build_keeping_memo(&path);
         if is_gone(&path) {
             swept_partial.entry(program).or_default().push(build);
         }
@@ -1152,6 +1179,37 @@ mod tests {
             );
             assert!(report.reclaimed.is_empty(), "{:?}", report.reclaimed);
         }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A build a tree's trust.lock resolved within the keep window survives gc though it is
+    /// neither current nor the rollback; the same build unmarked, or marked past the window, goes.
+    #[test]
+    fn run_keeps_a_build_a_lock_resolved_lately() {
+        let l = layout("run-locked");
+        for b in [16u64, 17, 18] {
+            seed(&l, "ay", b, false);
+        }
+        seed(&l, "ay", 19, true);
+        let mark = l
+            .build_dir("ay", 16)
+            .with_file_name(format!("16{}", crate::trust_lock::LOCKED_SUFFIX));
+        std::fs::write(&mark, b"").unwrap();
+        let report = run(&l, None);
+        assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![17u64])]);
+        assert!(l.build_dir("ay", 16).exists(), "the locked build survives");
+        let stale = std::time::SystemTime::now()
+            - crate::trust_lock::LOCKED_KEEP
+            - std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&mark)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let report = run(&l, None);
+        assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64])]);
+        assert!(!mark.exists(), "the mark goes with its build");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2683,6 +2741,55 @@ mod tests {
         for suffix in records {
             assert!(!orphan(29, suffix).exists(), "{suffix} goes with its build");
         }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A NAMED BUILD'S REFUSAL MEMO OUTLIVES ITS TREE AND GOES WITH THE KEEP WINDOW (A14): gc's sweep
+    /// of a tree that never completed (a refused build a first-exec hold kept) keeps the memo
+    /// beside it, so the next install does not download that pack again, and a named memo of a
+    /// gone build older than a lock's keep window is forgotten. NEGATIVE CONTROL: a fresh named
+    /// memo of a gone build, an update-lane memo of a gone build as old, and an old named memo
+    /// beside a build the store holds all stay.
+    #[test]
+    fn a_named_refusal_outlives_its_partial_tree_and_goes_with_the_keep_window() {
+        let l = layout("named-refusal-gc");
+        seed(&l, "trust", 40, true);
+        let partial = seed_partial(&l, "trust", 41);
+        let memo = |b: u64| {
+            l.build_dir("trust", b)
+                .with_file_name(format!("{b}.refused"))
+        };
+        let now = crate::flow::now_unix();
+        let digest = (crate::manifest::DigestAlg::Sha256, "aa");
+        let named = |b: u64, at: i64| {
+            crate::store::record_refusal_in(
+                crate::store::MemoLane::Named,
+                crate::store::RefusalKind::Held,
+                &l.build_dir("trust", b),
+                digest,
+                "bb",
+                "resolve",
+                at,
+            )
+            .unwrap();
+        };
+        named(40, 0);
+        named(41, now);
+        named(42, 0);
+        named(43, now);
+        crate::store::record_stage_refusal(&l.build_dir("trust", 44), digest, "bb", "digest", 0)
+            .unwrap();
+
+        let _ = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(!partial.exists(), "the partial tree is swept");
+        assert!(memo(41).is_file(), "its memo stays");
+        assert!(!memo(42).exists(), "a named memo past the keep window goes");
+        assert!(memo(43).is_file(), "a fresh one stays");
+        assert!(
+            memo(40).is_file(),
+            "an old named memo beside its build stays"
+        );
+        assert!(memo(44).is_file(), "the lane's memo is the lane's to bound");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

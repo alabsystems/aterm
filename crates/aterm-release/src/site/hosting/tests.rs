@@ -125,7 +125,7 @@ fn key_check_authenticates_without_touching_hosting() {
 /// The committed fixture's firebase.json, shaped as the site's own.
 fn fixture_config() -> String {
     std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site/firebase.json"),
+        aterm_tempfile::manifest_dir().join("tests/fixtures/site/firebase.json"),
     )
     .unwrap()
 }
@@ -960,7 +960,7 @@ fn os_gzip(args: &[&str], input: &[u8]) -> Vec<u8> {
 /// deflate would fail it.
 #[test]
 fn each_member_is_as_small_as_zlib_level_9() {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site");
+    let fixtures = aterm_tempfile::manifest_dir().join("tests/fixtures/site");
     let mut inputs: Vec<Vec<u8>> = files_under(&fixtures.join("public"))
         .into_iter()
         .map(|(_, bytes)| bytes)

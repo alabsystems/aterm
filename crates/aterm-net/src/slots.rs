@@ -188,6 +188,15 @@ impl Slots {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How many slots connections from `source` ([`source_of`]) hold before they authenticate.
+    #[cfg(test)]
+    pub(crate) fn unauthenticated_from(&self, source: IpAddr) -> usize {
+        self.lock()
+            .iter()
+            .filter(|slot| slot.source == source && slot.phase.unauthenticated())
+            .count()
+    }
+
     /// Whether a newcomer from `source` gets a slot.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -352,10 +361,10 @@ fn claim_deadline(state: &AtomicU8) -> bool {
         .is_ok()
 }
 
-/// The unauthenticated-phase watchdog.
+/// An owned socket deadline, also used for a connection's unauthenticated phase.
+/// The socket must stay open until this guard is finished or dropped, which joins its thread.
 pub(crate) struct HandshakeWatchdog {
-    started: Instant,
-    within: Duration,
+    until: Instant,
     /// The state claimed by exactly one of the handshake, the watchdog and an [`Evictor`].
     state: Arc<AtomicU8>,
     /// The parked watchdog thread (`None` once [`Self::finish`] or [`Drop`] has joined it).
@@ -384,6 +393,22 @@ impl HandshakeWatchdog {
         // Thread creation and delayed scheduling are part of this handshake's
         // budget. The worker must not restart its clock when it finally runs.
         let start = now();
+        let until = start.checked_add(handshake_timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "TLS deadline is out of range")
+        })?;
+        Self::arm_until_with_clock(tcp, until, now)
+    }
+
+    /// Arm an existing absolute deadline, including time spent before this phase.
+    pub(crate) fn arm_until(tcp: &TcpStream, until: Instant) -> io::Result<Self> {
+        Self::arm_until_with_clock(tcp, until, Instant::now)
+    }
+
+    pub(crate) fn arm_until_with_clock(
+        tcp: &TcpStream,
+        until: Instant,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> io::Result<Self> {
         let state = Arc::new(AtomicU8::new(WD_RUNNING));
         let _ = aterm_uds::keep_out_of_children(tcp);
         #[cfg(unix)]
@@ -405,8 +430,7 @@ impl HandshakeWatchdog {
                     WD_EVICTED | WD_FIRED => break true,
                     _ => break false, // finished early — nothing to cut off
                 }
-                let remaining =
-                    handshake_timeout.saturating_sub(now().saturating_duration_since(start));
+                let remaining = until.saturating_duration_since(now());
                 if remaining.is_zero() {
                     // Deadline reached: claim FIRED iff still running. A lost
                     // claim is re-read above: the handshake's leaves the socket
@@ -439,8 +463,7 @@ impl HandshakeWatchdog {
             }
         })?;
         Ok(Self {
-            started: start,
-            within: handshake_timeout,
+            until,
             state,
             thread: Some(thread),
             #[cfg(test)]
@@ -458,7 +481,6 @@ impl HandshakeWatchdog {
 
     /// Whether the deadline claimed the phase, so the watchdog hung the socket up at it: what a
     /// read or write of it meets then is the deadline's, not the peer's.
-    #[cfg(unix)]
     pub(crate) fn fired(&self) -> bool {
         self.state.load(Ordering::Acquire) == WD_FIRED
     }
@@ -493,7 +515,7 @@ impl HandshakeWatchdog {
     fn finish_at(mut self, now: Instant) -> Claim {
         // A delayed watchdog cannot grant time to a handshake that completed
         // after its original deadline. An earlier eviction still wins.
-        if now.saturating_duration_since(self.started) >= self.within {
+        if now >= self.until {
             let _ = claim_deadline(&self.state);
         }
         let claim = match self.state.compare_exchange(
@@ -777,25 +799,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// How long an idle socket ([`IdleSockets`]) waits before it dials again
+    /// once the listener closed it or its dial failed. A full listener closes
+    /// a newcomer the moment it accepts it, so a socket that dialed again at
+    /// once would spin, and each turn-away leaves a TIME_WAIT socket for 30 s
+    /// (macOS): one displaced socket dialing at kernel speed through
+    /// `a_slow_handshake_is_never_cut_for_a_heavier_address`'s 1.5 s wait made
+    /// 16,322 of them, nearly all of the Mac's TIME_WAIT count at a full
+    /// `verify`'s peak (each on the listener's own port, so other dials still
+    /// found ports), with the listener's thread doing nothing but turning them
+    /// away. Paced, a socket dials at most `elapsed / KNOCK_EVERY + 1` times
+    /// (`idle_sockets_turned_away_knock_and_never_spin`), still dozens of
+    /// knocks within the grace ([`GRACE`]) the displacement rules turn on.
+    pub(crate) const KNOCK_EVERY: Duration = Duration::from_millis(20);
+
     /// `count` idle sockets to one address (a listener's capacity: the
-    /// fleet's [`CAP`]), each sending nothing and reconnected the moment the
-    /// listener closes it, until dropped.
+    /// fleet's [`CAP`]), each sending nothing and dialing again
+    /// [`KNOCK_EVERY`] after the listener closes it, until dropped.
     pub(crate) struct IdleSockets {
         stop: Arc<AtomicBool>,
+        dials: Arc<AtomicUsize>,
         threads: Vec<std::thread::JoinHandle<()>>,
     }
 
     impl IdleSockets {
         pub(crate) fn hold(target: SocketAddr, count: usize) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
+            let dials = Arc::new(AtomicUsize::new(0));
             let threads = (0..count)
                 .map(|_| {
                     let stop = Arc::clone(&stop);
+                    let dials = Arc::clone(&dials);
                     std::thread::spawn(move || {
+                        let mut first = true;
                         while !stop.load(Ordering::SeqCst) {
+                            if !std::mem::take(&mut first) {
+                                std::thread::sleep(KNOCK_EVERY);
+                                if stop.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                            dials.fetch_add(1, Ordering::SeqCst);
                             let Ok(mut idle) = TcpStream::connect_timeout(&target, MUST_HAPPEN)
                             else {
-                                std::thread::sleep(Duration::from_millis(5));
                                 continue;
                             };
                             let _ = idle.set_read_timeout(Some(Duration::from_millis(50)));
@@ -811,7 +857,11 @@ pub(crate) mod tests {
                     })
                 })
                 .collect();
-            Self { stop, threads }
+            Self {
+                stop,
+                dials,
+                threads,
+            }
         }
     }
 
@@ -824,19 +874,83 @@ pub(crate) mod tests {
         }
     }
 
-    /// Once the listener turned a connection from `target` away at capacity
-    /// (`at_capacity`, its count of those), idle sockets hold every slot: the
-    /// attack is in force.
-    pub(crate) fn until_turned_away(at_capacity: &AtomicUsize, target: SocketAddr) {
-        let started = Instant::now();
-        while at_capacity.load(Ordering::SeqCst) == 0 {
-            assert!(
-                started.elapsed() < MUST_HAPPEN,
-                "the idle sockets never filled the listener"
-            );
-            drop(TcpStream::connect_timeout(&target, MUST_HAPPEN));
-            std::thread::sleep(Duration::from_millis(20));
+    /// IDLE SOCKETS KNOCK, THEY NEVER SPIN (MH1): against a listener that
+    /// closes every connection the moment it accepts it, as a full fleet
+    /// listener answers a newcomer, `SOCKETS` idle sockets over `elapsed` dial
+    /// at most `SOCKETS * (elapsed / KNOCK_EVERY + 1)` times. The bound is the
+    /// pause's own (a sleep never ends early), so it holds however loaded the
+    /// machine is. Negative control: with the pause removed, the sockets dial
+    /// at kernel speed and pass the bound before the first knock is due.
+    #[test]
+    fn idle_sockets_turned_away_knock_and_never_spin() {
+        const SOCKETS: usize = 2;
+        const TURNED_AWAY: usize = 40;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = listener.local_addr().unwrap();
+        /// Sends the doorman home however the test ends, a failed assertion included.
+        struct Done(Arc<AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
         }
+        let done = Arc::new(AtomicBool::new(false));
+        let (turned, turned_away) = std::sync::mpsc::channel();
+        let doorman = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if !wait_listener_readable(&listener, ACCEPT_POLL).unwrap() {
+                        continue;
+                    }
+                    while let Ok((tcp, _)) = listener.accept() {
+                        drop(tcp);
+                        let _ = turned.send(());
+                    }
+                }
+            })
+        };
+
+        let home = Done(Arc::clone(&done));
+        let started = Instant::now();
+        let idle = IdleSockets::hold(target, SOCKETS);
+        let dials = Arc::clone(&idle.dials);
+        for n in 0..TURNED_AWAY {
+            let left = MUST_HAPPEN.saturating_sub(started.elapsed());
+            assert!(
+                turned_away.recv_timeout(left).is_ok(),
+                "turn-away {n} of {TURNED_AWAY}: the idle sockets stopped dialing"
+            );
+        }
+        drop(idle);
+        let elapsed = started.elapsed();
+        drop(home);
+        doorman.join().unwrap();
+
+        let dialed = dials.load(Ordering::SeqCst);
+        let knocks = elapsed.as_nanos() / KNOCK_EVERY.as_nanos() + 1;
+        let bound = SOCKETS * usize::try_from(knocks).unwrap();
+        assert!(
+            dialed >= TURNED_AWAY,
+            "{dialed} dials, {TURNED_AWAY} turned away"
+        );
+        assert!(
+            dialed <= bound,
+            "{SOCKETS} idle sockets dialed {dialed} times in {elapsed:?}: at most {bound} at \
+             one dial each {KNOCK_EVERY:?}"
+        );
+    }
+
+    /// Once connections from `target`'s address hold every one of `slots`
+    /// before they authenticate, idle sockets fill the listener: the attack is
+    /// in force. Read from the listener's own slots, so no probe takes a seat
+    /// and no order of the kernel's accept queue is assumed.
+    pub(crate) fn until_seated(slots: &Slots, target: SocketAddr) {
+        let source = source_of(target.ip());
+        aterm_spec::wait::until_within(MUST_HAPPEN, "the idle sockets fill the listener", || {
+            (slots.unauthenticated_from(source) == slots.capacity).then_some(())
+        });
     }
 
     /// A listener on `[::]:0` that takes IPv4 too. A Unix IPv6 socket does by

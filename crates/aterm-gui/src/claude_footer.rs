@@ -7282,7 +7282,7 @@ pub(crate) struct SwitchPaint {
     pub(crate) face: crate::autopilot::HarnessSwitch,
     /// What the pointer or the keyboard is on.
     pub(crate) hover: HoverAt,
-    /// The harness ([`aterm_phase::CliHarness`]): its CLI's word and its version name the label;
+    /// The harness ([`aterm_phase::CliHarness`]): its version names the label (`alab v0.13`);
     /// `None` draws the switch with no label.
     pub(crate) harness: Option<aterm_phase::CliHarness>,
     /// The running CLI's version as its build states it ([`TopCli::ver`]): the label shows its
@@ -7472,7 +7472,7 @@ enum LabelInk {
     Pad,
     /// `alab`: the arc's end, bold.
     Brand,
-    /// The quiet words: `claude harness`, `(v2.1.305)`.
+    /// The quiet words: `(v2.1.305)`.
     Muted,
     /// The harness's version, `v0.5`, bold.
     Lit,
@@ -7480,19 +7480,20 @@ enum LabelInk {
     Target,
 }
 
-/// The cells a label, or the words in its slot, may take.
+/// The cells a label, or the words in its slot, may take: the widest label
+/// (`alab v0.5 (v<build>)`) or the widest build its hover shows alone (`claude v<build>`).
 const LABEL_MAX: usize = {
     let mut widest = 0;
     let mut i = 0;
     while i < aterm_phase::CliHarness::ALL.len() {
         let harness = aterm_phase::CliHarness::ALL[i];
-        let cells = "alab ".len()
-            + harness.cli().len()
-            + " harness v".len()
+        let label = "alab v".len()
             + harness.version_str().len()
             + " (v".len()
             + CLI_VERSION_MAX
             + ")".len();
+        let build = harness.cli().len() + " v".len() + CLI_VERSION_MAX;
+        let cells = if label > build { label } else { build };
         if cells > widest {
             widest = cells;
         }
@@ -7501,8 +7502,15 @@ const LABEL_MAX: usize = {
     widest
 };
 
-/// How many forms a label has, widest first ([`label_face`]).
-const LABEL_TIERS: usize = 4;
+/// How many forms a label has, widest first ([`label_face`]): `alab v0.5 (v2.1.305)`, then
+/// `alab v0.5`. The CLI is never named in it: the lockup at the rule's other end names it.
+const LABEL_TIERS: usize = 2;
+
+/// Whether the label laid at `tier` shows the running CLI's build (`(v2.1.305)`): every tier but
+/// the last ([`label_face`]).
+const fn label_says_cli(tier: usize) -> bool {
+    tier + 1 < LABEL_TIERS
+}
 
 /// One harness label as laid ([`label_face`]), or the words its slot shows ([`slot_words`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7522,7 +7530,7 @@ impl LabelFace {
     }
 
     /// The label's words.
-    #[cfg(test)]
+    #[cfg(any(test, a11y_tree))]
     fn text(&self) -> String {
         self.cells().iter().map(|(ch, _)| *ch).collect()
     }
@@ -7571,31 +7579,22 @@ impl LabelFace {
     }
 }
 
-/// The harness label at `tier` (`alab claude harness v0.5 (v2.1.305)`, `alab harness v0.5 (…)`,
-/// `alab v0.5 (…)`, `alab v0.5`), `None` past its narrowest, where a tier says no more than the
-/// next, or for a paint with no harness. The running CLI's version is left out where it is not
-/// known: never `(v?)`. An asked move keeps it: the label never grows under the press.
+/// The harness label at `tier` (`alab v0.5 (v2.1.305)`, then `alab v0.5`), `None` past its
+/// narrowest, where a tier says no more than the next, or for a paint with no harness. The
+/// running CLI's version is left out where it is not known: never `(v?)`. An asked move keeps
+/// it: the label never grows under the press.
 fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
     let harness = paint.harness?;
     let cli = paint.cli_core();
-    if tier >= LABEL_TIERS || (tier == 2 && cli.is_none()) {
+    if tier >= LABEL_TIERS || (label_says_cli(tier) && cli.is_none()) {
         return None;
     }
     let mut f = LabelFace::EMPTY;
     f.push("alab", LabelInk::Brand);
-    match tier {
-        0 => {
-            f.push(" ", LabelInk::Pad);
-            f.push(harness.cli(), LabelInk::Muted);
-            f.push(" harness", LabelInk::Muted);
-        }
-        1 => f.push(" harness", LabelInk::Muted),
-        _ => {}
-    }
     f.push(" ", LabelInk::Pad);
     f.push("v", LabelInk::Lit);
     f.push(harness.version_str(), LabelInk::Lit);
-    if let Some(from) = cli.filter(|_| tier < 3) {
+    if let Some(from) = cli.filter(|_| label_says_cli(tier)) {
         f.push(" (v", LabelInk::Muted);
         f.push(from, LabelInk::Muted);
         f.push(")", LabelInk::Muted);
@@ -7604,12 +7603,11 @@ fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
 }
 
 /// The label's forms with the CLI's whole build, in the label's own inks, as its hover shows
-/// them on a label laid at `tier`, the most said first: `alab muse harness v0.5
-/// (v1.4.13-R6996.1)`, `alab harness v0.5 (…)`, `alab v0.5 (…)`. A label laid without the CLI's
+/// them on a label laid at `tier`: `alab v0.5 (v1.4.13-R6996.1)`. A label laid without the CLI's
 /// build (the last tier, `alab v0.5`) shows the build alone instead, `claude v2.1.305` then
-/// `v2.1.305`, since a form with the harness's words is one the tier before would have laid had
-/// it fitted. `None` where the label shows the build's numbers and the build says no more than
-/// them (`2.1.305`), or where the build is not known.
+/// `v2.1.305`, since the label with the build is the form the tier before would have laid had it
+/// fitted. `None` where the label shows the build's numbers and the build says no more than them
+/// (`2.1.305`), or where the build is not known.
 fn label_whole(paint: &SwitchPaint, tier: usize) -> Option<Vec<Vec<(String, LabelInk)>>> {
     let harness = paint.harness?;
     let raw = paint.cli_ver.as_str().trim();
@@ -7621,20 +7619,13 @@ fn label_whole(paint: &SwitchPaint, tier: usize) -> Option<Vec<Vec<(String, Labe
             vec![(format!("v{raw}"), LabelInk::Muted)],
         ]);
     }
-    let form = |words: String| {
-        vec![
+    (raw != core).then(|| {
+        vec![vec![
             ("alab".to_owned(), LabelInk::Brand),
-            (words, LabelInk::Muted),
+            (" ".to_owned(), LabelInk::Muted),
             (format!("v{}", harness.version_str()), LabelInk::Lit),
             (format!(" (v{raw})"), LabelInk::Muted),
-        ]
-    };
-    (raw != core).then(|| {
-        vec![
-            form(format!(" {} harness ", harness.cli())),
-            form(" harness ".to_owned()),
-            form(" ".to_owned()),
-        ]
+        ]]
     })
 }
 
@@ -7657,10 +7648,6 @@ struct UpWords {
     /// [`Self::terse`] without what the restart ends, where it names some (` · after your
     /// draft`): the wait kept where no rule holds the shells as well.
     bare: Option<(String, LabelInk)>,
-    /// The words are a Claude Code tab's restart's: a press ([`TopUp::press`]), or a move under
-    /// way. A slot keeps when it lands and what it ends wherever a form that says them fits
-    /// ([`up_forms`]).
-    restart: bool,
 }
 
 /// What the ⬆️ says under the pointer, in its inks: `update to ` and the target build, bold
@@ -7674,7 +7661,7 @@ fn up_words(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<UpWor
         return None;
     }
     let ends = aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND;
-    let words = |verb: &str, when: String, terse: Option<(String, String)>, restart: bool| {
+    let words = |verb: &str, when: String, terse: Option<(String, String)>| {
         let (terse, bare) = terse.map_or((None, None), |(terse, bare)| {
             let bare = (bare != terse).then_some((bare, LabelInk::Muted));
             (Some((terse, LabelInk::Muted)), bare)
@@ -7685,7 +7672,6 @@ fn up_words(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<UpWor
             when: (when, LabelInk::Muted),
             terse,
             bare,
-            restart,
         }
     };
     // A Claude Code press's words: the live screen's reading where one was taken, else the
@@ -7708,7 +7694,6 @@ fn up_words(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<UpWor
                     press_when(terse, jobs, false),
                 )
             }),
-            true,
         ));
     }
     let verb = if up.state == UpState::Asked {
@@ -7736,7 +7721,6 @@ fn up_words(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<UpWor
         verb,
         when(wait, ends),
         terse_wait(wait).map(|terse| (when(terse, ends), when(terse, false))),
-        restart,
     ))
 }
 
@@ -7775,9 +7759,9 @@ pub(crate) fn up_said(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Op
 /// and those words alone, else the verb and the target where that is shorter than the form
 /// before it (a short when, `· now`, says more in fewer cells than the verb), then the target
 /// alone (an asked move's marked, then bare). Every form keeps what the arrow is for: the
-/// build, or why it cannot move. A Claude Code restart's forms with its when are the ones a
-/// slot shows wherever they fit ([`SlotWords`]): when it lands and, all but the last of a wait
-/// in the fewest words, what it ends, which the forms after them cut.
+/// build, or why it cannot move. The forms with a when are the ones a slot shows wherever they
+/// fit ([`SlotWords`]): when the move lands and, for a Claude Code restart (all but the last of
+/// a wait in the fewest words), what it ends, which the forms after them cut.
 fn up_forms(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<SlotWords> {
     let UpWords {
         verb,
@@ -7785,7 +7769,6 @@ fn up_forms(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<SlotW
         when,
         terse,
         bare,
-        restart,
     } = up_words(up, jobs, press)?;
     let asked = up.state == UpState::Asked;
     let marked = |form: Vec<(String, LabelInk)>| {
@@ -7806,11 +7789,10 @@ fn up_forms(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<SlotW
         forms.extend(terse.map(|terse| marked(vec![target.clone(), terse])));
         forms.extend(bare.map(|bare| marked(vec![target.clone(), bare])));
     }
-    let whole = if restart && forms.len() > 1 {
-        forms.len()
-    } else {
-        0
-    };
+    // Every form that says when the move lands says what it must: the label's own cells are a
+    // short version (`alab v0.5 (v2.1.305)`), so a form with the when grows left into the
+    // rule's room before a form without it takes them.
+    let whole = if forms.len() > 1 { forms.len() } else { 0 };
     let terse = (up.state == UpState::Held)
         .then(|| terse_refusal(up.why))
         .flatten();
@@ -7839,8 +7821,8 @@ const ASKED_MARK: &str = "\u{2192} ";
 
 /// The words a label's slot shows instead of the label ([`slot_words`]): their forms, the most
 /// said first, each shown whole or not at all, and how many of the first say what they must (a
-/// Claude Code restart's when, and what it ends where one fits, [`up_forms`]; 0 where every form
-/// will do).
+/// move's when, and for a Claude Code restart what it ends where one fits, [`up_forms`]; 0 where
+/// every form will do).
 struct SlotWords(Vec<Vec<(String, LabelInk)>>, usize);
 
 impl SlotWords {
@@ -7892,7 +7874,9 @@ fn slot_words(paint: &SwitchPaint, tier: usize) -> Option<SlotWords> {
             words(why.to_owned()),
         ];
         forms.extend(terse_refusal(why).map(|terse| words(terse.to_owned())));
-        return Some(SlotWords(forms, 0));
+        // The lead says the press failed: it grows into the rule's room before the reason
+        // alone takes the label's cells.
+        return Some(SlotWords(forms, 1));
     }
     match paint.hover {
         HoverAt::Label => label_whole(paint, tier).map(|forms| SlotWords(forms, 0)),
@@ -8201,10 +8185,10 @@ struct Laid {
 }
 
 /// The narrow ladder of a top line whose switch is `switch`, its lockup `lockup` cells wide, on
-/// `span`, widest rung first ([`lay_top`]). Words go first: the label's CLI word, `harness`, the
-/// CLI's version, the label, then the lockup's name, then its icon (with the ⬆️ laid, the
-/// lockup's name before the CLI's version); Claude's tail is never cut, and the last resort lays
-/// the switch in the run left of it.
+/// `span`, widest rung first ([`lay_top`]). Words go first: the CLI's build, the label, then the
+/// lockup's name, then its icon (with the ⬆️ laid beside a known build, the lockup's name before
+/// the CLI's build); Claude's tail is never cut, and the last resort lays the switch in the run
+/// left of it.
 fn ladder(
     span: TopSpan,
     switch: Option<SwitchPaint>,
@@ -8274,9 +8258,10 @@ fn ladder(
     };
     let full = lockup.map(|cells| (Lockup::Full, cells));
     let iconed = lockup.map(|_| (Lockup::Icon, icon));
-    // With the ⬆️ laid, the lockup's name (which the label's widest tier repeats) goes before the
-    // CLI's build: the running build stays beside the offer of the next one.
-    let named_tiers = if arrow > 0 && lockup.is_some() {
+    // With the ⬆️ laid beside a known build, the lockup's name goes before the label's CLI build:
+    // the running build stays beside the offer of the next one. With no build to keep, the name
+    // stays as long as the label does.
+    let named_tiers = if arrow > 0 && lockup.is_some() && paint.cli_core().is_some() {
         LABEL_TIERS - 1
     } else {
         LABEL_TIERS
@@ -8590,8 +8575,8 @@ fn compose_top_in(
     let arrow_at = up.map(|_| close_at - 2..close_at);
     let x = arrow_at.as_ref().map_or(close_at, |a| a.start - 1);
     // The words the label's slot shows in its place take the label's own cells, in a form that
-    // fits them, so a hover or a refusal moves nothing; only where no form fits, or where a
-    // Claude Code restart's form that says more than one that fits does fit the room
+    // fits them, so a refusal or the label's hover moves nothing; only where no form fits, or
+    // where a form that says when a move lands does not fit them but fits the room
     // ([`SlotWords::cells`]), does the slot grow left into the rule's room, the switch and
     // Claude's zone moving with it, and only as far as that form needs. Words that must be whole
     // and do not fit leave the label standing.
@@ -8759,7 +8744,7 @@ fn compose_top_in(
             let word_len = word.chars().count();
             let room = next.saturating_sub(name_at + 1 + title_lead);
             // While the label shows the CLI's version the title names the product alone.
-            let says_cli = rung.label.is_some_and(|tier| tier < 3)
+            let says_cli = rung.label.is_some_and(label_says_cli)
                 && switch.is_some_and(|paint| paint.cli_core().is_some());
             let title = key
                 .mark_hover
@@ -9240,18 +9225,17 @@ fn mark_layer(
     ))
 }
 
-/// Returns the accessibility label of border switch `b`: the label's words whole (`alab claude
-/// harness v0.5 (2.1.305)`, at every width) where one is laid, then the switch's state.
+/// Returns the accessibility label of border switch `b`: the label's widest words as the glass
+/// draws them (`alab v0.5 (v2.1.305)`, at every width, so every tier's visible words are in it)
+/// where one is laid, then the switch's state.
 #[cfg(a11y_tree)]
 pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> String {
     let state = switch_face(b.paint).words();
-    let lead = b.label.as_ref().and(b.paint.harness).map(|harness| {
-        let mut lead = format!("alab {} harness v{}", harness.cli(), harness.version_str());
-        if !b.paint.cli_ver.is_empty() {
-            lead.push_str(&format!(" ({})", b.paint.cli_ver.as_str()));
-        }
-        lead
-    });
+    let lead = b
+        .label
+        .as_ref()
+        .and_then(|_| (0..LABEL_TIERS).find_map(|tier| label_face(&b.paint, tier)))
+        .map(|face| face.text());
     match lead {
         Some(lead) if !state.is_empty() => format!("{lead} {state}"),
         Some(lead) => lead,
@@ -11170,20 +11154,12 @@ mod tests {
         };
         assert_eq!(
             labels(known),
-            [
-                format!("alab claude harness v{ver} (v2.1.305)"),
-                format!("alab harness v{ver} (v2.1.305)"),
-                format!("alab v{ver} (v2.1.305)"),
-                format!("alab v{ver}"),
-            ]
+            [format!("alab v{ver} (v2.1.305)"), format!("alab v{ver}")],
+            "the lockup names the CLI: the label never does"
         );
         assert_eq!(
             labels(paint(HarnessSwitch::On)),
-            [
-                format!("alab claude harness v{ver}"),
-                format!("alab harness v{ver}"),
-                format!("alab v{ver}"),
-            ],
+            [format!("alab v{ver}")],
             "an unknown CLI version is left out, never `(v?)`"
         );
         for (harness, raw, core) in [
@@ -11197,22 +11173,12 @@ mod tests {
             let wide = label_face(&p, 0).expect("the widest").text();
             assert_eq!(
                 wide,
-                format!(
-                    "alab {} harness v{} (v{core})",
-                    harness.cli(),
-                    harness.version_str()
-                ),
+                format!("alab v{} (v{core})", harness.version_str()),
                 "{harness:?}: the numbers alone"
             );
             let bare = raw.strip_prefix('v').unwrap_or(raw);
             let whole = label_whole(&p, 0).map(|w| LabelFace::of_words(&w[0]).text());
-            let want = (bare != core).then(|| {
-                format!(
-                    "alab {} harness v{} (v{bare})",
-                    harness.cli(),
-                    harness.version_str()
-                )
-            });
+            let want = (bare != core).then(|| format!("alab v{} (v{bare})", harness.version_str()));
             assert_eq!(whole, want, "{harness:?}: the hover says the whole build");
         }
         assert_eq!(
@@ -14324,7 +14290,7 @@ mod tests {
     }
 
     fn claude_rows(name: &str, cols: usize) -> Vec<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = aterm_tempfile::manifest_dir()
             .join("../aterm-phase/src/fixtures")
             .join(format!("claude-2.1.283-{name}.txt"));
         let rows: Vec<String> = std::fs::read_to_string(&path)

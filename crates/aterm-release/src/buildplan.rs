@@ -25,9 +25,6 @@ const COMPAT_CHECK_EPOCH: u64 = 1;
 const LIPO_ARM64: &str = "arm64";
 const LIPO_X86_64: &str = "x86_64";
 
-/// The compile-time marker every release build carries.
-pub const RELEASE_BUILD_MARKER: &str = "ATERM_RELEASE_BUILD";
-
 /// Platform policy, independent of the shared core pool and per-slice memory admission.
 pub enum Sequencing {
     /// macOS slices borrow from one Release jobserver.
@@ -52,7 +49,8 @@ pub struct BuildPlan {
     pub expected_update_pin_sha256: Option<String>,
     /// Platform sequencing policy for architecture builds.
     pub sequencing: Sequencing,
-    /// The shipped channel's published index run the build compiles in as [`atpkg::net::INDEX_HINT_ENV`].
+    /// The shipped channel's published index run the build stamps into the binary's identity
+    /// record ([`aterm_stamp::input::INDEX_HINT`]).
     pub index_hint: Option<String>,
 }
 
@@ -144,28 +142,7 @@ pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
 
 #[cfg(unix)]
 pub(crate) fn current_release_uid() -> Result<u32, String> {
-    let output = command("/usr/bin/id")
-        .env_clear()
-        .env("LC_ALL", "C")
-        .arg("-u")
-        .current_dir("/")
-        .output()
-        .map_err(|error| format!("inspect release user identity: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "inspect release user identity failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|error| format!("release user identity is not UTF-8: {error}"))?;
-    let trimmed = raw.trim();
-    if trimmed.starts_with('+') {
-        return Err("release user identity is malformed: invalid digit found in string".into());
-    }
-    trimmed
-        .parse::<u32>()
-        .map_err(|error| format!("release user identity is malformed: {error}"))
+    Ok(crate::trust_lane::proc_tree::euid())
 }
 
 #[cfg(not(unix))]
@@ -427,7 +404,7 @@ pub(crate) struct Take {
     /// Lipo, strip and the dSYM, recreated for each build.
     stage: PathBuf,
     release_uid: u32,
-    /// `git rev-parse --short=12 C` — pinned as the binary's `ATERM_GIT_COMMIT` and
+    /// `git rev-parse --short=12 C` — pinned as the commit of the binary's identity record and
     /// stamped as the bundle's `ATermGitCommit`, so binary and plist name C alike.
     short_commit: String,
     /// The cache, this take's alone until the take drops (declared last, so it is let
@@ -786,12 +763,17 @@ fn clock_now() -> String {
 
 fn log_tail(log: &Path, n: usize) -> String {
     let text = crate::durable::read_text(log).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..]
-        .iter()
-        .map(|l| format!("    | {l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut lines: Vec<&str> = text.lines().rev().take(n).collect();
+    lines.reverse();
+    let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 7).sum());
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str("    | ");
+        out.push_str(line);
+    }
+    out
 }
 
 fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<BuildOutput, String> {
@@ -1021,6 +1003,7 @@ struct ReleaseEnv<'a> {
 }
 
 fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
+    use aterm_stamp::input;
     let mut env: Vec<(&'static str, OsString)> = vec![
         ("PATH", e.path.clone()),
         ("HOME", e.home.to_os_string()),
@@ -1034,10 +1017,14 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             "cargo::core::compiler::fingerprint=info,targo::core::compiler::fingerprint=info"
                 .into(),
         ),
-        ("SOURCE_DATE_EPOCH", e.build_number.to_string().into()),
-        ("ATERM_BUILD_GIT_COMMIT", e.short_commit.into()),
-        ("ATERM_BUILD_GIT_COMMIT_FULL", e.commit.into()),
-        ("ATERM_BUILD_DEV_COMMITS", "0".into()),
+        // The identity record's inputs (`aterm_stamp::input`): only the `aterm` package's build
+        // script reads them, so the build number, commit and index hint are inputs of the leaf
+        // crate alone, never of a library unit.
+        (input::MODE, "commit".into()),
+        (input::EPOCH, e.build_number.to_string().into()),
+        (input::COMMIT, e.short_commit.into()),
+        (input::FULL_COMMIT, e.commit.into()),
+        (input::DEV_COMMITS, "0".into()),
         ("CARGO_TARGET_DIR", e.target_dir.clone().into_os_string()),
         (
             "CARGO_PROFILE_RELEASE_DEBUG",
@@ -1047,11 +1034,11 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             "CARGO_PROFILE_RELEASE_STRIP",
             release_profile_debug().1.into(),
         ),
-        (RELEASE_BUILD_MARKER, "1".into()),
+        (input::RELEASE, "1".into()),
         (aterm_capacity::RELEASE_RUN_ENV, "1".into()),
     ];
     if let Some(hint) = e.index_hint {
-        env.push((atpkg::net::INDEX_HINT_ENV, hint.into()));
+        env.push((input::INDEX_HINT, hint.into()));
     }
     if let Some(rustup_home) = &e.rustup_home {
         env.push(("RUSTUP_HOME", rustup_home.clone()));
@@ -1308,7 +1295,7 @@ pub(crate) fn build_static(
 /// # Errors
 /// What [`Take::prepare`] refuses, no stable x86_64 std, and a check that fails (the tail of its log).
 pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result<String, String> {
-    require_rustup_target(X86_64)?;
+    compat_available()?;
     let take = Take::prepare(repo_root, commit)?;
     let target_dir = take.target_root.join(COMPAT_CHECK_SLICE);
     snapshot::private_dir(&target_dir, "release compat check target")?;
@@ -1330,6 +1317,11 @@ pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result
     ))
 }
 
+/// The read-only compat lane's infrastructure prerequisite, distinct from a source failure.
+pub(crate) fn compat_available() -> Result<(), String> {
+    require_rustup_target(X86_64)
+}
+
 struct SliceRun<'a> {
     verb: &'static str,
     pkg: &'a str,
@@ -1340,6 +1332,19 @@ struct SliceRun<'a> {
     index_hint: Option<&'a str>,
     /// Link the C library in ([`cargo_build_args`]); only with a `target`.
     static_crt: bool,
+}
+
+fn compat_budget(cmd: &mut Command, held: Option<&str>, jobs: Option<&str>) -> Result<(), String> {
+    if held != Some("1") {
+        return Ok(());
+    }
+    let jobs = jobs
+        .ok_or("managed compat check has no CPU grant")?
+        .parse::<std::num::NonZeroU32>()
+        .map_err(|_| "managed compat check has an invalid CPU grant")?;
+    cmd.env("CARGO_BUILD_JOBS", jobs.to_string())
+        .env("BUILD_SLOT_HELD", "1");
+    Ok(())
 }
 
 fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<BuildUsage, String> {
@@ -1412,6 +1417,16 @@ fn run_slice_profile(
     if let Some((arm, cores)) = arm {
         cmd.envs(arm.environment())
             .env("CARGO_BUILD_JOBS", cores.to_string());
+    }
+    // A read-only compat check is also used by Background main sampling. Its enclosing cut
+    // already holds Release rank when there is one; the compile alone never claims a cut.
+    if verb == "check" {
+        cmd.env_remove(aterm_capacity::RELEASE_RUN_ENV);
+        compat_budget(
+            &mut cmd,
+            std::env::var("BUILD_SLOT_HELD").ok().as_deref(),
+            std::env::var("CARGO_BUILD_JOBS").ok().as_deref(),
+        )?;
     }
     // Cargo's implicit job is charged before it starts, just like its rustc workers.
     let _implicit = match pool {
@@ -1519,15 +1534,26 @@ fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
             }
             break;
         }
-        for &byte in &chunk[..n] {
-            if byte == b'\n' {
-                if !overflow {
+        let mut rest = &chunk[..n];
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            let (seg, after) = rest.split_at(pos);
+            rest = &after[1..];
+            if !overflow {
+                if line.is_empty() {
+                    if seg.len() <= MESSAGE_LINE_LIMIT {
+                        book(seg, &mut read);
+                    }
+                } else if line.len() + seg.len() <= MESSAGE_LINE_LIMIT {
+                    line.extend_from_slice(seg);
                     book(&line, &mut read);
                 }
-                line.clear();
-                overflow = false;
-            } else if line.len() < MESSAGE_LINE_LIMIT && !overflow {
-                line.push(byte);
+            }
+            line.clear();
+            overflow = false;
+        }
+        if !rest.is_empty() && !overflow {
+            if line.len() + rest.len() <= MESSAGE_LINE_LIMIT {
+                line.extend_from_slice(rest);
             } else {
                 overflow = true;
             }
@@ -2650,6 +2676,34 @@ mod tests {
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
+    #[test]
+    fn compat_compile_keeps_the_main_lanes_cpu_grant() {
+        let mut cmd = aterm_uds::spawnfd::command("unused");
+        super::compat_budget(&mut cmd, Some("1"), Some("3")).unwrap();
+        let env: std::collections::BTreeMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env.get("CARGO_BUILD_JOBS").and_then(Option::as_deref),
+            Some("3")
+        );
+        assert_eq!(
+            env.get("BUILD_SLOT_HELD").and_then(Option::as_deref),
+            Some("1")
+        );
+        assert!(super::compat_budget(&mut cmd, Some("1"), Some("0")).is_err());
+        assert!(super::compat_budget(&mut cmd, Some("1"), None).is_err());
+        let mut ordinary = aterm_uds::spawnfd::command("unused");
+        super::compat_budget(&mut ordinary, None, Some("3")).unwrap();
+        assert_eq!(ordinary.get_envs().count(), 0);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_build_wait_keeps_status_and_measured_peak_rss() {
@@ -2803,10 +2857,10 @@ mod tests {
 
     use super::{
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
-        RELEASE_BUILD_MARKER, RELEASE_SYSTEM_PATH, ReleaseEnv, Renderer, SECTION_64_LEN,
-        SEGMENT_COMMAND_64_LEN, SliceArch, SliceBuild, cargo_build_args, current_release_uid,
-        parse_thin_macho_update_pin, publish_verified_output, release_build_command, release_env,
-        release_tool_path, resolve_release_rustup_shim_dir, slice_drives_a_session, turn_verdict,
+        RELEASE_SYSTEM_PATH, ReleaseEnv, Renderer, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN,
+        SliceArch, SliceBuild, cargo_build_args, current_release_uid, parse_thin_macho_update_pin,
+        publish_verified_output, release_build_command, release_env, release_tool_path,
+        resolve_release_rustup_shim_dir, slice_drives_a_session, turn_verdict,
         validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
         validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
         validate_slice_update_pin_reports, x86_64_probe_asset_name, x86_64_probe_transcript,
@@ -3351,7 +3405,8 @@ mod tests {
             ] {
                 assert_eq!(get(steering), None, "{steering} reaches the release build");
             }
-            assert_eq!(get("SOURCE_DATE_EPOCH").as_deref(), Some("4242"));
+            assert_eq!(get(aterm_stamp::input::MODE).as_deref(), Some("commit"));
+            assert_eq!(get(aterm_stamp::input::EPOCH).as_deref(), Some("4242"));
             let (debug, strip) = if cfg!(target_os = "linux") {
                 ("0", "debuginfo")
             } else {
@@ -3359,9 +3414,9 @@ mod tests {
             };
             assert_eq!(get("CARGO_PROFILE_RELEASE_DEBUG").as_deref(), Some(debug));
             assert_eq!(get("CARGO_PROFILE_RELEASE_STRIP").as_deref(), Some(strip));
-            assert_eq!(get(RELEASE_BUILD_MARKER).as_deref(), Some("1"));
+            assert_eq!(get(aterm_stamp::input::RELEASE).as_deref(), Some("1"));
             assert_eq!(get(aterm_capacity::RELEASE_RUN_ENV).as_deref(), Some("1"));
-            assert_eq!(get(atpkg::net::INDEX_HINT_ENV).as_deref(), index_hint);
+            assert_eq!(get(aterm_stamp::input::INDEX_HINT).as_deref(), index_hint);
             assert_eq!(
                 get("RUSTUP_TOOLCHAIN").as_deref(),
                 compat.then_some("stable"),
@@ -3369,9 +3424,7 @@ mod tests {
             );
         }
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
+        let root = aterm_tempfile::manifest_dir().join("..").join("..");
         let mut manifests = vec![root.join("Cargo.toml")];
         for entry in std::fs::read_dir(root.join("crates"))
             .expect("crates/")

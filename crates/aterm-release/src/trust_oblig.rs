@@ -162,7 +162,9 @@ impl Record {
     pub fn to_text(&self) -> String {
         let total = self.total();
         let proved = self.proved();
-        let mut out = format!(
+        let mut out = String::with_capacity(128 + self.rows.len() * 96);
+        let _ = write!(
+            out,
             "{RECORD_MAGIC}\npackage\t{}\nunit\t{}\nfunctions\t{}\ntotal\t{total}\nproved\t{proved}\n",
             self.package, self.unit, self.functions,
         );
@@ -220,18 +222,56 @@ impl Record {
         let functions = number(&head("functions")?, "functions")?;
         let total = number(&head("total")?, "total")?;
         let proved = number(&head("proved")?, "proved")?;
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(usize::try_from(total).unwrap_or(0).min(1_000_000));
         let mut end = None;
         for (n, line) in lines {
             if end.is_some() {
                 return Err(format!("line {n} follows its `end` line"));
             }
-            let f: Vec<&str> = line.split('\t').collect();
-            match f.first().copied() {
-                Some("o") if f.len() == 12 => {
-                    rows.push(row_of(&f[1..]).map_err(|why| format!("line {n}: {why}"))?);
+            let mut f = line.split('\t');
+            match f.next() {
+                Some("o") => {
+                    let (
+                        Some(f0),
+                        Some(f1),
+                        Some(f2),
+                        Some(f3),
+                        Some(f4),
+                        Some(f5),
+                        Some(f6),
+                        Some(f7),
+                        Some(f8),
+                        Some(f9),
+                        Some(f10),
+                        None,
+                    ) = (
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                        f.next(),
+                    )
+                    else {
+                        return Err(format!("line {n} is not a row of a record"));
+                    };
+                    rows.push(
+                        row_of(&[f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10])
+                            .map_err(|why| format!("line {n}: {why}"))?,
+                    );
                 }
-                Some("end") if f.len() == 2 => end = Some(number(f[1], "end")?),
+                Some("end") => {
+                    let (Some(count), None) = (f.next(), f.next()) else {
+                        return Err(format!("line {n} is not a row of a record"));
+                    };
+                    end = Some(number(count, "end")?);
+                }
                 _ => return Err(format!("line {n} is not a row of a record")),
             }
         }
@@ -488,7 +528,7 @@ impl RawOutcome {
 /// first, when it carries several), `wall-backstop` for a `timeout` that names none (a
 /// per-obligation clock ran out), else [`NO_STOP`].
 fn stop_of(o: &RawOutcome) -> String {
-    fn tags(v: &aterm_json::Value, out: &mut Vec<String>) {
+    fn tags<'a>(v: &'a aterm_json::Value, out: &mut Vec<&'a str>) {
         match v {
             aterm_json::Value::String(s) => {
                 let mut rest = s.as_str();
@@ -499,7 +539,7 @@ fn stop_of(o: &RawOutcome) -> String {
                         .take_while(|b| b.is_ascii_lowercase() || *b == b'-')
                         .count();
                     if n > 0 && rest.as_bytes().get(n) == Some(&b']') {
-                        out.push(rest[..n].to_string());
+                        out.push(&rest[..n]);
                     }
                 }
             }
@@ -510,11 +550,11 @@ fn stop_of(o: &RawOutcome) -> String {
     }
     let mut found = Vec::new();
     tags(&o.all, &mut found);
-    if let Some(b) = found.iter().find(|t| is_backstop(t)) {
-        return b.clone();
+    if let Some(b) = found.iter().copied().find(|t| is_backstop(t)) {
+        return b.to_string();
     }
     match found.pop() {
-        Some(t) => t,
+        Some(t) => t.to_string(),
         None if o.status == "timeout" => "wall-backstop".into(),
         None => NO_STOP.into(),
     }
@@ -673,11 +713,22 @@ fn sysroot_tail(raw: &str) -> Option<&str> {
 /// The characters `a..b` of `s`.
 fn chars(s: &str, a: u32, b: u32) -> Option<String> {
     let (a, b) = (a as usize, b as usize);
+    if a > b {
+        return None;
+    }
     if s.is_ascii() {
         return s.get(a..b).map(str::to_owned);
     }
-    let n = s.chars().count();
-    (a <= b && b <= n).then(|| s.chars().skip(a).take(b - a).collect())
+    let mut it = s.chars();
+    for _ in 0..a {
+        it.next()?;
+    }
+    let need = b - a;
+    let mut out = String::with_capacity(need);
+    for _ in 0..need {
+        out.push(it.next()?);
+    }
+    Some(out)
 }
 
 /// Whitespace collapsed to single spaces.

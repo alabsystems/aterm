@@ -197,6 +197,133 @@ mod live {
             "every entry is a resource one"
         );
     }
+
+    /// The stand-in's stage, and the proof line it writes once it runs that stage.
+    const STAGE: &str = "ATERM_COALITION_STAGE";
+    const STAND_IN: &str = "coalitions::tests::live::coalition_stand_in";
+
+    /// The hang detector for a stand-in that must exit.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// This test binary, started as the spawn law's child: it writes its stage and exits, and at
+    /// stage `exec` it first execs itself at stage `done` (a new task in the same coalition).
+    #[test]
+    #[ignore = "the child the spawn law starts; alone it returns"]
+    fn coalition_stand_in() {
+        use std::io::Write as _;
+        let Ok(stage) = std::env::var(STAGE) else {
+            return;
+        };
+        println!("\n{stage}");
+        std::io::stdout().flush().expect("the stage's proof");
+        if stage == "exec" {
+            let failed =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                    .args(stand_in_args())
+                    .env(STAGE, "done")
+                    .exec();
+            panic!("the exec: {failed}");
+        }
+    }
+
+    fn stand_in_args() -> [&'static str; 5] {
+        [
+            "--exact",
+            STAND_IN,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+    }
+
+    /// Runs the stand-in at `stage` to its exit; panics unless it wrote `proof`.
+    fn run_stand_in(stage: &str, proof: &str) {
+        let mut cmd =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+        cmd.args(stand_in_args()).env(STAGE, stage);
+        let out = aterm_uds::deadline::output_within(&mut cmd, HANG)
+            .unwrap_or_else(|e| panic!("hang detector: the stand-in at {stage}: {e:?}"));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.lines().any(|l| l == proof),
+            "the stand-in at {stage}: {}: {text}",
+            out.status
+        );
+    }
+
+    /// `(started, exited)` of coalition `id` now.
+    fn tasks(id: u64) -> (u64, u64) {
+        let read = coalitions().expect("the list reads");
+        let row = read
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .expect("this process's coalition answers");
+        (row.tasks_started, row.tasks_exited)
+    }
+
+    /// A REAL SPAWN RAISES THE COALITION STARTS (record §8.2): a child spawned into this
+    /// process's coalition is one more task started and, once reaped, one more exited; a child
+    /// that execs before it exits is two started, the spawn's task and the exec's new one. Lower
+    /// bounds only: the coalition is shared with everything else in this test's tree, which may
+    /// start tasks meanwhile; the exact counts are the Processes lab's, on a quiet machine.
+    #[test]
+    fn a_real_spawn_raises_the_coalition_starts() {
+        let own = coalition_of(std::process::id()).expect("this process's coalition");
+        let before = tasks(own);
+        run_stand_in("spawn", "spawn");
+        let spawned = tasks(own);
+        assert!(
+            spawned.0 > before.0 && spawned.1 > before.1,
+            "a spawn and its exit: {before:?} then {spawned:?}"
+        );
+        run_stand_in("exec", "done");
+        let execed = tasks(own);
+        assert!(
+            execed.0 >= spawned.0 + 2 && execed.1 > spawned.1,
+            "a spawn, its exec and its exit: {spawned:?} then {execed:?}"
+        );
+    }
+
+    /// The live tasks of every coalition, `Σ (started − exited)`, are the process table's count
+    /// (record §8.2 measured 738 against `ps -A`'s 738): the coalitions cover every process of
+    /// every user, read unprivileged. The table is read between two coalition reads, so it may
+    /// differ from the first by what started or ended over them (counted by the starts formula,
+    /// `aterm_vitals::starts`), plus a zombie or two the table still lists after its task ended.
+    #[test]
+    fn live_tasks_by_coalition_match_the_process_table_within_the_reads_churn() {
+        let live = |r: &CoalitionRead| {
+            r.rows
+                .iter()
+                .map(|c| c.tasks_started.saturating_sub(c.tasks_exited))
+                .sum::<u64>()
+        };
+        let tasks = |r: &CoalitionRead| {
+            aterm_vitals::starts::CoalTaskRead::of(
+                r.newest,
+                r.truncated,
+                r.rows.iter().map(|c| aterm_vitals::starts::CoalTasks {
+                    id: c.id,
+                    started: c.tasks_started,
+                    exited: c.tasks_exited,
+                }),
+            )
+        };
+        let then = coalitions().expect("the list reads");
+        let table = crate::macos::pid_counts(0).0.expect("the process table");
+        let now = coalitions().expect("the list reads");
+        assert!(!then.truncated && !now.truncated, "whole lists");
+        let (starts, exits) = aterm_vitals::starts::coalition_moves(&tasks(&then), &tasks(&now))
+            .expect("two based reads");
+        let slack = starts + exits + 4;
+        let counted = live(&then);
+        assert!(
+            counted.abs_diff(table) <= slack,
+            "{counted} live tasks in {} coalitions against {table} processes in the table \
+             ({starts} started and {exits} ended over the reads)",
+            then.rows.len()
+        );
+    }
 }
 
 /// A kept coalition id is read again only where its pid's version moved (an exec, or a new

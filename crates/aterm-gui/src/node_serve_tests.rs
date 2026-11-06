@@ -24,9 +24,9 @@ use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, en
 use super::{
     NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
     WindowLauncher, a_window_relay_answers, apply_at_node_boot, arm_claims_off_on_quit,
-    claims_off_on_quit, claims_upkeep, has_live_window_relay, keeps_port_after, node_vault_paths,
-    query_window_survey_facts, read_line_raw, relay_ask, relay_socket_path, restart_for,
-    run_node_serve_with, serve_window_relay_at, wanted_for_node,
+    claims_off_on_quit, claims_upkeep, has_live_window_relay, keeps_port_after, mind_node_checker,
+    own_node_job, query_window_survey_facts, read_line_raw, relay_ask, relay_socket_path,
+    restart_for, run_node_serve_with, serve_window_relay_at, wanted_for_node, why_the_run_ends,
 };
 
 const SECRET_BYTES: [u8; 24] = [0x5a; 24];
@@ -265,6 +265,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         })
         .collect();
     let expected = SwarmSurveyFacts {
+        release_lines: Vec::new(),
         node: Some("11111111111111111111111111111111".to_owned()),
         label: Some("m22".to_owned()),
         roster_unread: false,
@@ -2269,34 +2270,6 @@ fn an_unreadable_swarm_switch_ends_the_node_jobs_generation() {
     );
 }
 
-/// A live node job reads its deny list from this user's vault, and one whose vault cannot be found
-/// (no home directory) does not start, rather than serve with a deny list that names no one, as
-/// only an isolated run (a test, a lab, CI) does.
-///
-/// NEGATIVE CONTROL (2026-11-01): with `node_vault_paths` reading a live failure as no vault
-/// (`live().ok()`, the shape the review found: `vault_paths` `None` meant isolated), this fails
-/// (`a live job with no vault must not start`).
-#[test]
-fn a_live_node_job_with_no_vault_does_not_start() {
-    let home = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = aterm_secrets::client::Paths::for_home(home.path());
-    assert_eq!(
-        node_vault_paths(true, || panic!("an isolated job reads no vault")),
-        Ok(None)
-    );
-    assert!(
-        node_vault_paths(false, || Err(aterm_secrets::Error::new(
-            "no home directory"
-        )))
-        .is_err(),
-        "a live job with no vault must not start"
-    );
-    assert_eq!(
-        node_vault_paths(false, || Ok(paths.clone())),
-        Ok(Some(paths))
-    );
-}
-
 /// launchd starts the node job at a soft limit of 256, which shares out half the fleet slots: the
 /// real entry serves a loopback handshake before its capacity is read. A window child is told
 /// the launcher's limit, which is what that window's shells get. The serving child proves both
@@ -2366,8 +2339,7 @@ fn the_node_job_raises_launchds_descriptor_limit_to_serve_every_fleet_slot() {
             crate::fleet_listen::fleet_slots() < aterm_net::fleet::MAX_SLOTS,
             "CONTROL: launchd's limit serves fewer"
         );
-        let server =
-            std::thread::spawn(|| super::run_node_serve(NodeBoot::nothing_at(Instant::now())));
+        let server = std::thread::spawn(|| super::run_node_serve_owning(|| {}));
         let mut reader = JobsReader::new();
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let port = loop {
@@ -2499,11 +2471,16 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A scripted [`NodeUpdater`]: its checker stages `stages` as it starts (and [`Self::stage`]
-/// stages more), its clock is its start plus what the test advanced, and it counts each look,
-/// apply and confirmation. Its restart is recorded and ends the run, as production's does.
+/// stages more), an older build stands in its place once [`Self::older`] says so, its checks
+/// setting moved once [`Self::checks_moved`] says so, its clock is its start plus what the test
+/// advanced, and it counts each look, checker look, apply and confirmation. Its restart is
+/// recorded and ends the run, as production's does.
 struct ScriptedUpdater {
     stages: Option<u64>,
     newer: std::sync::Mutex<Option<u64>>,
+    older: std::sync::Mutex<Option<u64>>,
+    checks_moved: AtomicBool,
+    minds: AtomicUsize,
     noticed: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     auto_apply: AtomicBool,
     confirms_land: AtomicBool,
@@ -2521,6 +2498,9 @@ impl ScriptedUpdater {
         Self {
             stages,
             newer: std::sync::Mutex::new(None),
+            older: std::sync::Mutex::new(None),
+            checks_moved: AtomicBool::new(false),
+            minds: AtomicUsize::new(0),
             noticed: std::sync::Mutex::new(None),
             auto_apply: AtomicBool::new(true),
             confirms_land: AtomicBool::new(true),
@@ -2578,6 +2558,18 @@ impl NodeUpdater for ScriptedUpdater {
     fn confirm_trial(&self) -> bool {
         self.confirms.fetch_add(1, Ordering::AcqRel);
         self.confirms_land.load(Ordering::Acquire)
+    }
+
+    fn older_build_installed(&self) -> Option<u64> {
+        *lock(&self.older)
+    }
+
+    fn checks_setting_moved(&self) -> bool {
+        self.checks_moved.load(Ordering::Acquire)
+    }
+
+    fn mind_checker(&self) {
+        self.minds.fetch_add(1, Ordering::AcqRel);
     }
 
     fn restart(&self, why: &str) {
@@ -2991,6 +2983,222 @@ fn a_node_job_with_a_window_stages_and_ends_its_run_only_once_the_window_quits()
     assert_eq!(updater.restarts().len(), 1, "{:?}", updater.restarts());
 }
 
+/// A START THAT FINDS THE JOB'S LOCK HELD BOOTS AND STARTS NOTHING (§4.13): no boot apply,
+/// which would swap a stage in or count a start against the boot trial of a build the instance
+/// holding the lock does not run, no startup of the job's services and no run; it ends as a
+/// second instance ends. A lock that cannot be opened orders no start, so that start still
+/// boots, which counts a new build that fails there against its trial, and then fails with no
+/// service started. CONTROL: once the lock is free, the start takes it, runs its boot while it
+/// holds it, then its startup, then the run, which lets it go as it returns.
+#[test]
+fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let state = root.path().join("state");
+    let calls = std::sync::Mutex::new(Vec::new());
+    let unopenable = root.path().join("a-file-not-a-state-dir");
+    std::fs::write(&unopenable, "").expect("a file where the state directory goes");
+    assert_eq!(
+        own_node_job(
+            &unopenable,
+            || {
+                lock(&calls).push("boot");
+                NodeBoot::nothing_at(Instant::now())
+            },
+            || lock(&calls).push("startup"),
+            |_, _| {
+                lock(&calls).push("serve");
+                ExitCode::SUCCESS
+            },
+        ),
+        ExitCode::FAILURE,
+        "a lock that cannot be opened fails the start"
+    );
+    assert_eq!(
+        std::mem::take(&mut *lock(&calls)),
+        ["boot"],
+        "a start whose lock cannot be opened still boots, and starts nothing"
+    );
+    let start = || {
+        own_node_job(
+            &state,
+            || {
+                lock(&calls).push("boot");
+                assert!(
+                    node_job_holds_lock(&state),
+                    "the boot ran before the job's lock was taken"
+                );
+                NodeBoot::nothing_at(Instant::now())
+            },
+            || lock(&calls).push("startup"),
+            |_, job_lock| {
+                lock(&calls).push("serve");
+                drop(job_lock);
+                ExitCode::FAILURE
+            },
+        )
+    };
+    let held = aterm_agent::node_service::NodeJobLock::try_acquire(&state)
+        .expect("open the job's lock")
+        .expect("take the job's lock");
+    assert_eq!(start(), ExitCode::SUCCESS, "a second instance ends as one");
+    assert!(
+        lock(&calls).is_empty(),
+        "a start that found the lock held ran {:?}",
+        lock(&calls)
+    );
+    drop(held);
+    assert_eq!(start(), ExitCode::FAILURE, "CONTROL: the run's own status");
+    assert_eq!(*lock(&calls), ["boot", "startup", "serve"]);
+    assert!(
+        !node_job_holds_lock(&state),
+        "the run kept the job's lock past its return"
+    );
+}
+
+/// AN OLDER INSTALLED BUILD ENDS A RUN ONLY ONCE THIS JOB'S IMAGE WAS REPLACED: a bundle whose
+/// `Info.plist` names an older build than the executable it holds would otherwise end every run
+/// at its first look and loop the job under launchd. CONTROL: a replaced image runs the older
+/// build; with none older nothing is asked.
+#[test]
+fn an_older_installed_build_ends_the_run_only_once_this_jobs_image_was_replaced() {
+    assert_eq!(
+        super::older_build_to_run(Some(1), || true),
+        Some(1),
+        "CONTROL"
+    );
+    assert_eq!(
+        super::older_build_to_run(Some(1), || false),
+        None,
+        "this job's image is still the installed file"
+    );
+    assert_eq!(
+        super::older_build_to_run(None, || panic!("asked with no older build")),
+        None
+    );
+}
+
+/// AN OLDER BUILD IN THIS COPY'S PLACE, OR A CHANGED CHECKS SETTING, ENDS THE NODE RUN WINDOW OR
+/// NOT (§4.13): the job serves a build that a revert put back or that no longer stands here, or
+/// checks under an `[update] enabled` it read once at its start, and only a restart is its next
+/// launch. Each names its reason, the older build first. CONTROL: a newer build still waits
+/// while a window runs here, and goes once it quits.
+#[test]
+fn an_older_build_or_a_changed_checks_setting_ends_the_node_run_window_or_not() {
+    let relay = crate::test_scratch::short_dir("node-update-ends");
+    let updater = ScriptedUpdater::new(None);
+    let boot = NodeBoot::nothing_at(updater.started);
+    let window = WindowRelay::open(relay.path());
+    updater.stage(3);
+    assert_eq!(
+        why_the_run_ends(&updater, boot, relay.path()),
+        None,
+        "CONTROL: a newer build waits while a window runs"
+    );
+    updater.checks_moved.store(true, Ordering::Release);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("a changed checks setting ends the run while a window runs");
+    assert!(why.contains("[update] enabled"), "{why}");
+    *lock(&updater.older) = Some(1);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("an older build in this copy's place ends the run while a window runs");
+    assert!(why.contains("build 1, older than this one"), "{why}");
+    drop(window);
+    *lock(&updater.older) = None;
+    updater.checks_moved.store(false, Ordering::Release);
+    let why = why_the_run_ends(&updater, boot, relay.path())
+        .expect("CONTROL: with the window gone the newer build ends the run");
+    assert!(why.contains("build 3 waits here"), "{why}");
+}
+
+/// THE NODE JOB'S LOOK MINDS ITS CHECKER AND ENDS ITS RUN FOR A CHANGED CHECKS SETTING (§4.13):
+/// every look asks the updater to mind its checker, a window or not, and the first look after
+/// `[update] enabled` moved ends the run, for launchd to start the job again under it.
+#[test]
+fn the_node_jobs_look_minds_its_checker_and_ends_its_run_for_a_changed_checks_setting() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let relay = crate::test_scratch::short_dir("node-update-minds");
+    let window = WindowRelay::open(relay.path());
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let server = serve_updating(
+        root.path(),
+        &root.path().join("state"),
+        relay.path(),
+        &updater,
+        ("[swarm]\nenabled = false\n", None),
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job's look minds its checker three times",
+        || (updater.minds.load(Ordering::Acquire) >= 3).then_some(()),
+    );
+    assert!(
+        updater.restarts().is_empty(),
+        "the job ended its run with nothing to end it for: {:?}",
+        updater.restarts()
+    );
+    updater.checks_moved.store(true, Ordering::Release);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the job ends its run for the changed setting",
+        || (!updater.restarts().is_empty()).then_some(()),
+    );
+    assert_eq!(server.join().expect("the job's thread"), ExitCode::SUCCESS);
+    let restarts = updater.restarts();
+    assert_eq!(restarts.len(), 1, "{restarts:?}");
+    assert!(restarts[0].contains("[update] enabled"), "{restarts:?}");
+    drop(window);
+}
+
+/// THE NODE JOB REPLACES A STALLED CHECKER AS A WINDOW DOES (§4.13), since with no window here
+/// nothing else would: a stale heartbeat is suspected at one look and replaced at a later one,
+/// once per generation. CONTROL: a fresh heartbeat is never replaced.
+#[test]
+fn the_node_job_replaces_a_stalled_checker_once_and_a_fresh_one_never() {
+    use aterm_update::checker_watch::{CheckerBeat, CheckerPhase, STALL_CONFIRM};
+    let beat = |phase, at_secs| CheckerBeat {
+        generation: 1,
+        phase,
+        at_secs,
+        max_interval_secs: 1_100,
+        respawns: 0,
+        deferrals: 0,
+        settings_misses: 0,
+        lane: None,
+        checks: 0,
+    };
+    let confirm = STALL_CONFIRM.as_secs();
+    let respawned = std::sync::Mutex::new(Vec::new());
+    let mut watch = crate::update_checker_watch::CheckerWatchState::default();
+    let mut look = |beat, now| {
+        mind_node_checker(&mut watch, Some(beat), now, |generation| {
+            lock(&respawned).push(generation);
+            Some(generation + 1)
+        })
+        .map(|(stall, replacement)| (stall.generation, replacement))
+    };
+    let fresh = beat(CheckerPhase::Waiting, 1_000);
+    assert_eq!(look(fresh, 1_060), None);
+    assert_eq!(
+        look(fresh, 1_060 + confirm),
+        None,
+        "CONTROL: a fresh heartbeat is never replaced"
+    );
+    let stuck = beat(CheckerPhase::LockWait, 1_000);
+    let days = 1_000 + 4 * 86_400;
+    assert_eq!(look(stuck, days), None, "the first look only suspects");
+    assert_eq!(
+        look(stuck, days + confirm),
+        Some((1, Some(2))),
+        "a later look replaces the stalled checker"
+    );
+    assert_eq!(
+        look(stuck, days + 2 * confirm),
+        None,
+        "the same stall is acted on once"
+    );
+    assert_eq!(*lock(&respawned), [1]);
+}
+
 /// THE BOOT TRIAL IS CONFIRMED ONCE THE NODE JOB IS UP (§4.13): serving, once its listener has
 /// answered for a tick; holding the LAN as its configuration says, once it has held a tick. A
 /// confirmation that does not land is asked again, and one that lands is not.
@@ -3094,6 +3302,16 @@ impl NodeUpdater for FixtureStage {
     fn confirm_trial(&self) -> bool {
         true
     }
+
+    fn older_build_installed(&self) -> Option<u64> {
+        None
+    }
+
+    fn checks_setting_moved(&self) -> bool {
+        false
+    }
+
+    fn mind_checker(&self) {}
 
     fn restart(&self, _why: &str) {
         self.restarted.store(true, Ordering::Release);

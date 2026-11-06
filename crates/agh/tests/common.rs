@@ -286,12 +286,12 @@ pub fn canonical_repos(fake: &FakeGithub) -> (u64, u64) {
     (dev, public)
 }
 
-/// The agh binary as the git helper: `CARGO_BIN_EXE_agh`, with no words before
-/// `auth git-credential`.
+/// The agh binary as the git helper: the package's `agh` ([`aterm_tempfile::bin_exe`]), with no
+/// words before `auth git-credential`.
 #[cfg(unix)]
 pub fn helper() -> HelperCommand {
     HelperCommand {
-        exe: PathBuf::from(env!("CARGO_BIN_EXE_agh")),
+        exe: aterm_tempfile::bin_exe("agh"),
         args: Vec::new(),
     }
 }

@@ -23,11 +23,9 @@ use aterm_vz_agent::wire::{self, Exec, Exit, Frame, Stdin};
 /// The hang detector: a wait for what must happen fails after a minute, never sooner.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The agent's debug executable, which the stand-ins are.
-pub const AGENT: &str = env!("CARGO_BIN_EXE_aterm-vz-agent");
-
 /// The executable the stand-ins run: `ATERM_VZ_AGENT_TEST_IMAGE` (an absolute path to a
-/// retained copy, for contained runs) when set, else Cargo's bin.
+/// retained copy, for contained runs) when set, else Cargo's bin, the agent's debug executable
+/// (`aterm_tempfile::bin_exe`).
 pub fn agent_exe() -> PathBuf {
     match std::env::var_os("ATERM_VZ_AGENT_TEST_IMAGE") {
         Some(path) => {
@@ -38,7 +36,7 @@ pub fn agent_exe() -> PathBuf {
             );
             path
         }
-        None => PathBuf::from(AGENT),
+        None => aterm_tempfile::bin_exe("aterm-vz-agent"),
     }
 }
 

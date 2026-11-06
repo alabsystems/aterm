@@ -140,18 +140,29 @@ pub(crate) const fn would_supervise(cfg: &SupervisorConfig, headless: bool) -> b
     cfg.enabled && (!headless || cfg.headless)
 }
 
+/// The switch that holds this instance's harness off ([`would_supervise`]), whose looks judge
+/// every worker's start and its startup deadline: `None` where it supervises.
+pub(crate) const fn harness_unsupervised(
+    cfg: &SupervisorConfig,
+    headless: bool,
+) -> Option<&'static str> {
+    if would_supervise(cfg, headless) {
+        None
+    } else if cfg.enabled {
+        Some("[harness] headless = false")
+    } else {
+        Some("[harness] enabled = false")
+    }
+}
+
 /// The switch that would leave a worker (`spawn agent=<word>`) with nothing to see its task through in this instance.
 pub(crate) fn worker_unsupervised(
     cfg: &SupervisorConfig,
     headless: bool,
     agent: Program,
 ) -> Option<&'static str> {
-    if !would_supervise(cfg, headless) {
-        Some(if cfg.enabled {
-            "[harness] headless = false"
-        } else {
-            "[harness] enabled = false"
-        })
+    if let Some(switch) = harness_unsupervised(cfg, headless) {
+        Some(switch)
     } else if admitted_mask(cfg) & agent_bit(agent) == 0 {
         Some(match agent {
             Program::Claude => "[harness.claude] enabled = false",
@@ -19598,19 +19609,26 @@ fn startups_on(
                 (TaskState::Working, Some("turn" | "moved")) => StartupState::Reopened,
                 _ => StartupState::Other,
             };
-            let rows_of = |t: &aterm_core::terminal::Terminal| -> Option<(Vec<String>, bool)> {
-                (!crate::frame_unfinished_now(t)).then(|| {
-                    (
-                        (0..t.rows() as usize)
-                            .map(|r| crate::control::visible_row(t, r))
-                            .collect(),
-                        shell_reached_prompt(t),
-                    )
-                })
-            };
+            // A PROGRAM WORKER (`crate::program_worker`) has started once its shell ran the line
+            // its launcher typed (a command a person ran in its tab is none): no screen of an
+            // agent's says so, and no box of one can hold it.
+            let program_worker = record.runs_a_program();
+            let rows_of =
+                |t: &aterm_core::terminal::Terminal| -> Option<(Vec<String>, bool, bool)> {
+                    (!crate::frame_unfinished_now(t)).then(|| {
+                        (
+                            (0..t.rows() as usize)
+                                .map(|r| crate::control::visible_row(t, r))
+                                .collect(),
+                            shell_reached_prompt(t),
+                            program_worker && crate::program_worker::started(t, &record),
+                        )
+                    })
+                };
             let for_start = state == StartupState::StalledAtStartup
                 || (state == StartupState::Working && !judged.contains(&sid));
-            let for_held = matches!(state, StartupState::Working | StartupState::Reopened)
+            let for_held = !program_worker
+                && matches!(state, StartupState::Working | StartupState::Reopened)
                 && held.may_be_held();
             // Read here, past the timeline's lock: only the limit on an awaited worker's install
             // reads this file ([`look_at_startups`]).
@@ -19625,9 +19643,11 @@ fn startups_on(
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 })
                 .flatten();
-            let (rows, prompt) = read.map_or((None, false), |(rows, prompt)| (Some(rows), prompt));
+            let (rows, prompt, ran) = read.map_or((None, false, false), |(rows, prompt, ran)| {
+                (Some(rows), prompt, ran)
+            });
             let seen = match (&rows, for_start, &pool_hold) {
-                _ if for_start && carried => StartupSeen::Started,
+                _ if for_start && (carried || ran) => StartupSeen::Started,
                 // Nothing was typed, so the screen says nothing of the worker: what holds it is
                 // the launcher's, whoever may claim the tab.
                 (_, true, Some(hold)) => StartupSeen::Holds(StartupHold::LaunchHeld {
@@ -19680,10 +19700,11 @@ fn startups_on(
                     .as_deref()
                     .is_some_and(|rows| aterm_phase::settings_panel(rows).is_some());
             }
-            let held = matches!(
-                state,
-                StartupState::Working | StartupState::Reopened | StartupState::StalledHeld
-            )
+            let held = (!program_worker
+                && matches!(
+                    state,
+                    StartupState::Working | StartupState::Reopened | StartupState::StalledHeld
+                ))
             .then_some(held);
             Some(Startup {
                 sid,

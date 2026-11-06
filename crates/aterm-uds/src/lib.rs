@@ -194,8 +194,9 @@ pub use win::{CtlListener, CtlStream};
 pub mod backup;
 
 /// Bounded regular-file reads on every platform; the whole-file writer on Unix and Windows
-/// (a new temporary beside it, synced and renamed; Unix modes apply on Unix), and aterm.toml's
-/// Unix editor under the config service's write lock.
+/// (a new temporary beside it, renamed over the file, and finished by the flush its caller
+/// takes: durable for `write`, the one named or none for `write_flushed`; Unix modes apply on
+/// Unix), and aterm.toml's Unix editor under the config service's write lock.
 pub mod atomic_file;
 
 /// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.

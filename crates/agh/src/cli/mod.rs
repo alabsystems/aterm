@@ -41,7 +41,7 @@ use std::sync::{Mutex, PoisonError};
 use astream_effects::EffectRecord;
 
 use crate::client::{Github, GithubBuilder, Meter};
-use crate::config::{self, Dirs, Validated};
+use crate::config::Dirs;
 use crate::download::DigestCheck;
 use crate::error::{Error, IdentityRef, Replay, Result, Sub};
 use crate::fx::Fx;
@@ -50,7 +50,7 @@ use crate::fx::tape::TapeHeader;
 use crate::git::HelperCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::identity::MapEnv;
-use crate::identity::vault::{self, Adoption};
+use crate::identity::vault::Adoption;
 use crate::identity::{EnvSource, ProcessEnv};
 use crate::model::Sha256Digest;
 #[cfg(any(test, debug_assertions))]
@@ -412,33 +412,41 @@ impl Ctx {
         self.github_noting(true)
     }
 
+    /// Recorded routing only: no identity-learning requests or adoption writes.
+    pub(crate) fn github_recorded(&mut self) -> Result<Github> {
+        self.github_mode(false, true)
+    }
+
     /// `github`, writing adoption's note lines only when `noting`.
     fn github_noting(&mut self, noting: bool) -> Result<Github> {
+        self.github_mode(noting, false)
+    }
+
+    fn github_mode(&mut self, noting: bool, recorded: bool) -> Result<Github> {
         if let Some(gh) = &self.github {
             return Ok(gh.clone());
         }
-        let explicit = match &self.dirs {
-            Some(dirs) => config::load(dirs)?,
-            None => None,
-        };
         let base = self.client(Router::empty());
-        let joins = explicit.as_ref().is_none_or(Validated::joins_vault);
-        let adopted = match self.dirs.clone() {
-            Some(dirs) if joins => self.adopted(&base, &dirs, noting)?,
-            _ => None,
-        };
-        let router = match (adopted, explicit) {
-            (Some(router), _) => router,
-            (None, Some(validated)) => Router::from_validated(validated),
-            (None, None) => Router::empty(),
-        };
-        let gh = base.with_router(router);
-        if let Some(adoption) = &self.adoption {
-            gh.absorb(adoption.spent());
-            for cred in adoption.pinned() {
-                gh.pin(cred.clone());
+        let gh = if let Some(dirs) = self.dirs.clone() {
+            let resolved = if self.anonymous || recorded {
+                crate::routing::view(&dirs, base.env())?
+            } else {
+                crate::routing::adopt(&base, &dirs)?
+            };
+            if noting
+                && !self.anonymous
+                && let Some(adoption) = resolved.adoption()
+            {
+                for line in adoption.note(&dirs.home) {
+                    out::note(self, &line);
+                }
             }
-        }
+            let bound = resolved.bind(&base);
+            self.adoption = resolved.into_adoption();
+            bound?
+        } else {
+            base
+        };
         self.github = Some(gh.clone());
         Ok(gh)
     }
@@ -452,29 +460,6 @@ impl Ctx {
             let _ = self.github_noting(false);
         }
         self.adoption.as_ref()
-    }
-
-    /// The router adoption gives (`None` when it does not apply), its note lines written to
-    /// stderr when `noting` and the call is not `--anonymous`. Under `--anonymous` it is the
-    /// record's alone (`vault::view`): a call that sends no token sends none to learn a login
-    /// either, and one it leaves out changes nothing.
-    fn adopted(&mut self, base: &Github, dirs: &Dirs, noting: bool) -> Result<Option<Router>> {
-        let found = if self.anonymous {
-            vault::view(dirs, base.env())
-        } else {
-            vault::adopt(base, dirs)
-        };
-        let Some(adoption) = found else {
-            return Ok(None);
-        };
-        if noting && !self.anonymous {
-            for line in adoption.note(&dirs.home) {
-                out::note(self, &line);
-            }
-        }
-        let router = adoption.router();
-        self.adoption = Some(adoption);
-        router.map(Some)
     }
 
     /// `error`'s next step made the vault's, when the call routed by adoption's rows and its

@@ -515,10 +515,8 @@ pub(crate) fn helper_route(env: &dyn EnvSource, dirs: &crate::config::Dirs) -> R
 /// The route the helper takes under `loose` or not. Not loose: `config::load(dirs)`, then,
 /// with no agh.toml or one that says `vault = true`, vault adoption as the record and the files
 /// stand (`vault::view`, design §6.10), whose rows route and whose judged tokens are pinned.
-/// Loose: `config::load_for_host(dirs)` alone, exactly the loader of the router that had a
-/// `legacy_loose()` profile to route (an AghHost's, which does not adopt), so a loose token
-/// file the run routed by is the one the helper reads, `vault = true` or not; were
-/// `load_for_host` to adopt, this follows it. A token the record does not bind adopts nothing
+/// Loose: the same shared view with AghHost's explicit `legacy_loose()` profile policy;
+/// vault credentials remain strict. A token the record does not bind adopts nothing
 /// here, which is why the runner checks the helper's route before it runs (`answers_as`): a
 /// runner whose call could not record a learned login refuses the run instead of spawning a
 /// git its helper will not answer.
@@ -532,19 +530,14 @@ pub(crate) fn route_for(
     dirs: &crate::config::Dirs,
     loose: bool,
 ) -> Result<HelperRoute> {
-    let explicit = if loose {
-        crate::config::load_for_host(dirs)?
+    let resolved = if loose {
+        crate::routing::view_for_host(dirs, env)?
     } else {
-        crate::config::load(dirs)?
+        crate::routing::view(dirs, env)?
     };
-    if !loose
-        && explicit
-            .as_ref()
-            .is_none_or(crate::config::Validated::joins_vault)
-        && let Some(adoption) = crate::identity::vault::view(dirs, env)
-    {
+    if let Some(adoption) = resolved.adoption() {
         return Ok(HelperRoute {
-            router: adoption.router()?,
+            router: resolved.router()?.clone(),
             pinned: adoption.pinned().to_vec(),
             #[cfg(unix)]
             next: adoption.next_step(),
@@ -552,9 +545,7 @@ pub(crate) fn route_for(
             adopted: true,
         });
     }
-    Ok(HelperRoute::over(
-        explicit.map_or_else(Router::empty, Router::from_validated),
-    ))
+    Ok(HelperRoute::over(resolved.router()?.clone()))
 }
 
 #[cfg(test)]

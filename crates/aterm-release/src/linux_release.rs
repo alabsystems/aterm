@@ -128,7 +128,7 @@ impl VerifierArtifact {
             || !self
                 .compiler_version
                 .lines()
-                .any(|line| line == format!("host: {}", target.triple()))
+                .any(|line| line.strip_prefix("host: ") == Some(target.triple()))
         {
             return Err(
                 "Linux bootstrap verifier receipt has mismatched source/build/target or no \
@@ -764,7 +764,7 @@ impl Artifact {
             || !self
                 .compiler_version
                 .lines()
-                .any(|line| line == format!("host: {}", target.triple()))
+                .any(|line| line.strip_prefix("host: ") == Some(target.triple()))
         {
             return Err(
                 "Linux handoff has mismatched source/build/target or invalid Trust provenance"
@@ -837,18 +837,22 @@ impl Handoff {
                 return Err("Linux handoff target order/identity mismatch".into());
             }
         }
+        let mut prev_pos = None;
         for verifier in &self.verifiers {
             verifier.validate(version, build, commit)?;
-        }
-        let order: Vec<Option<usize>> = self
-            .verifiers
-            .iter()
-            .map(|verifier| self.targets.iter().position(|t| *t == verifier.target))
-            .collect();
-        if order.iter().any(Option::is_none) || order.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(
-                "Linux handoff's bootstrap verifiers are not in its declared target order".into(),
-            );
+            let Some(pos) = self.targets.iter().position(|t| *t == verifier.target) else {
+                return Err(
+                    "Linux handoff's bootstrap verifiers are not in its declared target order"
+                        .into(),
+                );
+            };
+            if prev_pos.is_some_and(|prev| prev >= pos) {
+                return Err(
+                    "Linux handoff's bootstrap verifiers are not in its declared target order"
+                        .into(),
+                );
+            }
+            prev_pos = Some(pos);
         }
         Ok(())
     }
@@ -1284,16 +1288,18 @@ pub fn run_worker(
     let mut provenance_digest = aterm_digest::Sha256::new();
     provenance_digest.update(provenance_text.as_bytes());
     let provenance_hash = aterm_codec::hex::encode_lower(&provenance_digest.finalize());
-    let seal_field = |key: &str| -> Result<String, String> {
-        let prefix = format!("{key}=");
-        let values: Vec<_> = provenance_text
-            .lines()
-            .filter_map(|line| line.strip_prefix(&prefix))
-            .collect();
-        if values.len() != 1 {
+    let seal_field = |key: &str| -> Result<&str, String> {
+        let mut matches = provenance_text.lines().filter_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k == key).then_some(v)
+        });
+        let Some(first) = matches.next() else {
+            return Err(format!("Trust seal lacks unique {key}"));
+        };
+        if matches.next().is_some() {
             return Err(format!("Trust seal lacks unique {key}"));
         }
-        Ok(values[0].to_string())
+        Ok(first)
     };
     if seal_field("provenance_class")? != "BUILD-STAMPED-CLEAN"
         || seal_field("artifact_bin_trustc_sha256")? != compiler_hash

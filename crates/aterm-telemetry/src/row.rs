@@ -496,7 +496,7 @@ pub(crate) fn push_word_of(out: &mut String, text: &str, max: usize) {
     }
 }
 
-const fn word_char(c: char) -> bool {
+pub(crate) const fn word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | ',')
 }
 
@@ -505,12 +505,16 @@ pub(crate) fn is_word(w: &str) -> bool {
 }
 
 /// `body` with its checksum and the line feed.
-pub(crate) fn seal(mut line: String) -> String {
+pub(crate) fn seal_in_place(line: &mut String) {
     let d = aterm_digest::Sha256::digest(line.as_bytes());
     line.reserve(14);
     line.push_str(" sum=");
-    push_hex(&mut line, &d[..4]);
+    push_hex(line, &d[..4]);
     line.push('\n');
+}
+
+pub(crate) fn seal(mut line: String) -> String {
+    seal_in_place(&mut line);
     line
 }
 

@@ -161,7 +161,8 @@ pub fn grid_block_at(width: usize, label: &str, msg: &str) -> String {
         if label_placed {
             out.push_str(&gutter);
         } else {
-            out.push_str(&format!("  {label:<LABEL_MAX$} "));
+            use std::fmt::Write as _;
+            let _ = write!(out, "  {label:<LABEL_MAX$} ");
             label_placed = true;
         }
         out.push_str(row);
@@ -515,25 +516,21 @@ pub fn acquire_lease_action(
 pub fn release_lease_owner(git: &dyn GitRunner) -> Result<Option<String>> {
     let out = git_ok(git, &["ls-remote", "origin", RELEASE_LEASE_REF])?;
     let text = out.stdout_utf8();
-    let rows: Vec<&str> = text.lines().collect();
-    if rows.is_empty() {
+    let mut rows = text.lines();
+    let Some(row) = rows.next() else {
         return Ok(None);
-    }
-    if rows.len() != 1 {
+    };
+    if let Some(rest_count) = rows.next().map(|_| 2 + rows.count()) {
         return Err(Error::new(format!(
-            "release lease query returned {} rows for {RELEASE_LEASE_REF}",
-            rows.len()
+            "release lease query returned {rest_count} rows for {RELEASE_LEASE_REF}"
         )));
     }
-    let mut fields = rows[0].split_whitespace();
+    let mut fields = row.split_whitespace();
     let (Some(owner), Some(reference), None) = (fields.next(), fields.next(), fields.next()) else {
         return Err(Error::new("malformed release lease ls-remote response"));
     };
     if reference != RELEASE_LEASE_REF || !valid_lease_owner(owner) {
-        return Err(Error::new(format!(
-            "malformed release lease row: {:?}",
-            rows[0]
-        )));
+        return Err(Error::new(format!("malformed release lease row: {row:?}")));
     }
     Ok(Some(owner.to_ascii_lowercase()))
 }
@@ -546,16 +543,22 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
         &["ls-remote", "origin", PUBLISHER_FENCE_REF, &peeled_ref],
     )?;
     let text = out.stdout_utf8();
-    let rows: Vec<&str> = text.lines().collect();
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() != 2 {
-        return Err(Error::new(format!(
-            "publisher fence query returned {} rows; expected an annotated ref plus peel",
-            rows.len()
-        )));
-    }
+    let mut lines = text.lines();
+    let rows = match (lines.next(), lines.next(), lines.next()) {
+        (None, _, _) => return Ok(None),
+        (Some(r0), Some(r1), None) => [r0, r1],
+        (Some(_), None, _) => {
+            return Err(Error::new(
+                "publisher fence query returned 1 rows; expected an annotated ref plus peel",
+            ));
+        }
+        (Some(_), Some(_), Some(_)) => {
+            return Err(Error::new(format!(
+                "publisher fence query returned {} rows; expected an annotated ref plus peel",
+                3 + lines.count()
+            )));
+        }
+    };
     let mut token = None;
     let mut owner = None;
     for row in rows {
@@ -641,12 +644,13 @@ fn fence_field(value: &str) -> String {
 }
 
 pub(crate) fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
+    use std::fmt::Write as _;
     let mut out = format!(
         "fence-format: {FENCE_IDENTITY_FORMAT}\nfence-pid: {}\n",
         std::process::id()
     );
     if let Some(pgid) = probe.pgid() {
-        out.push_str(&format!("fence-pgid: {pgid}\n"));
+        let _ = writeln!(out, "fence-pgid: {pgid}");
     }
     for (key, value) in [
         ("host", probe.host()),
@@ -655,11 +659,11 @@ pub(crate) fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
         ("version", publisher_fence_self_version()),
     ] {
         if let Some(value) = value {
-            out.push_str(&format!("fence-{key}: {}\n", fence_field(&value)));
+            let _ = writeln!(out, "fence-{key}: {}", fence_field(&value));
         }
     }
     if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        out.push_str(&format!("fence-started: {}\n", now.as_secs()));
+        let _ = writeln!(out, "fence-started: {}", now.as_secs());
     }
     out
 }
@@ -924,7 +928,7 @@ impl PublisherProbe for LocalProbe {
 }
 
 fn executables_agree(recorded: &str, observed: &str) -> bool {
-    let base = |path: &str| {
+    fn base(path: &str) -> &str {
         let trimmed = path.trim();
         trimmed
             .strip_suffix(" (deleted)")
@@ -933,17 +937,16 @@ fn executables_agree(recorded: &str, observed: &str) -> bool {
             .next()
             .unwrap_or(path)
             .trim()
-            .to_string()
-    };
+    }
     let recorded = base(recorded);
     let observed = base(observed);
     if recorded.is_empty() || observed.is_empty() || recorded == observed {
         return true;
     }
     let (short, long) = if recorded.len() <= observed.len() {
-        (recorded.as_str(), observed.as_str())
+        (recorded, observed)
     } else {
-        (observed.as_str(), recorded.as_str())
+        (observed, recorded)
     };
     short.len() >= 8 && long.starts_with(short)
 }
@@ -2274,8 +2277,8 @@ fn server_refused_without_creating(out: &RunOut) -> bool {
 
 fn http_status_from_curl_failure(stderr: &str) -> Option<u16> {
     let tail = stderr.rsplit_once("returned error: ")?.1;
-    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let len = tail.bytes().take_while(u8::is_ascii_digit).count();
+    tail[..len].parse().ok()
 }
 
 /// What a failed one-shot POST proves about the object it asked for.
@@ -4949,15 +4952,16 @@ fn remote_annotated_tag(git: &dyn GitRunner, tag: &str) -> Result<Option<RemoteA
         &["ls-remote", "--tags", "origin", &tag_ref, &peeled_ref],
     )?;
     let text = out.stdout_utf8();
-    let rows: Vec<&str> = text.lines().collect();
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() != 2 {
-        return Err(Error::new(format!(
-            "recovery tag {tag} is not one exact annotated tag plus peel"
-        )));
-    }
+    let mut lines = text.lines();
+    let rows = match (lines.next(), lines.next(), lines.next()) {
+        (None, _, _) => return Ok(None),
+        (Some(r0), Some(r1), None) => [r0, r1],
+        _ => {
+            return Err(Error::new(format!(
+                "recovery tag {tag} is not one exact annotated tag plus peel"
+            )));
+        }
+    };
     let mut token = None;
     let mut commit = None;
     for row in rows {
@@ -5398,8 +5402,9 @@ pub(crate) fn validate_claim_provenance(
     let text =
         std::str::from_utf8(bytes).map_err(|_| Error::new("release provenance is not UTF-8"))?;
     let field = |name: &str| -> Result<&str> {
-        let prefix = format!("{name}=");
-        let mut values = text.lines().filter_map(|line| line.strip_prefix(&prefix));
+        let mut values = text
+            .lines()
+            .filter_map(|line| line.strip_prefix(name)?.strip_prefix('='));
         let first = values
             .next()
             .ok_or_else(|| Error::new(format!("release provenance has no exact {name}= field")))?;
@@ -7804,12 +7809,10 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let diag_text = String::from_utf8_lossy(&diag.stdout).into_owned();
     buildplan::validate_app_version_reports(&ctx.version, &[("shipped universal", &diag_text)])?;
     let expect_built = bundle::epoch_to_rfc3339(ctx.build);
-    let built = diag_text.lines().find_map(|l| {
-        l.split("built ")
-            .nth(1)
-            .map(|t| t.trim_end_matches(')').to_string())
-    });
-    if built.as_deref() != Some(expect_built.as_str()) {
+    let built = diag_text
+        .lines()
+        .find_map(|l| l.split_once("built ").map(|(_, t)| t.trim_end_matches(')')));
+    if built != Some(expect_built.as_str()) {
         return Err(Error::new(format!(
             "self-check failed: binary build stamp {built:?} != expected {expect_built:?} \
              (from claimed n {}) — the binary was not compiled with this claim",
@@ -8493,8 +8496,8 @@ pub const POINTER_PROBE_DELAY: Duration = Duration::from_secs(10);
 pub fn anon_probe_refusal(stderr: &str) -> Option<u16> {
     let idx = stderr.find("returned error: ")?;
     let rest = &stderr[idx + "returned error: ".len()..];
-    let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    match code.as_str() {
+    let len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    match &rest[..len] {
         "403" => Some(403),
         "429" => Some(429),
         _ => None,

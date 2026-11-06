@@ -30,7 +30,7 @@ pub(super) fn fresh(
     home: &Path,
     account: &str,
     staging: Option<StagedGoogleLogin<'_>>,
-    _: Instant,
+    _: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     let staging = staging.unwrap();
     let mut grant =
@@ -84,7 +84,7 @@ fn recovered_google_grants_keep_the_scope_even_without_cookies() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let seeded = run_with(
             &exe,
             &state,
@@ -137,7 +137,7 @@ fn closing_work_during_cached_google_verification_preserves_the_checkpoint() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     drop(
         run_with(
             &exe,
@@ -181,7 +181,7 @@ fn closing_after_native_completion_records_recovery_without_publishing_or_replay
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let lifetime = crate::harness::account_work::Lifetime::default();
     let work = lifetime.enter();
     let pause = std::cell::RefCell::new(None);
@@ -225,7 +225,7 @@ fn pending_crash_stand_in() {
     let state = root.join("state");
     let home = root.join("home");
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let grant = run_with(
         &exe,
         &state,
@@ -239,7 +239,7 @@ fn pending_crash_stand_in() {
     let _retained: Result<VerifiedGoogleGrant, UnverifiedGoogleGrant> =
         if std::env::var_os("ATERM_TEST_PENDING_AFTER_PROOF").is_some() {
             Ok(grant
-                .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+                .verify_with_retry(|| deadline.remaining(), proof, |_| {})
                 .unwrap())
         } else {
             Err(grant)
@@ -288,7 +288,7 @@ fn pending_native_completion_survives_process_death_and_removed_staging() {
         }
         std::fs::remove_dir_all(root.path().join("first")).unwrap();
         let before = std::fs::read(&browser_snapshot).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let resumed = run_with(
             &exe,
             &state,
@@ -302,7 +302,7 @@ fn pending_native_completion_survives_process_death_and_removed_staging() {
         let calls = Cell::new(0);
         let verified = resumed
             .verify_with_retry(
-                deadline,
+                || deadline.remaining(),
                 |token, expected, wait| {
                     calls.set(calls.get() + 1);
                     assert_eq!(token, "synthetic-token");
@@ -314,7 +314,6 @@ fn pending_native_completion_survives_process_death_and_removed_staging() {
                     proof(token, expected, wait)
                 },
                 |_| {},
-                Instant::now,
             )
             .unwrap();
         assert_eq!(calls.get(), 2);
@@ -346,7 +345,7 @@ fn pending_native_recovery_refuses_corruption_wrong_machine_and_concurrent_owner
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let grant = run_with(
             &exe,
             &state,
@@ -377,7 +376,11 @@ fn pending_native_recovery_refuses_corruption_wrong_machine_and_concurrent_owner
             if case == 1 { &another } else { &home },
             "one",
             staging(&root.path().join("second"), 4),
-            if case == 3 { Instant::now() } else { deadline },
+            if case == 3 {
+                WakeDeadline::after(Duration::ZERO)
+            } else {
+                deadline
+            },
             |_, _, _, _, _, _| panic!("an unavailable checkpoint triggered authentication"),
         );
         assert!(result.is_err(), "case {case}");
@@ -398,7 +401,7 @@ fn pending_native_rejection_and_deadlines_preserve_refresh_recovery() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let grant = run_with(
             &exe,
             &state,
@@ -412,7 +415,13 @@ fn pending_native_rejection_and_deadlines_preserve_refresh_recovery() {
         let path = candidate_file(&state);
         let ciphertext = std::fs::read(&path).unwrap();
         let result = grant.verify_with_retry(
-            if case == 2 { Instant::now() } else { deadline },
+            || {
+                if case == 2 {
+                    Duration::ZERO
+                } else {
+                    deadline.remaining()
+                }
+            },
             |_, _, _| {
                 assert_ne!(case, 2);
                 Err(if case == 0 {
@@ -422,7 +431,6 @@ fn pending_native_rejection_and_deadlines_preserve_refresh_recovery() {
                 })
             },
             |_| {},
-            Instant::now,
         );
         assert!(result.is_err());
         if case != 1 {
@@ -439,7 +447,7 @@ fn rate_limits_preserve_direct_and_pool_completions_without_retry_or_new_login()
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, identity) = setup(root.path());
         let program = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let first = root.path().join("first");
         let grant = if direct {
             super::direct_with(
@@ -473,13 +481,12 @@ fn rate_limits_preserve_direct_and_pool_completions_without_retry_or_new_login()
         let before = std::fs::read(&record).unwrap();
         let calls = Cell::new(0);
         let result = grant.verify_with_retry(
-            deadline,
+            || deadline.remaining(),
             |_, _, _| {
                 calls.set(calls.get() + 1);
                 Err(google_profile::Error::RateLimited)
             },
             |_| panic!("rate limiting scheduled an immediate retry"),
-            Instant::now,
         );
         assert!(matches!(result, Err(google_profile::Error::RateLimited)));
         assert_eq!(calls.get(), 1);
@@ -515,7 +522,7 @@ fn rate_limits_preserve_direct_and_pool_completions_without_retry_or_new_login()
             .unwrap()
         };
         grant
-            .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+            .verify_with_retry(|| deadline.remaining(), proof, |_| {})
             .unwrap()
             .finish_recovery()
             .unwrap();
@@ -528,7 +535,7 @@ fn changed_pending_record_is_not_deleted_or_sent_to_google() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let grant = run_with(
         &exe,
         &state,
@@ -544,10 +551,9 @@ fn changed_pending_record_is_not_deleted_or_sent_to_google() {
     assert!(
         grant
             .verify_with_retry(
-                deadline,
+                || deadline.remaining(),
                 |_, _, _| panic!("changed attempt contacted Google"),
                 |_| {},
-                Instant::now
             )
             .is_err()
     );
@@ -676,7 +682,7 @@ fn stale_pending_scope_starts_only_a_new_authorized_attempt() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let grant = run_with(
             &exe,
             &state,
@@ -722,7 +728,7 @@ fn stale_pending_scope_starts_only_a_new_authorized_attempt() {
             "stale authorization restored a cached native grant"
         );
         let verified = grant
-            .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+            .verify_with_retry(|| deadline.remaining(), proof, |_| {})
             .unwrap();
         verified.finish_recovery().unwrap();
     }
@@ -735,7 +741,7 @@ fn resumed_rejected_completion_renews_only_after_canonical_rejection() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let first = root.path().join("first");
         let grant = run_with(
             &exe,
@@ -847,7 +853,7 @@ fn rejected_encrypted_completion_reaches_native_refresh_handoff() {
         .unwrap();
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let grant = run_with(&program, &state, &home, "one", staging(&root.path().join("first"), 4), deadline,
         |program, state, home, account, staging, deadline| {
             let grant = fresh(program, state, home, account, staging, deadline)?;

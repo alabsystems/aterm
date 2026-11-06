@@ -482,7 +482,13 @@ fn cpu_hardware_report_copy_stays_in_the_existing_lens() {
     let (on, _) = r.instrument(Instrument::Cpu);
     r.move_to(on);
     r.click(MouseButton::Left);
-    let expected = super::cpu_diagnostic_report(r.app.vitals.snapshot.as_deref().unwrap());
+    // ⌘⇧C copies the report where the lens binds it ([`super::cpu_report_key`]); on Linux it is
+    // the lens's ⌘C, which copies the lens's sentence.
+    let expected = if super::cpu_report_key(aterm_vitals::words::Platform::host()) {
+        super::cpu_diagnostic_report(r.app.vitals.snapshot.as_deref().unwrap())
+    } else {
+        r.sentence(Instrument::Cpu)
+    };
     r.chord(
         ModifiersState::SUPER | ModifiersState::SHIFT,
         KeyCode::KeyC,

@@ -12085,6 +12085,23 @@ impl TurnEndReading {
             && !self.interrupted
             && matches!(self.composer, Composer::Empty | Composer::Placeholder(_))
     }
+
+    /// AN ANSWERED POINT THAT SAYS NOTHING ([`Self::answered_point`]'s shape, a conversation
+    /// drawn, no stop notice, no wall or limit notice drawn): no reply read, or one of whitespace
+    /// alone, none of it cut above the screen. A land check's answer read so has not answered it
+    /// yet ([`TurnEndState::unsaid_reading`]).
+    fn unsaid(&self) -> bool {
+        self.answered_point()
+            && self.fault.is_none()
+            && !self.wall_drawn()
+            && self.since_limit.is_none()
+            && !self.taskless
+            && !self.said_cut
+            && self
+                .said_tail
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty())
+    }
 }
 
 /// THE HARNESS'S OWN ESC ([`TurnEndState::woken_esc`]).
@@ -12622,6 +12639,9 @@ struct Awaited {
     submitted: bool,
     submits: Option<u64>,
     screen: Option<u64>,
+    /// THE LAND CHECK'S TURN RAN AND ENDED SAYING NOTHING ([`TurnEndState::unsaid_reading`]):
+    /// the work it ran for, which the reading its words are drawn on is judged with.
+    ran: Option<Duration>,
 }
 
 impl Awaited {
@@ -14021,6 +14041,7 @@ impl TurnEndState {
             submitted: false,
             submits: None,
             screen: None,
+            ran: None,
         });
         true
     }
@@ -17772,6 +17793,8 @@ impl TurnEndState {
         } else {
             reading
         };
+        let drawn_late = self.unsaid_reading(reading, now);
+        let reading = drawn_late.as_ref().unwrap_or(reading);
         let unseen;
         let reading = match self
             .answered_unseen(reading, now)
@@ -17946,8 +17969,10 @@ impl TurnEndState {
         let act_owed = landing && !act_seen && reading.worked.is_none() && awaited.is_none();
         let check_yield = landing && !act_owed && self.land.check_pending;
         // A CHECK'S TURN THE PERSON STOPPED (Esc) gave no answer: its last words are not the
-        // agent's audit, so nothing lands on them and the defense stays owed its check.
-        let answer_stopped = check_yield && reading.interrupted;
+        // agent's audit, so nothing lands on them and the defense stays owed its check. Nor did
+        // one that said nothing, judged once its take window ran out ([`Self::unsaid_reading`]):
+        // no words are no audit either.
+        let no_answer = check_yield && (reading.interrupted || reading.unsaid());
         let answer_read = land_check::land_check_answer(
             reading.said_tail.as_deref().unwrap_or_default(),
             reading.before(),
@@ -18142,7 +18167,7 @@ impl TurnEndState {
                     self.short = 0;
                 }
                 if ok_to_leave {
-                    land_judged = landing && !self.exchange && act_taken && !answer_stopped;
+                    land_judged = landing && !self.exchange && act_taken && !no_answer;
                     let lands = land_judged && clean;
                     self.done = if self.exchange || lands {
                         2
@@ -18200,7 +18225,7 @@ impl TurnEndState {
                 self.followed = if checked { self.seeded_check } else { None };
                 self.point_worked = d;
                 self.new_point(now);
-                land_judged = landing && !left && ok_to_leave && !answer_stopped;
+                land_judged = landing && !left && ok_to_leave && !no_answer;
                 self.land.legs = None;
                 let lands = land_judged && clean;
                 self.done = if left || lands {
@@ -18267,7 +18292,7 @@ impl TurnEndState {
                         self.short = self.short.saturating_add(1);
                     }
                 }
-                land_judged = landing && act_seen && ok_to_leave && !answer_stopped;
+                land_judged = landing && act_seen && ok_to_leave && !no_answer;
                 if landing && act_seen && reading.wall.is_some() {
                     self.cut_land = true;
                 }
@@ -18680,13 +18705,15 @@ impl TurnEndState {
             // [`Self::seed_land_checked`]; the post-landing review, 2026-11-01): read again as the
             // loop before this one read it, so a rest on a need stays a rest, typing nothing, a
             // list stays answered and quoted, and the defense it audits is audited. A stopped
-            // turn gave no answer, there as here. Its left hold, which the books that loop handed
-            // on leave out ([`Self::land_books`]), is counted where it still holds, and a `LANDED`
-            // no left row holds now, over a repository read clean, lands, as the check's answer
-            // lands where it is first read so ([`Self::left_holds`]).
+            // turn, or one that said nothing, gave no answer, there as here. Its left hold, which
+            // the books that loop handed on leave out ([`Self::land_books`]), is counted where it
+            // still holds, and a `LANDED` no left row holds now, over a repository read clean,
+            // lands, as the check's answer lands where it is first read so ([`Self::left_holds`]).
             let left_held = self.left_holds(reading);
-            let answer = (std::mem::take(&mut self.land.check_pending) && !reading.interrupted)
-                .then_some(answer_read);
+            let answer = (std::mem::take(&mut self.land.check_pending)
+                && !reading.interrupted
+                && !reading.unsaid())
+            .then_some(answer_read);
             match &answer {
                 Some(answer) => {
                     if let Some(mark) = self.land.sent.take()
@@ -19294,6 +19321,17 @@ impl TurnEndState {
                 return false;
             }
             self.stale_input = true;
+        } else if let Some(a) = &self.awaiting
+            && a.ran.is_some()
+            && self.land.check_pending
+            && reading.unsaid()
+        {
+            // A CHECK'S ANSWER THAT SAYS NOTHING YET ([`Self::unsaid_reading`]): the check stays
+            // awaited until its words are drawn or its take window, counted from that answer,
+            // runs out.
+            if now < a.due(&self.timing) {
+                return false;
+            }
         } else if let Some(a) = &mut self.awaiting
             && !a.command
             && reading.worked.is_none()
@@ -19304,6 +19342,42 @@ impl TurnEndState {
             }
         }
         true
+    }
+
+    /// A LAND CHECK'S ANSWER WITH NO WORDS ANSWERS NOTHING YET (L19, the 2026-11-05 confirm
+    /// run's `land-o` on agy 1.5.1 on a loaded Mac): agy can draw its composer idle under the
+    /// check's message, with nothing between, before the reply it then draws (`LANDED` 0.55 s
+    /// later there). The check is the one act whose answer is its words (`LANDED`, or what is
+    /// left, [`super::land_check::land_check_answer`]); every other act's turn is judged by its
+    /// shape, so a turn that says nothing ends there as before. A check's turn that ran and
+    /// ended so ([`TurnEndReading::unsaid`]) keeps the check awaited, its work kept in
+    /// [`Awaited::ran`] and its take window counted from that answer ([`Self::point_judged`]);
+    /// every reading after it is judged with that work and any run since (`Some`, the reading to
+    /// judge), so the one that draws the words is that turn's end. Past the window an answer
+    /// still unsaid is judged as it stands, and its defense stays owed its check
+    /// ([`Self::observe`]).
+    fn unsaid_reading(&mut self, reading: &TurnEndReading, now: Instant) -> Option<TurnEndReading> {
+        if !self.land.check_pending {
+            return None;
+        }
+        let a = self.awaiting.as_mut().filter(|a| !a.command)?;
+        let worked = match (a.ran, reading.worked) {
+            (None, Some(w)) if reading.unsaid() => {
+                a.unseen_since = Some(now);
+                a.taken = true;
+                a.ran = Some(w);
+                return None;
+            }
+            (None, _) => return None,
+            (Some(ran), w) => w.map_or(ran, |w| ran.saturating_add(w)),
+        };
+        if reading.unsaid() {
+            a.ran = Some(worked);
+        }
+        Some(TurnEndReading {
+            worked: Some(worked),
+            ..reading.clone()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19534,6 +19608,7 @@ impl TurnEndState {
             submitted: matches!(action, TurnEndAction::Submit { .. }),
             submits: reading.submits,
             screen: reading.screen_mark,
+            ran: None,
         });
         let typed_rule = match action {
             TurnEndAction::Type { rule_id, .. } => Some(*rule_id),
@@ -19907,6 +19982,7 @@ impl TurnEndState {
             submitted: false,
             submits: None,
             screen: None,
+            ran: None,
         });
     }
 }

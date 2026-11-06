@@ -170,7 +170,11 @@ clean {
     --    (Astream.Broker.TlaPushEdge), on TlaFederationBridge's temporal prelude
     -- ========================================================================
     -- A source log of `len` offsets, `data o` when offset `o` holds a record the edge carries (a
-    -- group commit, a mark, a hidden subject or one the rewrite drops does not), where the group
+    -- group commit, a mark, a hidden subject, one outside the bridge's `carry` filters or one the
+    -- rewrite drops does not; an edge that follows its group over several lanes carries their
+    -- union, so it is one edge here, where two bridges on one group would be two edges sharing one
+    -- `resumeAt`, which this model does not admit: either one's commit could pass the other's
+    -- records), where the group
     -- resumes (`resumeAt`, the broker's `group_start`: one past its inclusive commit, and `from_`
     -- before this edge's first, as a relay that starts at the head commits it), and the bridge's
     -- runs. A run scans from `resumeAt`; the destination answers each carried record for good

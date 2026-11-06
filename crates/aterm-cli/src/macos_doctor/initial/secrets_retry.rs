@@ -90,7 +90,7 @@ impl Inputs {
 /// What can change a Secrets try's answer without the person, read before and after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pace {
-    /// This aterm build ([`aterm_types::version::build_id`]).
+    /// This aterm build ([`aterm_stamp::build_id`]).
     pub(super) build: String,
     /// A digest of known network/vault/service facts ([`marks`]); a failed
     /// local read supplies no new fact against an earlier hold.
@@ -261,7 +261,7 @@ pub(super) struct Live;
 
 impl Reads for Live {
     fn build(&self) -> String {
-        aterm_types::version::build_id()
+        aterm_stamp::build_id()
     }
 
     fn now(&self) -> u64 {

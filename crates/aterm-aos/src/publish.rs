@@ -1103,13 +1103,14 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         {
             return Err(PublishRefusal::LineageMismatch);
         }
-        if rec.log.header().ancestor != rec.checkpoint.digest() {
+        let checkpoint_digest = rec.checkpoint.digest();
+        if rec.log.header().ancestor != checkpoint_digest {
             return Err(PublishRefusal::AncestorMismatch {
-                checkpoint: rec.checkpoint.digest(),
+                checkpoint: checkpoint_digest,
                 log: rec.log.header().ancestor,
             });
         }
-        if w.ancestor() != rec.checkpoint.digest() {
+        if w.ancestor() != checkpoint_digest {
             return Err(PublishRefusal::WitnessMismatch("ancestor"));
         }
         if w.log_epoch() != rec.log.header().log_epoch {
@@ -1165,7 +1166,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             effect_cursor: live.effect_cursor,
             branch: live.branch,
             revision,
-            parent: Some(rec.checkpoint.digest()),
+            parent: Some(checkpoint_digest),
         };
         let checkpoint = Checkpoint::capture(&self.schema, &prepared.state, provenance);
         if checkpoint.state_digest() != w.candidate_state_digest() {

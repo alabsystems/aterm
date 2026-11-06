@@ -554,7 +554,7 @@ struct Fonts {
 
 impl Fonts {
     fn load() -> Result<Self, String> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-render/assets/bundled");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-render/assets/bundled");
         let face = |name: &str| -> Result<aterm_render::font::Font, String> {
             let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
             aterm_render::font::Font::from_bytes(bytes, aterm_render::font::FontSettings::default())

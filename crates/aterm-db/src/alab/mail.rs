@@ -422,6 +422,52 @@ pub struct Ask<'a> {
     pub when_ms: u64,
 }
 
+fn open_credential<'a>(
+    addresses: &'a Projection,
+    mailboxes: &'a Projection,
+    sealer: &'a dyn Sealer,
+    ask: Ask<'a>,
+) -> std::result::Result<(Cell<'a>, crate::typed::secret::Secret), Withheld> {
+    let Some(mb_row) = mailboxes.rows.get(ask.mailbox).filter(|r| r.live()) else {
+        return Err(Withheld::NoMailbox);
+    };
+    let Some(login_pk) = text_ref(mb_row, "login") else {
+        return Err(Withheld::NoMailbox);
+    };
+    let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
+        return Err(Withheld::NoMailbox);
+    };
+    if text_ref(login_row, "addr").is_none() {
+        return Err(Withheld::NoMailbox);
+    }
+    let column = ask.which.column();
+    let (collection, row_pk, row) = match ask.which {
+        Credential::Password => (ADDRESS.name, login_pk, login_row),
+        Credential::MailboxPassword | Credential::Totp => (MAILBOX.name, ask.mailbox, mb_row),
+    };
+    let tokens = token_candidates(row, column);
+    let Some((first, rest)) = tokens.split_first() else {
+        return Err(Withheld::NotSet);
+    };
+    let Ok(held) = sealer.open(collection, row_pk, column, first) else {
+        return Err(Withheld::Unopened);
+    };
+    for token in rest {
+        match sealer.open(collection, row_pk, column, token) {
+            Ok(other) if other.same(&held) => {}
+            Ok(_) => return Err(Withheld::TwoValues),
+            Err(_) => return Err(Withheld::Unopened),
+        }
+    }
+    let cell = Cell {
+        table: sealer.table(),
+        collection,
+        row: row_pk,
+        column,
+    };
+    Ok((cell, held))
+}
+
 /// Hand `ask`'s credential to `consume`, journalled once as a sign-in's reveal. Candidates that
 /// open to one value are one value; two different values are withheld until the owner picks
 /// one, so a sign-in never guesses between them.
@@ -436,42 +482,9 @@ pub fn reveal_in<T>(
     ask: Ask<'_>,
     consume: impl FnOnce(&str) -> T,
 ) -> Result<std::result::Result<T, Withheld>> {
-    let Some(mb_row) = mailboxes.rows.get(ask.mailbox).filter(|r| r.live()) else {
-        return Ok(Err(Withheld::NoMailbox));
-    };
-    let Some(login_pk) = text_ref(mb_row, "login") else {
-        return Ok(Err(Withheld::NoMailbox));
-    };
-    let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
-        return Ok(Err(Withheld::NoMailbox));
-    };
-    if text_ref(login_row, "addr").is_none() {
-        return Ok(Err(Withheld::NoMailbox));
-    }
-    let column = ask.which.column();
-    let (collection, row_pk, row) = match ask.which {
-        Credential::Password => (ADDRESS.name, login_pk, login_row),
-        Credential::MailboxPassword | Credential::Totp => (MAILBOX.name, ask.mailbox, mb_row),
-    };
-    let tokens = token_candidates(row, column);
-    let Some((first, rest)) = tokens.split_first() else {
-        return Ok(Err(Withheld::NotSet));
-    };
-    let Ok(held) = sealer.open(collection, row_pk, column, first) else {
-        return Ok(Err(Withheld::Unopened));
-    };
-    for token in rest {
-        match sealer.open(collection, row_pk, column, token) {
-            Ok(other) if other.same(&held) => {}
-            Ok(_) => return Ok(Err(Withheld::TwoValues)),
-            Err(_) => return Ok(Err(Withheld::Unopened)),
-        }
-    }
-    let cell = Cell {
-        table: sealer.table(),
-        collection,
-        row: row_pk,
-        column,
+    let (cell, held) = match open_credential(addresses, mailboxes, sealer, ask) {
+        Ok(opened) => opened,
+        Err(why) => return Ok(Err(why)),
     };
     super::secret::record_reveal(journal, cell, Surface::SignIn, ask.when_ms)?;
     Ok(Ok(consume(held.plaintext())))
@@ -540,23 +553,28 @@ pub fn reveal_bound<T>(
             if !accept(&found) {
                 return Ok(Err(Withheld::NoMailbox));
             }
-            let mut values = Vec::with_capacity(parts.len());
+            let mut opened = Vec::with_capacity(parts.len());
             for part in parts {
-                match reveal_in(
+                match open_credential(
                     &addresses,
                     &mailboxes,
                     sealer,
-                    journal,
                     Ask {
                         mailbox,
                         which: *part,
                         when_ms,
                     },
-                    |value| aterm_secrets::SecretBytes::from(value.as_bytes()),
-                )? {
-                    Ok(value) => values.push(value),
+                ) {
+                    Ok(item) => opened.push(item),
                     Err(why) => return Ok(Err(why)),
                 }
+            }
+            let mut values = Vec::with_capacity(opened.len());
+            for (cell, held) in opened {
+                super::secret::record_reveal(journal, cell, Surface::SignIn, when_ms)?;
+                values.push(aterm_secrets::SecretBytes::from(
+                    held.plaintext().as_bytes(),
+                ));
             }
             Ok(Ok(consume(&values)))
         },

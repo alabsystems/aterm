@@ -689,7 +689,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     spoken(light.description.as_deref(), Mode::Plan, rewritten);
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
     let label = crate::claude_footer::probe::harness_label(aterm_phase::CliHarness::ClaudeCode);
-    assert_eq!(switch.label, format!("{label} on"));
+    assert_eq!(switch.label, format!("{label} on: harness"));
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
     assert!(switch.description.is_some(), "{switch:?}");
     let drawn = app.windows[&wid]
@@ -757,7 +757,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     assert_eq!(autopilot(&app, session).1, AutopilotView::MasterOff);
     let chips = app.claude_chips_a11y(wid);
     let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
-    assert_eq!(switch.label, format!("{label} off"));
+    assert_eq!(switch.label, format!("{label} off: harness"));
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
 }
 

@@ -985,6 +985,157 @@ fn check_packed(
     Ok(())
 }
 
+/// The filters the filtered reads of a [`packed_stream`] are checked with: one subject, one
+/// batch subject, every subject and one no record names.
+const PACKED_FILTERS: [&str; 4] = ["/f/packed/s3", "/f/packed/b1", "/f/packed/>", "/f/none/>"];
+
+/// A `Fetch` page of `log` from `start` as a scan of one summary an index reads it (test
+/// reference, `start` at or above the base): each retained record below `scan_max` records on
+/// and below `visible`, unhidden and matched, read back, up to `max` of them; the page ends
+/// before a record it cannot read, and past the records held.
+fn fetch_each(
+    log: &BrokerLog,
+    start: u64,
+    filter: &astream_wire::Filter,
+    max: usize,
+    scan_max: usize,
+    visible: u64,
+) -> (Vec<Arc<BrokerRecord>>, u64) {
+    let base = log.base().0;
+    let tier = log.tier_for_test();
+    let limit = start.saturating_add(scan_max as u64).min(visible);
+    let mut out = Vec::new();
+    for off in start..limit {
+        let i = (off - base) as usize;
+        let Some(s) = tier.summary(i) else {
+            return (out, off);
+        };
+        if s.is_hidden() || !filter.matches_str(s.subject()) {
+            continue;
+        }
+        let Some(rec) = log.record_arc(i) else {
+            return (out, off);
+        };
+        out.push(rec);
+        if out.len() >= max {
+            return (out, off + 1);
+        }
+    }
+    (out, limit.max(start))
+}
+
+/// A filtered tail's step of `log` from `*cursor` (at or above the base) as a scan of one
+/// summary an index reads it (test reference): the records and the offset it scanned to, `Err`
+/// for a record it cannot read before any other, and the cursor moved where it found none.
+fn tail_each(
+    log: &BrokerLog,
+    cursor: &mut u64,
+    filter: &astream_wire::Filter,
+    also_at: Option<u64>,
+    max: usize,
+) -> Result<(Vec<Arc<BrokerRecord>>, u64), u64> {
+    let (base, head) = (log.base().0, log.head().0);
+    let tier = log.tier_for_test();
+    if *cursor >= head {
+        return Ok((Vec::new(), *cursor));
+    }
+    let from = (*cursor - base) as usize;
+    let to = (from + max.max(1)).min((head - base) as usize);
+    let mut out = Vec::new();
+    let mut scanned_to = *cursor;
+    for i in from..to {
+        let off = base + i as u64;
+        let want = also_at == Some(off)
+            || tier
+                .summary(i)
+                .is_none_or(|s| !s.is_hidden() && filter.matches_str(s.subject()));
+        if want {
+            let Some(rec) = log.record_arc(i) else {
+                if out.is_empty() {
+                    return Err(off);
+                }
+                break;
+            };
+            out.push(rec);
+        }
+        scanned_to = off + 1;
+    }
+    if out.is_empty() {
+        *cursor = scanned_to;
+    }
+    Ok((out, scanned_to))
+}
+
+/// Every filtered read of `log` against [`fetch_each`] and [`tail_each`]: for each of
+/// [`PACKED_FILTERS`], a reader paging `Fetch`es from the filter's oldest to the head (one
+/// record a page over 7 records a scan, and up to 1,000 over 300), and a tail stepping from the
+/// base (9 and 1,000 records a step, with and without a record `also_at` a third of the way
+/// in), each page and step the same records, next offset and cursor as the reference's.
+fn check_fetches(log: &BrokerLog) -> Result<(), String> {
+    use crate::store::TailStep;
+    let (base, head) = (log.base().0, log.head().0);
+    let ids = |page: &[Arc<BrokerRecord>]| page.iter().map(|r| r.seq.0).collect::<Vec<_>>();
+    for pat in PACKED_FILTERS {
+        let filter = astream_wire::Filter::new(pat).map_err(|e| e.to_string())?;
+        for (max, scan_max) in [(1, 7), (1_000, 300)] {
+            let mut from = log.oldest(&filter).0;
+            while from < head {
+                let mine = log.fetch(from, &filter, max, scan_max, head);
+                let theirs = fetch_each(log, from, &filter, max, scan_max, head);
+                if mine != theirs {
+                    return Err(format!(
+                        "fetch {pat:?} from {from} (max {max}, scan {scan_max}): {:?} next {}, \
+                         one an index {:?} next {}",
+                        ids(&mine.0),
+                        mine.1,
+                        ids(&theirs.0),
+                        theirs.1
+                    ));
+                }
+                if mine.1 <= from {
+                    break;
+                }
+                from = mine.1;
+            }
+        }
+        let third = base + (head - base) / 3;
+        for (max, also_at) in [
+            (9, None),
+            (9, Some(third)),
+            (1_000, None),
+            (1_000, Some(third)),
+        ] {
+            let mut at = base;
+            while at < head {
+                let (mut mine_at, mut theirs_at) = (at, at);
+                let mine = match log.read_tail_chunk(&mut mine_at, head, &filter, also_at, max) {
+                    TailStep::Chunk {
+                        records,
+                        scanned_to,
+                    } => Ok((records, scanned_to)),
+                    TailStep::Unreadable(off) => Err(off),
+                };
+                let theirs = tail_each(log, &mut theirs_at, &filter, also_at, max);
+                if mine != theirs || mine_at != theirs_at {
+                    return Err(format!(
+                        "tail {pat:?} step from {at} (max {max}, also {also_at:?}): {:?} cursor \
+                         {mine_at}, one an index {:?} cursor {theirs_at}",
+                        mine.as_ref().map(|(r, to)| (ids(r), *to)),
+                        theirs.as_ref().map(|(r, to)| (ids(r), *to))
+                    ));
+                }
+                // The tail's reader moves on past what the step scanned.
+                let Ok((_, to)) = mine else { break };
+                if to <= at {
+                    break;
+                }
+                at = to;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How a [`packed_stream`] holds its log: sealed at rest or not, its residency budget, the
 /// page size each open repages to (`None`: the production page), and the most records a
 /// batch commits.
@@ -1025,7 +1176,8 @@ impl StreamShape {
 /// commit records, reopens (each one's broker times the same as before it) and, with
 /// `retention`, cuts; after every step `check_packed` (every retained record against what
 /// was published, read back through the tier), the tier's pages against the slot vector
-/// beside them (`Tier::check_shadow`) and, with `retention`, the retention planning over
+/// beside them (`Tier::check_shadow`), every fourth step the filtered reads against a scan of
+/// one summary an index (`check_fetches`) and, with `retention`, the retention planning over
 /// each (`Tier::check_plans`).
 fn packed_stream(seed: u64, shape: StreamShape) -> (crate::test_scratch::Scratch, BrokerLog) {
     use crate::brecord::GroupCommit;
@@ -1135,6 +1287,12 @@ fn packed_stream(seed: u64, shape: StreamShape) -> (crate::test_scratch::Scratch
         }
         if let Err(e) = log.tier_for_test().check_shadow() {
             panic!("seed {seed} {shape:?} step {step}: {e}");
+        }
+        // The filtered reads every fourth step, and after the last.
+        if step % 4 == 3 {
+            if let Err(e) = check_fetches(&log) {
+                panic!("seed {seed} {shape:?} step {step}: {e}");
+            }
         }
         #[cfg(feature = "retention")]
         {
@@ -1342,5 +1500,38 @@ fn a_page_entry_off_by_one_record_is_caught_on_a_real_log() {
                 "seed {seed}: {mutant:?} answers as the slot vector"
             );
         }
+    }
+}
+
+/// The negative control of the filtered reads' page skip on a real log (aterm F11c): a pass
+/// that passes whole a page it wants a record of answers a `Fetch` and a tail step differently
+/// from a scan of one summary an index, and the slot vector beside the pages tells it apart, at
+/// every page size from one record to the production page, a stream of its own each (whose
+/// cuts leave it a page or two at the larger sizes).
+#[test]
+fn a_pass_that_drops_a_wanted_page_is_caught_on_a_real_log() {
+    use crate::tier::PageMutant;
+    let shifts = (0..crate::tier::PAGE_SHIFT).map(Some).chain([None]);
+    for (seed, page_shift) in (2u64..).step_by(3).zip(shifts) {
+        let shift = page_shift.unwrap_or(crate::tier::PAGE_SHIFT);
+        let shape = StreamShape {
+            page_shift,
+            ..StreamShape::of(seed, false)
+        };
+        let (_root, mut log) = packed_stream(seed, shape);
+        assert_eq!(check_fetches(&log), Ok(()), "seed {seed} shift {shift}");
+        assert!(
+            log.tier_for_test().len() >= 12,
+            "seed {seed} shift {shift}: a dozen records to pass"
+        );
+        log.tier_mut_for_test().mutate(PageMutant::DropWanted);
+        assert!(
+            check_fetches(&log).is_err(),
+            "seed {seed} shift {shift}: a pass dropping a page it wants reads as one an index"
+        );
+        assert!(
+            log.tier_for_test().check_shadow().is_err(),
+            "seed {seed} shift {shift}: a pass dropping a page it wants answers as the slot vector"
+        );
     }
 }

@@ -599,6 +599,8 @@ impl Explanation {
 pub struct Router {
     validated: Option<Validated>,
     single: Option<Profile>,
+    // A separate capability: generated routing rows never become file authority.
+    file_writers: Option<Vec<(String, Vec<Slug>)>>,
 }
 
 impl Router {
@@ -609,17 +611,38 @@ impl Router {
         Router {
             validated: None,
             single: None,
+            file_writers: None,
         }
     }
 
     /// The rules of `validated`.
     #[inline]
     #[must_use]
-    pub const fn from_validated(validated: Validated) -> Router {
+    pub fn from_validated(validated: Validated) -> Router {
+        let file_writers =
+            (validated.origin() == ConfigOrigin::File).then(|| validated.writers().to_vec());
         Router {
             validated: Some(validated),
             single: None,
+            file_writers,
         }
+    }
+
+    /// Retain file-backed grants and the admitted posture of explicit profiles only.
+    pub(crate) fn with_file_authority(mut self, source: &Validated) -> Self {
+        self.file_writers =
+            (source.origin() == ConfigOrigin::File).then(|| source.writers().to_vec());
+        #[cfg(unix)]
+        if source.origin() == ConfigOrigin::File
+            && let Some(composed) = &mut self.validated
+        {
+            for (name, original) in source.profiles() {
+                if let Some(profile) = composed.profiles.get_mut(name) {
+                    profile.set_legacy_loose(original.legacy_loose());
+                }
+            }
+        }
+        self
     }
 
     /// Whether an agh.toml stands behind it.
@@ -1191,23 +1214,22 @@ impl Router {
     ///
     /// - Refused `not_granted` (`Sub::Policy(RefusalCode::NotGranted)`), next
     ///   `agh policy grant {caller} {slug}`, when no `[[writers]]` row of
-    ///   `caller` lists `slug` (ASCII case-insensitive), or this router's `Validated` did not
-    ///   come from a file (`ConfigOrigin::Text`), or it has none;
+    ///   `caller` lists `slug` (ASCII case-insensitive), or no separately retained owner-file
+    ///   authority exists. Synthesized and text-validated routing rows grant nothing;
     /// - Usage when `caller` is not `[a-z][a-z0-9-]{0,31}`.
     pub fn grant(&self, caller: &str, slug: &Slug) -> Result<ExplicitTarget> {
         if let Some(fault) = crate::config::caller_fault(caller) {
             return Err(Error::usage(fault));
         }
-        let why = match &self.validated {
-            None => {
+        let why = match &self.file_writers {
+            None if self.validated.is_none() => {
                 format!("{caller} has no grant for {slug}: no agh.toml stands behind this client")
             }
-            Some(v) if v.origin() != ConfigOrigin::File => format!(
+            None => format!(
                 "{caller} has no grant for {slug}: a grant counts only in agh.toml read from the owner's file"
             ),
-            Some(v) => {
-                let listed = v
-                    .writers()
+            Some(writers) => {
+                let listed = writers
                     .iter()
                     .any(|(row, repos)| row == caller && repos.iter().any(|repo| repo == slug));
                 if listed {
@@ -1322,6 +1344,7 @@ impl Router {
         Router {
             validated: None,
             single: Some(profile),
+            file_writers: None,
         }
     }
 
@@ -1331,15 +1354,10 @@ impl Router {
         self.single.is_some()
     }
 
-    /// The `[[writers]]` rows (empty without a file-made `Validated`): `policy check` prints
-    /// them.
+    /// The explicit owner-file `[[writers]]` rows, independently of composed routing rows.
     #[must_use]
     pub fn writers(&self) -> Vec<(String, Vec<Slug>)> {
-        self.validated
-            .as_ref()
-            .filter(|v| v.origin() == ConfigOrigin::File)
-            .map(|v| v.writers().to_vec())
-            .unwrap_or_default()
+        self.file_writers.as_ref().cloned().unwrap_or_default()
     }
 }
 

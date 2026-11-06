@@ -567,7 +567,7 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     assert!(
         at_rest.starts_with("\u{2500}\u{2500}    claude \u{2500}")
             && at_rest.ends_with(&format!(
-                "\u{2500} \u{25cf} on  alab claude harness v{} (v2.1.283) \u{2500}\u{2500}",
+                "\u{2500} \u{25cf} on  alab v{} (v2.1.283) \u{2500}\u{2500}",
                 aterm_phase::CliHarness::ClaudeCode.version_str()
             )),
         "the lockup and the lit switch are on the top rule: {at_rest:?}"
@@ -610,7 +610,10 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     );
     let narrowed = glass_chars(&app, wid, top);
     assert!(
-        narrowed.contains("alab claude harness") && narrowed.chars().count() == cols,
+        narrowed.contains(&format!(
+            "alab v{} (v2.1.283)",
+            aterm_phase::CliHarness::ClaudeCode.version_str()
+        )) && narrowed.chars().count() == cols,
         "CONTROL: the switch laid anew at {cols}: {narrowed:?}"
     );
     assert_eq!(top_cost(&mut app, wid), (0, 0, 0), "CONTROL: at rest again");
@@ -1009,9 +1012,9 @@ fn rung_name(rung: Option<Rung>) -> String {
         (true, _, _, Field::Run) => "last resort".into(),
         (true, Some(label), Some(Lockup::Icon), _) => format!("T{label} icon"),
         (true, Some(label), _, _) => format!("T{label}"),
-        (true, None, Some(Lockup::Full), _) => "T4".into(),
-        (true, None, Some(Lockup::Icon), _) => "T4 icon".into(),
-        (true, None, None, _) => "T4 bare".into(),
+        (true, None, Some(Lockup::Full), _) => "no label".into(),
+        (true, None, Some(Lockup::Icon), _) => "no label icon".into(),
+        (true, None, None, _) => "no label bare".into(),
     }
 }
 
@@ -1021,14 +1024,14 @@ fn first_fit(span: TopSpan, rungs: &[Rung]) -> Option<Rung> {
 }
 
 /// Walks `rungs` from a wide line to nothing: each is laid in its turn, and what a narrower line
-/// gives up never comes back. The words go first (the label's CLI word, `harness`, the CLI's
-/// version, the label), then the lockup's name, then its icon; with the ⬆️ laid (`arrow`) the
+/// gives up never comes back. The words go first (the CLI's version, then the label), then the
+/// lockup's name, then its icon; with the ⬆️ laid beside a known build (`keeps_build`) the
 /// lockup's name goes before the CLI's version.
 fn walk_order(
     span_of: &dyn Fn(usize) -> TopSpan,
     widths: std::ops::RangeInclusive<usize>,
     rungs: &[Rung],
-    arrow: bool,
+    keeps_build: bool,
 ) -> Result<(), String> {
     let lockup = rungs.iter().any(|r| r.lockup.is_some());
     let rank = |r: &Rung| {
@@ -1066,7 +1069,7 @@ fn walk_order(
                 ));
             }
         }
-        let named = if arrow { LABEL_TIERS - 2 } else { LABEL_TIERS };
+        let named = if keeps_build { 0 } else { LABEL_TIERS };
         if lockup
             && now.switch
             && now.lockup != Some(Lockup::Full)
@@ -1132,19 +1135,23 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
                 }),
                 Some(arrow_paint(UpState::Ready)),
                 Some(arrow_paint(UpState::Held)),
+                Some(SwitchPaint {
+                    cli_ver: Inline::new(""),
+                    ..arrow_paint(UpState::Ready)
+                }),
                 None,
             ] {
-                let arrow = switch.is_some_and(|p| p.up.shows());
+                let keeps_build = switch.is_some_and(|p| p.up.shows() && !p.cli_ver.is_empty());
                 for (line, span_of, least) in lines {
                     let (rungs, n) = ladder(span_of(200), switch, Some(mark.lockup_cells(build)));
-                    walk_order(&span_of, least..=260, &rungs[..n], arrow)
+                    walk_order(&span_of, least..=260, &rungs[..n], keeps_build)
                         .unwrap_or_else(|e| panic!("{mark:?} {build:?} {line} {switch:?}: {e}"));
                     walked += 1;
                 }
             }
         }
     }
-    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 9 * 4);
+    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 10 * 4);
     let span_of = |w: usize| tailed_run(w.saturating_sub(12), &tail).span(KeyFace::default());
     let (rungs, n) = ladder(
         span_of(200),
@@ -1154,7 +1161,7 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     let mut skipped: Vec<Rung> = rungs[..n].to_vec();
     let icon = skipped
         .iter()
-        .position(|r| rung_name(Some(*r)) == "T4 icon")
+        .position(|r| rung_name(Some(*r)) == "no label icon")
         .expect("the icon's rung");
     let rung = skipped.remove(icon);
     skipped.insert(icon - 2, rung);
@@ -1163,21 +1170,25 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
         "CONTROL: a rung the walk never lays is caught"
     );
     let mut early: Vec<Rung> = rungs[..n].to_vec();
-    early[3].lockup = Some(Lockup::Icon);
+    early[1].lockup = Some(Lockup::Icon);
     assert!(
         walk_order(&span_of, 0..=260, &early, false).is_err_and(|e| e.contains("before the label")),
         "CONTROL: the name dropped before the label is caught"
     );
+    let unknown = SwitchPaint {
+        cli_ver: Inline::new(""),
+        ..arrow_paint(UpState::Ready)
+    };
     let (rungs, n) = ladder(
         span_of(200),
-        Some(arrow_paint(UpState::Ready)),
+        Some(unknown),
         Some(CliMark::Claude.lockup_cells(Build::Vendor)),
     );
     let mut early: Vec<Rung> = rungs[..n].to_vec();
-    early[1].lockup = Some(Lockup::Icon);
+    early[0].lockup = Some(Lockup::Icon);
     assert!(
-        walk_order(&span_of, 0..=260, &early, true).is_err_and(|e| e.contains("before the label")),
-        "CONTROL: with the arrow, the name dropped before T2 is caught"
+        walk_order(&span_of, 0..=260, &early, false).is_err_and(|e| e.contains("before the label")),
+        "CONTROL: beside a ⬆️ with no build to keep, the name dropped before the label is caught"
     );
 }
 
@@ -1200,11 +1211,9 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
     let table = [
         ("T0", labels[0] + 40),
         ("T1", labels[1] + 40),
-        ("T2", labels[2] + 40),
-        ("T3", labels[3] + 40),
-        ("T4", 39),
-        ("T4 icon", 32),
-        ("T4 bare", 26),
+        ("no label", 39),
+        ("no label icon", 32),
+        ("no label bare", 26),
     ];
     for (name, need) in table {
         assert_eq!(rung_at(tailed(need)), name, "{name} at {need}");
@@ -1234,15 +1243,15 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         ..arrow_paint(UpState::Ready)
     };
     let up_at = |w: usize| rung_name(lay_top(tailed(w), Some(up), lockup).map(|l| l.rung));
-    let named_build = labels[2] + 43;
-    let icon_build = labels[2] + 36;
-    assert_eq!(up_at(named_build), "T2", "the arrow's three more");
+    let named_build = labels[0] + 43;
+    let icon_build = labels[0] + 36;
+    assert_eq!(up_at(named_build), "T0", "the arrow's three more");
     assert_eq!(
         up_at(named_build - 1),
-        "T2 icon",
+        "T0 icon",
         "a column short: the name goes first"
     );
-    assert_eq!(up_at(icon_build), "T2 icon", "the icon keeps the build");
+    assert_eq!(up_at(icon_build), "T0 icon", "the icon keeps the build");
     let (rungs, n) = ladder(tailed(icon_build), Some(up), lockup);
     let full = CliMark::Claude.lockup_cells(Build::Vendor);
     let named: Vec<Rung> = rungs[..n]
@@ -1258,7 +1267,7 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         .collect();
     assert_eq!(
         rung_name(first_fit(tailed(icon_build), &named)),
-        "T3",
+        "T1",
         "CONTROL: keeping the name drops the build"
     );
     for w in 22..=25 {
@@ -3003,12 +3012,10 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
     // The arrow's 3 cells more on every rung, and the lockup's name gone before the CLI's build.
     for (name, need) in [
         ("T0", labels[0] + 43),
-        ("T1", labels[1] + 43),
-        ("T2", labels[2] + 43),
-        ("T2 icon", labels[2] + 36),
-        ("T3 icon", labels[3] + 36),
-        ("T4 icon", 35),
-        ("T4 bare", 29),
+        ("T0 icon", labels[0] + 36),
+        ("T1 icon", labels[1] + 36),
+        ("no label icon", 35),
+        ("no label bare", 29),
     ] {
         assert_eq!(
             rung_at(ready, need),
@@ -3027,8 +3034,8 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
             rung_at(ready, labels[0] + 43),
             rung_at(ready, labels[0] + 42)
         ),
-        ("T0".to_owned(), "T0".to_owned(), "T1".to_owned()),
-        "the arrow needs three more cells; one short drops a tier"
+        ("T0".to_owned(), "T0".to_owned(), "T0 icon".to_owned()),
+        "the arrow needs three more cells; one short drops the lockup's name"
     );
     let off = SwitchPaint {
         up: ready.up,
@@ -3110,16 +3117,18 @@ fn laid_at(top: &ComposedTop) -> (std::ops::Range<usize>, Option<(usize, usize)>
     (top.switch.as_ref().expect("laid").cols.clone(), top.tag)
 }
 
-/// THE ARROW'S WORDS TAKE THE LABEL'S OWN CELLS: under the pointer the slot says the verb, the
+/// THE ARROW'S WORDS SAY WHEN THE MOVE LANDS: under the pointer the slot says the verb, the
 /// target build bold in its own ink and when the move would land, in Claude's own job words
-/// where its mode row gives them, in the first form that fits the label's own cells, so neither
-/// the switch nor Claude's tag moves; a form that drops the verb keeps the target and when
-/// (`v2.1.310 · after 1 shell`), then the verb and the target, then the target alone; a
+/// where its mode row gives them. A form with the when is said whole: in the label's own cells
+/// where it fits them, else grown left into the rule's room, the switch and Claude's tag moving
+/// left by exactly the cells it grew; a form that drops the verb keeps the target and when
+/// (`v2.1.310 · after 1 shell`), and only where the room holds no form with the when does the
+/// verb and the target, then the target alone, take the label's own cells, moving nothing. A
 /// refused press's words win for a few seconds; a sprite rings the arrow, and none rings an
 /// asked move's `◐`, which takes no press. CONTROL: at rest the label shows, and at a tier with
 /// no label the hover writes nothing new.
 #[test]
-fn the_arrows_words_take_the_labels_own_cells() {
+fn the_arrows_words_say_when_the_move_lands() {
     let rest = arrow_paint(UpState::Ready);
     let (rest_key, at_rest) = slot_top(rest, 158);
     let label = label_face(&rest, 0).expect("T0").text();
@@ -3180,11 +3189,11 @@ fn the_arrows_words_take_the_labels_own_cells() {
         4,
         "CONTROL: a long when keeps the verb's form"
     );
-    let mut shortened = 0;
+    let (mut shortened, mut grown, mut kept) = (0, 0, 0);
     for paint in [jobs, hovered, asked, idle] {
         let SlotWords(forms, required) =
             up_forms(&paint.up, paint.jobs.as_str(), paint.press).expect("forms");
-        assert_eq!(required, 0, "these offers do not require a restart's words");
+        assert!(required > 0, "an offer with a when says it whole");
         let forms: Vec<String> = forms
             .iter()
             .map(|form| form.iter().map(|(text, _)| text.as_str()).collect())
@@ -3200,25 +3209,51 @@ fn the_arrows_words_take_the_labels_own_cells() {
             let Some((slot, _)) = still.switch.as_ref().and_then(|s| s.label.as_ref()) else {
                 continue;
             };
+            let label = slot.len();
+            let (_, over) = slot_top(paint, w);
+            let shown = slot_of(&over).expect("the slot");
             let selected = forms
                 .iter()
-                .position(|form| form.chars().count() <= slot.len())
-                .expect("the target fits the resting label");
+                .position(|form| *form == shown)
+                .unwrap_or_else(|| panic!("{w}: {shown:?} is one of the forms, whole"));
             shortened += usize::from(selected > 0);
-            let (_, over) = slot_top(paint, w);
-            assert_eq!(
-                slot_of(&over).as_deref(),
-                Some(forms[selected].as_str()),
-                "{w}: the first whole form fitting the resting label"
+            assert!(
+                forms[..selected]
+                    .iter()
+                    .all(|form| form.chars().count() > label),
+                "{w}: no form before {shown:?} fits the label's own {label} cells"
             );
+            let grew = shown.chars().count().saturating_sub(label);
+            if grew > 0 {
+                grown += 1;
+                assert!(
+                    selected < required,
+                    "{w}: only a form with the when grows: {shown:?}"
+                );
+            } else {
+                kept += 1;
+            }
             assert_eq!(
-                laid_at(&over),
-                laid_at(&still),
-                "{w}: the switch and the tag stand where they stood"
+                (
+                    laid_at(&still).0.start - laid_at(&over).0.start,
+                    laid_at(&over).0.len()
+                ),
+                (grew, laid_at(&still).0.len()),
+                "{w}: the switch moves left by exactly the cells the words grew"
             );
         }
+        let (_, wide) = slot_top(paint, 158);
+        assert_eq!(
+            slot_of(&wide).as_deref(),
+            Some(forms[0].as_str()),
+            "158: the rule's room holds the most said form"
+        );
     }
-    assert!(shortened > 0, "narrow labels must exercise shorter forms");
+    assert!(
+        shortened > 0 && grown > 0 && kept > 0,
+        "the widths exercise shorter forms ({shortened}), grown ones ({grown}) and kept ones \
+         ({kept})"
+    );
     let (key, over) = slot_top(jobs, 158);
     let inks = FaceInks::of(&jobs, Some(CardPalette::Cruise), blank(), key.mark_fg);
     let (cols, _) = over
@@ -3268,6 +3303,8 @@ fn the_arrows_words_take_the_labels_own_cells() {
         ring_layer(&held_key, &held_over, 7, &mut RingContents::default()).is_none(),
         "a held move's \u{2191} asks nothing: no ring"
     );
+    // A refusal's lead says the press failed: it grows left into the rule's room, as a when
+    // does, before the reason alone takes the label's own cells.
     let (_, said) = slot_top(rest.refused_with(Some("press it again")), 158);
     assert_eq!(
         slot_of(&said).as_deref(),
@@ -3278,7 +3315,7 @@ fn the_arrows_words_take_the_labels_own_cells() {
     let (_, t4_over) = slot_top(hovered, 40);
     assert!(
         t4.switch.as_ref().is_some_and(|s| s.label.is_none()),
-        "T4: no label"
+        "40: no label"
     );
     assert_eq!(
         t4_over.cells, t4.cells,
@@ -3288,10 +3325,13 @@ fn the_arrows_words_take_the_labels_own_cells() {
 
 /// A HELD ARROW'S WORDS AND A REFUSAL KEEP THEIR REASON: at every width from 158 columns down to
 /// the narrowest that lays a label, the slot under the pointer on a held ⬆️ and after a refused
-/// press says why the move cannot be asked for (in its fewest words where the label is narrow:
-/// `v2.1.310 · autopilot off`, `the harness is off`), whole, never cut; it moves nothing where
-/// a form fits the label's own cells, and grows only as far as a whole form needs (`alab v0.5`
-/// gives way to `autopilot off`). CONTROL: a rule too narrow for any form keeps its label.
+/// press says why the move cannot be asked for, whole, never cut. A held hover says when the
+/// move could land, grown left into the rule's room where the label's own cells cannot hold it
+/// (`v2.1.310 · once autopilot is on` at 76 columns), and in its fewest words (`autopilot off`)
+/// only where the room cannot hold that either; a refusal takes the first form that fits the
+/// label's own cells (`the harness is off`). It moves nothing where the form shown fits the
+/// label's own cells, and grows only as far as a whole form needs (`alab v0.5` gives way to
+/// `autopilot off`). CONTROL: a rule too narrow for any form keeps its label.
 #[test]
 fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
     use aterm_agent::harness::upgrade::{Agent, Phase, Request};
@@ -3392,8 +3432,16 @@ fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
     };
     assert_eq!(
         at(hover, 76).as_deref(),
-        Some("v2.1.310 \u{b7} autopilot off"),
-        "76: the target and why, in the label's own cells"
+        Some("v2.1.310 \u{b7} once autopilot is on"),
+        "76: the target and when, grown left into the rule's room"
+    );
+    let (_, rest76) = slot_top(autopilot, 76);
+    let (_, over76) = slot_top(hover, 76);
+    let rest_words = slot_of(&rest76).expect("the label");
+    assert_eq!(
+        laid_at(&rest76).0.start - laid_at(&over76).0.start,
+        "v2.1.310 \u{b7} once autopilot is on".chars().count() - rest_words.chars().count(),
+        "76: the switch moved only as far as the words need"
     );
     assert_eq!(
         at(autopilot.refused_with(Some("autopilot is off")), 76).as_deref(),
@@ -3411,7 +3459,7 @@ fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
         "alab v{}",
         aterm_phase::CliHarness::ClaudeCode.version_str()
     );
-    assert_eq!(slot_of(&rest50).as_deref(), Some(short.as_str()), "50: T3");
+    assert_eq!(slot_of(&rest50).as_deref(), Some(short.as_str()), "50: T1");
     assert_eq!(
         slot_of(&press50).as_deref(),
         Some("autopilot off"),
@@ -3425,10 +3473,10 @@ fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
 }
 
 /// THE LABEL'S HOVER SAYS ONLY WHAT IT LEAVES OUT: under the pointer a Muse label shows its
-/// whole build in the label's own inks (`alab` in the brand's), in the first form that fits the
-/// label's own cells (`alab v0.5 (v1.4.13-R6996.1)` where `alab muse harness v0.5 (v1.4.13)`
-/// stood), so nothing moves; where no form fits, and for Claude Code (whose build is its
-/// numbers), the label stands.
+/// whole build in the label's own inks (`alab` in the brand's): `alab v0.5 (v1.4.13-R6996.1)`
+/// where `alab v0.5 (v1.4.13)` stood, grown left into the rule's room, the switch moving left by
+/// exactly the cells it grew and no further; where no form fits, and for Claude Code (whose build
+/// is its numbers), the label stands.
 #[test]
 fn the_labels_hover_says_only_what_it_leaves_out() {
     let tail = claude_tail();
@@ -3465,7 +3513,7 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     let (rest, _) = slot(&compose(muse, 158));
     let (shown, cells) = slot(&compose(over, 158));
     let whole = format!(
-        "alab muse harness v{} (v1.4.13-R6996.1)",
+        "alab v{} (v1.4.13-R6996.1)",
         aterm_phase::CliHarness::Muse.version_str()
     );
     assert_eq!(
@@ -3475,20 +3523,22 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     );
     assert_eq!(
         shown.trim_start(),
-        format!(
-            "alab v{} (v1.4.13-R6996.1)",
-            aterm_phase::CliHarness::Muse.version_str()
-        ),
-        "the hover, the whole build in the label's own cells"
+        whole,
+        "the hover, the whole build grown left into the rule"
+    );
+    let grew = whole.len() - rest.trim_start().len();
+    assert!(
+        grew > 0,
+        "CONTROL: the whole build is wider than the label's own cells"
+    );
+    let (moved, stood) = (
+        compose(over, 158).switch.expect("laid").cols,
+        compose(muse, 158).switch.expect("laid").cols,
     );
     assert_eq!(
-        compose(over, 158).switch.map(|s| s.cols),
-        compose(muse, 158).switch.map(|s| s.cols),
-        "the switch stands where it stood"
-    );
-    assert!(
-        whole.len() > rest.len(),
-        "CONTROL: the widest form would move it"
+        (stood.start - moved.start, moved.len()),
+        (grew, stood.len()),
+        "the switch moves left by exactly the cells the words grew"
     );
     let inks = FaceInks::of(
         &over,
@@ -3525,7 +3575,7 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     assert_eq!(
         shown.trim_start(),
         format!(
-            "alab claude harness v{} (v{full_version})",
+            "alab v{} (v{full_version})",
             aterm_phase::CliHarness::ClaudeCode.version_str()
         )
     );
@@ -4049,14 +4099,15 @@ fn an_arrow_says_a_turns_end_only_for_a_turn() {
 /// A PRESS'S HOVER KEEPS ITS WAIT AND WHAT IT ENDS: with a draft in the composer, the slot under
 /// the pointer on a Claude Code ⬆️ says the press waits for it and what the restart ends, before
 /// the press and once it is under way. Where no form that says both fits the label's own cells
-/// (35 here, with a shell to end), the slot grows left into the rule's room for the most said that
-/// does: the whole sentence at 144 and 230 columns alike, the wait in its fewest words (`v2.1.310 ·
-/// after your draft · ends 1 shell`) at 95; at 80, where none fits, it keeps the wait and cuts
-/// what the restart ends (`v2.1.310 · after your draft`), never to the verb and the target. A
-/// slot takes a form that says all it must wherever one fits, before one that cuts it. NEGATIVE
-/// CONTROLS: another CLI's arrow, whose words carry no restart, keeps to the label's own cells
-/// (its wait in the fewest words, the switch where it stood); a slot with no form that must be
-/// said shows the first that fits the label's cells.
+/// (21 here, `alab v0.5 (v2.1.305)`), the slot grows left into the rule's room for the most said
+/// that does: the whole sentence at 144 and 230 columns alike, the wait in its fewest words
+/// (`v2.1.310 · after your draft · ends 1 shell`) at 95; at 80, where none fits, it keeps the
+/// wait and cuts what the restart ends (`v2.1.310 · after your draft`), never to the verb and the
+/// target. A slot takes a form that says all it must wherever one fits, before one that cuts it.
+/// NEGATIVE CONTROLS: another CLI's arrow, whose words carry no restart, grows for its when alike
+/// but names no shell to end (`update to v2.1.310 · once your draft is sent or cleared`), the
+/// switch moving left by exactly the cells it grew; a slot with no form that must be said shows
+/// the first that fits the label's cells.
 #[test]
 fn a_press_keeps_its_wait_and_what_it_ends() {
     let words = |text: &str| vec![(text.to_owned(), LabelInk::Muted)];
@@ -4177,23 +4228,26 @@ fn a_press_keeps_its_wait_and_what_it_ends() {
         ..ready
     };
     let (_, other_over) = slot_top(other, 144);
+    let other_said = format!("update to v2.1.310 \u{b7} {draft}");
     assert_eq!(
         slot_of(&other_over).as_deref(),
-        Some("v2.1.310 \u{b7} after your draft"),
-        "NEGATIVE CONTROL: another CLI's arrow, in the label's own cells"
+        Some(other_said.as_str()),
+        "NEGATIVE CONTROL: another CLI's arrow says its when and no shell to end"
     );
+    let rest_words = slot_of(&still).expect("the label");
     assert_eq!(
-        laid_at(&other_over),
-        laid_at(&still),
-        "NEGATIVE CONTROL: its switch and tag stand where they stood"
+        laid_at(&still).0.start - laid_at(&other_over).0.start,
+        other_said.chars().count() - rest_words.chars().count(),
+        "NEGATIVE CONTROL: its switch moves left by exactly the cells it grew"
     );
 }
 
 /// The cells the slot under the pointer may grow into on a [`slot_top`] rule of `w` columns:
 /// the longest refusal it shows whole, which a slot shows only in its room once the refusal with
-/// its lead (`couldn't update · …`) does not fit there. Rooms past 60 cells are not read.
+/// its lead (`couldn't update · …`) does not fit there. A refusal holds 64 bytes
+/// ([`SwitchPaint::refused`]), so rooms past 63 cells are not read.
 fn room_at(w: usize) -> usize {
-    let room = (1..=60)
+    let room = (1..=64)
         .rev()
         .find(|&n| {
             let why = "x".repeat(n);
@@ -4204,21 +4258,22 @@ fn room_at(w: usize) -> usize {
             slot_of(&top).as_deref() == Some(why.as_str())
         })
         .expect("a room");
-    assert!(room < 60, "{w}: a room past what is read");
+    assert!(room < 64, "{w}: a room past what is read");
     room
 }
 
 /// A PRESS'S HOVER KEEPS ITS VERB WHERE THE RULE HAS ROOM: with no draft, the slot under the
 /// pointer on a Claude Code ⬆️ whose press lands now says the whole sentence (`update to v2.1.310
 /// · now · ends 1 shell`), grown left into the rule's room, wherever the room holds it (230 and
-/// 144 columns, and 95 or 80 where theirs does), before the form without the verb that fits the
-/// label's own cells (`v2.1.310 · now · ends 1 shell`), which shows only where growing cannot
-/// fit. Of a slot's forms that say all they must, each in turn is shown wherever it fits, the
-/// label's cells or the room. NEGATIVE CONTROLS: where the room cannot hold the verb's form, the
-/// shorter one takes the label's cells and nothing moves; a slot with no form that must be said
-/// shows the first that fits the label's cells though the room would hold a longer one; and
-/// another CLI's arrow, whose words carry no restart, keeps to the label's own cells without its
-/// verb, its switch and tag where they stood.
+/// 144 columns, and 95 or 80 where theirs does), then the form without the verb (`v2.1.310 · now
+/// · ends 1 shell`) wherever the room holds that, and only where neither fits, the verb and the
+/// target in the label's own cells (`update to v2.1.310`). Of a slot's forms that say all they
+/// must, each in turn is shown wherever it fits, the label's cells or the room. NEGATIVE
+/// CONTROLS: where the room cannot hold the verb's form, a shorter one is shown and the switch
+/// moves only as far as it needs; a slot with no form that must be said shows the first that fits
+/// the label's cells though the room would hold a longer one; and another CLI's arrow, whose
+/// words carry no restart, grows for its when alike but names no shell to end
+/// (`update to v2.1.310 · after background jobs`).
 #[test]
 fn a_press_keeps_its_verb_where_the_rule_has_room() {
     let words = |text: &str| vec![(text.to_owned(), LabelInk::Muted)];
@@ -4278,13 +4333,14 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
         )
         .1
     };
+    let named = "update to v2.1.310";
     let mut grew = Vec::new();
     for w in [230, 144, 95, 80] {
         let label = slot_of(&still(w)).expect("the label").chars().count();
         let room = if w > 100 { usize::MAX } else { room_at(w) };
         assert!(
-            verbless.chars().count() <= label,
-            "{w}: the form without the verb fits the label's {label} cells"
+            named.chars().count() <= label && verbless.chars().count() > label,
+            "{w}: the verb and the target fit the label's {label} cells, the when does not"
         );
         let grows = said.chars().count() <= room;
         let (_, over) = slot_top(ready, w);
@@ -4293,8 +4349,10 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
             shown,
             if grows {
                 said.as_str()
-            } else {
+            } else if verbless.chars().count() <= room {
                 verbless.as_str()
+            } else {
+                named
             },
             "{w}: a label of {label} cells, a room of {room}"
         );
@@ -4317,15 +4375,17 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
     }
     .with_jobs("");
     let (_, other_over) = slot_top(other, 144);
+    let other_said = "update to v2.1.310 \u{b7} after background jobs";
     assert_eq!(
         slot_of(&other_over).as_deref(),
-        Some("v2.1.310 \u{b7} after background jobs"),
-        "NEGATIVE CONTROL: another CLI's arrow, in the label's own cells"
+        Some(other_said),
+        "NEGATIVE CONTROL: another CLI's arrow says its when and no shell to end"
     );
+    let label = slot_of(&still(144)).expect("the label").chars().count();
     assert_eq!(
-        laid_at(&other_over),
-        laid_at(&still(144)),
-        "NEGATIVE CONTROL: its switch and tag stand where they stood"
+        laid_at(&still(144)).0.start - laid_at(&other_over).0.start,
+        other_said.chars().count() - label,
+        "NEGATIVE CONTROL: its switch moves left by exactly the cells it grew"
     );
 }
 
@@ -4333,7 +4393,8 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
 /// restart ends fits (80 columns, Claude's effort tag on the rule), the slot under the pointer
 /// still says what the press waits for, in its fewest words, before the verb and the target:
 /// `v2.1.310 · after your draft`, `· after its dialog`, `· after the hold`, and an asked move's
-/// `→ v2.1.310 · after your draft`, each in the label's own cells, so nothing moves. CONTROLS:
+/// `→ v2.1.310 · after your draft`, each grown left into the rule's room only as far as it needs,
+/// since the label's own cells (`alab v0.5 (v2.1.305)`) cannot hold it. CONTROLS:
 /// at 95 the form that names the shells still wins; the verb and the target remain the form after
 /// it. NEGATIVE CONTROLS: with no shell to end there is no second form in the fewest words (the
 /// one there is says the wait alone already); another CLI's arrow, whose words carry no restart,
@@ -4397,13 +4458,13 @@ fn a_press_keeps_its_wait_on_a_narrow_rule() {
         if wait == "draft" {
             assert_eq!(shown, bare, "{wait} at 80: the wait alone");
             assert!(
-                bare.chars().count() <= label,
-                "{wait}: in the label's own cells"
+                bare.chars().count() > label,
+                "{wait}: wider than the label's own {label} cells"
             );
             assert_eq!(
-                laid_at(&over),
-                laid_at(&rest),
-                "{wait}: its switch and tag stand where they stood"
+                laid_at(&rest).0.start - laid_at(&over).0.start,
+                bare.chars().count() - label,
+                "{wait}: its switch moves left by exactly the cells it grew"
             );
         }
         let (_, wider) = slot_top(paint, 95);

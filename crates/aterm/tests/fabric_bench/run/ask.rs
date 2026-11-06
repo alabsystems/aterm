@@ -238,7 +238,7 @@ impl Spent {
 
 /// `v / n`, or `None` for no posts.
 fn per(v: f64, n: usize) -> Option<f64> {
-    (n > 0).then(|| v / n as f64)
+    (n > 0).then_some(v / n as f64)
 }
 
 fn fmt3(v: Option<f64>) -> String {

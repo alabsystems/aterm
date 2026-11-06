@@ -157,9 +157,10 @@ fn realm_of(cli: Cli, vendor: &Vendor) -> String {
 /// routes it.
 pub(crate) fn db_entry(forwarded: Vec<OsString>) -> ExitCode {
     if forwarded.first().is_some_and(|word| word == "alab") {
-        let Some(words) = forwarded[1..]
-            .iter()
-            .map(|word| word.clone().into_string().ok())
+        let mut iter = forwarded.into_iter();
+        iter.next();
+        let Some(words) = iter
+            .map(|word| word.into_string().ok())
             .collect::<Option<Vec<String>>>()
         else {
             return aterm_uds::stdout::answer_exit("aterm db alab", "arguments must be UTF-8\n", 2);

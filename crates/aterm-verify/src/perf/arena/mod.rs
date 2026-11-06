@@ -390,8 +390,9 @@ pub(crate) struct RepoPin {
     pub commit: String,
 }
 
+/// The arena's pins, in the running checkout ([`super::workspace_root`]).
 pub(crate) fn manifest_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/arena/manifest.toml")
+    aterm_tempfile::manifest_dir().join("perf/arena/manifest.toml")
 }
 
 pub(crate) fn pins() -> Result<Pins, String> {

@@ -3,6 +3,7 @@
 
 //! Whole-file publication through a sibling temporary on Unix and Windows.
 
+use aterm_durable::Flush;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +16,23 @@ use std::time::Duration;
 /// but its entry may not survive a power loss.
 pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_checked(path, bytes, mode, || Ok(()))
+}
+
+/// [`write`], finished by `flush`. Every arm writes a temporary beside `path` and renames it
+/// over `path`, so while the machine runs a reader finds `path` as it was or holding all of
+/// `bytes`, never part of them. The arms differ in what a power loss may leave:
+/// - `Some(Flush::Durable)` is [`write`]: the temporary is flushed in full before the rename,
+///   and `path`'s directory after it.
+/// - `Some(Flush::Ordered)` takes barriers there instead ([`aterm_durable::ordered`]): the
+///   temporary's bytes are ordered ahead of the rename, and the rename ahead of later writes on
+///   its device.
+/// - `None` flushes neither, so after a power loss `path` may hold what it held before, or a
+///   file that lacks some or all of `bytes`. It suits a file every reader treats as advisory,
+///   such as a pid file, whose process no power loss leaves running.
+/// # Errors
+/// As [`write`]. With `None` there is no directory flush to fail.
+pub fn write_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Option<Flush>) -> io::Result<()> {
+    write_landing(path, bytes, mode, || Ok(()), flush, Flush::dir)?
 }
 
 /// Produce a file atomically, with the same permissions and durability as [`write`].
@@ -32,7 +50,8 @@ pub fn write_with(
         mode,
         produce,
         || Ok(()),
-        |dir| aterm_durable::Flush::Durable.dir(dir),
+        Some(Flush::Durable),
+        Flush::dir,
     )?
 }
 
@@ -53,7 +72,8 @@ pub fn write_with_metadata(
         produce,
         std::fs::File::metadata,
         || Ok(()),
-        |dir| aterm_durable::Flush::Durable.dir(dir),
+        Some(Flush::Durable),
+        Flush::dir,
     )?;
     landed?;
     Ok(metadata)
@@ -71,42 +91,43 @@ pub fn write_checked(
     mode: u32,
     check: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    write_flushing_dir(path, bytes, mode, check, |dir| {
-        aterm_durable::Flush::Durable.dir(dir)
-    })
+    write_flushing_dir(path, bytes, mode, check, Flush::dir)
 }
 
-/// [`write_checked`] with the directory's flush (`flush_dir`) handed in, so a test can make
-/// it fail; its outcome is classified here either way.
+/// [`write_checked`] with the directory's flush (`flush_dir`, handed the [`Flush`] it is to
+/// take) handed in, so a test can make it fail; its outcome is classified here either way.
 pub(super) fn write_flushing_dir(
     path: &Path,
     bytes: &[u8],
     mode: u32,
     check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    write_landing(path, bytes, mode, check, flush_dir)?
+    write_landing(path, bytes, mode, check, Some(Flush::Durable), flush_dir)?
 }
 
 /// What a careful write's rename left ([`write_landing`]): `path` holds the bytes either way.
 /// `Err` is the directory's flush after the rename, failed other than as unavailable, so the
-/// entry may not survive a power loss.
+/// entry may not survive a power loss. A write finished by no flush has none to fail.
 pub(super) type Landed = io::Result<()>;
 
-/// [`write_flushing_dir`], telling a failure before the rename (the outer `Err`: `path` is as
-/// it was) from one after it ([`Landed`]).
+/// [`write_flushed`] with a check before the rename and the directory's flush handed in,
+/// telling a failure before the rename (the outer `Err`: `path` is as it was) from one after it
+/// ([`Landed`]).
 pub(super) fn write_landing(
     path: &Path,
     bytes: &[u8],
     mode: u32,
     check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+    flush: Option<Flush>,
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<Landed> {
     write_produced_landing(
         path,
         mode,
         |writer| writer.write_all(bytes),
         check,
+        flush,
         flush_dir,
     )
 }
@@ -129,19 +150,25 @@ pub(super) fn write_produced_landing(
     mode: u32,
     produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
     check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+    flush: Option<Flush>,
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<Landed> {
-    write_captured_landing(path, mode, produce, |_| Ok(()), check, flush_dir)
+    write_captured_landing(path, mode, produce, |_| Ok(()), check, flush, flush_dir)
         .map(|(_, landed)| landed)
 }
 
+/// The careful write itself: `produce` writes the temporary, `flush` (when there is one)
+/// finishes it, `capture` reads it, `check` may still refuse the rename, and after the rename
+/// `flush_dir` takes the same flush of `path`'s directory. With no `flush` neither the
+/// temporary nor the directory is flushed.
 pub(super) fn write_captured_landing<T>(
     path: &Path,
     mode: u32,
     produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
     capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
     check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+    flush: Option<Flush>,
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<(T, Landed)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -157,7 +184,9 @@ pub(super) fn write_captured_landing<T>(
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
     #[cfg(windows)]
     let _ = mode;
-    aterm_durable::durable(&file)?;
+    if let Some(flush) = flush {
+        flush.file(&file)?;
+    }
     let captured = capture(&file)?;
     drop(file);
     check()?;
@@ -168,6 +197,9 @@ pub(super) fn write_captured_landing<T>(
     std::fs::rename(&temporary.path, path)?;
     // The old temporary name is free after the rename; do not remove a later user's file.
     temporary.armed = false;
+    let Some(flush) = flush else {
+        return Ok((captured, Ok(())));
+    };
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -178,7 +210,8 @@ pub(super) fn write_captured_landing<T>(
     // that classifies it.
     Ok((
         captured,
-        aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()),
+        aterm_durable::DirFlushed::classify(flush_dir(flush, dir))
+            .map(|_flushed_or_unavailable| ()),
     ))
 }
 
@@ -192,7 +225,7 @@ pub mod publication_seam {
         static FAILURE: Cell<Option<io::ErrorKind>> = const { Cell::new(None) };
     }
 
-    /// Refuse this thread's renames after writing and flushing the temporary.
+    /// Refuse this thread's renames after writing the temporary and taking its flush, if any.
     /// Nested guards restore the preceding failure when dropped.
     #[must_use = "the failure stops when the guard drops"]
     pub struct FailBeforeRename {

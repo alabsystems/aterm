@@ -582,6 +582,89 @@ fn a_reopened_bus_log_takes_what_the_pass_applied() {
         .expect("the origin keys are installed: C's halt lands");
 }
 
+/// A rotated seat's resend of a record its old node landed here lands once (§11 C3b): the pass
+/// that applies the rotation tells `bus.log` the seat's new node continues its old one, whether
+/// the log is hosted then or opens after, so the new node's record at a sequence the old one holds
+/// is that record again; at a sequence the old one never wrote it is the new node's own.
+/// NEGATIVE CONTROL: before the pass applies the rotation, the new node's record at a sequence
+/// the old one holds is appended.
+#[test]
+fn a_rotated_seats_resend_of_what_its_old_node_landed_lands_once() {
+    for hosted_first in [true, false] {
+        let case = format!("hosted_first={hosted_first}");
+        let lab = Lab::new();
+        let macs = lab_of(&lab, 1);
+        let b = &macs[0];
+        let (old_key, new_key) = ([0xa1; 32], [0xa2; 32]);
+        let old = astream_broker::identity_principal(&old_key);
+        let new = astream_broker::identity_principal(&new_key);
+        let rotated = Standings {
+            current: [b.key, new_key].into(),
+            retired: [old_key].into(),
+            rotated: [(old_key, new_key)].into(),
+            ..Standings::default()
+        };
+        b.read(if hosted_first {
+            Standings {
+                current: [b.key, old_key].into(),
+                ..Standings::default()
+            }
+        } else {
+            rotated.clone()
+        });
+        b.follow();
+        let root = Root::new(9);
+        let _slot = host_bus(b, &root);
+        let subject = lane(&b.principal, &old);
+        let publish = |producer: &str, seq: u64| -> (u64, bool) {
+            root.local(
+                &root.secret,
+                &format!("rw,p={producer}:/f/{FLEET}/in/{}/*/{old}/*", b.principal),
+            )
+            .expect("a writer")
+            .publish(pid(producer), seq, &subject, b"mail")
+            .expect("it lands")
+        };
+        // What the old node's push landed here, as the log holds it (a local writer bound to no
+        // principal: once the rotation applies, the old one is revoked).
+        let landed: Vec<u64> = {
+            let mut writer = root
+                .local(
+                    &root.secret,
+                    &format!("rw:/f/{FLEET}/in/{}/*/{old}/*", b.principal),
+                )
+                .expect("a writer");
+            (1..=3)
+                .map(|seq| {
+                    writer
+                        .publish(pid(&old), seq, &subject, b"mail")
+                        .expect("it lands")
+                        .0
+                })
+                .collect()
+        };
+        if hosted_first {
+            let (appended, dup) = publish(&new, 1);
+            assert!(
+                !dup && appended > landed[2],
+                "{case}: the control: before the rotation, the new node's own"
+            );
+            b.read(rotated);
+            b.follow();
+        }
+        assert_eq!(
+            publish(&new, 2),
+            (landed[1], true),
+            "{case}: the old node's record again"
+        );
+        let (own, dup) = publish(&new, 4);
+        assert!(
+            !dup && own > landed[2],
+            "{case}: a sequence the old node never wrote is the new node's own"
+        );
+    }
+}
+
 /// What a keeper test's hosting reads: 0 unprovisioned, 1 on, 2 off.
 const ON: u8 = 1;
 const OFF: u8 = 2;

@@ -891,7 +891,7 @@ fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
     let a = Account::new("desktop");
     let bin = a.places.bin_dir.join("aterm");
     exe(&bin, "#!/bin/sh\n");
-    let icons = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/linux/icons/hicolor");
+    let icons = aterm_tempfile::manifest_dir().join("../../assets/linux/icons/hicolor");
     let shipped = std::fs::read_dir(&icons)
         .expect("the checkout's icons")
         .count();
@@ -971,7 +971,7 @@ fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
 
 #[test]
 fn a_piped_install_takes_the_man_page_and_icons_the_binary_carries() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = aterm_tempfile::manifest_dir().join("../..");
     let a = Account::new("carried");
     let bin = a.places.bin_dir.join("aterm");
     exe(&bin, "#!/bin/sh\n");

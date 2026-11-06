@@ -4102,6 +4102,7 @@ mod acts {
         let proof = desk::Proof {
             decide: &decide,
             refuses: &refuses,
+            authority: None,
             fleet: None,
         };
         let mut serve = |stream: &mut UnixStream| {

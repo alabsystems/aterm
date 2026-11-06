@@ -14,10 +14,10 @@ use std::process::ExitStatus;
 use super::*;
 use crate::measure::{committed, header_build, read_but_not_held, repo_with, standing_verdict};
 
-const COMMITTED: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-agent/src/harness/testdata/steps"
-);
+/// The step testdata, in the agent crate beside this package.
+fn committed_dir() -> PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-agent/src/harness/testdata/steps")
+}
 
 const B: &str = "2.1.399";
 
@@ -784,7 +784,7 @@ fn a_calls_end_is_read_off_the_row_under_it() {
 /// the fold made no step of (an attachment) what was lost.
 #[test]
 fn a_rows_check_is_the_one_that_read_the_step_the_fold_made_of_it() {
-    let text = std::fs::read_to_string(Path::new(COMMITTED).join("2.1.303.jsonl"))
+    let text = std::fs::read_to_string(committed_dir().join("2.1.303.jsonl"))
         .expect("the measured reduction");
     let parsed: Vec<Value> = rows(&text)
         .map(|r| aterm_json::from_str(r).expect("a row"))
@@ -830,7 +830,7 @@ fn a_rows_check_is_the_one_that_read_the_step_the_fold_made_of_it() {
 
 #[test]
 fn every_claude_build_in_the_step_testdata_reads_as_measured() {
-    let all = committed(&CLAUDE, Path::new(COMMITTED)).expect("the step testdata");
+    let all = committed(&CLAUDE, &committed_dir()).expect("the step testdata");
     assert!(
         all.iter().any(|r| r.build.as_deref() == Some("2.1.303")),
         "2.1.303 is measured"
@@ -852,7 +852,7 @@ fn every_claude_build_in_the_step_testdata_reads_as_measured() {
 #[test]
 fn gone_holds_a_build_to_every_transcript_key_the_fold_reads() {
     assert_eq!(
-        read_but_not_held(&CLAUDE, Path::new(COMMITTED)),
+        read_but_not_held(&CLAUDE, &committed_dir()),
         Vec::<String>::new(),
         "keys the fold reads of a committed reduction that TRANSCRIPT_KEYS does not name"
     );

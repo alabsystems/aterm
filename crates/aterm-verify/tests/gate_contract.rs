@@ -384,7 +384,7 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
     };
     let doc_run = || {
         let mut ctx = repo.ctx(&[Check::Doc], Scope::workspace());
-        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         run_ctx(&ctx)
     };
 
@@ -601,7 +601,7 @@ fn whole_and_shaped_compiles_are_followed_by_one_fresh_recording_pass() {
             ),
         );
         let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
-        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         let planned = plan::plan(&ctx);
         let compile = planned
             .iter()
@@ -708,7 +708,7 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
         );
     }
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let planned = plan::plan(&ctx);
     let compile = planned
         .iter()
@@ -762,7 +762,7 @@ fn an_overriding_runner_keeps_runtime_json_without_an_extra_compile() {
         ),
     );
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|spec| spec.id == StageId::Test)
@@ -796,7 +796,7 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
         ),
     );
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let planned = plan::plan(&ctx);
     let compile = planned
         .iter()
@@ -855,7 +855,7 @@ fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
         ),
     );
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|spec| spec.id == StageId::Test)
@@ -905,7 +905,7 @@ fn admitted_test_workers_keep_their_share_on_replay_and_serial_fallback() {
         ctx = ctx
             .with_test_jobs(NonZeroU32::new(u32::MAX))
             .with_test_threads(NonZeroU32::new(2));
-        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::Test)
@@ -949,9 +949,9 @@ fn invalid_managed_admission_refuses_before_any_stage_or_cli_check() {
             .contains("no stage was run")
     );
     for value in [None, Some("0"), Some("no"), Some("4294967296")] {
-        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-verify"));
+        let mut cmd = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-verify"));
         cmd.arg("test")
-            .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .current_dir(aterm_tempfile::manifest_dir().join("../.."))
             .env("BUILD_SLOT_HELD", "1");
         if let Some(value) = value {
             cmd.env("CARGO_BUILD_JOBS", value);
@@ -1036,7 +1036,7 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     write("d", body("d", &libtest_ok("d")));
 
     let mut ctx = repo.ctx(&land(), Scope::workspace());
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     ctx.test_jobs = 2;
     ctx.test_threads = Some(6);
     // A held share of exactly two binaries' threads, so the pool runs two at a time on any host:
@@ -1183,7 +1183,7 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
             );
         }
         let mut ctx = repo.ctx(&land(), Scope::workspace()).with_halt(halt);
-        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         ctx.test_jobs = 1;
         let spec = plan::plan(&ctx)
             .into_iter()
@@ -1246,7 +1246,7 @@ fn a_binary_the_ceiling_left_no_time_to_start_keeps_no_history() {
     );
     common::standin_body(&deps.join("b-1"), "echo 'b ran'\nexit 0");
     let mut ctx = repo.ctx(&land(), Scope::workspace());
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     ctx.test_jobs = 1;
     ctx.test_threads = Some(1);
     ctx.child_ceiling = Some(std::time::Duration::from_secs(3));
@@ -1321,7 +1321,7 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
         let _ = fs::remove_file(&trace);
         with_recording_cargo(&repo, &bins, extra);
         let mut ctx = repo.ctx(&land(), Scope::workspace());
-        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::Test)
@@ -1363,7 +1363,7 @@ fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
         common::standin_body(&deps.join(format!("{name}-1")), "exit 0");
     }
     let mut ctx = repo.ctx(&land(), Scope::workspace());
-    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)
@@ -1377,4 +1377,62 @@ fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     );
     let t = tally(std::slice::from_ref(&report));
     assert!(t.gate_failures.is_empty(), "{t:?}");
+}
+
+/// A recorded test binary that cannot start at its turn (gone, ENOENT) is its own COULD NOT RUN
+/// row naming its spec, through the run as verify runs it: the binaries beside it decide the
+/// run's row (a pass, and a failed test itemized under cargo's rerun spec), and the log names
+/// only that failed one a failed target.
+#[test]
+fn a_recorded_binary_that_cannot_start_is_its_own_could_not_run_row() {
+    let repo = FakeRepo::new();
+    let bins = [
+        ("fixture", "--test a", "a"),
+        ("fixture", "--test b", "b"),
+        ("fixture", "--test c", "c"),
+    ];
+    with_recording_cargo(&repo, &bins, "");
+    let deps = repo.root.join("target/debug/deps");
+    common::standin_body(
+        &deps.join("a-1"),
+        "printf '\\nrunning 1 test\\ntest a::fine ... ok\\n\\ntest result: ok. 1 passed; 0 \
+         failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'",
+    );
+    common::standin_body(
+        &deps.join("c-1"),
+        "printf '\\nrunning 1 test\\ntest t::broke ... FAILED\\n\\nfailures:\\n\\n---- t::broke \
+         stdout ----\\n\\nthread '\"'\"'t::broke'\"'\"' panicked at src/c.rs:3:5:\\nbroke\\n\\n\
+         failures:\\n    t::broke\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 \
+         measured; 0 filtered out; finished in 0.01s\\n\\n'\nexit 101",
+    );
+    let mut ctx = repo.ctx(&land(), Scope::workspace());
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert_eq!(tags(&block), ["NOT RUN", "FAIL"], "{block}");
+    assert!(
+        labels_with(&block, "NOT RUN")
+            .iter()
+            .any(|l| l.contains("-p fixture --test b")),
+        "{block}"
+    );
+    assert_eq!(
+        report
+            .findings()
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect::<Vec<_>>(),
+        ["-p fixture --test c -- t::broke"],
+        "{block}"
+    );
+    assert!(
+        block.contains("error: 1 target failed:\n    `-p fixture --test c`\n")
+            && !block.contains("rerun pass `-p fixture --test b`")
+            && !block.contains("could not execute"),
+        "{block}"
+    );
 }

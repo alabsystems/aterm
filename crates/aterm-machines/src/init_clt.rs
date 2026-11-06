@@ -508,7 +508,7 @@ pub struct Unbidden {
     /// The record ([`aterm_types::clt_mark::path`]); `None` where it has no place, which holds
     /// the ask as a record naming this build does.
     mark: Option<PathBuf>,
-    /// The build that asks ([`aterm_types::version::build_id`]).
+    /// The build that asks ([`aterm_stamp::build_id`]).
     build: String,
     /// The person's choices now, as the setup records say ([`crate::init::Records::holds`]).
     holds: Arc<dyn Fn() -> crate::init::Holds + Send + Sync>,
@@ -536,7 +536,7 @@ impl Unbidden {
     pub fn here(records: &'static dyn crate::init::Records) -> Self {
         Self::new(
             aterm_types::clt_mark::path(),
-            aterm_types::version::build_id(),
+            aterm_stamp::build_id(),
             move || records.holds(),
         )
     }

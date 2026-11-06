@@ -761,6 +761,12 @@ pub trait System: Sync {
     /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
+    /// Metadata identity of a resolved regular file, without reading its bytes or running it.
+    /// This is a change observation, never admission of a program or its contents.
+    fn file_version(&self, _path: &Path) -> io::Result<[u8; 32]> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Read this tree's native GNU ELF/libc requirements without starting a child. Other
     /// operating systems have no GNU libc gate. Unknown capability refuses a managed build.
     fn admit_runtime(&self, _root: &Path) -> Result<(), String> {
@@ -1802,6 +1808,17 @@ impl System for Live {
 
     fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {
         &aterm_types::clt_mark::Live
+    }
+
+    fn file_version(&self, path: &Path) -> io::Result<[u8; 32]> {
+        use aterm_toolchain::stat_digest::{StatDigest, StatKey};
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut digest = StatDigest::new(b"repository helper file");
+        digest.entry(b"", &StatKey::of(&metadata));
+        Ok(digest.finish().0)
     }
 
     /// Opened by [`aterm_uds::nofollow::open_reader_with_identity`] (`O_NOFOLLOW_ANY | O_NONBLOCK`,
@@ -3702,6 +3719,19 @@ mod fake {
                 .get(path)
                 .map(|(b, _)| b.clone())
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+
+        fn file_version(&self, path: &Path) -> io::Result<[u8; 32]> {
+            let stat = self.stat(path)?;
+            if stat.dir || stat.symlink {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let mut digest = aterm_digest::Sha256::new();
+            digest.update(self.read_file(path)?);
+            digest.update(stat.uid.to_le_bytes());
+            digest.update(stat.gid.to_le_bytes());
+            digest.update(stat.mode.to_le_bytes());
+            Ok(digest.finalize())
         }
 
         fn read_owned_file(

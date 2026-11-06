@@ -174,8 +174,7 @@ fn the_shipped_tables_are_the_generators_output() {
         "five glass pages, then Gruvbox Light, Solarized Light and Catppuccin Latte lip-forward"
     );
     let want = render(&solved);
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/rainbow_kitty/prism_glass/tables.rs");
+    let path = aterm_tempfile::manifest_dir().join("src/rainbow_kitty/prism_glass/tables.rs");
     if std::env::var_os("ATERM_BLESS_GOLDEN").is_some_and(|v| v == "1") {
         std::fs::write(&path, &want).expect("tables.rs is writable");
         return;
@@ -217,7 +216,7 @@ fn the_shipped_pages_are_every_light_builtin_scheme() {
 /// `<id>.conf` names.
 #[test]
 fn the_pack_light_pages_are_the_manifests_light_rows() {
-    let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/themes/pack");
+    let pack = aterm_tempfile::manifest_dir().join("../../contrib/themes/pack");
     let manifest =
         std::fs::read_to_string(pack.join("manifest.tsv")).expect("the pack's manifest reads");
     let key = |conf: &str, key: &str| {

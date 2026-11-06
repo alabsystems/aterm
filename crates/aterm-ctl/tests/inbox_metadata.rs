@@ -27,7 +27,7 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     let socket = scratch.path().join("peer.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
+    let mut command = Command::new(aterm_tempfile::bin_exe("aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         if aterm_uds::process::stripped_from_child(&key) {
             command.env_remove(key);

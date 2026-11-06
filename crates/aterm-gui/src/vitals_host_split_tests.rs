@@ -83,6 +83,7 @@ const STAND_IN: CoalProbe = CoalProbe {
             }],
         })
     },
+    forks: |_| None,
     birth: |pid| {
         count(|r| r.births += 1);
         KERNEL.with(|k| {
@@ -253,34 +254,39 @@ fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
     assert!(split_due(Some(t0), &pulled, true, t0 + MIN_WINDOW));
 }
 
+/// The coalitions are read at every reading while the lane is on, whatever asked for it: they
+/// are the start counter's read (record §8.2), and a split tick's split takes that same read.
+/// Only a split tick sweeps each process's coalition and moves the split's clock.
 #[test]
-fn the_coalitions_are_read_on_split_ticks_only() {
+fn the_coalitions_are_read_every_reading_and_split_on_split_ticks_only() {
     let (mut reader, armed) = stand_in_reader();
     let reads = || {
         let r = READS.get();
         (r.coalitions, r.swept)
     };
     READS.take();
-    reader.read_machine(&Request {
+    let _ = reader.read_machine(&Request {
         machine_only: true,
         cadence_ms: 10_000,
         ..bars()
     });
-    assert_eq!(reads(), (0, 0), "a hidden deck's machine counters");
+    assert_eq!(reads(), (1, 0), "a hidden deck's machine counters");
     reader.read(&Request {
         jobs_now: true,
         ..bars()
     });
-    assert_eq!(reads(), (0, 0), "the jobs engine's reading");
+    assert_eq!(reads(), (2, 0), "the jobs engine's reading");
     reader.read(&Request {
         deck: false,
         ..bars()
     });
-    assert_eq!(reads(), (0, 0), "the Fleet Monitor tab's");
+    assert_eq!(reads(), (3, 0), "the Fleet Monitor tab's");
     let _ = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
-    assert_eq!(reads(), (0, 0), "an unarmed pull");
+    assert_eq!(reads(), (4, 0), "an unarmed pull");
+    assert!(reader.split.last.is_none(), "no split tick yet");
     reader.read(&bars());
-    assert_eq!(reads(), (1, 1), "the bars' first reading");
+    assert_eq!(reads(), (5, 1), "the bars' first reading");
+    assert!(reader.split.last.is_some(), "a split tick");
     let kept = reader.split.coalition_ids.len();
     assert_eq!(
         kept > 0,
@@ -288,8 +294,10 @@ fn the_coalitions_are_read_on_split_ticks_only() {
         "its coalitions kept: {kept}"
     );
     just_read(&mut reader);
+    let tick = reader.split.last;
     reader.read(&bars());
-    assert_eq!(reads(), (1, 1), "the bars' next, at once");
+    assert_eq!(reads(), (6, 1), "the bars' next, at once");
+    assert_eq!(reader.split.last, tick, "no split tick");
     assert_eq!(
         reader.split.coalition_ids.len(),
         kept,
@@ -300,7 +308,110 @@ fn the_coalitions_are_read_on_split_ticks_only() {
         assert!(!reader.split_cold(), "the last split tick is fresh");
         let _ = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
     }
-    assert_eq!(reads(), (2, 2), "a warm pull while armed");
+    assert_eq!(reads(), (7, 2), "a warm pull while armed");
+}
+
+thread_local! {
+    /// Reads of the growing stand-in's counters so far.
+    static GROWN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Each read of the growing stand-in: coalition 1, aterm's own, has started ten more tasks and
+/// ended four more.
+fn grown() -> u64 {
+    GROWN.set(GROWN.get() + 1);
+    GROWN.get()
+}
+
+const GROWING: CoalProbe = CoalProbe {
+    coalitions: || {
+        count(|r| r.coalitions += 1);
+        let n = grown();
+        Some(CoalitionRead {
+            listed: 1,
+            newest: Some(1),
+            truncated: false,
+            rows: vec![CoalitionUsage {
+                id: 1,
+                tasks_started: 10 * n,
+                tasks_exited: 4 * n,
+                ..CoalitionUsage::default()
+            }],
+        })
+    },
+    forks: |_| Some(100 * grown()),
+    ..STAND_IN
+};
+
+/// THE START COUNTER RIDES EVERY READING, a hidden deck's machine reading and a whole reading
+/// between split ticks alike (record §8.2): each reads the coalitions' task counters once, and
+/// each after the first counts what they grew by over its interval, aterm's own coalition's
+/// share apart. With no coalition lane the counter is the forks (Linux's), which count no exits
+/// and no share. NEGATIVE CONTROL: a lane the self-check turned off reads no coalition, and the
+/// forks it falls back to are the stand-in's.
+#[test]
+fn the_start_counter_rides_every_reading() {
+    let hidden = Request {
+        machine_only: true,
+        ..bars()
+    };
+    let flows = |probe: CoalProbe, whole: bool| {
+        let mut reader = Reader::new(Arc::default());
+        reader.split = SplitReader::new(probe, gauge());
+        READS.take();
+        let first = reader.read_machine(&hidden);
+        assert_eq!(first.facts.flow, None, "the first read is the base");
+        std::thread::sleep(Duration::from_millis(20));
+        let next = if whole {
+            just_read(&mut reader);
+            reader.read(&bars())
+        } else {
+            reader.read_machine(&hidden)
+        };
+        let r = READS.take();
+        (next.facts.flow, (r.coalitions, r.swept))
+    };
+    for whole in [false, true] {
+        let (flow, reads) = flows(GROWING, whole);
+        assert_eq!(
+            reads,
+            (2, 0),
+            "whole: {whole}: one read a reading, no split"
+        );
+        let flow = flow.expect("a flow");
+        assert!(flow.starts_ps > 0.0, "{flow:?}");
+        let exits = flow.exits_ps.expect("the coalitions' exits");
+        assert!((exits / flow.starts_ps - 0.4).abs() < 1e-9, "{flow:?}");
+        assert_eq!(
+            flow.aterm_starts_ps,
+            Some(flow.starts_ps),
+            "all in aterm's own"
+        );
+    }
+    let (flow, reads) = flows(
+        CoalProbe {
+            self_check: |_| Err("unsupported"),
+            ..GROWING
+        },
+        false,
+    );
+    assert_eq!(reads, (0, 0), "no lane, no coalition read");
+    let flow = flow.expect("the forks' flow");
+    assert!(flow.starts_ps > 0.0, "{flow:?}");
+    assert_eq!((flow.exits_ps, flow.aterm_starts_ps), (None, None));
+    let (flow, reads) = flows(
+        CoalProbe {
+            self_check: |_| Err("missed"),
+            forks: |_| None,
+            ..GROWING
+        },
+        false,
+    );
+    assert_eq!(
+        (flow, reads),
+        (None, (0, 0)),
+        "NEGATIVE CONTROL: a lane turned off"
+    );
 }
 
 #[test]
@@ -368,7 +479,12 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     reader.split.last = stale();
     assert!(!reader.split_cold(), "no `sys why` arms the split");
     let _ = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
-    assert_eq!(READS.take().coalitions, 0);
+    let r = READS.take();
+    assert_eq!(
+        (r.coalitions, r.swept),
+        (1, 0),
+        "the start counter's read, and no split"
+    );
 }
 
 struct Paced {
@@ -1455,7 +1571,7 @@ fn births_ride_every_whole_reading() {
     });
     let r = READS.take();
     assert_eq!(
-        (r.births, r.tables, r.coalitions),
+        (r.births, r.tables, r.swept),
         (0, 0, 0),
         "NEGATIVE CONTROL: a machine-only reading"
     );
@@ -1484,7 +1600,7 @@ fn births_ride_every_whole_reading() {
     ] {
         let snap = reader.read(&req);
         let r = READS.take();
-        assert_eq!(r.coalitions, 0, "{why}: not a split tick");
+        assert_eq!(r.swept, 0, "{why}: not a split tick");
         assert_eq!(own_birth(&snap), (Some(BORN), Some(BORN)), "{why}");
     }
 }

@@ -43,6 +43,9 @@ mod changelog;
 #[path = "../../src/channel.rs"]
 #[allow(dead_code)]
 mod channel;
+#[path = "../../src/check_record.rs"]
+#[allow(dead_code)]
+mod check_record;
 #[path = "../../src/clean.rs"]
 #[allow(dead_code)]
 mod clean;
@@ -91,6 +94,9 @@ mod ledger;
 #[path = "../../src/line.rs"]
 #[allow(dead_code)]
 mod line;
+#[path = "../../src/line_claim.rs"]
+#[allow(dead_code)]
+mod line_claim;
 #[path = "../../src/machines.rs"]
 #[allow(dead_code)]
 mod machines;
@@ -164,6 +170,9 @@ mod trust_facts;
 #[path = "../../src/trust_lane.rs"]
 #[allow(dead_code)]
 mod trust_lane;
+#[path = "../../src/trust_lock.rs"]
+#[allow(dead_code)]
+mod trust_lock;
 #[path = "../../src/trust_oblig.rs"]
 #[allow(dead_code)]
 mod trust_oblig;

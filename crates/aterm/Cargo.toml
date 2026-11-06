@@ -7,6 +7,8 @@ name = "aterm"
 # are modules of one suite binary where they can share a process. With autotests
 # off a `tests/*.rs` file listed nowhere never compiles.
 autotests = false
+# The product version, and the one member that inherits it: this leaf package, which nothing
+# depends on, writes it into the binary's identity record (build.rs, crates/aterm-stamp).
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -68,6 +70,7 @@ aterm-time = { workspace = true }
 aterm-pty = { workspace = true }
 # `aterm update`'s log hint names the resolved log directory (`dirs::logs_dir`);
 # already in the graph through aterm-gui.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
 # `aterm keeper start|stop|status|serve` — the PTY keeper.
@@ -212,6 +215,9 @@ aterm-session = { workspace = true }
 # `embed-resource` pulls `vswhom`, which needs `libc::wchar_t`/`wcslen`, items crates/aterm-libc
 # does not declare on Windows.
 aterm-winres = { workspace = true }
+# The identity record's format: the build script writes `OUT_DIR/stamp.bin` with the encoder the
+# binary decodes it with (`aterm_stamp::encode`), so the two cannot disagree.
+aterm-stamp = { workspace = true }
 
 [lints]
 workspace = true

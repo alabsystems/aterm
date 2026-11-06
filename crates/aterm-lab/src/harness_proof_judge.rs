@@ -14,7 +14,8 @@
 //! - `who`'s `fgpgid=` ([`fgpgid`]): the tab's foreground group, whose leader is the job the
 //!   shell started (the harness, or the vendor in its place after a pass-through);
 //! - aterm's log ([`held_lines`]): the line a proven contract 3 claim writes, with its versions and
-//!   scope, and the acts of the built-in engine's relaunch and upgrade lanes ([`builtin_acts`]);
+//!   scope, the acts of the built-in engine's relaunch and upgrade lanes ([`builtin_acts`]), and
+//!   the relaunch lane's record of a launch it can bring back ([`snapshot_kept`]);
 //! - `blocks --json` ([`blocks_of`]): each command the tab's shell ran, its exit, and the line
 //!   aterm's built-in relaunch lane typed;
 //! - beside aterm, the stand-in's own start log ([`starts_of`]): each start's parent, so a start
@@ -198,6 +199,18 @@ pub(crate) fn builtin_acts(log: &str, sid: &str, kind: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether aterm's built-in relaunch lane has recorded process `pid` in `sid` with its
+/// conversation: the `harness @<sid>: the relaunch snapshot kept names pid <pid> and its
+/// conversation` line (`crates/aterm-gui/src/harness_host.rs` `publish_snapshot_from`). The lane
+/// relaunches only a launch it recorded while it ran, so an end before this line is one the lane
+/// leaves (`nothing-recorded`), whoever ended it.
+#[must_use]
+pub(crate) fn snapshot_kept(log: &str, sid: &str, pid: u32) -> bool {
+    let line =
+        format!("harness @{sid}: the relaunch snapshot kept names pid {pid} and its conversation");
+    log.lines().any(|l| l.trim_end().ends_with(&line))
+}
+
 /// One command block of a tab, as `blocks --json` lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Block {
@@ -347,8 +360,10 @@ pub(crate) struct After<'a> {
 }
 
 /// THE CRASH RELAUNCH: after the child crashed, a new child came up on the same session as its next
-/// start, the harness kept its pid and its claim, and aterm's built-in relaunch lane stood down
-/// (`builtin`: it acted).
+/// start, the harness kept its pid and its claim, and aterm logged no act of its built-in relaunch
+/// lane (`builtin`: it acted). That last check shows no stand-down: in a tab the harness leads,
+/// aterm sees no exit and its relaunch lane knows no conversation for the harness's pid, so it
+/// holds with no claim too.
 #[must_use]
 pub(crate) fn relaunch(id: &str, before: &Frame, after: &After<'_>, builtin: bool) -> Vec<Check> {
     let f = after.frame;
@@ -375,7 +390,10 @@ pub(crate) fn relaunch(id: &str, before: &Frame, after: &After<'_>, builtin: boo
         ),
         kept_pid(after.leader.0, after.leader.1),
         still_claimed(id, after.leader.0, &after.seen),
-        check(!builtin, "aterm's built-in relaunch lane stood down"),
+        check(
+            !builtin,
+            "aterm logged no act of its built-in relaunch lane",
+        ),
     ]
 }
 
@@ -416,8 +434,8 @@ pub(crate) fn held_still(
 }
 
 /// THE MOVE at a safe point: the child came back on build `to` as a new process on the same
-/// session, the harness kept its pid and its claim, and aterm's built-in upgrade lane stood down
-/// (`builtin`: it acted).
+/// session, the harness kept its pid and its claim, and aterm logged no act of its built-in upgrade
+/// lane (`builtin`: it acted), which, as for [`relaunch`], shows no stand-down.
 #[must_use]
 pub(crate) fn moved(
     id: &str,
@@ -445,7 +463,7 @@ pub(crate) fn moved(
         ),
         kept_pid(after.leader.0, after.leader.1),
         still_claimed(id, after.leader.0, &after.seen),
-        check(!builtin, "aterm's built-in upgrade lane stood down"),
+        check(!builtin, "aterm logged no act of its built-in upgrade lane"),
     ]
 }
 
@@ -528,13 +546,15 @@ pub(crate) fn reexec(
 
 /// THE NEGATIVE CONTROL'S PASS-THROUGH: with no `contract=3` served, the vendor took the harness's
 /// place (aterm names the tab's program by the vendor's command, `vendor`, and the job's leader is
-/// the stand-in's own pid, `frame`), and nothing claimed the session.
+/// the stand-in's own pid, `frame`), and no harness claimed the session: `supervisor=` is `-`, or
+/// `host`, the holder aterm's built-in lanes take a tab under (`aterm-harness@<aterm's pid>`).
 #[must_use]
 pub(crate) fn passed_through(
     vendor: &str,
     seen: &ClaimSeen,
     leader: Option<u32>,
     frame: Option<&Frame>,
+    host: &str,
 ) -> Vec<Check> {
     vec![
         check(
@@ -553,20 +573,34 @@ pub(crate) fn passed_through(
             ),
         ),
         check(
-            seen.holder.is_none(),
+            seen.holder.as_deref().is_none_or(|h| h == host),
             format!(
-                "nothing claimed the session (status supervisor={})",
+                "no harness claimed the session: nothing did, or aterm's own built-in host {host} \
+                 (status supervisor={})",
                 seen.holder.as_deref().unwrap_or("-")
             ),
         ),
     ]
 }
 
-/// THE BUILT-IN LANES TOOK THE SESSION: after the vendor crashed, aterm's built-in relaunch lane
-/// typed its resume line (`typed`) and the vendor came back on the same session as a new process.
+/// THE BUILT-IN LANES TOOK THE SESSION: aterm's built-in relaunch lane recorded the vendor's
+/// launch while it ran (`recorded`, [`snapshot_kept`]), and after the vendor crashed it typed its
+/// resume line (`typed`) and the vendor came back on the same session as a new process.
 #[must_use]
-pub(crate) fn builtin_took(before: &Frame, typed: bool, after: Option<&Frame>) -> Vec<Check> {
+pub(crate) fn builtin_took(
+    before: &Frame,
+    recorded: bool,
+    typed: bool,
+    after: Option<&Frame>,
+) -> Vec<Check> {
     vec![
+        check(
+            recorded,
+            format!(
+                "aterm's built-in relaunch lane recorded the vendor's launch (pid {}) before the crash",
+                before.pid
+            ),
+        ),
         check(
             typed,
             format!(

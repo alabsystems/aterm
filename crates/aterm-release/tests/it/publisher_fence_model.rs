@@ -45,7 +45,7 @@ fn identity(repo: &Path) {
 
 fn bare_fixture(name: &str) -> BareFixture {
     static BUILT: crate::template::Template<String> = crate::template::Template::new();
-    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("publisher-fence-model");
+    let parent = aterm_tempfile::target_tmpdir().join("publisher-fence-model");
     std::fs::create_dir_all(&parent).unwrap();
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("{name}-"))

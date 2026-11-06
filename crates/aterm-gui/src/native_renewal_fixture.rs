@@ -583,8 +583,10 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     handle.shell_identity = shell_identity;
     let image =
         aterm_agent::harness::native_act::Image::at(&config.codex).ok_or("fixture codex image")?;
+    // The fixture's catalog is grok-alab's row alone, the one its captured image stands for.
+    let grok = aterm_agent::harness::contract::row_named("grok-alab").ok_or("grok-alab row")?;
     let policy = crate::native_session_policy::FixturePolicy::new(
-        aterm_agent::harness::contract::ROSTER,
+        std::slice::from_ref(grok),
         vec![crate::native_session_policy::FixtureImages {
             row: "grok-alab",
             images: vec![image],

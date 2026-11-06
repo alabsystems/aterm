@@ -322,10 +322,10 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     };
     if let Some(adoption) = adoption {
         profiles.extend(vault_rows(&adoption, &*ctx.env, &home, &ctx.redactor));
-        profiles.sort_by_key(|row| {
-            row.get("profile")
+        profiles.sort_by(|a, b| {
+            a.get("profile")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .cmp(&b.get("profile").and_then(Value::as_str))
         });
         if adoption.adopted_any() {
             routing = if present { FROM_JOINED } else { FROM_VAULT };

@@ -36,9 +36,9 @@ pub(crate) fn schema(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     ))
 }
 
-/// `agh version`: `agh {VERSION} (api {API_VERSION})`.
+/// `agh version`: `agh {version} (api {API_VERSION})`.
 pub(crate) fn version(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let _ = ctx;
-    let line = format!("agh {} (api {})\n", crate::VERSION, crate::API_VERSION);
+    let line = format!("agh {} (api {})\n", crate::version(), crate::API_VERSION);
     Ok(local(inv, Answer::Bytes(line.into_bytes())))
 }

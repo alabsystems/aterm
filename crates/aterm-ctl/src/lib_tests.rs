@@ -674,6 +674,38 @@ fn a_spawned_workers_row_names_the_folder_its_head_sends() {
     assert_eq!(worker_folder(&argv(&["cwd=sub", "-"]), None), None);
 }
 
+/// A PROGRAM WORKER'S SPAWN SENDS ITS PROGRAM AND EACH ARGUMENT AS ONE WORD, percent-encoded
+/// whatever it holds (a space, a quote, a `%`), which the server decodes; the rest of the head is
+/// an agent's. CONTROL: a `cwd=` beside them is quoted as an agent's is, not encoded.
+#[test]
+fn a_program_workers_spawn_line_sends_each_word_percent_encoded() {
+    let proj = native_abs("/w/proj");
+    let here = Path::new(&proj);
+    let args = argv(&[
+        "program=/opt/my tools/run",
+        "arg=-c",
+        "arg=echo \"it's\" 100%",
+        "arg=",
+        "cwd=my dir",
+        "-",
+    ]);
+    assert_eq!(
+        worker_spawn_head(None, &args, Some("s-ab12"), Some(here)).unwrap(),
+        format!(
+            "spawn program=/opt/my%20tools/run arg=-c arg=echo%20%22it's%22%20100%25 arg= \
+             cwd=\"{}\" from=s-ab12",
+            native_abs("/w/proj/my dir")
+        )
+    );
+    assert_eq!(
+        worker_spawn_head(None, &argv(&["program=sh"]), None, Some(here))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput,
+        "its task is read from stdin, as an agent's is"
+    );
+}
+
 #[test]
 fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
     let args = argv(&["agent=claude", "model=opus", "-"]);

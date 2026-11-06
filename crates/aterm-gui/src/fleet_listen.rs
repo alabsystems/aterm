@@ -443,15 +443,57 @@ fn served_now() -> Serving {
     }
 }
 
-/// The grants among `grants` that admit now in this window's fleet state: none while it was taken
-/// under another vault than the one this window reads ([`window_vault`],
-/// [`in_effect`]). Every reader of the window's grants reads them so: each connection's serving
-/// and each lift of a hold.
+/// The grants among `grants` that admit now in this window's fleet state: [`grants_under`] of
+/// the state directory and of the vault this process reads ([`vault_here`]). Every reader of the
+/// window's grants reads them so: each connection's serving and each lift of a hold. Where none
+/// admits because the vault cannot be found, the journal says so once ([`say_no_grant_admits`]).
 #[cfg(unix)]
 fn window_grants(grants: Vec<aterm_net::fleet::DriveGrant>) -> Vec<aterm_net::fleet::DriveGrant> {
-    match aterm_types::dirs::state_dir() {
-        Some(state) => in_effect(grants, &state, window_vault().as_ref()),
-        None => grants,
+    let vault = vault_here();
+    let (admitted, unfound) = grants_under(
+        grants,
+        aterm_types::dirs::state_dir().as_deref(),
+        vault.as_ref().map(Option::as_ref),
+    );
+    if let Some(why) = unfound {
+        say_no_grant_admits(&why);
+    }
+    admitted
+}
+
+/// Journal, once in this process, that no drive grant admits a Mac because its vault cannot be
+/// found (`why`, [`vault_under`]'s error): a record, not an alert. The deny list it cannot read
+/// says the rest, that every Mac that dials this one is turned away ([`denied_nodes_now`]).
+#[cfg(unix)]
+fn say_no_grant_admits(why: &str) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        note_fleet(
+            &format!(
+                "fleet: no drive grant in aterm.toml lets a Mac drive this one: {}",
+                aterm_log::sanitize_record(why)
+            ),
+            true,
+        );
+    });
+}
+
+/// The grants among `grants` that admit beside the fleet state at `state` under `vault`, the
+/// vault this process reads ([`vault_under`]), and why none does where that vault cannot be found
+/// (`Some` only where `grants` held one): none where a run on the account's own state cannot find
+/// its vault (`Err`), as the node job then serves none, and none while the state was taken under
+/// another vault than the one `vault` configures ([`in_effect`]); with no state directory, which
+/// holds no fleet key, as they are.
+#[cfg(unix)]
+fn grants_under(
+    grants: Vec<aterm_net::fleet::DriveGrant>,
+    state: Option<&std::path::Path>,
+    vault: Result<Option<&aterm_secrets::client::Paths>, &String>,
+) -> (Vec<aterm_net::fleet::DriveGrant>, Option<String>) {
+    match (state, vault) {
+        (_, Err(why)) => (Vec::new(), (!grants.is_empty()).then(|| why.clone())),
+        (Some(state), Ok(vault)) => (in_effect(grants, state, vault), None),
+        (None, Ok(_)) => (grants, None),
     }
 }
 
@@ -544,8 +586,9 @@ fn update_denied_nodes_cache(
 /// local vault is mid-apply or unreadable, and `None` until one was read
 /// ([`update_denied_nodes_cache`]). It is read again only when one of the vault files it reads
 /// changed ([`aterm_secrets::client::swarm_denied_nodes_now`]), so the listener's per-dialer
-/// lookup and each control request cost no vault decrypt. An isolated run (a test, a lab's
-/// scratch state, CI) reads no vault, and so has a deny list that names no one.
+/// lookup and each control request cost no vault decrypt. A process that reads no vault (one
+/// under a private state root, [`vault_here`]) has a deny list that names no one; one on the
+/// account's own state whose vault cannot be found has none, and says why.
 ///
 /// The window's per-connection checks ([`admit_driver`], [`register_member`], [`share_book`],
 /// [`receive_pushed_facts`], `served_live`, the vault-join judge) refuse while this answers `None`
@@ -557,14 +600,11 @@ fn update_denied_nodes_cache(
 /// `a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has`).
 #[cfg(unix)]
 fn denied_nodes_now() -> Option<Arc<[String]>> {
-    let isolated = cfg!(test)
-        || std::env::var_os("ATERM_STATE_HOME").is_some()
-        || std::env::var_os("CI").is_some();
-    if isolated {
-        return Some(Arc::from(&[][..]));
-    }
-    let observed = aterm_secrets::client::Paths::live()
-        .and_then(|paths| aterm_secrets::client::swarm_denied_nodes_now(&paths));
+    let observed = match vault_here() {
+        Ok(None) => return Some(Arc::from(&[][..])),
+        Ok(Some(paths)) => aterm_secrets::client::swarm_denied_nodes_now(&paths),
+        Err(why) => Err(aterm_secrets::Error::new(why)),
+    };
     let (denied, said) = update_denied_nodes_cache(&mut DENIED_NODES.lock_or_recover(), observed);
     if let Some(line) = said {
         note_fleet(&line, denied.is_none());
@@ -589,17 +629,19 @@ fn still_drives(
 }
 
 /// The membership log's admission in this window's process (`docs/DESIGN-fluid-swarm-2026-10-28.md`
-/// §4.1, F17: [`aterm_agent::fleet_log::LocalLog`] of the live secrets directory): none in a
-/// test, in an isolated run (`ATERM_STATE_HOME`, `CI`, as the node job) or while this Mac holds
-/// no log. While the store cannot be read it is the verdict last read under the vault configured
-/// now (the same vault, its configuration rewritten or not), and with none, one that admits no
-/// key.
+/// §4.1, F17: [`aterm_agent::fleet_log::LocalLog`] of the vault [`vault_here`] reads): none in a
+/// process that reads no vault (under a private state root) or cannot find it, or while this Mac
+/// holds no log. While the store cannot be read it is the verdict last read under the vault
+/// configured now (the same vault, its configuration rewritten or not), and with none, one that
+/// admits no key.
 #[cfg(unix)]
 pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
     static LOG: std::sync::OnceLock<Option<aterm_agent::fleet_log::LocalLog>> =
         std::sync::OnceLock::new();
     LOG.get_or_init(|| {
-        window_vault()
+        vault_here()
+            .ok()
+            .flatten()
             .as_ref()
             .map(aterm_agent::fleet_log::LocalLog::of)
     })
@@ -607,17 +649,71 @@ pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
     .keys()
 }
 
-/// The vault this window's process reads its membership log, and the vault its fleet's grants
-/// are of, from: the live secrets directory, none in a test or an isolated run (`ATERM_STATE_HOME`,
-/// `CI`, as the node job).
+/// THE RULE for which vault this process's fleet readers read, the window's and the node job's
+/// alike, and LAN toolset sharing's downloads (`aterm`'s `unit_peers`): the deny list, the
+/// membership log, the vault the fleet's grants are of ([`aterm_agent::fleet_vault`]) and the
+/// vault a `vault-join` is judged by and served on ([`vault_join_on`]). It is decided by where the
+/// state root, which holds the fleet's key, resolved (`private_root`): under a private one none,
+/// as that fleet state is no account's; under the account's own, the vault `live` finds,
+/// whatever else the environment says (`CI`, or an `ATERM_STATE_HOME` a release build does not
+/// read), as that fleet's key is the account's and so must be its deny list and its grants'
+/// vault.
+///
+/// # Errors
+/// A run on the account's own state that cannot find its vault (no home directory): its
+/// listener admits by no grant ([`grants_under`]) and turns every dialer away
+/// ([`denied_nodes_now`]), the node job does not serve, and a download dials no member, rather
+/// than serve or dial as though the deny list named no one.
 #[cfg(unix)]
-pub(crate) fn window_vault() -> Option<aterm_secrets::client::Paths> {
-    let isolated = cfg!(test)
-        || std::env::var_os("ATERM_STATE_HOME").is_some()
-        || std::env::var_os("CI").is_some();
-    (!isolated)
-        .then(|| aterm_secrets::client::Paths::live().ok())
-        .flatten()
+pub(crate) fn vault_under(
+    private_root: bool,
+    live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
+) -> Result<Option<aterm_secrets::client::Paths>, String> {
+    if private_root {
+        return Ok(None);
+    }
+    live()
+        .map(Some)
+        .map_err(|error| format!("this Mac's vault cannot be found ({error})"))
+}
+
+/// Whether this process's state root resolved to a private one, [`vault_under`]'s
+/// `private_root` ([`aterm_types::dirs::runs_under_private_state_root`]): a lab instance's
+/// `ATERM_STATE_HOME` in a build that reads that seam, or a test binary's scratch root, so no
+/// test reads the person's vault. Neither `CI` nor an `ATERM_STATE_HOME` a release build does not
+/// read makes one: such a run keeps the account's own state. A unit test of this crate counts as
+/// one even where its scratch root could not be made; that also hides this predicate from this
+/// crate's own tests, so `aterm`'s, which build this crate as a library, hold it
+/// (`unit_peers`' `a_download_reads_the_vault_its_state_root_resolved_to`).
+#[cfg(unix)]
+pub(crate) fn state_root_is_private() -> bool {
+    cfg!(test) || aterm_types::dirs::runs_under_private_state_root()
+}
+
+/// [`vault_under`] of where this process's state root resolved ([`state_root_is_private`]) and
+/// of `live`, the read of this user's vault: [`vault_here`], with that read a test's.
+///
+/// # Errors
+/// As [`vault_under`]: a run on the account's own state that cannot find its vault.
+#[cfg(unix)]
+pub fn vault_reading(
+    live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
+) -> Result<Option<aterm_secrets::client::Paths>, String> {
+    vault_under(state_root_is_private(), live)
+}
+
+/// The vault this process reads ([`vault_reading`] of this user's vault). The fleet readers of
+/// the vault the rule names read it here: the window's deny list ([`denied_nodes_now`]), its
+/// membership log ([`window_log`]), its grants ([`window_grants`]), its heartbeat's log write and
+/// vault record, its `vault-join` ([`vault_join_on`]), the node job's vault, and `aterm`'s LAN
+/// toolset downloads. The members desk's own exchanges (`crate::members_desk`'s `ask`) read the
+/// user's vault directly: they are the vault's desk, not a reader of the fleet's.
+///
+/// # Errors
+/// As [`vault_under`]: a run on the account's own state that cannot find its vault.
+#[cfg(unix)]
+pub fn vault_here() -> Result<Option<aterm_secrets::client::Paths>, String> {
+    vault_reading(aterm_secrets::client::Paths::live)
 }
 
 /// The key `keys` binds `node` to, unless the membership log `log` holds that key out of the
@@ -1480,7 +1576,10 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 }
                 if op == FleetOp::VaultJoin {
                     // No deny list read: the proof cannot be told from a removed Mac's, so it is
-                    // judged by none until one is (the handshake gate refuses before this).
+                    // judged by none until one is (the handshake gate refuses before this). The
+                    // vault it is judged by and served on is the one this process reads: none
+                    // under a private state root, which refuses it ([`vault_join_on`]).
+                    let vault = vault_here();
                     let judged = aterm_types::dirs::state_dir()
                         .ok_or_else(|| "this Mac has no state directory".to_owned())
                         .and_then(|state| {
@@ -1492,13 +1591,14 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                                 (&state, &served_now().grants),
                                 &denied,
                                 window_log().as_deref(),
-                                aterm_secrets::client::Paths::live().ok().as_ref(),
+                                vault.as_ref().map_err(Clone::clone)?.as_ref(),
                             )
                         });
+                    let on = vault_join_on(judged, vault.ok().flatten());
                     return served.answer(|stream| {
                         stream.set_read_timeout(Some(within))?;
                         stream.set_write_timeout(Some(within))?;
-                        crate::members_desk::serve_vault_join(stream, peer, judged);
+                        crate::members_desk::serve_vault_join(stream, peer, on);
                         Ok(())
                     });
                 }
@@ -1770,6 +1870,26 @@ pub(crate) fn judge_vault_join_at(
     )
 }
 
+/// What a `vault-join` its judge found `judged` is served on: the vault that judge read
+/// (`vault`, [`vault_here`]), in the window and the node job alike. A process that reads no vault
+/// (under a private state root) refuses it, as its proof was judged by no vault's fleet code and
+/// the vault its desk would let the Mac into is none this fleet follows.
+#[cfg(unix)]
+pub(crate) fn vault_join_on(
+    judged: Result<aterm_agent::vault_join::Judged, String>,
+    vault: Option<aterm_secrets::client::Paths>,
+) -> Result<
+    (
+        aterm_agent::vault_join::Judged,
+        aterm_secrets::client::Paths,
+    ),
+    String,
+> {
+    let judged = judged?;
+    let vault = vault.ok_or_else(|| "this aterm follows no vault".to_owned())?;
+    Ok((judged, vault))
+}
+
 /// Whether this Mac lets the peer of `served` drive it under `grants`.
 #[cfg(unix)]
 fn lists_driver(
@@ -2026,7 +2146,7 @@ fn register_member_at<S: std::io::Read + std::io::Write>(
             node,
             host,
             port: addr.port(),
-            version: aterm_types::version::app_version().to_owned(),
+            version: aterm_stamp::app_version().to_owned(),
         })
     };
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
@@ -2123,7 +2243,7 @@ fn share_book_at<S: std::io::Write>(
             self_entry_while(
                 state,
                 &me,
-                (&host, addr.port(), aterm_types::version::app_version()),
+                (&host, addr.port(), aterm_stamp::app_version()),
                 current,
             )
         })
@@ -2482,14 +2602,7 @@ fn watch_fleet_generation(
             .and_then(|dir| read_node_identity(&dir).ok().flatten())
             .map(|node| (node.node().to_owned(), node.key()))
     };
-    let isolated = cfg!(test)
-        || std::env::var_os("ATERM_STATE_HOME").is_some()
-        || std::env::var_os("CI").is_some();
-    if !isolated
-        && let (Some(state), Ok(paths)) = (
-            aterm_types::dirs::state_dir(),
-            aterm_secrets::client::Paths::live(),
-        )
+    if let (Some(state), Ok(Some(paths))) = (aterm_types::dirs::state_dir(), vault_here())
         && let Some(me) = read_node_identity(&state).ok().flatten()
     {
         let _ = aterm_agent::fleet_log::ensure_local_node_key_in_log(
@@ -2580,18 +2693,19 @@ fn spawn_member_heartbeat(
         return;
     };
     // A record of the vault the fleet state is of, adopted where an older build left none.
-    aterm_agent::fleet_vault::keep(&state, window_vault().as_ref());
+    let vault = vault_here().ok().flatten();
+    aterm_agent::fleet_vault::keep(&state, vault.as_ref());
     let mut log = window_log();
     if log.as_deref().is_some_and(|keys| {
         aterm_net::fleet_member::read_node_identity(&state)
             .ok()
             .flatten()
             .is_some_and(|me| !keys.admits(&me.key()))
-    }) && let Ok(paths) = aterm_secrets::client::Paths::live()
+    }) && let Some(paths) = vault.as_ref()
         && let Some(me) = aterm_net::fleet_member::read_node_identity(&state)
             .ok()
             .flatten()
-        && aterm_agent::fleet_log::ensure_local_node_key_in_log(&paths, &me, log.as_deref())
+        && aterm_agent::fleet_log::ensure_local_node_key_in_log(paths, &me, log.as_deref())
     {
         log = window_log();
     }
@@ -2649,10 +2763,9 @@ type HeartbeatReach = (
 /// answered. Its answers are noted in the network place's evidence under `state`
 /// (`aterm_net::fleet_member`'s `note_place`), the state root this process's member desk reads
 /// it under (`aterm_secrets::home_lan::home_net`), each marked logged only where the round ran
-/// under the vault's membership log (`log`): an isolated job (`ATERM_STATE_HOME` or `CI`) has
-/// none, so nothing it hears admits anyone, even under a state root it shares with the real vault
-/// (`CI` alone). A generation that is no longer `current` stops at the next exchange boundary and
-/// cannot supersede a newer generation.
+/// under the vault's membership log (`log`): a process that reads no vault (under a private state
+/// root, [`vault_under`]) has none, so nothing it hears admits anyone. A generation that is no
+/// longer `current` stops at the next exchange boundary and cannot supersede a newer generation.
 #[cfg(unix)]
 fn spawn_member_heartbeat_at(
     state: &std::path::Path,
@@ -2684,7 +2797,7 @@ fn spawn_member_heartbeat_at(
         node: me.node().to_owned(),
         host,
         port: addr.port(),
-        version: aterm_types::version::app_version().to_owned(),
+        version: aterm_stamp::app_version().to_owned(),
         key: None,
         signed: None,
     };
@@ -2912,6 +3025,212 @@ fn note_fleet(line: &str, refusal: bool) {
 mod tests {
     use super::*;
 
+    /// Which vault a process reads follows where its state root resolved, and nothing else
+    /// (ATERM-KI-1105-10, [`vault_under`]): on the account's own state it reads the account's
+    /// vault, with `CI` set as without; under a private root it reads none; on the account's own
+    /// state with no vault to be found it reads none and says why. A test binary runs under its
+    /// scratch root, so no test reads the person's vault.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): `vault_under` deciding by the environment
+    /// (`private_root` or `ATERM_STATE_HOME` or `CI` set, a mutation inside the rule; the base
+    /// read the environment in the predicate that feeds it, [`state_root_is_private`]'s place)
+    /// fails "`CI` on the account's own state reads its vault". That predicate put back to the
+    /// base's reading fails no test of this crate, as `cfg!(test)` holds it true here; `aterm`'s
+    /// `unit_peers` test holds it.
+    #[cfg(unix)]
+    #[test]
+    fn the_vault_a_process_reads_follows_where_its_state_root_resolved() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let vault = aterm_secrets::client::Paths::for_home(home.path());
+        let found = || Ok(vault.clone());
+        crate::test_env::scoped("CI", "1", || {
+            assert_eq!(
+                vault_under(false, found),
+                Ok(Some(vault.clone())),
+                "`CI` on the account's own state reads its vault"
+            );
+        });
+        assert_eq!(
+            vault_under(false, found),
+            Ok(Some(vault.clone())),
+            "the account's own state reads its vault"
+        );
+        assert_eq!(
+            vault_under(true, || panic!("a private state root reads no vault")),
+            Ok(None),
+            "a private state root reads none"
+        );
+        let unfound = vault_under(false, || {
+            Err(aterm_secrets::Error::new("no home directory"))
+        });
+        assert!(
+            unfound
+                .as_ref()
+                .is_err_and(|why| why.contains("no home directory")),
+            "the account's own state with no vault to be found reads none and says why: \
+             {unfound:?}"
+        );
+        assert!(
+            aterm_types::dirs::runs_under_private_state_root() && state_root_is_private(),
+            "PRECONDITION: a test binary runs under its scratch root"
+        );
+        assert_eq!(vault_here(), Ok(None), "a test reads no vault");
+    }
+
+    /// The window's grants admit by the vault the process reads ([`grants_under`] of the rule's
+    /// answer, [`vault_under`], as [`window_grants`] reads them of [`vault_here`];
+    /// ATERM-KI-1105-10): beside a fleet state taken under the vault configured they admit as
+    /// made, beside one taken under another vault none does, `"*"` included, `CI` set or not, and
+    /// on the account's own state with no vault to be found none does, as the node job then
+    /// serves none, and why is said; under a private state root, which reads no vault, they admit
+    /// as made.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-05): `grants_under` reading a vault that cannot be found as
+    /// none (its `Err` arm admitting by [`in_effect`] under no vault, the window's reading before
+    /// 2026-11-05) fails "on the account's own state with no vault to be found no grant admits";
+    /// `vault_under` deciding by the environment (as in the rule's own test) fails "beside a
+    /// fleet taken under another vault no grant admits, `CI` set or not". A `window_grants` that
+    /// takes its vault from anything but [`vault_here`] fails no test: in a test binary the rule
+    /// reads no vault, as such a revert would.
+    #[cfg(unix)]
+    #[test]
+    fn the_windows_grants_admit_only_beside_the_vault_its_fleet_was_taken_under() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        aterm_secrets::fsx::ensure_private_dir(&state).unwrap();
+        aterm_net::fleet_member::write_held(&state, aterm_net::fleet_member::Began::Here, |book| {
+            book.write_key(&[0x5a; 24]).expect("write fleet key");
+        })
+        .expect("write_held");
+        let vault = aterm_secrets::client::Paths::for_home(root.path());
+        let configure = |name: &str, signer: u8| {
+            aterm_secrets::fsx::ensure_private_dir(&vault.dir).unwrap();
+            aterm_secrets::fsx::write_atomic(
+                &vault.dir.join("source.toml"),
+                format!(
+                    "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = \"{}\"\n\
+                     host = \"m22\"\n",
+                    aterm_secrets::b64::encode_padded(&[signer; 32])
+                )
+                .as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        };
+        configure("alab", 1);
+        aterm_agent::fleet_vault::keep(&state, Some(&vault));
+        assert!(
+            aterm_net::fleet_member::read_vault(&state)
+                .unwrap()
+                .is_some(),
+            "PRECONDITION: the fleet state records the vault \"alab\""
+        );
+        let all = || {
+            vec![
+                aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
+                    .expect("the default grant"),
+            ]
+        };
+        let found = || Ok(vault.clone());
+        let unfound = || Err(aterm_secrets::Error::new("no home directory"));
+        /// `grants` beside `state` under the vault the rule names for `private_root` and `live`.
+        fn under(
+            grants: Vec<aterm_net::fleet::DriveGrant>,
+            state: Option<&std::path::Path>,
+            private_root: bool,
+            live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
+        ) -> (Vec<aterm_net::fleet::DriveGrant>, Option<String>) {
+            let vault = vault_under(private_root, live);
+            grants_under(grants, state, vault.as_ref().map(Option::as_ref))
+        }
+        let (admitted, said) = under(all(), Some(&state), false, found);
+        assert_eq!(
+            (admitted.len(), said),
+            (1, None),
+            "the grant made under the vault the fleet was taken under admits"
+        );
+        let (admitted, said) = under(all(), Some(&state), false, unfound);
+        assert_eq!(
+            admitted,
+            Vec::new(),
+            "on the account's own state with no vault to be found no grant admits"
+        );
+        assert!(
+            said.as_deref()
+                .is_some_and(|why| why.contains("no home directory")),
+            "and why is said: {said:?}"
+        );
+        assert_eq!(
+            under(Vec::new(), Some(&state), false, unfound),
+            (Vec::new(), None),
+            "with no grant there is nothing to say"
+        );
+        assert_eq!(
+            under(all(), None, false, unfound).0,
+            Vec::new(),
+            "nor with no state directory"
+        );
+        configure("other", 9);
+        crate::test_env::scoped("CI", "1", || {
+            assert_eq!(
+                under(all(), Some(&state), false, found).0,
+                Vec::new(),
+                "beside a fleet taken under another vault no grant admits, `CI` set or not"
+            );
+        });
+        assert_eq!(
+            under(all(), Some(&state), false, found),
+            (Vec::new(), None),
+            "beside a fleet taken under another vault no grant admits"
+        );
+        assert_eq!(
+            under(all(), Some(&state), true, || panic!("reads no vault"))
+                .0
+                .len(),
+            1,
+            "under a private state root, which reads no vault, the grants admit as made"
+        );
+    }
+
+    /// A `vault-join` is served on the vault its judge read, in the window and the node job alike
+    /// ([`vault_join_on`]; ATERM-KI-1105-10): a process that reads no vault (under a private
+    /// state root) refuses it, a judged one is served on that vault, and one its judge refused
+    /// is refused with the judge's reason.
+    ///
+    /// NEGATIVE CONTROL (2026-11-05): `vault_join_on` serving a join whose judge read no vault on
+    /// another vault anyway (the window read `Paths::live()` for it before; here a vault under a
+    /// scratch path, so the control reads no person's vault) fails "a process that reads no vault
+    /// refuses a vault-join".
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_join_is_served_only_on_the_vault_its_judge_read() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let vault = aterm_secrets::client::Paths::for_home(home.path());
+        let judged = aterm_agent::vault_join::Judged {
+            node: [7; 32],
+            fleet: false,
+            book: aterm_secrets::client::Book::default(),
+        };
+        let refused = vault_join_on(Ok(judged), None);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("follows no vault")),
+            "a process that reads no vault refuses a vault-join: {refused:?}"
+        );
+        assert_eq!(
+            vault_join_on(Ok(judged), Some(vault.clone())),
+            Ok((judged, vault.clone())),
+            "a judged vault-join is served on the vault its judge read"
+        );
+        let why = "this Mac has no state directory".to_owned();
+        assert_eq!(
+            vault_join_on(Err(why.clone()), Some(vault)),
+            Err(why),
+            "one its judge refused is refused with the judge's reason"
+        );
+    }
+
     /// With MESH off a window still listens, leaving the port only to a node job that holds it;
     /// with MESH on it leaves the port to the node service, the one listener on this Mac.
     #[test]
@@ -2942,7 +3261,7 @@ mod tests {
         self_entry(
             state.path(),
             &me,
-            ("127.0.0.1", 7200, aterm_types::version::app_version()),
+            ("127.0.0.1", 7200, aterm_stamp::app_version()),
         )
         .unwrap();
         let descriptor = state.path().join("fleet-self-entry");
@@ -3848,6 +4167,7 @@ mod tests {
 
         // 1. The issuer (its book names no issuer but itself) keeps its own facts alone.
         let holder_facts = SwarmSurveyFacts {
+            release_lines: Vec::new(),
             node: Some(holder_id.node().to_owned()),
             label: Some("fixture-holder".to_owned()),
             roster_unread: false,
@@ -3945,6 +4265,7 @@ mod tests {
         .unwrap();
 
         let member_facts = SwarmSurveyFacts {
+            release_lines: Vec::new(),
             node: Some(member_id.node().to_owned()),
             label: Some("m7".to_owned()),
             roster_unread: false,

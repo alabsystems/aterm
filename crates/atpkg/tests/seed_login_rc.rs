@@ -45,7 +45,7 @@ impl Fixture {
         state: Option<&Path>,
         path: Option<&Path>,
     ) -> Output {
-        let mut seed = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut seed = Command::new(aterm_tempfile::bin_exe("atpkg"));
         seed.arg("seed");
         if let Some(path) = path {
             seed.env("PATH", path);
@@ -83,7 +83,7 @@ impl Fixture {
     /// `$ZDOTDIR/.zshrc`, so one set where the tests run sent this scratch home's block into
     /// that folder's real `.zshrc`.
     fn shell_setup(&self, login: &str, shell: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(["shell-setup", "--path", "--toolset-coming", "--bin-dir"])
             .arg(self.home.join(".local/bin"))
             .env("HOME", &self.home)

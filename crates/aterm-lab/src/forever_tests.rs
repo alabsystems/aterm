@@ -5922,6 +5922,10 @@ fn seen_cruise_n() -> Seen {
         end_ms: T0 + 875_000,
         window: surfaces::Window {
             front_tab: true,
+            // A glance at each read below, one in each step's span.
+            glances: [1_000, 6_000, 131_000, 376_000, 861_000]
+                .map(|t| T0 + t)
+                .to_vec(),
             chip: vec![j(
                 1_000,
                 "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\"",
@@ -6147,6 +6151,8 @@ fn cruise_n_leaves_a_step_its_window_never_read_unobserved() {
     ] {
         watched(v);
     }
+    s.window.glances.retain(|t| *t > T0 + 125_000);
+    s.window.glances.insert(0, T0 + 129_000);
     s.window.chip.insert(
         0,
         j(
@@ -6165,11 +6171,63 @@ fn cruise_n_leaves_a_step_its_window_never_read_unobserved() {
         verdicts(Chain::CruiseN, &s, "claude")[1..],
         [("N2", "PASS"), ("N3", "PASS"), ("N4", "PASS")]
     );
-    // One glance inside the span, its page read and nothing changed: N1's rows are judged again,
-    // and the rows that stood from before its reply say nothing of it.
-    s.window.page_reads.push(T0 + 60_000);
+    // One glance inside the span that changed nothing: N1's rows are judged again, and the rows
+    // that stood from before its reply say nothing of it.
+    s.window.glances.insert(0, T0 + 60_000);
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
     assert_eq!(w, "FAIL", "{why}");
+}
+
+/// A GLANCE THAT CHANGED NOTHING IS A READ: one inside N1's span whose Harness page read failed,
+/// whose tooltip table was partial and whose chip and menu were as before its reply re-read the
+/// rows that stood then, here no need row, so N1 fails on them (`Window::glances`). Negative
+/// control: `n_unglanced` counting only page reads, tooltip reads and changes reads N1
+/// UNOBSERVED.
+#[test]
+fn cruise_n_fails_a_step_on_rows_a_glance_read_again_unchanged() {
+    const CHIP: &str =
+        "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\"";
+    // The window's chrome before N1's reply and inside its span: the chip, a strip whose second
+    // tab has no tooltip (a partial table), and a menu with no row naming cruise-n.
+    let chrome = format!(
+        "autopilot sid=s-cn {CHIP}\n\
+         toolbar-tabs count=2 selected=0 labels=[\"cruise-n\", \"other\"] states=[[], []] \
+         tooltips=[Some(\"cruise-n\\ndriven by aterm (cruise)\")]\n\
+         statusmenu \"Needs you (1)\" enabled=no at=0\n\
+         statusmenu \"◇ other — approve it · 4s\" enabled=yes checked=no at=1\n\
+         statusmenu --- at=2"
+    );
+    let mut s = seen_cruise_n();
+    let mut w = surfaces::Window {
+        front_tab: true,
+        opening: s.window.opening.clone(),
+        stopped: s.window.stopped.clone(),
+        ..window("cruise-n")
+    };
+    let before = surfaces::Glance::of(T0 + 1_000, &chrome, "");
+    let said = w.note(&before, "s-cn");
+    assert!(said.iter().any(|(what, _)| *what == "chip"), "{said:?}");
+    let inside = surfaces::Glance::of(T0 + 60_000, &chrome, "");
+    assert!(!inside.page_read && !inside.hover_read);
+    let said = w.note(&inside, "s-cn");
+    assert!(
+        said.iter()
+            .all(|(what, _)| !matches!(*what, "chip" | "menu" | "page")),
+        "{said:?}"
+    );
+    assert_eq!(w.glances, [T0 + 1_000, T0 + 60_000]);
+    assert!(w.page_reads.is_empty() && w.hover_reads.is_empty());
+    // The chip's title (`?`, this chrome prints none) is another judge's, kept as the fixture's.
+    w.title = s.window.title.clone();
+    s.window = w;
+    let (v, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
+    assert_eq!(v, "FAIL", "{why}");
+    assert!(why.contains("no need row"), "{why}");
+    // No glance in the span at all: the same rows say nothing of N1.
+    s.window.glances.retain(|t| *t < T0 + 5_000);
+    let (v, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
+    assert_eq!(v, "UNOBSERVED", "{why}");
+    assert!(why.contains("no window read in N1's span"), "{why}");
 }
 
 #[test]
@@ -8109,7 +8167,7 @@ fn the_scroll_drive_reads_search_and_scroll_replies() {
 fn tool_ended() -> Seen {
     Seen {
         journal: vec![
-            j(6_000, "EVENT idle seq=1 ⏺ Read(README.md)"),
+            j(6_000, "EVENT idle seq=1 Read 1 file (ctrl+o to expand)"),
             backoff(6_100, 1, 1, 120_000),
             j(
                 126_400,
@@ -8132,10 +8190,7 @@ fn tool_ended() -> Seen {
         end_ms: T0 + 429_000,
         cover: Cover {
             tool_results: Some(1),
-            first_screen: Some((
-                T0 + 6_500,
-                vec!["⏺ Read(README.md)".into(), "  ⎿  Read 3 lines".into()],
-            )),
+            first_screen: Some((T0 + 6_500, claude_tool_screen(false))),
             ..Cover::default()
         },
         ..Seen::default()
@@ -8147,7 +8202,10 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     let f3 = |s: &Seen| one(Chain::ToolEnd, s, "claude", Scenario::F3);
     let (w, why) = f3(&tool_ended());
     assert_eq!(w, "PASS", "{why}");
-    assert!(why.contains("Read(README.md)"), "{why}");
+    assert!(
+        why.contains("the first turn's last row, read at +6.5 s: Read 1 file"),
+        "{why}"
+    );
     let mut s = tool_ended();
     s.journal.truncate(1);
     s.ledger.clear();
@@ -8198,6 +8256,37 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     }
 }
 
+/// The screen's rows (blank ones dropped) as F3's lab reads them at its first point on Claude Code
+/// 2.1.318 (`f3p-cl`, 2026-11-05): the opener's echo, the tool's row and the turn timer, then
+/// Land's instruction and the rest of its landing where it was typed at once (`landed`), else the
+/// composer.
+fn claude_tool_screen(landed: bool) -> Vec<String> {
+    let mut rows = vec![
+        "▐▛███▛█   Claude Code v2.1.318",
+        "❯ FOREVERLAB-TOOL-END. write the parser for this repository and land it",
+        "  Read 1 file (ctrl+o to expand)",
+        "✻ Worked for 0s · done 9:56 PM",
+    ];
+    if landed {
+        rows.extend([
+            "❯ [aterm harness] Autopilot is Land: land ALL of this work into the remote main branch,",
+            "  Nothing left:",
+            "⏺ Nothing left: the parser is committed and pushed to origin/main.",
+            "✻ Brewed for 0s · done 9:56 PM",
+            "❯ [aterm harness] Land check: Reread your report, since git sees only part of the work.",
+            "⏺ LANDED",
+            "✻ Churned for 0s · done 9:56 PM",
+        ]);
+    }
+    rows.extend([
+        "────────────────────────────────────────",
+        "❯",
+        "────────────────────────────────────────",
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    ]);
+    rows.into_iter().map(String::from).collect()
+}
+
 /// F3 as main recorded it on Claude Code 2.1.318 (`e-cl-res`, 2026-11-04): the tool's row read
 /// at +1.3 s, Land's instruction typed at that point at once, the land check, LANDED.
 fn tool_ended_at_once() -> Seen {
@@ -8232,10 +8321,7 @@ fn tool_ended_at_once() -> Seen {
         end_ms: T0 + 24_500,
         cover: Cover {
             tool_results: Some(4),
-            first_screen: Some((
-                T0 + 8_200,
-                vec!["  ⎿  Read 1 file (ctrl+o to expand)".into()],
-            )),
+            first_screen: Some((T0 + 8_200, claude_tool_screen(true))),
             ..Cover::default()
         },
         ..Seen::default()
@@ -8268,6 +8354,82 @@ fn f3_takes_lands_instruction_at_the_tool_ended_point_at_once() {
     let (w, why) = f3(&other);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no back-off decided before it"), "{why}");
+}
+
+/// F3'S PREMISE IS READ, NOT ASSUMED: the screen read at the first point shows the first turn
+/// ending on its tool's row (`cover::first_turn`), each program's as it drew it on 2026-11-05
+/// (`f3p-{cl,ag,mu}`), Land's instruction already typed or not; where words, an error or no row
+/// follow the tool, the opener's echo is not on that screen, or no screen was read, the point
+/// judged was no tool-ended one and F3 is UNOBSERVED, whatever was decided there. Negative control:
+/// the premise taken as met reads each of those PASS.
+#[test]
+fn f3_reads_its_premise_off_the_first_turns_rows() {
+    let f3 = |rows: &[&str]| {
+        let mut s = tool_ended_at_once();
+        s.cover.first_screen = Some((T0 + 2_400, rows.iter().map(|r| r.to_string()).collect()));
+        one(Chain::ToolEnd, &s, "agy", Scenario::F3)
+    };
+    let rule = "────────────────────────────────────────";
+    let agy = [
+        "▄▀▀▄        Antigravity CLI 1.5.1",
+        rule,
+        "> FOREVERLAB-TOOL-END. write the parser for this repository and land it",
+        "● Explored 1 file (README.md) (ctrl+o to expand)",
+        rule,
+        "> [aterm harness] Autopilot is Land: land ALL of this work into the remote main branch,",
+        "  Nothing left: the parser is committed and pushed to origin/main.",
+        rule,
+        "> [aterm harness] Land check: Reread your report, since git sees only part of t",
+        rule,
+        "                                        Gemini 3.1 Pro · low",
+    ];
+    let (w, why) = f3(&agy);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("read at +2.4 s: ● Explored 1 file (README.md)"),
+        "{why}"
+    );
+    let muse = [
+        "  Muse Code 1.4.14",
+        "❯ FOREVERLAB-TOOL-END. write the parser for this repository and land it",
+        "  Read README.md",
+        "❯ [aterm harness] Autopilot is Land: land ALL of this work into the remote main branch,",
+        "◆ Nothing left: the parser is committed and pushed to origin/main.",
+        "── Voice input (⌥ + v to start) ──────────",
+        "❯",
+        rule,
+        "  lab-stub · high · /private/tmp/at.atth/proj/tool-end · Auto-review",
+    ];
+    let (w, why) = f3(&muse);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("Read README.md"), "{why}");
+    // Before Land's instruction: the turn runs to the composer.
+    let (w, why) = f3(&[&agy[..4], &[rule, ">", rule, "? for shortcuts"]].concat());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("● Explored 1 file"), "{why}");
+    let error =
+        "Error: model output error: model output must contain either output text or tool calls";
+    let worded = [&agy[..4], &[error, rule], &agy[5..]].concat();
+    let said = [&agy[..4], &["● Next, the parser itself."], &agy[4..]].concat();
+    let bare = [&agy[..3], &agy[4..]].concat();
+    for (rows, want) in [
+        (&worded[..], "did not end on the tool's row"),
+        (&said[..], "did not end on the tool's row"),
+        (&bare[..], "its rows read at +2.4 s: none"),
+        (&agy[5..], "holds no echo of the opener"),
+    ] {
+        let (w, why) = f3(rows);
+        assert_eq!(w, "UNOBSERVED", "{rows:?}: {why}");
+        assert!(why.contains(want), "{why}");
+    }
+    let mut s = tool_ended_at_once();
+    s.cover.first_screen = None;
+    let (w, why) = one(Chain::ToolEnd, &s, "agy", Scenario::F3);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(
+        why.contains("the screen at the first point not read"),
+        "{why}"
+    );
 }
 
 fn laddered(scale: f64) -> Seen {

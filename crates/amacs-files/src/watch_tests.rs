@@ -384,6 +384,54 @@ fn a_due_wait_polls_at_once_and_a_short_one_never_spins() {
     assert_eq!(poll_millis(Some(Duration::MAX)), i32::MAX);
 }
 
+/// A file whose folder, and that folder's folder, are not there yet is heard
+/// once all three are made: the watch listens on the nearest folder that is
+/// there and arms again lower as each one below it is made.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_hears_a_file_made_in_folders_made_after_the_watch() {
+    let dir = scratch("amacs-watch-folders");
+    let outer = dir.path().join("outer");
+    let path = outer.join("inner").join("doc.txt");
+    let (told, heard) = mpsc::channel();
+    let arms = Arc::new(Mutex::new(0));
+    let events = Counted {
+        inner: platform_events().unwrap(),
+        arms: Arc::clone(&arms),
+    };
+    let watch = FileWatch::spawn(
+        Box::new(events),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(5, path.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the first look"
+    );
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the watch arms", || {
+        (*arms.lock().unwrap() >= 2).then_some(())
+    });
+    std::fs::create_dir(&outer).unwrap();
+    // The look the outer folder's making brings arms on it.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the watch arms lower",
+        || (*arms.lock().unwrap() >= 3).then_some(()),
+    );
+    std::fs::create_dir(outer.join("inner")).unwrap();
+    std::fs::write(&path, "made\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the file made in its new folders"
+    );
+    drop(watch);
+}
+
 /// Linux's inotify events: one names its watch and entry, so it touches only
 /// the key watching that file in that directory (the negative control), and
 /// a queue overflow (watch -1, the kernel dropped events) touches every key,

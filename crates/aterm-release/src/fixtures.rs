@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use crate::gates::{
-    GateTree, HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_GUARD_TARGET, HANDOFF_FIXTURE_README,
-    HANDOFF_FIXTURE_ROOT, HandoffFixtures,
+    GateTree, HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_README, HANDOFF_FIXTURE_ROOT, HandoffFixtures,
 };
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 
@@ -32,10 +31,6 @@ pub const STAGED_ANSWERS: &str = "shipped-state.txt";
 
 /// Environment variable naming where the generator writes [`STAGED_ANSWERS`].
 pub const ANSWERS_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
-
-/// Written in the generator's target before it runs and removed once the release judged
-/// what it built there: found by a later stage, it means no release did.
-pub const UNJUDGED: &str = "unjudged";
 
 /// Release identity pins stamped into generated fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +155,24 @@ pub fn generator_args() -> Vec<&'static str> {
     args
 }
 
+/// macOS assesses a first exec by path, even if a later compiler would replace its bytes.
+fn execution_hold(root: &Path, binary: &Path) -> PathBuf {
+    let key = aterm_digest::Sha256::digest(binary.as_os_str().as_encoded_bytes());
+    root.join(".ubd/generator-holds.noindex")
+        .join(aterm_codec::hex::encode_lower(&key))
+}
+
+fn check_execution_hold(root: &Path, binary: &Path) -> Result<()> {
+    if let Some(left) = crate::gates::first_exec_hold(&execution_hold(root, binary)) {
+        return Err(Error::new(format!(
+            "handoff fixtures: {} never showed it ran; execution hold has {} s left",
+            binary.display(),
+            left.as_secs()
+        )));
+    }
+    Ok(())
+}
+
 /// Runs the in-tree fixture generator under `pins` into `root`, unless already staged.
 ///
 /// Refuses when the generator does not pass both its tests (one off macOS, which has no
@@ -169,9 +182,9 @@ pub fn generator_args() -> Vec<&'static str> {
 /// ([`STAGED_ANSWERS`], at `$ATERM_SHIPPED_STATE_OUT`).
 ///
 /// # Errors
-/// Each refusal above, no `rendezvous.toml` on macOS, a `targo` that cannot run, an
-/// unreadable handoff guard, and a staging or target directory that cannot be prepared,
-/// read or written.
+/// Each refusal above, no `rendezvous.toml` on macOS, an unidentifiable or dirty candidate,
+/// an unreadable handoff guard, a missing generator that cannot be compiled or indexed,
+/// a generator that cannot run, an execution hold, and staging or index I/O failures.
 pub fn stage(
     targo: &Path,
     tree: &Path,
@@ -179,6 +192,8 @@ pub fn stage(
     pins: &Pins,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
 ) -> Result<Staged> {
+    let physical_tree = aterm_verify::physical(tree);
+    let tree = physical_tree.as_path();
     if let Some(found) = staged(root, pins) {
         return Ok(found);
     }
@@ -197,56 +212,78 @@ pub fn stage(
     let at = pins.staged_in(root);
     let dir = at.join(pins.tag());
     fs::create_dir_all(&dir).map_err(|e| io("cannot create", &dir, e))?;
-    let target = tree.join(HANDOFF_FIXTURE_GUARD_TARGET);
-    match fs::symlink_metadata(&target) {
-        Ok(meta) if !meta.is_dir() => {
-            return Err(Error::new(format!(
-                "handoff fixtures: retained target {} is not a directory",
-                target.display()
-            )));
+    let (target, layout) = crate::release_steps::verify_layout(tree);
+    let index_path = target.join("verify/test-executables.json");
+    let (tree_id, compiler) = aterm_verify::test_index::identities(tree, targo)
+        .map_err(|e| io("cannot identify candidate", tree, e))?;
+    let select = |index: &aterm_verify::test_index::Index| {
+        index.fixture_binary(&tree_id, &compiler, tree).cloned()
+    };
+    let previous = aterm_verify::test_index::Index::read(&index_path);
+    if let Some(previous) = &previous {
+        for entry in &previous.binaries {
+            if entry.kind == "lib"
+                && entry.name == "aterm_gui"
+                && entry.manifest_path == tree.join("crates/aterm-gui/Cargo.toml")
+            {
+                // Check before Cargo can invalidate or replace a stale artifact.
+                check_execution_hold(root, &entry.path)?;
+            }
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io("cannot read", &target, error)),
     }
-    let unjudged = target.join(UNJUDGED);
-    // A single copy's `ran` marker cannot attest to every program in a Cargo target.
-    clear_marker(&target.join(aterm_uds::deadline::RAN))
-        .map_err(|e| io("cannot clear", &target, e))?;
-    if fs::symlink_metadata(&unjudged).is_ok() {
-        // The release that ran the generator here ended before it judged the target, so a
-        // program built there may never have shown it ran. The run claim keeps a rerun out
-        // while that release's child lives, so its run is over by now: the hold runs from
-        // here.
-        stamp_hold(&target).map_err(|e| io("cannot renew execution hold", &target, e))?;
-        fs::remove_file(&unjudged).map_err(|e| io("cannot remove", &unjudged, e))?;
-    }
-    if let Some(left) = crate::gates::first_exec_hold(&target) {
-        return Err(Error::new(format!(
-            "handoff fixtures: {} holds programs an earlier run started that never showed \
-             they ran, so macOS may still be assessing a first exec; it stays — run again in \
-             {} s (or after a restart)",
-            target.display(),
-            left.as_secs()
-        )));
-    }
-    // Stamped and marked unjudged before anything runs from it: a release killed before it
-    // judges the target leaves the mark, and the next stage holds the target from then.
-    // Cargo owns invalidation of retained compiler outputs. Fixture outputs live in `at`,
-    // separately keyed by all release pins, and are regenerated above for each new identity.
-    fs::create_dir_all(&target).map_err(|e| io("cannot create", &target, e))?;
-    stamp_hold(&target).map_err(|e| io("cannot stamp before execution", &target, e))?;
-    crate::durable::write_fresh(&unjudged, b"").map_err(|e| io("cannot write", &unjudged, e))?;
+    let entry = match previous.and_then(|i| select(&i)) {
+        Some(entry) => entry,
+        None => {
+            let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, &target);
+            if let Some(layout) = &layout {
+                compile.arg("--config").arg(layout);
+            }
+            let output = run(&mut compile).map_err(|e| io("cannot compile generator", targo, e))?;
+            if !output.status.success() {
+                return Err(Error::new(format!(
+                    "handoff fixtures: generator compile failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            let index = aterm_verify::test_index::Index::from_messages(
+                tree_id.clone(),
+                compiler.clone(),
+                &String::from_utf8_lossy(&output.stdout),
+            )
+            .map_err(|e| io("cannot index generator", &index_path, e))?;
+            let entry = select(&index).ok_or_else(|| Error::new("handoff fixtures: compile did not report the candidate's GUI library test binary"))?;
+            index
+                .write(&index_path)
+                .map_err(|e| io("cannot save generator index", &index_path, e))?;
+            entry
+        }
+    };
+    // Holds belong to this executable alone. No directory-wide marker can attest to
+    // another binary, and no fixture run clears or deletes compiler outputs.
+    let hold = execution_hold(root, &entry.path);
+    fs::create_dir_all(&hold).map_err(|e| io("cannot create execution hold", &hold, e))?;
+    check_execution_hold(root, &entry.path)?;
+    stamp_hold(&hold).map_err(|e| io("cannot stamp execution hold", &hold, e))?;
     println!(
-        "==> handoff fixtures: {} build {} ({}) written by its own producer (targo \
-         --unverified test -p aterm-gui --lib -- {})",
+        "==> handoff fixtures: {} build {} ({}) directly from indexed binary {}",
         pins.tag(),
         pins.build,
         pins.short(),
-        generator_args().join(" ")
+        entry.path.display()
     );
-    let mut command = crate::gates::aterm_gui_lib_test(targo, tree, &target, &generator_args());
+    let mut command = aterm_uds::spawnfd::command(&entry.path);
     command
+        .args(generator_args())
+        .current_dir(tree)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .env(
+            "CARGO_MANIFEST_DIR",
+            entry
+                .manifest_path
+                .parent()
+                .ok_or_else(|| Error::new("generator manifest has no parent"))?,
+        )
+        .env("ATERM_HANDOFF_FIXTURE_VERSION", &pins.version)
         .env("ATERM_BUILD_GIT_COMMIT", pins.short())
         .env("ATERM_BUILD_GIT_COMMIT_FULL", &pins.commit)
         .env("SOURCE_DATE_EPOCH", pins.build.to_string())
@@ -254,63 +291,17 @@ pub fn stage(
         .env("ATERM_RENDEZVOUS_FIXTURE_OUT", &dir)
         .env(ANSWERS_OUT, at.join(STAGED_ANSWERS));
     let outcome = run(&mut command);
-    // Cargo waits for each build script and test binary it starts, so only its own exit, with
-    // no signal forwarded to them, shows every program built in `target` ran. One that did
-    // not is stamped again: its hold runs from now, after every exec. A `run` that failed
-    // and left nothing in `target` but its stamp built nothing there to hold.
-    let proven = crate::interrupt::caught().is_none()
-        && outcome
-            .as_ref()
-            .is_ok_and(|out| out.status.code().is_some());
-    let built_nothing = outcome.is_err()
-        && fs::read_dir(&target).is_ok_and(|mut entries| {
-            entries.all(|entry| {
-                entry.is_ok_and(|entry| {
-                    entry.file_name() == aterm_uds::deadline::EXEC_STAMP
-                        || entry.file_name() == UNJUDGED
-                })
-            })
-        });
-    if !proven && !built_nothing {
-        if let Err(error) = stamp_hold(&target) {
-            println!(
-                "==> handoff fixtures: could not renew {} ({error}); the unjudged marker \
-                 keeps the next run from reusing the target",
-                target.display()
-            );
-        } else if let Err(error) = fs::remove_file(&unjudged) {
-            println!(
-                "==> handoff fixtures: could not remove {} ({error}); the next run holds the \
-                 target from when it finds it",
-                unjudged.display()
-            );
-        }
-        println!(
-            "==> handoff fixtures: kept {}: the generator did not exit on its own, so a \
-             program built there may never have shown it ran and macOS may still be assessing \
-             its first exec; the next run checks its execution hold before reusing it",
-            target.display()
-        );
+    if outcome.as_ref().is_ok_and(|out| {
+        let (passed, failed, _) =
+            crate::gates::libtest_tally(&String::from_utf8_lossy(&out.stdout));
+        passed + failed > 0
+    }) {
+        clear_marker(&hold.join(aterm_uds::deadline::EXEC_STAMP))
+            .map_err(|e| io("cannot clear execution hold", &hold, e))?;
     } else {
-        // A completed Cargo process has reaped its children. Clear only our execution
-        // markers; removing the target here forces a cold compiler graph at the next cut.
-        for marker in [aterm_uds::deadline::EXEC_STAMP, UNJUDGED] {
-            let path = target.join(marker);
-            if let Err(error) = clear_marker(&path) {
-                println!(
-                    "==> handoff fixtures: could not clear {} ({error}); the next run may \
-                     conservatively hold the retained target",
-                    path.display()
-                );
-            }
-        }
+        stamp_hold(&hold).map_err(|e| io("cannot renew execution hold", &hold, e))?;
     }
-    let output = outcome.map_err(|e| {
-        Error::new(format!(
-            "handoff fixtures: cannot run {}: {e}",
-            targo.display()
-        ))
-    })?;
+    let output = outcome.map_err(|e| io("cannot run generator", &entry.path, e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (passed, failed, failing) = crate::gates::libtest_tally(&stdout);
     let expected = if cfg!(target_os = "macos") {
@@ -377,14 +368,15 @@ pub fn stage(
             answers.display()
         )));
     }
+    let expected_lines = [
+        format!("producer_version = \"{}\"", pins.version),
+        format!("producer_commit = \"{}\"", pins.short()),
+        format!("outgoing_build = {}", pins.build),
+    ];
     for desk in &desks {
         let parent = dir.join(desk).join("parent.toml");
         let text = crate::durable::read_text(&parent).map_err(|e| io("cannot read", &parent, e))?;
-        for line in [
-            format!("producer_version = \"{}\"", pins.version),
-            format!("producer_commit = \"{}\"", pins.short()),
-            format!("outgoing_build = {}", pins.build),
-        ] {
+        for line in &expected_lines {
             if !text.lines().any(|l| l == line) {
                 return Err(refuse(format!(
                     "{desk}'s parent.toml lacks `{line}`: it was not written as the shipped \
@@ -499,7 +491,9 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
 pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(String, usize)> {
     let prefix = format!("{tag}/");
     let refuse = |why: String| Error::new(format!("{tag}'s shipped-state answers: {why}"));
-    let key = |line: &str| line.split_once('\t').map_or(line, |(id, _)| id).to_string();
+    fn key(line: &str) -> &str {
+        line.split_once('\t').map_or(line, |(id, _)| id)
+    }
     let lines: Vec<&str> = staged.lines().collect();
     let first = lines
         .iter()
@@ -647,8 +641,9 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             if ft.is_dir() {
                 stack.push((entry.path(), path));
             } else if ft.is_file() {
-                let bytes = crate::durable::read_file(&entry.path())
-                    .map_err(|e| Error::new(format!("read {}: {e}", entry.path().display())))?;
+                let entry_path = entry.path();
+                let bytes = crate::durable::read_file(&entry_path)
+                    .map_err(|e| Error::new(format!("read {}: {e}", entry_path.display())))?;
                 out.push((path, bytes));
             }
         }

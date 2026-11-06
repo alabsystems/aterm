@@ -120,6 +120,9 @@ pub fn write_staged(path: &Path, bytes: &[u8], prefix: &str, max: u64) -> io::Re
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+    #[cfg(unix)]
+    let mut file = aterm_uds::kept_out(|| options.open(&staged))?;
+    #[cfg(not(unix))]
     let mut file = options.open(&staged)?;
     #[cfg(unix)]
     {

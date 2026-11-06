@@ -40,7 +40,7 @@ fn a_wrong_prototype_fails_the_probe_on_both_arches() {
 
 /// The message constants `src/power/iokit.rs` declares: `(name, value)`.
 fn messages() -> Vec<(String, String)> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/power/iokit.rs");
+    let path = aterm_tempfile::manifest_dir().join("src/power/iokit.rs");
     let src = std::fs::read_to_string(path).expect("the module is readable");
     src.lines()
         .filter_map(sdk_consts::parse_const_decl)

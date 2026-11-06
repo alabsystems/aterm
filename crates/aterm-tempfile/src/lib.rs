@@ -13,6 +13,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod build_paths;
+pub use build_paths::{bin_exe, manifest_dir, target_tmpdir};
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a temporary name component from the pid, a process-wide counter,

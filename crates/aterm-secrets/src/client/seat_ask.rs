@@ -282,10 +282,12 @@ pub fn test_read_dropped<T>(read: impl FnOnce() -> T) -> T {
 /// locker opened ([`Stored::In`]), its log reads it as [`Seat::Seatless`], and its identity is no
 /// lab identity (`client::refuse_lab_member_browse`: a lab identity founds its own lab and asks
 /// the live ALab nothing). `aterm members status`, `aterm secrets status` and `aterm members join`
-/// read this, so what they say is what the subscriber does ([`asks_for_seat`]).
+/// read this, so what they say is what the subscriber does ([`asks_for_seat`]), and so does the
+/// machine title's reader at each change of the vault's saved state, which is why the seat read
+/// is memoized here too ([`seat_memoized`]).
 #[must_use]
 pub fn seat_asks(paths: &Paths) -> bool {
-    asks_with(paths, &seat)
+    asks_with(paths, &seat_memoized)
 }
 
 /// [`seat_asks`], `seat_of` reading the seat once the cheap conditions hold.
@@ -407,6 +409,43 @@ pub fn take_seat(paths: &Paths, bundle: &crate::members::Bundle) -> crate::Resul
         _ => Err(Error::new(
             "the member's records do not seat this Mac's recipient",
         )),
+    }
+}
+
+/// Merge a guarded proof's seat while its caller holds the state lock and has checked its
+/// exact source. A seat never replaces the existing configuration, state, files or keys.
+pub(super) fn take_seat_admitted_held(
+    paths: &Paths,
+    bundle: &crate::members::Bundle,
+    admission: &crate::members::join::ProofAdmission<'_>,
+) -> crate::Result<Report> {
+    let store = seat_records(paths, bundle)?;
+    retained_history::validate_write(paths, &store)?;
+    let source_crossed = matches!(
+        &bundle.handed,
+        crate::members::bundle::Handed::Log { source: Some(source), .. } if source.crossed
+    );
+    let crosses = source_crossed
+        || crate::crossing::past_legacy(
+            store
+                .log()
+                .map_or(0, crate::membership_log::Log::held_count),
+        );
+    let publish = || {
+        admission.check(paths)?;
+        write_records(paths, &store)?;
+        match seat(paths) {
+            Seat::Seated => Ok(Report::default()),
+            _ => Err(Error::new(
+                "the member's records do not seat this Mac's recipient",
+            )),
+        }
+    };
+    if crosses {
+        admission.check(paths)?;
+        after_crossed_mark(&crossing_mark(paths), publish)
+    } else {
+        publish()
     }
 }
 

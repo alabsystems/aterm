@@ -11,7 +11,10 @@ use aterm_core::terminal::Terminal;
 use super::tests::{ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env};
 use super::*;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/handoff");
+/// The recorded handoff fixtures, a folder per release.
+fn fixtures_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("tests/fixtures/handoff")
+}
 
 const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.91.0", "claude-code-1049"),
@@ -1084,6 +1087,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.156.0", "stalled-sequence"),
     ("v0.156.0", "twelve-panes"),
     ("v0.156.0", "variants"),
+    ("v0.157.0", "carried-state"),
+    ("v0.157.0", "claude-code-1049"),
+    ("v0.157.0", "colour-and-shell"),
+    ("v0.157.0", "engine-state"),
+    ("v0.157.0", "fold"),
+    ("v0.157.0", "held-failed"),
+    ("v0.157.0", "held-pane"),
+    ("v0.157.0", "held-withheld"),
+    ("v0.157.0", "history"),
+    ("v0.157.0", "history-carry"),
+    ("v0.157.0", "incident-55x149"),
+    ("v0.157.0", "link-dense"),
+    ("v0.157.0", "link-dense-history"),
+    ("v0.157.0", "lone-workers-list"),
+    ("v0.157.0", "policy-repaint"),
+    ("v0.157.0", "policy-visible"),
+    ("v0.157.0", "shell-integration"),
+    ("v0.157.0", "stalled-sequence"),
+    ("v0.157.0", "twelve-panes"),
+    ("v0.157.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -1396,7 +1419,7 @@ impl DeskPath {
 }
 
 fn every_desk_path() -> Vec<DeskPath> {
-    let mut releases = std::fs::read_dir(FIXTURES)
+    let mut releases = std::fs::read_dir(fixtures_dir())
         .expect("the handoff fixture root exists")
         .flatten()
         .filter(|entry| entry.path().is_dir())
@@ -3583,7 +3606,7 @@ pub(super) fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
 /// Every release's `rendezvous.toml`, by release.
 #[cfg(target_os = "macos")]
 fn every_rendezvous_record() -> Vec<(String, RendezvousRecord)> {
-    let mut records = std::fs::read_dir(FIXTURES)
+    let mut records = std::fs::read_dir(fixtures_dir())
         .expect("the handoff fixture root exists")
         .flatten()
         .filter(|entry| entry.path().join("rendezvous.toml").is_file())

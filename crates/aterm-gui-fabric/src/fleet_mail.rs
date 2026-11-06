@@ -1003,9 +1003,12 @@ pub fn post(ctx: &dyn FabricSession, rest: &str) -> String {
             if boxed.rows.len() >= ROWS
                 || boxed.rows.iter().filter(|r| r.node == driver.node).count() >= PER_NODE
             {
-                // Both participants have received these completed conversations. Reclaim
-                // them only under pressure, after checking retained idempotency keys.
-                boxed.rows.retain(|row| !row.reply_seen);
+                // Listing consumes mail without a reply; a retained reply still belongs to
+                // its sender until acknowledged. Reclaim only under pressure, after checking
+                // retained idempotency keys, so read progress notes cannot fill the mailbox.
+                boxed
+                    .rows
+                    .retain(|row| !row.reply_seen && (!row.listed || row.reply.is_some()));
             }
             if boxed.rows.len() >= ROWS
                 || boxed.rows.iter().filter(|r| r.node == driver.node).count() >= PER_NODE
@@ -2290,6 +2293,39 @@ mod tests {
             crate::cmd_await_inbox(&receiver, &["since=0"], 0),
             "OK timeout\n"
         );
+    }
+
+    #[test]
+    fn read_mail_releases_capacity_but_peeks_and_unacknowledged_replies_do_not() {
+        for mesh in [false, true] {
+            for nodes in [1, ROWS / PER_NODE] {
+                let scratch = aterm_tempfile::tempdir().unwrap();
+                let path = scratch.path().join("private/inbox.toml");
+                let receiver = if mesh { meshed(&path) } else { session(&path) };
+                for node in 0..nodes {
+                    for n in 0..PER_NODE {
+                        assert!(
+                            as_node(["a", "b", "c", "d"][node], || post(
+                                &receiver,
+                                &format!("key=k{n} kind=note -- progress")
+                            ))
+                            .starts_with("OK ")
+                        );
+                    }
+                }
+                let next = || as_node("a", || post(&receiver, "key=next kind=note -- next"));
+                crate::cmd_inbox(&receiver, "--peek");
+                assert!(next().starts_with("ERR "), "peeking frees no capacity");
+                crate::cmd_inbox(&receiver, "");
+                post(&receiver, "re=f1 key=answer kind=answer -- retained reply");
+                assert_eq!(next(), format!("OK f{}\n", nodes * PER_NODE + 1));
+                assert!(
+                    as_node("a", || inbox(&receiver, "", false))
+                        .contains("reply_text=retained%20reply")
+                );
+                assert_eq!(next(), format!("OK f{} dup=1\n", nodes * PER_NODE + 1));
+            }
+        }
     }
 
     #[test]

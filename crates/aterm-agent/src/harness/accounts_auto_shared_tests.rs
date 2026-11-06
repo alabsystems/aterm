@@ -193,6 +193,128 @@ fn native_tasks_need_the_exact_admitted_identity_before_they_can_run() {
     }
 }
 
+/// What native preparation says is logged once per change, per guard: the same refusal on
+/// every upkeep pass writes one line, another refusal writes its own, and the same one after a
+/// pass that said nothing (nothing to prepare, or an admitted task) writes again. A fresh guard
+/// (another process's upkeep) says its own first line. Mutants: logging each pass's refusal
+/// (the code before) writes five lines at the first assertion; never forgetting the last line
+/// on a pass that said nothing loses the repeats after a recovery; gating only the refusal arm
+/// writes two lines for the unadmitted task.
+#[test]
+fn native_preparation_logs_a_lasting_refusal_once_per_change() {
+    use super::super::native_keys::{self, PreparationId, PreparationTask};
+    const EXCLUDED: &str = "Commons unavailable (control-excluded): x";
+    const UNINITIALIZED: &str = "application table is not initialized";
+    const NOTHING: usize = 2;
+    const UNADMITTED: usize = 3;
+    const ADMITTED: usize = 4;
+    let bed = Bed::new(None);
+    let mode = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let discovery = {
+        let mode = mode.clone();
+        let ran = ran.clone();
+        Box::new(
+            move |_: &Path, _: &Path, _: &Path, admit: &mut dyn FnMut(&PreparationId) -> bool| {
+                let ran = ran.clone();
+                let task = |key: &str| PreparationTask {
+                    preparation: native_preparation_id(key),
+                    run: Box::new(move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                };
+                match mode.load(Ordering::SeqCst) {
+                    0 => Err(EXCLUDED.to_owned()),
+                    1 => Err(UNINITIALIZED.to_owned()),
+                    NOTHING => Ok(None),
+                    UNADMITTED => Ok(Some(task("native:unadmitted"))),
+                    _ => {
+                        assert!(admit(&native_preparation_id("native:admitted")));
+                        Ok(Some(task("native:admitted")))
+                    }
+                }
+            },
+        )
+    };
+    native_keys::with_test_discovery(discovery, || {
+        let log: SignInLog = {
+            let lines = lines.clone();
+            Arc::new(move |line| lines.lock().unwrap().push(line.to_owned()))
+        };
+        let pass = |guard: &Arc<Mutex<AutoRenewGuard>>, now: usize, times: usize| {
+            mode.store(now, Ordering::SeqCst);
+            for _ in 0..times {
+                assert_eq!(
+                    shared_renewal::prepare_native(
+                        &bed.home,
+                        &bed.state,
+                        &config_beside(&bed.roster),
+                        guard,
+                        &inline,
+                        &log,
+                        None,
+                    ),
+                    now == ADMITTED
+                );
+            }
+        };
+        // A line is told apart by the refusal the discovery stand-in returned, never by the
+        // wording around it; the unadmitted task's line carries neither refusal.
+        let causes = || -> Vec<&'static str> {
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|line| {
+                    [EXCLUDED, UNINITIALIZED]
+                        .into_iter()
+                        .find(|why| line.ends_with(why))
+                        .unwrap_or("unadmitted")
+                })
+                .collect()
+        };
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        pass(&guard, 0, 5);
+        assert_eq!(causes(), [EXCLUDED]);
+        pass(&guard, 1, 2);
+        pass(&guard, NOTHING, 1);
+        pass(&guard, 1, 1);
+        assert_eq!(
+            causes(),
+            [EXCLUDED, UNINITIALIZED, UNINITIALIZED],
+            "a refusal that returns after a pass that said nothing is said again"
+        );
+        pass(&guard, UNADMITTED, 2);
+        pass(&guard, ADMITTED, 1);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        pass(&guard, UNADMITTED, 1);
+        assert_eq!(
+            causes()[3..],
+            ["unadmitted", "unadmitted"],
+            "an unadmitted task is said once, and again after an admitted one"
+        );
+        {
+            let lines = lines.lock().unwrap();
+            assert_eq!(
+                lines[3], lines[4],
+                "the unadmitted task says one line each time"
+            );
+        }
+        let other = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        pass(&other, 0, 2);
+        pass(&guard, 0, 1);
+        pass(&guard, 0, 1);
+        assert_eq!(
+            causes()[5..],
+            [EXCLUDED, EXCLUDED],
+            "each guard says its own first line, and neither repeats it"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    });
+}
+
 struct NativeRevisionFixture {
     bed: Bed,
     guard: Arc<Mutex<AutoRenewGuard>>,

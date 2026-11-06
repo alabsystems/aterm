@@ -1208,7 +1208,7 @@ pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::R
 /// configuration (`checked_log_bundle`), or a write failed. Each of these but the last refuses
 /// before anything is written. A required crossed mark is stored before any new custody.
 pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
-    write_log_bundle(paths, bundle, Moving::Allowed)
+    write_log_bundle(paths, bundle, Moving::Allowed, None)
 }
 
 /// [`write_from_log_bundle`] of the bundle a proof with nobody's Allow brought
@@ -1221,7 +1221,27 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
 /// # Errors
 /// As [`write_from_log_bundle`], and the bundle is another vault's than the one configured.
 pub fn readmit_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
-    write_log_bundle(paths, bundle, Moving::Refused)
+    write_log_bundle(paths, bundle, Moving::Refused, None)
+}
+
+pub(crate) fn readmit_from_log_bundle_admitted(
+    paths: &Paths,
+    bundle: &Bundle,
+    admission: &crate::members::join::ProofAdmission<'_>,
+) -> crate::Result<Report> {
+    write_log_bundle(paths, bundle, Moving::Refused, Some(admission))
+}
+
+/// Publish local proof metadata against the same source guard as a default HTTP join.
+/// No network operation belongs inside `publish`.
+pub(crate) fn with_proof_admission<T>(
+    paths: &Paths,
+    admission: &crate::members::join::ProofAdmission<'_>,
+    publish: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = StateLock::take(paths)?;
+    admission.check(paths)?;
+    publish()
 }
 
 /// Whether a log bundle's write may move this Mac to another vault ([`readmit_from_log_bundle`]).
@@ -1231,8 +1251,20 @@ enum Moving {
     Refused,
 }
 
-fn write_log_bundle(paths: &Paths, bundle: &Bundle, moving: Moving) -> crate::Result<Report> {
+fn write_log_bundle(
+    paths: &Paths,
+    bundle: &Bundle,
+    moving: Moving,
+    admission: Option<&crate::members::join::ProofAdmission<'_>>,
+) -> crate::Result<Report> {
     let _lock = StateLock::take(paths)?;
+    if let Some(admission) = admission {
+        admission.check(paths)?;
+        admission.accepts(bundle)?;
+        if super::seat(paths) == super::Seat::Seatless {
+            return super::seat_ask::take_seat_admitted_held(paths, bundle, admission);
+        }
+    }
     let CheckedLog {
         config,
         state,
@@ -1248,6 +1280,9 @@ fn write_log_bundle(paths: &Paths, bundle: &Bundle, moving: Moving) -> crate::Re
         ));
     }
     let publish = || {
+        if let Some(admission) = admission {
+            admission.check(paths)?;
+        }
         let mut state = state;
         super::records_file_for_write(paths, &store)?;
         // A bundle of another vault than the one this Mac's state holds (one that let it go, or
@@ -1280,6 +1315,9 @@ fn write_log_bundle(paths: &Paths, bundle: &Bundle, moving: Moving) -> crate::Re
         Ok(report)
     };
     if requires_crossed_mark {
+        if let Some(admission) = admission {
+            admission.check(paths)?;
+        }
         super::after_crossed_mark(&super::crossing_mark(paths), publish)
     } else {
         publish()

@@ -1741,7 +1741,7 @@ mod tests {
     }
 
     fn contrib_themes() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/themes/")
+        aterm_tempfile::manifest_dir().join("../../contrib/themes/")
     }
 
     fn strict_check(path: &Path) -> (Outcome, Value) {

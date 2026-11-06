@@ -665,26 +665,48 @@ const fn user_event(fflags: u32, flags: u16) -> libc::kevent {
 #[cfg(target_os = "macos")]
 fn kq_wait(kq: &std::os::fd::OwnedFd, timeout: Duration) -> std::io::Result<Option<i16>> {
     use std::os::fd::AsRawFd as _;
-    // SAFETY: `kevent` initializes this out-parameter before it is read.
-    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-    let ts = libc::timespec {
-        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
-        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
-    };
-    // SAFETY: one event slot and an initialized timeout, both live for the call.
-    let rc = unsafe { libc::kevent(kq.as_raw_fd(), std::ptr::null(), 0, &mut event, 1, &ts) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
+    kq_wait_by(timeout, |ts, event| {
+        // SAFETY: one event slot and an initialized timeout, both live for the call.
+        let rc = unsafe { libc::kevent(kq.as_raw_fd(), std::ptr::null(), 0, event, 1, ts) };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(rc)
+        }
+    })
+}
+
+/// [`kq_wait`]'s loop over `wait_once`, one call of the kernel's wait with the timeout and the
+/// event slot it is given: a call a signal interrupted (`EINTR`) is made again with what is left
+/// of `timeout`, so an event that comes later in the wait still wakes it.
+#[cfg(target_os = "macos")]
+fn kq_wait_by(
+    timeout: Duration,
+    mut wait_once: impl FnMut(&libc::timespec, &mut libc::kevent) -> std::io::Result<libc::c_int>,
+) -> std::io::Result<Option<i16>> {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let left = deadline.map_or(timeout, |at| at.saturating_duration_since(Instant::now()));
+        let ts = libc::timespec {
+            tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::from(left.subsec_nanos()),
+        };
+        // SAFETY: a `kevent` holds integers and one raw pointer, each valid as all-zero bytes.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let rc = match wait_once(&ts, &mut event) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            rc => rc?,
+        };
+        if rc == 0 {
+            return Ok(None);
+        }
+        if event.flags & libc::EV_ERROR != 0 {
+            return Err(std::io::Error::from_raw_os_error(
+                i32::try_from(event.data).unwrap_or(libc::EIO),
+            ));
+        }
+        return Ok(Some(event.filter));
     }
-    if rc == 0 {
-        return Ok(None);
-    }
-    if event.flags & libc::EV_ERROR != 0 {
-        return Err(std::io::Error::from_raw_os_error(
-            i32::try_from(event.data).unwrap_or(libc::EIO),
-        ));
-    }
-    Ok(Some(event.filter))
 }
 
 /// One thing a newer build moves: where it lives (asked again at every
@@ -901,6 +923,42 @@ fn watch(kq: &std::os::fd::OwnedFd, dir: &Path) -> std::io::Result<std::fs::File
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// A WAIT A SIGNAL INTERRUPTS WAITS AGAIN, for what is left of it, and the event that comes
+    /// next wakes it: an interrupted wait is no failure that sleeps the whole wait out. CONTROLS:
+    /// any other errno is the wait's error at once, and a call that times out is `None`.
+    #[test]
+    fn an_interrupted_kqueue_wait_waits_again_for_the_event() {
+        let wait = Duration::from_secs(60);
+        let mut asked: Vec<Duration> = Vec::new();
+        let woke = kq_wait_by(wait, |ts, event| {
+            asked.push(Duration::new(
+                u64::try_from(ts.tv_sec).unwrap(),
+                u32::try_from(ts.tv_nsec).unwrap(),
+            ));
+            if asked.len() == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+            }
+            event.filter = libc::EVFILT_VNODE;
+            Ok(1)
+        });
+        assert_eq!(woke.unwrap(), Some(libc::EVFILT_VNODE));
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked[1] <= asked[0] && asked[0] <= wait, "{asked:?}");
+
+        let mut calls = 0;
+        let failed = kq_wait_by(wait, |_, _| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EBADF))
+        });
+        assert_eq!(
+            failed.unwrap_err().raw_os_error(),
+            Some(libc::EBADF),
+            "CONTROL"
+        );
+        assert_eq!(calls, 1, "CONTROL: another errno is not waited again");
+        assert_eq!(kq_wait_by(wait, |_, _| Ok(0)).unwrap(), None, "CONTROL");
+    }
 
     #[test]
     fn a_proc_stat_line_names_an_exited_process_by_its_state() {

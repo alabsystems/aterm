@@ -3489,9 +3489,14 @@ pub(super) fn parse_raw_http_response(
                 if let Some((ck, cv)) = pair.split_once('=') {
                     let ck = ck.trim();
                     let cv = cv.trim();
+                    // A control character in a cookie would ride into the next request's
+                    // `Cookie:` header (a CR, its own line there): such a cookie is not kept.
                     if cv.is_empty() || expired {
                         cookies.remove(ck);
-                    } else if !ck.is_empty() {
+                    } else if !ck.is_empty()
+                        && !ck.chars().any(char::is_control)
+                        && !cv.chars().any(char::is_control)
+                    {
                         cookies.insert(ck.to_owned(), cv.to_owned());
                     }
                 }
@@ -4356,6 +4361,19 @@ pub fn authorize_with_mailbox_config(
     super::headless_oauth::finish_deadline(result, deadline)
 }
 
+/// Whether a mailbox sign-in for `email` drives the authorization page itself before it starts a
+/// headless browser: `mailbox_cfg` reads a code from somewhere a browser is not needed for (the
+/// local folder, IMAP, an HTTP mailbox or the fleet's relay), not from webmail alone.
+fn drives_page_first(
+    mailbox_cfg: &super::headless_oauth::MailboxConfig,
+    email: Option<&str>,
+) -> bool {
+    mailbox_cfg.dir.is_some()
+        || mailbox_cfg.effective_imap_url(email).is_some()
+        || mailbox_cfg.http_url_for(email).is_some()
+        || mailbox_cfg.reads_relay_for(email)
+}
+
 fn authorize_with_mailbox_until(
     authorize_url: &str,
     mailbox_cfg: &super::headless_oauth::MailboxConfig,
@@ -4377,14 +4395,7 @@ fn authorize_with_mailbox_until(
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
-    let has_non_webmail = mailbox_cfg.dir.is_some()
-        || mailbox_cfg
-            .effective_imap_url(resolved_email.as_deref())
-            .is_some()
-        || mailbox_cfg
-            .http_url_for(resolved_email.as_deref())
-            .is_some();
-    if !force_headless && has_non_webmail {
+    if !force_headless && drives_page_first(mailbox_cfg, resolved_email.as_deref()) {
         let mut pending_credential = None;
         let mut seen_otps = BTreeSet::new();
         let mut attempt = 0usize;

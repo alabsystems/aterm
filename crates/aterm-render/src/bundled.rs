@@ -809,7 +809,8 @@ mod tests {
     #[test]
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_configured_font_still_wins_over_the_bundled_default() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/DejaVuSansMono.ttf");
+        let file = aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf");
+        let path = file.to_str().expect("a UTF-8 package directory");
         let r = Renderer::from_system_with_family(Some(path), 18.0, Theme::default()).unwrap();
         assert_eq!(
             r.primary_source_path(),
@@ -1797,7 +1798,8 @@ mod tests {
                 "the identity is not a file — reading it as one is the bug"
             );
         }
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/DejaVuSansMono.ttf");
+        let file = aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf");
+        let path = file.to_str().expect("a UTF-8 package directory");
         assert_eq!(
             &crate::read_resolved_font(path).unwrap()[..],
             &std::fs::read(path).unwrap()[..]

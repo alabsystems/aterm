@@ -126,7 +126,7 @@ fn getsid(pid: c_int) -> Option<u32> {
 }
 
 fn counters(pid: c_int, task: Option<&libc::proc_taskinfo>) -> Option<Counters> {
-    let u = rusage(pid)?;
+    let u = rusage(pid)?.ri;
     let (numer, denom) = timebase();
     let ns = |ticks: u64| ticks_to_ns(ticks, numer, denom);
     let nonneg = |v: i32| u64::try_from(v).ok();
@@ -295,6 +295,7 @@ fn start_facts(
         translated: translated(pid)?,
         local: None,
         age_ms: now_us.checked_sub(start_us).map(|us| us / 1000),
+        start_us: Some(start_us),
     })
 }
 

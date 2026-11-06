@@ -94,15 +94,46 @@ pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
 /// A named account never borrows another account's managed build; native Git is the fallback.
 #[must_use]
 pub fn installed_git_for(sys: &dyn System, user_home: Option<&Path>) -> Option<PathBuf> {
+    installed_git_reading(sys, user_home).map(GitInstallation::program)
+}
+
+/// The selected Git's admitted executable identity, without starting it. A managed build's
+/// immutable payload path changes when activation replaces the build behind its stable shim.
+#[must_use]
+pub fn installed_git_identity(sys: &dyn System) -> Option<PathBuf> {
+    installed_git_reading(sys, None).map(GitInstallation::identity)
+}
+
+enum GitInstallation {
+    Native(PathBuf),
+    Managed { shim: PathBuf, payload: PathBuf },
+}
+
+impl GitInstallation {
+    fn program(self) -> PathBuf {
+        match self {
+            Self::Native(path) | Self::Managed { shim: path, .. } => path,
+        }
+    }
+
+    fn identity(self) -> PathBuf {
+        match self {
+            Self::Native(path) | Self::Managed { payload: path, .. } => path,
+        }
+    }
+}
+
+fn installed_git_reading(sys: &dyn System, user_home: Option<&Path>) -> Option<GitInstallation> {
+    let native = || installed_git_without_atpkg(sys).map(GitInstallation::Native);
     if let Some(home) = user_home {
-        return atpkg_installed_git(sys, home).or_else(|| installed_git_without_atpkg(sys));
+        return atpkg_installed_git(sys, home).or_else(native);
     }
     if let Some(home) = sys.account_home()
         && let Some(git) = atpkg_installed_git(sys, &home)
     {
         return Some(git);
     }
-    installed_git_without_atpkg(sys)
+    native()
 }
 
 fn atpkg_prefix_for(sys: &dyn System, home: &Path) -> PathBuf {
@@ -145,7 +176,7 @@ fn physical(sys: &dyn System, store_git: &Path, current: &Path) -> Option<String
     (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())).then_some(build)
 }
 
-fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<PathBuf> {
+fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<GitInstallation> {
     if !home.is_absolute() {
         return None;
     }
@@ -160,12 +191,13 @@ fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<PathBuf> {
     if !reg_file(&store_git.join(format!("{build}.ready"))) {
         return None;
     }
-    if !exec_file(&store_git.join(&build).join("bin/git")) {
+    let payload = store_git.join(&build).join("bin/git");
+    if !exec_file(&payload) {
         return None;
     }
     sys.admit_runtime(&store_git.join(&build)).ok()?;
     let shim = prefix.join("bin/git");
-    exec_file(&shim).then_some(shim)
+    exec_file(&shim).then_some(GitInstallation::Managed { shim, payload })
 }
 
 /// [`installed_git`], or where none is installed the one it looks for first ([`CLT_GIT`],
@@ -1316,6 +1348,54 @@ mod tests {
             preserved,
             [(true, true); 4],
             "all unknown/invalid reads refuse and retain every original byte"
+        );
+    }
+
+    #[test]
+    fn git_identity_tracks_only_admitted_builds_without_starting_a_program() {
+        let sys = Fake::root();
+        sys.logged_in(&alice());
+        sys.file(CLT_GIT, b"native Git");
+        assert_eq!(installed_git_identity(&sys), Some(CLT_GIT.into()));
+        let prefix = Path::new("/Users//alice/Library/Application Support/aterm/pkg");
+        let store = prefix.join("store/git");
+        let shim = prefix.join("bin/git");
+        sys.stat_of(
+            shim.to_str().unwrap(),
+            Stat {
+                mode: 0o755,
+                ..FILE
+            },
+        );
+        for build in ["12", "13"] {
+            let payload = store.join(build).join("bin/git");
+            sys.link(store.join("current").to_str().unwrap(), build);
+            sys.stat_of(
+                payload.to_str().unwrap(),
+                Stat {
+                    mode: 0o755,
+                    ..FILE
+                },
+            );
+            assert_eq!(
+                installed_git_identity(&sys),
+                Some(CLT_GIT.into()),
+                "an incomplete activation cannot supply a new build identity"
+            );
+            sys.stat_of(store.join(format!("{build}.ready")).to_str().unwrap(), FILE);
+            sys.runtime_unready(&store.join(build), "the selected runtime is unavailable");
+            assert_eq!(
+                installed_git_identity(&sys),
+                Some(CLT_GIT.into()),
+                "a ready record cannot bypass native runtime admission"
+            );
+            sys.runtime_ready(&store.join(build));
+            assert_eq!(installed_git(&sys), Some(shim.clone()));
+            assert_eq!(installed_git_identity(&sys), Some(payload));
+        }
+        assert!(
+            sys.calls().is_empty(),
+            "no lookup or capability process is needed"
         );
     }
 

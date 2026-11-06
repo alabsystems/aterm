@@ -386,11 +386,15 @@ pub(crate) fn run_once(prepared: Prepared) -> Result<RunOut> {
 /// number in its JSON spelling; a boolean as `true`/`false`; null as nothing.
 #[must_use]
 pub(crate) fn tsv(fields: &[&Value]) -> String {
-    fields
-        .iter()
-        .map(|value| match value {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, value) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push('\t');
+        }
+        match value {
             Value::String(s) => {
-                let mut out = String::with_capacity(s.len());
+                out.reserve(s.len());
                 for c in s.chars() {
                     match c {
                         '\\' => out.push_str("\\\\"),
@@ -400,13 +404,14 @@ pub(crate) fn tsv(fields: &[&Value]) -> String {
                         c => out.push(c),
                     }
                 }
-                out
             }
-            Value::Null => String::new(),
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\t")
+            Value::Null => {}
+            other => {
+                let _ = write!(out, "{other}");
+            }
+        }
+    }
+    out
 }
 
 /// `value` as `jq`'s `tostring` spells it: a string as itself, anything else as its JSON.

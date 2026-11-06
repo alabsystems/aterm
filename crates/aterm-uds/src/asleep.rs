@@ -377,6 +377,13 @@ mod imp {
         })
     }
 
+    #[cfg_attr(
+        target_pointer_width = "64",
+        expect(
+            clippy::useless_conversion,
+            reason = "c_long is i64 on LP64 and i32 on 32-bit"
+        )
+    )]
     pub(super) fn this_thread() -> Thread {
         // SAFETY: `gettid` takes no argument and cannot fail.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };

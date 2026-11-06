@@ -325,12 +325,13 @@ back as the serde corpus's
 `ATERM_SHIPPED_STATE_OUT` when set). So a desk the guard cannot read fails the
 tree that writes it, not main after the release lands it.
 
-Nothing in it is edited per release. `ATERM_BUILD_GIT_COMMIT` (12 digits),
+Nothing in it is edited per release. `ATERM_HANDOFF_FIXTURE_VERSION` (the
+tree's `[workspace.package] version`), `ATERM_BUILD_GIT_COMMIT` (12 digits),
 `ATERM_BUILD_GIT_COMMIT_FULL` and `SOURCE_DATE_EPOCH` (the ledger's build
-number) are the pins: `fx_install_release_stamp` refuses to run without them
-and installs them as the shipped binary's stamp, so `producer_version`,
-`producer_commit` and `outgoing_build` are the release's. The version is the
-tree's `[workspace.package] version`; the stamp's compiler is `trustc -vV` of
+number) are the pins, read at run time: `fx_install_release_stamp` refuses to
+run without them and installs them as the shipped binary's stamp, so
+`producer_version`, `producer_commit` and `outgoing_build` are the release's.
+The test binary compiles no product version (no library does); the stamp's compiler is `trustc -vV` of
 `$TRUST_STAGE2_BIN`, else of the `trustc` on PATH. The successor is a build a
 day newer (`fx_target_build`) at the next MINOR (`fx_successor_version`).
 
@@ -380,6 +381,7 @@ git -C ~/aterm-vX.Y.0.noindex submodule update --init vendor/astream
 git worktree add -b test/handoff-fixtures-vXY0 ~/aterm-wt-fxXY0 origin/main
 cd ~/aterm-vX.Y.0.noindex
 OUT=~/aterm-wt-fxXY0/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0
+ATERM_HANDOFF_FIXTURE_VERSION=X.Y.0 \
 ATERM_BUILD_GIT_COMMIT=$(git rev-parse --short=12 'vX.Y.0^{commit}') \
 ATERM_BUILD_GIT_COMMIT_FULL=$(git rev-parse 'vX.Y.0^{commit}') \
 SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \

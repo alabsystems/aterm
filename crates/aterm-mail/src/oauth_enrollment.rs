@@ -141,10 +141,10 @@ impl Enrollment {
                             }
                             Ok(code)
                         });
-                    let status = if result.is_ok() {
-                        "200 OK"
+                    let response = if result.is_ok() {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".as_slice()
                     } else {
-                        "400 Bad Request"
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".as_slice()
                     };
                     let left = end.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -153,10 +153,7 @@ impl Enrollment {
                     stream
                         .set_write_timeout(Some(left.min(Duration::from_secs(2))))
                         .map_err(|_| error(ErrorKind::Transport))?;
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-                    );
+                    let _ = stream.write_all(response);
                     match result {
                         Ok(Some(code)) => completed = Some(code),
                         Ok(None) => return Err(error(ErrorKind::Rejected)),
@@ -269,9 +266,12 @@ fn callback(request: &str, port: u16, state: &str) -> Result<Option<Secret>, Err
     let mut hosts = lines
         .filter_map(|line| line.split_once(':'))
         .filter(|(name, _)| name.eq_ignore_ascii_case("host"));
-    let expected_host = format!("127.0.0.1:{port}");
-    if hosts.next().map(|(_, value)| value.trim()) != Some(expected_host.as_str())
-        || hosts.next().is_some()
+    let mut host_buf = [0u8; 20];
+    let mut host_cur = std::io::Cursor::new(&mut host_buf[..]);
+    let _ = write!(host_cur, "127.0.0.1:{port}");
+    let host_len = host_cur.position() as usize;
+    let expected_host = std::str::from_utf8(&host_buf[..host_len]).unwrap_or("");
+    if hosts.next().map(|(_, value)| value.trim()) != Some(expected_host) || hosts.next().is_some()
     {
         return Err(invalid());
     }

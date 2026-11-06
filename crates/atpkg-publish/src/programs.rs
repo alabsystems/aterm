@@ -110,6 +110,8 @@ pub struct BottleDef {
     pub darwin: &'static [Triple],
     /// The GNU/Linux targets an upstream install archive may carry.
     pub linux: &'static [Triple],
+    /// A shared pinned tool recipe; absent for formula-derived packages.
+    pub pinned: Option<&'static aterm_uds::host::upstream::PinnedTool>,
 }
 
 /// How a sysroot bundle is packed and proven.
@@ -190,6 +192,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
     plain("nn", None, DUAL_DARWIN),
     plain("ny", None, DUAL_DARWIN),
     plain("ty", None, DUAL_DARWIN),
+    plain("astream", None, DUAL_DARWIN),
     ProgramDef {
         name: "trust-mc",
         repo: "trust-mc",
@@ -253,6 +256,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["gh"],
             darwin: DUAL_DARWIN,
             linux: &[],
+            pinned: None,
         }),
     },
     ProgramDef {
@@ -265,6 +269,59 @@ pub static PROGRAMS: &[ProgramDef] = &[
             exposes: &["git"],
             darwin: DUAL_DARWIN,
             linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
+            pinned: None,
+        }),
+    },
+    ProgramDef {
+        name: "gitleaks",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("Gitleaks is published for macOS and GNU/Linux only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["gitleaks"],
+            darwin: DUAL_DARWIN,
+            linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
+            pinned: Some(&aterm_uds::host::upstream::GITLEAKS),
+        }),
+    },
+    ProgramDef {
+        name: "cpython",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The pinned release-host CPython is published for macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["python3.14"],
+            darwin: DUAL_DARWIN,
+            linux: &[],
+            pinned: Some(&aterm_uds::host::upstream::CPYTHON),
+        }),
+    },
+    ProgramDef {
+        name: "openssl-signing",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The pinned source-signing OpenSSL is published for macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["openssl-signing"],
+            darwin: DUAL_DARWIN,
+            linux: &[],
+            pinned: Some(&aterm_uds::host::upstream::OPENSSL_SIGNING),
+        }),
+    },
+    ProgramDef {
+        name: "lean4",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The pinned Lean/Lake runtime is published for macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["lake"],
+            darwin: DUAL_DARWIN,
+            linux: &[],
+            pinned: Some(&aterm_uds::host::upstream::LEAN4),
         }),
     },
 ];

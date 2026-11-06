@@ -103,6 +103,7 @@ pub mod node_service;
 /// The launcher's half of `aterm --headless --ready-fd <n>`.
 #[cfg(unix)]
 pub mod ready;
+pub mod release_progress;
 /// The supervisor: the loop the window's own host runs on every agent session, its policy,
 /// command classifier, journal, ledger and tapes.
 pub mod supervise;

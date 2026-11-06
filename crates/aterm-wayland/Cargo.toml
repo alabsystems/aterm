@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-wayland"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license = "Apache-2.0 AND MIT"
 repository.workspace = true
@@ -31,7 +31,8 @@ aterm-dl = { workspace = true }
 aterm-log = { workspace = true }
 
 [dev-dependencies]
-# tests/generated.rs's negative control writes a changed protocol file here.
+# tests/generated.rs's negative control writes a changed protocol file here; the
+# tests find the checkout's protocol files and recordings at run time.
 aterm-tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

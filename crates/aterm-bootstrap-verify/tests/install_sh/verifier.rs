@@ -24,7 +24,7 @@ pub struct Built {
 /// this build's own, in place.
 pub fn under_test() -> PathBuf {
     std::env::var_os("ATERM_TEST_BOOTSTRAP_VERIFIER").map_or_else(
-        || PathBuf::from(env!("CARGO_BIN_EXE_aterm-bootstrap-verify")),
+        || aterm_tempfile::bin_exe("aterm-bootstrap-verify"),
         PathBuf::from,
     )
 }

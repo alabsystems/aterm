@@ -24,6 +24,8 @@ pub struct Args {
     /// `--fail-fast`: the run's first proven red ends it, as it ends a release; a bare run keeps
     /// its whole sweep.
     pub fail_fast: bool,
+    /// Repeatable tree sample: yield at stage boundaries to foreground waiters.
+    pub background: bool,
     /// `list`: print the table of checks and run nothing.
     pub list: bool,
     pub help: bool,
@@ -56,6 +58,14 @@ pub struct Args {
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
+    /// `--passed-binaries <path>`: with `release` running `test`, the test binaries that passed in
+    /// this tree before, each `<sha256> <spec>` on its own line; one whose executable still
+    /// hashes so is carried, not run again ([`crate::testrun::carry`]).
+    pub passed_binaries: Option<PathBuf>,
+    /// `--events <path>`: with `release`, the file each `check-finished` and
+    /// `test-binary-finished` line is appended to whole, apart from the output its children
+    /// share ([`crate::event_log`]): what its cutter keeps its records from.
+    pub events: Option<PathBuf>,
 }
 
 impl Args {
@@ -149,6 +159,7 @@ where
             "--compile-only" => a.compile_only = true,
             "--as-release" => a.as_release = true,
             "--fail-fast" => a.fail_fast = true,
+            "--background" => a.background = true,
             "--tree" => tree = true,
             "--bundle" => bundle = true,
             "--checks" => listed.push(value("--checks")?),
@@ -169,6 +180,10 @@ where
                 }
             }
             "--log" => a.log = Some(PathBuf::from(value("--log")?)),
+            "--passed-binaries" => {
+                a.passed_binaries = Some(PathBuf::from(value("--passed-binaries")?));
+            }
+            "--events" => a.events = Some(PathBuf::from(value("--events")?)),
             p if p.starts_with("-p") && p.len() > 2 => a.packages.push(p[2..].to_string()),
             f if f.starts_with('-') => return usage(format!("unknown flag `{f}`")),
             w => match lookup(w) {
@@ -248,6 +263,9 @@ where
             "--compile-only requires test or checkers; it cannot qualify a release".into(),
         );
     }
+    if a.background && !(a.release && tree && !bundle) {
+        return usage("--background requires release --tree".into());
+    }
     if a.as_release
         && (!a.all
             || a.checks.is_empty()
@@ -280,6 +298,16 @@ where
                 "this release runs no `measure`, which alone reads --app; drop it".into(),
             );
         }
+    }
+    if a.passed_binaries.is_some() && !(a.release && a.checks.contains(&Check::Test)) {
+        return usage(
+            "--passed-binaries carries test binaries into a release's test run; run it with \
+             `release` and its test check"
+                .into(),
+        );
+    }
+    if a.events.is_some() && !a.release {
+        return usage("--events keeps a release's events; run it with `release`".into());
     }
     Ok(a)
 }
@@ -385,6 +413,7 @@ Run aterm's checks in place, alone or in any combination.
   verify fmt --fix                rewrite what fmt finds unformatted
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
+  verify watch                    idle-capacity main samples; journaled verdicts, no gate
   verify release --bundle --app <APP>
                                   its bundle half, after the build and the tree
   verify list                     every check: sets, needs, what it runs
@@ -461,6 +490,12 @@ Options:
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
                           <target>/verify/logs.noindex, the newest 20 kept)
+      --passed-binaries <path>
+                          with release and its test check: binaries that passed
+                          in this tree, `<sha256> <spec>` per line; each whose
+                          executable hashes the same is carried, not run again
+      --events <path>     with release: append each check-finished and
+                          test-binary-finished line there too, whole
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.
@@ -472,6 +507,22 @@ whose HEAD moved to another commit mid-run is exit 3: its checks read both trees
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_is_only_a_repeatable_tree_sample() {
+        let parse = |args: &[&str]| super::parse(args.iter().copied());
+        assert!(
+            parse(&["release", "--tree", "--background"])
+                .unwrap()
+                .background
+        );
+        for args in [
+            vec!["test", "--background"],
+            vec!["release", "--background"],
+            vec!["release", "--bundle", "--app", "app", "--background"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+    }
     use super::*;
 
     fn ok(args: &[&str]) -> Args {
@@ -511,6 +562,50 @@ mod tests {
         assert!(parse(["release"]).is_err(), "release needs its bundle");
         assert!(parse(["release", "--app", "a", "-p", "x"]).is_err());
         assert!(parse(["release", "cells", "--app", "a", "--cell", "win"]).is_err());
+    }
+
+    /// `--passed-binaries` goes only with a release whose run holds `test`, the whole release's
+    /// or a resume's, and `--events` with any release. Negative control: dropping either rule
+    /// lets a dev `test --all` take it.
+    #[test]
+    fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
+        assert_eq!(
+            ok(&["release", "--tree", "--events", "/l/06-verify.events"])
+                .events
+                .as_deref(),
+            Some(std::path::Path::new("/l/06-verify.events"))
+        );
+        let a = ok(&[
+            "release",
+            "--checks=test",
+            "--passed-binaries",
+            "/l/06-verify.passed-binaries",
+        ]);
+        assert_eq!(a.checks, [Check::Test]);
+        assert_eq!(
+            a.passed_binaries.as_deref(),
+            Some(std::path::Path::new("/l/06-verify.passed-binaries"))
+        );
+        assert!(
+            ok(&["release", "--passed-binaries", "/p", "--app", "/a"])
+                .checks
+                .contains(&Check::Test)
+        );
+        for args in [
+            &["release", "--checks", "fmt", "--passed-binaries", "/p"][..],
+            &[
+                "release",
+                "--bundle",
+                "--passed-binaries",
+                "/p",
+                "--app",
+                "/a",
+            ],
+            &["test", "--all", "--passed-binaries", "/p"],
+            &["test", "--all", "--events", "/e"],
+        ] {
+            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
+        }
     }
 
     /// `release --tree` and `release --bundle --app A` run its halves, both its whole set, and

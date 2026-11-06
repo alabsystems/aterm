@@ -10,6 +10,10 @@
 //!   appears (`new`) and goes (`gone`).
 //! - `reader OUT`: the words of each dialog that comes up, read through Accessibility (the person
 //!   base's grant) and never answered: nothing is posted ([`reader`]).
+//! - `ax-texts PID`: every string PID's windows carry, read through Accessibility as `lab
+//!   reveal-tab` reads its instance's tree (`../ax_texts.rs`, shared with it), printed as one JSON
+//!   object ([`tree_report`]); the lane's `reveal-tab` rows run it from the guest's `lab reveal-tab
+//!   --ax-helper`, disclaimed, so tccd judges this file's own grant ([`ax_texts`]).
 //! - `person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE]`: the
 //!   person at the guest's console. A one-point pointer move every [`NUDGE`] (a posted HID event, which resets
 //!   `HIDIdleTime`: each input's line carries the idle clock read just before it and the read
@@ -45,8 +49,8 @@
 //!   window through its own `aterm ctl image` at each milestone the lane's records name, and at
 //!   the lane's own ([`captures`]).
 //! - `browse SECS DIR SERVICE...`, `dns-sd SECS OUT ARG...`, `arrivals SEED JOINER FILE...`,
-//!   `enrol HOME AUTHORITY`: the guest steps that are more than one command ([`steps`]); each
-//!   ends by itself.
+//!   `enrol HOME AUTHORITY`, `genesis HOME OUT`, `repair HOME PEER ROUNDS [AUTHORITY]`: the guest
+//!   steps that are more than one command ([`steps`]); each ends by itself.
 //!
 //! The first six and `captures` write a record: every line starts with its kind and the guest's
 //! clock in epoch ms, and is flushed as written; the lane reads them (`mac_nux::read_census`,
@@ -60,8 +64,12 @@ use std::io::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod captures;
+mod dns_sd_text;
 mod member;
 mod steps;
+#[cfg(target_os = "macos")]
+#[path = "../ax_texts.rs"]
+mod tree;
 
 /// How often `census` and `person` sweep the windows.
 const SWEEP: Duration = Duration::from_millis(250);
@@ -113,7 +121,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | reader OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
+    let usage = "usage: aterm-lab-guest census OUT | reader OUT | ax-texts PID | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY | genesis HOME OUT | repair HOME PEER ROUNDS [AUTHORITY]";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {
@@ -154,6 +162,7 @@ fn run(args: &[String]) -> Result<(), String> {
             watch(file, &out, kill)
         }
         Some("reader") => reader(&Out::open(args.get(1).ok_or(usage)?)?),
+        Some("ax-texts") => ax_texts(args.get(1).ok_or(usage)?, &mut std::io::stdout().lock()),
         Some("procs") => {
             let exe = args.get(1).ok_or(usage)?;
             procs(exe, &Out::open(args.get(2).ok_or(usage)?)?)
@@ -165,6 +174,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("dns-sd") => steps::dns_sd(&args[1..]),
         Some("arrivals") => steps::arrivals(&args[1..], &mut std::io::stdout().lock()),
         Some("enrol") => steps::enrol(&args[1..], &mut std::io::stdout().lock()),
+        Some("genesis") => steps::genesis(&args[1..], &mut std::io::stdout().lock()),
+        Some("repair") => steps::repair(&args[1..], &mut std::io::stdout().lock()),
         _ => Err(usage.into()),
     }
 }
@@ -337,6 +348,34 @@ fn read_by_reader(owner: &str) -> bool {
 /// Pure.
 fn reader_line(last: Option<&str>, reading: &str) -> Option<String> {
     (!reading.is_empty() && last != Some(reading)).then(|| reading.to_owned())
+}
+
+/// `ax-texts PID`: one reading of every string PID's windows carry ([`tree::texts`]), as
+/// [`tree_report`] prints it, with no string where this process holds no Accessibility grant. The
+/// lane's guest run of `lab reveal-tab --ax-helper` starts it disclaimed, its own responsible
+/// process, so tccd judges this file's grant (the person base's, by path and identifier) and
+/// never the run's; what it read goes to that run alone, which judges it, and never to a record.
+fn ax_texts(pid: &str, out: &mut impl std::io::Write) -> Result<(), String> {
+    let pid: i32 = pid.parse().map_err(|_| format!("ax-texts {pid}: no pid"))?;
+    #[cfg(target_os = "macos")]
+    let (trusted, texts) = if tree::trusted() {
+        (true, tree::texts(pid))
+    } else {
+        (false, Vec::new())
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (trusted, texts) = {
+        let _ = pid;
+        (false, Vec::new())
+    };
+    writeln!(out, "{}", tree_report(trusted, &texts)?).map_err(|e| format!("ax-texts: {e}"))
+}
+
+/// What `ax-texts` prints: `{"trusted": bool, "texts": [string…]}` on one line, which the lab
+/// reads back (`reveal_tab::helper_reading`).
+fn tree_report(trusted: bool, texts: &[String]) -> Result<String, String> {
+    aterm_json::to_string(&aterm_json::json!({"trusted": trusted, "texts": texts}))
+        .map_err(|e| format!("ax-texts: {e}"))
 }
 
 /// `reader OUT`: the words of every dialog that comes up ([`read_by_reader`]), read through
@@ -2797,6 +2836,36 @@ mod ax {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ax-texts` prints one line the lab reads back: the grant, and each string whole, quotes and
+    /// line breaks included; with no grant, no string.
+    #[test]
+    fn the_trees_reading_is_one_line_of_its_grant_and_its_strings() {
+        let texts = vec![
+            "Row 2, password: hidden value".to_owned(),
+            "a \"b\"\nc".to_owned(),
+        ];
+        let line = tree_report(true, &texts).unwrap();
+        assert!(!line.contains('\n'), "{line}");
+        let read = aterm_json::from_str::<aterm_json::Value>(&line).unwrap();
+        assert_eq!(
+            read.get("trusted").and_then(aterm_json::Value::as_bool),
+            Some(true)
+        );
+        let back: Vec<&str> = read
+            .get("texts")
+            .and_then(aterm_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(aterm_json::Value::as_str)
+            .collect();
+        assert_eq!(back, texts);
+        let none = tree_report(false, &[]).unwrap();
+        assert_eq!(none, "{\"texts\":[],\"trusted\":false}");
+        let mut printed = Vec::new();
+        assert!(ax_texts("no-pid", &mut printed).is_err());
+        assert!(printed.is_empty());
+    }
 
     #[test]
     fn the_reader_writes_each_dialogs_words_once_per_change_and_reads_no_settings_page() {

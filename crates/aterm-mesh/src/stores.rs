@@ -169,7 +169,12 @@ pub trait Stores: Send + Sync {
 /// The subject of `table`'s records `principal` puts on the mesh.
 #[must_use]
 pub fn table_subject(table: &Digest, principal: &str) -> String {
-    format!("/t/{}/{principal}", aterm_codec::hex::encode_lower(table))
+    let mut subject = String::with_capacity(4 + 64 + principal.len());
+    subject.push_str("/t/");
+    aterm_codec::hex::push_lower(&mut subject, table);
+    subject.push('/');
+    subject.push_str(principal);
+    subject
 }
 
 /// The subject of the membership records `principal` puts on the mesh.

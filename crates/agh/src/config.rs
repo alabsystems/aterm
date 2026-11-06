@@ -1194,7 +1194,9 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     #[cfg(unix)]
     {
-        load_private(dirs, false).map_err(|refusal| refusal.error)
+        load_private(dirs, false)
+            .map(|snapshot| snapshot.map(|(validated, _)| validated))
+            .map_err(|refusal| refusal.error)
     }
     #[cfg(not(unix))]
     {
@@ -1236,11 +1238,27 @@ pub fn load_for_host_faults(
 ) -> std::result::Result<Option<Validated>, HostConfigRefusal> {
     #[cfg(unix)]
     {
-        load_private(dirs, true)
+        load_private(dirs, true).map(|snapshot| snapshot.map(|(validated, _)| validated))
     }
     #[cfg(not(unix))]
     {
         let _ = dirs;
+        Ok(None)
+    }
+}
+
+/// One admitted file snapshot, retaining its rows for vault composition without rereading it.
+pub(crate) fn load_routing_snapshot(
+    dirs: &Dirs,
+    honour_loose: bool,
+) -> std::result::Result<Option<(Validated, AghConfig)>, HostConfigRefusal> {
+    #[cfg(unix)]
+    {
+        load_private(dirs, honour_loose)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dirs, honour_loose);
         Ok(None)
     }
 }
@@ -1751,7 +1769,7 @@ fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Opti
 fn load_private(
     dirs: &Dirs,
     honour_loose: bool,
-) -> std::result::Result<Option<Validated>, HostConfigRefusal> {
+) -> std::result::Result<Option<(Validated, AghConfig)>, HostConfigRefusal> {
     let whole = |error| HostConfigRefusal { error, first: None };
     let text = match read_config_in(&dirs.config, CONFIG_FILE, &dirs.home, Some(&dirs.config)) {
         ConfigText::Missing => return Ok(None),
@@ -1781,7 +1799,13 @@ fn load_private(
                     }
                 }
             }
-            Ok(Some(validated))
+            let Some(rows) = judged.parsed else {
+                return Err(whole(invalid(
+                    "validated config has no parsed rows".to_string(),
+                    POLICY_CHECK,
+                )));
+            };
+            Ok(Some((validated, rows)))
         }
         Err(faults) => Err(HostConfigRefusal {
             error: invalid(

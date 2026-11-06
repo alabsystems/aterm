@@ -26,12 +26,35 @@ const IDLE_QUIET_BEFORE_MS: i64 = 10_000;
 /// How far before a tab's next due act the idle window closes.
 const IDLE_CLEAR_AFTER_MS: i64 = 15_000;
 
+/// How often aterm's status sweep may observe a session at its defaults: the dwell, clamped to
+/// 250 ms (`NOMINAL_TAB_STATUS_OBSERVE_INTERVAL_MS` in aterm-gui's `app_config.rs`).
+const STATUS_OBSERVE_MS: i64 = 250;
+
+/// How long a session the sweep saw move stays `running` with no further move, at aterm's
+/// default `tab_status_quiet_after_ms`.
+const STATUS_QUIET_AFTER_MS: i64 = 5_000;
+
+/// How long a new phase stands before the sweep publishes it, at aterm's default
+/// `tab_status_dwell_ms`.
+const STATUS_DWELL_MS: i64 = 750;
+
+/// The latest instant the status sweep still owes a fire for a program's write at `write_ms`:
+/// the sweep sees the write within [`STATUS_OBSERVE_MS`] and holds `running` (published a
+/// [`STATUS_DWELL_MS`] later); [`STATUS_QUIET_AFTER_MS`] after that sight it reads `quiet`, which
+/// it publishes a dwell later. A resting program can still write, which no journal line shows (two
+/// resting Claude Code tabs of cf-claude-both repainted their screens every 30 s or so), so a
+/// write can come just before the reset.
+const fn status_settled_after(write_ms: i64) -> i64 {
+    write_ms + STATUS_OBSERVE_MS + STATUS_QUIET_AFTER_MS + STATUS_DWELL_MS
+}
+
 /// How long after the idle window's `metrics reset` its opening `metrics` read comes, from which
-/// the window counts its timer wakes, arms and fires: eight times the status sweep's longest
-/// follow-up (250 ms after a write) and twenty the output-wake watch's latch (100 ms), so what a
-/// write just before the reset was owed fires before the count opens, not inside it beside no
-/// `Output` wake.
-const IDLE_SETTLE_MS: i64 = 2_000;
+/// the window counts its timer wakes, arms and fires: the status sweep's settle after a write
+/// ([`status_settled_after`], 6 s, which also covers the output-wake watch's 100 ms latch) and
+/// 2 s more for a late wake, so what a write before the reset was owed fires before the count
+/// opens, not inside it beside no `Output` wake. A write after the reset is the window's own
+/// `Output` cause, which allows the sweep's fires.
+const IDLE_SETTLE_MS: i64 = status_settled_after(0) + 2_000;
 
 /// The hang detector of the search for an idle window.
 const IDLE_SEARCH_MS: i64 = 8 * 60_000;
@@ -50,6 +73,9 @@ const STEP_WAIT: Duration = Duration::from_secs(60);
 pub struct Window {
     /// Whether window surfaces were read (`false` under `--no-surfaces`).
     pub read: bool,
+    /// When each glance was noted ([`Window::note`]): its `chrome` read answered, so the chip,
+    /// strip and menu were read then, whether or not any of them changed.
+    pub glances: Vec<i64>,
     /// Tab label across surfaces (the chain's name).
     pub label: String,
     /// Whether this tab is the front tab of the chains window.
@@ -108,6 +134,7 @@ impl Window {
     /// Appends changed surface observations for `sid` from `g`, returning each change.
     pub fn note(&mut self, g: &Glance, sid: &str) -> Vec<(&'static str, String)> {
         self.read = true;
+        self.glances.push(g.t);
         let label = self.label.clone();
         let (chip, title) = chip_of(&g.chrome, sid).map_or_else(
             || ("-".to_string(), "-".to_string()),
@@ -3095,19 +3122,15 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     told(said, &bad, &unread)
 }
 
-/// UNOBSERVED where no window read fell in N`k+1`'s span (`(from, until)`): no glance's Harness
-/// page or tooltip read, nor a chip, menu or page change, between its reply and its next act. The
-/// menu and page the span settles on are then a read from before its reply or none, which say
-/// nothing of the step (Muse Code's N1, 2026-11-05: the watch's first read of cruise-n came at
-/// +129.3 s, after its first need's 2 min back-off had closed the span, and the judges failed it
-/// on rows nobody read).
+/// UNOBSERVED where no window read fell in N`k+1`'s span (`(from, until)`): no glance
+/// ([`Window::glances`]) between its reply and its next act. The menu and page the span settles
+/// on are then a read from before its reply or none, which say nothing of the step (Muse Code's
+/// N1, 2026-11-05: the watch's first read of cruise-n came at +129.3 s, after its first need's
+/// 2 min back-off had closed the span, and the judges failed it on rows nobody read). A glance
+/// that changed nothing counts: it read the rows that stood from before the reply again, inside
+/// the span.
 fn n_unglanced(w: &Window, t0: i64, k: usize, (from, until): (i64, i64)) -> Option<Verdict> {
-    let inside = |t: &i64| *t > from && *t < until;
-    let read = w.page_reads.iter().chain(&w.hover_reads).any(inside)
-        || [&w.chip, &w.menu, &w.page]
-            .into_iter()
-            .flatten()
-            .any(|(t, _)| inside(t));
+    let read = w.glances.iter().any(|t| *t > from && *t < until);
     (!read).then(|| {
         Verdict::Unobserved(format!(
             "no window read in N{}'s span (+{} to +{})",
@@ -3952,12 +3975,31 @@ pub fn idle_percentiles(reply: &str) -> String {
     )
 }
 
+/// Opens an idle window's count: `metrics reset`, [`IDLE_SETTLE_MS`] through `wait`, then the
+/// opening `metrics` and `metrics percentiles` replies through `read`, which
+/// [`idle_metrics_between`] and [`idle_percentiles_between`] count from. Every idle window the lab
+/// judges by [`idle_counts`] opens here (END's, `autopilot-captures`' and `codex-alab-proof`'s),
+/// so none of them counts a status-sweep fire that a program's write before its reset was owed.
+///
+/// # Errors
+///
+/// What `wait` returned (the run was stopped), before any opening read.
+pub(crate) fn open_idle_count<E>(
+    mut read: impl FnMut(&[&str]) -> String,
+    wait: impl FnOnce(Duration) -> Result<(), E>,
+) -> Result<(String, String), E> {
+    let _ = read(&["metrics", "reset"]);
+    wait(Duration::from_millis(IDLE_SETTLE_MS.unsigned_abs()))?;
+    let opened = read(&["metrics"]);
+    Ok((opened, read(&["metrics", "percentiles"])))
+}
+
 /// What END keeps of the idle window's `metrics` replies ([`Idle::metrics`]): the effects
 /// (`timer_wakes`, `event_wakes`, `wake_heals`, each owner's arms and fires) counted from
-/// `opened`, read [`IDLE_SETTLE_MS`] after the reset, to `closed`, and the causes
-/// (`wakes_by_variant`'s writes, `output_wake_late`) and `deadline_owner` as `closed` reads them,
-/// from the reset. A write the window counts is owed its fires inside the count; one before the
-/// reset had its fires before `opened`.
+/// `opened`, read [`IDLE_SETTLE_MS`] after the reset ([`open_idle_count`]), to `closed`, and the
+/// causes (`wakes_by_variant`'s writes, `output_wake_late`) and `deadline_owner` as `closed`
+/// reads them, from the reset. A write the window counts is owed its fires inside the count; one
+/// before the reset had its fires before `opened`.
 #[must_use]
 pub fn idle_metrics_between(opened: &str, closed: &str) -> String {
     between(
@@ -4096,12 +4138,7 @@ fn idle_window(
                 String::new()
             })
         };
-        let _ = read(&["metrics", "reset"]);
-        stop::sleep(Duration::from_millis(
-            u64::try_from(IDLE_SETTLE_MS).unwrap_or(2_000),
-        ))?;
-        let opened = read(&["metrics"]);
-        let opened_percentiles = read(&["metrics", "percentiles"]);
+        let (opened, opened_percentiles) = open_idle_count(&mut read, stop::sleep)?;
         stop::sleep(Duration::from_millis(
             u64::try_from(IDLE_MS).unwrap_or(20_000),
         ))?;

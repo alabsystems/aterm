@@ -265,12 +265,14 @@ fn ring_tables(
     let now = aterm_time::unix_millis()
         .map(|ms| ms / 1000)
         .ok_or_else(|| Error::new("system clock cannot place the ring tables"))?;
+    let catalog_digest = directory.catalog_scope().digest();
     let mut tables = Vec::new();
     for ring in ring::RINGS {
         let state = directory.ring_view(session, ring);
         for epoch in state.window(ring, now) {
             let scope = ring.scope(directory.trust(), epoch)?;
-            let included = policy.includes(directory.catalog_scope().digest(), scope.digest());
+            let digest = scope.digest();
+            let included = policy.includes(catalog_digest, digest);
             let observation = if included {
                 directory
                     .observe_table_if_exists(session, scope)?
@@ -286,7 +288,7 @@ fn ring_tables(
             tables.push(json!({"application":ring.application, "role":ring.role,
                 "period_s":ring.period_s, "epoch":epoch,
                 "state":if included { "subscribed" } else { "excluded" },
-                "table":aterm_codec::hex::encode_lower(&scope.digest()),
+                "table":aterm_codec::hex::encode_lower(&digest),
                 "retained":observation.map(|(count, _)| count),
                 "recovery_reader":observation.map(|(_, recovery)| recovery)}));
         }
@@ -437,9 +439,10 @@ fn inventory_scope(
     now: Option<u64>,
 ) -> Result<(&'static str, Option<Scope>)> {
     let catalog = directory.catalog_scope();
-    let (subscription, scope) = if !policy.includes(catalog.digest(), table) {
+    let catalog_digest = catalog.digest();
+    let (subscription, scope) = if !policy.includes(catalog_digest, table) {
         ("excluded", None)
-    } else if table == catalog.digest() {
+    } else if table == catalog_digest {
         ("catalog", Some(catalog))
     } else if let Some((_, _, scope)) = directory.ring_of(
         session,
@@ -728,12 +731,16 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
         }
     };
     let trust = bootstrap.trust();
-    let retained_nodes = journal.inventory().count();
-    let largest_fact_count = journal
-        .inventory()
-        .filter_map(|id| journal.node(id))
-        .map(|node| node.facts().len())
-        .max();
+    let mut retained_nodes = 0usize;
+    let mut largest_fact_count = None;
+    for id in journal.inventory() {
+        retained_nodes += 1;
+        if let Some(node) = journal.node(id) {
+            let count = node.facts().len();
+            largest_fact_count =
+                Some(largest_fact_count.map_or(count, |max: usize| max.max(count)));
+        }
+    }
     Ok(json!({
         "state": state, "ready": role.is_some(), "role": role,
         "sharing_enabled": sharing, "can_initialize_network": false,

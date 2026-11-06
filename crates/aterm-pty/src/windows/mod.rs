@@ -61,21 +61,22 @@ struct WinSession {
 
 impl Drop for WinSession {
     fn drop(&mut self) {
-        // The pseudoconsole too: a session dropped before its waiter closed it (the waiter thread
-        // failed to start) held its HPCON, and with it conhost, to the end of the process.
-        close_pseudoconsole(self);
-        for h in [
-            self.input,
-            self.output,
-            self.process,
-            self.conhost,
-            self.job,
-            self.close_evt,
-        ] {
+        let close = |h: isize| {
             if h != 0 {
                 // SAFETY: handles are exclusively owned by this session entry and closed once on `Drop`.
                 unsafe { ffi::CloseHandle(h) };
             }
+        };
+        // Our pipe ends first: conhost writes a last frame as its pseudoconsole closes, and with
+        // nobody left to read `output`, that write, and `ClosePseudoConsole` with it, could wait
+        // for good. Then the pseudoconsole: a session dropped before its waiter closed it (the
+        // waiter thread failed to start) held its HPCON, and with it conhost, to the end of the
+        // process.
+        close(self.input);
+        close(self.output);
+        close_pseudoconsole(self);
+        for h in [self.process, self.conhost, self.job, self.close_evt] {
+            close(h);
         }
     }
 }
@@ -2099,8 +2100,11 @@ mod tests {
     }
 
     /// A session dropped before its waiter hung its console up (the waiter thread failed to
-    /// start) closes its `HPCON` as it drops, once. NEGATIVE CONTROL: a drop that closes only the
-    /// session's handles leaves the pseudoconsole, and its conhost, open.
+    /// start) closes its `HPCON` as it drops, once, and the drop returns although nothing reads
+    /// its output: its own pipe ends close first, so conhost's last frame cannot hold the close.
+    /// NEGATIVE CONTROL: a drop that closes only the session's handles leaves the pseudoconsole,
+    /// and its conhost, open; one that closes the pseudoconsole before the output pipe it never
+    /// read can wait on that frame for good.
     #[test]
     fn a_dropped_session_closes_its_pseudoconsole() {
         let (pcon, pipes) = create_pseudoconsole(coord(80, 24), OsStr::new("cmd.exe"), false)
@@ -2110,31 +2114,43 @@ mod tests {
         };
         let hpc = hpc.release();
         assert_ne!(hpc, 0, "CreatePseudoConsole names its HPCON");
-        // Nothing reads its output: closed first, conhost's last frame cannot block the close.
-        drop(pipes);
-        CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow_mut().clear());
-        drop(WinSession {
-            hpc: Mutex::new(hpc),
-            signal: Mutex::new(0),
-            reference: Mutex::new(0),
-            host: ConsoleHostKind::Inbox,
-            input: 0,
-            output: 0,
-            process: 0,
-            conhost: conhost.into_raw(),
-            job: 0,
-            outside_job_ended: Mutex::new(false),
-            close_evt: 0,
-            pid: 0,
-            exit_code: Mutex::new(None),
-            resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
-            input_severed: AtomicBool::new(false),
-            leave_client: Mutex::new(None),
-            input_writes: std::sync::atomic::AtomicU64::new(0),
+        // As a spawn leaves them: conhost holds the child's ends, the session ours, unread.
+        let Pipes {
+            in_read,
+            in_write,
+            out_read,
+            out_write,
+        } = pipes;
+        drop((in_read, out_write));
+        let (input, output, conhost) =
+            (in_write.into_raw(), out_read.into_raw(), conhost.into_raw());
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(WinSession {
+                hpc: Mutex::new(hpc),
+                signal: Mutex::new(0),
+                reference: Mutex::new(0),
+                host: ConsoleHostKind::Inbox,
+                input,
+                output,
+                process: 0,
+                conhost,
+                job: 0,
+                outside_job_ended: Mutex::new(false),
+                close_evt: 0,
+                pid: 0,
+                exit_code: Mutex::new(None),
+                resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
+                input_severed: AtomicBool::new(false),
+                leave_client: Mutex::new(None),
+                input_writes: std::sync::atomic::AtomicU64::new(0),
+            });
+            let _ = dropped.send(CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow().clone()));
         });
         assert_eq!(
-            CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow().clone()),
-            [hpc]
+            done.recv_timeout(std::time::Duration::from_secs(60)),
+            Ok(vec![hpc]),
+            "the drop closes the HPCON once and returns with its output unread"
         );
     }
 

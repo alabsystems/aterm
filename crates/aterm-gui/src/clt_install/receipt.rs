@@ -5,7 +5,8 @@
 //! which build's line in the account's record ([`super::Mark`]) that tab's own claim added: its
 //! landing's, or a later adoption's, which replaces the receipt whole ([`Receipt::claim`]). So a
 //! launch of that build that adopts the live tab again (the PTY keeper outlived a crash) takes back
-//! on failure exactly the line the tab's own claim added.
+//! on failure exactly the line the tab's own claim added. A receipt whose child is gone names a
+//! tab no launch adopts and whose end no window read ([`Receipt::orphans`]).
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -62,9 +63,7 @@ impl Receipt {
             return None;
         }
         let claim = claim_line(claimed)?;
-        let mut directory = mark.file_name()?.to_os_string();
-        directory.push(".children");
-        let directory = mark.with_file_name(directory);
+        let directory = folder(mark)?;
         let name = format!("{sid}-{pid}-{birth}");
         let text = format!("v2\n{sid}\n{pid}\n{birth}\n{claim}\n");
         (name.len() <= 255 && text.len() <= MAX_BYTES).then(|| Self {
@@ -93,6 +92,35 @@ impl Receipt {
             claim => Some(claim.strip_prefix("claimed ")?),
         };
         Self::for_child(mark, sid, pid, birth, claimed).filter(|receipt| receipt.text == text)
+    }
+
+    /// The receipts beside the record at `mark` whose child no longer runs (`alive` says whether
+    /// the process `pid` born `birth` runs: [`alive`]), each read back whole as [`Self::adopt`]
+    /// reads one. No launch adopts such a tab: the PTY keeper closes a record whose shell died
+    /// while no window held it, and a tab only its window held (one that landed before the keeper
+    /// answered) went with that window. So no window read how it ended. A name no receipt has,
+    /// and a receipt that is partial, malformed, or in a folder that is not this account's alone,
+    /// give none.
+    #[cfg(any(not(test), unix))]
+    pub(super) fn orphans(mark: &Path, alive: impl Fn(i32, u64) -> bool) -> Vec<Self> {
+        let Some(entries) = folder(mark).and_then(|directory| std::fs::read_dir(directory).ok())
+        else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter_map(|name| {
+                // `<sid>-<pid>-<birth>`: a session id holds a dash of its own.
+                let mut parts = name.rsplitn(3, '-');
+                let birth = parts.next()?.parse().ok()?;
+                let pid = parts.next()?.parse().ok()?;
+                let sid = parts.next()?;
+                if alive(pid, birth) {
+                    return None;
+                }
+                Self::adopt(mark, sid, pid, Some(birth))
+            })
+            .collect()
     }
 
     /// The build whose line the tab's own claim added to the account's record, if one added a line.
@@ -260,6 +288,20 @@ impl Receipt {
             );
         }
     }
+}
+
+/// The folder of receipts beside the record at `mark`: the record's name with `.children`.
+fn folder(mark: &Path) -> Option<PathBuf> {
+    let mut directory = mark.file_name()?.to_os_string();
+    directory.push(".children");
+    Some(mark.with_file_name(directory))
+}
+
+/// Whether the process `pid` born `birth` runs now, and is no zombie: a receipt names the birth
+/// [`aterm_pty::process_birth`] read as its child spawned ([`aterm_pty::record_spawned_shell`]).
+#[cfg(any(not(test), unix))]
+pub(super) fn alive(pid: i32, birth: u64) -> bool {
+    aterm_pty::process_birth(pid) == Some(birth)
 }
 
 #[cfg(all(test, unix))]
@@ -535,5 +577,42 @@ mod tests {
         assert!(receipt.write_exclusive().is_err());
         assert!(!receipt.matches());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// A launch reads back, whole, each receipt whose child no longer runs, and none whose child
+    /// does; a staged claim file, a stranger's name and a partial receipt are no receipt. This
+    /// process runs at the birth [`alive`] reads, and at no other.
+    /// NEGATIVE CONTROL: the mutant whose look skips `alive` reads the running child's receipt as
+    /// gone, which its adoption still needs.
+    #[test]
+    fn a_receipt_whose_child_is_gone_is_an_orphan() {
+        const BUILD: &str = "0.9.0+gabc1234";
+        const OTHER: &str = "s-fedcba9876543210fedc";
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mark = root.path().join("command-line-tools-tab");
+        assert!(
+            Receipt::orphans(&mark, |_, _| false).is_empty(),
+            "no folder"
+        );
+        let gone = Receipt::for_child(&mark, SID, 23, Some(45), Some(BUILD)).unwrap();
+        gone.write_exclusive().unwrap();
+        let running = Receipt::for_child(&mark, OTHER, 24, Some(46), None).unwrap();
+        running.write_exclusive().unwrap();
+        let directory = gone.directory.clone();
+        std::fs::write(directory.join(format!(".{SID}-23-45.claim-7")), &gone.text).unwrap();
+        std::fs::write(directory.join("notes"), b"v2\n").unwrap();
+        std::fs::write(directory.join(format!("{OTHER}-25-47")), b"partial\n").unwrap();
+
+        let orphans = Receipt::orphans(&mark, |pid, birth| (pid, birth) == (24, 46));
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0].text, gone.text);
+        assert_eq!(orphans[0].claimed(), Some(BUILD));
+        assert!(orphans[0].matches());
+        assert_eq!(Receipt::orphans(&mark, |_, _| true).len(), 0, "all running");
+
+        let own = i32::try_from(std::process::id()).unwrap();
+        let birth = aterm_pty::process_birth(own).expect("this process's birth");
+        assert!(alive(own, birth));
+        assert!(!alive(own, birth + 1), "another process at this pid");
     }
 }

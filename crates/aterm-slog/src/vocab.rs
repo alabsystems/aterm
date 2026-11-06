@@ -907,6 +907,8 @@ pub const WHY_WORDS: &[&str] = &[
     "marker",
     "done-check",
     "exit",
+    "exit-status",
+    "no-exit-status",
     "shell",
     "startup",
     "held",

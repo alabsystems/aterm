@@ -5580,6 +5580,55 @@ fn note_wrong_account_logins(
     events
 }
 
+/// `label`, or where `taken` holds it, the first of `label-2`, `label-3`, … that `taken` does not
+/// hold, with the end of `label` cut where its `-N` would carry it past [`accounts::LABEL_MAX`]:
+/// the label an admissible one moves to is admissible too, however long the first one was.
+fn untaken_label(label: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut next = label.to_owned();
+    let mut suffix = 2u32;
+    while taken(&next) {
+        let tail = format!("-{suffix}");
+        let stem = super::truncate_bytes(label, accounts::LABEL_MAX.saturating_sub(tail.len()));
+        next = format!("{stem}{tail}");
+        suffix = suffix.saturating_add(1);
+    }
+    next
+}
+
+#[cfg(test)]
+mod untaken_label_tests {
+    use super::*;
+
+    /// A ROW THE POOL CARRIES UNDER A LABEL ALREADY TAKEN GETS AN ADMISSIBLE ONE: a 64-byte label
+    /// keeps its `-N` within [`accounts::LABEL_MAX`] by losing the end of its stem. CONTROLS: a
+    /// short label gets `-2`, then `-3` where `-2` is taken too, and an untaken one stays itself.
+    #[test]
+    fn a_long_label_that_collides_gets_an_admissible_one() {
+        let long = "a".repeat(accounts::LABEL_MAX);
+        assert!(accounts::admissible_label(&long));
+        let next = untaken_label(&long, |l| l == long);
+        assert!(
+            accounts::admissible_label(&next),
+            "{next:?} ({} bytes)",
+            next.len()
+        );
+        assert_eq!(next, format!("{}-2", "a".repeat(accounts::LABEL_MAX - 2)));
+        let tenth = untaken_label(&long, |l| {
+            l == long || (2..10).any(|n| l.ends_with(&format!("-{n}")))
+        });
+        assert_eq!(tenth, format!("{}-10", "a".repeat(accounts::LABEL_MAX - 3)));
+        assert!(accounts::admissible_label(&tenth), "{tenth:?}");
+
+        assert_eq!(untaken_label("work", |l| l == "work"), "work-2", "CONTROL");
+        assert_eq!(
+            untaken_label("work", |l| l == "work" || l == "work-2"),
+            "work-3",
+            "CONTROL"
+        );
+        assert_eq!(untaken_label("work", |_| false), "work", "CONTROL");
+    }
+}
+
 fn apply_pool_to_claude_roster(
     mut roster: Roster,
     existing: &Roster,
@@ -5598,12 +5647,7 @@ fn apply_pool_to_claude_roster(
         if already_in {
             continue;
         }
-        let mut label = prev.label.clone();
-        let mut suffix = 2u32;
-        while roster.rows.iter().any(|r| r.label == label) {
-            label = format!("{}-{suffix}", prev.label);
-            suffix = suffix.saturating_add(1);
-        }
+        let label = untaken_label(&prev.label, |l| roster.rows.iter().any(|r| r.label == l));
         let has_default = roster.rows.iter().any(|r| r.dir.is_none());
         let dir = if prev.dir.is_none() && has_default {
             store
@@ -12025,6 +12069,9 @@ struct AutoRenewGuard {
     last_attempt: BTreeMap<String, Instant>,
     shared_preparations: BTreeMap<String, (accounts::shared::Source, [u8; 32])>,
     native_preparations: BTreeMap<String, [u8; 32]>,
+    /// The line native preparation last logged, `None` after a pass that said nothing
+    /// ([`shared_renewal::prepare_native`]), so a lasting refusal is logged once per change.
+    native_said: Option<String>,
     mailbox_mtimes: BTreeMap<String, std::time::SystemTime>,
     /// The rows whose last background renewal stopped where only a person can go on
     /// ([`super::cli::Renewal::NeedsPerson`]), and since when: none is tried again in the
@@ -17748,7 +17795,7 @@ fn spawn_vendor_renewal_with(
         None => workflow_browser_window_token(&store, &raw_workflow, logins, 0),
     };
     // A bot check on record holds the row as long as a stop for a person, across a restart
-    // too, where the guard's own hold is gone; it notes no task and asks nobody (design R-13).
+    // too, where the guard's own hold is gone. Its human task follows the same account wait.
     if pin_request.is_none()
         && !native_profile
         && bot_check_on_record_at(&store, &raw_workflow, logins)

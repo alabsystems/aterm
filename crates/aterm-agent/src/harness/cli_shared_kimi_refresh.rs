@@ -133,7 +133,10 @@ fn verify_target(
                 .post(url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .header("Accept", "application/json")
-                .header("User-Agent", concat!("aterm/", env!("CARGO_PKG_VERSION")))
+                .header(
+                    "User-Agent",
+                    &format!("aterm/{}", aterm_stamp::app_version()),
+                )
                 .guard(guard.clone())
                 .limit(REPLY_MAX)
                 .backstop(wait)

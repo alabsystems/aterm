@@ -16,6 +16,12 @@ use crate::native_config_language::reader_fields;
 use crate::restore::{CellMetricsCache, RestoreManifest};
 use crate::session_store::SessionHandoff;
 
+/// This package's directory, where its corpora are.
+fn package() -> String {
+    let dir = aterm_tempfile::manifest_dir();
+    dir.to_str().expect("a UTF-8 package directory").to_owned()
+}
+
 fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     let mut doc = base.to_string();
     for (from, to) in edits {
@@ -86,7 +92,7 @@ max_sessions = 4
 
 #[test]
 fn config_documents_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "config");
+    let mut corpus = Corpus::new(&package(), "config");
     let read = |doc: &str| aterm_toml::from_str::<Config>(doc).map(|config| config_answer(&config));
     corpus.record("base", read(CONFIG));
     corpus.record("empty", read(""));
@@ -279,7 +285,7 @@ fn record_tables<T: serde::de::DeserializeOwned>(
 
 #[test]
 fn derived_field_lists_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "fields");
+    let mut corpus = Corpus::new(&package(), "fields");
     record_tables::<Config>(&mut corpus, "Config", &mut Vec::new());
     record_tables::<RestoreManifest>(&mut corpus, "RestoreManifest", &mut Vec::new());
     record_tables::<SessionHandoff>(&mut corpus, "SessionHandoff", &mut Vec::new());
@@ -388,7 +394,7 @@ focused = true
 
 #[test]
 fn restore_layouts_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "restore");
+    let mut corpus = Corpus::new(&package(), "restore");
     let read = |doc: &str| {
         aterm_toml::from_str::<RestoreManifest>(doc)
             .map_err(|e| e.to_string())
@@ -616,7 +622,7 @@ journal_key = "663:1"
 
 #[test]
 fn handoff_manifests_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "handoff");
+    let mut corpus = Corpus::new(&package(), "handoff");
     let read = |doc: &str| {
         aterm_toml::from_str::<SessionHandoff>(doc)
             .map_err(|e| e.to_string())
@@ -823,7 +829,7 @@ const META_FIXTURE: &str = "v0.104.0/claude-code-1049/s0.meta.json";
 
 #[test]
 fn checkpoint_metas_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "checkpoint-meta");
+    let mut corpus = Corpus::new(&package(), "checkpoint-meta");
     let read = |doc: &str| {
         aterm_json::from_str::<CheckpointMeta>(doc)
             .map_err(|e| e.to_string())
@@ -1000,7 +1006,7 @@ fn checkout_text(path: &Path) -> String {
 }
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/handoff")
+    aterm_tempfile::manifest_dir().join("tests/fixtures/handoff")
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1040,7 +1046,7 @@ fn shipped_files(root: &Path, release: Option<(&str, &Path)>) -> Vec<(PathBuf, P
 }
 
 fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], Vec<String>) {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "shipped-state");
+    let mut corpus = Corpus::new(&package(), "shipped-state");
     let (mut manifests, mut layouts, mut metas) = (0, 0, 0);
     let mut refused = Vec::new();
     for (rel, path) in shipped_files(&fixtures(), release) {

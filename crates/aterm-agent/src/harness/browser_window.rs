@@ -1164,8 +1164,11 @@ fn exit_end(status: std::process::ExitStatus) -> WindowEnd {
 /// Opens `profile` in `browser` at `url` in a window of its own process group (so this
 /// terminal's Ctrl-C never reaches it), nothing on its stdio, and waits until it exits by
 /// itself, `ended` names an end ([`WindowEnd::Done`], [`WindowEnd::Interrupted`]) or `hang`
-/// runs out. To end it, it is sent a hangup (never a terminate: a hangup is a clean close that
-/// keeps its cookies), given `grace` to exit, and only then its process group is killed.
+/// runs out, counting the time the host slept ([`super::wake_deadline::WakeDeadline`]): the
+/// window holds the machine's sign-in lock, so a window left open while the host sleeps ends at
+/// its first look after the host wakes past `hang`. To end it, it is sent a hangup (never a
+/// terminate: a hangup is a clean close that keeps its cookies), given `grace` to exit, and only
+/// then its process group is killed.
 /// # Errors
 /// The browser did not start, or could not be waited for (and its group was killed).
 #[cfg(unix)]
@@ -1213,10 +1216,7 @@ pub(crate) fn run_window_with(
         let _ = child.kill();
         let _ = child.wait();
     };
-    let now = std::time::Instant::now();
-    let deadline = now
-        .checked_add(hang)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
+    let deadline = super::wake_deadline::WakeDeadline::after(hang);
     let asked = loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(exit_end(status)),
@@ -1229,7 +1229,7 @@ pub(crate) fn run_window_with(
         if let Some(end) = ended() {
             break end;
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.passed() {
             break WindowEnd::TimeLimit;
         }
         std::thread::sleep(Duration::from_millis(50));

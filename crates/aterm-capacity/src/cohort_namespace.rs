@@ -108,11 +108,12 @@ impl Namespace {
         Ok(retired)
     }
 
-    pub(crate) fn open_host_lock(&self) -> io::Result<File> {
-        let backend = self.open_backend()?;
-        let lock = regular(&backend, crate::leadership::LOCK)?;
-        self.identities[10].check(&lock, false)?;
-        Ok(lock)
+    pub(crate) fn open_host_lock_in(&self, backend: &File) -> io::Result<(File, (u64, u64))> {
+        let (lock, inode) = regular_inode(backend, crate::leadership::LOCK)?;
+        if inode != self.identities[10] {
+            return Err(refused("cohort namespace entry changed physical identity"));
+        }
+        Ok((lock, (inode.0, inode.1)))
     }
     /// Prepare a fresh domain under an existing private home inside an existing private root.
     /// Neither path may be the account home or contain it. This does not redirect `Ledger::user`.
@@ -393,7 +394,8 @@ impl Namespace {
         }
         let container = directory(&self.root)?;
         self.identities[2].check(&container, true)?;
-        let text = read(&container, HEADER)?;
+        let (header, header_inode) = regular_inode(&container, HEADER)?;
+        let text = read_open(&header)?;
         let (record, private_root) = Self::decode(&text)?;
         confined(&private_root, &self.home)?;
         if &record != self {
@@ -402,24 +404,22 @@ impl Namespace {
         self.identities[0].check(&directory(&private_root)?, true)?;
         self.identities[1].check(&directory(&self.home)?, true)?;
         let old = child_dir(&container, PRIOR)?;
-        let fence = regular(&container, OLD)?;
+        let (fence, fence_inode) = regular_inode(&container, OLD)?;
         let backend = child_dir(&container, BACKEND)?;
-        let header = regular(&container, HEADER)?;
-        let ready = regular(&backend, READY)?;
+        let (ready, ready_inode) = regular_inode(&backend, READY)?;
         let active = child_dir(&backend, ACTIVE)?;
         let retired = child_dir(&backend, RETIRED)?;
-        for (identity, file, is_dir) in [
-            (&self.identities[3], &old, true),
-            (&self.identities[4], &fence, false),
-            (&self.identities[5], &backend, true),
-            (&self.identities[6], &header, false),
-            (&self.identities[7], &ready, false),
-            (&self.identities[8], &active, true),
-            (&self.identities[9], &retired, true),
-        ] {
-            identity.check(file, is_dir)?;
+        self.identities[3].check(&old, true)?;
+        if fence_inode != self.identities[4]
+            || header_inode != self.identities[6]
+            || ready_inode != self.identities[7]
+        {
+            return Err(refused("cohort namespace entry changed physical identity"));
         }
-        if read(&container, OLD)? != text || read(&backend, READY)? != text {
+        self.identities[5].check(&backend, true)?;
+        self.identities[8].check(&active, true)?;
+        self.identities[9].check(&retired, true)?;
+        if read_open(&fence)? != text || read_open(&ready)? != text {
             return Err(refused("cohort namespace fence and readiness disagree"));
         }
         empty(&old)
@@ -546,7 +546,11 @@ fn child_dir(parent: &File, name: impl fd::Arg) -> io::Result<File> {
     })
 }
 
-pub(crate) fn regular(parent: &File, name: &str) -> io::Result<File> {
+pub(crate) fn regular(parent: &File, name: &str) -> io::Result<(File, (u64, u64))> {
+    regular_inode(parent, name).map(|(file, inode)| (file, (inode.0, inode.1)))
+}
+
+fn regular_inode(parent: &File, name: &str) -> io::Result<(File, Inode)> {
     let file = aterm_uds::kept_out(|| {
         fd::openat(
             parent,
@@ -557,8 +561,8 @@ pub(crate) fn regular(parent: &File, name: &str) -> io::Result<File> {
         .map(File::from)
         .map_err(io::Error::from)
     })?;
-    Inode::read(&file, false)?;
-    Ok(file)
+    let inode = Inode::read(&file, false)?;
+    Ok((file, inode))
 }
 
 pub(crate) fn create(parent: &File, name: &str) -> io::Result<File> {
@@ -580,10 +584,13 @@ pub(crate) fn create(parent: &File, name: &str) -> io::Result<File> {
 }
 
 fn read(parent: &File, name: &str) -> io::Result<String> {
+    let (file, _) = regular_inode(parent, name)?;
+    read_open(&file)
+}
+
+fn read_open(mut file: &File) -> io::Result<String> {
     let mut text = String::with_capacity(256);
-    regular(parent, name)?
-        .take(MAX + 1)
-        .read_to_string(&mut text)?;
+    (&mut file).take(MAX + 1).read_to_string(&mut text)?;
     if text.len() as u64 > MAX {
         return Err(refused("cohort namespace header is too large"));
     }

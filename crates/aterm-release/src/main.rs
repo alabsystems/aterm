@@ -11,6 +11,7 @@ mod build_inputs;
 mod buildplan;
 mod bundle;
 mod changelog;
+mod check_record;
 
 mod channel;
 
@@ -40,6 +41,7 @@ mod hook;
 mod interrupt;
 mod ledger;
 mod line;
+mod line_claim;
 
 mod machines;
 mod manifest_out;
@@ -72,6 +74,13 @@ mod trust_credit;
 mod trust_facts;
 
 mod trust_lane;
+
+/// The candidate's `trust.lock` and the prover it names (A14's release seam).
+#[expect(
+    dead_code,
+    reason = "the release chain's prover() and checks() adopt it (release.rs, release_steps.rs)"
+)]
+mod trust_lock;
 
 mod trust_oblig;
 mod verify;

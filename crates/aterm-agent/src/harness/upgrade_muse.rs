@@ -705,7 +705,7 @@ pub fn data_home(xdg: Option<&str>, home: Option<&str>, fallback: &Path) -> Opti
     }
 }
 
-/// Filter `env` to the non-empty `XDG_DATA_HOME` and `XDG_CONFIG_HOME` pairs needed on a relaunch line.
+/// Borrow `env` (the [`relaunch_env`] pairs) as `(&str, &str)` pairs for a relaunch line.
 #[must_use]
 pub fn line_env(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter()

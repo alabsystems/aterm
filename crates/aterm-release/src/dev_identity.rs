@@ -61,7 +61,6 @@ fn unanswered(state: &str) -> String {
 
 /// Every SHA-1 of an identity named exactly [`NAME`] in `find-identity -p codesigning` output.
 fn identity_hashes(listing: &str) -> Vec<String> {
-    let quoted = format!("\"{NAME}\"");
     listing
         .lines()
         .filter_map(|line| {
@@ -74,7 +73,11 @@ fn identity_hashes(listing: &str) -> Vec<String> {
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b));
-            (hex && name.starts_with(&quoted)).then(|| hash.to_string())
+            let matches_name = name
+                .strip_prefix('"')
+                .and_then(|s| s.strip_prefix(NAME))
+                .is_some_and(|s| s.starts_with('"'));
+            (hex && matches_name).then(|| hash.to_string())
         })
         .collect()
 }
@@ -517,18 +520,21 @@ fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
 /// Whether `codesign -d -r-` output pins the leaf `hash`.
 fn names_leaf(codesign_output: &str, hash: &str) -> bool {
     const LEAF_MARKER: &[u8] = b"certificate leaf";
+    let hash_bytes = hash.as_bytes();
+    let window_len = hash_bytes.len() + 3;
     crate::sign::classify_dr(codesign_output) == crate::sign::DrClass::Identity
         && crate::sign::designated_requirement(codesign_output).is_some_and(|dr| {
             dr.as_bytes()
                 .windows(LEAF_MARKER.len())
                 .position(|w| w.eq_ignore_ascii_case(LEAF_MARKER))
-                .and_then(|pos| dr.get(pos + LEAF_MARKER.len()..))
+                .and_then(|pos| dr.as_bytes().get(pos + LEAF_MARKER.len()..))
                 .is_some_and(|pinned| {
-                    let leaf = format!("h\"{hash}\"");
-                    pinned
-                        .as_bytes()
-                        .windows(leaf.len())
-                        .any(|w| w.eq_ignore_ascii_case(leaf.as_bytes()))
+                    pinned.windows(window_len).any(|w| {
+                        matches!(w[0], b'h' | b'H')
+                            && w[1] == b'"'
+                            && w[window_len - 1] == b'"'
+                            && w[2..window_len - 1].eq_ignore_ascii_case(hash_bytes)
+                    })
                 })
         })
 }

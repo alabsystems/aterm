@@ -5973,3 +5973,61 @@ fn deferred_opener_records_require_the_exact_service_cause_and_closed_grammar() 
         assert_eq!(read_terminal_outcome(&path), None);
     }
 }
+
+/// A SET-COOKIE WITH A CONTROL CHARACTER IN ITS NAME OR VALUE IS NOT KEPT, so it never rides into
+/// the next request's `Cookie:` header. CONTROL: a plain cookie in the same response is kept.
+#[test]
+fn a_cookie_holding_a_control_character_is_not_kept() {
+    let mut cookies = BTreeMap::new();
+    let raw = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Set-Cookie: a=b\x01c; Path=/\r\n",
+        "Set-Cookie: sp\x7fit=v; Path=/\r\n",
+        "Set-Cookie: cr=x\rInjected: yes; Path=/\r\n",
+        "Set-Cookie: next=li\u{85}ne; Path=/\r\n",
+        "Set-Cookie: plain=b; Path=/\r\n\r\n",
+        "body"
+    );
+    let resp = parse_raw_http_response(raw, &mut cookies).expect("a response");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        cookies.into_iter().collect::<Vec<_>>(),
+        vec![("plain".to_owned(), "b".to_owned())],
+        "only the plain cookie is kept"
+    );
+}
+
+/// A MAILBOX SIGN-IN WHOSE CODES COME FROM THE FLEET'S RELAY ALONE DRIVES THE PAGE ITSELF FIRST, as
+/// one reading a folder, IMAP or an HTTP mailbox does, where the relay's reader is built (unix).
+/// CONTROLS: webmail alone, the relay with no email to ask for, and no mailbox at all start the
+/// browser instead.
+#[test]
+fn a_relay_only_mailbox_drives_the_page_first() {
+    use super::super::headless_oauth::MailboxConfig;
+    let relay = MailboxConfig {
+        relay_enabled: true,
+        ..MailboxConfig::default()
+    };
+    assert_eq!(
+        drives_page_first(&relay, Some("work@example.test")),
+        cfg!(unix)
+    );
+    let folder = MailboxConfig {
+        dir: Some(PathBuf::from("/var/empty/mail")),
+        ..MailboxConfig::default()
+    };
+    assert!(drives_page_first(&folder, None), "CONTROL: a folder");
+    let webmail = MailboxConfig {
+        webmail_url: Some("https://mail.example.test/".to_owned()),
+        ..MailboxConfig::default()
+    };
+    assert!(
+        !drives_page_first(&webmail, Some("work@example.test")),
+        "CONTROL: webmail alone"
+    );
+    assert!(!drives_page_first(&relay, None), "CONTROL: no email");
+    assert!(
+        !drives_page_first(&MailboxConfig::default(), Some("work@example.test")),
+        "CONTROL: no mailbox"
+    );
+}

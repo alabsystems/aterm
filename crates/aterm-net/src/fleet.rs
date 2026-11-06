@@ -2430,9 +2430,33 @@ pub fn serve_with_handshake<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    serve_with_handshake_on(
+        listener,
+        listening,
+        running,
+        handshake_within,
+        (hand_over, on_event),
+        Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+    );
+}
+
+/// [`serve_with_handshake`] seating its connections in `slots`, which the caller keeps to read
+/// who holds them.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn serve_with_handshake_on<H, E>(
+    listener: &TcpListener,
+    listening: &Listening,
+    running: &AtomicBool,
+    handshake_within: Duration,
+    (hand_over, on_event): (H, E),
+    slots: Arc<Slots>,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
     let empty = Arc::new(Denied::default());
     let offering = (listening.scope, listening.serves);
-    serve_inner(
+    serve_seated(
         ListenerSocket::Fleet(listener),
         (
             listening,
@@ -2443,8 +2467,8 @@ pub fn serve_with_handshake<H, E>(
         running,
         Locality::Fleet,
         handshake_within,
-        hand_over,
-        on_event,
+        (hand_over, on_event),
+        slots,
     );
 }
 
@@ -2567,6 +2591,33 @@ fn serve_inner<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    serve_seated(
+        listener,
+        (listening, offer, deny),
+        ask,
+        running,
+        locality,
+        handshake_within,
+        (hand_over, on_event),
+        Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+    );
+}
+
+/// [`serve_inner`] seating its connections in `slots`.
+#[allow(clippy::too_many_arguments)]
+fn serve_seated<H, E>(
+    listener: ListenerSocket<'_>,
+    (listening, offer, deny): (&Listening, OfferFn, DenyFn),
+    ask: Option<AskHandler>,
+    running: &AtomicBool,
+    locality: Locality,
+    handshake_within: Duration,
+    (hand_over, on_event): (H, E),
+    slots: Arc<Slots>,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
     let _ = aterm_uds::keep_out_of_children(listener.tcp());
     if let Err(error) = listener.tcp().set_nonblocking(true) {
         drop(listener);
@@ -2575,7 +2626,6 @@ fn serve_inner<H, E>(
         )));
         return;
     }
-    let slots = Arc::new(Slots::new(listening.slots, PREAUTH_GRACE));
     let live = Arc::new(LiveConnections::default());
     let mut next_id: u64 = 0;
     let mut stopped = None;
@@ -4953,6 +5003,9 @@ mod tests {
 
     struct Serving {
         heard: Arc<Heard>,
+        /// The listener's slots where [`Serving::start`] made them, read to see
+        /// who holds them ([`Serving::seats`]).
+        slots: Option<Arc<Slots>>,
         running: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -4960,38 +5013,51 @@ mod tests {
     impl Serving {
         fn start(listener: TcpListener, listening: Listening) -> Self {
             let heard = Arc::new(Heard::default());
+            let slots = Arc::new(Slots::new(listening.slots, PREAUTH_GRACE));
             let running = Arc::new(AtomicBool::new(true));
             let thread = std::thread::spawn({
                 let (heard, running) = (Arc::clone(&heard), Arc::clone(&running));
+                let slots = Arc::clone(&slots);
                 move || {
-                    serve_with_handshake(
+                    let on_event = move |event| {
+                        if let FleetEvent::Refused { peer, reason } = event {
+                            heard.refused.lock().unwrap().push(reason.clone());
+                            if reason == AT_CAPACITY {
+                                heard.at_capacity.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if reason == DISPLACED {
+                                heard.displaced.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if peer.ip().to_canonical().is_ipv6() {
+                                heard.refused_v6.lock().unwrap().push(reason);
+                            }
+                        }
+                    };
+                    serve_with_handshake_on(
                         &listener,
                         &listening,
                         &running,
                         HANG,
-                        echo,
-                        move |event| {
-                            if let FleetEvent::Refused { peer, reason } = event {
-                                heard.refused.lock().unwrap().push(reason.clone());
-                                if reason == AT_CAPACITY {
-                                    heard.at_capacity.fetch_add(1, Ordering::SeqCst);
-                                }
-                                if reason == DISPLACED {
-                                    heard.displaced.fetch_add(1, Ordering::SeqCst);
-                                }
-                                if peer.ip().to_canonical().is_ipv6() {
-                                    heard.refused_v6.lock().unwrap().push(reason);
-                                }
-                            }
-                        },
+                        (echo, on_event),
+                        slots,
                     );
                 }
             });
             Self {
                 heard,
+                slots: Some(slots),
                 running,
                 thread: Some(thread),
             }
+        }
+    }
+
+    impl Serving {
+        /// The listener's slots ([`crate::slots::tests::until_seated`]).
+        fn seats(&self) -> &Slots {
+            self.slots
+                .as_deref()
+                .expect("a listener Serving::start started")
         }
     }
 
@@ -5117,6 +5183,7 @@ mod tests {
         });
         let serving = Serving {
             heard,
+            slots: None,
             running,
             thread: Some(thread),
         };
@@ -5267,6 +5334,7 @@ mod tests {
         });
         let serving = Serving {
             heard: Arc::new(Heard::default()),
+            slots: None,
             running,
             thread: Some(thread),
         };
@@ -5299,7 +5367,7 @@ mod tests {
 
     #[test]
     fn idle_sockets_from_one_address_never_turn_away_a_member_from_another() {
-        use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
+        use crate::slots::tests::{IdleSockets, dual_stack_listener, until_seated};
         use std::net::{Ipv4Addr, Ipv6Addr};
         let test = "idle_sockets_from_one_address_never_turn_away_a_member_from_another";
         let (listener, port) = dual_stack_listener(test);
@@ -5309,7 +5377,7 @@ mod tests {
         let member = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
 
         let idle = IdleSockets::hold(attacker, slots);
-        until_turned_away(&served.heard.at_capacity, attacker);
+        until_seated(served.seats(), attacker);
 
         let tcp = TcpStream::connect_timeout(&member, HANG).unwrap();
         let (mut admitted, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG)
@@ -5323,16 +5391,18 @@ mod tests {
                 )
             });
         assert!(echoes(&mut admitted), "the admitted member is served");
-        assert!(
-            served.heard.displaced.load(Ordering::SeqCst) >= 1,
-            "the member got in by taking an idle socket's slot, and the listener said so"
+        // The displaced worker frees its slot before it says so.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the member got in by taking an idle socket's slot, and the listener said so",
+            || (served.heard.displaced.load(Ordering::SeqCst) >= 1).then_some(()),
         );
         drop(idle);
     }
 
     #[test]
     fn idle_sockets_never_lock_a_member_of_their_own_address_out() {
-        use crate::slots::tests::{IdleSockets, until_turned_away};
+        use crate::slots::tests::{IdleSockets, until_seated};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let served = Serving::start(listener, listening(MAX_SLOTS, HANG));
@@ -5346,7 +5416,7 @@ mod tests {
         drop(control);
 
         let idle = IdleSockets::hold(addr, MAX_SLOTS);
-        until_turned_away(&served.heard.at_capacity, addr);
+        until_seated(served.seats(), addr);
         let started = Instant::now();
         let (mut admitted, _) = loop {
             match dial() {
@@ -5364,16 +5434,18 @@ mod tests {
             }
         };
         assert!(echoes(&mut admitted), "the admitted member is served");
-        assert!(
-            served.heard.displaced.load(Ordering::SeqCst) >= 1,
-            "the member got in by taking an idle socket's slot, and the listener said so"
+        // The displaced worker frees its slot before it says so.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the member got in by taking an idle socket's slot, and the listener said so",
+            || (served.heard.displaced.load(Ordering::SeqCst) >= 1).then_some(()),
         );
         drop(idle);
     }
 
     #[test]
     fn a_slow_handshake_is_never_cut_for_a_heavier_address() {
-        use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
+        use crate::slots::tests::{IdleSockets, dual_stack_listener, until_seated};
         use std::net::{Ipv4Addr, Ipv6Addr};
         let test = "a_slow_handshake_is_never_cut_for_a_heavier_address";
         let (listener, port) = dual_stack_listener(test);
@@ -5382,7 +5454,7 @@ mod tests {
         let member = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
 
         let idle = IdleSockets::hold(attacker, MAX_SLOTS);
-        until_turned_away(&served.heard.at_capacity, attacker);
+        until_seated(served.seats(), attacker);
 
         let late = PREAUTH_GRACE + Duration::from_millis(500);
         let tcp = TcpStream::connect_timeout(&member, HANG).unwrap();

@@ -50,7 +50,10 @@ const TABLE: &[Verb] = &[
         name: "install",
         tier: Tier::Daily,
         usage: "aterm pkg install <program>\n\
-                aterm pkg install --default-set    — the whole ALab toolset",
+                aterm pkg install --default-set    — the whole ALab toolset\n\
+                aterm pkg install trust --build <N> [--retry] — Trust build N beside `current`, \
+                which stays (the build a trust.lock names; --retry: download a held-back build \
+                again now)",
         arity: Arity::Parsed {
             refuse: |rest| parse_install_argv(rest).err(),
         },
@@ -77,9 +80,9 @@ const TABLE: &[Verb] = &[
                 aterm pkg update codex --vendor | --alab  — OpenAI's codex here, or back to \
                 ALab's",
         arity: Arity::One {
-            flags: &["--retry", SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG],
+            flags: &[RETRY_FLAG, SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG],
         },
-        program_flags: Some(&["--retry", SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG]),
+        program_flags: Some(&[RETRY_FLAG, SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG]),
         mutates_store: true,
         applies_machine: true,
         run: cmd_update_argv,
@@ -113,12 +116,12 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "which",
         tier: Tier::Daily,
-        usage: "aterm pkg which <tool>",
-        arity: Arity::One { flags: &[] },
-        program_flags: Some(&[]),
+        usage: "aterm pkg which [--json] <tool>  — --json: read-only managed lookup, schema 1",
+        arity: Arity::Own,
+        program_flags: None,
         mutates_store: false,
         applies_machine: false,
-        run: |rest| cmd_which(rest.first()),
+        run: cmd_which,
     },
     Verb {
         name: "run",
@@ -2929,7 +2932,7 @@ fn built_in(verb: &str, rest: &[String]) -> Option<crate::builtin::VerbAnswer> {
         Arity::One { flags } => flags,
         Arity::None | Arity::Own | Arity::Parsed { .. } => &[],
     };
-    crate::builtin::verb_answer(verb, rest, flags, aterm_types::version::app_version())
+    crate::builtin::verb_answer(verb, rest, flags, aterm_stamp::app_version())
 }
 
 fn built_in_answer(verb: &str, rest: &[String]) -> Option<ExitCode> {
@@ -3159,10 +3162,37 @@ fn doctor(prefix: &str, detail: crate::doctor::Detail, json: bool) -> ExitCode {
     }
 }
 
-fn cmd_which(tool: Option<&String>) -> ExitCode {
-    let Some(tool) = tool else {
-        return usage_error("which", None);
+fn which_args(rest: &[String]) -> Result<(&str, bool), &'static str> {
+    let mut json = false;
+    let mut tool = None;
+    for arg in rest {
+        match arg.as_str() {
+            "--json" if !json => json = true,
+            name if !name.starts_with('-') && tool.is_none() => tool = Some(name),
+            _ => return Err("expected one tool and at most one --json"),
+        }
+    }
+    tool.map(|tool| (tool, json)).ok_or("expected one tool")
+}
+
+fn cmd_which(rest: &[String]) -> ExitCode {
+    let (tool, json) = match which_args(rest) {
+        Ok(args) => args,
+        Err(why) => return usage_error("which", Some(why)),
     };
+    if json {
+        let record = crate::lookup::configured(tool);
+        return match aterm_json::to_string(&record) {
+            Ok(text) => {
+                println!("{text}");
+                ExitCode::from(u8::from(record.status != crate::lookup::Status::Ready))
+            }
+            Err(_) => {
+                eprintln!("atpkg: could not encode the tool lookup");
+                ExitCode::from(1)
+            }
+        };
+    }
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
@@ -4431,9 +4461,7 @@ fn with_built_in_section(mut lines: Vec<String>) -> Vec<String> {
     } else {
         None
     };
-    lines.extend(crate::builtin::list_human_lines(
-        aterm_types::version::app_version(),
-    ));
+    lines.extend(crate::builtin::list_human_lines(aterm_stamp::app_version()));
     lines.extend(next);
     lines
 }
@@ -5465,7 +5493,7 @@ fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
         floor,
         || crate::index_probe::cached_index_builds(layout, &crate::net::github_source_id(&owner)),
         (owner == aterm_update_core::ATPKG_INDEX_OWNER)
-            .then(crate::net::compiled_index_hint)
+            .then(crate::net::stamped_index_hint)
             .flatten(),
         PUBLISHED_INDEX_HINT.with(std::cell::Cell::get),
     );
@@ -5479,7 +5507,7 @@ fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
 fn discovery_hint(
     floor: u64,
     cached: impl FnOnce() -> Option<Vec<u64>>,
-    compiled: Option<crate::net::IndexHint>,
+    stamped: Option<crate::net::IndexHint>,
     published: Option<u64>,
 ) -> Option<crate::net::IndexHint> {
     let fresh = floor == 0;
@@ -5487,13 +5515,13 @@ fn discovery_hint(
         .then(cached)
         .flatten()
         .and_then(|b| b.into_iter().max());
-    let compiled = compiled.filter(|_| fresh);
-    let newest = [cached, compiled.map(|c| c.newest), published]
+    let stamped = stamped.filter(|_| fresh);
+    let newest = [cached, stamped.map(|c| c.newest), published]
         .into_iter()
         .flatten()
         .max()?;
     Some(crate::net::IndexHint {
-        low: compiled.and_then(|c| c.low),
+        low: stamped.and_then(|c| c.low),
         newest,
     })
 }
@@ -7877,21 +7905,176 @@ fn install_vendor_door(
 
 fn cmd_install_argv(rest: &[String]) -> ExitCode {
     match parse_install_argv(rest) {
-        Ok(program) => cmd_install(program, "install"),
+        Ok(InstallArgs {
+            program: Some(program),
+            build: Some(build),
+            retry,
+        }) => cmd_install_build(program, build, retry),
+        Ok(InstallArgs { program, .. }) => cmd_install(program, "install"),
         Err(refusal) => refusal,
     }
 }
 
-fn parse_install_argv(rest: &[String]) -> Result<Option<&String>, ExitCode> {
-    if rest.len() > 1 {
-        eprintln!(
-            "atpkg install: one program at a time (got {}); the whole toolset is \
-             `aterm pkg install --default-set`",
-            rest.len()
-        );
-        return Err(ExitCode::from(2));
+/// The flag that names the build `install` stages ([`cmd_install_build`]).
+pub(crate) const BUILD_FLAG: &str = "--build";
+
+/// The flag that tries a held-back download again now: `update`'s, and after a named build the
+/// one that forgets that build's stage refusal memo first ([`crate::flow::NamedAsk`]).
+pub(crate) const RETRY_FLAG: &str = "--retry";
+
+/// What `install`'s operands ask for: a program, and with [`BUILD_FLAG`] one build of it, its
+/// refusal memo forgotten first with [`RETRY_FLAG`].
+#[derive(Debug, PartialEq, Eq)]
+struct InstallArgs<'a> {
+    program: Option<&'a String>,
+    build: Option<u64>,
+    retry: bool,
+}
+
+fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
+    match rest {
+        [] => Ok(InstallArgs {
+            program: None,
+            build: None,
+            retry: false,
+        }),
+        [program] => Ok(InstallArgs {
+            program: Some(program),
+            build: None,
+            retry: false,
+        }),
+        [program, flag, _] | [program, flag, _, _]
+            if flag == BUILD_FLAG && program != crate::trust_lock::PROGRAM =>
+        {
+            eprintln!(
+                "atpkg install: {BUILD_FLAG} stages the Trust build a trust.lock names: \
+                 `aterm pkg install {} {BUILD_FLAG} <N>`; {program} installs its pinned build",
+                crate::trust_lock::PROGRAM
+            );
+            Err(ExitCode::from(2))
+        }
+        [program, flag, build, tail @ ..]
+            if flag == BUILD_FLAG
+                && matches!(tail, [] | [_])
+                && tail.iter().all(|t| t == RETRY_FLAG) =>
+        {
+            match crate::store::parse_build_name(build) {
+                Some(build) => Ok(InstallArgs {
+                    program: Some(program),
+                    build: Some(build),
+                    retry: !tail.is_empty(),
+                }),
+                None => {
+                    eprintln!("atpkg install: {BUILD_FLAG} takes a build number, not {build:?}");
+                    Err(ExitCode::from(2))
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "atpkg install: one program at a time (got {}); the whole toolset is \
+                 `aterm pkg install --default-set`, one build of Trust \
+                 `aterm pkg install trust {BUILD_FLAG} <N> [{RETRY_FLAG}]`",
+                rest.len()
+            );
+            Err(ExitCode::from(2))
+        }
     }
-    Ok(rest.first())
+}
+
+/// `aterm pkg install trust --build <N>`: Trust build N, verified under the head index and staged
+/// beside `current`, which stays ([`crate::flow::install_build`]); held to the tree a `trust.lock`
+/// above this directory names when it names that build, and marked so gc keeps it
+/// ([`crate::trust_lock::mark_locked`]). Only Trust ([`parse_install_argv`] refuses any other
+/// program): a lock names nothing else, and gc would take any other program's unpinned build back.
+/// With `retry` ([`RETRY_FLAG`]) the build's stage refusal memo goes first, so a build a refusal
+/// holds back is downloaded again now.
+fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
+    if !manager_enabled() {
+        eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
+        return ExitCode::from(1);
+    }
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let seams = PassSeams::process();
+    let expect = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::trust_lock::find(&cwd))
+        .and_then(|found| found.lock.ok())
+        .filter(|lock| lock.build == build);
+    let req = crate::InstallRequest {
+        channel: crate::config::CHANNEL,
+        program,
+        triple: current_triple(),
+        installed: None,
+    };
+    let got = crate::flow::install_build(
+        &*resolve_fetcher(&layout),
+        &layout,
+        &(seams.anchor)(&layout),
+        build_floor(&layout),
+        (seams.now)(),
+        &req,
+        crate::flow::NamedAsk {
+            build,
+            expect_root: expect.as_ref().map(|lock| lock.tree_root.as_str()),
+            retry,
+        },
+    );
+    match got {
+        Ok(named) => {
+            let _ = crate::trust_lock::mark_locked(&layout.prefix, build);
+            let (said, root) = match &named {
+                crate::flow::NamedBuild::Present { tree_root } => ("is in the store", tree_root),
+                crate::flow::NamedBuild::Staged { tree_root } => ("staged", tree_root),
+            };
+            println!(
+                "atpkg: {program} {build} {said} beside `current`, which stays (tree root {})",
+                root.get(..12).unwrap_or(root)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atpkg: {program} {build}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// THE TREE ROOT THE VERIFIED HEAD INDEX SIGNS FOR `program` `build` on this Mac's triple
+/// ([`crate::flow::signed_pkg`]): what `atpkg-publish adopt` holds a lock's tree root to, so a
+/// lock names only a build the channel still offers and every Mac can install.
+///
+/// # Errors
+/// A disabled manager, a store with no layout, the index's refusals (withdrawn, below its floor,
+/// unreachable, unsigned), and a build with no artifact for this triple, each said.
+pub fn signed_tree_root(program: &str, build: u64) -> Result<String, String> {
+    if !manager_enabled() {
+        return Err("atpkg is disabled (no root key pinned): no index signs a build".to_string());
+    }
+    let layout = layout().ok_or_else(|| "atpkg's store has no layout here".to_string())?;
+    let seams = PassSeams::process();
+    let triple = current_triple();
+    let req = crate::InstallRequest {
+        channel: crate::config::CHANNEL,
+        program,
+        triple,
+        installed: None,
+    };
+    let (_, pkg) = crate::flow::signed_pkg(
+        &*resolve_fetcher(&layout),
+        &layout,
+        &(seams.anchor)(&layout),
+        build_floor(&layout),
+        (seams.now)(),
+        &req,
+        build,
+    )
+    .map_err(|e| format!("{program} {build}: {e}"))?;
+    pkg.artifact_for(triple)
+        .map(|artifact| artifact.tree_root.clone())
+        .ok_or_else(|| format!("{program} {build} has no signed artifact for {triple}"))
 }
 
 pub(crate) fn is_clt_alias(program: &str) -> bool {
@@ -8562,7 +8745,7 @@ fn cmd_update_argv(rest: &[String]) -> ExitCode {
     let mut choice: Option<&str> = None;
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
-        if arg == "--retry" {
+        if arg == RETRY_FLAG {
             retry = true;
         } else if arg == SOURCE_VENDOR_FLAG || arg == SOURCE_ALAB_FLAG {
             if choice.is_some_and(|c| c != arg) {

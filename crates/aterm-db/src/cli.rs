@@ -512,10 +512,16 @@ pub fn run(words: &[String]) -> Result<Value> {
             } else if let Some(name) = value.get("name").and_then(Value::as_str) {
                 name.to_owned()
             } else {
-                let number = (1..=u32::MAX)
-                    .find(|n| !view.machine_names.contains_key(&format!("m{n}")))
-                    .ok_or_else(|| Error::new("no machine names remain"))?;
-                format!("m{number}")
+                use std::fmt::Write as _;
+                let mut candidate = String::with_capacity(12);
+                (1..=u32::MAX)
+                    .find_map(|n| {
+                        candidate.clear();
+                        let _ = write!(candidate, "m{n}");
+                        (!view.machine_names.contains_key(&candidate))
+                            .then(|| std::mem::take(&mut candidate))
+                    })
+                    .ok_or_else(|| Error::new("no machine names remain"))?
             };
             value
                 .as_object_mut()

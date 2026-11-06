@@ -14,7 +14,7 @@ pub(super) fn fresh(
     home: &Path,
     account: &str,
     staged: Option<StagedGoogleLogin<'_>>,
-    _: Instant,
+    _: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     assert!(staged.is_none());
     let registry = registry(state).unwrap();
@@ -44,7 +44,7 @@ fn direct_crash_stand_in() {
         return;
     };
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let grant = direct_with(
         &exe,
         &root.join("state"),
@@ -57,7 +57,7 @@ fn direct_crash_stand_in() {
     let _retained: Result<VerifiedGoogleGrant, UnverifiedGoogleGrant> =
         if std::env::var_os("ATERM_TEST_DIRECT_AFTER_PROOF").is_some() {
             Ok(grant
-                .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+                .verify_with_retry(|| deadline.remaining(), proof, |_| {})
                 .unwrap())
         } else {
             Err(grant)
@@ -105,7 +105,7 @@ fn direct_google_login_resumes_after_process_death_without_native_auth() {
                 .windows(b"synthetic-token".len())
                 .any(|bytes| bytes == b"synthetic-token")
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         // This test executable rejects agy's arguments. Success therefore proves the
         // recovery driver restored the pending result without executing native auth.
         let grant =
@@ -113,7 +113,7 @@ fn direct_google_login_resumes_after_process_death_without_native_auth() {
                 .unwrap();
         assert_eq!(std::fs::read(&native).unwrap(), original);
         let verified = grant
-            .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+            .verify_with_retry(|| deadline.remaining(), proof, |_| {})
             .unwrap();
         assert_eq!(std::fs::read(&native).unwrap(), original);
         let claim = identity.claim(&state).unwrap();
@@ -137,7 +137,7 @@ fn direct_recovery_never_overwrites_changed_deleted_or_held_credentials() {
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let grant = direct_with(&exe, &state, &home, "one", deadline, fresh).unwrap();
         let native = grant.path().to_owned();
         let profile = native
@@ -179,7 +179,7 @@ fn direct_and_pool_records_are_independent_and_cannot_roll_back_a_newer_browser_
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, identity) = setup(root.path());
     let exe = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let pool = run_with(
         &exe,
         &state,
@@ -195,7 +195,7 @@ fn direct_and_pool_records_are_independent_and_cannot_roll_back_a_newer_browser_
     let pool_bytes = std::fs::read(&pool_path).unwrap();
     let direct = direct_with(&exe, &state, &home, "one", deadline, fresh).unwrap();
     let verified = direct
-        .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+        .verify_with_retry(|| deadline.remaining(), proof, |_| {})
         .unwrap();
     verified.finish_recovery().unwrap();
     drop(verified);
@@ -215,7 +215,7 @@ fn direct_and_pool_records_are_independent_and_cannot_roll_back_a_newer_browser_
     )
     .unwrap();
     let verified = pool
-        .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+        .verify_with_retry(|| deadline.remaining(), proof, |_| {})
         .unwrap();
     assert_eq!(std::fs::read(&snapshot).unwrap(), newer_ciphertext);
     let claim = identity.claim(&state).unwrap();
@@ -238,7 +238,7 @@ fn a_credential_replaced_before_verification_never_uses_the_old_pending_cookies(
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, identity) = setup(root.path());
         let exe = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let grant = if direct {
             direct_with(&exe, &state, &home, "one", deadline, fresh).unwrap()
         } else {
@@ -259,10 +259,9 @@ fn a_credential_replaced_before_verification_never_uses_the_old_pending_cookies(
         assert!(
             grant
                 .verify_with_retry(
-                    deadline,
+                    || deadline.remaining(),
                     |_, _, _| panic!("replaced credential reached Google"),
                     |_| {},
-                    Instant::now
                 )
                 .is_err()
         );

@@ -68,12 +68,21 @@ impl Grid {
         if self.storage.cursor_template_bg_rgb.is_none() {
             return;
         }
-        let cleared: Vec<u16> = match self.row(row) {
-            Some(r) => cols.filter(|&c| !r.is_cell_protected(c)).collect(),
-            None => return,
-        };
-        for col in cleared {
-            self.fill_bce_rgb_range(row, col, col.saturating_add(1));
+        let mut next = cols.start;
+        while next < cols.end {
+            let Some(cells) = self.row(row) else {
+                return;
+            };
+            let Some(start) = (next..cols.end).find(|&col| !cells.is_cell_protected(col)) else {
+                break;
+            };
+            let end = (start.saturating_add(1)..cols.end)
+                .find(|&col| cells.is_cell_protected(col))
+                .unwrap_or(cols.end);
+            // RGB fills touch only extras, so the row's protection mask stays
+            // fixed while its unprotected runs are emitted.
+            self.fill_bce_rgb_range(row, start, end);
+            next = end.saturating_add(1);
         }
     }
 
@@ -1551,6 +1560,45 @@ mod tests {
             "the protected cell has no truecolor"
         );
         assert_ne!(char_at(&grid, 0, 2), ' ');
+    }
+
+    #[test]
+    fn unprotected_bce_runs_match_a_per_column_reference() {
+        use crate::{Cell, PackedColor};
+        const COLS: u16 = 8;
+        for mask in 0..1u16 << COLS {
+            for range in [0..0, 0..COLS, 1..7, 0..1, 7..8, 9..10] {
+                let mut grid = Grid::new(1, COLS);
+                fill_grid(&mut grid, 1, COLS);
+                for col in 0..COLS {
+                    if mask & (1 << col) != 0 {
+                        protect_cell(&mut grid, 0, col);
+                    }
+                }
+                grid.set_cursor_template(
+                    Cell::bce_blank_from_bg(PackedColor::rgb(1, 2, 3)),
+                    Some([1, 2, 3]),
+                );
+                grid.fill_bce_rgb_range(0, 0, COLS);
+                grid.set_cursor_template(
+                    Cell::bce_blank_from_bg(PackedColor::rgb(10, 20, 30)),
+                    Some([10, 20, 30]),
+                );
+                grid.fill_bce_rgb_unprotected(0, range.clone());
+                for col in 0..COLS {
+                    let expected = if range.contains(&col) && mask & (1 << col) == 0 {
+                        [10, 20, 30]
+                    } else {
+                        [1, 2, 3]
+                    };
+                    assert_eq!(
+                        grid.bg_rgb_at(0, col),
+                        Some(expected),
+                        "mask={mask} range={range:?} col={col}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-db"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,6 +25,7 @@ aterm-json.workspace = true
 aterm-net.workspace = true
 aterm-uds.workspace = true
 aterm-time.workspace = true
+aterm-stamp.workspace = true
 aterm-types.workspace = true
 aterm-tempfile.workspace = true
 aterm-toml.workspace = true

@@ -174,7 +174,7 @@ impl Trigger {
 /// The last pass, as `<state_dir>/converge/aligned.json` keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// The build that ran it (`aterm_types::version::build_id`).
+    /// The build that ran it (`aterm_stamp::build_id`).
     pub build: String,
     /// The [`SPEC`] it ran under.
     pub spec: u32,

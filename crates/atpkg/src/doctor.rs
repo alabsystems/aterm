@@ -1601,7 +1601,7 @@ pub(crate) fn read(
         "the atpkg speaking",
         format!(
             "this atpkg is {} at {}",
-            aterm_types::version::app_version(),
+            aterm_stamp::app_version(),
             std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "<unknown path>".to_string())

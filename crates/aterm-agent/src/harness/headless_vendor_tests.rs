@@ -1860,7 +1860,7 @@ fn a_page_wanting_a_persons_sign_in_ends_needs_sign_in_and_a_browser_that_never_
         sign_in_once: Some(SIGN_IN_ONCE),
         ..device_gate()
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
     let (mut cdp, browser) = fake_cdp(google.clone(), false);
     let got = drive_cdp_vendor(&mut cdp, KIMI_CARD_URL, gate, &|| false, deadline, no_mail);
@@ -2293,7 +2293,7 @@ fn kimi_card_value(url: &str) -> Value {
 #[test]
 fn the_drive_presses_kimis_card_once_and_never_one_naming_another_code() {
     use super::super::login_drive::Approval;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
     let presses_of = |url: &str| {
         let reads = Arc::new(AtomicUsize::new(0));
@@ -2343,7 +2343,7 @@ fn a_page_that_stalls_ends_the_drive_needs_sign_in() {
             &mut cdp,
             KIMI_CARD_URL,
             gate,
-            (&|| false, Instant::now() + budget),
+            (&|| false, WakeDeadline::after(budget)),
             PageStall::within(stall),
             no_mail,
         );
@@ -2364,6 +2364,156 @@ fn a_page_that_stalls_ends_the_drive_needs_sign_in() {
         Approval::NeedsYou(why) => assert!(why.contains("not approved in time"), "{why}"),
         other => panic!("CONTROL: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// Runs `drive` on a thread of its own holding a [`SleepSeam`](super::super::wake_deadline::SleepSeam),
+/// handing it that seam's [`Sleeper`](super::super::wake_deadline::Sleeper), and returns what it
+/// said, waiting for it within the one-minute hang detector.
+#[cfg(unix)]
+fn drive_under_seam(
+    drive: impl FnOnce(super::super::wake_deadline::Sleeper) -> super::super::login_drive::Approval
+    + Send
+    + 'static,
+) -> super::super::login_drive::Approval {
+    let (said, drove) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let seam = super::super::wake_deadline::SleepSeam::hold();
+        let _ = said.send(drive(seam.sleeper()));
+    });
+    drove
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the drive waited on the clock that stops in sleep, past the deadline its host slept through")
+}
+
+/// A VENDOR DRIVE ITS HOST SLEPT PAST ENDS AT ITS NEXT LOOK (KI-1105-14): a drive given an hour on
+/// a page that asks nothing of aterm, whose host slept two hours before its next look at its end,
+/// ends out of time then. NEGATIVE CONTROL: the hour measured on the clock that stops in sleep
+/// alone was left, and the drive read the page until the one-minute hang detector reported it.
+#[cfg(unix)]
+#[test]
+fn a_vendor_drive_its_host_slept_past_ends_at_its_next_look() {
+    use super::super::login_drive::Approval;
+    let got = drive_under_seam(|_| {
+        let logged_out = json!({
+            "url": KIMI_CARD_URL,
+            "heading": "",
+            "text": "Log in to Kimi\nContinue with Google",
+            "buttons": ["continue with google"],
+            "inputs": []
+        });
+        let slept = std::cell::Cell::new(false);
+        let finished = || {
+            if !slept.replace(true) {
+                super::super::wake_deadline::host_slept(2 * HOUR);
+            }
+            false
+        };
+        let (mut cdp, browser) = fake_cdp(logged_out, false);
+        let got = drive_cdp_vendor_within(
+            &mut cdp,
+            KIMI_CARD_URL,
+            device_gate(),
+            (&finished, WakeDeadline::after(HOUR)),
+            PageStall::within(HOUR),
+            |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
+        );
+        drop(cdp);
+        browser.join().expect("stand-in browser");
+        got
+    });
+    assert!(
+        matches!(&got, Approval::NeedsYou(why) if why.contains("not approved in time")),
+        "{got:?}"
+    );
+}
+
+/// A DEVICE PAGE'S WAIT FOR ITS CLI COUNTS THE TIME ITS HOST SLEPT: a drive given an hour on a
+/// page that says the device is authorized waits for the CLI to say it is done, and ends at its
+/// next look once its host slept two hours in that wait. NEGATIVE CONTROL: that wait measured on
+/// the clock that stops in sleep alone waited the hour out, which the one-minute hang detector
+/// reports.
+#[cfg(unix)]
+#[test]
+fn a_device_pages_wait_for_its_cli_ends_once_its_host_slept_past_it() {
+    use super::super::login_drive::Approval;
+    let authorized = json!({
+        "url": KIMI_CARD_URL,
+        "heading": "",
+        "text": "Device authorized. You can close this window.",
+        "buttons": [],
+        "inputs": []
+    });
+    assert_eq!(
+        vendor_step(&page_of(&authorized), &device_gate()),
+        Step::Done,
+        "CONTROL: the page reads as done"
+    );
+    let got = drive_under_seam(move |_| {
+        let looks = std::cell::Cell::new(0);
+        // The drive's first look is before it reads the page; the next is the done wait's.
+        let finished = || {
+            looks.set(looks.get() + 1);
+            if looks.get() == 2 {
+                super::super::wake_deadline::host_slept(2 * HOUR);
+            }
+            false
+        };
+        let (mut cdp, browser) = fake_cdp(authorized, false);
+        let got = drive_cdp_vendor_within(
+            &mut cdp,
+            KIMI_CARD_URL,
+            device_gate(),
+            (&finished, WakeDeadline::after(HOUR)),
+            PageStall::within(HOUR),
+            |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
+        );
+        drop(cdp);
+        browser.join().expect("stand-in browser");
+        assert_eq!(looks.get(), 2, "the done wait looked once");
+        got
+    });
+    assert!(matches!(got, Approval::Approved { .. }), "{got:?}");
+}
+
+/// A DEVTOOLS CALL ITS HOST SLEPT THROUGH ENDS WITHIN A TICK OF THE WAKING: a drive given an hour
+/// whose browser never answers its read of the page, and whose host slept two hours once that
+/// read was sent, ends out of time within about a second. NEGATIVE CONTROL: a call that took what
+/// was left of the deadline as one span, when it began, waited the hour out, which the one-minute
+/// hang detector reports.
+#[cfg(unix)]
+#[test]
+fn a_devtools_call_its_host_slept_through_ends_within_a_tick() {
+    use super::super::login_drive::Approval;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let got = drive_under_seam(move |sleeper| {
+        let (mut cdp, browser) = fake_cdp_serving(false, move |expression| {
+            if expression == VENDOR_PAGE_JS {
+                sleeper.slept(2 * HOUR);
+                // Never answers while the drive runs.
+                let _ = released.recv();
+            }
+            json!({"ok": true})
+        });
+        let got = drive_cdp_vendor_within(
+            &mut cdp,
+            KIMI_CARD_URL,
+            device_gate(),
+            (&|| false, WakeDeadline::after(HOUR)),
+            PageStall::within(HOUR),
+            |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test"),
+        );
+        drop(cdp);
+        drop(release);
+        browser.join().expect("stand-in browser");
+        got
+    });
+    assert!(
+        matches!(&got, Approval::NeedsYou(why) if why.contains("not approved in time")),
+        "{got:?}"
+    );
 }
 
 /// The APPROVER opens nothing on a profile another of aterm's launches holds (a headless shell
@@ -2392,7 +2542,7 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
         hosts: KIMI_GLOBAL,
         email: Some(email),
         finished: &|| false,
-        deadline: Instant::now() + Duration::from_secs(60),
+        deadline: WakeDeadline::after(Duration::from_secs(60)),
     };
     match approver.approve(&handoff) {
         Approval::NotRun(why) => assert!(
@@ -2436,9 +2586,9 @@ fn vendor_browser_preparation_obeys_the_login_lifetime() {
             email: Some("codex-one@example.com"),
             finished: &|| finished,
             deadline: if finished {
-                Instant::now() + Duration::from_secs(60)
+                WakeDeadline::after(Duration::from_secs(60))
             } else {
-                Instant::now()
+                WakeDeadline::after(Duration::ZERO)
             },
         };
         assert_eq!(
@@ -2479,7 +2629,7 @@ fn vendor_aterm_profile_contention_and_spawn_failure_report_not_run_while_extern
         hosts: &["auth.openai.com"],
         email: Some("codex-one@example.invalid"),
         finished: &|| false,
-        deadline: Instant::now() + Duration::from_secs(60),
+        deadline: WakeDeadline::after(Duration::from_secs(60)),
     };
     let profile_dir = approver.profile_dir(handoff.email);
     std::fs::create_dir_all(&profile_dir).unwrap();
@@ -3195,7 +3345,10 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
         &mut cdp,
         "https://auth.openai.com/email-verification",
         otp_gate,
-        (&|| false, Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        (
+            &|| false,
+            WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        ),
         PageStall::within(aterm_spec::wait::MUST_HAPPEN),
         |_, _| {
             poll_count += 1;
@@ -4070,7 +4223,10 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
             &mut cdp,
             "https://auth.openai.com/oauth/authorize?client_id=app_test",
             gate,
-            (&|| false, Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            (
+                &|| false,
+                WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            ),
             PageStall::within(stall),
             no_mail,
         );

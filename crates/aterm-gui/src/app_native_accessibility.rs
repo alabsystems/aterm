@@ -98,6 +98,36 @@ impl App {
         }
     }
 
+    /// Send a client what a window that cannot present owes it.
+    ///
+    /// No frame will publish here. A tree the failed frame staged would wait for a present that is
+    /// not coming, and a page that moved by itself, under a file reloaded beneath it say, would
+    /// leave the client's tree behind it: its next selection would land at old offsets in the new
+    /// text. With neither there is nothing to send, since a raster that holds the model says what
+    /// the client already read, shown or not. An overlay's tree does not follow the page.
+    #[cfg(a11y_tree)]
+    pub(crate) fn publish_in_a_parked_window(&mut self, wid: WindowId) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        if window.overlay.is_some() {
+            return;
+        }
+        let staged = window.native_a11y_staged.is_some();
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        let moved = plan.leaves.iter().any(|leaf| {
+            matches!(self.view_store.get(leaf.view), Some(View::Native(_)))
+                && self
+                    .retained_native_leaf_artifact_from_plan(wid, leaf.view, false, &plan)
+                    .is_none()
+        });
+        if staged || moved {
+            self.push_a11y_tree(wid);
+        }
+    }
+
     /// Produce the native accessibility tree for a publish.
     pub(crate) fn take_native_accessibility_update(
         &mut self,
@@ -122,10 +152,20 @@ impl App {
                 Ok(_) => return None,
                 Err(error) => return Some(Err(error)),
             };
-        let staged = self.windows.get_mut(&wid).and_then(|ws| {
-            let staged = ws.native_a11y_staged.take()?;
-            staged.matches(&owners, &ws.current_title).then_some(staged)
-        });
+        // A frame whose present failed leaves its tree here, and the model can move past it.
+        let staged = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.native_a11y_staged.take())
+            .filter(|staged| {
+                self.windows
+                    .get(&wid)
+                    .is_some_and(|ws| staged.matches(&owners, &ws.current_title))
+                    && owners.iter().all(|owner| {
+                        self.retained_native_leaf_artifact_from_plan(wid, owner.view, false, plan)
+                            .is_some()
+                    })
+            });
 
         let projection = match staged {
             Some(staged) => staged.projection,

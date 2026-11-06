@@ -1864,7 +1864,7 @@ pub(crate) mod test_fixtures {
 
     /// Returns the repository root directory.
     pub(crate) fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        aterm_tempfile::manifest_dir()
             .parent()
             .and_then(Path::parent)
             .expect("crates/aterm-census lives two levels under the repo root")

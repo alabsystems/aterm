@@ -457,13 +457,14 @@ pub(crate) fn judge(intent: &Intent, first: Option<FrameId>) -> Verdict {
 }
 
 /// THE OPEN'S RECOVERY of a compaction a crash interrupted: run before the base and the
-/// carried state are read, on `existing`, the log's bytes as the open found them. See the
+/// carried state are read, on `first`, the log's first stored frame as the open found it
+/// ([`logid::first_frame`]; `None` when the log holds none). See the
 /// module docs. `anti_rollback` says the open verifies the watermark. A finished compaction
 /// re-identifies a watermark beside the log whenever the open holds the key, verified or
 /// not ([`reidentify`]).
 pub(crate) fn recover(
     log: &Path,
-    existing: &[u8],
+    first: Option<&[u8]>,
     key: Option<AtRestRef<'_>>,
     anti_rollback: bool,
 ) -> io::Result<()> {
@@ -483,7 +484,7 @@ pub(crate) fn recover(
         }
         Found::Intent(intent) => intent,
     };
-    let first = match logid::first_frame(existing) {
+    let first = match first {
         Some(frame) => Some(FrameId::of(frame)),
         None => None,
     };
@@ -512,13 +513,13 @@ pub(crate) fn recover(
 /// finish's own ([`ready_to_finish`]), so the open's finish can fail only by a write.
 pub(crate) fn pending(
     log: &Path,
-    existing: &[u8],
+    first: Option<&[u8]>,
     key: Option<AtRestRef<'_>>,
 ) -> io::Result<Option<u64>> {
     let Found::Intent(intent) = read_intent(log, key)? else {
         return Ok(None);
     };
-    let first = match logid::first_frame(existing) {
+    let first = match first {
         Some(frame) => Some(FrameId::of(frame)),
         None => None,
     };

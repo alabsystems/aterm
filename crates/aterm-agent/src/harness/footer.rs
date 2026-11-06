@@ -4899,6 +4899,9 @@ pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
         .rev()
         .find(|&i| chars[i] == '\u{2500}' && chars[i - 1] == '\u{2500}')?
         + 1;
+    if chars[zone] != ' ' {
+        return None;
+    }
     let key: Vec<char> = CLAUDE_TOP_EFFORT_KEY.chars().collect();
     let labels = &chars[zone..n - 2];
     let mut at = 0;

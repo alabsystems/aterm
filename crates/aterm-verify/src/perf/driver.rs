@@ -134,6 +134,9 @@ mod tests {
             refused: Some(stage2.clone()),
             store_bin: None,
             demoted: None,
+            lock: None,
+            lock_refusal: None,
+            lock_override: None,
         };
         let why = driver_of(&refused).expect_err("a refused directory drives nothing");
         assert!(why.contains("NOT the toolchain"), "{why}");

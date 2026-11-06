@@ -687,7 +687,7 @@ impl Book {
         if let Some(label) = &presence.label {
             row.insert("label".into(), Value::from(label.as_str()));
         }
-        row.insert("aterm".into(), Value::from(env!("CARGO_PKG_VERSION")));
+        row.insert("aterm".into(), Value::from(aterm_stamp::app_version()));
         if let Some(os) = presence.os {
             row.insert("os".into(), Value::from(os));
         }

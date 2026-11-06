@@ -9,9 +9,30 @@ use aterm_json::{Value, json};
 
 use super::judge::{Frame, TOLERANCE, Verdict, max_byte_delta};
 
-/// The committed recording of the wgpu-WebGL module, beside this crate.
-pub(crate) fn wgpu_webgl_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("browser/wgpu-webgl")
+/// The committed recording of the wgpu-WebGL module, in this crate in the checkout at `root`.
+pub(crate) fn checkout_dir(root: &Path) -> PathBuf {
+    root.join("crates/aterm-verify/browser/wgpu-webgl")
+}
+
+/// Where [`lay`] puts a copy of the committed recording in a browser site, which a session reads:
+/// the site is all `verify browser-drive` is handed, in the Linux lane's guest with no checkout of
+/// its own.
+pub(crate) const IN_SITE: &str = "wgpu-webgl";
+
+/// Copy the committed recording's files from the checkout at `root` into `site`'s [`IN_SITE`].
+pub(crate) fn lay(root: &Path, site: &Path) -> Result<(), String> {
+    let (from, into) = (checkout_dir(root), site.join(IN_SITE));
+    std::fs::create_dir_all(&into)
+        .map_err(|e| format!("could not create {}: {e}", into.display()))?;
+    for entry in std::fs::read_dir(&from).map_err(|e| format!("{}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", from.display()))?;
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let path = entry.path();
+            crate::copy_regular_fresh(&path, into.join(entry.file_name()))
+                .map_err(|e| format!("could not copy {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 const MANIFEST: &str = "recording.json";
@@ -280,6 +301,22 @@ mod tests {
 
     fn run_of(rec: &Recording) -> Vec<(String, &Frame)> {
         rec.frames.iter().map(|(n, f)| (n.clone(), f)).collect()
+    }
+
+    /// A laid site carries the committed recording, which reads back as the checkout's own: a
+    /// drive handed only the site holds its frames to it. NEGATIVE CONTROL: before the lay, the
+    /// site has none to read.
+    #[test]
+    fn a_laid_site_carries_the_committed_recording() {
+        let root = aterm_tempfile::manifest_dir().join("../..");
+        let site = aterm_tempfile::tempdir().expect("tempdir");
+        assert!(read(&site.path().join(IN_SITE)).is_err());
+        lay(&root, site.path()).expect("lay");
+        let committed = read(&checkout_dir(&root)).expect("the committed recording");
+        assert_eq!(
+            read(&site.path().join(IN_SITE)).expect("the site's copy"),
+            committed
+        );
     }
 
     #[test]

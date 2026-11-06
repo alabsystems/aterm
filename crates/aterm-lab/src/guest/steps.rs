@@ -10,9 +10,10 @@
 //!   output up to 30 s, so a kill before then left an empty transcript, which read as "nothing
 //!   heard" (measured 2026-10-28). The lane reads the transcripts (`mac_nux::guest_heard`).
 //! - `dns-sd SECS OUT ARG...`: one `dns-sd ARG...` for SECS seconds, under `script -q -t 0` into
-//!   OUT, then its process group killed and reaped, as `browse` runs each: the lane's resolve of
-//!   an advert the guest heard (`-i <index> -L …`, `-i <index> -G v4 <host>`), which it reads to
-//!   tell this Mac's own registration from the guest's (`mac_nux::advert`).
+//!   OUT, then on until a resolve has answered (`dns_sd_text::answered`, within the one-minute
+//!   hang detector), then its process group killed and reaped, as `browse` runs each: the lane's
+//!   resolve of an advert the guest heard (`-i <index> -L …`, `-i <index> -G v4v6 <host>`), which
+//!   it reads to tell this Mac's own registration from the guest's (`mac_nux::advert`).
 //! - `arrivals SEED JOINER FILE...`: for each FILE, `<file> <mtime s|none> <same|differs|absent>`:
 //!   `JOINER/FILE`'s modification time in epoch seconds (to the nanosecond the file system keeps)
 //!   and whether its bytes are `SEED/FILE`'s, compared here and never printed.
@@ -21,12 +22,27 @@
 //!   under AUTHORITY: one control exchange between the two custodies over a loopback connection
 //!   in this process, as the admin's Commons runtime and the new Mac's run it over the LAN
 //!   (`lab swarm partition`'s plane does the same). It prints `enrolled <epoch ms>`.
+//! - `genesis HOME OUT`: the vault the admin under HOME made signs its membership log's Genesis v2
+//!   into the new file OUT, seeding the log's first audience epochs (`[everyone]` among them)
+//!   wrapped to each Mac its vault and Commons list, as a lab's founder does
+//!   (`aterm_secrets::client::seed_vault_genesis`; `lab mesh churn` and `lab commons-lan` found
+//!   theirs the same way). `secrets create` mints no `[everyone]` epoch of its own, and a table's
+//!   digest is keyed by one. It prints `genesis <epoch ms> members=<n> digest=<8 hex>`.
+//! - `repair HOME PEER ROUNDS [AUTHORITY]`: ROUNDS Commons repair rounds (1 to [`MOST_ROUNDS`]),
+//!   HOME's custody dialing PEER's over a fresh loopback connection in this process each round,
+//!   one `Repair` per side kept across them, as the Commons runtime repairs a peer it heard over
+//!   the LAN: control history, then one table a round. Two homes in one guest share its address,
+//!   and the runtime drops every beacon from its own addresses, so no runtime of theirs would
+//!   ever hear the other: this is how `vault-phrase`'s joiner gets the lab's tables. A HOME still
+//!   pending in Commons is first enrolled with AUTHORITY (as `enrol`); without one it is refused.
+//!   It prints `repaired <epoch ms> standing=<enrolled|enrolled-now> rounds=<n> control=<records
+//!   HOME took> rows=<table operations HOME took> keys=<historical keys HOME took>`, counts only.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aterm_db::control::{Endpoint, Repair, Side};
+use aterm_db::control::{Endpoint, Repair, Report, Side};
 use aterm_net::lan::{Connection, Scope};
 use aterm_secrets::client::Paths;
 use aterm_secrets::commons::bootstrap::Bootstrap;
@@ -84,9 +100,23 @@ pub(crate) fn dns_sd(args: &[String]) -> Result<(), String> {
     }
     let child = listen(Path::new(out), rest).map_err(|e| format!("dns-sd: {e}"))?;
     std::thread::sleep(Duration::from_secs(secs));
+    // A resolve of an advert that was heard must answer: listen on until it has, within the
+    // hang detector (`dns_sd_text`'s module docs).
+    let hang = Instant::now() + HANG;
+    while Instant::now() < hang
+        && !crate::dns_sd_text::answered(
+            rest,
+            &String::from_utf8_lossy(&read_regular_file(Path::new(out)).unwrap_or_default()),
+        )
+    {
+        std::thread::sleep(ANSWER_POLL);
+    }
     end(vec![child]);
     Ok(())
 }
+
+/// How often `dns-sd` looks at its transcript for a resolve's answer once its window ended.
+const ANSWER_POLL: Duration = Duration::from_millis(100);
 
 /// One `dns-sd ARGS...` under `script -q -t 0` into `file` (removed first), in a session of its
 /// own so [`end`] kills its whole group.
@@ -217,6 +247,30 @@ pub(crate) fn enrol(args: &[String], out: &mut dyn std::io::Write) -> Result<(),
     writeln!(out, "enrolled {}", super::now_ms()).map_err(|e| format!("enrol: {e}"))
 }
 
+/// `genesis HOME OUT` (the module docs).
+///
+/// # Errors
+/// A missing or extra word, or the genesis could not be signed or seeded.
+pub(crate) fn genesis(args: &[String], out: &mut dyn std::io::Write) -> Result<(), String> {
+    let [home, file] = args else {
+        return Err("genesis HOME OUT".to_owned());
+    };
+    let signed = aterm_secrets::client::seed_vault_genesis(
+        &Paths::for_home(Path::new(home)),
+        Path::new(file),
+    )
+    .map_err(|e| format!("{home}: genesis: {e}"))?;
+    let digest = aterm_codec::hex::encode_lower(&signed.digest);
+    writeln!(
+        out,
+        "genesis {} members={} digest={}",
+        super::now_ms(),
+        signed.members,
+        digest.get(..8).unwrap_or_default()
+    )
+    .map_err(|e| format!("genesis: {e}"))
+}
+
 /// The Commons bootstrap under `paths`, its custody's lock within [`HANG`].
 fn bootstrap(paths: &Paths) -> Result<Bootstrap, String> {
     Bootstrap::required_until(paths, Instant::now() + HANG)
@@ -239,22 +293,123 @@ fn endpoint(home: &Path) -> Result<Option<Endpoint>, String> {
 
 /// One exchange: `initiator` dials `responder` on a loopback port of this process.
 fn exchange(initiator: &Endpoint, responder: &Endpoint) -> Result<(), String> {
+    let (mut mine, mut theirs) = (Repair::default(), Repair::default());
+    round(initiator, responder, &mut mine, &mut theirs).map(|_| ())
+}
+
+/// The most rounds one `repair` runs: a fresh registry is its catalog and a few batches of 16.
+pub(crate) const MOST_ROUNDS: usize = 32;
+
+/// What HOME took over a `repair`'s rounds, summed from its side's reports.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Took {
+    /// Control (membership) records acknowledged into HOME's history.
+    pub control: usize,
+    /// Table operations HOME ingested.
+    pub rows: usize,
+    /// Historical key handoffs HOME received.
+    pub keys: usize,
+}
+
+impl Took {
+    /// One round's reports added in: the control exchange's, and its table round's where it
+    /// completed one.
+    fn add(&mut self, control: Report, table: Option<aterm_db::replica::Report>) {
+        self.control += control.received;
+        if let Some(t) = table {
+            self.rows += t.received + t.conflicts_received;
+            self.keys += t.keys_received;
+        }
+    }
+}
+
+/// `repair HOME PEER ROUNDS [AUTHORITY]`'s words: the two homes, the rounds, the authority.
+///
+/// # Errors
+/// A missing or stray word, or ROUNDS outside 1 to [`MOST_ROUNDS`].
+fn repair_words(args: &[String]) -> Result<(&Path, &Path, usize, Option<&Path>), String> {
+    let usage = || format!("repair HOME PEER ROUNDS [AUTHORITY] (ROUNDS 1 to {MOST_ROUNDS})");
+    let (home, peer, rounds, authority) = match args {
+        [h, p, r] => (h, p, r, None),
+        [h, p, r, a] => (h, p, r, Some(Path::new(a))),
+        _ => return Err(usage()),
+    };
+    let rounds = rounds
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=MOST_ROUNDS).contains(n))
+        .ok_or_else(usage)?;
+    Ok((Path::new(home), Path::new(peer), rounds, authority))
+}
+
+/// `repair HOME PEER ROUNDS [AUTHORITY]` (the module docs), its line written to `out`.
+///
+/// # Errors
+/// Its words ([`repair_words`]); HOME pending with no AUTHORITY, or its enrolment failed; PEER is
+/// not enrolled; or a round failed, its table round included (its words, never a value).
+pub(crate) fn repair(args: &[String], out: &mut dyn std::io::Write) -> Result<(), String> {
+    let (home, peer, rounds, authority) = repair_words(args)?;
+    let standing = if endpoint(home)?.is_some() {
+        "enrolled"
+    } else {
+        let authority = authority.ok_or_else(|| {
+            format!(
+                "{} is pending in Commons and no AUTHORITY was named to enrol it",
+                home.display()
+            )
+        })?;
+        let words = [home, authority].map(|p| p.to_string_lossy().into_owned());
+        enrol(&words, &mut std::io::sink())?;
+        "enrolled-now"
+    };
+    let me = endpoint(home)?
+        .ok_or_else(|| format!("{} is still pending after its enrolment", home.display()))?;
+    let them =
+        endpoint(peer)?.ok_or_else(|| format!("{} is not enrolled itself", peer.display()))?;
+    let (mut mine, mut theirs) = (Repair::default(), Repair::default());
+    let mut took = Took::default();
+    for at in 1..=rounds {
+        let control =
+            round(&me, &them, &mut mine, &mut theirs).map_err(|e| format!("round {at}: {e}"))?;
+        if let Some(e) = mine.application_error().or(theirs.application_error()) {
+            return Err(format!("round {at}'s table round: {e}"));
+        }
+        took.add(control, mine.application());
+    }
+    writeln!(
+        out,
+        "repaired {} standing={standing} rounds={rounds} control={} rows={} keys={}",
+        super::now_ms(),
+        took.control,
+        took.rows,
+        took.keys
+    )
+    .map_err(|e| format!("repair: {e}"))
+}
+
+/// One round on a fresh loopback connection of this process: `initiator` dials `responder`,
+/// each side's `Repair` carried in; the initiator's report.
+fn round(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    mine: &mut Repair,
+    theirs: &mut Repair,
+) -> Result<Report, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let (mut mine, mut theirs) = (Repair::default(), Repair::default());
     let (served, dialed) = std::thread::scope(|s| {
         let server = s.spawn(|| {
             let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
             let conn = Connection::admit(stream, Scope::Loopback).map_err(|e| e.to_string())?;
             responder
-                .exchange(conn, Side::Responder, &mut theirs)
+                .exchange(conn, Side::Responder, theirs)
                 .map_err(|e| e.to_string())
         });
         let dialed = Connection::connect(addr, Scope::Loopback, HANG)
             .map_err(|e| e.to_string())
             .and_then(|conn| {
                 initiator
-                    .exchange(conn, Side::Initiator, &mut mine)
+                    .exchange(conn, Side::Initiator, mine)
                     .map_err(|e| e.to_string())
             });
         if dialed.is_err() {
@@ -267,8 +422,7 @@ fn exchange(initiator: &Endpoint, responder: &Endpoint) -> Result<(), String> {
         (served, dialed)
     });
     served.map_err(|e| format!("the authority's side: {e}"))?;
-    dialed.map_err(|e| format!("the newcomer's side: {e}"))?;
-    Ok(())
+    dialed.map_err(|e| format!("the newcomer's side: {e}"))
 }
 
 #[cfg(test)]
@@ -357,6 +511,76 @@ mod tests {
     fn enrol_names_a_home_and_its_authority() {
         assert!(enrol(&args(&["/m"]), &mut Vec::new()).is_err());
         assert!(enrol(&args(&["/m", "/s", "/x"]), &mut Vec::new()).is_err());
+    }
+
+    /// A genesis names a home and the new file it writes, and nothing else.
+    #[test]
+    fn a_genesis_names_a_home_and_its_file() {
+        assert!(genesis(&args(&["/s"]), &mut Vec::new()).is_err());
+        assert!(genesis(&args(&["/s", "/g", "/x"]), &mut Vec::new()).is_err());
+    }
+
+    /// A repair names two homes and its rounds, and an authority only when it names one; its
+    /// rounds are bounded before anything opens a custody.
+    #[test]
+    fn a_repair_names_two_homes_its_rounds_and_maybe_an_authority() {
+        let three = args(&["/j", "/s", "8"]);
+        let (home, peer, rounds, authority) = repair_words(&three).unwrap();
+        assert_eq!(
+            (home, peer, rounds, authority),
+            (Path::new("/j"), Path::new("/s"), 8, None)
+        );
+        let four = args(&["/j", "/s", "8", "/a"]);
+        let (.., authority) = repair_words(&four).unwrap();
+        assert_eq!(authority, Some(Path::new("/a")));
+        for words in [
+            &["/j", "/s"][..],
+            &["/j", "/s", "0"],
+            &["/j", "/s", "33"],
+            &["/j", "/s", "many"],
+            &["/j", "/s", "8", "/a", "/x"],
+        ] {
+            assert!(repair_words(&args(words)).is_err(), "{words:?}");
+        }
+        assert!(repair(&args(&["/j"]), &mut Vec::new()).is_err());
+    }
+
+    /// What a repair took is HOME's own counts: control records, table operations with their
+    /// conflicts, and historical keys; a round with no completed table round adds control alone.
+    #[test]
+    fn a_repair_sums_what_its_home_took() {
+        let mut took = Took::default();
+        let table = aterm_db::replica::Report {
+            received: 16,
+            conflicts_received: 1,
+            keys_received: 2,
+            sent: 99,
+            ..aterm_db::replica::Report::default()
+        };
+        took.add(
+            Report {
+                sent: 7,
+                received: 3,
+                deferred: 0,
+            },
+            Some(table),
+        );
+        took.add(
+            Report {
+                sent: 0,
+                received: 1,
+                deferred: 4,
+            },
+            None,
+        );
+        assert_eq!(
+            took,
+            Took {
+                control: 4,
+                rows: 17,
+                keys: 2
+            }
+        );
     }
 
     /// The browse's words are read before anything runs, and each transcript has its own file.

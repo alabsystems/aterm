@@ -729,6 +729,64 @@ fn checks_name_the_holder_and_what_a_rename_would_do() {
     assert!(matches!(at("m0"), Verdict::Grammar(_)));
 }
 
+/// A number another Mac's vault label names refuses both a rename and a take, whether the label
+/// is a bound node's or kept for a Mac or role no record names; this machine's own label does
+/// not, and a signed holder's class still speaks first.
+#[test]
+fn another_macs_vault_label_refuses_a_rename() {
+    let v = view([
+        (1, Entry::Record(rec(Some(8), Class::Auto, T0))),
+        (2, chosen(21, T0)),
+    ]);
+    let s = settle(&v);
+    let kept = [
+        Kept::Label {
+            num: m(50),
+            node: None,
+        },
+        Kept::Label {
+            num: m(51),
+            node: Some(node(1)),
+        },
+        Kept::Label {
+            num: m(21),
+            node: None,
+        },
+    ];
+    let labels = BTreeMap::from([
+        (
+            node(3),
+            Labels {
+                admission: Some(m(60)),
+                roster: Some(m(61)),
+            },
+        ),
+        (
+            node(1),
+            Labels {
+                admission: Some(m(62)),
+                roster: None,
+            },
+        ),
+    ]);
+    let f = fleet(&v, &s, 30, &kept, &labels);
+    let at = |text: &str| check(text, &f, node(1));
+    assert_eq!(at("m50"), Verdict::Labelled { by: None });
+    assert_eq!(at("m60"), Verdict::Labelled { by: Some(node(3)) });
+    assert_eq!(at("m61"), Verdict::Labelled { by: Some(node(3)) });
+    assert_eq!(at("m51"), Verdict::Free, "this machine's own label");
+    assert_eq!(at("m62"), Verdict::Free, "this machine's own admission");
+    assert_eq!(at("m21"), Verdict::HeldByPerson { by: node(2) });
+    let labelled = Verdict::Labelled { by: None };
+    assert!(!labelled.renames() && !labelled.takes());
+    // Negative control: without the labels the same numbers read free.
+    let unlabelled = BTreeMap::new();
+    let bare = fleet(&v, &s, 30, &[], &unlabelled);
+    for free in ["m50", "m60", "m61"] {
+        assert_eq!(check(free, &bare, node(1)), Verdict::Free, "{free}");
+    }
+}
+
 #[test]
 fn a_second_node_and_a_stronger_sibling_refuse_a_rename() {
     let mut first = rec(Some(8), Class::Seeded, 2);

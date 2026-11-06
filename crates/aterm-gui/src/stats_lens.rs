@@ -12,7 +12,7 @@ use aterm_vitals::explain::{
 };
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
-    CpuView, DiskFacts, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
+    CpuView, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
     StripEventKind,
 };
 use aterm_vitals::ring::GapKind;
@@ -21,6 +21,7 @@ use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
 use crate::stats_deck::{DeckInput, StatsBars, kind_ink};
 use crate::stats_paint::{Bar, Instrument, Painter, WellMark, a, panel};
+use crate::stats_skyline::{self as skyline, BoxHeat, BoxValue, Skyline};
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, Rgba, TextFace, TextWeight, rgba, text_prim};
 
@@ -268,7 +269,7 @@ pub(crate) fn cpu_diagnostic_report(snap: &Snapshot) -> String {
             .ok()
             .map_or_else(|| Jv::why("not_sampled"), |p| Jv::s(p.to_string_lossy())),
     );
-    report.set("build", Jv::s(aterm_types::version::app_version()));
+    report.set("build", Jv::s(aterm_stamp::app_version()));
     report.to_text()
 }
 
@@ -655,6 +656,14 @@ impl<'a> Pen<'a> {
                 width: 1.0,
                 color: ink,
             });
+        }
+    }
+
+    /// A strip box [`skyline::skyline_box_in`] laid in device px, square-cornered.
+    fn skyline(&mut self, sky: &Skyline) {
+        if self.draw {
+            let prims = sky.prims(&self.inks, 0.0, (self.ox, self.oy));
+            self.p.prims.extend(prims);
         }
     }
 
@@ -1046,10 +1055,18 @@ struct TraceEvent {
     ink: InkKind,
 }
 
-/// A step trace's data and words.
+/// A trace's data and words: a strip of boxes on uniform time, each drawn by
+/// [`skyline::skyline_box_in`] at its axis height (`docs/DESIGN-stats-deck-units-2026-11-04.md`
+/// §7, "Lens traces keep their axes and time base").
 struct Trace {
-    /// The values, oldest first.
+    /// The values, oldest first: each column's mean.
     vals: Vec<Option<f64>>,
+    /// Each column's largest reading in the values' unit, its peak tick; `None` where the history
+    /// keeps one figure a column.
+    peaks: Vec<Option<f64>>,
+    /// Each column's heat as its lens names it, a share of capacity: the mean's (the column's
+    /// ink), the largest reading's (the tick's) and the over share (the cap).
+    heat: Vec<HeatCell>,
     /// The labels under the plot.
     under: &'static [(f64, &'static str)],
     /// The least span the axis shows, in the values' unit.
@@ -1115,6 +1132,21 @@ fn trace_overlays(
     events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.at.total_cmp(&b.1.at)));
     let events = events.into_iter().map(|(_, ev)| ev).collect();
     (gaps, events)
+}
+
+/// `view`'s last hour as 60 one-minute trace columns ending at `now`: each column's mean and
+/// largest reading over `unit` (never below 0), and its heat as the deck's strip takes it, a share
+/// of the row's capacity now.
+fn hour_columns(
+    view: &ResourceView,
+    now: i64,
+    unit: f64,
+) -> (Vec<Option<f64>>, Vec<Option<f64>>, Vec<HeatCell>) {
+    let cells = view.columns(60, 60, now);
+    let of = |v: Option<f64>| v.map(|b| (b / unit).max(0.0));
+    let vals = cells.iter().map(|cell| of(cell.mean)).collect();
+    let peaks = cells.iter().map(|cell| of(cell.max)).collect();
+    (vals, peaks, view.heat_cells(cells))
 }
 
 /// The labels under a 24 hour trace and an hour's.
@@ -1193,10 +1225,56 @@ fn trace_h(ch: f64) -> f64 {
     ch + 32.0
 }
 
+/// Each read column of `t` as a strip box between `x0` and `x1` and from `y0` down to `y1` (pt),
+/// at its height on the axis `lo..hi`: whole device px each edge, a device px of ground between
+/// columns 4 px or more apart. Unread columns keep the trace's own gap marks.
+fn trace_boxes(
+    pen: &Pen<'_>,
+    t: &Trace,
+    (x0, y0, x1, y1): (f64, f64, f64, f64),
+    (lo, hi): (f64, f64),
+) -> Vec<Skyline> {
+    let cols = t.vals.len().max(1);
+    let pitch = (x1 - x0) / cols as f64;
+    let gap = if pitch * pen.s >= 4.0 { 1.0 } else { 0.0 };
+    let span = (hi - lo).max(f64::MIN_POSITIVE);
+    let share = |v: f64| ((v - lo) / span) as f32;
+    let (top, bottom) = (pen.px(y0), pen.px(y1));
+    t.vals
+        .iter()
+        .enumerate()
+        .filter_map(|(j, v)| {
+            let v = (*v)?;
+            let xa = pen.px(x0 + j as f64 * pitch);
+            let xb = pen.px(x0 + (j + 1) as f64 * pitch) - gap;
+            let h = t.heat.get(j).copied().unwrap_or_default();
+            let value = BoxValue {
+                mean: Some(share(v)),
+                max: t.peaks.get(j).copied().flatten().map(share),
+                over: h.over,
+            };
+            let heat = BoxHeat {
+                mean: h.heat,
+                max: h.max,
+            };
+            (xb > xa && bottom > top).then(|| {
+                skyline::skyline_box_in(
+                    (xa, top, xb - xa, bottom - top),
+                    value,
+                    heat,
+                    pen.s,
+                    &pen.inks,
+                    pen.ic,
+                )
+            })
+        })
+        .collect()
+}
+
 /// The trace `t` in `p` under its heading.
 fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     let inks = pen.inks;
-    let read: Vec<f64> = t.vals.iter().flatten().copied().collect();
+    let read: Vec<f64> = t.vals.iter().chain(&t.peaks).flatten().copied().collect();
     let ch = p.h - 32.0;
     let (Some(&first), true) = (read.first(), ch >= 8.0) else {
         return;
@@ -1222,37 +1300,28 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     if x1 - x0 < 24.0 {
         return;
     }
+    let cols = t.vals.len().max(1);
+    let pitch = (x1 - x0) / cols as f64;
+    let skies = trace_boxes(pen, t, (x0, y0, x1, y1), (lo, hi));
+    // Plates first, the axis rules over them, then each column, tick and cap over the rules.
+    for sky in &skies {
+        let plate = Skyline {
+            plate: sky.plate,
+            ..Skyline::default()
+        };
+        pen.skyline(&plate);
+    }
     for (k, l) in labels.iter().enumerate() {
         let yy = y1 - ch * k as f64 / n as f64;
         pen.rule(x0, yy, x1 - x0, rgba(inks.grid, 0xFF));
         pen.text_end(x0 - 4.0, yy + 3.2, l, AXIS_PT, false, inks.words2);
     }
-    let cols = t.vals.len().max(1);
-    let pitch = (x1 - x0) / cols as f64;
-    let yv = |v: f64| y1 - (v - lo) / (hi - lo) * ch;
-    let ink = rgba(inks.words2, 0xFF);
-    let mut run: Option<(f64, f64)> = None;
-    for (j, v) in t.vals.iter().enumerate() {
-        let xa = x0 + j as f64 * pitch;
-        match (v.map(yv), run) {
-            (Some(yy), Some((sx, sy))) if (yy - sy).abs() < 0.05 => {
-                let _ = sx;
-            }
-            (Some(yy), Some((sx, sy))) => {
-                pen.line(sx, sy, xa, sy, ink);
-                pen.line(xa, sy, xa, yy, ink);
-                run = Some((xa, yy));
-            }
-            (Some(yy), None) => run = Some((xa, yy)),
-            (None, Some((sx, sy))) => {
-                pen.line(sx, sy, xa, sy, ink);
-                run = None;
-            }
-            (None, None) => {}
-        }
-    }
-    if let Some((sx, sy)) = run {
-        pen.line(sx, sy, x1, sy, ink);
+    for sky in &skies {
+        let rest = Skyline {
+            plate: None,
+            ..*sky
+        };
+        pen.skyline(&rest);
     }
     let mut rule_xs: Vec<f64> = Vec::with_capacity(t.events.len() + 1);
     if let Some((at, _)) = &t.mark {
@@ -2968,17 +3037,35 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// GB free, last 24 hours.
+/// GB used, last 24 hours: occupancy as space used, so a column's height and its heat both mean
+/// full, as the deck's Disk row does (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). Each
+/// 10-minute column is the most used of its readings ([`aterm_vitals::history::FreeHistory`] keeps
+/// each bucket's least free), so it draws no tick.
 fn filling_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let now = snap.at_unix_ms;
     const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
-    let vals: Vec<Option<f64>> = snap
+    let total = snap
+        .volume
+        .as_ref()
+        .map(|v| v.total)
+        .or_else(|| snap.free_history.volume().map(|v| v.total))
+        .filter(|&t| t > 0);
+    let used: Vec<Option<u64>> = snap
         .free_history
         .window(now)
         .into_iter()
-        .map(|v| v.map(|b| b as f64 / 1e9))
+        .map(|free| Some(total?.saturating_sub(free?)))
         .collect();
+    let vals: Vec<Option<f64>> = used.iter().map(|u| u.map(|b| b as f64 / 1e9)).collect();
+    let heat: Vec<HeatCell> = used
+        .iter()
+        .map(|u| HeatCell {
+            heat: u.zip(total).map(|(u, t)| (u as f64 / t as f64) as f32),
+            ..HeatCell::default()
+        })
+        .collect();
+    let peaks = vec![None; vals.len()];
     let n = vals.len() as i64;
     let start_ms = (now.div_euclid(BUCKET_MS) + 1 - n) * BUCKET_MS;
     let freed = watched(snap).and_then(|d| d.freed_today.as_ref());
@@ -2993,6 +3080,8 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
     let (gaps, events) = trace_overlays(snap, start_ms, BUCKET_MS, vals.len());
     let trace = Trace {
         vals,
+        peaks,
+        heat,
         under: DAY,
         min_span: 1.0,
         mark,
@@ -3000,7 +3089,7 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         events,
     };
     let mut said = trace_said(
-        "GB free over the last 24 hours",
+        "GB used over the last 24 hours",
         "gigabytes",
         &trace,
         (start_ms, BUCKET_MS),
@@ -3019,7 +3108,7 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
     }
     trace_section(
         c,
-        "GB free, last 24 hours",
+        "GB used, last 24 hours",
         growth,
         trace,
         said,
@@ -3176,6 +3265,14 @@ fn writing_section(c: Ctx<'_>) -> Section<'_> {
 const CPU_POLICY_KEY: &str =
     "\u{2318}\u{21e7}P reads CPU policy once, by password; changes no policy, keeps no password.";
 
+/// Whether ⌘⇧C in an open CPU lens copies its diagnostic report on `platform`, and so whether the
+/// lens says so: where aterm's hardcoded ⌘ (Super) shortcut suite is live
+/// ([`crate::app_input::HARDCODED_SUPER_CHORDS`]), never on Linux. There the lens still takes the
+/// chord as its ⌘C (Shift aside), which copies its sentence.
+pub(crate) const fn cpu_report_key(platform: Platform) -> bool {
+    !matches!(platform, Platform::Linux)
+}
+
 /// The CPU lens (§11.4).
 fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
     let snap = c.snap;
@@ -3215,17 +3312,25 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         "Heat is how many of the cores were busy, as a share of all of them.".to_owned()
     };
     let view = c.view(Resource::Cpu);
+    // Ten-second columns' worth of over readings: each column adds its over share.
     let over = view
         .columns(10, 60, snap.at_unix_ms)
         .iter()
-        .filter(|cell| cell.over)
-        .count();
+        .map(aterm_vitals::ring::Cell::over_share)
+        .sum::<f64>()
+        .round() as usize;
     let over_words = match over {
         0 => "not in the last 10 min".to_owned(),
         k if k < 6 => format!("{} s of the last 10 min", k * 10),
         k => format!("{:.0} of the last 10 min", (k as f64 / 6.0).round()),
     };
     let load = match (snap.facts.load1, n) {
+        // Linux's load counts threads waiting on disk too, so its excess over the cores is no
+        // count of the threads waiting for one.
+        (Some(l), _) if c.loc.platform == Platform::Linux => vec![
+            format!("1-minute load {l:.1} (counts disk waits too)"),
+            format!("1-minute load {l:.1}"),
+        ],
         (Some(l), n) if n > 0 => {
             let waiting = (l - n as f64).round();
             let base = format!("{l:.1} on {n} cores");
@@ -3260,22 +3365,26 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         });
         #[cfg(not(target_os = "macos"))]
         let policy: Option<String> = None;
-        let keys: Vec<String> = std::iter::once(
-            "\u{2318}\u{21e7}C copies the diagnostic report. Cause not established.".to_owned(),
-        )
-        .chain(policy)
-        .collect();
-        let items = keys
+        let keys: Vec<String> = cpu_report_key(c.loc.platform)
+            .then(|| {
+                "\u{2318}\u{21e7}C copies the diagnostic report. Cause not established.".to_owned()
+            })
+            .into_iter()
+            .chain(policy)
+            .collect();
+        let items: Vec<Vec<String>> = keys
             .iter()
             .map(|k| wrap(c.m, k, c.cw, BODY_PT))
             .chain(text.iter().map(|l| vec![l.clone()]))
             .collect();
-        let line = keys.first().cloned().into_iter().collect();
+        let line = keys.first().or(text.first()).cloned().into_iter().collect();
         let words = keys.into_iter().chain(text).collect();
-        sections.insert(
-            0,
-            rows_section("Hardware & limits", items, line, words, true),
-        );
+        if !items.is_empty() {
+            sections.insert(
+                0,
+                rows_section("Hardware & limits", items, line, words, true),
+            );
+        }
     }
     sections.extend(why);
     LensDoc {
@@ -3843,16 +3952,13 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
                      is free memory plus reclaimable file cache; unclassified memory is excluded."
         .to_owned();
     let now = snap.at_unix_ms;
-    let vals: Vec<Option<f64>> = c
-        .view(Resource::Memory)
-        .columns(60, 60, now)
-        .iter()
-        .map(|cell| cell.mean.map(|b| b / 1_073_741_824.0))
-        .collect();
+    let (vals, peaks, heat) = hour_columns(&c.view(Resource::Memory), now, 1_073_741_824.0);
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
         vals,
+        peaks,
+        heat,
         under: HOUR,
         min_span: 0.5,
         mark: None,
@@ -4163,16 +4269,13 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
         c.loc.platform.machine()
     );
     let now = snap.at_unix_ms;
-    let vals: Vec<Option<f64>> = c
-        .view(Resource::Processes)
-        .columns(60, 60, now)
-        .iter()
-        .map(|cell| cell.mean)
-        .collect();
+    let (vals, peaks, heat) = hour_columns(&c.view(Resource::Processes), now, 1.0);
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
         vals,
+        peaks,
+        heat,
         under: HOUR,
         min_span: 5.0,
         mark: None,
@@ -4225,8 +4328,7 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
 fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
     let snap = c.snap;
     let f = &snap.facts;
-    let (system, user) = f.pid_counts;
-    let limits = f.proc_limits;
+    let room = f.room;
     let of = |n: Option<u64>, l: Option<u64>| match (n, l) {
         (Some(n), Some(l)) => format!("{} of {}", words::grouped(n), words::grouped(l)),
         (Some(n), None) => words::grouped(n),
@@ -4244,15 +4346,15 @@ fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
             chip: Some(ProcScope::Other),
             name: machine.into(),
             scope: None,
-            share: share(system, limits.system),
-            figure: of(system, limits.system),
+            share: share(room.procs, room.procs_max),
+            figure: of(room.procs, room.procs_max),
         },
         Row {
             chip: Some(ProcScope::Other),
             name: "yours".into(),
             scope: None,
-            share: share(user, limits.per_user),
-            figure: of(user, limits.per_user),
+            share: share(room.user_procs, room.user_procs_max),
+            figure: of(room.user_procs, room.user_procs_max),
         },
     ];
     if let Some(n) = view.aterm.now {
@@ -4260,7 +4362,7 @@ fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
             chip: Some(ProcScope::Aterm),
             name: "aterm".into(),
             scope: None,
-            share: share(Some(n as u64), limits.system),
+            share: share(Some(n as u64), room.procs_max),
             figure: words::grouped(n.round() as u64),
         });
     }
@@ -4269,17 +4371,17 @@ fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
             chip: Some(ProcScope::Tab(k)),
             name: c.tab_label.to_owned(),
             scope: None,
-            share: share(Some(n as u64), limits.system),
+            share: share(Some(n as u64), room.procs_max),
             figure: words::grouped(n.round() as u64),
         });
     }
     let line = vec![
         format!(
             "{} \u{b7} yours {}",
-            of(system, limits.system),
-            of(user, limits.per_user)
+            of(room.procs, room.procs_max),
+            of(room.user_procs, room.user_procs_max)
         ),
-        of(system, limits.system),
+        of(room.procs, room.procs_max),
     ];
     list_section(
         c,
@@ -4912,26 +5014,24 @@ fn traffic_section(c: Ctx<'_>) -> Section<'_> {
 fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let now = snap.at_unix_ms;
-    let raw: Vec<Option<f64>> = c
-        .view(Resource::Network)
+    let view = c.view(Resource::Network);
+    let peak = view
         .columns(60, 60, now)
         .iter()
-        .map(|cell| cell.mean)
-        .collect();
-    let peak = raw.iter().flatten().copied().fold(0.0_f64, f64::max);
+        .filter_map(|cell| cell.mean)
+        .fold(0.0_f64, f64::max);
     let (scale, unit, min_span) = if peak >= 100_000.0 {
         (1_000_000.0, "MB/s", 0.5)
     } else {
         (1_000.0, "KB/s", 5.0)
     };
-    let vals: Vec<Option<f64>> = raw
-        .into_iter()
-        .map(|v| v.map(|b| (b / scale).max(0.0)))
-        .collect();
+    let (vals, peaks, heat) = hour_columns(&view, now, scale);
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
         vals,
+        peaks,
+        heat,
         under: HOUR,
         min_span,
         mark: None,
@@ -4967,7 +5067,7 @@ fn sockets_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let name = format!("Open sockets{}", c.suffix());
     let net = snap.net.as_ref();
-    let tcp_total = net.and_then(|n| n.tcp).map(|t| t.total());
+    let tcp_total = net.and_then(|n| n.tcp).and_then(|t| t.known_total());
     let aterm_s = net.and_then(|n| n.aterm_sockets);
     let denom = tcp_total.unwrap_or(0).max(aterm_s.unwrap_or(0)).max(1) as f64;
     let mut rows: Vec<Row> = Vec::new();
@@ -5018,6 +5118,10 @@ fn sockets_section(c: Ctx<'_>) -> Section<'_> {
             == Some(aterm_vitals::NoFigure::NotPerApp)
         {
             "no per-app network figure"
+        } else if aterm_s.is_none() {
+            // No process's sockets were read (on Linux, before the first TCP dump or once it
+            // retired): unread, not none.
+            "open sockets not read"
         } else {
             "none open in this scope"
         };
@@ -5086,6 +5190,18 @@ fn connectivity_section(c: Ctx<'_>) -> Section<'_> {
 
 fn tcp_states_section(c: Ctx<'_>) -> Option<Section<'_>> {
     let tcp = c.snap.net.as_ref()?.tcp?;
+    if tcp.counters_only {
+        let est = words::grouped(u64::from(tcp.established));
+        let mut full = vec![format!("{est} established or close-wait")];
+        if tcp.time_wait > 0 {
+            full.push(format!(
+                "{} time-wait or fin-wait-2",
+                words::grouped(u64::from(tcp.time_wait))
+            ));
+        }
+        let forms = dedup(vec![full.join(" \u{b7} "), format!("{est} est")]);
+        return Some(line_section("TCP states", "TCP", forms, true));
+    }
     let mut full = vec![
         format!("{} established", words::grouped(u64::from(tcp.established))),
         format!("{} listen", words::grouped(u64::from(tcp.listen))),
@@ -5176,27 +5292,25 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                 if let Some(a) = g.alloc_bytes {
                     lines.push(format!("{} GPU memory allocated", words::mem(a)));
                 }
-                lines.push(
-                    if c.loc.platform == Platform::MacOs
-                        && g.name
-                            .as_deref()
-                            .is_some_and(|name| name.starts_with("Apple "))
-                    {
-                        "GPU memory total not reported; available not reported; uses unified system memory".into()
-                    } else {
-                        "GPU memory total not reported; available not reported".into()
-                    },
-                );
+                lines.push(if g.unified {
+                    "GPU memory total not reported; available not reported; uses unified system memory".into()
+                } else {
+                    "GPU memory total not reported; available not reported".into()
+                });
             }
-            match f.gpu_resets {
-                Some((n, since)) => lines.push(format!(
+            match (f.gpu_resets, f.gpu.as_ref().and_then(|g| g.recoveries)) {
+                (Some((n, since)), _) => lines.push(format!(
                     "reset {n}\u{d7} since {}",
                     c.loc.clock(since, snap.at_unix_ms)
                 )),
-                None => lines.push(f.gpu.as_ref().and_then(|g| g.recoveries).map_or_else(
-                    || "GPU recovery counter not read".to_owned(),
-                    |count| format!("GPU recovery counter observed: {count}"),
-                )),
+                (None, Some(count)) => {
+                    lines.push(format!("GPU recovery counter observed: {count}"))
+                }
+                // Only macOS has a reader of the counter; elsewhere its line is absent.
+                (None, None) if c.loc.platform == Platform::MacOs => {
+                    lines.push("GPU recovery counter not read".to_owned());
+                }
+                (None, None) => {}
             }
             if snap.resources[Resource::Gpu.index()].aterm.missing
                 == Some(aterm_vitals::NoFigure::NotPerApp)
@@ -6335,7 +6449,11 @@ impl crate::App {
             // The lens's two copies write the person's clipboard, which a control client's
             // gesture never reaches: a key an `hwkey` burst posted arrives here by the person's
             // key path under the controller mark ([`App::dispatch_hw_key`]).
-            if open.focus == Instrument::Cpu && command("c") && mods.shift_key() {
+            if cpu_report_key(Platform::host())
+                && open.focus == Instrument::Cpu
+                && command("c")
+                && mods.shift_key()
+            {
                 if !self.refuse_clipboard_gesture("CPU diagnostic report copy")
                     && let Some(snap) = self.vitals.snapshot.as_deref()
                 {

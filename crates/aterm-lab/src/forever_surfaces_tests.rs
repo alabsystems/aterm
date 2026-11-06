@@ -585,6 +585,80 @@ fn a_line_written_again_is_no_move() {
     }
 }
 
+/// A program's write just before END's `metrics reset` has had every status-sweep fire it is
+/// owed (its sight, `running`, then `quiet` and that phase's dwell) by the opening read, where
+/// the window's count begins: the count never holds a write's fire beside no `Output` wake, which
+/// the reset cleared.
+#[test]
+fn a_write_before_the_reset_settles_before_the_idle_count_opens() {
+    let reset = unix_ms_of("2026-11-06T06:30:31Z").unwrap();
+    let opened = reset + IDLE_SETTLE_MS;
+    // The latest such write is the one just before the reset.
+    let owed = status_settled_after(reset - 1);
+    assert!(
+        owed < opened,
+        "a write 1 ms before the reset is owed a fire at +{} ms, after the count opens at +{IDLE_SETTLE_MS} ms",
+        owed - reset
+    );
+    // CONTROL: cf-claude-both at 5d8d4bfded. A resting Claude Code repainted its screen about
+    // 3 s before the reset; under the 2 s settle this replaces, the count opened while its
+    // `quiet` dwell was still owed, and that one fire failed END.
+    assert!(status_settled_after(reset - 3_000) > reset + 2_000);
+}
+
+/// Every idle window the lab judges opens its count through [`open_idle_count`]: the reset, a wait
+/// past what a write just before it is owed, then the opening `metrics` and `metrics percentiles`,
+/// whose replies it hands back in that order. A stopped wait opens no count.
+#[test]
+fn an_idle_count_opens_after_the_reset_once_a_write_before_it_has_settled() {
+    let steps = std::cell::RefCell::new(Vec::new());
+    let opened = open_idle_count(
+        |args: &[&str]| {
+            steps.borrow_mut().push(args.join(" "));
+            format!("OK {}", args.join(" "))
+        },
+        |d: Duration| -> Result<(), &str> {
+            steps.borrow_mut().push(format!("wait {}", d.as_millis()));
+            Ok(())
+        },
+    );
+    assert_eq!(
+        opened,
+        Ok((
+            "OK metrics".to_string(),
+            "OK metrics percentiles".to_string()
+        ))
+    );
+    let steps = steps.into_inner();
+    let [reset, wait, metrics, percentiles] = steps.as_slice() else {
+        panic!("{steps:?}");
+    };
+    assert_eq!(
+        [reset.as_str(), metrics.as_str(), percentiles.as_str()],
+        ["metrics reset", "metrics", "metrics percentiles"]
+    );
+    let waited: i64 = wait
+        .strip_prefix("wait ")
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("{steps:?}"));
+    assert!(
+        status_settled_after(-1) < waited,
+        "the count opens {waited} ms after the reset, while a write 1 ms before it is owed a fire at +{} ms",
+        status_settled_after(-1)
+    );
+    // CONTROL: a stopped wait reads nothing after the reset.
+    let mut read = Vec::new();
+    let stopped = open_idle_count(
+        |args: &[&str]| {
+            read.push(args.join(" "));
+            String::new()
+        },
+        |_| Err("stopped"),
+    );
+    assert_eq!(stopped, Err("stopped"));
+    assert_eq!(read, ["metrics reset"]);
+}
+
 /// The window is read where a chain of the run has a window want (the cover
 /// and cap modes' for their Off control), and END runs only with land-j's
 /// and land-k's ends to stand in it.

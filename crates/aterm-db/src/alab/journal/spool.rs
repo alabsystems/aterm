@@ -182,6 +182,7 @@ impl Spool {
         Ok(self
             .read_bytes(name, max)?
             .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
             .filter_map(Event::from_line)
             .collect())
     }

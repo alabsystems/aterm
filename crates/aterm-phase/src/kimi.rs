@@ -6,9 +6,10 @@
 //! Measured on Kimi Code 2.3.1 signed out (`fixtures/kimi-2.3.1-*.txt`): the welcome box, the
 //! composer (a rounded box whose first row is `│ > ` and the draft), the `context: N%` footer
 //! under it, and the indented `Error: <why>` row a failed turn ends on. The quota and balance
-//! texts are the patterns Kimi Code itself classifies a 429 by
-//! (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`); its concurrency throttle is a retryable rate limit,
-//! not a wall. A busy turn is unmeasured, so no phase is authoritative.
+//! texts are the server's words, which 2.3.3's classifier matched a 429 by
+//! (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`); 2.5 classifies by code alone and shows the server's
+//! message (`[provider.api_error] …`). Its concurrency throttle is a retryable rate limit, not a
+//! wall. A busy turn is unmeasured, so no phase is authoritative.
 
 use crate::wall::{Placement, Wall, WallKind};
 
@@ -16,16 +17,18 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 11, "0.11");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 12, "0.12");
 
-/// The usage limit is spent: Kimi Code's own quota patterns (lowercase).
+/// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
+/// (lowercase).
 const QUOTA: [&str; 3] = [
     "exceeded your current quota",
     "exceeded your current token quota",
     "exceeded_current_quota_error",
 ];
 
-/// The account's balance is spent: Kimi Code's own balance patterns (lowercase).
+/// The account's balance is spent: the server's balance words 2.3.3's patterns matched
+/// (lowercase).
 const BALANCE: [&str; 5] = [
     "check your account balance",
     "insufficient balance",

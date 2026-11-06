@@ -297,12 +297,12 @@ fn a_build_nobody_measured_is_read_partial_and_an_unknown_meta_binds_nothing() {
 #[test]
 fn an_unmeasured_builds_rollout_is_read_partial() {
     let newest = *CODEX_MEASURED_BUILDS.last().expect("a measured build");
-    let leg = format!(
-        "{}/src/harness/testdata/steps/{}-approval.jsonl",
-        env!("CARGO_MANIFEST_DIR"),
+    let leg = aterm_tempfile::manifest_dir().join(format!(
+        "src/harness/testdata/steps/{}-approval.jsonl",
         rollout_reduction_stem(newest)
-    );
-    let committed = std::fs::read_to_string(&leg).unwrap_or_else(|e| panic!("{leg}: {e}"));
+    ));
+    let committed =
+        std::fs::read_to_string(&leg).unwrap_or_else(|e| panic!("{}: {e}", leg.display()));
     let own: String = committed
         .lines()
         .filter(|l| !l.starts_with('#'))

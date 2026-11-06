@@ -11,11 +11,8 @@ const COLS: usize = 20;
 const BG: u32 = 0x0011_1318; // Theme::default().bg
 
 fn renderer() -> Renderer {
-    let bytes = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/DejaVuSansMono.ttf"
-    ))
-    .expect("bundled DejaVu asset");
+    let bytes = std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+        .expect("bundled DejaVu asset");
     let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).expect("fixture parses");
     r.set_runtime_font_discovery(false);
     r.debug_block_on_lazy_fallbacks();

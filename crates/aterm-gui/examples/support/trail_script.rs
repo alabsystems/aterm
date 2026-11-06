@@ -3,7 +3,8 @@
 
 //! `trail_dump`'s scripts and printer (`docs/design/PRISM-GLASS.md` §15.1 P0.4, §15.7.2): the
 //! `.trail` grammar, frozen now with every directive a later phase needs, and the dump of the
-//! frames a script drives through the headless App its includer names `super::rig`.
+//! frames a script drives through the headless App its includer names `super::rig`, on the font
+//! file it names there (`rig::fixture_font`).
 //! `examples/trail_dump.rs` runs it on `aterm_gui::TrailRig`; aterm-gui's tests include this
 //! file and run it on the crate's own.
 //!
@@ -46,7 +47,7 @@
 //! for the frame that draws. `--full --frame <n>` also prints every element and word of frame `n`
 //! (`W …` lines). Exit codes: 0 dumped, 1 a run failed, 2 a usage or script error.
 
-use super::rig::{TrailFrame, TrailRig};
+use super::rig::{TrailFrame, TrailRig, fixture_font};
 use aterm_effects::rainbow_kitty::ribbon::BedInkLut;
 use aterm_effects::state_words::{Fold, StateWords, Words};
 use std::fmt::Write as _;
@@ -60,12 +61,6 @@ mod stream_words;
 pub(crate) const EXIT_USAGE: i32 = 2;
 /// Exit code: a run failed.
 pub(crate) const EXIT_FAILED: i32 = 1;
-
-/// The font every dump draws: the repo's fixture face, so glyph pixels never move with the host.
-pub(crate) const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
 
 /// The background `page translucent` asks for: a translucent page, not a choice of opacity.
 const TRANSLUCENT_OPACITY: f32 = 0.8;
@@ -867,7 +862,7 @@ struct Runner {
 impl Runner {
     fn new(detail: Detail) -> Result<Self, String> {
         Ok(Self {
-            rig: TrailRig::new(std::path::Path::new(FIXTURE_FONT))?,
+            rig: TrailRig::new(&fixture_font()?)?,
             detail,
             config: Config::new(),
             applied: None,

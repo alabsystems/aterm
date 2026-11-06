@@ -833,10 +833,7 @@ impl Proton {
             .client
             .request(method, &endpoint)
             .header("x-pm-appversion", app_version)
-            .header(
-                "User-Agent",
-                concat!("aterm-mail/", env!("CARGO_PKG_VERSION")),
-            )
+            .header("User-Agent", crate::user_agent())
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .limit(32 * 1024 * 1024);

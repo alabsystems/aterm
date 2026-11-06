@@ -461,6 +461,14 @@ fn recovered_issuer_prepares_a_newly_admitted_member_without_relaxing_direct_iss
     assert_eq!(terms.device, new_member);
     assert_eq!(terms.intent.unwrap().decision, intent.id());
     assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    // Discovery's observation selects the generation its writer session does, so it drops no
+    // preparation that writer permits, through the predecessor's home and the successor's.
+    for paths in [&original, &lab.paths[1]] {
+        let discovery = Activations::at(paths.clone());
+        let found = discovery.local_preparations().unwrap();
+        assert!(!found.is_empty(), "PRECONDITION: a preparation here");
+        assert_eq!(found, permitted(&discovery));
+    }
     // Even a previously minted witness cannot outlive current revocation.
     let successor = Bootstrap::required(&lab.paths[1]).unwrap();
     let predecessor = Bootstrap::required(&original).unwrap();
@@ -536,6 +544,75 @@ fn local_discovery_requires_current_root_head_and_exact_device() {
     let stop = db.stop_request(ACCOUNT, vec![local.id()]).unwrap();
     db.issue(&admin, [13; 16], stop).unwrap();
     assert!(db.local_preparations().unwrap().is_empty());
+}
+
+/// DISCOVERING NOTHING PREPARED HERE IS NO FAILURE AND TAKES NO WRITER: `local_preparations` is
+/// empty in a Commons that declared only another table, and in an activations table that holds no
+/// current decision for this Mac (none at all, then only another Mac's), and each time it reads
+/// while the test holds this Mac's control journal writer, the writer converge's own writers fail
+/// fast against. CONTROL: the other Mac finds the decision that names it, a current decision for
+/// this Mac is found, and only through its permit: while the test holds the writer that permit
+/// needs (a wait the admission's one-minute hang detector ends), it finds nothing permitted;
+/// demoted to a Reader, the same Mac finds nothing, and readmitted as a Writer, finds it again.
+#[test]
+fn local_discovery_of_nothing_prepared_is_empty_and_takes_no_writer() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    super::super::proposals::Proposals::at(lab.paths[0].clone())
+        .write(
+            [1; 16],
+            vec![Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(account(&lab, false)),
+            }],
+        )
+        .unwrap();
+    let db = Activations::at(lab.paths[0].clone());
+    assert!(db.inspect(ACCOUNT).is_err(), "PRECONDITION: undeclared");
+    let held = || {
+        let bootstrap = lab.bootstrap(0);
+        Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap()
+    };
+    let discover = |hold: bool| {
+        let _writer = hold.then(held);
+        db.local_preparations().map_err(|why| why.0)
+    };
+    assert_eq!(discover(false), Ok(vec![]), "undeclared");
+    assert_eq!(discover(true), Ok(vec![]), "undeclared, writer held");
+    db.initialize().unwrap();
+    assert_eq!(discover(true), Ok(vec![]), "no decision, writer held");
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let actor = |n: usize| lab.bootstrap(n).request().unwrap().binding().actor();
+    let foreign = db
+        .configuration(&admin, [72; 32], "one", actor(1), vec![])
+        .unwrap();
+    let (foreign, _) = db.issue(&admin, [12; 16], foreign).unwrap();
+    assert_eq!(discover(true), Ok(vec![]), "another Mac's, writer held");
+    crate::table::tests::repair_commons(&lab, 3);
+    assert_eq!(
+        Activations::at(lab.paths[1].clone())
+            .local_preparations()
+            .map_err(|why| why.0),
+        Ok(vec![([72; 32], foreign.id())]),
+        "CONTROL: the Mac it names"
+    );
+    let local = db
+        .configuration(&admin, ACCOUNT, "one", actor(0), vec![])
+        .unwrap();
+    let (local, _) = db.issue(&admin, [11; 16], local).unwrap();
+    assert_eq!(discover(false), Ok(vec![(ACCOUNT, local.id())]), "CONTROL");
+    assert!(
+        !matches!(discover(true), Ok(found) if !found.is_empty()),
+        "CONTROL: a busy writer permits nothing"
+    );
+    lab.admit(&[Role::Reader, Role::Writer]);
+    assert_eq!(discover(false), Ok(vec![]), "CONTROL: no permit");
+    lab.admit(&[Role::Writer, Role::Writer]);
+    assert_eq!(
+        discover(false),
+        Ok(vec![(ACCOUNT, local.id())]),
+        "CONTROL: readmitted"
+    );
 }
 
 #[test]
@@ -783,6 +860,27 @@ fn sign(lab: &Lab, request: Request) -> Record {
     admin
         .prepare_account_decision(&bootstrap, &journal, request)
         .unwrap()
+}
+/// What the admitted writer session alone permits: `local_preparations` without its observation.
+fn permitted(db: &Activations) -> Vec<(Digest, Digest)> {
+    db.with_store(false, |session, store, scope| {
+        let history = History::read(session, store, scope.trust())?;
+        Ok(history
+            .statuses()
+            .into_iter()
+            .filter_map(|(account, state)| {
+                let State::Ready(decision) = state else {
+                    return None;
+                };
+                intents::current(&history, &history.records[&decision]).ok()?;
+                session
+                    .permit_account(&history.records[&decision])
+                    .ok()
+                    .map(|()| (account, decision))
+            })
+            .collect())
+    })
+    .unwrap()
 }
 fn history(records: Vec<Record>) -> History {
     History {

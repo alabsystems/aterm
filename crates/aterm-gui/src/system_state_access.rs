@@ -325,6 +325,10 @@ pub(crate) struct StepsReach {
     /// Whether any macOS dialog this process started is up
     /// ([`aterm_types::macos_setup::macos_dialog_up`]).
     pub(crate) dialog_up: fn() -> bool,
+    /// Wake the window once no macOS dialog of this process is up, or now where none is
+    /// ([`aterm_types::macos_setup::wake_window_when_no_macos_dialog`]): what a gesture that read
+    /// [`Self::dialog_up`] and waits on it arms, since nothing else may look again then.
+    pub(crate) wake_when_no_dialog: fn(),
     /// Hand this process's LAN to the Commons runtime
     /// ([`aterm_types::macos_setup::lan_first_use::hand_over`]) once the step's trigger has asked.
     pub(crate) hand_lan_over: fn(u64),
@@ -381,6 +385,7 @@ impl StepsReach {
         frontmost: |_| false,
         quiet: |_, _| false,
         dialog_up: || false,
+        wake_when_no_dialog: || {},
         hand_lan_over: |_| {},
         door_asked: || false,
         end_door_hold: || false,
@@ -410,6 +415,7 @@ impl StepsReach {
             frontmost: App::system_state_frontmost,
             quiet: App::step_moment_is_quiet,
             dialog_up: aterm_types::macos_setup::macos_dialog_up,
+            wake_when_no_dialog: aterm_types::macos_setup::wake_window_when_no_macos_dialog,
             hand_lan_over: aterm_types::macos_setup::lan_first_use::hand_over,
             door_asked: aterm_types::macos_setup::lan_first_use::asked,
             end_door_hold: aterm_types::macos_setup::lan_first_use::answer_heard,
@@ -447,6 +453,10 @@ pub(crate) struct AccessSteps {
     /// A silent check heard no answer. Retry independently of window or tab focus;
     /// this never repeats the OS permission trigger.
     local_network_recheck: Option<(u64, Instant)>,
+    /// The revision whose last re-probe heard no answer, which told the LAN readers so
+    /// ([`App::on_local_network_probe_ready`]): a recheck of it that hears none again tells
+    /// nothing, since nothing moved.
+    local_network_unheard: Option<u64>,
     /// This Mac's network moved since the step last looked for a LAN to name, as the watch
     /// started at its first such look tells it ([`StepsReach::watch_network`]).
     network_moved: Arc<AtomicBool>,
@@ -896,6 +906,7 @@ impl AccessSteps {
             local_network_watch: None,
             local_network_retry: None,
             local_network_recheck: None,
+            local_network_unheard: None,
             network_moved: Arc::new(AtomicBool::new(false)),
             watching_network: false,
             nothing_to_ask: false,
@@ -1394,7 +1405,7 @@ impl App {
         let revision = self.access_revision();
         devtools_helper::Marks {
             devtools: revision.map_or_else(
-                || aterm_types::version::app_version().to_owned(),
+                || aterm_stamp::app_version().to_owned(),
                 atpkg::devtools::revision_key,
             ),
             fda: Self::fda_opened_key(revision),
@@ -1476,6 +1487,14 @@ impl App {
     /// Whether another macOS gesture owns the dialog slot (inert in headless tests).
     pub(crate) fn access_dialog_up(&self) -> bool {
         (self.access_steps.reach.dialog_up)()
+    }
+
+    /// Have the window woken once no macOS dialog of this process is up
+    /// ([`crate::Wake::NoMacosDialog`]): a gesture that found the slot up
+    /// ([`Self::access_dialog_up`]) and waits for it calls this, since the dialog's end publishes
+    /// nothing else the window reads. Inert in headless tests.
+    pub(crate) fn wake_when_no_access_dialog(&self) {
+        (self.access_steps.reach.wake_when_no_dialog)();
     }
 
     /// Reserve the worker's dialog slot before a pane, panel or folder worker
@@ -1676,6 +1695,9 @@ impl App {
         if self.developer_tools_install_active() {
             hold("the Developer Tools installer is up");
         }
+        if self.mac_setup_tab_comes_next() {
+            hold("the Mac Setup tab goes first (setup's one Mac password)");
+        }
         if self.consent_warmup.is_live() {
             hold("the launch folder pass is walking");
         }
@@ -1742,9 +1764,16 @@ impl App {
     }
 
     /// The one-gesture rule: none of the window's own access gestures up
-    /// ([`Self::access_gesture_up`]) and no macOS dialog of this process up.
+    /// ([`Self::access_gesture_up`]), no macOS dialog of this process up, and the Mac Setup tab
+    /// not this window's next macOS ask ([`Self::mac_setup_tab_comes_next`]): setup's one Mac
+    /// password goes first, as the walk that starts by itself yields to it
+    /// (`App::look_for_walk_start`), since an alert or page nobody answers would hold that
+    /// password for as long as it stands. E3's clock-back row (2026-11-05) measured the Local
+    /// Network alert taking the dialog slot 193 ms after the tab's shell was booked, deferring
+    /// its landing; the alert's hold, with nobody there to answer it, outlasted the row, and
+    /// setup stood a minute with its password owed.
     fn no_gesture_up(&self, now: Instant) -> bool {
-        !self.access_gesture_up(now) && !self.access_dialog_up()
+        !self.access_gesture_up(now) && !self.access_dialog_up() && !self.mac_setup_tab_comes_next()
     }
 
     /// A control verb's moment (`devtools_helper::Origin::Ctl`): its own quiet moment, with no
@@ -1753,7 +1782,7 @@ impl App {
     /// has up, a pane's hold (a bound, not a reading: macOS does not say when a pane closes) and
     /// the Local Network alert's hold (the person's counted time, ended sooner by the re-probe's
     /// answer or once the alert watch sees no window of the alert's owner left,
-    /// [`Self::on_local_network_alert_answered`]).
+    /// [`Self::on_local_network_alert_answered`]), and lets the Mac Setup tab go first.
     pub(crate) fn control_ask_moment(&self, now: Instant) -> bool {
         self.no_gesture_up(now) && self.devtools_moment_is_quiet(now)
     }
@@ -1860,10 +1889,13 @@ impl App {
     /// dialog up when [`AccessOutcome::Granted`] wakes it, then record `Granted` when a LAN server
     /// answered. A probe that heard nothing (no ALab vault on this network, an answer after its
     /// 30 s, or nobody there to answer) leaves the hold to the person's time with the alert
-    /// ([`Self::look_at_local_network_alert`]). Whatever it
-    /// heard, the LAN readers look again now ([`StepsReach::lan_answer_moved`]): a grant or a
-    /// Don't Allow moved the answer, and a probe that heard nothing still ends with the question
-    /// asked, which a look before it did not know.
+    /// ([`Self::look_at_local_network_alert`]). The LAN
+    /// readers look again now ([`StepsReach::lan_answer_moved`]) unless the probe heard nothing
+    /// and the last one of its revision heard nothing too: a grant or a Don't Allow moved the
+    /// answer, and a probe that heard nothing first still ends with the question asked, which a
+    /// look before it did not know. A recheck every [`LOCAL_NETWORK_RETRY`] that hears nothing
+    /// again moved nothing (E3, 2026-11-05: a guest whose question nobody answered ran its
+    /// converge pass and account upkeep every 90 s on it).
     pub(crate) fn on_local_network_probe_ready(&mut self, now: Instant) {
         if !self.config.swarm_enabled() {
             cancel_local_network_probe();
@@ -1904,7 +1936,12 @@ impl App {
                 "system state: Local Network granted (LAN answered, revision {revision})"
             );
         }
-        (self.access_steps.reach.lan_answer_moved)();
+        let unheard_before = self.access_steps.local_network_unheard == Some(revision);
+        let heard = probe_heard_an_answer(probe);
+        self.access_steps.local_network_unheard = (!heard).then_some(revision);
+        if heard || !unheard_before {
+            (self.access_steps.reach.lan_answer_moved)();
+        }
     }
 
     /// Count the person's time with macOS's Local Network alert the step raised, and end its hold

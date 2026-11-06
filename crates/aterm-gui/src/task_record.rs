@@ -144,6 +144,15 @@ pub(crate) const WHY_USAGE_LIMIT: &str = aterm_agent::supervise::USAGE_LIMIT_WHY
 /// `why=` of an agent that left its tab with nothing to bring it back.
 pub(crate) const WHY_EXIT: &str = "exit";
 
+/// `why=` of a program worker's conclusion (`spawn program=`, `crate::program_worker`): its
+/// program exited, `done` on status 0 and `failed` on any other, the record's `exit=` naming it.
+pub(crate) const WHY_EXIT_STATUS: &str = "exit-status";
+
+/// `why=` of a program worker's failed conclusion where no exit status of its program was read: the
+/// next prompt sealed its block with none, job control hid how it ended, or a restore brought it
+/// back with its shell gone. Its record carries no `exit=`.
+pub(crate) const WHY_NO_EXIT_STATUS: &str = "no-exit-status";
+
 /// `why=` of a worker its launcher refused because its CLI is signed out, which only a person
 /// can fix (`task_launch::refused_why`).
 pub(crate) const WHY_SIGNIN: &str = "signin";
@@ -163,6 +172,8 @@ pub(crate) const TASK_WHY: &[&str] = &[
     "marker",
     "done-check",
     WHY_EXIT,
+    WHY_EXIT_STATUS,
+    WHY_NO_EXIT_STATUS,
     "shell",
     "startup",
     "held",
@@ -198,6 +209,8 @@ pub(crate) fn failed_words(state: TaskState, why: Option<&str>) -> String {
         (_, Some(WHY_EXIT)) | (TaskState::Exited, None) => {
             "its agent exited before landing".to_string()
         }
+        (_, Some(WHY_EXIT_STATUS)) => "its program exited with a failure status".to_string(),
+        (_, Some(WHY_NO_EXIT_STATUS)) => "no exit status of its program was read".to_string(),
         (_, Some(why)) => format!("ended unfinished ({why})"),
         (_, None) => "ended unfinished".to_string(),
     }
@@ -320,6 +333,12 @@ pub(crate) struct TaskRecord {
     pub(crate) agent: Option<aterm_phase::Program>,
     /// Canonical `cwd` trusted by the starter when spawning the worker.
     pub(crate) trusted_cwd: Option<String>,
+    /// A PROGRAM WORKER'S BLOCK ([`Self::runs_a_program`], `crate::program_worker`): the id of the
+    /// shell block its launcher typed its program into ([`note_program_block`]), the first of the
+    /// tab's blocks its program's end is read from; none before its line was typed, and none once
+    /// its task concluded ([`TaskMark::apply`]), so nothing that reopens it later is concluded
+    /// again by that end. A carry row holds it (`block=`).
+    pub(crate) program_block: Option<u64>,
     /// The fact word the harness loop noted for a managed worker under the owner's `prompt`
     /// (`fact=`, [`mark_session_task_fact_if`]): the line it would have typed but for the
     /// manager. A mark never touches it.
@@ -340,6 +359,13 @@ impl TaskRecord {
     #[must_use]
     pub(crate) fn conclusion(&self) -> Option<Conclusion> {
         self.state.conclusion(self.finished)
+    }
+
+    /// Whether the record is a program worker's (`spawn program=`): no harness reads its tab, and
+    /// its program's exit code concludes it (`crate::program_worker`).
+    #[must_use]
+    pub(crate) fn runs_a_program(&self) -> bool {
+        self.agent == Some(aterm_phase::Program::Generic)
     }
 
     /// Whether a waiter has news (a terminal state or a standing ask, [`Self::attention`]).
@@ -448,6 +474,9 @@ impl TaskRecord {
         if let Some(folder) = &self.trusted_cwd {
             out.push_str(" trusted_cwd=");
             out.push_str(&crate::control::pct_encode(folder));
+        }
+        if let Some(block) = self.program_block {
+            out.push_str(&format!(" block={block}"));
         }
         if self.fact_rev > 0 {
             if let Some(word) = self.fact {
@@ -562,6 +591,10 @@ impl TaskRecord {
             carried_entered: None,
             agent: field("agent").and_then(worker_agent),
             trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
+            program_block: match field("block") {
+                Some(block) => Some(parse_u64(block)?),
+                None => None,
+            },
             fact: field("fact")
                 .filter(|_| fact_rev > 0)
                 .and_then(FactWord::parse),
@@ -588,12 +621,16 @@ fn trusted_folder(value: &str) -> Option<String> {
 }
 
 /// The agent a worker's `agent=` word names: one a spawn can start
-/// (`aterm_agent::harness::worker::worker_cli`), else none.
+/// (`aterm_agent::harness::worker::worker_cli`), or [`aterm_phase::Program::Generic`], a program
+/// worker's ([`TaskRecord::runs_a_program`]); else none.
 fn worker_agent(word: &str) -> Option<aterm_phase::Program> {
     aterm_phase::Program::ALL
         .into_iter()
         .find(|p| p.name() == word)
-        .filter(|p| aterm_agent::harness::worker::worker_cli(*p).is_some())
+        .filter(|p| {
+            *p == aterm_phase::Program::Generic
+                || aterm_agent::harness::worker::worker_cli(*p).is_some()
+        })
 }
 
 /// THE `checked=` WORD `value` IS (§14.9, slice 9c), as a landing's receipt writes it
@@ -627,6 +664,13 @@ pub(crate) const CHECKED_BY_HAND: &str =
 /// and that fails the task itself.
 pub(crate) const FAILED_UNDER_A_LOOP: &str = "ERR task mark: Autopilot carries this session, so a \
      mark of failed would not stop its typing: set its Autopilot off, which fails the task\n";
+
+/// THE REFUSAL OF A HARNESS'S MARK ON A PROGRAM WORKER'S TASK (`spawn program=`,
+/// `crate::program_worker`): its program's exit status concludes it, so an agent's harness reading
+/// a CLI the program started (`program=env arg=claude`, a script that runs one) marks nothing of
+/// it, and its conclusion is never two concluders' race.
+pub(crate) const PROGRAM_MARK_BY_HARNESS: &str = "ERR task mark: a program worker's task is \
+     concluded by its program's exit status, not by a harness\n";
 
 /// Whether a loop carries the session now: a live claim on it, under an Autopilot word that types.
 fn loop_carries(ctx: &SessionCtx) -> bool {
@@ -787,6 +831,7 @@ impl TaskMark {
                 carried_entered: None,
                 agent: None,
                 trusted_cwd: None,
+                program_block: None,
                 fact: None,
                 fact_rev: 0,
             };
@@ -844,6 +889,13 @@ impl TaskMark {
         next.result_bytes = self.result_bytes;
         next.result_path.clone_from(&self.result_path);
         next.attention = attention;
+        // A PROGRAM'S END CONCLUDES ITS TASK ONCE: a concluded record keeps no block to read it from.
+        if matches!(
+            self.state,
+            TaskState::Done | TaskState::Failed | TaskState::Exited
+        ) {
+            next.program_block = None;
+        }
         (next, true)
     }
 }
@@ -1166,11 +1218,15 @@ pub(crate) fn fact_edit(
     (outcome, Some(next))
 }
 
-/// Reopens a finished or failed worker's task to `working` when a new turn is sent to it.
+/// Reopens a finished or failed worker's task to `working` when a new turn is sent to it. A
+/// program worker's never reopens ([`TaskRecord::runs_a_program`]): its task was its one program,
+/// whose end concluded it, and what a turn types runs at its shell as no task of its.
 pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found: Option<u64>) {
     let is_done = |r: Option<&TaskRecord>| {
         r.is_some_and(|r| {
-            matches!(r.state, TaskState::Done | TaskState::Failed) && Some(r.entered) == found
+            matches!(r.state, TaskState::Done | TaskState::Failed)
+                && Some(r.entered) == found
+                && !r.runs_a_program()
         })
     };
     if *by == TurnBy::Harness
@@ -1205,6 +1261,10 @@ pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found
 /// AN OFF FAILS THE TASK ONCE IT HAS STOOD [`OFF_SETTLES_MS`] (`now_unix_ms`): the chip's click
 /// order passes through Off on its way from Land to Cruise, and a click that only passes through
 /// tells a waiter nothing ([`off_settles_in`] says when to look again).
+///
+/// A PROGRAM WORKER'S TASK NEVER MOVES BY THE WORD ([`TaskRecord::runs_a_program`]): no Autopilot
+/// carries it, so an Off stops nothing of its and Cruise types no task into it; its program's exit
+/// status alone concludes it.
 #[must_use]
 pub(crate) fn autopilot_mark(
     record: &TaskRecord,
@@ -1213,6 +1273,9 @@ pub(crate) fn autopilot_mark(
     now_unix_ms: u64,
 ) -> Option<TaskMark> {
     use aterm_agent::supervise::Autopilot;
+    if record.runs_a_program() {
+        return None;
+    }
     let set_by = set_by.filter(|by| by.actor != aterm_slog::Actor::Aterm)?;
     let set_ms = u64::try_from(set_by.since_ms).ok();
     let set_since = set_ms.is_some_and(|ms| ms >= record.since_unix_ms);
@@ -1250,7 +1313,8 @@ pub(crate) fn autopilot_mark(
 pub(crate) const OFF_SETTLES_MS: u64 = 3_000;
 
 /// How long until the Off standing on `record`'s session has stood [`OFF_SETTLES_MS`], where it is
-/// one that will fail the task then ([`autopilot_mark`]); `None` where no Off waits to fail it.
+/// one that will fail the task then ([`autopilot_mark`]); `None` where no Off waits to fail it, a
+/// program worker's included.
 #[must_use]
 pub(crate) fn off_settles_in(
     record: &TaskRecord,
@@ -1258,6 +1322,9 @@ pub(crate) fn off_settles_in(
     set_by: Option<&crate::session_timeline::AutopilotSetBy>,
     now_unix_ms: u64,
 ) -> Option<std::time::Duration> {
+    if record.runs_a_program() {
+        return None;
+    }
     let set_by = set_by.filter(|by| by.actor != aterm_slog::Actor::Aterm)?;
     let set_ms = u64::try_from(set_by.since_ms).ok()?;
     let settles = set_ms.saturating_add(OFF_SETTLES_MS);
@@ -1501,6 +1568,26 @@ pub(crate) fn mark_restored_over(ctx: &SessionCtx, local_id: u64) {
     }
 }
 
+/// Notes on `ctx`'s program worker record ([`TaskRecord::runs_a_program`]) the shell block `block`
+/// its launcher just typed its program into ([`TaskRecord::program_block`]), where none is noted
+/// and the record is still open (`working`, or `stalled` by a deadline that read it first), under
+/// the fence a committing update holds, waiting at most `fence_wait`, so a seamless update carries
+/// it. It moves no rev: nothing a waiter reads changed. Returns whether it was noted.
+pub(crate) fn note_program_block(
+    ctx: &SessionCtx,
+    block: u64,
+    fence_wait: std::time::Duration,
+) -> bool {
+    ctx.fabric
+        .run_unfenced(fence_wait, || {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note_program_block(block)
+        })
+        .unwrap_or(false)
+}
+
 /// Restores a carried task record onto `ctx` during seamless-update adoption.
 pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     let Some(row) = row else {
@@ -1611,17 +1698,20 @@ pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str
     } else {
         AttentionEdit::TakeDown(crate::harness_host::deadline_attention_stands)
     };
+    let by_harness = crate::control::serving_principal() == Principal::Harness;
     let Ok(marked) = mark_session_task_with(
         ctx,
         local_id,
         Some(&parsed),
         edit,
         ctx.fabric.fence_wait(),
-        |_, _| true,
+        |record, _| !(by_harness && record.is_some_and(TaskRecord::runs_a_program)),
     ) else {
         return crate::fabric::HOLD_BUSY.to_string();
     };
-    let marked = marked.expect("an unconditional mark is applied");
+    let Some(marked) = marked else {
+        return PROGRAM_MARK_BY_HARNESS.to_string();
+    };
     if marked.attention_moved {
         crate::presence::post_meta_changed(local_id);
     }
@@ -1777,9 +1867,10 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
 
 /// Formats a single `await task` reply row (` conclusion=` once the task ended,
 /// [`TaskRecord::conclusion`], ` why=` where something said, ` checked=` where a landing named what
-/// aterm checked, §14.9 slice 9c, ` left=` where it read the agent's left processes, and ` fact=
-/// fact_rev=` at its end once the record's fact word was
-/// ever edited, [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a claim shown
+/// aterm checked, §14.9 slice 9c, ` left=` where it read the agent's left processes, ` exit=` where
+/// an exit code is known, as `task` orders them, and ` fact= fact_rev=` at its end once the
+/// record's fact word was ever edited, [`TaskRecord::push_fact`]); `program` is the
+/// `program_state=` column, a claim shown
 /// beside `agent=` that no wait reads. A tab closed on a task with no conclusion yet reads
 /// `conclusion=failed`: nothing is left to finish it.
 #[must_use]
@@ -1815,6 +1906,9 @@ pub(crate) fn await_row(
         if let Some(left) = &record.left {
             row.push_str(" left=");
             row.push_str(left);
+        }
+        if let Some(exit) = record.exit {
+            row.push_str(&format!(" exit={exit}"));
         }
         record.push_fact(&mut row);
     }

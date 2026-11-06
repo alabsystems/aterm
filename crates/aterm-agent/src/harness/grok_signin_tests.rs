@@ -13,6 +13,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Grok Build 1.0.70's lines under the no-desk sandbox (`fixtures/signin/…no-desk.stderr`, its
 /// code made up), up to the wait.
@@ -331,7 +332,7 @@ impl Auto for Rung {
     fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
         self.asked += 1;
         self.email = handoff.email.map(str::to_owned);
-        self.left = Some(handoff.deadline.saturating_duration_since(Instant::now()));
+        self.left = Some(handoff.deadline.remaining());
         let wait_for_end = |rung: &mut Rung| {
             let until = Instant::now() + Duration::from_secs(60);
             while !(handoff.finished)() && Instant::now() < until {
@@ -2341,7 +2342,7 @@ fn the_live_rung_waits_for_the_machines_sign_in_lock() {
     }
     let url = "https://accounts.x.ai/oauth2/device?client_id=a&client_id=b&user_code=WMRT-8KQZ";
     let mut approve = |finished: &'static dyn Fn() -> bool, within: Duration| -> Approval {
-        let deadline = Instant::now() + within;
+        let deadline = WakeDeadline::after(within);
         live.approve(&Handoff {
             url,
             code: Some("WMRT-8KQZ"),
@@ -2370,6 +2371,178 @@ fn the_live_rung_waits_for_the_machines_sign_in_lock() {
         matches!(&said, Approval::Refused(why) if why.contains("conflicting clients")),
         "CONTROL: {said:?}"
     );
+}
+
+/// THE LIVE RUNG'S WAIT FOR THE MACHINE'S SIGN-IN LOCK COUNTS THE TIME ITS HOST SLEPT
+/// (KI-1105-14): while another of aterm's sign-ins holds the lock, a rung with an hour's deadline
+/// whose host then slept two hours stops for a person at its first look, naming the lock.
+/// NEGATIVE CONTROL: that wait measured on the clock that stops in sleep alone waited the hour
+/// out, which the one-minute hang detector reports.
+#[cfg(unix)]
+#[test]
+fn the_live_rungs_wait_for_the_sign_in_lock_counts_the_time_its_host_slept() {
+    use super::super::accounts::Store;
+    const HOUR: Duration = Duration::from_secs(3600);
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    let roster = tmp.path().join("grok-accounts.toml");
+    std::fs::write(
+        &roster,
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n",
+    )
+    .unwrap();
+    let store = Store::at_for(&state, Cli::Grok, &home);
+    let _held = store.signin_now().expect("lock").expect("free");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The rung runs on this thread, which alone reads the sleep its first look says its host
+    // slept.
+    std::thread::spawn(move || {
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let mut live = LiveAuto::new(Some(roster), Some(store), Some(home), clock());
+        let _ = live.ladder(false, &|| false);
+        let slept = std::cell::Cell::new(false);
+        let finished = || {
+            if !slept.replace(true) {
+                super::super::wake_deadline::host_slept(2 * HOUR);
+            }
+            false
+        };
+        let said = live.approve(&Handoff {
+            url: "https://accounts.x.ai/oauth2/device?client_id=a&client_id=b&user_code=WMRT-8KQZ",
+            code: Some("WMRT-8KQZ"),
+            completion: crate::ai::connector::Completion::Device,
+            hosts: &["accounts.x.ai"],
+            email: Some("main@example.com"),
+            finished: &finished,
+            deadline: WakeDeadline::after(HOUR),
+        });
+        let _ = tx.send((said, slept.get()));
+    });
+    let (said, slept) = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the rung waited for the lock on the clock that stops in sleep, past the deadline its host slept through");
+    assert!(slept, "the rung looked at grok's end while it waited");
+    assert!(
+        matches!(&said, Approval::NeedsYou(why) if why.starts_with(super::super::accounts::SIGNIN_HELD)),
+        "{said:?}"
+    );
+}
+
+/// A CALLER'S WAIT FOR ANOTHER'S SIGN-IN COUNTS THE TIME ITS HOST SLEPT (KI-1105-14): a caller
+/// that waits, an hour's hang detector, on a lock another holds, whose host then slept two hours
+/// before its first look at its end, gives up then and runs nothing. NEGATIVE CONTROL: that wait
+/// measured on the clock that stops in sleep alone waited the hour out, which the one-minute hang
+/// detector reports.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_callers_wait_for_another_sign_in_counts_the_time_its_host_slept() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    let (said, waited) = std::sync::mpsc::channel();
+    // The wait runs on this thread, under its seam.
+    std::thread::spawn(move || {
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let bed = Bed::new("sign");
+        let seen = Seen::default();
+        let _held = try_take(lock_file(&bed.state()).unwrap())
+            .unwrap()
+            .expect("free");
+        let slept = std::cell::Cell::new(false);
+        let stopped = || {
+            if !slept.replace(true) {
+                super::super::wake_deadline::host_slept(2 * HOUR);
+            }
+            false
+        };
+        let mut owner = Counted::new(&seen, None);
+        let (ended, _) = gate_run_as(
+            &bed,
+            Some(Path::new(login_drive::SANDBOX_EXEC)),
+            (true, true),
+            (HOUR, &stopped),
+            vec![],
+            &mut Rung::bare(),
+            &mut owner,
+        );
+        let _ = said.send((ended, slept.get(), bed.runs()));
+    });
+    let (ended, slept, runs) = waited
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the caller waited on the clock that stops in sleep, past the deadline its host slept through");
+    assert!(
+        slept,
+        "the caller looked at whether it was stopped while it waited"
+    );
+    assert!(
+        matches!(&ended, Ended::NotRun(why) if why.starts_with("another sign-in held the lock past")),
+        "{ended:?}"
+    );
+    assert_eq!(runs, 0, "it ran nothing");
+}
+
+/// THE PERSON'S RUNG ENDS ONCE ITS HOST SLEPT PAST THE DEADLINE: a need raised with an hour's
+/// deadline, whose host then slept two hours, stops waiting for the person at its first look.
+/// NEGATIVE CONTROL: that wait measured on the clock that stops in sleep alone waited the hour out,
+/// which the one-minute hang detector reports.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_persons_rung_ends_once_its_host_slept_past_its_deadline() {
+    const HOUR: Duration = Duration::from_secs(3600);
+    let (said, waited) = std::sync::mpsc::channel();
+    // The rung runs on this thread, under its seam.
+    std::thread::spawn(move || {
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let bed = Bed::new("sign");
+        let seen = Seen::default();
+        let var = vars(vec![("HOME", bed.home().into_os_string())]);
+        let (home, state) = (bed.home(), bed.state());
+        let begin = |_: i64| -> Result<(), String> { Ok(()) };
+        let gate = Gate {
+            state: &state,
+            home: Some(&home),
+            var: &var,
+            program: (&bed.exe, &bed.lead),
+            sandbox: None,
+            hang: HOUR,
+            wait: false,
+            ack: true,
+            stopped: &never,
+            now: &clock,
+            begin: &begin,
+        };
+        let mut owner = Counted::new(&seen, None);
+        let mut need = NeedApprover {
+            owner: &mut owner,
+            gate: &gate,
+            setup: None,
+            raised: false,
+            stopped: false,
+            elsewhere: None,
+        };
+        let slept = std::cell::Cell::new(false);
+        let finished = || {
+            if !slept.replace(true) {
+                super::super::wake_deadline::host_slept(2 * HOUR);
+            }
+            false
+        };
+        let approval = need.approve(&Handoff {
+            url: "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
+            code: Some("WMRT-8KQZ"),
+            completion: crate::ai::connector::Completion::Device,
+            hosts: &["accounts.x.ai"],
+            email: None,
+            finished: &finished,
+            deadline: WakeDeadline::after(HOUR),
+        });
+        let _ = said.send((approval, need.raised));
+    });
+    let (approval, raised) = waited
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the rung waited on the clock that stops in sleep, past the deadline its host slept through");
+    assert!(raised, "the need went up before the wait");
+    assert_eq!(approval, Approval::Approved { page: false });
 }
 
 /// The record never credits the automatic rung with an approval grok's end made: a rung that

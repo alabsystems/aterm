@@ -98,20 +98,25 @@ pub fn mac_pins(index: &Value) -> Result<[BTreeMap<String, u64>; 2], Unknown> {
         )));
     };
     let programs = index.get("programs").and_then(Value::as_table);
-    let table = |v: Option<&Value>| {
-        v.and_then(Value::as_table)
-            .cloned()
-            .unwrap_or_else(aterm_toml::Table::new)
-    };
+    let base_pin = channel.get("pin").and_then(Value::as_table);
+    let by_target = channel.get("pin_by_target").and_then(Value::as_table);
     let mut out: [BTreeMap<String, u64>; 2] = Default::default();
     for (slot, arch) in MAC_ARCHES.iter().enumerate() {
-        let mut view = table(channel.get("pin"));
-        let overlay = table(table(channel.get("pin_by_target")).get(&triple(arch)));
-        for (k, v) in overlay {
-            view.insert(k, v);
+        let mut view: BTreeMap<&str, &Value> = base_pin
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        if let Some(overlay) = by_target
+            .and_then(|t| t.get(&triple(arch)))
+            .and_then(Value::as_table)
+        {
+            for (k, v) in overlay {
+                view.insert(k.as_str(), v);
+            }
         }
         for (program, build) in view {
-            if programs.and_then(|p| p.get(&program)).is_none() {
+            if programs.and_then(|p| p.get(program)).is_none() {
                 continue;
             }
             let name_ok = !program.is_empty()
@@ -119,8 +124,8 @@ pub fn mac_pins(index: &Value) -> Result<[BTreeMap<String, u64>; 2], Unknown> {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
             match build {
-                Value::Integer(n) if name_ok && n >= 0 => {
-                    out[slot].insert(program, n.unsigned_abs());
+                Value::Integer(n) if name_ok && *n >= 0 => {
+                    out[slot].insert(program.to_string(), n.unsigned_abs());
                 }
                 other => {
                     return Err(Unknown::Other(format!(
@@ -284,7 +289,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn fixture() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site/toolchain")
+        aterm_tempfile::manifest_dir().join("tests/fixtures/site/toolchain")
     }
 
     fn read_dir(dir: &Path) -> BTreeMap<String, String> {

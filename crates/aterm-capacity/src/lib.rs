@@ -170,10 +170,12 @@ pub(crate) fn open_regular_reader_with_meta(
     #[cfg(unix)]
     let (file, meta) = {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(path)
+        })?;
         let meta = file.metadata()?;
         (file, meta)
     };

@@ -101,14 +101,17 @@ fn exit_code(code: ExitCode) -> i32 {
     }
 }
 
-/// The checkout this binary was built from: the lanes build, measure and
-/// record against its tree.
+/// The checkout whose aterm-verify is running: the lanes build, measure and record against its
+/// tree. Every reader runs under `targo run -p aterm-verify` (the `verify` alias, a release's
+/// pilot lanes) or this crate's own tests, whose runner names this package's directory in that
+/// checkout when it starts the process ([`aterm_tempfile::manifest_dir`]); the verbs the Linux
+/// lane's guest runs bare (`browser-drive`, `provision`) read none.
 pub(crate) fn workspace_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = aterm_tempfile::manifest_dir();
     manifest
         .parent()
         .and_then(Path::parent)
-        .map_or_else(|| manifest.to_path_buf(), Path::to_path_buf)
+        .map_or_else(|| manifest.clone(), Path::to_path_buf)
 }
 
 /// Every lane, in the order a run executes them.

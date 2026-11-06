@@ -1290,6 +1290,13 @@ impl CellExtras {
 
     /// Clear extras for a single row (cleared or scrolled off), including both rings.
     pub(crate) fn clear_row(&mut self, row: u16) {
+        self.clear_row_retaining_capacity(row);
+        self.maybe_shrink();
+    }
+
+    /// Clear a row before replacing it, retaining the map allocation through the
+    /// refill. Judge excess capacity with `maybe_shrink` after the replacement.
+    pub(crate) fn clear_row_retaining_capacity(&mut self, row: u16) {
         // Rings first: ring-only writes bypass the map, so they may hold data
         // even when the map is empty.
         if let Some(ring) = &mut self.rgb_ring {
@@ -1315,7 +1322,6 @@ impl CellExtras {
             keep
         });
         self.max_row_cache.set_exact_opt(max_row);
-        self.maybe_shrink();
     }
 
     /// Clear extras for a range of columns in a row, including both rings.
@@ -1364,6 +1370,13 @@ impl CellExtras {
 
     /// Clear extras for a range of rows in a single pass, including both rings.
     pub(crate) fn clear_rows(&mut self, rows: core::ops::Range<u16>) {
+        self.clear_rows_retaining_capacity(rows);
+        self.maybe_shrink();
+    }
+
+    /// Remove a row range in one pass before refilling it. Judge excess map
+    /// capacity after the replacement has finished.
+    pub(crate) fn clear_rows_retaining_capacity(&mut self, rows: core::ops::Range<u16>) {
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_rows(rows.clone());
         }
@@ -1385,7 +1398,6 @@ impl CellExtras {
             keep
         });
         self.max_row_cache.set_exact_opt(max_row);
-        self.maybe_shrink();
     }
 
     /// Clear extras inside a rectangular area in one pass, including both rings, which the fast write paths fill directly (a DECCRA overwrite must wipe them).

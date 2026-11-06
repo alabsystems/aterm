@@ -65,8 +65,10 @@ impl PointSink for Points {
 }
 
 fn face_bytes(rel: &str) -> Vec<u8> {
-    let path = format!("{}/../aterm-render/{rel}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {path}: {e}"))
+    let path = aterm_tempfile::manifest_dir()
+        .join("../aterm-render")
+        .join(rel);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {}: {e}", path.display()))
 }
 
 fn truetype_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> (Vec<Seg>, Vec<bool>) {

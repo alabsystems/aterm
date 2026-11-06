@@ -3854,6 +3854,124 @@ fn a_drives_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() 
     );
 }
 
+/// A drive's typed turn into a Claude Code composer, its keys slower than the drive's 20 s
+/// allows (each held 400 ms on the driven node, `ATERM_DEBUG_TURN_KEY_LAG_MS`), lands whole: the
+/// composer takes the keys that fit and the rest as one paste, then an Enter moves the whole line
+/// up; and one whose first key does not fit writes nothing. The composer is then as the turn
+/// found it, so the next line is taken alone. As in the shell's drive above, what it judges is
+/// that property, never how soon the composer answers: a verified Enter is the composer's, and an
+/// Enter no look verified in its window says `pressed=`.
+/// NEGATIVE CONTROLS: cutting the typing at the deadline, as the turn did before its pace, answers
+/// `skipped reason=deadline typed=<n>` and leaves those keys in the composer (m14's drive of m108,
+/// 2026-11-04); the stand-in started as a plain program has its Enter verified by the screen,
+/// `submit_by=screen`.
+#[test]
+fn a_drives_typed_turn_into_claude_code_slower_than_its_deadline_lands_whole_or_writes_nothing() {
+    let (issuer, member, worker, target) =
+        driven_pair_with(("afci", "afcm"), &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
+    let at = format!("@{worker}");
+    let script = member.tmp.join("composer.sh");
+    std::fs::write(&script, crate::turn_submit_live_headless::COMPOSER).expect("the stand-in");
+    crate::turn_submit_live_headless::start(&member, &worker, &script, true, "takes");
+    let row = |n: usize| {
+        let screen = ctl_ok(&member, &[&at, "text"]);
+        screen
+            .lines()
+            .nth(n)
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    };
+    let shows = |n: usize, want: &str| {
+        let mut last = String::new();
+        let shown = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            last = row(n);
+            (last == want).then_some(())
+        });
+        assert!(
+            shown.is_some(),
+            "row {} never read {want:?}: {last:?}",
+            n + 1
+        );
+    };
+    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let line: String = format!("follow up on the notes {alphabet}")
+        .chars()
+        .take(72)
+        .collect();
+    let keys = line.chars().count();
+    // 72 keys 400 ms apart do not fit the drive's 20 s; the submit's share is half of it.
+    let sent = drive_in(
+        &issuer.tmp,
+        &target,
+        &[
+            &at,
+            "turn",
+            "typed=1",
+            "timeout=20000",
+            "settle=submitted",
+            "submit_window=10000",
+            &line,
+        ],
+    );
+    let verdict = String::from_utf8_lossy(&sent.stderr).into_owned();
+    // A turn whose Enter no look verified in its window ends `status=timeout`, which exits 124.
+    assert!(
+        sent.status.success() || sent.status.code() == Some(124),
+        "{sent:?}"
+    );
+    let count = |name: &str| {
+        field(verdict.trim_end(), name)
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("{name}= in {verdict}"))
+    };
+    let (typed, pasted) = (count("typed"), count("pasted"));
+    assert!(
+        !verdict.contains(" turn skipped ")
+            && ((verdict.contains("submitted=1") && verdict.contains(" submit_by=composer"))
+                || (verdict.contains("submitted=0") && verdict.contains(" pressed=")))
+            && typed > 0
+            && pasted > 0
+            && typed + pasted == keys,
+        "the keys that fit, then the rest as one paste and an Enter the composer took: {verdict}"
+    );
+    // The whole line went up once, and the composer is empty.
+    shows(2, &format!("❯ {line}"));
+    shows(20, "❯");
+    // A first key that does not fit: nothing is written.
+    let (_, skipped) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[
+            &at,
+            "turn",
+            "typed=1",
+            "cadence=2000",
+            "timeout=1000",
+            "submit_window=200",
+            "never typed",
+        ],
+    );
+    assert!(
+        skipped.contains(" turn skipped reason=deadline typed=0 pasted=0 submitted=0 "),
+        "{skipped}"
+    );
+    ctl_ok(
+        &member,
+        &[
+            &at,
+            "turn",
+            "typed=1",
+            "settle=submitted",
+            "submit_window=60000",
+            "timeout=60000",
+            "carry on",
+        ],
+    );
+    shows(3, "❯ carry on");
+    assert_eq!(row(2), format!("❯ {line}"), "the first line went up once");
+}
+
 #[test]
 fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_not() {
     let (holder, port) = hold_a_port();

@@ -101,6 +101,10 @@ pub struct ProcessReading {
     pub disk_read: Option<u64>,
     /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, and on Linux. An unreaped zombie keeps its final count, its start, its `disk_read` and its CPU times (macOS), though not its footprint.
     pub disk_written: Option<u64>,
+    /// Energy its threads used since it started, nanojoules (macOS `ri_energy_nj`, read with
+    /// `RUSAGE_INFO_V6`, [`crate::rusage`]); an unreaped zombie keeps its final count. `None`
+    /// where refused, on a kernel before macOS 12 (which has no V6), and off macOS.
+    pub energy_nj: Option<u64>,
     /// Its name, whole where any reader holds it whole ([`whole_name`]): on macOS `p_comm` (15
     /// bytes through the short BSD info, 16 through a zombie's kernel record), else `p_name` (31)
     /// or its image's basename; on Linux
@@ -293,6 +297,7 @@ pub(crate) mod imp {
     use super::{MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
     use crate::jobs::RunState;
     use crate::jobs::darwin::{PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
+    use crate::rusage::{Flavor, RusageV6, Usage};
 
     /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), which the `libc` crate does not export.
     const PROC_PIDT_SHORTBSDINFO: c_int = 13;
@@ -316,7 +321,6 @@ pub(crate) mod imp {
         rfu: u32,
     }
     const _: () = assert!(std::mem::size_of::<ShortInfo>() == 64);
-    const _: () = assert!(std::mem::size_of::<libc::rusage_info_v4>() == 296);
 
     /// The kernel's Mach timebase `(numer, denom)` ([`super::kernel_timebase`]), 1/1 when it cannot be read.
     pub(crate) fn timebase() -> (u32, u32) {
@@ -414,29 +418,32 @@ pub(crate) mod imp {
         (n == size).then_some(info.idversion)
     }
 
-    /// `pid`'s `RUSAGE_INFO_V4` (the user's own processes), or `None`.
-    pub(crate) fn rusage(pid: c_int) -> Option<libc::rusage_info_v4> {
+    /// `pid`'s usage (the user's own processes, and any zombie's), `RUSAGE_INFO_V6` where the
+    /// kernel has it ([`crate::rusage`]), or `None`.
+    pub(crate) fn rusage(pid: c_int) -> Option<Usage> {
         rusage_result(pid).ok()
     }
 
-    fn rusage_result(pid: c_int) -> Result<libc::rusage_info_v4, i32> {
-        // SAFETY: `rusage_info_v4` is plain integers; all-zero is valid.
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a writable `rusage_info_v4` and the flavor names exactly that layout.
-        let rc = unsafe {
-            libc::proc_pid_rusage(
-                pid,
-                libc::RUSAGE_INFO_V4,
-                (&raw mut info).cast::<libc::rusage_info_t>(),
-            )
-        };
-        if rc == 0 {
-            Ok(info)
-        } else {
-            Err(std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO))
-        }
+    /// The flavor this kernel answers, learned at the first read that tells.
+    static FLAVOR: Flavor = Flavor::new();
+
+    fn rusage_result(pid: c_int) -> Result<Usage, i32> {
+        let mut ri = RusageV6::default();
+        let v6 = FLAVOR.read(&mut ri, |flavor, ri| {
+            // SAFETY: `ri` is a writable `rusage_info_v6`, which holds either flavor's record
+            // (V4's is its first 296 bytes), and the kernel writes no more than the flavor's.
+            let rc = unsafe {
+                libc::proc_pid_rusage(pid, flavor, (&raw mut *ri).cast::<libc::rusage_info_t>())
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            }
+        })?;
+        Ok(Usage { ri, v6 })
     }
 
     fn priority(pid: c_int, which: c_int) -> Result<i32, i32> {
@@ -465,7 +472,7 @@ pub(crate) mod imp {
         }
     }
 
-    fn qos_cpu(u: libc::rusage_info_v4, numer: u32, denom: u32) -> [u64; 7] {
+    fn qos_cpu(u: &RusageV6, numer: u32, denom: u32) -> [u64; 7] {
         [
             u.ri_cpu_time_qos_default,
             u.ri_cpu_time_qos_maintenance,
@@ -479,7 +486,7 @@ pub(crate) mod imp {
     }
 
     /// `u`'s own user plus system time, ns at the timebase `numer/denom`.
-    fn cpu_of(u: libc::rusage_info_v4, numer: u32, denom: u32) -> u64 {
+    fn cpu_of(u: &RusageV6, numer: u32, denom: u32) -> u64 {
         ticks_to_ns(
             u.ri_user_time.saturating_add(u.ri_system_time),
             numer,
@@ -488,7 +495,7 @@ pub(crate) mod imp {
     }
 
     /// `u`'s reaped children's user plus system time, ns at the timebase `numer/denom`.
-    fn child_cpu_of(u: libc::rusage_info_v4, numer: u32, denom: u32) -> u64 {
+    fn child_cpu_of(u: &RusageV6, numer: u32, denom: u32) -> u64 {
         ticks_to_ns(
             u.ri_child_user_time.saturating_add(u.ri_child_system_time),
             numer,
@@ -552,13 +559,13 @@ pub(crate) mod imp {
             scheduling.qos_cpu_ns = match after_read {
                 Err(errno) => Some(Err(errno)),
                 Ok(u) => {
-                    super::kernel_timebase().map(|(numer, denom)| Ok(qos_cpu(u, numer, denom)))
+                    super::kernel_timebase().map(|(numer, denom)| Ok(qos_cpu(&u.ri, numer, denom)))
                 }
             };
             let after = after_read.ok();
             let usage = match (before, after) {
                 (Some(before), Some(after))
-                    if before.ri_proc_start_abstime == after.ri_proc_start_abstime =>
+                    if before.ri.ri_proc_start_abstime == after.ri.ri_proc_start_abstime =>
                 {
                     Some(after)
                 }
@@ -573,14 +580,15 @@ pub(crate) mod imp {
             procs.push(ProcessReading {
                 scheduling: Some(scheduling),
                 pid: pid as u32,
-                start: usage.map(|u| u.ri_proc_start_abstime),
+                start: usage.map(|u| u.ri.ri_proc_start_abstime),
                 ppid: info.ppid,
-                cpu_ns: usage.map(|u| cpu_of(u, numer, denom)),
-                child_cpu_ns: usage.map(|u| child_cpu_of(u, numer, denom)),
-                footprint: usage.map(|u| u.ri_phys_footprint),
-                resident: usage.map(|u| u.ri_resident_size),
-                disk_read: usage.map(|u| u.ri_diskio_bytesread),
-                disk_written: usage.map(|u| u.ri_diskio_byteswritten),
+                cpu_ns: usage.map(|u| cpu_of(&u.ri, numer, denom)),
+                child_cpu_ns: usage.map(|u| child_cpu_of(&u.ri, numer, denom)),
+                footprint: usage.map(|u| u.ri.ri_phys_footprint),
+                resident: usage.map(|u| u.ri.ri_resident_size),
+                disk_read: usage.map(|u| u.ri.ri_diskio_bytesread),
+                disk_written: usage.map(|u| u.ri.ri_diskio_byteswritten),
+                energy_nj: usage.and_then(|u| u.energy_nj()),
                 name,
                 pgid: info.pgid,
                 uid: Some(info.uid),
@@ -589,8 +597,8 @@ pub(crate) mod imp {
                 sid: u32::try_from(sid).unwrap_or(0),
                 has_tty: Some(info.flags & PROC_FLAG_CONTROLT != 0),
                 exec: Some(info.flags & PROC_FLAG_EXEC != 0),
-                runnable_ns: usage.map(|u| ticks_to_ns(u.ri_runnable_time, numer, denom)),
-                peak_footprint: usage.map(|u| u.ri_lifetime_max_phys_footprint),
+                runnable_ns: usage.map(|u| ticks_to_ns(u.ri.ri_runnable_time, numer, denom)),
+                peak_footprint: usage.map(|u| u.ri.ri_lifetime_max_phys_footprint),
                 read_at,
                 coalition,
                 version,
@@ -610,17 +618,18 @@ pub(crate) mod imp {
             };
             let last = before
                 .zip(rusage(pid))
-                .filter(|(b, a)| a.ri_proc_start_abstime == b.ri_proc_start_abstime)
+                .filter(|(b, a)| a.ri.ri_proc_start_abstime == b.ri.ri_proc_start_abstime)
                 .map(|(_, a)| a);
             procs.push(ProcessReading {
                 pid: pid as u32,
-                start: last.map(|u| u.ri_proc_start_abstime),
+                start: last.map(|u| u.ri.ri_proc_start_abstime),
                 ppid: k.ppid,
-                cpu_ns: last.map(|u| cpu_of(u, numer, denom)),
-                child_cpu_ns: last.map(|u| child_cpu_of(u, numer, denom)),
+                cpu_ns: last.map(|u| cpu_of(&u.ri, numer, denom)),
+                child_cpu_ns: last.map(|u| child_cpu_of(&u.ri, numer, denom)),
                 footprint: None,
-                disk_read: last.map(|u| u.ri_diskio_bytesread),
-                disk_written: last.map(|u| u.ri_diskio_byteswritten),
+                disk_read: last.map(|u| u.ri.ri_diskio_bytesread),
+                disk_written: last.map(|u| u.ri.ri_diskio_byteswritten),
+                energy_nj: last.and_then(|u| u.energy_nj()),
                 name: super::whole_name(k.comm.as_bytes(), KINFO_COMM_CUT, longer_names(pid)),
                 pgid: k.pgid,
                 uid: Some(k.uid),
@@ -928,6 +937,13 @@ mod tests {
     /// Live on Linux: this process's swept birth is `ps`'s reckoning of it (`/proc/stat`'s
     /// `btime` plus its start in clock ticks), within `btime`'s whole second.
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        target_pointer_width = "64",
+        expect(
+            clippy::useless_conversion,
+            reason = "sysconf's c_long is i64 on LP64 and i32 on 32-bit"
+        )
+    )]
     #[test]
     fn the_linux_sweep_reads_this_processs_birth_as_ps_reckons_it() {
         let me = std::process::id();
@@ -1362,7 +1378,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn own_and_reaped_ns(pid: u32) -> (u64, u64) {
         let (numer, denom) = imp::timebase();
-        let u = imp::rusage(i32::try_from(pid).expect("a pid")).expect("its usage");
+        let u = imp::rusage(i32::try_from(pid).expect("a pid"))
+            .expect("its usage")
+            .ri;
         (
             ticks_to_ns(
                 u.ri_user_time.saturating_add(u.ri_system_time),

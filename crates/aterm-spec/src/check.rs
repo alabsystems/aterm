@@ -300,8 +300,11 @@ pub(crate) fn each_after<T: Sync, R: Send>(
     done.into_iter().map(|(_, r)| r).collect()
 }
 
+/// aterm-spec-models, beside the running package under `crates/`: spec-check runs through
+/// `targo run -p aterm-models` (verify's spec row and every bundle's README), which names that
+/// package's directory when it starts the binary ([`aterm_tempfile::manifest_dir`]).
 fn spec_models() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-spec-models")
+    aterm_tempfile::manifest_dir().join("../aterm-spec-models")
 }
 
 const LABEL: &str = "spec-check";

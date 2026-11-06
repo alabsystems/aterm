@@ -287,6 +287,23 @@ impl Sim {
         s.dev.logical.len()
     }
 
+    /// The log's length.
+    pub(crate) fn log_len(&self) -> usize {
+        self.lock().dev.logical.len()
+    }
+
+    /// Up to `buf.len()` bytes of the log from byte `start`, fewer where it ends: how many.
+    pub(crate) fn read_log_at(&self, start: u64, buf: &mut [u8]) -> usize {
+        let s = self.lock();
+        let from = usize::try_from(start).unwrap_or(usize::MAX);
+        let have = s.dev.logical.get(from..).unwrap_or(&[]);
+        let n = have.len().min(buf.len());
+        if let (Some(dst), Some(src)) = (buf.get_mut(..n), have.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        n
+    }
+
     pub(crate) fn append(&self, bytes: &[u8]) {
         let mut s = self.lock();
         let from = s.dev.logical.len();

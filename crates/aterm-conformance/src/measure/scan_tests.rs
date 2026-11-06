@@ -1607,7 +1607,7 @@ struct Fixture {
 
 impl Fixture {
     fn load(dir: &str, names: &'static [&'static str]) -> Self {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = aterm_tempfile::manifest_dir()
             .join("tests/fixtures/paint")
             .join(dir);
         let frames = names
@@ -2276,7 +2276,7 @@ const PLANE_TAKE: TypedRow = TypedRow {
 };
 
 fn plane_reaches(dir: &str, shots: &[&str]) -> Vec<Option<usize>> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = aterm_tempfile::manifest_dir()
         .join("tests/fixtures/paint")
         .join(dir);
     let load = |n: &str| Frame::load(&root.join(format!("{n}.png"))).expect("fixture frame");

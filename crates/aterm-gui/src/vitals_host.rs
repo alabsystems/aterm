@@ -22,8 +22,8 @@ use aterm_vitals::explain::{
 use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample,
-    Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample,
-    ProcState, Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens,
+    Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcSample, ProcState,
+    Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens, TaskRoom,
     Thermal, Throttle, Ticks, VolumeSample,
 };
 use aterm_vitals::ring::{GapKind, SavedRing, TimeGap};
@@ -83,7 +83,9 @@ pub(crate) const MIN_WINDOW: Duration = Duration::from_millis(250);
 /// Minimum interval between pane-layout checks between readings.
 pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 const JOB_EVENTS_CAP: usize = 256;
-/// How often, at most, the bars' reading reads the split set.
+/// How often, at most, the bars' reading reads the split set: each process's coalition and the
+/// split. The coalitions' counters it splits are read at every reading
+/// ([`SplitReader::coalitions`]).
 pub(crate) const SPLIT_EVERY: Duration = Duration::from_secs(5);
 /// How often, at most, the bars' reading reads the split set while a lens is open.
 pub(crate) const SPLIT_EVERY_LENS: Duration = Duration::from_secs(1);
@@ -364,6 +366,10 @@ pub(crate) struct Request {
     /// clause, but a close-up opens from it as from the Deck, and a close-up's causes are the
     /// episodes already open.
     pub(crate) deck: bool,
+    /// A window in view shows the bars or a page that reads them ([`Audience::in_view`]): when
+    /// none does, Linux's all-states TCP dump paces itself to a hidden deck's minute
+    /// ([`Source::after_publish`]).
+    pub(crate) in_view: bool,
     /// Every agent session's token totals, each session once.
     pub(crate) tokens: Vec<TokenRow>,
     /// The front tab's plan usage, while current.
@@ -1159,6 +1165,11 @@ trait Source {
     /// The thread's stop, after its last reading, with the host's last tellings: the leftover pass
     /// closes the tabs it holds at it ([`crate::vitals_left::LeftPass::at_stop`]).
     fn at_stop(&mut self, _told: &[u64]) {}
+    /// After a reading is handed over and published, its post made: work a reading leaves off its
+    /// own path, posting nothing to the main loop (A3 L1's hook, which A2's S7 lanes extend).
+    /// `hidden`: no window in view shows the bars or a page that reads them
+    /// ([`Request::in_view`]), whatever the reading read.
+    fn after_publish(&mut self, _hidden: bool) {}
     fn capture_name(
         &self,
         _session: u64,
@@ -1189,6 +1200,10 @@ impl Source for Reader {
         } else {
             self.read(req)
         }
+    }
+
+    fn after_publish(&mut self, hidden: bool) {
+        (self.net.after_publish)(hidden);
     }
 
     fn model(&mut self) -> &mut aterm_vitals::Vitals {
@@ -1467,6 +1482,7 @@ fn run(
                 at: Instant::now(),
             })
         });
+        let hidden = !req.in_view;
         let jobs_moved = hand_over_allocation(latest, &snap, words, began, leases);
         crate::metrics::note_reading(crate::metrics::ReadingStep::Handed);
         if let Some(sys) = sys {
@@ -1494,6 +1510,7 @@ fn run(
             break;
         }
         finish_names(&source, replies);
+        source.after_publish(hidden);
         let kept_at = Instant::now();
         if current_report.is_some() {
             report.keep(&current_report, kept_at, policy_changed);
@@ -1921,8 +1938,12 @@ pub(crate) struct CoalProbe {
         aterm_sysprobe::SweepOpts,
         &mut aterm_sysprobe::coalitions::CoalitionIds,
     ) -> Option<aterm_sysprobe::Sweep>,
-    /// Every coalition's counters ([`aterm_sysprobe::coalitions::coalitions`]).
+    /// Every coalition's counters ([`aterm_sysprobe::coalitions::coalitions`]), read at every
+    /// reading while the lane is on: the start counter's, and on split ticks the split's too.
     pub(crate) coalitions: fn() -> Option<aterm_sysprobe::coalitions::CoalitionRead>,
+    /// The start counter where no coalition lane reads: Linux's forks, from the reading's own
+    /// core-ticks read of `/proc/stat` ([`aterm_sysprobe::Probe::forks`]).
+    pub(crate) forks: fn(&aterm_sysprobe::Probe) -> Option<u64>,
     /// A process's short name and birth, unix ms, from its kernel record
     /// ([`aterm_sysprobe::kproc::record`]).
     pub(crate) birth: fn(u32) -> Option<(String, i64)>,
@@ -1948,6 +1969,7 @@ impl CoalProbe {
         self_check: aterm_sysprobe::coalitions::self_check,
         sweep: aterm_sysprobe::processes_keeping,
         coalitions: aterm_sysprobe::coalitions::coalitions,
+        forks: aterm_sysprobe::Probe::forks,
         birth: |pid| aterm_sysprobe::kproc::record(pid).and_then(name_and_birth),
         births: || {
             Some(
@@ -1968,6 +1990,7 @@ impl CoalProbe {
         self_check: |_| Err("unsupported"),
         sweep: aterm_sysprobe::processes_keeping,
         coalitions: || None,
+        forks: |_| None,
         birth: |_| None,
         births: || None,
         identity: |_| None,
@@ -1985,8 +2008,12 @@ pub(crate) struct NetProbe {
     pub(crate) links: fn(&mut Vec<u8>) -> Option<Vec<aterm_sysprobe::LinkReading>>,
     /// TCP socket states and passive smoothed RTT ([`aterm_sysprobe::tcp_summary_into`]).
     pub(crate) tcp: fn(&mut Vec<u8>) -> Option<aterm_sysprobe::TcpSummary>,
-    /// Open `AF_INET`/`AF_INET6` sockets of one process ([`aterm_sysprobe::open_socket_count`]).
+    /// Open TCP sockets of one process ([`aterm_sysprobe::open_socket_count`]; macOS counts every
+    /// socket).
     pub(crate) open_sockets: fn(u32) -> Option<u32>,
+    /// The TCP readers' work after a reading publishes, `true` when no window in view reads the
+    /// stream ([`aterm_sysprobe::tcp_after_publish`]: Linux's all-states dump, once an epoch).
+    pub(crate) after_publish: fn(bool),
 }
 
 impl NetProbe {
@@ -1995,6 +2022,7 @@ impl NetProbe {
         links: aterm_sysprobe::net_links_into,
         tcp: aterm_sysprobe::tcp_summary_into,
         open_sockets: aterm_sysprobe::open_socket_count,
+        after_publish: aterm_sysprobe::tcp_after_publish,
     };
 
     /// The inert arm for deterministic offline tests.
@@ -2003,6 +2031,7 @@ impl NetProbe {
         links: |_| None,
         tcp: |_| None,
         open_sockets: |_| None,
+        after_publish: |_| {},
     };
 }
 
@@ -2046,6 +2075,8 @@ struct Ident {
 pub(crate) struct SplitReader {
     probe: CoalProbe,
     lane: CoalLane,
+    /// aterm's own resource coalition, as the launch self-check read it.
+    own: Option<u64>,
     vouches: bool,
     armed: &'static Arming,
     last: Option<Instant>,
@@ -2066,7 +2097,8 @@ pub(crate) struct SplitReader {
 impl SplitReader {
     /// Constructs a split reader and runs the launch self-check on this process.
     pub(crate) fn new(probe: CoalProbe, armed: &'static Arming) -> Self {
-        let lane = match (probe.self_check)(std::process::id()) {
+        let checked = (probe.self_check)(std::process::id());
+        let lane = match checked {
             Ok(_) => CoalLane::On,
             Err("unsupported") => CoalLane::Unsupported,
             Err(missed) => {
@@ -2088,6 +2120,7 @@ impl SplitReader {
         Self {
             probe,
             lane,
+            own: checked.ok(),
             vouches,
             armed,
             last: None,
@@ -2102,6 +2135,31 @@ impl SplitReader {
 
     fn due(&self, req: &Request, now: Instant) -> bool {
         self.lane.on() && split_due(self.last, req, self.armed.armed(), now)
+    }
+
+    /// Every coalition's counters, read at every reading while the lane is on (record §8.2):
+    /// the start counter's read, which a split tick's split takes too.
+    fn coalitions(&self) -> Option<aterm_sysprobe::coalitions::CoalitionRead> {
+        self.lane.on().then(self.probe.coalitions).flatten()
+    }
+
+    /// The machine's start counter at this reading ([`aterm_vitals::starts`]): while the lane
+    /// is on, each answering coalition's task counters from `read`, and aterm's own coalition (a
+    /// read in which none answered counts nothing, [`aterm_vitals::starts::coalition_moves`]);
+    /// with the lane off or unsupported, Linux's forks from `machine`'s core-ticks read at this
+    /// reading.
+    fn start_count(
+        &self,
+        read: Option<&aterm_sysprobe::coalitions::CoalitionRead>,
+        machine: &aterm_sysprobe::Probe,
+    ) -> Option<aterm_vitals::StartCount> {
+        if self.lane.on() {
+            return read.map(|r| aterm_vitals::StartCount::Coalitions {
+                read: coal_tasks(r),
+                own: self.own,
+            });
+        }
+        (self.probe.forks)(machine).map(aterm_vitals::StartCount::Forks)
     }
 
     fn cold(&self, now: Instant) -> bool {
@@ -2313,6 +2371,21 @@ fn lead_identity(
     }
 }
 
+/// The task counters of `read`'s answering coalitions ([`aterm_vitals::starts`]).
+fn coal_tasks(
+    read: &aterm_sysprobe::coalitions::CoalitionRead,
+) -> aterm_vitals::starts::CoalTaskRead {
+    aterm_vitals::starts::CoalTaskRead::of(
+        read.newest,
+        read.truncated,
+        read.rows.iter().map(|u| aterm_vitals::starts::CoalTasks {
+            id: u.id,
+            started: u.tasks_started,
+            exited: u.tasks_exited,
+        }),
+    )
+}
+
 fn coal_sample(read: aterm_sysprobe::coalitions::CoalitionRead) -> CoalSample {
     CoalSample {
         listed: read.listed,
@@ -2468,8 +2541,8 @@ impl WhyFixture {
             tcp_srtt_ms: live.tcp_srtt_ms,
             aterm_sockets: live.aterm_sockets,
             tab_sockets: live.tab_sockets.clone(),
-            proc_limits: live.proc_limits,
-            pid_counts: live.pid_counts,
+            room: live.room,
+            starts: live.starts.clone(),
             disk: live.disk.clone(),
             tokens: live.tokens.clone(),
             plan: live.plan.clone(),
@@ -2738,6 +2811,15 @@ impl Reader {
         reader
     }
 
+    /// The machine's coalitions at this reading ([`SplitReader::coalitions`]); none while a
+    /// recorded scene stands for the machine's lane, whose coalitions are the scene's.
+    fn coalitions(&self) -> Option<aterm_sysprobe::coalitions::CoalitionRead> {
+        if self.fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
+            return None;
+        }
+        self.split.coalitions()
+    }
+
     fn read_scene(&mut self, fixture: Option<WhyFixture>) {
         if fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
             self.split.lane = CoalLane::On;
@@ -2807,10 +2889,9 @@ impl Reader {
             },
             &mut self.split.coalition_ids,
         );
-        let coalitions = (live_split && sweep.is_some())
-            .then(self.split.probe.coalitions)
-            .flatten();
+        let coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, at_unix_ms);
+        sample.starts = self.split.start_count(coalitions.as_ref(), &self.probe);
         sample.machine_only = false;
         sample.procs_truncated = sweep.as_ref().is_some_and(|s| s.truncated);
         let observed = sweep
@@ -2833,7 +2914,7 @@ impl Reader {
                 complete,
             }
         });
-        if let Some(read) = coalitions {
+        if let Some(read) = coalitions.filter(|_| live_split && sweep.is_some()) {
             self.split.fill(&mut sample, read, now);
         } else {
             // Every whole reading, a jobs-only edge's too: `sys` answers a
@@ -2916,8 +2997,10 @@ impl Reader {
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
+        let coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, unix_ms_now());
         sample.machine_only = true;
+        sample.starts = self.split.start_count(coalitions.as_ref(), &self.probe);
         sample.timeline = self.split.timeline();
         let scene = self
             .fixture
@@ -3039,12 +3122,12 @@ impl Reader {
             thermal: (self.thermal)().or_else(|| self.counter_throttle()),
             swapped_kib: aterm_sysprobe::swapped_kib(),
             links,
-            tcp: tcp_sum.map(|s| tcp_counts(s.counts)),
+            tcp: tcp_sum.map(|s| tcp_counts(s.counts, s.counters_only)),
             tcp_srtt_ms: tcp_sum.and_then(|s| s.srtt_ms),
             aterm_sockets: None,
             tab_sockets: Vec::new(),
-            proc_limits: proc_limits(aterm_sysprobe::process_limits()),
-            pid_counts: aterm_sysprobe::pid_counts(self.uid.unwrap_or(0)),
+            room: task_room(aterm_sysprobe::task_room(self.uid.unwrap_or(0))),
+            starts: None,
             self_uid: self.uid,
             disk: Some(disk_facts(
                 shelf,
@@ -3136,6 +3219,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         name: p.name.clone(),
         disk_read: p.disk_read,
         disk_written: p.disk_written,
+        energy_nj: p.energy_nj,
         uid: p.uid,
         pgid: p.pgid,
         sid: p.sid,
@@ -3246,6 +3330,7 @@ fn gpu_sample(g: aterm_sysprobe::GpuReading) -> GpuSample {
         recoveries: g.recoveries,
         renderer_pct: g.renderer_pct,
         tiler_pct: g.tiler_pct,
+        unified: g.unified,
     }
 }
 
@@ -3284,7 +3369,7 @@ fn link_sample(l: &aterm_sysprobe::LinkReading) -> LinkSample {
     }
 }
 
-const fn tcp_counts(t: aterm_sysprobe::TcpCounts) -> aterm_vitals::TcpCounts {
+const fn tcp_counts(t: aterm_sysprobe::TcpCounts, counters_only: bool) -> aterm_vitals::TcpCounts {
     aterm_vitals::TcpCounts {
         established: t.established,
         syn_sent: t.syn_sent,
@@ -3297,13 +3382,20 @@ const fn tcp_counts(t: aterm_sysprobe::TcpCounts) -> aterm_vitals::TcpCounts {
         last_ack: t.last_ack,
         listen: t.listen,
         closing: t.closing,
+        counters_only,
     }
 }
 
-const fn proc_limits(l: aterm_sysprobe::ProcessLimits) -> ProcLimits {
-    ProcLimits {
-        system: l.system,
-        per_user: l.per_user,
+const fn task_room(r: aterm_sysprobe::TaskRoom) -> TaskRoom {
+    TaskRoom {
+        procs: r.procs,
+        procs_max: r.procs_max,
+        user_procs: r.user_procs,
+        user_procs_max: r.user_procs_max,
+        threads: r.threads,
+        threads_max: r.threads_max,
+        files: r.files,
+        files_max: r.files_max,
     }
 }
 
@@ -3903,7 +3995,7 @@ fn cpu_report_record(snap: &Snapshot) -> Option<aterm_vitals::sys::json::Jv> {
         ),
         ("captured_unix_ms", Jv::Int(snap.at_unix_ms)),
         ("origin_pid", Jv::u(u64::from(std::process::id()))),
-        ("origin_build", Jv::s(aterm_types::version::app_version())),
+        ("origin_build", Jv::s(aterm_stamp::app_version())),
         (
             "origin_executable",
             std::env::current_exe()
@@ -5172,6 +5264,7 @@ impl crate::App {
             pull: false,
             hardware: false,
             deck: self.deck_in_view(),
+            in_view: self.vitals_audience().in_view(),
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
             lenses: self.open_lens_rows(),

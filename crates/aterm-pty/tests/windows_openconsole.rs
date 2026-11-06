@@ -157,8 +157,7 @@ struct ConsoleClients;
 
 impl ConsoleClients {
     fn standin() -> Self {
-        let standin = env!("CARGO_BIN_EXE_aterm-pty-console-client");
-        aterm_pty::set_console_client(Some(standin.into()));
+        aterm_pty::set_console_client(Some(aterm_tempfile::bin_exe("aterm-pty-console-client")));
         ConsoleClients
     }
 }
@@ -525,7 +524,9 @@ fn a_gui_program_runs_once_and_keeps_openconsole_for_later_tabs() {
     let marker = std::env::temp_dir().join(format!("aterm-gui-standin-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let marker_arg = marker.display().to_string();
-    let gui = Tab::spawn(&[env!("CARGO_BIN_EXE_aterm-pty-gui-standin"), &marker_arg]);
+    let standin = aterm_tempfile::bin_exe("aterm-pty-gui-standin");
+    let standin = standin.to_str().expect("a UTF-8 path");
+    let gui = Tab::spawn(&[standin, &marker_arg]);
     gui.wait_eof();
     let runs = std::fs::read_to_string(&marker).unwrap_or_default();
     let _ = std::fs::remove_file(&marker);

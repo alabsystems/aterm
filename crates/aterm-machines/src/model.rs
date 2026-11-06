@@ -212,7 +212,7 @@ pub struct HostFacts {
     pub keyboards: Vec<Keyboard>,
     /// SHA-256 (hex) of each artifact the agent's root cache holds.
     pub cached: Vec<String>,
-    /// The agent's version (`CARGO_PKG_VERSION`).
+    /// The agent's version: the running aterm's product version (`aterm_stamp::app_version`).
     pub agent_version: String,
 }
 

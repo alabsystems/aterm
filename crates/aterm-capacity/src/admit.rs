@@ -861,13 +861,13 @@ pub fn covering(
         }));
     }
     let all = ledger.list()?;
-    let all: Vec<&Record> = all.iter().collect();
     if !all
         .iter()
         .any(|r| r.held.is_some() && r.need.mem > 0 && r.need.covers)
     {
         return Ok(None);
     }
+    let all: Vec<&Record> = all.iter().collect();
     Ok(covering_of(pid, &all, line()).cloned())
 }
 
@@ -971,7 +971,7 @@ pub(crate) fn reserving<'r>(
 /// What a look that admits a claim grants it ([`decide`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Grant {
-    /// The cores it is granted (CORES-GRANT, [`grant`]).
+    /// The cores it is granted (CORES-GRANT, [`ranked_grant`]).
     pub(crate) cores: u32,
     /// How its memory was admitted alone; `None` beside other claims.
     pub(crate) alone: Option<Alone>,
@@ -1182,14 +1182,15 @@ fn ranked_grant(
     if need.rank == crate::Rank::Release {
         return need.cores.min(room);
     }
-    let peers: Vec<_> = others
-        .iter()
-        .filter(|o| {
+    grant_iter(
+        need.cores,
+        reading,
+        others.iter().filter(|o| {
             o.record.held.is_some() || (o.record.need.rank, o.record.order()) < (need.rank, mine)
-        })
-        .cloned()
-        .collect();
-    grant(need.cores, reading, &peers, now).min(room)
+        }),
+        now,
+    )
+    .min(room)
 }
 
 /// The fair share before `ranked_grant` applies reservations and the physical core bound.
@@ -1209,14 +1210,19 @@ fn ranked_grant(
 /// a core whatever the load), so under load a grant is what is fair, not what the scheduler
 /// gives it. CAP-1's first rule granted the idle cores alone: 1 at any 5-minute load above 12
 /// on 14 cores, which lengthened the claimed work without quieting the machine.
-pub(crate) fn grant(asked: u32, reading: &Reading, others: &[Other<'_>], now: u64) -> u32 {
+fn grant_iter<'a, 'b: 'a>(
+    asked: u32,
+    reading: &Reading,
+    others: impl Iterator<Item = &'a Other<'b>>,
+    now: u64,
+) -> u32 {
     if asked == 0 {
         return 0;
     }
     let cores = f64::from(reading.cores.max(1));
     let tau = LOAD5_TIME_CONSTANT.as_secs_f64();
     let (mut held, mut in_load, mut waiting) = (0.0, 0.0, 0.0);
-    for o in others.iter().filter(|o| o.record.need.cores > 0) {
+    for o in others.filter(|o| o.record.need.cores > 0) {
         match o.record.held {
             Some(h) => {
                 let jobs = f64::from(h.cores);
@@ -1389,7 +1395,8 @@ impl Claim {
             .need
             .patience
             .ok_or(TimingIssue::UnknownAdmission)?;
-        if now_ms() < admitted || now_ms() >= admitted.saturating_add(millis(patience.hold)) {
+        let now = now_ms();
+        if now < admitted || now >= admitted.saturating_add(millis(patience.hold)) {
             return Err(TimingIssue::Expired);
         }
         let max = self
@@ -1538,7 +1545,8 @@ impl Claim {
         // The entry's patience counts on the counters' own clock, from its first point.
         let mut began = None;
         loop {
-            if now_ms() < admitted || now_ms() >= expires {
+            let now = now_ms();
+            if now < admitted || now >= expires {
                 return Err(TimingIssue::Expired);
             }
             let point = machine.cpu_point().ok_or(TimingIssue::Unavailable)?;
@@ -2065,7 +2073,9 @@ impl Waiter {
     }
 
     fn poll_mode(mut self, machine: &dyn Machine, forced_now: bool) -> Polled {
-        if matches!(self.laid.path().try_exists(), Ok(false)) {
+        if std::fs::symlink_metadata(self.laid.path())
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
             return Polled::Gone(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -2231,7 +2241,9 @@ impl Waiter {
         let trees = procs
             .as_ref()
             .map(|p| {
-                let mut roots: Vec<u32> = Vec::with_capacity(claimants.len());
+                let mut roots: Vec<u32> = Vec::with_capacity(
+                    claimants.len() + records.iter().map(|r| r.credit.len()).sum::<usize>(),
+                );
                 roots.extend(claimants.iter().copied());
                 roots.extend(records.iter().flat_map(|r| r.credit.iter().copied()));
                 p.trees(&roots)
@@ -2350,8 +2362,12 @@ impl Waiter {
             });
             (granted, quiet)
         });
+        let cores = match &decided {
+            Ok((granted, _)) => granted.cores,
+            Err(_) => ranked_grant(&need, mine, &reading, &others, now),
+        };
         Ok(Found {
-            cores: ranked_grant(&need, mine, &reading, &others, now),
+            cores,
             decided,
             cpu: cpu.ok(),
             load1: reading.load1,
@@ -2539,6 +2555,7 @@ impl Waiter {
     /// A measured need that runs loaded starts there on a busy machine and says so, a strict one
     /// is refused; load-only admission starts whatever the load.
     pub(crate) fn line(&self, short: &Shortfall) -> String {
+        use std::fmt::Write as _;
         let mut line = format!(
             "capacity: {} waits ({}): {short}",
             self.record.need.what,
@@ -2561,23 +2578,24 @@ impl Waiter {
                 Duration::from_secs(ms.div_ceil(1000))
             };
             let start = span(at(p.start));
-            let ending = if self.record.need.quiet_policy != crate::QuietPolicy::Timing {
-                format!("starts whatever the load in {start}")
-            } else if self.record.need.at_bound == crate::AtBound::RunLoaded {
-                format!(
-                    "starts loaded at its bound in {start}, saying so, unless the machine is quiet first"
-                )
-            } else {
-                format!("refuses its work at its bound in {start} unless the machine is quiet")
-            };
             match at(p.reserve) {
-                Duration::ZERO => {
-                    line.push_str(&format!("; it reserves the machine, and {ending}"))
+                Duration::ZERO => line.push_str("; it reserves the machine, and "),
+                d => {
+                    let _ = write!(line, "; it reserves the machine in {}, and ", span(d));
                 }
-                d => line.push_str(&format!(
-                    "; it reserves the machine in {}, and {ending}",
-                    span(d)
-                )),
+            }
+            if self.record.need.quiet_policy != crate::QuietPolicy::Timing {
+                let _ = write!(line, "starts whatever the load in {start}");
+            } else if self.record.need.at_bound == crate::AtBound::RunLoaded {
+                let _ = write!(
+                    line,
+                    "starts loaded at its bound in {start}, saying so, unless the machine is quiet first"
+                );
+            } else {
+                let _ = write!(
+                    line,
+                    "refuses its work at its bound in {start} unless the machine is quiet"
+                );
             }
         }
         line

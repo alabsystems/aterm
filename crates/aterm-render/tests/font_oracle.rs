@@ -16,6 +16,7 @@ mod reader;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aterm_render::font::{Font, FontSettings};
@@ -38,13 +39,13 @@ fn for_each_face(mut f: impl FnMut(&Loaded)) -> Present {
     let mut present = Present::new();
     for face in FACES {
         let path = match face.origin {
-            Origin::Repo(rel) => format!("{}/{rel}", env!("CARGO_MANIFEST_DIR")),
-            Origin::System(abs) => abs.to_string(),
+            Origin::Repo(rel) => aterm_tempfile::manifest_dir().join(rel),
+            Origin::System(abs) => PathBuf::from(abs),
         };
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if matches!(face.origin, Origin::Repo(_)) => {
-                panic!("committed face {path} is unreadable: {e}")
+                panic!("committed face {} is unreadable: {e}", path.display())
             }
             Err(_) => continue,
         };
@@ -852,12 +853,15 @@ fn blessing() -> bool {
     std::env::var_os("ATERM_BLESS_GOLDEN").is_some()
 }
 
+/// The recorded corpora's directory, `tests/fixtures/font-oracle` in this package.
+fn corpus_dir() -> PathBuf {
+    aterm_tempfile::manifest_dir().join("tests/fixtures/font-oracle")
+}
+
 /// Bless `got` into `{name}.txt` or compare it against that file.
 fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str]) {
-    let path = format!(
-        "{}/tests/fixtures/font-oracle/{name}.txt",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let file = corpus_dir().join(format!("{name}.txt"));
+    let path = file.display();
     let mut ids = BTreeSet::new();
     for line in &got {
         assert!(
@@ -866,7 +870,7 @@ fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str])
             line.id()
         );
     }
-    let want = std::fs::read_to_string(&path)
+    let want = std::fs::read_to_string(&file)
         .unwrap_or_default()
         .replace("\r\n", "\n");
     if blessing() {
@@ -885,12 +889,8 @@ fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str])
         for line in &got {
             let _ = writeln!(text, "{}", line.render());
         }
-        std::fs::create_dir_all(format!(
-            "{}/tests/fixtures/font-oracle",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("corpus directory");
-        std::fs::write(&path, text).expect("bless font oracle corpus");
+        std::fs::create_dir_all(corpus_dir()).expect("corpus directory");
+        std::fs::write(&file, text).expect("bless font oracle corpus");
         return;
     }
     assert!(
@@ -1233,11 +1233,9 @@ fn compare_shaping(
 
 #[test]
 fn shaping_answers_hold() {
-    let path = format!(
-        "{}/tests/fixtures/font-oracle/shaping.txt",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let want = std::fs::read_to_string(&path)
+    let file = corpus_dir().join("shaping.txt");
+    let path = file.display();
+    let want = std::fs::read_to_string(&file)
         .unwrap_or_default()
         .replace("\r\n", "\n");
     let chars = corpus_chars(&want);
@@ -1397,11 +1395,7 @@ fn a_shaping_delta_is_classified_narrowly() {
 
 #[test]
 fn normalization_is_not_replayed() {
-    let corpus_text = std::fs::read_to_string(format!(
-        "{}/tests/fixtures/font-oracle/shaping.txt",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let corpus_text = std::fs::read_to_string(corpus_dir().join("shaping.txt")).unwrap();
     let chars = corpus_chars(&corpus_text);
     let lines: Vec<Line> = corpus_text
         .lines()

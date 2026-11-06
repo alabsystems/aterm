@@ -162,20 +162,23 @@ pub fn engine_js(hash: &str) -> String {
 }
 
 fn replaced(name: &str, keep: [&str; 2]) -> bool {
-    let hashed = name.strip_prefix(&format!("{STEM}.")).is_some_and(|rest| {
-        rest.strip_suffix(".js")
-            .or_else(|| rest.strip_suffix(".wasm"))
-            .is_some_and(valid_hash)
-    });
+    let hashed = name
+        .strip_prefix(STEM)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| {
+            rest.strip_suffix(".js")
+                .or_else(|| rest.strip_suffix(".wasm"))
+                .is_some_and(valid_hash)
+        });
     !keep.contains(&name)
-        && (hashed || name == format!("{STEM}.js") || name == format!("{STEM}_bg.wasm"))
+        && (hashed
+            || name
+                .strip_prefix(STEM)
+                .is_some_and(|s| matches!(s, ".js" | "_bg.wasm")))
 }
 
 fn valid_hash(hash: &str) -> bool {
-    hash.len() == 12
-        && hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(hash, 12)
 }
 
 struct Stage {
@@ -362,10 +365,13 @@ fn install(term: &Path, hash: &str, js: &str, wasm: &[u8]) -> Result<(), String>
     for entry in entries {
         let entry =
             entry.map_err(|e| format!("cannot read an entry in {}: {e}", term.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if replaced(&name, [&js_name, &wasm_name]) {
-            std::fs::remove_file(entry.path())
-                .map_err(|e| format!("cannot remove {}: {e}", entry.path().display()))?;
+        let file_name = entry.file_name();
+        if let Some(name) = file_name.to_str()
+            && replaced(name, [&js_name, &wasm_name])
+        {
+            let path = entry.path();
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
         }
     }
     Ok(())

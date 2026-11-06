@@ -1120,9 +1120,9 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
 }
 
 /// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the `Switch`
-/// names the harness by its label and no product (`alab claude harness v0.5 on`), since a press
-/// there turns every agent's harness. NEGATIVE CONTROL: under the agent's own switch off it names
-/// the agent's harness.
+/// names the harness by its label and no product (`alab v0.5 on: harness`), since a press there
+/// turns every agent's harness. NEGATIVE CONTROL: under the agent's own switch off it names the
+/// agent's harness.
 #[cfg(a11y_tree)]
 #[test]
 fn the_switch_names_the_harness_it_switches() {
@@ -1141,20 +1141,23 @@ fn the_switch_names_the_harness_it_switches() {
     let label = harness_label(aterm_phase::CliHarness::ClaudeCode);
     assert_eq!(
         labels(&app),
-        named(&[(HarnessChip::Switch, &format!("{label} on"))])
+        named(&[(HarnessChip::Switch, &format!("{label} on: harness"))])
     );
     policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
     assert_eq!(
         labels(&app),
-        named(&[(HarnessChip::Switch, &format!("{label} off"))]),
+        named(&[(HarnessChip::Switch, &format!("{label} off: harness"))]),
         "the master switch off"
     );
     policy(&mut app, "[harness.claude]\nenabled = false\n");
     frame(&mut app, wid);
     assert_eq!(
         labels(&app),
-        named(&[(HarnessChip::Switch, &format!("{label} off: Claude Code"))]),
+        named(&[(
+            HarnessChip::Switch,
+            &format!("{label} off: Claude Code harness")
+        )]),
         "NEGATIVE CONTROL: the agent's own switch off"
     );
 }
@@ -1182,7 +1185,10 @@ fn decoration_has_no_node() {
     assert_eq!(switches.len(), 1, "{chips:?}");
     assert_eq!(
         switches[0].label,
-        format!("{} on", harness_label(aterm_phase::CliHarness::ClaudeCode)),
+        format!(
+            "{} on: harness",
+            harness_label(aterm_phase::CliHarness::ClaudeCode)
+        ),
         "the harness by its label, no product"
     );
     assert!(names(&switches[0].label), "{:?}", switches[0].label);
@@ -1262,7 +1268,7 @@ fn the_harness_top_rule_is_held_whole_and_the_lower_rules_strokes_are_the_progra
     let row = chars(b.frame_row);
     let (strokes, marks) = split(&row);
     assert!(
-        strokes.len() > 60 && marks.len() >= 20 && marks.iter().any(|&c| c < 20),
+        strokes.len() > 60 && marks.len() >= 15 && marks.iter().any(|&c| c < 20),
         "fixture: the tinted rule, the lockup at its left, the switch: {:?}",
         row.iter().collect::<String>()
     );

@@ -1579,9 +1579,9 @@ fn an_nvml_failure_says_why() {
 }
 
 /// Live: this host's NVIDIA card, where it has one and the driver's
-/// `libnvidia-ml.so.1`, reads a whole percent from the real NVML by its PCI
-/// slot, and, where its runtime PM cannot move, through the system root's
-/// GPU reader too.
+/// `libnvidia-ml.so.1`, reads a whole percent and NVML's name for it from the
+/// real NVML by its PCI slot, and, where its runtime PM cannot move, through
+/// the system root's GPU reader too.
 #[cfg(target_os = "linux")]
 #[test]
 fn nvml_reads_the_nvidia_card_on_this_host() {
@@ -1617,17 +1617,48 @@ fn nvml_reads_the_nvidia_card_on_this_host() {
         return;
     }
     let first = Instant::now();
-    let pct = crate::nvml::device_pct(&slot).expect("NVML's figure");
+    let card = crate::nvml::card(&slot);
     let first = first.elapsed();
     let again = Instant::now();
-    let pct2 = crate::nvml::device_pct(&slot).expect("NVML's figure, again");
+    let card2 = crate::nvml::card(&slot);
     let again = again.elapsed();
+    let pct = card.busy.expect("NVML's figure");
+    let pct2 = card2.busy.expect("NVML's figure, again");
     assert!(pct <= 100 && pct2 <= 100, "{pct} {pct2}");
-    eprintln!("nvml {slot}: {pct}% in {first:?}, then {pct2}% in {again:?}");
+    eprintln!("nvml {slot}: {pct}% in {first:?}, then {pct2}% in {again:?}; {card:?}");
+    let name = card.name.as_deref().expect("NVML's name for the card");
+    assert!(!name.is_empty() && name != "nvidia", "{card:?}");
+    assert_eq!(
+        (&card2.name, card2.unified),
+        (&card.name, card.unified),
+        "kept for the process"
+    );
     let g = linux::Root::system().gpu().expect("a GPU");
     eprintln!("Root::system().gpu(): {g:?}");
     assert!(g.device_pct.is_some_and(|p| p <= 100), "{g:?}");
     assert_eq!(g.unread, None, "{g:?}");
+    // Root::gpu gives the first card, by number, whose figure reads, and only amdgpu's and
+    // nvidia's do: its name is this card's where this is the one such card.
+    let readable = std::fs::read_dir(drm)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("card"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && std::fs::read_to_string(e.path().join("device/uevent")).is_ok_and(|u| {
+                    u.lines()
+                        .any(|l| l == "DRIVER=nvidia" || l == "DRIVER=amdgpu")
+                })
+        })
+        .count();
+    if readable == 1 {
+        assert_eq!((&g.name, g.unified), (&card.name, card.unified), "{g:?}");
+    } else {
+        eprintln!("SKIP the name check: {readable} cards read a figure; Root::gpu gives the first");
+    }
 }
 
 /// Live: the root volume's figures are in order and name their mount and
@@ -2001,12 +2032,12 @@ fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_process_tables_ceilings_read_on_this_host() {
-    let l = crate::process_limits();
-    let system = l.system.expect("the machine's ceiling");
-    assert!(system > 0, "{l:?}");
+    let room = crate::task_room(0);
+    let system = room.procs_max.expect("the machine's ceiling");
+    assert!(system > 0, "{room:?}");
     if cfg!(target_os = "macos") {
-        let per_user = l.per_user.expect("one user's ceiling");
-        assert!(per_user <= system, "{l:?}");
+        let per_user = room.user_procs_max.expect("one user's ceiling");
+        assert!(per_user <= system, "{room:?}");
     }
 }
 
@@ -2194,6 +2225,10 @@ fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() 
     let listeners: Vec<std::net::TcpListener> = (0..HELD)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener"))
         .collect();
+    // Linux's listeners and its socket scopes come from the all-states dump, which a reading
+    // takes once an epoch after it publishes: take one now that names the listeners held here.
+    #[cfg(target_os = "linux")]
+    crate::linux::tcp::dump_now();
     let mut scratch = Vec::new();
     if let Some(tcp) = crate::tcp_summary_into(&mut scratch) {
         assert!(
@@ -2210,128 +2245,6 @@ fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() 
         "open_socket_count must count the {HELD} listeners this test holds: {during}"
     );
     drop(listeners);
-}
-
-#[test]
-fn linux_inet_diag_rtt_parser_extracts_non_loopback_median_and_skips_loopback() {
-    fn diag_msg(family: u8, state: u8, dst16: [u8; 16], rtt_us: u32) -> Vec<u8> {
-        let mut tcp_info = [0u8; 76];
-        tcp_info[68..72].copy_from_slice(&rtt_us.to_ne_bytes());
-        let nla_len: u16 = (4 + tcp_info.len()) as u16;
-        let nlmsg_len: u32 = (16 + 72 + usize::from(nla_len)) as u32;
-        let mut msg = vec![0u8; nlmsg_len as usize];
-        msg[0..4].copy_from_slice(&nlmsg_len.to_ne_bytes());
-        msg[4..6].copy_from_slice(&20u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
-        msg[16] = family;
-        msg[17] = state;
-        msg[16 + 24..16 + 40].copy_from_slice(&dst16);
-        let attr_at = 16 + 72;
-        msg[attr_at..attr_at + 2].copy_from_slice(&nla_len.to_ne_bytes());
-        msg[attr_at + 2..attr_at + 4].copy_from_slice(&2u16.to_ne_bytes()); // INET_DIAG_INFO
-        msg[attr_at + 4..attr_at + 4 + tcp_info.len()].copy_from_slice(&tcp_info);
-        msg
-    }
-    let mut done = vec![0u8; 20];
-    done[0..4].copy_from_slice(&20u32.to_ne_bytes());
-    done[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
-
-    let mut stream = Vec::new();
-    // Remote IPv4 (1.1.1.1): 12.5 ms
-    let mut v4_remote = [0u8; 16];
-    v4_remote[0..4].copy_from_slice(&[1, 1, 1, 1]);
-    stream.extend_from_slice(&diag_msg(2, 1, v4_remote, 12_500));
-    // Loopback IPv4 (127.0.0.1): 100 us -> must be excluded!
-    let mut v4_loop = [0u8; 16];
-    v4_loop[0..4].copy_from_slice(&[127, 0, 0, 1]);
-    stream.extend_from_slice(&diag_msg(2, 1, v4_loop, 100));
-    // Loopback IPv6 (::1): 80 us -> must be excluded!
-    let mut v6_loop = [0u8; 16];
-    v6_loop[15] = 1;
-    stream.extend_from_slice(&diag_msg(10, 1, v6_loop, 80));
-    // Remote IPv6 (2606:4700::1): 24.5 ms
-    let mut v6_remote = [0u8; 16];
-    v6_remote[0..2].copy_from_slice(&[0x26, 0x06]);
-    v6_remote[15] = 1;
-    stream.extend_from_slice(&diag_msg(10, 1, v6_remote, 24_500));
-    stream.extend_from_slice(&done);
-
-    let mut rtts = Vec::new();
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&stream, &mut rtts),
-        Some(true)
-    );
-    assert_eq!(rtts, vec![12.5, 24.5]);
-    assert_eq!(crate::linux::median_rtt_ms(&mut rtts), Some(18.5));
-
-    // Sequence-filtered parsing ignores stale frames (including NLMSG_DONE) from an earlier seq.
-    let with_seq = |mut frame: Vec<u8>, seq: u32| {
-        frame[8..12].copy_from_slice(&seq.to_ne_bytes());
-        frame
-    };
-    let mut mixed = Vec::new();
-    mixed.extend_from_slice(&with_seq(diag_msg(2, 1, v4_remote, 99_000), 1));
-    mixed.extend_from_slice(&with_seq(done.clone(), 1));
-    mixed.extend_from_slice(&with_seq(diag_msg(10, 1, v6_remote, 24_500), 2));
-    let mut seq2_rtts = Vec::new();
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts_seq(&mixed, Some(2), &mut seq2_rtts),
-        Some(false),
-        "stale seq=1 NLMSG_DONE must not terminate seq=2 before seq=2's own NLMSG_DONE"
-    );
-    assert_eq!(seq2_rtts, vec![24.5]);
-    let seq2_done = with_seq(done, 2);
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts_seq(&seq2_done, Some(2), &mut seq2_rtts),
-        Some(true)
-    );
-    let mut huge_len = vec![0u8; 32];
-    huge_len[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&huge_len, &mut seq2_rtts),
-        None
-    );
-
-    // NEGATIVE CONTROL: interrupted dumps (`NLM_F_DUMP_INTR`), negative `NLMSG_DONE` errnos,
-    // `NLMSG_OVERRUN`, truncated `SOCK_DIAG_BY_FAMILY` headers, and malformed attributes fail
-    // the datagram without leaving partial readings in `rtts`.
-    let baseline = seq2_rtts.clone();
-    let mut intr = diag_msg(2, 1, v4_remote, 40_000);
-    intr[6..8].copy_from_slice(&16u16.to_ne_bytes()); // NLM_F_DUMP_INTR
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&intr, &mut seq2_rtts),
-        None
-    );
-    assert_eq!(seq2_rtts, baseline);
-
-    let mut done_err = vec![0u8; 20];
-    done_err[0..4].copy_from_slice(&20u32.to_ne_bytes());
-    done_err[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
-    done_err[16..20].copy_from_slice(&(-16i32).to_ne_bytes()); // -EBUSY
-    let mut partial_then_err = diag_msg(2, 1, v4_remote, 40_000);
-    partial_then_err.extend_from_slice(&done_err);
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&partial_then_err, &mut seq2_rtts),
-        None
-    );
-    assert_eq!(seq2_rtts, baseline);
-
-    let mut overrun = vec![0u8; 16];
-    overrun[0..4].copy_from_slice(&16u32.to_ne_bytes());
-    overrun[4..6].copy_from_slice(&4u16.to_ne_bytes()); // NLMSG_OVERRUN
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&overrun, &mut seq2_rtts),
-        None
-    );
-    assert_eq!(seq2_rtts, baseline);
-
-    let mut short_diag = vec![0u8; 20];
-    short_diag[0..4].copy_from_slice(&20u32.to_ne_bytes());
-    short_diag[4..6].copy_from_slice(&20u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY < 72B payload
-    assert_eq!(
-        crate::linux::parse_inet_diag_rtts(&short_diag, &mut seq2_rtts),
-        None
-    );
-    assert_eq!(seq2_rtts, baseline);
 }
 
 /// The OS's major version is the leading number of the first word that has one, and words

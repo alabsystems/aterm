@@ -219,7 +219,7 @@ mod measuring {
     pub fn run() -> std::process::ExitCode {
         let rig = Rig::release(
             &["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"],
-            env!("CARGO_BIN_EXE_fake-tui"),
+            aterm_tempfile::bin_exe("fake-tui"),
         );
         let windows = std::env::var_os(NO_WINDOWS).is_none();
         let rows: Vec<(&str, SpinRow)> = ROWS

@@ -187,6 +187,16 @@ struct GuardHelper {
 
 const GUARD_HELPERS: &[GuardHelper] = &[
     GuardHelper {
+        symbol: "tcp_lane",
+        identity: "LANE",
+        def_file: "crates/aterm-sysprobe/src/linux_tcp.rs",
+    },
+    GuardHelper {
+        symbol: "held_namespaces",
+        identity: "NAMESPACES",
+        def_file: "crates/aterm-sysprobe/src/linux_tcp.rs",
+    },
+    GuardHelper {
         symbol: "posts",
         identity: "posts",
         def_file: "crates/aterm-link/src/state.rs",
@@ -641,7 +651,9 @@ pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> St
     out
 }
 
-/// Per line of `text`, whether [`mask_items_where`] keeps it.
+/// Per line of `text`, whether [`mask_items_where`] keeps it. A line that opens inside a literal or
+/// comment carried over from an earlier line ends no item by its indent: its code view starts
+/// wherever the literal happens to end.
 pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<bool> {
     // Literal/comment state spans physical lines. A fixture's column-zero `}`
     // or `#[cfg(test)]` is data, never an item boundary or an attribute. Keep
@@ -649,6 +661,7 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
     let lexed = crate::lex::lex(text);
     let lines: Vec<&str> = lexed.code.lines().collect();
     let attrs: Vec<&str> = lexed.text.lines().collect();
+    let carried = lines_opening_in_a_span(text, lines.len());
     let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut keep = vec![true; lines.len()];
     let mut i = 0;
@@ -673,7 +686,7 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         let mut terminated = false;
         while k < lines.len() {
             let item = lines[k];
-            if k > j && !item.trim().is_empty() && indent_of(lines[k]) < indent {
+            if k > j && !carried[k] && !item.trim().is_empty() && indent_of(lines[k]) < indent {
                 k -= 1;
                 terminated = true;
                 break;
@@ -685,7 +698,9 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
                 break;
             }
             let s = item.trim_end();
-            if s.ends_with(';') || (s.ends_with(',') && indent_of(lines[k]) == indent) {
+            if s.ends_with(';')
+                || (s.ends_with(',') && !carried[k] && indent_of(lines[k]) == indent)
+            {
                 terminated = true;
                 break;
             }
@@ -726,6 +741,26 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         i = k + 1;
     }
     keep
+}
+
+/// Per line of `text` (`count` of them, as [`str::lines`] splits it), whether the line opens inside
+/// a literal or comment that began on an earlier line.
+fn lines_opening_in_a_span(text: &str, count: usize) -> Vec<bool> {
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .take(count)
+        .collect();
+    let mut carried = vec![false; count];
+    for span in crate::lex::spans(text) {
+        let first = starts.partition_point(|&start| start <= span.start);
+        for (line, &start) in starts.iter().enumerate().skip(first) {
+            if start >= span.end {
+                break;
+            }
+            carried[line] = true;
+        }
+    }
+    carried
 }
 
 /// A logical statement line.
@@ -3257,6 +3292,39 @@ fn shipped() {
             "real code after the test module survives"
         );
         assert_eq!(masked.lines().count(), source.lines().count());
+    }
+
+    /// A literal's later lines sit at any column: one at column 0 opens inside the literal, so it
+    /// is no dedent, and its `;` still ends the gated statement. Read on raw indents, each tail
+    /// below was kept as shipped code.
+    #[test]
+    fn a_literal_tail_at_column_0_ends_no_gated_item() {
+        let text = [
+            "fn shipped() {",
+            "    #[cfg(test)]",
+            "    let cooked = \"",
+            "term_lock(&t).resize(1, 2)\";",
+            "    #[cfg(test)]",
+            "    let raw = r#\"",
+            "gamma.lock()",
+            "\"#;",
+            "    #[cfg(test)]",
+            "    let listed = [\"a",
+            "\", delta.lock()];",
+            "    beta.lock();",
+            "}",
+            "",
+        ]
+        .join("\n");
+        let m = mask_cfg_test_items(&text);
+        for gone in ["term_lock", "gamma.lock()", "\"#;", "delta.lock()"] {
+            assert!(!m.contains(gone), "`{gone}` is test code:\n{m}");
+        }
+        assert!(
+            m.contains("fn shipped() {") && m.contains("beta.lock();"),
+            "the fn's shipped lines survive:\n{m}"
+        );
+        assert_eq!(m.lines().count(), text.lines().count());
     }
 
     #[test]

@@ -23,13 +23,14 @@ use crate::triple::{
     X86_64_UNKNOWN_LINUX_GNU,
 };
 
-mod git_macos;
 mod git_text;
+mod macos;
+mod pinned;
 mod source;
 pub mod upstream;
 
 /// `pack-bottle`'s usage synopsis.
-pub const SYNOPSIS: &str = "pack-bottle <program> --archive <path> --version <ver> --build <N> \
+pub const SYNOPSIS: &str = "pack-bottle <program> (--archive <path> | --install-tree <dir>) --version <ver> --build <N> \
      [--triple T] [--strip-components K] [--dep-bottle PATH]… [--donor-root DIR]… \
      [--merge-from PKG] [--key PATH] [--out DIR] [--unsigned | --upload]";
 
@@ -319,6 +320,8 @@ fn inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     }
 }
 
+const MAX_BOTTLE_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Rewrite Homebrew interpreter placeholders in NUL-free regular files inside `stage` once per
 /// hard-link inode.
 ///
@@ -342,7 +345,21 @@ pub fn rewrite_bottle_text(stage: &Path) -> Result<()> {
         {
             continue;
         }
-        let bytes = crate::identity::read_regular_file_bytes(file, &meta, 64 * 1024 * 1024)
+        if meta.len() > MAX_BOTTLE_TEXT_BYTES {
+            use std::io::Read as _;
+            let mut prefix = Vec::new();
+            (&file)
+                .take(64 * 1024)
+                .read_to_end(&mut prefix)
+                .map_err(|error| Error::io(format!("read {} prefix", path.display()), &error))?;
+            // A NUL already proves this is not a rewriteable text file. Large
+            // compiler libraries need no full read; ambiguous large files still
+            // reach the same bounded-reader refusal below.
+            if prefix.contains(&0) {
+                continue;
+            }
+        }
+        let bytes = crate::identity::read_regular_file_bytes(file, &meta, MAX_BOTTLE_TEXT_BYTES)
             .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
             continue;
@@ -829,10 +846,10 @@ fn check_stage_tree(
             break;
         }
         if arch::read(&path).is_some() {
-            if program == "git" {
+            if matches!(program, "git" | "openssl-signing") {
                 let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
                     .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
-                git_macos::check(&bytes)
+                macos::check(&bytes, program)
                     .map_err(|why| Error::refused(format!("{}: {why}", rel.display())))?;
             }
             if backend.is_native_object(&path) {
@@ -1138,7 +1155,9 @@ fn archive_container(path: &Path) -> Result<Container> {
                 .get(name.len() - ext.len()..)
                 .is_some_and(|s| s.eq_ignore_ascii_case(ext))
     };
-    if ends_with_ignore_case(".tar.gz") || ends_with_ignore_case(".tgz") {
+    if ends_with_ignore_case(".tar.zst") {
+        Ok(Container::TarZst)
+    } else if ends_with_ignore_case(".tar.gz") || ends_with_ignore_case(".tgz") {
         Ok(Container::TarGz)
     } else if ends_with_ignore_case(".tar") {
         Ok(Container::Tar)
@@ -1146,7 +1165,7 @@ fn archive_container(path: &Path) -> Result<Container> {
         Ok(Container::Zip)
     } else {
         Err(Error::usage(format!(
-            "unsupported bottle archive extension on {} (expected .tar.gz, .tgz, .tar, or .zip)",
+            "unsupported bottle archive extension on {} (expected .tar.zst, .tar.gz, .tgz, .tar, or .zip)",
             path.display()
         )))
     }
@@ -1159,7 +1178,7 @@ fn archive_container(path: &Path) -> Result<Container> {
 pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
     let usage = || Error::usage(SYNOPSIS);
     let mut program = None;
-    let mut archive = None;
+    let mut input = None;
     let mut version = None;
     let mut build = None;
     let mut triple = None;
@@ -1176,7 +1195,19 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().ok_or_else(usage);
         match arg.as_str() {
-            "--archive" => archive = Some(PathBuf::from(value()?)),
+            "--archive" | "--install-tree" => {
+                if input.is_some() {
+                    return Err(Error::usage(
+                        "pack-bottle takes exactly one --archive or --install-tree",
+                    ));
+                }
+                let path = PathBuf::from(value()?);
+                input = Some(if arg == "--archive" {
+                    BottleInput::Archive(path)
+                } else {
+                    BottleInput::InstallTree(path)
+                });
+            }
             "--version" => version = Some(value()?),
             "--build" => {
                 let v = value()?;
@@ -1213,7 +1244,7 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
     }
 
     let program = program.ok_or_else(usage)?;
-    let archive = archive.ok_or_else(usage)?;
+    let input = input.ok_or_else(usage)?;
     let version = version.ok_or_else(usage)?;
     let build = build.ok_or_else(usage)?;
     let triple = match triple {
@@ -1224,7 +1255,7 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
 
     Ok(BottleRequest {
         program,
-        input: BottleInput::Archive(archive),
+        input,
         version,
         build,
         triple,
@@ -1279,8 +1310,81 @@ mod tests {
     use crate::artifact::relocate::ObjectRefs;
     use crate::artifact::tarwrite::RawFrames;
 
+    #[test]
+    fn cli_accepts_one_archive_or_install_tree_and_refuses_ambiguous_inputs() {
+        use crate::host::fake::FakeHost;
+        use crate::testkit::Keys;
+        use std::sync::Arc;
+
+        let work = aterm_tempfile::tempdir().unwrap();
+        let ctx = Keys::mint("m3", &[]).ctx(work.path(), Arc::new(FakeHost::new()));
+        let base = ["lean4", "--version", "4.31.0", "--build", "1", "--unsigned"];
+        let args = |tail: &[&str]| {
+            base.iter()
+                .chain(tail)
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        let archive = parse_args(&ctx, &args(&["--archive", "runtime.tar.zst"])).unwrap();
+        assert!(
+            matches!(archive.input, BottleInput::Archive(p) if p == Path::new("runtime.tar.zst"))
+        );
+        let tree = parse_args(&ctx, &args(&["--install-tree", "owned runtime tree"])).unwrap();
+        assert!(
+            matches!(tree.input, BottleInput::InstallTree(p) if p == Path::new("owned runtime tree"))
+        );
+        for tail in [
+            vec![],
+            vec!["--archive", "a", "--install-tree", "b"],
+            vec!["--install-tree", "a", "--archive", "b"],
+            vec!["--archive", "a", "--archive", "b"],
+            vec!["--install-tree", "a", "--install-tree", "b"],
+        ] {
+            assert!(parse_args(&ctx, &args(&tail)).is_err(), "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn text_rewriting_skips_proven_large_binaries_but_keeps_its_text_cap() {
+        use std::io::Write as _;
+
+        let work = aterm_tempfile::tempdir().unwrap();
+        let binary = work.path().join("libLean.a");
+        let mut file = std::fs::File::create(&binary).unwrap();
+        file.write_all(b"!<arch>\n\0binary").unwrap();
+        file.set_len(MAX_BOTTLE_TEXT_BYTES + 1).unwrap();
+        drop(file);
+        rewrite_bottle_text(work.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&binary).unwrap().len(),
+            MAX_BOTTLE_TEXT_BYTES + 1
+        );
+        let text = work.path().join("large-text");
+        let mut file = std::fs::File::create(&text).unwrap();
+        file.write_all(&vec![b'x'; 64 * 1024]).unwrap();
+        file.set_len(MAX_BOTTLE_TEXT_BYTES + 1).unwrap();
+        drop(file);
+        let error = rewrite_bottle_text(work.path()).unwrap_err();
+        assert!(error.to_string().contains("file exceeds"), "{error}");
+    }
+
+    #[test]
+    fn bottle_archives_recognize_zstd_without_changing_other_containers() {
+        for (name, want) in [
+            ("lean.tar.zst", Container::TarZst),
+            ("LEAN.TAR.ZST", Container::TarZst),
+            ("tool.tar.gz", Container::TarGz),
+            ("tool.tgz", Container::TarGz),
+            ("tool.tar", Container::Tar),
+            ("tool.zip", Container::Zip),
+        ] {
+            assert_eq!(archive_container(Path::new(name)).unwrap(), want);
+        }
+        assert!(archive_container(Path::new("tool.zst")).is_err());
+    }
+
     #[derive(Default)]
-    struct FakeBackend {
+    pub(super) struct FakeBackend {
         refs: Mutex<BTreeMap<PathBuf, ObjectRefs>>,
         interpreters: Mutex<BTreeMap<PathBuf, String>>,
     }
@@ -1407,7 +1511,7 @@ mod tests {
         }
     }
 
-    fn thin_macho_bytes(cputype: u32) -> Vec<u8> {
+    pub(super) fn thin_macho_bytes(cputype: u32) -> Vec<u8> {
         let mut bytes = vec![0u8; 32];
         bytes[0..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         bytes[4..8].copy_from_slice(&cputype.to_le_bytes());
@@ -1443,13 +1547,13 @@ mod tests {
         h
     }
 
-    enum TarEntry<'a> {
+    pub(super) enum TarEntry<'a> {
         Dir(&'a str),
         File(&'a str, &'a [u8], u32),
         Symlink(&'a str, &'a str),
     }
 
-    fn build_tar(path: &Path, entries: &[TarEntry<'_>]) {
+    pub(super) fn build_tar(path: &Path, entries: &[TarEntry<'_>]) {
         let mut out = Vec::new();
         for e in entries {
             match *e {
@@ -1485,6 +1589,23 @@ mod tests {
         assert!(bottle_row("git", X86_64_APPLE_DARWIN).is_ok());
         assert!(bottle_row("git", X86_64_UNKNOWN_LINUX_GNU).is_ok());
         assert!(bottle_row("git", AARCH64_UNKNOWN_LINUX_GNU).is_ok());
+        assert!(bottle_row("gitleaks", AARCH64_APPLE_DARWIN).is_ok());
+        assert!(bottle_row("gitleaks", X86_64_APPLE_DARWIN).is_ok());
+        assert!(bottle_row("gitleaks", X86_64_UNKNOWN_LINUX_GNU).is_ok());
+        assert!(bottle_row("gitleaks", AARCH64_UNKNOWN_LINUX_GNU).is_ok());
+        assert!(bottle_row("cpython", AARCH64_APPLE_DARWIN).is_ok());
+        assert!(bottle_row("cpython", X86_64_APPLE_DARWIN).is_ok());
+        assert!(bottle_row("openssl-signing", AARCH64_APPLE_DARWIN).is_ok());
+        assert!(bottle_row("openssl-signing", X86_64_APPLE_DARWIN).is_ok());
+        for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+            assert!(bottle_row("gitleaks", Triple::named(target)).is_err());
+            assert!(bottle_row("cpython", Triple::named(target)).is_err());
+            assert!(bottle_row("openssl-signing", Triple::named(target)).is_err());
+        }
+        assert!(bottle_row("cpython", AARCH64_UNKNOWN_LINUX_GNU).is_err());
+        assert!(bottle_row("cpython", X86_64_UNKNOWN_LINUX_GNU).is_err());
+        assert!(bottle_row("openssl-signing", AARCH64_UNKNOWN_LINUX_GNU).is_err());
+        assert!(bottle_row("openssl-signing", X86_64_UNKNOWN_LINUX_GNU).is_err());
         assert!(bottle_row("gh", X86_64_UNKNOWN_LINUX_GNU).is_err());
         assert!(bottle_row("git", Triple::named("x86_64-pc-windows-msvc")).is_err());
         assert!(bottle_row("aterm", AARCH64_APPLE_DARWIN).is_err());

@@ -445,6 +445,21 @@ fn attach_and_absorb(reader: &mut Reader, mut sample: Sample, req: &Request) -> 
     reader.vitals.absorb(&sample)
 }
 
+/// A3 L2 (D2): where this platform has no CPU Stats source, every reading of the reader's sample
+/// is the word the report treats as no source ([`aterm_vitals::sys::hardware::NO_SOURCE`]), so
+/// the Linux CPU lens and `sys cores` print none of the clauses those sources feed (the lens law
+/// `the_linux_cpu_lens_prints_no_ioreport_clpc_or_power_limit_words` feeds this sample). Not
+/// built on macOS, whose reader opens IOReport.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_platform_without_cpu_stats_reads_no_source() {
+    const { assert!(!aterm_sysprobe::cpu_hardware::SOURCE) };
+    assert_eq!(
+        hardware_sample(aterm_sysprobe::cpu_hardware::Probe::default().sample(Duration::ZERO)),
+        aterm_vitals::hardware::Sample::unavailable(aterm_vitals::sys::hardware::NO_SOURCE)
+    );
+}
+
 #[test]
 fn cpu_hardware_is_sampled_after_complete_machine_and_process_counters() {
     fn hardware(
@@ -1274,6 +1289,7 @@ fn the_new_readings_reach_the_model() {
         alloc_bytes: Some(2_048 << 20),
         recoveries: Some(1),
         cores: Some(40),
+        unified: true,
         ..aterm_sysprobe::GpuReading::default()
     });
     assert_eq!(
@@ -1282,14 +1298,16 @@ fn the_new_readings_reach_the_model() {
             g.alloc_bytes,
             g.recoveries,
             g.renderer_pct,
-            g.tiler_pct
+            g.tiler_pct,
+            g.unified
         ),
         (
             Some(1_700 << 20),
             Some(2_048 << 20),
             Some(1),
             Some(10),
-            Some(3)
+            Some(3),
+            true
         )
     );
     assert_eq!(
@@ -1357,14 +1375,27 @@ fn the_new_readings_reach_the_model() {
             (LinkKind::Ethernet, false),
         ]
     );
+    let read = aterm_sysprobe::TaskRoom {
+        procs: Some(742),
+        procs_max: Some(8_000),
+        user_procs: Some(435),
+        user_procs_max: Some(5_333),
+        threads: Some(3_318),
+        threads_max: Some(40_960),
+        files: Some(6_131),
+        files_max: Some(245_760),
+    };
     assert_eq!(
-        proc_limits(aterm_sysprobe::ProcessLimits {
-            system: Some(16_000),
-            per_user: Some(10_666),
-        }),
-        ProcLimits {
-            system: Some(16_000),
-            per_user: Some(10_666),
+        task_room(read),
+        TaskRoom {
+            procs: Some(742),
+            procs_max: Some(8_000),
+            user_procs: Some(435),
+            user_procs_max: Some(5_333),
+            threads: Some(3_318),
+            threads_max: Some(40_960),
+            files: Some(6_131),
+            files_max: Some(245_760),
         }
     );
 }
@@ -1401,14 +1432,10 @@ fn two_readings_give_this_process_a_scope_and_the_machine_its_cores() {
     }
     if cfg!(any(target_os = "macos", target_os = "linux")) {
         assert!(snap.facts.load1.is_some(), "the load average is read");
-        assert!(
-            snap.facts.proc_limits.system.is_some(),
-            "the limits are read"
-        );
-        assert!(
-            snap.facts.pid_counts.0.is_some(),
-            "the processes are counted"
-        );
+        let room = snap.facts.room;
+        assert!(room.procs_max.is_some(), "the limits are read: {room:?}");
+        assert!(room.procs.is_some(), "the processes are counted: {room:?}");
+        assert!(room.threads.is_some(), "the threads are counted: {room:?}");
     }
 
     let hidden = Request {
@@ -1420,7 +1447,7 @@ fn two_readings_give_this_process_a_scope_and_the_machine_its_cores() {
     assert!(snap.aterm.is_none(), "a hidden reading sweeps no process");
     if cfg!(any(target_os = "macos", target_os = "linux")) {
         assert!(snap.cpu.is_some(), "the machine counters are still read");
-        assert!(snap.facts.pid_counts.0.is_some());
+        assert!(snap.facts.room.procs.is_some());
     }
 }
 
@@ -5571,6 +5598,81 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
     );
 }
 
+/// THE AFTER-PUBLISH HOOK ADDS NO MAIN-LOOP WAKE (A3 L1): the TCP readers' hook runs once a
+/// reading, after the reading is handed over and its one post made, told whether any window in
+/// view reads the stream, and posts nothing. A whole reading no window in view asked for (a
+/// windowless ask) is a hidden one. NEGATIVE CONTROL: a hook run before the hand-over would find
+/// no snapshot handed over, and one that posted would make two posts of one reading.
+#[test]
+fn the_after_publish_hook_adds_no_main_loop_wake() {
+    struct Hooked<'a> {
+        model: aterm_vitals::Vitals,
+        log: Arc<Mutex<Vec<String>>>,
+        latest: &'a Mutex<Handover>,
+    }
+    impl Source for Hooked<'_> {
+        fn reading(&mut self, request: &Request) -> Snapshot {
+            self.log.lock().unwrap().push("read".into());
+            Snapshot {
+                seq: 1,
+                machine_only: request.machine_only,
+                ..Snapshot::default()
+            }
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.model
+        }
+        fn after_publish(&mut self, hidden: bool) {
+            let handed = self.latest.lock().unwrap().snap.as_ref().map(|s| s.seq);
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("after:{hidden}:{handed:?}"));
+        }
+    }
+    for (in_view, machine_only, hidden) in [
+        (false, true, true),
+        (false, false, true),
+        (true, false, false),
+    ] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let latest = Mutex::new(Handover::default());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(Msg::Read(Box::new(Request {
+            machine_only,
+            in_view,
+            ..Request::default()
+        })))
+        .unwrap();
+        drop(tx);
+        run(
+            &rx,
+            &latest,
+            &|| {
+                log.lock().unwrap().push("post".into());
+                true
+            },
+            Hooked {
+                model: aterm_vitals::Vitals::new(),
+                log: Arc::clone(&log),
+                latest: &latest,
+            },
+            None,
+            None,
+            &AtomicBool::new(false),
+            PriorRun::default(),
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "read".to_owned(),
+                "post".to_owned(),
+                format!("after:{hidden}:Some(1)")
+            ]
+        );
+    }
+}
+
 /// Distinct naming messages survive the real probe drain, canceled work never enters the
 /// engine, and the published snapshot and wake precede either reply.
 #[test]
@@ -6624,10 +6726,12 @@ fn net_probe_seam_and_socket_attribution_reach_the_snapshot() {
                     established: 4,
                     ..aterm_sysprobe::TcpCounts::default()
                 },
+                counters_only: false,
                 srtt_ms: Some(18.5),
             })
         },
         open_sockets: |_| Some(2),
+        after_publish: |_| {},
     };
     let req = Request {
         self_pid: std::process::id(),

@@ -915,7 +915,9 @@ fn draft_removal(
     });
 
     // The batch rotates `[everyone]` and Commons where this Mac opens their newest epochs, and
-    // each host list `rotate_host_lists` mints (`Rotation { hosts: true }` below).
+    // each host list `rotate_host_lists` mints (`Rotation { hosts: true }` below). Once the fold's
+    // adoption gate holds here, `[everyone]` alone: tables derive their key from it (M6).
+    let fold = crate::commons::fold::on(paths);
     let fill = RemovalFill::of(
         &log,
         &opened,
@@ -927,6 +929,7 @@ fn draft_removal(
                 EpochAudience::Hosts(_) => {
                     log_entries::rotates_host_list(&log, &opened, audience, newest, gone)
                 }
+                EpochAudience::Commons if fold => false,
                 EpochAudience::Everyone | EpochAudience::Commons => {
                     log_entries::opens_newest(&opened, audience)
                 }
@@ -984,6 +987,7 @@ fn draft_removal(
             &Rotation {
                 everyone: Some(&everyone),
                 hosts: true,
+                fold,
             },
             &mut minted,
         )
@@ -2736,6 +2740,16 @@ fn tend_ready_epochs_by(
             log.rekey_dues()
                 .into_iter()
                 .map(|due| due.audience)
+                .collect()
+        } else {
+            still
+        };
+        // Once the fold is on here, `[everyone]` is the one keyed audience that gets new epochs
+        // (one-mesh M6): a Commons due is a Mac's whose gate has not held yet, never this one's.
+        let still = if crate::commons::fold::on(paths) {
+            still
+                .into_iter()
+                .filter(|audience| *audience != EpochAudience::Commons)
                 .collect()
         } else {
             still

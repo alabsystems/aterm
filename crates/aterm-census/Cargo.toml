@@ -7,7 +7,7 @@
 
 [package]
 name = "aterm-census"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -29,9 +29,14 @@ aterm-regex = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-zstd = { workspace = true }
 aterm-hash = { workspace = true }
+# The identity record's input names (`aterm_stamp::input::ALL`), which `identity-read` bans from
+# every compile-time read: one list, the one release_env and `ship dev-app` set them from. No
+# dependencies of its own.
+aterm-stamp = { workspace = true }
 
 [dev-dependencies]
-# None: tests use only std (synthetic sources and trees under a temp dir).
+# The checkout the tests read, named when they run (`manifest_dir`); std-only too.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,7 +4,7 @@
 //! C2SP CCTV age test vectors for an X25519-only reader.
 
 use aterm_secrets::age::{AgeError, Identity, decrypt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
@@ -33,9 +33,7 @@ struct Vector {
 }
 
 fn dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("cctv")
+    aterm_tempfile::manifest_dir().join("tests").join("cctv")
 }
 
 fn hex32(text: &str) -> [u8; 32] {

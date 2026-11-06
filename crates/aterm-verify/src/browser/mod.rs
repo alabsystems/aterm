@@ -106,9 +106,9 @@ const GLOW_THEMES: [(&str, [u32; 4]); 4] = [
 /// ramps run's ramps ride the fx stream the art opens.
 const GLOW_ART: [(&str, &str); 2] = [("dark art", "dark"), ("light art", "light")];
 
-/// The pages, beside this crate.
-fn pages_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("browser")
+/// The pages, in this crate in the checkout at `root`.
+fn pages_dir(root: &Path) -> PathBuf {
+    root.join("crates/aterm-verify/browser")
 }
 
 /// What `window.atermLane` is handed: the grid, theme, px and frames.
@@ -500,7 +500,7 @@ struct Built {
 }
 
 /// Files and directories laid by [`assemble`].
-const SITE_FILES: [&str; 9] = [
+const SITE_FILES: [&str; 10] = [
     "cpu.html",
     "gpu.html",
     "worker.html",
@@ -510,6 +510,7 @@ const SITE_FILES: [&str; 9] = [
     "font.ttf",
     "cpu",
     "gpu",
+    recorded::IN_SITE,
 ];
 
 /// First entry of [`SITE_FILES`] missing from `site`, if any.
@@ -755,7 +756,7 @@ fn session(
         Ok(Ok(())) => r.raw(say(format!("timings in {}", record.display()))),
         _ => r.raw(say(format!("could not write {}", record.display()))),
     }
-    let recording = recorded::read(&recorded::wgpu_webgl_dir());
+    let recording = recorded::read(&built.site.join(recorded::IN_SITE));
     let mut failures = held(r, &say, &session, gpu, &recording, &dir.join("gpu-frames"));
     let pages: Vec<&str> = GLOW_THEMES.iter().map(|(page, _)| *page).collect();
     let glow = judge::glow(gpu, &GLOW_STYLES, &pages, &GLOW_ART, GLOW_FRAMES);
@@ -1011,12 +1012,14 @@ fn timing_line(who: &str, p: &Page) -> String {
     format!("{who}: {}", parts.join(", "))
 }
 
-/// Assemble the browser test site and wasm glue in `site`.
+/// Assemble the browser test site, the wgpu-WebGL recording its sessions are held to
+/// ([`recorded::lay`]) and the wasm glue in `site`.
 fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(site);
     std::fs::create_dir_all(site)
         .map_err(|e| format!("could not create {}: {e}", site.display()))?;
     let font = root.join("crates/aterm-render/assets/DejaVuSansMono.ttf");
+    let pages = pages_dir(root);
     let copies = [
         "cpu.html",
         "gpu.html",
@@ -1024,13 +1027,14 @@ fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
         "lane.mjs",
         "worker.mjs",
     ]
-    .map(|p| (pages_dir().join(p), site.join(p)))
+    .map(|p| (pages.join(p), site.join(p)))
     .into_iter()
     .chain([(font, site.join("font.ttf"))]);
     for (from, to) in copies {
         crate::copy_regular_fresh(&from, &to)
             .map_err(|e| format!("could not copy {} to {}: {e}", from.display(), to.display()))?;
     }
+    recorded::lay(root, site)?;
     let spec_path = site.join("spec.json");
     aterm_json::to_string(&spec())
         .map_err(|e| format!("could not encode the spec: {e}"))
@@ -1730,8 +1734,8 @@ mod tests {
         std::fs::create_dir_all(&site).expect("site");
         assert_eq!(site_lacks(&site), Some("cpu.html"));
         for f in SITE_FILES {
-            if f == "cpu" || f == "gpu" {
-                std::fs::create_dir_all(site.join(f)).expect("glue dir");
+            if f == "cpu" || f == "gpu" || f == recorded::IN_SITE {
+                std::fs::create_dir_all(site.join(f)).expect("glue or recording dir");
             } else {
                 std::fs::write(site.join(f), "x").expect("file");
             }

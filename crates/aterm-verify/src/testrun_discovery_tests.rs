@@ -36,6 +36,7 @@ fn recorder_discovery_stops_at_the_first_test_header() {
         [TestExe {
             exe: "/r/target/debug/deps/actual-1".into(),
             flag: "--lib".into(),
+            bin_env: Vec::new(),
         }]
     );
     assert_eq!(
@@ -63,6 +64,7 @@ fn colored_and_doc_test_headers_keep_the_remaining_bytes_owned_by_the_test() {
             [TestExe {
                 exe: "/r/target/debug/deps/actual-1".into(),
                 flag: "--lib".into(),
+                bin_env: Vec::new(),
             }]
         );
         assert_eq!(log, format!("warning: before tests\n{tail}"));
@@ -119,6 +121,7 @@ fn a_recording_without_a_test_header_still_reads_its_compile_metadata() {
         [TestExe {
             exe: "/r/target/debug/deps/partial-1".into(),
             flag: "--test partial".into(),
+            bin_env: Vec::new(),
         }]
     );
     assert_eq!(log, "error: compilation stopped before a test started\n");

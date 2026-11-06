@@ -821,10 +821,8 @@ mod tests {
 
     #[test]
     fn the_shipped_pins_file_is_a_shape_this_writer_understands() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-update-core/src/pins.rs"
-        );
+        let path = aterm_tempfile::manifest_dir().join("../aterm-update-core/src/pins.rs");
+        let path = path.to_str().expect("a UTF-8 checkout path");
         let src = String::from_utf8(
             crate::fsio::read_bytes(path).expect("the anchor file is in the tree"),
         )

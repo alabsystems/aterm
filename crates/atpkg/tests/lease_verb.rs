@@ -63,7 +63,7 @@ fn a_sigterm_to_the_holder_ends_the_command_it_holds_for() {
     use std::os::unix::process::ExitStatusExt as _;
     let fx = Fixture::new("term");
     let pidfile = fx.root.path().join("child.pid");
-    let mut holder = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let mut holder = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .arg("lease")
         .arg(fx.bin())
         .args(["--who", "sigterm test", "--", "/bin/sh", "-c"])

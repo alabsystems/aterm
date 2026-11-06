@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
-    Fetcher, LandingBytes, digest_refusal_note, disk_gate, fetch_artifact, make_staging_dir,
+    Fetcher, LandingBytes, Retry, digest_refusal_note, disk_gate, fetch_artifact, make_staging_dir,
     staged_download_path, sweep_foreign_partials, verified_pkg_or_miss,
 };
 use crate::gate::{ApplyDecision, decide};
@@ -474,7 +474,7 @@ fn job(
             return None;
         }
     }
-    if digest_refusal_note(layout, program, pinned, artifact, false).is_some() {
+    if digest_refusal_note(layout, program, pinned, artifact, Retry::Program).is_some() {
         return None;
     }
     let dl = staged_download_path(layout, program, &artifact.asset).ok()?;

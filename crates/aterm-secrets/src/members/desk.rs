@@ -1602,6 +1602,9 @@ pub struct Fleet {
     pub current: bool,
 }
 
+/// A caller's bounded public membership evidence, read before possession with no desk lock.
+pub type ProofAuthority<'a> = &'a (dyn Fn(&Proving<'_>) -> Result<Vec<u8>> + Sync);
+
 /// How a desk's caller serves `prove` on one connection ([`serve_with`]).
 #[derive(Clone, Copy)]
 pub struct Proof<'a> {
@@ -1610,6 +1613,9 @@ pub struct Proof<'a> {
     /// Why this member refuses the Mac whatever it proves next, asked before the possession
     /// challenge (`client::refuses_before_possession`); called with no lock of the desk held.
     pub refuses: Refuses<'a>,
+    /// Public/sealed acknowledged membership records, bounded by the joining reader. An
+    /// automatic default join verifies these before answering possession. No desk lock is held.
+    pub authority: Option<ProofAuthority<'a>>,
     /// What the fleet's channel proved on this connection, where it came over the fleet
     /// (`vault-join`): the proof must name its node key, and [`Proving::fleet`] holds whether it
     /// also proved the vault's current fleet code.
@@ -1671,7 +1677,7 @@ pub fn serve_with_request_policy<S: Read + Write + ?Sized>(
         "node" => node(desk, &parsed).map(|taken| format!("OK state={}", taken.word())),
         "run" => return run(desk, stream, &parsed, from, &challenge, bundle),
         "prove" if let Some(proof) = proof => {
-            return prove(desk, stream, &parsed, from, &challenge, proof).map(|()| None);
+            return prove(desk, stream, &parsed, &line, from, &greeted, proof).map(|()| None);
         }
         _ => Err(Error::new(
             "the other Mac asked for something this Mac does not serve",
@@ -2074,8 +2080,9 @@ fn prove<S: Read + Write + ?Sized>(
     desk: &Mutex<Desk>,
     stream: &mut S,
     first: &Line<'_>,
+    proof_line: &str,
     from: IpAddr,
-    challenge: &[u8; CHALLENGE_LEN],
+    greeted: &super::joiner::Greeting,
     proof: Proof<'_>,
 ) -> Result<()> {
     let ended = (|| {
@@ -2091,7 +2098,7 @@ fn prove<S: Read + Write + ?Sized>(
             let request = held.begin_proof(
                 from,
                 &asked,
-                challenge,
+                &greeted.challenge,
                 proof.fleet.as_ref().map(|fleet| &fleet.node),
                 Instant::now(),
             )?;
@@ -2121,6 +2128,35 @@ fn prove<S: Read + Write + ?Sized>(
         // may follow. The desk's lock is not held: this reads the vault's state.
         if let Some(why) = (proof.refuses)(&proving) {
             return Err(Error::new(why));
+        }
+        if first.get("authority").is_ok() {
+            let nonce = first.hex::<32>("authority")?;
+            let records = proof
+                .authority
+                .ok_or_else(|| Error::new("this member serves no proof authority witness"))?(
+                &proving,
+            )?;
+            if records.len() > crate::membership_log::MAX_RECORDS_STREAM {
+                return Err(Error::new("the member's authority exceeds its bound"));
+            }
+            let message = super::authority::message(&nonce, greeted, proof_line, &records);
+            let signature = {
+                let held = desk.lock_or_recover();
+                if held.local.key() != &greeted.key {
+                    return Err(Error::new("the member's identity changed during proof"));
+                }
+                super::joiner::sign(&held.local.device, &message)?
+            };
+            wire::write_line(
+                stream,
+                &format!(
+                    "OK authority={} authoritysig={}",
+                    records.len(),
+                    wire::hex(signature.as_ref()),
+                ),
+            )?;
+            stream.write_all(&records)?;
+            stream.flush()?;
         }
         // The possession challenge, under the network this member pins.
         let (mut pending, possess) = Pending::issue(&request, trust.network, trust.authority)?;

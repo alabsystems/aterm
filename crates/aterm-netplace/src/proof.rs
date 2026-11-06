@@ -57,7 +57,13 @@ pub fn read_with(state: &Path, here: Here, now: u64) -> Now {
                 .unwrap_or_default(),
             crate::heard::read_counted_in(&dir, &judged),
         ),
-        Err(_) => (Default::default(), crate::heard::read_counted(&dir)),
+        Err(_) => (
+            Default::default(),
+            (
+                Default::default(),
+                crate::heard::refused(&dir, crate::heard::FILE),
+            ),
+        ),
     };
     let (record, _) = step(&record, &here.facts, &evidence, None, now, None);
     let stay = record.current();

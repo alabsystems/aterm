@@ -136,7 +136,7 @@ fn a_header_gives_back_what_the_run_was_given() {
     assert!(text.starts_with("atape 1\n"), "{text}");
     let back = Header::decode(&text).expect("a header this build wrote");
     assert_eq!(back.tape, "t-7");
-    assert_eq!(back.build, aterm_types::version::build_id());
+    assert_eq!(back.build, aterm_stamp::build_id());
     assert_eq!(back.entry, Entry::Hosted);
     assert_eq!(back.roots, h.roots);
     assert_eq!(back.setup, setup);

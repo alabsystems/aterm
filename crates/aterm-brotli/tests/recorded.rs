@@ -5,7 +5,6 @@
 //! decodes to, and its verdict on every recorded mutation of them (`tests/recorded`).
 
 use std::io::{self, Read};
-use std::path::PathBuf;
 
 use crate::support::{Trickle, decode, sha256_hex};
 
@@ -19,7 +18,7 @@ fn rows(tsv: &str) -> impl Iterator<Item = Vec<&str>> {
 }
 
 fn stream(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("tests/recorded/corpus")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

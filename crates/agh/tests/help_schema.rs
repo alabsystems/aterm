@@ -13,7 +13,7 @@ use agh::cli::{Captured, Ctx};
 use agh::wire::Endpoints;
 use agh::wire::door::is_authorization;
 use agh::wire::scripted::ScriptedTransport;
-use agh::{API_VERSION, Kind, VERSION};
+use agh::{API_VERSION, Kind, version};
 use aterm_json::Value;
 
 use crate::common;
@@ -326,7 +326,7 @@ fn version_prints_both_versions() {
     assert_eq!(exit, 0);
     assert_eq!(
         captured.stdout_text(),
-        format!("agh {VERSION} (api {API_VERSION})\n")
+        format!("agh {} (api {API_VERSION})\n", version())
     );
 }
 

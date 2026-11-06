@@ -499,8 +499,11 @@ impl UploadFile {
             match file.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    hasher.update(&buf[..n]);
                     len = len.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                    if len > meta.len() {
+                        return Err(Error::local(format!("{shown} changed while it was hashed")));
+                    }
+                    hasher.update(&buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(unread(e)),
@@ -2431,26 +2434,26 @@ fn made_object(view: &IntentView) -> Option<u64> {
 /// where the intent sent one (an intent with no target matches any, design §11.2).
 fn matches(release: &ReleaseObject, intent: &Intent) -> bool {
     release.tag_name == intent.key
-        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
-            == Some(Sha256Digest::of(
-                release.body.as_deref().unwrap_or("").as_bytes(),
-            ))
         && intent
             .target_commitish
             .as_ref()
             .is_none_or(|target| *target == release.target_commitish)
+        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
+            == Some(Sha256Digest::of(
+                release.body.as_deref().unwrap_or("").as_bytes(),
+            ))
 }
 
 /// §4.6.9's agreeing: `req` asks for what `intent` asked for: its tag, its body's digest, and
 /// its target where the intent has one.
 fn agrees(req: &DraftRequest, intent: &Intent) -> bool {
     req.tag_name == intent.key
-        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
-            == Some(Sha256Digest::of(req.body.as_bytes()))
         && intent
             .target_commitish
             .as_ref()
             .is_none_or(|target| req.target_commitish.as_ref() == Some(target))
+        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
+            == Some(Sha256Digest::of(req.body.as_bytes()))
 }
 
 /// A release's assets by name and digest.

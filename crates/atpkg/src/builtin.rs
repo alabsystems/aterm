@@ -60,7 +60,7 @@ pub fn which_line(tool: &str, path_var: Option<&OsStr>) -> Option<String> {
         program,
         alias_dir().as_deref(),
         crate::vendor::first_on_path(program.name, path_var).as_deref(),
-        aterm_types::version::app_version(),
+        aterm_stamp::app_version(),
     ))
 }
 

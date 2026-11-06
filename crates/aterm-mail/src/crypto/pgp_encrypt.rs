@@ -117,7 +117,10 @@ impl EncryptedBody {
         digest.update(&[18, 3, 1, recipient.hash, recipient.cipher]);
         digest.update(b"Anonymous Sender    ");
         digest.update(&recipient.fingerprint);
-        let derived = Zeroizing::new(digest.finish().as_ref().to_vec());
+        let klen = key_len(recipient.cipher)?;
+        let finished = digest.finish();
+        let mut derived = Zeroizing::new([0u8; 32]);
+        derived[..klen].copy_from_slice(&finished.as_ref()[..klen]);
         let mut plain = Zeroizing::new([5u8; 40]);
         plain[0] = 9;
         plain[1..33].copy_from_slice(self.session.as_ref());
@@ -126,7 +129,7 @@ impl EncryptedBody {
             .iter()
             .fold(0u16, |a, b| a.wrapping_add(u16::from(*b)));
         plain[33..35].copy_from_slice(&sum.to_be_bytes());
-        let wrapped = aes::wrap(&derived[..key_len(recipient.cipher)?], plain.as_ref())?;
+        let wrapped = aes::wrap(&derived[..klen], plain.as_ref())?;
         let mut packet = Vec::with_capacity(14 + 32 + wrapped.len());
         packet.push(3);
         packet.extend_from_slice(&recipient.id);
@@ -137,9 +140,7 @@ impl EncryptedBody {
         Ok(frame(1, &packet))
     }
     pub fn armored(&self, recipient: &Recipient) -> Result<String, String> {
-        let key_pkt = self.key_packet(recipient)?;
-        let mut bytes = Vec::with_capacity(key_pkt.len() + self.data.len());
-        bytes.extend_from_slice(&key_pkt);
+        let mut bytes = self.key_packet(recipient)?;
         bytes.extend_from_slice(&self.data);
         let encoded =
             aterm_codec::base64::encode(&bytes).map_err(|_| "Could not encode encrypted mail")?;

@@ -702,18 +702,27 @@ fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
     ])
 }
 
-fn nvml_42(slot: &str) -> Result<u8, Why> {
-    assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
-    Ok(42)
+/// An NVML arm that reads the card busy at `busy`, with no name and no memory fact.
+const fn nvml_busy(busy: Result<u8, Why>) -> linux::NvidiaCard {
+    linux::NvidiaCard {
+        busy,
+        name: None,
+        unified: false,
+    }
 }
 
-fn nvml_never(slot: &str) -> Result<u8, Why> {
+fn nvml_42(slot: &str) -> linux::NvidiaCard {
+    assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
+    nvml_busy(Ok(42))
+}
+
+fn nvml_never(slot: &str) -> linux::NvidiaCard {
     panic!("NVML asked for {slot}, a card whose runtime PM a read could move");
 }
 
 #[test]
 fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
-    let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaBusy| {
+    let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaRead| {
         let g = Root::new(root.path())
             .with_nvidia(arm)
             .gpu()
@@ -728,14 +737,14 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
         .gpu()
         .expect("a GPU");
     assert_eq!(crate::caps::gpu_cap(Some(&g)), Cap::Yes);
-    assert_eq!(gpu(&spark, |_| Ok(250)), nvidia(Some(100), None));
-    let failures: [(linux::NvidiaBusy, Why); 3] = [
-        (|_| Err(Why::Unsupported), Why::Unsupported),
+    assert_eq!(gpu(&spark, |_| nvml_busy(Ok(250))), nvidia(Some(100), None));
+    let failures: [(linux::NvidiaRead, Why); 3] = [
+        (|_| nvml_busy(Err(Why::Unsupported)), Why::Unsupported),
         (
-            |_| Err(Why::NeedsPrivilege("nvml")),
+            |_| nvml_busy(Err(Why::NeedsPrivilege("nvml"))),
             Why::NeedsPrivilege("nvml"),
         ),
-        (|_| Err(Why::NotRead), Why::NotRead),
+        (|_| nvml_busy(Err(Why::NotRead)), Why::NotRead),
     ];
     for (arm, why) in failures {
         assert_eq!(gpu(&spark, arm), nvidia(None, Some(why)));
@@ -825,7 +834,61 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
         (None, Some(Why::NotRead)),
         "a fixture root never reaches NVML"
     );
-    assert_eq!(linux::no_nvml("000f:01:00.0"), Err(Why::NotRead));
+    assert_eq!(
+        linux::no_nvml("000f:01:00.0"),
+        linux::NvidiaCard::unread(Why::NotRead)
+    );
+}
+
+/// A3 L4 (D7): an NVIDIA card NVML reads takes NVML's own name for it (`NVIDIA GB10`), not its
+/// DRM driver's, and carries the reader's memory fact, whether NVML read its busy figure or not.
+/// NEGATIVE CONTROL: an arm that names nothing, a card NVML is not asked about (its runtime PM
+/// could move) and a fixture root's inert arm all leave the driver's name, `nvidia`, and no fact.
+#[test]
+fn the_nvml_gpu_is_named_by_nvml() {
+    fn gb10(slot: &str) -> linux::NvidiaCard {
+        assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
+        linux::NvidiaCard {
+            busy: Ok(7),
+            name: Some("NVIDIA GB10".into()),
+            unified: true,
+        }
+    }
+    fn gb10_unsupported(_: &str) -> linux::NvidiaCard {
+        linux::NvidiaCard {
+            busy: Err(Why::Unsupported),
+            ..gb10("000f:01:00.0")
+        }
+    }
+    let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaRead| {
+        let g = Root::new(root.path())
+            .with_nvidia(arm)
+            .gpu()
+            .expect("a GPU");
+        (g.name, g.unified, g.device_pct, g.unread)
+    };
+    let spark = nvidia_card("auto\n", "1\n");
+    assert_eq!(
+        gpu(&spark, gb10),
+        (Some("NVIDIA GB10".to_owned()), true, Some(7), None)
+    );
+    assert_eq!(
+        gpu(&spark, gb10_unsupported),
+        (
+            Some("NVIDIA GB10".to_owned()),
+            true,
+            None,
+            Some(Why::Unsupported)
+        )
+    );
+    let driver = |pct, unread| (Some("nvidia".to_owned()), false, pct, unread);
+    assert_eq!(gpu(&spark, nvml_42), driver(Some(42), None));
+    assert_eq!(
+        gpu(&spark, linux::no_nvml),
+        driver(None, Some(Why::NotRead))
+    );
+    let laptop = nvidia_card("auto\n", "0\n");
+    assert_eq!(gpu(&laptop, nvml_never), driver(None, Some(Why::NotRead)));
 }
 
 #[test]
@@ -1246,81 +1309,80 @@ fn machine_words_are_the_first_cpu_model_and_the_os_pretty_name() {
     );
 }
 
-/// A clipped protocol table cannot supply a machine total, even when all rows
-/// before its cap parse. Exact-cap EOF is complete; one further valid row is not.
-#[test]
-fn clipped_tcp_tables_cannot_supply_a_complete_count() {
-    const HEADER: &str =
-        "sl local_address rem_address st tx_queue:rx_queue tr retrnsmt uid timeout inode\n";
-    const V4: &str =
-        "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 42\n";
-    const V6: &str = "0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 43\n";
-    let v4 = format!("{HEADER}{V4}");
-    let v6 = format!("{HEADER}{V6}");
-    let root = tree(&[("proc/net/tcp", &v4), ("proc/net/tcp6", &v6)]);
-    let mut scratch = Vec::new();
-    let expected = crate::TcpCounts {
-        established: 1,
-        listen: 1,
-        ..crate::TcpCounts::default()
-    };
-    assert_eq!(
-        linux::tcp_counts_under_into(root.path(), &mut scratch),
-        Some(expected)
-    );
-
-    // Use the actual reader's buffer size, filling it with complete valid rows
-    // and then blank lines so a row never straddles the cap in this control.
-    let cap = scratch.len();
-    let capped = |row: &str| {
-        let n = (cap - HEADER.len()) / row.len();
-        let mut text = format!("{HEADER}{}", row.repeat(n));
-        text.extend(std::iter::repeat_n('\n', cap - text.len()));
-        (text, u32::try_from(n).expect("bounded fixture count"))
-    };
-    let (mut full_v4, listens) = capped(V4);
-    write(root.path(), "proc/net/tcp", &full_v4);
-    assert_eq!(
-        linux::tcp_counts_under_into(root.path(), &mut scratch),
-        Some(crate::TcpCounts {
-            listen: listens,
-            ..expected
-        }),
-        "EOF exactly at the cap still counts every complete row"
-    );
-    full_v4.push_str(V4);
-    write(root.path(), "proc/net/tcp", &full_v4);
-    assert_eq!(
-        linux::tcp_counts_under_into(root.path(), &mut scratch),
-        None,
-        "an unread valid IPv4 row must not become an exact total"
-    );
-
-    write(root.path(), "proc/net/tcp", &v4);
-    let (mut full_v6, _) = capped(V6);
-    full_v6.push_str(V6);
-    write(root.path(), "proc/net/tcp6", &full_v6);
-    assert_eq!(
-        linux::tcp_counts_under_into(root.path(), &mut scratch),
-        None,
-        "a complete IPv4 table cannot conceal clipped IPv6"
-    );
-}
-
+/// THE NETWORK SCOPE COUNTS ONLY TCP SOCKETS (A3 D13): a descriptor counts when it links to a
+/// socket the newest TCP dump names; a tty, a pipe, an event queue and a Unix socket do not.
+/// NEGATIVE CONTROL: the same fd directory with no socket of it in the dump counts 0, where
+/// counting every `socket:[` link counted 2.
 #[cfg(unix)]
 #[test]
-fn open_socket_count_counts_only_socket_symlinks_in_fd_dir() {
+fn the_network_scope_counts_only_tcp_sockets() {
     use std::os::unix::fs::symlink;
     let root = tree(&[]);
     let fd_dir = root.path().join("proc/4242/fd");
     std::fs::create_dir_all(&fd_dir).expect("fd dir");
     symlink("/dev/pts/3", fd_dir.join("0")).expect("tty symlink");
-    symlink("pipe:[9911]", fd_dir.join("1")).expect("pipe symlink");
-    symlink("socket:[12345]", fd_dir.join("3")).expect("socket 3");
-    symlink("socket:[67890]", fd_dir.join("4")).expect("socket 4");
+    symlink("pipe:[12345]", fd_dir.join("1")).expect("pipe symlink");
+    symlink("socket:[12345]", fd_dir.join("3")).expect("a TCP socket");
+    symlink("socket:[67890]", fd_dir.join("4")).expect("a Unix socket");
     symlink("anon_inode:[eventpoll]", fd_dir.join("5")).expect("epoll");
-    assert_eq!(Root::new(root.path()).open_socket_count(4242), Some(2));
-    assert_eq!(Root::new(root.path()).open_socket_count(9999), None);
+    let tcp = std::collections::HashMap::from([(
+        12345,
+        crate::jobs::linux::TcpRow {
+            inode: 12345,
+            state: crate::jobs::TcpState::Established,
+            local_port: 1,
+            remote: None,
+            rx_queue: 0,
+        },
+    )]);
+    let root = Root::new(root.path());
+    assert_eq!(root.open_socket_count(4242, &tcp), Some(1));
+    assert_eq!(root.open_socket_count(9999, &tcp), None);
+    assert_eq!(
+        root.open_socket_count(4242, &std::collections::HashMap::new()),
+        Some(0)
+    );
+}
+
+/// THE SOCKET SCOPES COUNT THIS NAMESPACE'S SOCKETS ALONE: their counts are shares of this
+/// namespace's TCP total, so a process in another network namespace counts none of its sockets,
+/// even once the jobs pass has read that namespace's table, which names them. NEGATIVE CONTROL:
+/// the jobs pass's lookup does name the sandbox's listener.
+#[cfg(unix)]
+#[test]
+fn the_socket_scopes_count_this_namespaces_sockets_alone() {
+    use std::os::unix::fs::symlink;
+    let dir = tree(&[]);
+    let at = |p: &str| dir.path().join(p);
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:0C38 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 55555 1 0\n";
+    for pid in ["self", "4343", "4444"] {
+        std::fs::create_dir_all(at(&format!("proc/{pid}/ns"))).expect("ns dir");
+    }
+    symlink("net:[4026531840]", at("proc/self/ns/net")).expect("own namespace");
+    symlink("net:[4026532999]", at("proc/4343/ns/net")).expect("a sandbox's namespace");
+    symlink("net:[4026531840]", at("proc/4444/ns/net")).expect("this namespace");
+    for pid in ["4343", "4444"] {
+        std::fs::create_dir_all(at(&format!("proc/{pid}/fd"))).expect("fd dir");
+        std::fs::create_dir_all(at(&format!("proc/{pid}/net"))).expect("net dir");
+        std::fs::write(at(&format!("proc/{pid}/net/tcp")), table).expect("tcp table");
+        symlink("socket:[55555]", at(&format!("proc/{pid}/fd/3"))).expect("a listener");
+        symlink("socket:[67890]", at(&format!("proc/{pid}/fd/4"))).expect("a Unix socket");
+    }
+    let _ = linux::tcp::namespace_sockets(&at("proc/4343"));
+    linux::tcp::read_namespaces_now();
+    assert!(
+        linux::tcp::namespace_sockets(&at("proc/4343")).is_some_and(|t| t.contains_key(&55555)),
+        "the jobs pass's lookup names it"
+    );
+    let root = Root::new(dir.path());
+    let none = std::collections::HashMap::new();
+    assert_eq!(root.open_socket_count(4343, &none), Some(0));
+    assert_eq!(
+        root.open_socket_count(4444, &none),
+        Some(0),
+        "this namespace: the dump's word"
+    );
 }
 
 /// The sequence the socket-dump fixtures answer.

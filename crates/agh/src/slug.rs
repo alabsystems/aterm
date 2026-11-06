@@ -102,6 +102,16 @@ impl Slug {
         s.make_ascii_lowercase();
         s
     }
+
+    /// Whether `full_name` is `{owner}/{repo}` ignoring ASCII case, without allocating.
+    #[inline]
+    #[must_use]
+    pub fn eq_full_name(&self, full_name: &str) -> bool {
+        let Some((owner, repo)) = full_name.split_once('/') else {
+            return false;
+        };
+        self.owner.eq_ignore_ascii_case(owner) && self.repo.eq_ignore_ascii_case(repo)
+    }
 }
 
 impl Slug {

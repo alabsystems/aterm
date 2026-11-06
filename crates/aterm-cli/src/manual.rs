@@ -1656,6 +1656,9 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              install the whole ALab toolset (lifting an `uninstall --all`)
   aterm pkg install <program>
                              install one program from the signed index or its vendor
+  aterm pkg install trust --build <N>
+                             Trust build N, the one a checkout's trust.lock names, beside
+                             `current`, which stays
   aterm pkg list [--porcelain]
                              installed programs, live builds, builds kept for rollback
   aterm pkg doctor [--verbose] [--json]
@@ -1664,7 +1667,9 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              update everything, or one program; `update codex --vendor |
                              --alab` switches between OpenAI's codex and ALab's
   aterm pkg verify [program] re-verify the installed bytes against the signed root, offline
-  aterm pkg which <tool>     the store path a tool resolves to, and its routing
+  aterm pkg which [--json] <tool>
+                             the store path and routing; --json: schema-1 local lookup,
+                             no launch, install or network; exit 1 unless ready
   aterm pkg run <tool> [args…]
                              run the store binary with its declared environment (what
                              `aterm <tool>` does)
@@ -3242,6 +3247,24 @@ AGENTS
   the launch says so and the line runs any copy of the shell's own.
   `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
+ANY OTHER PROGRAM
+  aterm ctl @self spawn program=<path|word> [arg=<word>]... - < task
+                             a worker running a program no harness reads (a script,
+                             or Kimi Code CLI: `program=sh arg=-c
+                             arg='exec kimi --auto -p "$(cat)"'`): its task file is
+                             its standard input, its exit status
+                             concludes it once (`done why=exit-status exit=0`, else
+                             `failed why=exit-status exit=<n>`, or `failed
+                             why=no-exit-status` where none was read; a job stopped
+                             with Ctrl-Z has not ended), and `result` is its output
+                             tail (`source=output`, the last 200 rows, redacted, at most
+                             16 KiB); the board, `await task` and the reaper read it as
+                             any worker's. No Autopilot or `turn` reopens it, and no
+                             harness marks it. Nothing reads its screen: a program
+                             that asks on its terminal waits there, so bound the wait
+                             (`await task … timeout=`). A CLI `agent=` starts is
+                             refused here by name.
+
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>`)
   `<h>` is a peer's host, node id or address (`aterm fleet peers`), its host's first label,
   or its short name: the lead word of its host (`m102` of `m102-macbook-…`), else a word
@@ -3328,7 +3351,9 @@ GOTCHAS
   * `conclusion=` on `await task` and `task` says how a worker ended: `finished`, or
     `failed` with `why=` (`could-not-finish`, a reply whose first line starts `Could not
     finish: <why>`; `exit`, before it finished; `off`, a person; `off-ctl`, a manager or a
-    script; `expired`; `repeated`; a stall, until it moves).
+    script; `expired`; `repeated`; `exit-status`, a `spawn program=` worker whose program
+    exited `exit=<n>` other than 0; `no-exit-status`, one whose status was not read; a
+    stall, until it moves).
   * `done` means a clean `Nothing left:` defense, a `git` check that found nothing left
     to land where it could read, and `LANDED` answered to the land check (codex-alab runs
     its own; `aterm help harness` names where the check cannot read); `checked=` on
@@ -3749,6 +3774,7 @@ FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
 const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `m0` until it is numbered) and nickname
 
   aterm name [--json]
+  aterm name set <mN> [--nick <word>] [--dry-run] [--json]
   aterm name nick <word> | --random  [--dry-run] [--json]
 
   Unix only for now: elsewhere it exits 2, keeping no name.
@@ -3756,13 +3782,27 @@ const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `m0`
 WHAT IT SAYS
   One line, `m8 Heron  class=seeded fleet=in node=<node id>`: the NAME and nickname this
   machine goes by, how the NAME was claimed (`auto`, aterm picked it; `chosen`, a person
-  did; `seeded`, from an older build's names), whether this machine holds a fleet key that
-  reads (`fleet=in`, else `fleet=out`), a migration from an older build's names not
+  did; `seeded`, from an older build's names), whether it is in a fleet (`fleet=in`: a
+  member of its vault, or it holds a fleet key that reads and its vault did not take it
+  out; `fleet=joining`: let in, asking, or waiting for a seat; `fleet=out`; `fleet=unread`:
+  the vault's state cannot be read, as `aterm members status` would say), a migration from an older build's names not
   finished yet (`migration=pending` or `migration=waiting`), and this machine's fleet node
-  once it has one. `--json` prints one object: `name`, `number` (null while `m0`), `nick`,
+  once it has one. An unreadable identity is journaled; an existing valid name is still
+  reported, with no node in text and `node: null` in JSON. `--json` prints one object:
+  `name`, `number` (null while `m0`), `nick`,
   `title`, `class`, `nick_class`, `since`, `rev`, `migration`, `fleet`, `node`, and `made`,
   where a name this run wrote came from (`kept` when it was there already). On macOS the
   menu bar shows the same title right of the version, its nickname clipped to 16 letters.
+
+CHANGING THE NAME
+  On macOS, click the machine name beside the version and choose Rename This Mac….
+  Enter the number and nickname, for example `m86 MissBunny`. Change Nickname… changes
+  only the nickname.
+
+  From a shell, `aterm name set m86 --nick MissBunny` chooses that number and nickname.
+  Leave out `--nick` to keep the nickname. The number must be positive; `m0` means the
+  machine has not been numbered. A number another known machine holds is refused.
+  `--dry-run` reports the proposed name without changing it.
 
 THE NICKNAME
   `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and
@@ -3871,7 +3911,16 @@ fn rust_page() -> String {
     let prefix = atpkg_prefix(&home, xdg.as_deref());
     let checks_pin = checks_pinned_channel();
     let rustup = atpkg::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &home);
-    let tools = checks_toolchain(explicit.as_deref(), &rustup, &prefix, &path_env);
+    let lock = cwd
+        .as_deref()
+        .and_then(|d| atpkg::trust_lock::found_for(d, Some(&prefix)));
+    let tools = checks_toolchain(
+        explicit.as_deref(),
+        &rustup,
+        &prefix,
+        &path_env,
+        lock.as_ref(),
+    );
     let store_bin = prefix.join("bin");
     let layout = atpkg::store::Layout {
         prefix: prefix.clone(),
@@ -3995,6 +4044,8 @@ fn rust_page() -> String {
              \x20                  `targo on PATH` below.",
             tools.stage2_dir.display()
         );
+    } else if let Some(why) = &tools.lock_refusal {
+        let _ = writeln!(out, "  check toolchain  NONE: {why}");
     } else {
         let _ = writeln!(
             out,
@@ -4005,6 +4056,7 @@ fn rust_page() -> String {
             trust_install_act(unserved.is_some())
         );
     }
+    let _ = writeln!(out, "{}", trust_lock_rows(lock.as_ref(), &tools, &prefix));
     if let Some(r) = &tools.refused {
         let _ = writeln!(
             out,
@@ -4119,7 +4171,7 @@ fn rust_page() -> String {
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| Some(home.join(".cargo")));
-    let movers = rustc_movers(
+    let movers = atpkg::toolchain::rustc_movers::rustc_movers(
         cwd.as_deref(),
         &|key| std::env::var(key).ok(),
         cargo_home.as_deref(),
@@ -4429,95 +4481,11 @@ fn rust_toolchain_row(pinned: Option<&str>, rustup_env: Option<&str>) -> String 
     }
 }
 
-/// What moves a bare `targo` off the `trustc` beside it in `cwd`, in cargo's
-/// resolution order: `$RUSTC`, `$CARGO_BUILD_RUSTC`, then `build.rustc` in each
-/// `.cargo/config.toml` / `.cargo/config` from `cwd` up (nearest first), then
-/// `$CARGO_HOME`'s.
-fn rustc_movers(
-    cwd: Option<&Path>,
-    var: &dyn Fn(&str) -> Option<String>,
-    cargo_home: Option<&Path>,
-) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    for key in ["RUSTC", "CARGO_BUILD_RUSTC"] {
-        if let Some(value) = var(key).filter(|v| !v.is_empty()) {
-            found.push((format!("${key}"), value));
-        }
-    }
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut dir = cwd;
-    while let Some(d) = dir {
-        files.push(d.join(".cargo").join("config.toml"));
-        files.push(d.join(".cargo").join("config"));
-        dir = d.parent();
-    }
-    if let Some(h) = cargo_home {
-        files.push(h.join("config.toml"));
-        files.push(h.join("config"));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for file in files {
-        if !seen.insert(file.clone()) {
-            continue;
-        }
-        if let Some(value) = aterm_uds::atomic_file::read_regular_text(
-            &file,
-            aterm_uds::atomic_file::MAX_CONFIG_BYTES,
-        )
-        .ok()
-        .as_deref()
-        .and_then(build_rustc_in)
-        {
-            found.push((format!("build.rustc in {}", file.display()), value));
-        }
-    }
-    found
-}
-
-/// The `rustc` key of a cargo config's `[build]` table (or a top-level dotted
-/// `build.rustc`), verbatim between its quotes; the last one wins.
-fn build_rustc_in(text: &str) -> Option<String> {
-    let mut table = String::new();
-    let mut found = None;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[') {
-            table = header
-                .split(']')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if !((table == "build" && key == "rustc") || (table.is_empty() && key == "build.rustc")) {
-            continue;
-        }
-        let value = value.trim_start();
-        let Some(quote) = value.chars().next().filter(|q| *q == '"' || *q == '\'') else {
-            continue;
-        };
-        if let Some(end) = value[1..].find(quote) {
-            let inner = &value[1..=end];
-            if !inner.is_empty() {
-                found = Some(inner.to_string());
-            }
-        }
-    }
-    found
-}
-
 /// The `targo here` row: the compiler a bare `targo` runs here, from the
-/// directory it resolves into (`dir`) and [`rustc_movers`].
-fn targo_here_row(dir: Option<&Path>, movers: &[(String, String)]) -> String {
-    if let Some((what, value)) = movers.first() {
+/// directory it resolves into (`dir`) and what moves it there
+/// (`atpkg::toolchain::rustc_movers`).
+fn targo_here_row(dir: Option<&Path>, movers: &[atpkg::toolchain::rustc_movers::Mover]) -> String {
+    if let Some(atpkg::toolchain::rustc_movers::Mover { what, value, .. }) = movers.first() {
         return format!(
             "NOT trustc: {what} = {value} names the compiler targo runs here.\n\
              \x20                  (Measured: $RUSTC and build.rustc move targo; a rust-toolchain.toml pin\n\
@@ -4875,12 +4843,14 @@ fn checks_pinned_channel() -> Option<String> {
 }
 
 /// The toolchain aterm's checks pick here: `Toolchain::discover_with_store` as aterm-verify's
-/// `run_toolchain` calls it, under [`checks_pinned_channel`].
+/// `run_toolchain` calls it, under [`checks_pinned_channel`], for the tree whose `trust.lock` is
+/// `lock`.
 fn checks_toolchain(
     explicit: Option<&Path>,
     rustup_home: &Path,
     prefix: &Path,
     path_env: &std::ffi::OsStr,
+    lock: Option<&atpkg::trust_lock::Found>,
 ) -> atpkg::toolchain::Toolchain {
     atpkg::toolchain::Toolchain::discover_with_store(
         explicit,
@@ -4888,7 +4858,58 @@ fn checks_toolchain(
         Some(prefix),
         path_env,
         checks_pinned_channel().as_deref(),
+        lock,
     )
+}
+
+/// The `trust.lock` rows of `aterm help rust`: the lock above this directory and the build it
+/// names, what took its place, and whether plain `targo` (the shim in `<prefix>/bin`) runs it.
+fn trust_lock_rows(
+    lock: Option<&atpkg::trust_lock::Found>,
+    tools: &atpkg::toolchain::Toolchain,
+    prefix: &Path,
+) -> String {
+    let Some(found) = lock else {
+        return "  trust.lock       none above this directory: no lock binds this tree's compiler"
+            .to_string();
+    };
+    let locked = match &found.lock {
+        Err(why) => {
+            let mut rows = format!(
+                "  trust.lock       {} DOES NOT READ: {why}",
+                found.path.display()
+            );
+            if let Some(overridden) = &tools.lock_override {
+                let _ = write!(rows, "\n                   {overridden}");
+            }
+            return rows;
+        }
+        Ok(locked) => locked,
+    };
+    let mut rows = format!(
+        "  trust.lock       {}: Trust build {} (tree root {}, compiler {})",
+        found.path.display(),
+        locked.build,
+        locked.tree_root.get(..12).unwrap_or(&locked.tree_root),
+        locked
+            .compiler_commit
+            .get(..12)
+            .unwrap_or(&locked.compiler_commit),
+    );
+    if let Some(overridden) = &tools.lock_override {
+        let _ = write!(rows, "\n                   {overridden}");
+    }
+    // Only a run that compiles has a build for the shim to differ from; a refused one says why
+    // on its `check toolchain` row.
+    let shim = atpkg::trust_lock::shim_answer(prefix);
+    if let Some(mismatch) = tools
+        .have_targo()
+        .then(|| atpkg::trust_lock::shim_mismatch(&shim, found, locked, &tools.stage2_dir))
+        .flatten()
+    {
+        let _ = write!(rows, "\n                   {mismatch}");
+    }
+    rows
 }
 
 /// A Trust toolchain `bin`: an executable `trustc` with a `lib/rustlib` sysroot
@@ -5831,6 +5852,106 @@ mod tests {
         assert!(trust_version_row(Some(empty.to_string())).starts_with("NONE"));
     }
 
+    /// `aterm help rust` names the tree's lock and its build, what took its place, and a `targo`
+    /// shim that runs another build than the run compiles with; with no lock it says none binds
+    /// the tree. NEGATIVE CONTROLS: a run whose locked build is refused, and a shim laid for the
+    /// build the run resolved, state no mismatch.
+    #[test]
+    #[cfg(unix)]
+    fn trust_lock_rows_name_the_lock_and_a_shim_that_runs_another_build() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-cli-lock-rows-")
+            .tempdir()
+            .expect("scratch");
+        let prefix = scratch.path().join("pkg");
+        let runnable = |bin: &Path| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::create_dir_all(bin).expect("bin");
+            let targo = bin.join("targo");
+            std::fs::write(&targo, "#!/bin/sh\n").expect("targo");
+            std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        };
+        let tools =
+            |stage2_dir: PathBuf, lock_override: Option<&str>| atpkg::toolchain::Toolchain {
+                targo: stage2_dir.join("targo"),
+                trustdoc: stage2_dir.join("trustdoc"),
+                stage2_dir,
+                tippy: None,
+                trustfmt: None,
+                borrowed: Vec::new(),
+                refused: None,
+                store_bin: None,
+                demoted: None,
+                lock: None,
+                lock_refusal: None,
+                lock_override: lock_override.map(str::to_string),
+            };
+        let own = scratch.path().join("s/bin");
+        runnable(&own);
+        let none = trust_lock_rows(None, &tools(own.clone(), None), &prefix);
+        assert!(none.contains("none above this directory"), "{none}");
+
+        let found = atpkg::trust_lock::Found {
+            path: PathBuf::from("/c/trust.lock"),
+            lock: Ok(atpkg::trust_lock::TrustLock {
+                build: 83,
+                tree_root: "d".repeat(64),
+                compiler_commit: "a".repeat(40),
+                receipt: "SEED-MINT sha256:00".to_string(),
+                stock_toolchain: "1.99.1".to_string(),
+            }),
+        };
+        let laid = |build: u64| {
+            std::fs::create_dir_all(prefix.join("bin")).expect("bin");
+            let target = atpkg::trust_lock::build_dir(&prefix, build).join("bin/targo");
+            std::fs::write(
+                prefix.join("bin/targo"),
+                format!(
+                    "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
+                    target.display()
+                ),
+            )
+            .expect("shim");
+        };
+        laid(16387);
+        let rows = trust_lock_rows(
+            Some(&found),
+            &tools(
+                own.clone(),
+                Some("TRUST_STAGE2_BIN=/s/bin overrides /c/trust.lock"),
+            ),
+            &prefix,
+        );
+        assert!(
+            rows.starts_with(
+                "  trust.lock       /c/trust.lock: Trust build 83 (tree root dddddddddddd"
+            ),
+            "{rows}"
+        );
+        assert!(rows.contains("TRUST_STAGE2_BIN=/s/bin overrides"), "{rows}");
+        assert!(rows.contains("plain `targo` resolves 16387"), "{rows}");
+
+        // A run whose locked build is refused compiles with nothing: no shim differs from it.
+        let resolved = atpkg::trust_lock::build_dir(&prefix, 83).join("bin");
+        let refused = atpkg::toolchain::Toolchain {
+            lock_refusal: Some(
+                "/c/trust.lock names Trust build 83, which this Mac's store does not hold"
+                    .to_string(),
+            ),
+            ..tools(resolved.clone(), None)
+        };
+        let rows = trust_lock_rows(Some(&found), &refused, &prefix);
+        assert!(!rows.contains("plain `targo`"), "{rows}");
+        assert_eq!(rows.lines().count(), 1, "{rows}");
+
+        laid(83);
+        runnable(&resolved);
+        let rows = trust_lock_rows(Some(&found), &tools(resolved, None), &prefix);
+        assert!(!rows.contains("plain `targo`"), "{rows}");
+        assert_eq!(rows.lines().count(), 1, "{rows}");
+    }
+
     /// The `rust-toolchain` row never says a Trust pin drives a stock `cargo` while
     /// `RUSTUP_TOOLCHAIN` (which rustup ranks above the pin) names another toolchain,
     /// and never says nothing selects stock Rust where no pin exists.
@@ -5862,93 +5983,6 @@ mod tests {
         );
     }
 
-    /// `build.rustc` is read the way cargo's config names it: under `[build]`, or
-    /// dotted at the top level; never a wrapper, never another table's key.
-    #[test]
-    fn build_rustc_is_read_from_the_build_table_only() {
-        assert_eq!(
-            build_rustc_in("[build]\nrustc = \"/x/rustc\"\n").as_deref(),
-            Some("/x/rustc")
-        );
-        assert_eq!(
-            build_rustc_in("build.rustc = '/y/rustc' # stock\n").as_deref(),
-            Some("/y/rustc")
-        );
-        assert_eq!(
-            build_rustc_in("[build]\nrustc = \"/a/b#c\" # a comment\n").as_deref(),
-            Some("/a/b#c"),
-            "a # inside the quotes is the value's"
-        );
-        for none in [
-            "[build]\nrustc-wrapper = \"sccache\"\n",
-            "[target.aarch64-apple-darwin]\nrustc = \"/z\"\n",
-            "# [build]\n# rustc = \"/z\"\n",
-            "[build]\nrustflags = [\"-Ztrust-verify=off\"]\n",
-            "[build]\nrustc = \"\"\n",
-            "",
-        ] {
-            assert_eq!(build_rustc_in(none), None, "{none:?}");
-        }
-    }
-
-    /// What can move targo off trustc here, in cargo's precedence: `$RUSTC`, then
-    /// `$CARGO_BUILD_RUSTC`, then the nearest config file's `build.rustc`, then
-    /// `$CARGO_HOME`'s — each file read once however it is reached.
-    #[test]
-    fn what_moves_targo_off_trustc_is_read_in_cargos_order() {
-        let hold = path_scratch("movers");
-        let root = hold.path();
-        let repo = root.join("repo");
-        let deep = repo.join("crates").join("x");
-        let home = root.join("cargo-home");
-        for dir in [&deep, &repo.join(".cargo"), &home] {
-            std::fs::create_dir_all(dir).expect("mkdir");
-        }
-        let none = |_: &str| None;
-        assert!(
-            rustc_movers(Some(&deep), &none, Some(&home)).is_empty(),
-            "nothing set, nothing moves it"
-        );
-        std::fs::write(
-            home.join("config.toml"),
-            "[build]\nrustc = \"/home/rustc\"\n",
-        )
-        .expect("write");
-        std::fs::write(
-            repo.join(".cargo").join("config.toml"),
-            "[build]\nrustc = \"/repo/rustc\"\n",
-        )
-        .expect("write");
-        let env = |k: &str| (k == "RUSTC").then(|| "/env/rustc".to_string());
-        let got: Vec<String> = rustc_movers(Some(&deep), &env, Some(&home))
-            .into_iter()
-            .map(|(what, value)| format!("{what}={value}"))
-            .collect();
-        assert_eq!(got.len(), 3, "{got:?}");
-        assert_eq!(got[0], "$RUSTC=/env/rustc");
-        assert_eq!(
-            got[1],
-            format!(
-                "build.rustc in {}=/repo/rustc",
-                repo.join(".cargo").join("config.toml").display()
-            )
-        );
-        assert_eq!(
-            got[2],
-            format!(
-                "build.rustc in {}=/home/rustc",
-                home.join("config.toml").display()
-            )
-        );
-        // An empty variable is unset.
-        let empty = |k: &str| (k == "RUSTC").then(String::new);
-        assert_eq!(rustc_movers(Some(&deep), &empty, Some(&home)).len(), 2);
-        // $CARGO_HOME reached twice — as an ancestor's `.cargo` and as itself — is
-        // one row, not two.
-        let own = repo.join(".cargo");
-        assert_eq!(rustc_movers(Some(&repo), &none, Some(&own)).len(), 1);
-    }
-
     /// The `targo here` row names the trustc beside targo when nothing moves it,
     /// the mover when one does, and says so when that targo has no trustc.
     #[test]
@@ -5968,7 +6002,11 @@ mod tests {
         );
         let moved = targo_here_row(
             Some(root),
-            &[("$RUSTC".to_string(), "/s/rustc".to_string())],
+            &[atpkg::toolchain::rustc_movers::Mover {
+                what: "$RUSTC".to_string(),
+                value: "/s/rustc".to_string(),
+                base: root.to_path_buf(),
+            }],
         );
         assert!(
             moved.starts_with("NOT trustc: $RUSTC = /s/rustc"),

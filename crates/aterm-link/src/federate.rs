@@ -6,8 +6,10 @@
 //!
 //! - **Names.** A Mac's node is `n-` and the first 16 hex digits of its node key
 //!   ([`node_of_key`]), the principal astream binds and the link proves. Its fabric bridge writes
-//!   `bus.log` under `producer_id_of` that node, and nothing else on this Mac does; the person
-//!   carry writes its node's lanes under [`CARRIER`]'s.
+//!   `bus.log` under `producer_id_of` that node, and nothing else on this Mac does but the move of
+//!   its own unread mail across a key rotation ([`Lane::Inbox`]), numbered by the offsets it had
+//!   on that log, each below 2^32 (incarnation 0), below every sequence the bridge numbers (from
+//!   incarnation 1); the person carry writes its node's lanes under [`CARRIER`]'s.
 //! - **Mail goes one hop.** For each Mac this Mac's sessions wrote to, the node service runs one
 //!   push bridge ([`Lane::Mail`]) from this Mac's `bus.log` straight to that Mac's, over the
 //!   mesh link. Its consumer group is the name the mail rule gives that lane's reader
@@ -17,7 +19,12 @@
 //!   deduplicates on (producer, source offset), so each record lands there once.
 //! - **A node-key rotation** changes a Mac's node. Its senders carry the mail they still hold
 //!   for the old node to the new one under the new subjects, once ([`Lane::Move`]): the same push,
-//!   from the old node's group, its subjects rewritten.
+//!   from the old node's group, its subjects rewritten. The rotated Mac's own pushes carry the mail
+//!   its sessions wrote under its old nodes as well as under its new one: each follows its one
+//!   group over every lane this Mac wrote to its addressee, under any of its nodes ([`Lane::records`],
+//!   §11 C3b), and the far end's ring takes mail the peer wrote under a node its seat held before
+//!   ([`peer_ring`]). And the mail its own `bus.log` holds, unread, for a node it held before
+//!   moves to its node now on that log, once ([`Lane::Inbox`]), where its bridge reads it.
 //! - **Topics go one hop** to each Mac that holds one ([`Lane::Say`]).
 //! - **The hand-off.** The node service reads the membership log; the bridge does not. It writes
 //!   what the bridge must know to route, [`Handoff`], beside `bus.sock` ([`HANDOFF_FILE`]): the
@@ -63,6 +70,13 @@ pub const NODE_KEY_FILE: &str = "fleet-node-key";
 
 /// The hand-off's file, beside `bus.sock` in the fabric root.
 pub const HANDOFF_FILE: &str = "mesh-handoff";
+
+/// The reader's ring the node service mints the fabric bridge beside the hand-off, in a cap
+/// file's lines ([`write_old_reads`]): the read of the mail lanes of each node a key rotation
+/// retired from this Mac ([`old_reads`]), where the record each one the node service moved
+/// ([`Lane::Inbox`]) came from still lies, so the bridge answers a moved record as the one it
+/// was moved from. It only reads, so it publishes as no one.
+pub const OLD_READS_FILE: &str = "mesh-old-inbox.cap";
 
 /// The most records one push sends before it waits for their acknowledgement.
 pub const BURST: usize = 256;
@@ -180,19 +194,26 @@ pub fn mail_group(dst: &str) -> String {
     subject::inbox_group(FLEET, dst)
 }
 
-/// The node a mail lane `subject` this Mac (`me`) wrote is addressed to: `None` for any other
-/// subject.
+/// Every mail lane of the fleet, `/f/alab/in/>`: what [`Routes`] watches on this Mac's
+/// `bus.log` for the nodes it wrote to, under any node of its own.
 #[must_use]
-pub fn addressee<'a>(subject: &'a str, me: &str) -> Option<&'a str> {
+pub fn every_lane() -> String {
+    format!("/f/{FLEET}/in/>")
+}
+
+/// The node a mail lane `subject` is addressed to and the node that wrote it, `(dst, src)`:
+/// `None` for a lane a person wrote, and for any other subject.
+#[must_use]
+pub fn mail_lane(subject: &str) -> Option<(&str, &str)> {
     let rest = subject.strip_prefix(&format!("/f/{FLEET}/in/"))?;
     let mut parts = rest.split('/');
     let (dst, sid, src, kind) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     (parts.next().is_none()
-        && src == me
+        && is_node(src)
         && is_node(dst)
         && subject::is_principal(sid)
         && !kind.is_empty())
-    .then_some(dst)
+    .then_some((dst, src))
 }
 
 /// Every topic broadcast this Mac (`me`) writes: `/f/alab/pub/<me>/*/say/>`.
@@ -242,6 +263,48 @@ pub fn say_group(me: &str, dst: &str) -> String {
     format!("/f/{FLEET}/cur/{me}/say/{dst}")
 }
 
+/// The most retired nodes of one seat a ring names ([`peer_ring`], `olds`), and of this Mac its
+/// bridge's reader's ring ([`old_reads`]): astream attaches at most 16 grants on one connection,
+/// and the ring's own five, the halts' and an inbox's pair fit beside them.
+pub const RING_OLDS_MAX: usize = 8;
+
+/// The grants of [`OLD_READS_FILE`] for a Mac whose retired nodes are `olds`: the read of each
+/// one's mail lanes (`ro:/f/alab/in/<old>/>`), the first [`RING_OLDS_MAX`] in node order.
+#[must_use]
+pub fn old_reads(olds: &BTreeSet<String>) -> Vec<String> {
+    olds.iter()
+        .take(RING_OLDS_MAX)
+        .map(|old| format!("ro:{}", subject::inbox_filter(FLEET, old)))
+        .collect()
+}
+
+/// Write [`OLD_READS_FILE`] in `dir` for the Mac `handoff` names (its `me`): each grant of
+/// [`old_reads`] for its retired nodes, minted by `mint`, owner-only. Where it has none, the
+/// file goes.
+///
+/// # Errors
+/// A grant `mint` refuses, or the file's write or removal.
+pub fn write_old_reads(
+    dir: &Path,
+    handoff: &Handoff,
+    mint: &dyn Fn(&str) -> io::Result<Capability>,
+) -> io::Result<()> {
+    let grants = old_reads(&handoff.retired(&handoff.me));
+    if grants.is_empty() {
+        return match std::fs::remove_file(dir.join(OLD_READS_FILE)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let mut lines = String::new();
+    for grant in &grants {
+        let cap = mint(grant)?;
+        lines.push_str(&astream_cap::capfile::format_line(&cap.filter, &cap.tag));
+        lines.push('\n');
+    }
+    aterm_uds::private_file::write_private(dir, OLD_READS_FILE, lines.as_bytes())
+}
+
 /// The principal the person carry writes this Mac's lanes under (§11 C3c): a producer of its own,
 /// so the sequence numbers of its records, the offsets of the posts it carries, never meet the
 /// bridge's. Not a node's key-named principal, so no link's proof binds it.
@@ -285,7 +348,12 @@ pub fn person_post<'a>(subject: &'a str, me: &str) -> Option<(&'a str, &'a str, 
 /// - its own topic broadcasts (`rw …/pub/<peer>/*/say/>`);
 /// - reading the halt rows (`ro …/fleet/>`);
 /// - relaying halts (`rw,relay …/halt/>`), each origin-signed and checked against the seats, and
-///   reading its own, so it finds the high water this Mac holds of it.
+///   reading its own, so it finds the high water this Mac holds of it;
+/// - mail addressed to this Mac that the peer's sessions wrote under a node its seat held before
+///   a key rotation, `olds` (`rw …/in/<me>/*/<old>/*`, §11 C3b): its push carries that mail,
+///   under its own producer now, as it carries what it wrote since. The first
+///   [`RING_OLDS_MAX`] of them, in node order, but this Mac's node or the peer's: the peer's
+///   pushes carry those alone, and journal the mail they leave under any other.
 ///
 /// Nothing else: no presence row, no session log (`ev`), no person's lane, and no reader's group:
 /// this Mac pushes the mail it holds, so nothing reads it here. A person's post from the peer
@@ -293,14 +361,21 @@ pub fn person_post<'a>(subject: &'a str, me: &str) -> Option<(&'a str, &'a str, 
 /// for, and is the person's only where this Mac's bridge verified that seal: the ring lets the
 /// peer write it, never makes it human.
 #[must_use]
-pub fn peer_ring(fleet: &str, me: &str, peer: &str) -> Vec<String> {
-    vec![
+pub fn peer_ring(fleet: &str, me: &str, peer: &str, olds: &BTreeSet<String>) -> Vec<String> {
+    let mut ring = vec![
         format!("rw,p={peer}:/f/{fleet}/in/{me}/*/{peer}/*"),
         format!("rw,p={peer}:/f/{fleet}/pub/{peer}/*/say/>"),
         format!("ro,p={peer}:/f/{fleet}/fleet/>"),
         format!("rw,relay,p={peer}:/f/{fleet}/halt/>"),
         format!("ro,p={peer}:/f/{fleet}/halt/{peer}"),
-    ]
+    ];
+    ring.extend(
+        olds.iter()
+            .filter(|old| *old != peer && *old != me)
+            .take(RING_OLDS_MAX)
+            .map(|old| format!("rw,p={peer}:/f/{fleet}/in/{me}/*/{old}/*")),
+    );
+    ring
 }
 
 /// What the node service hands the fabric bridge ([`HANDOFF_FILE`]): this Mac's node, the
@@ -402,6 +477,17 @@ impl Handoff {
         aterm_uds::private_file::write_private(dir, HANDOFF_FILE, self.render().as_bytes())
     }
 
+    /// The retired nodes whose seat `node` holds now: each moved node [`Handoff::current`] follows
+    /// to `node`, through every rotation since.
+    #[must_use]
+    pub fn retired(&self, node: &str) -> BTreeSet<String> {
+        self.moved
+            .keys()
+            .filter(|old| *old != node && self.current(old) == Some(node))
+            .cloned()
+            .collect()
+    }
+
     /// The current member `node` names: itself when it is one, or the member its seat holds now
     /// when a key rotation retired it, followed through each later rotation. `None` for a node
     /// that is neither.
@@ -442,29 +528,63 @@ pub enum Lane {
         /// The Mac that holds one.
         dst: String,
     },
+    /// The mail this Mac's own `bus.log` holds, unread, for `old`, a node of its own that a key
+    /// rotation retired, moved on that log to the node it holds now, under its subjects (§11
+    /// C3b). The push follows the group the old node's bridge read that mail under, so it takes
+    /// up exactly where that bridge stopped, and the mail rule holds each record until it is
+    /// carried; the bridge reads the moved mail on its one inbox.
+    Inbox {
+        /// This Mac's retired node.
+        old: String,
+    },
 }
 
 impl Lane {
-    /// The Mac whose link carries it.
+    /// The Mac whose link carries it: `None` for this Mac's own `bus.log` ([`Lane::Inbox`]).
     #[must_use]
-    pub fn to(&self) -> &str {
+    pub fn to(&self) -> Option<&str> {
         match self {
-            Self::Mail { dst } | Self::Say { dst } => dst,
-            Self::Move { new, .. } => new,
+            Self::Mail { dst } | Self::Say { dst } => Some(dst),
+            Self::Move { new, .. } => Some(new),
+            Self::Inbox { .. } => None,
         }
     }
 
-    /// The records it carries from this Mac (`me`). With `forward_all` (the
-    /// [`FORWARD_ALL`] negative control) a mail push carries every lane this Mac wrote,
-    /// whatever node it names.
+    /// The records it carries from this Mac (`me`, whose retired nodes are `olds`): the filter its
+    /// group follows, and the lanes within it it carries ([`FederationConfig::carry`]; none: all
+    /// of it). A mail push to a node follows its group over every lane this Mac wrote to that node
+    /// under any of its nodes, so one group, the one the mail rule holds that node's lanes by,
+    /// covers them all and its commit passes none it did not carry; two pushes on that group, one
+    /// per node of this Mac, could each commit past the other's. With `forward_all` (the
+    /// [`FORWARD_ALL`] negative control) a mail push carries every lane this Mac wrote, whatever
+    /// node it names.
     #[must_use]
-    pub fn filter(&self, me: &str, forward_all: bool) -> String {
-        match self {
-            Self::Mail { .. } if forward_all => written_lanes(me),
-            Self::Mail { dst } => mail_lanes(dst, me),
-            Self::Move { old, .. } => mail_lanes(old, me),
-            Self::Say { .. } => say_lanes(me),
+    pub fn records(
+        &self,
+        me: &str,
+        olds: &BTreeSet<String>,
+        forward_all: bool,
+    ) -> (String, Vec<String>) {
+        let to = match self {
+            Self::Mail { .. } if forward_all => return (written_lanes(me), Vec::new()),
+            Self::Say { .. } => return (say_lanes(me), Vec::new()),
+            Self::Inbox { old } => return (subject::inbox_filter(FLEET, old), Vec::new()),
+            Self::Mail { dst } => dst,
+            Self::Move { old, .. } => old,
+        };
+        if olds.is_empty() {
+            return (mail_lanes(to, me), Vec::new());
         }
+        let carry = std::iter::once(me)
+            .chain(olds.iter().map(String::as_str))
+            .map(|src| mail_lanes(to, src))
+            .collect();
+        (format!("/f/{FLEET}/in/{to}/*/*/*"), carry)
+    }
+
+    /// Whether the records it carries depend on this Mac's retired nodes: a mail push's do.
+    const fn carries_olds(&self) -> bool {
+        matches!(self, Self::Mail { .. } | Self::Move { .. })
     }
 
     /// The group it follows under on this Mac (`me`).
@@ -472,23 +592,25 @@ impl Lane {
     pub fn group(&self, me: &str) -> String {
         match self {
             Self::Mail { dst } => mail_group(dst),
-            Self::Move { old, .. } => mail_group(old),
+            Self::Move { old, .. } | Self::Inbox { old } => mail_group(old),
             Self::Say { dst } => say_group(me, dst),
         }
     }
 
-    /// How its subjects read at the far end.
+    /// How its subjects read at the far end, for this Mac (`me`).
     ///
     /// # Errors
     /// A rewrite astream refuses (never, for nodes [`is_node`] takes).
-    pub fn rewrite(&self) -> Result<SubjectRewrite, String> {
-        match self {
-            Self::Mail { .. } | Self::Say { .. } => Ok(SubjectRewrite::passthrough()),
-            Self::Move { old, new } => SubjectRewrite::prefix_map(
-                &format!("/f/{FLEET}/in/{old}"),
-                &format!("/f/{FLEET}/in/{new}"),
-            ),
-        }
+    pub fn rewrite(&self, me: &str) -> Result<SubjectRewrite, String> {
+        let (old, new) = match self {
+            Self::Mail { .. } | Self::Say { .. } => return Ok(SubjectRewrite::passthrough()),
+            Self::Move { old, new } => (old.as_str(), new.as_str()),
+            Self::Inbox { old } => (old.as_str(), me),
+        };
+        SubjectRewrite::prefix_map(
+            &format!("/f/{FLEET}/in/{old}"),
+            &format!("/f/{FLEET}/in/{new}"),
+        )
     }
 
     /// Its word in a journal line.
@@ -498,23 +620,30 @@ impl Lane {
             Self::Mail { dst } => format!("mail to {dst}"),
             Self::Move { old, new } => format!("mail held for {old}, moved to {new}"),
             Self::Say { dst } => format!("topics to {dst}"),
+            Self::Inbox { old } => format!("this Mac's unread mail for {old}, its node before"),
         }
     }
 }
 
-/// The pushes this Mac (`me`) runs: one per node this Mac's sessions wrote to (`written`) that is
-/// a current member, one per retired node it wrote to whose seat holds a current member now, and
-/// one per member that holds a topic (`holders`). With `forward_all` ([`FORWARD_ALL`]) every
-/// member gets a mail push, written to or not.
+/// The pushes this Mac (`me`, whose retired nodes are `olds`) runs: one per node this Mac's
+/// sessions wrote to (`written`) that is a current member, one per retired node it wrote to whose
+/// seat holds a current member now, one per member that holds a topic (`holders`), and one per
+/// retired node of its own, for the mail its `bus.log` holds for it unread. With `forward_all`
+/// ([`FORWARD_ALL`]) every member gets a mail push, written to or not.
 #[must_use]
 pub fn plan(
     me: &str,
+    olds: &BTreeSet<String>,
     handoff: &Handoff,
     holders: &BTreeSet<String>,
     written: &BTreeSet<String>,
     forward_all: bool,
 ) -> BTreeSet<Lane> {
-    let mut lanes = BTreeSet::new();
+    let mut lanes: BTreeSet<Lane> = olds
+        .iter()
+        .filter(|old| *old != me)
+        .map(|old| Lane::Inbox { old: old.clone() })
+        .collect();
     for dst in written {
         if dst == me {
             continue;
@@ -556,6 +685,27 @@ thread_local! {
     /// where it is set follows each mail push under a group of its own, not the one the mail rule
     /// names the lane's reader by, so a carried record's hold is never released on the sender.
     pub static ANOTHER_GROUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of a rotated Mac's pushes (`one-node`): [`Routes`] started on a
+    /// thread where it is set counts and carries the lanes of this Mac's current node alone, as the
+    /// pushes before §11 C3b did, so the mail its sessions wrote under a node it held before is
+    /// never carried, and its group, which holds those lanes too, can pass them unsent.
+    pub static ONE_NODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`ONE_NODE`] is on: set on this thread, or named for this process.
+fn one_node() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        ONE_NODE.with(std::cell::Cell::get) || aterm_types::negative_control::on("one-node")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -677,6 +827,7 @@ struct Shared {
     cfg: RoutesConfig,
     forward_all: bool,
     another_group: bool,
+    one_node: bool,
     unsealed_carry: bool,
     state: Mutex<State>,
     bell: Condvar,
@@ -687,9 +838,11 @@ struct State {
     stopped: bool,
     handoff: Handoff,
     holders: BTreeSet<String>,
-    written: BTreeSet<String>,
+    /// Each node the watch saw a lane of, and the nodes it wrote to.
+    wrote: BTreeMap<String, BTreeSet<String>>,
     running: BTreeMap<Lane, Running>,
-    ending: Vec<JoinHandle<()>>,
+    /// Pushes told to stop and not joined yet, each with the group it followed.
+    ending: Vec<(String, JoinHandle<()>)>,
     watcher: Option<JoinHandle<()>>,
     watch_closer: Option<Closer>,
     carry: CarryStatus,
@@ -699,17 +852,34 @@ struct State {
     kicks: u64,
 }
 
+impl State {
+    /// The nodes this Mac wrote to under any of its nodes (`me` and its retired `olds`).
+    fn written(&self, me: &str, olds: &BTreeSet<String>) -> BTreeSet<String> {
+        std::iter::once(me)
+            .chain(olds.iter().map(String::as_str))
+            .filter_map(|src| self.wrote.get(src))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
 struct Running {
     stop: Arc<AtomicBool>,
     closer: Option<FederationBridgeCloser>,
     handle: Option<JoinHandle<()>>,
     status: RouteStatus,
+    /// The retired nodes of this Mac whose lanes it carries.
+    olds: BTreeSet<String>,
+    /// The group it follows.
+    group: String,
 }
 
 impl Routes {
     /// Start the watch over the lanes this Mac writes and the person carry, with no member yet:
     /// no push runs, and the carry reads nothing, until [`Routes::set`] names some.
-    /// [`FORWARD_ALL`], [`ANOTHER_GROUP`] and [`UNSEALED_CARRY`] are read on the calling thread.
+    /// [`FORWARD_ALL`], [`ANOTHER_GROUP`], [`ONE_NODE`] and [`UNSEALED_CARRY`] are read on the
+    /// calling thread.
     ///
     /// # Errors
     /// Where the watch's or the carry's thread cannot start.
@@ -718,6 +888,7 @@ impl Routes {
             cfg,
             forward_all: forward_all(),
             another_group: another_group(),
+            one_node: one_node(),
             unsealed_carry: unsealed_carry(),
             state: Mutex::new(State::default()),
             bell: Condvar::new(),
@@ -740,9 +911,25 @@ impl Routes {
 
     /// Route by `handoff` (the members, and each rotated node's successor) and `holders` (the
     /// members that hold a topic): pushes no longer planned stop, new ones start, and the person
-    /// carry carries to the members it names.
+    /// carry carries to the members it names. A hand-off that retired more of this Mac's nodes
+    /// than a peer's ring names ([`RING_OLDS_MAX`]) is journaled, naming the ones whose mail no
+    /// push carries.
     pub fn set(&self, handoff: &Handoff, holders: &BTreeSet<String>) {
         let mut state = self.shared.state.lock_or_recover();
+        if state.handoff != *handoff {
+            let past: Vec<String> = handoff
+                .retired(&self.shared.cfg.me)
+                .into_iter()
+                .skip(RING_OLDS_MAX)
+                .collect();
+            if !past.is_empty() {
+                self.shared.note(&format!(
+                    "mesh: mail this Mac wrote under {} is not carried: a peer's ring names the \
+                     first {RING_OLDS_MAX} nodes a key rotation retired of it",
+                    past.join(" ")
+                ));
+            }
+        }
         handoff.clone_into(&mut state.handoff);
         holders.clone_into(&mut state.holders);
         self.shared.reconcile(&mut state);
@@ -777,10 +964,12 @@ impl Routes {
             .collect()
     }
 
-    /// The nodes the watch saw this Mac write to.
+    /// The nodes the watch saw this Mac write to, under its node or one the hand-off says it
+    /// held before.
     #[must_use]
     pub fn written(&self) -> BTreeSet<String> {
-        self.shared.state.lock_or_recover().written.clone()
+        let state = self.shared.state.lock_or_recover();
+        state.written(&self.shared.cfg.me, &self.shared.olds(&state))
     }
 
     /// Ask every push and the watch to stop, without waiting: each followed group's bridge and
@@ -809,7 +998,10 @@ impl Routes {
     pub fn stop(&self) {
         self.stop_soon();
         let mut state = self.shared.state.lock_or_recover();
-        let mut handles: Vec<JoinHandle<()>> = std::mem::take(&mut state.ending);
+        let mut handles: Vec<JoinHandle<()>> = std::mem::take(&mut state.ending)
+            .into_iter()
+            .map(|(_, handle)| handle)
+            .collect();
         for running in state.running.values_mut() {
             handles.extend(running.handle.take());
         }
@@ -834,25 +1026,64 @@ impl Shared {
         (self.cfg.note)(line);
     }
 
+    /// This Mac's retired nodes, by the hand-off (none under [`ONE_NODE`]): the first
+    /// [`RING_OLDS_MAX`], in node order, the ones a peer's ring grants ([`peer_ring`]) and the
+    /// reader's ring reads ([`old_reads`]). A mail push that carried a lane the peer refuses would
+    /// stop at that lane's first record, all its mail with it; so mail under any other is passed
+    /// with its group, uncarried, as [`Routes::set`] says.
+    fn olds(&self, state: &State) -> BTreeSet<String> {
+        if self.one_node {
+            BTreeSet::new()
+        } else {
+            let mut olds = state.handoff.retired(&self.cfg.me);
+            while olds.len() > RING_OLDS_MAX {
+                olds.pop_last();
+            }
+            olds
+        }
+    }
+
+    /// The group `lane`'s push follows on this Mac ([`ANOTHER_GROUP`] gives a mail push one of
+    /// its own).
+    fn group_of(&self, lane: &Lane) -> String {
+        let me = &self.cfg.me;
+        match lane {
+            Lane::Mail { dst } if self.another_group => format!("/f/{FLEET}/cur/{me}/push/{dst}"),
+            _ => lane.group(me),
+        }
+    }
+
     /// Start each planned push that is not running and stop each running one that is not
-    /// planned, joining none: a stopped push's thread is joined at the next reconcile once it
-    /// ended, or at [`Routes::stop`].
+    /// planned, or whose records changed with this Mac's retired nodes, joining none: a stopped
+    /// push's thread is joined at the next reconcile once it ended, or at [`Routes::stop`]. A push
+    /// started on a group another one still follows joins that one first, so no two bridges ever
+    /// follow one group: either one's commit could pass records the other has not carried.
     fn reconcile(self: &Arc<Self>, state: &mut State) {
         if state.stopped {
             return;
         }
+        let me = &self.cfg.me;
+        let olds = self.olds(state);
         let planned = plan(
-            &self.cfg.me,
+            me,
+            &olds,
             &state.handoff,
             &state.holders,
-            &state.written,
+            &state.written(me, &olds),
             self.forward_all,
         );
+        let carried = |lane: &Lane| {
+            if lane.carries_olds() {
+                olds.clone()
+            } else {
+                BTreeSet::new()
+            }
+        };
         let gone: Vec<Lane> = state
             .running
-            .keys()
-            .filter(|lane| !planned.contains(*lane))
-            .cloned()
+            .iter()
+            .filter(|(lane, running)| !planned.contains(*lane) || running.olds != carried(lane))
+            .map(|(lane, _)| lane.clone())
             .collect();
         for lane in gone {
             if let Some(mut running) = state.running.remove(&lane) {
@@ -860,18 +1091,20 @@ impl Shared {
                 if let Some(closer) = &running.closer {
                     closer.close();
                 }
-                state.ending.extend(running.handle.take());
+                if let Some(handle) = running.handle.take() {
+                    state.ending.push((running.group, handle));
+                }
                 self.note(&format!("mesh: stopped the push of {}", lane.describe()));
                 // A push waiting out its back-off hears its stop now.
                 self.bell.notify_all();
             }
         }
         let mut ended = Vec::new();
-        for handle in std::mem::take(&mut state.ending) {
+        for (group, handle) in std::mem::take(&mut state.ending) {
             if handle.is_finished() {
                 ended.push(handle);
             } else {
-                state.ending.push(handle);
+                state.ending.push((group, handle));
             }
         }
         for handle in ended {
@@ -884,10 +1117,27 @@ impl Shared {
         for lane in wanted {
             let stop = Arc::new(AtomicBool::new(false));
             let pushing = Arc::clone(self);
+            let (group, lane_olds) = (self.group_of(&lane), carried(&lane));
+            let (before, still): (Vec<_>, Vec<_>) = std::mem::take(&mut state.ending)
+                .into_iter()
+                .partition(|(was, _)| *was == group);
+            state.ending = still;
+            let before: Vec<JoinHandle<()>> = before.into_iter().map(|(_, h)| h).collect();
             let (for_thread, stop_for_thread) = (lane.clone(), Arc::clone(&stop));
+            let (group_for_thread, olds_for_thread) = (group.clone(), lane_olds.clone());
             let handle = std::thread::Builder::new()
                 .name("aterm-link-mail-push".to_owned())
-                .spawn(move || pushing.push(&for_thread, &stop_for_thread));
+                .spawn(move || {
+                    for handle in before {
+                        let _ = handle.join();
+                    }
+                    pushing.push(
+                        &for_thread,
+                        &group_for_thread,
+                        &olds_for_thread,
+                        &stop_for_thread,
+                    );
+                });
             match handle {
                 Ok(handle) => {
                     state.running.insert(
@@ -897,6 +1147,8 @@ impl Shared {
                             closer: None,
                             handle: Some(handle),
                             status: RouteStatus::default(),
+                            olds: lane_olds,
+                            group,
                         },
                     );
                 }
@@ -933,10 +1185,11 @@ impl Shared {
         }
     }
 
-    /// Run `lane`'s push until it is stopped: open it, follow its group until the link or the
-    /// source ends, then back off and open it again. Each open resumes where its group's commit
-    /// stands, and the far end's dedup takes a resent record once.
-    fn push(self: Arc<Self>, lane: &Lane, stop: &AtomicBool) {
+    /// Run `lane`'s push until it is stopped: open it under `group`, carrying the lanes of this
+    /// Mac's retired nodes `olds` too, follow its group until the link or the source ends, then
+    /// back off and open it again. Each open resumes where its group's commit stands, and the far
+    /// end's dedup takes a resent record once.
+    fn push(self: Arc<Self>, lane: &Lane, group: &str, olds: &BTreeSet<String>, stop: &AtomicBool) {
         let mut wait = BACKOFF_FIRST;
         let mut told: Option<String> = None;
         loop {
@@ -944,7 +1197,7 @@ impl Shared {
                 return;
             }
             let kicks = self.kicks();
-            let ended = match self.open(lane) {
+            let ended = match self.open(lane, group, olds) {
                 Ok(mut bridge) => {
                     let mut state = self.state.lock_or_recover();
                     if state.stopped || stop.load(Ordering::Acquire) {
@@ -997,28 +1250,44 @@ impl Shared {
         }
     }
 
-    /// Open `lane`'s push: this Mac's `bus.log` under the grants it needs, to the far end's
-    /// over its link, in mirror mode under this Mac's producer id.
-    fn open(&self, lane: &Lane) -> io::Result<FederationBridge> {
+    /// Open `lane`'s push under `group`: this Mac's `bus.log` under the grants it needs, to the
+    /// far end's over its link, in mirror mode under this Mac's producer id, carrying the lanes
+    /// it wrote under its retired nodes `olds` too ([`Lane::records`]).
+    fn open(
+        &self,
+        lane: &Lane,
+        group: &str,
+        olds: &BTreeSet<String>,
+    ) -> io::Result<FederationBridge> {
         let me = &self.cfg.me;
-        let filter = lane.filter(me, self.forward_all);
-        let group = match lane {
-            Lane::Mail { dst } if self.another_group => format!("/f/{FLEET}/cur/{me}/push/{dst}"),
-            _ => lane.group(me),
+        let (filter, carry) = lane.records(me, olds, self.forward_all);
+        let (to, dest) = match lane.to() {
+            Some(to) => (to, (self.cfg.dest)(to)?),
+            // This Mac's own log, written under its node, on its own node's lanes alone.
+            None => (
+                me.as_str(),
+                Dest {
+                    dial: Arc::clone(&self.cfg.source),
+                    grants: vec![(self.cfg.mint)(&format!(
+                        "rw,p={me}:{}",
+                        subject::inbox_filter(FLEET, me)
+                    ))?],
+                },
+            ),
         };
-        let dest = (self.cfg.dest)(lane.to())?;
         let caps = vec![
             (self.cfg.mint)(&format!("ro:{filter}"))?,
             (self.cfg.mint)(&format!("rw,p={me}:{group}"))?,
         ];
         let rewrite = lane
-            .rewrite()
+            .rewrite(me)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         FederationBridge::open(FederationConfig {
             source: FederationEndpoint::stream(me, Arc::clone(&self.cfg.source)).with_caps(caps),
-            dest: FederationEndpoint::stream(lane.to(), dest.dial).with_caps(dest.grants),
-            group,
+            dest: FederationEndpoint::stream(to, dest.dial).with_caps(dest.grants),
+            group: group.to_owned(),
             filter,
+            carry,
             producer_id: astream_cap::producer_id_of(me),
             rewrite,
             relay: false,
@@ -1057,10 +1326,12 @@ impl Shared {
         }
     }
 
-    /// One watch: every node a lane this Mac wrote names, then each new one as it is written.
-    /// `Ok` once stopped.
+    /// One watch: every node each mail lane on this Mac's `bus.log` names, then each new one as
+    /// it is written. It reads every node's lanes, not only those this Mac writes now, so it knows
+    /// what this Mac wrote under a node it held before whenever the hand-off says which those
+    /// were. `Ok` once stopped.
     fn watch_once(self: &Arc<Self>) -> io::Result<()> {
-        let filter = written_lanes(&self.cfg.me);
+        let filter = every_lane();
         let cap = (self.cfg.mint)(&format!("ro:{filter}"))?;
         let (mut client, closer) = astream_broker::connect_stream(self.cfg.source.dial()?);
         {
@@ -1094,14 +1365,18 @@ impl Shared {
         }
     }
 
-    /// Note the node each of `subjects` is addressed to, and start what that plans.
+    /// Note the node each of `subjects` is addressed to and the node that wrote it, and start
+    /// what that plans.
     fn saw<'a>(self: &Arc<Self>, subjects: impl IntoIterator<Item = &'a str>) {
-        let me = &self.cfg.me;
         let mut state = self.state.lock_or_recover();
         let mut grew = false;
         for subject in subjects {
-            if let Some(dst) = addressee(subject, me) {
-                grew |= state.written.insert(dst.to_owned());
+            if let Some((dst, src)) = mail_lane(subject) {
+                grew |= state
+                    .wrote
+                    .entry(src.to_owned())
+                    .or_default()
+                    .insert(dst.to_owned());
             }
         }
         if grew {
@@ -1252,7 +1527,8 @@ impl Shared {
     /// under [`CARRIER`] numbered by `off`, so a retry after a lost answer, or a carry that a node
     /// key's rotation started over, writes and says nothing again. The lane a post was carried on
     /// is given back at once ([`Shared::give_back`]). `false` for any other record, with nothing
-    /// written.
+    /// written, a post to a node this Mac held before a key rotation among them, which the
+    /// own-inbox move takes ([`Lane::Inbox`]).
     fn carry_one(
         &self,
         writer: &mut astream_broker::AnyClient,
@@ -1265,15 +1541,20 @@ impl Shared {
         let Some((dst, sid, person, kind)) = person_post(subject, me) else {
             return Ok(false);
         };
-        let (body, _) = Body::decode(raw);
-        let now = crate::now_ms();
-        let member = self
+        let current = self
             .state
             .lock_or_recover()
             .handoff
             .current(dst)
-            .filter(|member| member != me)
             .map(str::to_owned);
+        if current.as_ref() == Some(me) && !self.one_node {
+            // A post to a node this Mac held before is this Mac's own mail: the own-inbox move
+            // takes it to the node it holds now ([`Lane::Inbox`], §11 C3b).
+            return Ok(false);
+        }
+        let (body, _) = Body::decode(raw);
+        let now = crate::now_ms();
+        let member = current.filter(|member| member != me);
         let checked = match member {
             None => Err(Uncarried::NotMember),
             Some(member) if self.unsealed_carry => Ok(member),

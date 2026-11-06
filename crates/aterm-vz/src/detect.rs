@@ -86,13 +86,21 @@ impl Fired {
 
 /// The key two `Booting` frames share when they name the same jobs: each job's id, unit and
 /// state, in id order (the elapsed times always grow, so they are no part of it).
-fn job_key(jobs: &[Job]) -> Vec<(u32, String, String)> {
+fn job_key_refs(jobs: &[Job]) -> Vec<(u32, &str, &str)> {
     let mut key: Vec<_> = jobs
         .iter()
-        .map(|j| (j.id, j.unit.clone(), j.state.clone()))
+        .map(|j| (j.id, j.unit.as_str(), j.state.as_str()))
         .collect();
-    key.sort();
+    key.sort_unstable();
     key
+}
+
+fn job_key_matches(stored: &[(u32, String, String)], current: &[(u32, &str, &str)]) -> bool {
+    stored.len() == current.len()
+        && stored
+            .iter()
+            .zip(current)
+            .all(|((id, u, s), (cid, cu, cs))| id == cid && u == *cu && s == *cs)
 }
 
 /// The boot and heartbeat detectors over one boot.
@@ -134,9 +142,12 @@ impl Watch {
 
     /// A `Booting` frame naming `jobs` arrived at `now`.
     pub fn booting(&mut self, jobs: &[Job], now: Duration) {
-        let key = job_key(jobs);
-        if key != self.jobs_key {
-            self.jobs_key = key;
+        let key = job_key_refs(jobs);
+        if !job_key_matches(&self.jobs_key, &key) {
+            self.jobs_key = key
+                .into_iter()
+                .map(|(id, u, s)| (id, u.to_owned(), s.to_owned()))
+                .collect();
             self.jobs_since = now;
         }
         self.jobs = jobs.to_vec();

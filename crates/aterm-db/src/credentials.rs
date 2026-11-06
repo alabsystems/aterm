@@ -114,22 +114,12 @@ impl Record {
         }
     }
 
-    fn command_request_from(&self, bytes: &[u8]) -> [u8; 16] {
-        let mut sha = Sha256::new();
-        sha.update(COMMAND_DOMAIN);
-        sha.update(self.kind.as_bytes());
-        sha.update([0]);
-        sha.update(self.key.as_bytes());
-        sha.update([0]);
-        sha.update(bytes);
-        let digest = sha.finalize();
-        let mut request = [0; 16];
-        request.copy_from_slice(&digest[..16]);
-        request
-    }
-
     fn command_request(&self) -> Result<[u8; 16]> {
-        Ok(self.command_request_from(&canonical(&self.body)?))
+        Ok(command_request_from(
+            &self.kind,
+            &self.key,
+            &canonical(&self.body)?,
+        ))
     }
 
     /// The command that carries it. Its retry identity is derived from the record, so a
@@ -235,9 +225,27 @@ fn hex_field<const N: usize>(value: &Value) -> Option<[u8; N]> {
         .and_then(|text| crate::database::decode_hex::<N>(text).ok())
 }
 
+fn command_request_from(kind: &str, key: &str, bytes: &[u8]) -> [u8; 16] {
+    let mut sha = Sha256::new();
+    sha.update(COMMAND_DOMAIN);
+    sha.update(kind.as_bytes());
+    sha.update([0]);
+    sha.update(key.as_bytes());
+    sha.update([0]);
+    sha.update(bytes);
+    let digest = sha.finalize();
+    let mut request = [0; 16];
+    request.copy_from_slice(&digest[..16]);
+    request
+}
+
 /// Check a record's closed schema: the fields its kind allows, each well formed.
 fn check(record: &Record) -> Result<Vec<u8>> {
-    let allowed: &[&str] = match record.kind.as_str() {
+    check_parts(&record.kind, &record.key, &record.body)
+}
+
+fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
+    let allowed: &[&str] = match kind {
         "request" => &[
             "nonce",
             "want",
@@ -257,19 +265,14 @@ fn check(record: &Record) -> Result<Vec<u8>> {
         "retired" => &["reason", "evidence", "note", "att"],
         _ => return Err(Error::new("unsupported credential record kind")),
     };
-    if record
-        .body
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if body.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(Error::new(
             "unknown credential record field; values belong in the vault",
         ));
     }
-    ids(&record.key)?;
-    let body = &record.body;
+    ids(key)?;
     let att = || optional(body, "att", hex_field::<64>);
-    match record.kind.as_str() {
+    match kind {
         "request" => {
             body.get("nonce")
                 .and_then(hex_field::<16>)
@@ -345,7 +348,7 @@ fn check(record: &Record) -> Result<Vec<u8>> {
     canonical(body)
 }
 
-fn record_of(command: &Command) -> Result<Record> {
+fn check_command(command: &Command) -> Result<(&str, &str, &Map)> {
     let Command::Write { request, changes } = command else {
         return Err(Error::new("credential records are whole-value writes"));
     };
@@ -357,18 +360,22 @@ fn record_of(command: &Command) -> Result<Record> {
     let Some(Value::Object(body)) = &change.value else {
         return Err(Error::new("a credential record is an object"));
     };
-    let record = Record {
-        kind: change.collection.clone(),
-        key: change.key.clone(),
-        body: body.clone(),
-    };
-    let bytes = check(&record)?;
-    if record.command_request_from(&bytes) != *request {
+    let bytes = check_parts(&change.collection, &change.key, body)?;
+    if command_request_from(&change.collection, &change.key, &bytes) != *request {
         return Err(Error::new(
             "credential command's retry identity is not its record's",
         ));
     }
-    Ok(record)
+    Ok((&change.collection, &change.key, body))
+}
+
+fn record_of(command: &Command) -> Result<Record> {
+    let (kind, key, body) = check_command(command)?;
+    Ok(Record {
+        kind: kind.to_owned(),
+        key: key.to_owned(),
+        body: body.clone(),
+    })
 }
 
 fn encode(command: &Command) -> Result<Vec<u8>> {
@@ -387,7 +394,7 @@ fn decode(payload: &[u8]) -> Result<Command> {
     if command.encode()? != payload {
         return Err(Error::new("credential record encoding is not canonical"));
     }
-    record_of(&command)?;
+    check_command(&command)?;
     Ok(command)
 }
 
@@ -726,14 +733,14 @@ impl Book {
         // requester.
         let mut order: Vec<&Thread> = threads.values().collect();
         order.sort_by_key(|thread| (thread.requester, thread.sequence));
-        let mut live: BTreeMap<Actor, Vec<(String, Purpose)>> = BTreeMap::new();
+        let mut live: BTreeMap<Actor, Vec<(&Want, Purpose)>> = BTreeMap::new();
         let mut dropped = Vec::new();
         for thread in order {
-            let mine = live.entry(thread.requester).or_default();
             if thread.ended() {
                 continue;
             }
-            let identity = (thread.want.key(), thread.purpose);
+            let mine = live.entry(thread.requester).or_default();
+            let identity = (&thread.want, thread.purpose);
             if mine.contains(&identity) {
                 dropped.push((
                     thread.id,

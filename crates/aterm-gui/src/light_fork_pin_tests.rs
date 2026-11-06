@@ -27,10 +27,9 @@ use aterm_effects::state_words::ArmsDrawn;
 use std::time::{Duration, Instant};
 
 /// The font the rig draws ([`TrailRig::new`]), as the dump draws it.
-const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
+fn fixture_font() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf")
+}
 
 /// The light instance a tab's own dark theme stands in.
 const LIGHT_INSTANCE: &str = "Default Light";
@@ -606,7 +605,7 @@ fn run_at(
     extra: &str,
     (live, ink, scale): (Option<Live>, &str, f64),
 ) -> (TrailRig, Vec<Drawn>) {
-    let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
+    let mut rig = TrailRig::new(&fixture_font()).expect("the rig");
     let t0 = rig.t0();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     if let Ground::Pack { id, text } = ground {

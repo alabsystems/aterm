@@ -870,7 +870,8 @@ fn a_tools_variable_is_its_upper_snake_name() {
 #[test]
 fn the_user_cache_follows_each_platform_convention() {
     let home = Path::new("/h");
-    let xdg = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let xdg = aterm_tempfile::manifest_dir();
+    let xdg = xdg.as_path();
     assert_eq!(
         user_cache("macos", Some(home), Some(xdg), "browser"),
         Some(PathBuf::from("/h/Library/Caches/aterm/browser.noindex"))

@@ -127,7 +127,7 @@ pub(crate) fn leading_space_chars(s: &str) -> usize {
 /// Every fixture file under `src/fixtures/` as `(name, text)` in name order.
 #[cfg(test)]
 pub(crate) fn fixture_files() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .map(|e| e.expect("a fixture").path())

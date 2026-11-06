@@ -29,7 +29,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use crate::place::{Alab, Evidence, Kind, Lane, NetworkId, Place, Where, member_key};
+use crate::place::{Alab, Evidence, Kind, Lane, NetworkId, Place, Where, member_key_bytes};
 
 /// How often a round dials every member while away (besides once right after each move): the
 /// fleet glance's longest backoff, so a lane away never dials its whole book more often than a
@@ -186,7 +186,13 @@ impl Routes {
         if !self.paced() {
             return true;
         }
-        if node.is_some_and(|node| self.heard.contains(&member_key(Lane::Fleet, node))) {
+        if !self.heard.is_empty()
+            && node.is_some_and(|node| {
+                let key = member_key_bytes(Lane::Fleet, node);
+                self.heard
+                    .contains(std::str::from_utf8(&key).unwrap_or_default())
+            })
+        {
             return true;
         }
         if addr.is_some_and(|addr| addr.to_canonical().is_loopback()) {
@@ -343,7 +349,7 @@ impl Round {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::place::{Answer, InternetState};
+    use crate::place::{Answer, InternetState, member_key};
 
     const HOTSPOT_ADDR: Ipv4Addr = Ipv4Addr::new(172, 20, 10, 2);
 

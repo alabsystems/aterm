@@ -758,6 +758,51 @@ pub fn held_programs() -> Option<HeldNow> {
     None
 }
 
+/// How many of `pids`, each read by `read`, are held at macOS's program check
+/// ([`aterm_sysprobe::jobs::judge_start`]) and forked at or after `since_us` (µs since the epoch,
+/// [`aterm_sysprobe::jobs::StartFacts::start_us`]): checks sent to a syspolicyd that started at
+/// `since_us` that it has yet to answer. A held row whose fork is unread counts, since it may be
+/// one. The count is a lower bound of that daemon's queue: a row `read` cannot read is skipped,
+/// and a fork is all one read dates, so a check queued before `since_us` or sent after it by a
+/// pid that forked before it is not counted.
+#[cfg(any(unix, windows))]
+#[must_use]
+pub fn held_since_among(
+    pids: &[u32],
+    read: impl Fn(u32) -> Option<aterm_sysprobe::jobs::StartFacts>,
+    since_us: u64,
+) -> usize {
+    use aterm_sysprobe::jobs::{AtStart, judge_start};
+    pids.iter()
+        .filter_map(|&pid| read(pid))
+        .filter(|f| judge_start(f) == AtStart::Held && f.start_us.is_none_or(|s| s >= since_us))
+        .count()
+}
+
+/// [`held_since_among`] over this user's processes, read as [`held_programs`] reads them: how
+/// many held programs forked at or after `since_us`, the start of the syspolicyd running now.
+/// `None` when the process list cannot be read, and off macOS.
+#[cfg(target_os = "macos")]
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn held_since(since_us: u64) -> Option<usize> {
+    let pids = crate::holders::uid_pids().ok()?;
+    let now = aterm_sysprobe::jobs::now_us();
+    let mounts = std::cell::OnceCell::new();
+    Some(held_since_among(
+        &pids,
+        |pid| aterm_sysprobe::jobs::read_start_in(pid, now, &mounts),
+        since_us,
+    ))
+}
+
+/// See the macOS twin: there is no program check to count here.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn held_since(_since_us: u64) -> Option<usize> {
+    None
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1071,6 +1116,49 @@ mod tests {
             }
         );
         assert_eq!(held_among(&[3, 4, 5], read), HeldNow::default());
+    }
+
+    /// Only a held row forked at or after the daemon's start counts: one forked before it, a
+    /// started row and an unreadable row count nothing, and a held row whose fork is unread
+    /// counts, since it may be one.
+    #[test]
+    fn held_since_counts_only_held_rows_forked_at_or_after_the_daemon() {
+        use aterm_sysprobe::jobs::StartFacts;
+        const T: u64 = 1_800_000_000_000_000;
+        let held = |start_us| StartFacts {
+            lone_zero: true,
+            local: Some(true),
+            age_ms: Some(30_000),
+            start_us,
+            ..StartFacts::default()
+        };
+        let read = |pid| match pid {
+            1 => Some(held(Some(T - 1_000_000))),
+            2 => Some(held(Some(T))),
+            3 => Some(held(Some(T + 5_000_000))),
+            4 => Some(StartFacts {
+                start_us: Some(T + 9_000_000),
+                ..StartFacts::default()
+            }),
+            6 => Some(held(None)),
+            _ => None,
+        };
+        assert_eq!(held_since_among(&[1, 2, 3, 4, 5], read, T), 2);
+        assert_eq!(held_since_among(&[1, 2, 3, 4, 5], read, T + 9_000_001), 0);
+        assert_eq!(held_since_among(&[1, 6], read, T), 1);
+    }
+
+    /// The live count reads this user's processes on macOS and answers nothing elsewhere. On
+    /// macOS a lone `0` is read with its fork or not at all, so no held row there has an unread
+    /// one, and a daemon that started at the end of time has none forked since. Negative control:
+    /// have the macOS `held_since` answer `None`, and this fails.
+    #[test]
+    fn the_live_held_since_reads_this_users_processes_on_macos_only() {
+        if !cfg!(target_os = "macos") {
+            assert_eq!(held_since(0), None);
+            return;
+        }
+        assert_eq!(held_since(u64::MAX), Some(0));
     }
 
     /// A held program's age reads in seconds, then minutes, then hours with two-digit minutes.

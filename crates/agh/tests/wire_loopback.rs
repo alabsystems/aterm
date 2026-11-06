@@ -92,7 +92,7 @@ fn the_api_origin_gets_user_agent_api_version_and_accept() {
     assert_eq!(seen[0].path_and_query, "/repos/fixture-dev/repo");
     assert_eq!(
         seen[0].header("user-agent"),
-        Some(format!("agh/{} (test)", agh::VERSION).as_str())
+        Some(format!("agh/{} (test)", agh::version()).as_str())
     );
     assert_eq!(seen[0].header("x-github-api-version"), Some("2022-11-28"));
     assert_eq!(

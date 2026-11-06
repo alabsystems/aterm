@@ -177,11 +177,9 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
             .unwrap_err()
             .contains("from= is a session id")
     );
-    assert!(
-        parse("done why=because")
-            .unwrap_err()
-            .contains("why= is one of landed|marker|done-check|exit|shell|startup|held|turn")
-    );
+    assert!(parse("done why=because").unwrap_err().contains(
+        "why= is one of landed|marker|done-check|exit|exit-status|no-exit-status|shell|startup|held|turn"
+    ));
     let mut outsides: Vec<String> = [
         "/etc/passwd",
         "/state/aterm/tasks",
@@ -308,6 +306,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         agent: None,
         trusted_cwd: None,
         fact: None,
+        program_block: None,
         fact_rev: 0,
     };
     let row = record.carry_row(t0 + Duration::from_secs(66));
@@ -369,6 +368,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w/my proj")),
         fact: None,
+        program_block: None,
         fact_rev: 0,
     };
     let carried = t0 + Duration::from_secs(5);
@@ -447,7 +447,9 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         };
         let back = TaskRecord::from_carry_row(&with.carry_row(t0), Some(&tasks()), t0, 10_000)
             .expect("reads");
-        let spawned = aterm_agent::harness::worker::worker_cli(agent).is_some();
+        // A worker's agent is one a spawn starts, or a program worker's `generic`.
+        let spawned = agent == aterm_phase::Program::Generic
+            || aterm_agent::harness::worker::worker_cli(agent).is_some();
         assert_eq!(back.agent, spawned.then_some(agent), "{agent:?}");
         assert_eq!(
             TaskRecord {
@@ -531,6 +533,7 @@ fn the_reply_event_and_status_spellings() {
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w")),
         fact: None,
+        program_block: None,
         fact_rev: 0,
     };
     let fields = record.wire_fields();
@@ -1633,6 +1636,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         agent: None,
         trusted_cwd: None,
         fact: hold_room(2),
+        program_block: None,
         fact_rev: 3,
     };
     let row = record.carry_row(t0);

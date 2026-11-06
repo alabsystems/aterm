@@ -463,6 +463,14 @@ impl State {
             .map(|(_, l)| l.clone())
     }
 
+    /// Requests used for `(token, resource)` without cloning `token`.
+    pub(crate) fn used_count(&self, token: Option<&str>, resource: &'static str) -> u64 {
+        self.used
+            .iter()
+            .find(|((t, r), _)| t.as_deref() == token && *r == resource)
+            .map_or(0, |(_, &count)| count)
+    }
+
     /// Whether `login` is some token's login (a User).
     pub(crate) fn is_user(&self, login: &str) -> bool {
         self.tokens

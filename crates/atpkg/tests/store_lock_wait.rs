@@ -78,7 +78,7 @@ impl Fixture {
         std::fs::write(layout.declined(), b"declined by the test fixture\n").unwrap();
     }
 
-    fn command(&self, program: &str) -> Command {
+    fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
@@ -93,8 +93,9 @@ impl Fixture {
 
     fn spawn(&self, args: &[&str]) -> Child {
         // A fresh build's first-exec check is waited out here, outside the line waits.
-        aterm_spec::wait::first_exec(Path::new(env!("CARGO_BIN_EXE_atpkg")), &["--help"]);
-        self.command(env!("CARGO_BIN_EXE_atpkg"))
+        let atpkg = aterm_tempfile::bin_exe("atpkg");
+        aterm_spec::wait::first_exec(&atpkg, &["--help"]);
+        self.command(&atpkg)
             .args(args)
             .spawn()
             .expect("spawn dev atpkg child")
@@ -471,7 +472,7 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         .arg("-c")
         .arg(script)
         .arg("sh")
-        .arg(env!("CARGO_BIN_EXE_atpkg"))
+        .arg(aterm_tempfile::bin_exe("atpkg"))
         .spawn()
         .expect("spawn the throwaway parent");
     let started = Instant::now();
@@ -574,7 +575,7 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
         .arg("-c")
         .arg(r#"( read _ <"$3"; exec "$1" seed --wait-lock "$2" ) & echo "waiter=$!""#)
         .arg("sh")
-        .arg(env!("CARGO_BIN_EXE_atpkg"))
+        .arg(aterm_tempfile::bin_exe("atpkg"))
         .arg(bound.as_secs().to_string())
         .arg(&gate_path)
         .spawn()

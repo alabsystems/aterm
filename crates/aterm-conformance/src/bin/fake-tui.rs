@@ -7,7 +7,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     if args == ["--version"] {
-        println!("fake-tui {}", env!("CARGO_PKG_VERSION"));
+        println!("fake-tui");
         return;
     }
     #[cfg(unix)]
@@ -77,7 +77,8 @@ mod shapes {
         let mut buf = [0u8; 64];
         // SAFETY: reads into a live 64-byte buffer.
         let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        Some(buf[..usize::try_from(n).unwrap_or(0)].to_vec())
+        let len = usize::try_from(n).ok()?;
+        Some(buf[..len.min(buf.len())].to_vec())
     }
 
     fn bracket(body: &str) {
@@ -220,7 +221,8 @@ mod shapes {
             if n % 12 == 11 {
                 w(&format!(" |{:03}| ", n / 12)); // the multi-cell arm
             } else {
-                w(&char::from(TOKENS[n % TOKENS.len()]).to_string()); // one cell
+                let idx = n % TOKENS.len();
+                w(std::str::from_utf8(&TOKENS[idx..=idx]).unwrap_or("")); // one cell
             }
             if n % 24 == 23 {
                 w("\r\n");

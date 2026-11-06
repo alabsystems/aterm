@@ -235,6 +235,35 @@ fn c_source_targets_remain_bound_to_their_own_channel_pin_without_rust_cross_sup
     assert!(w.fx.packer.legs().is_empty());
 }
 
+#[test]
+fn prebuilt_capability_does_not_imply_another_programs_source_sdk() {
+    let fx = Fx::at(scratch("linux-prebuilt-capability"));
+    fx.publish_pkg("gitleaks", 1, &manifest("gitleaks", 1, &DARWIN));
+    fx.publish_pkg("git", 12, &manifest("git", 12, &DARWIN));
+    fx.publish_head(7, &[("gitleaks", 1), ("git", 12)]);
+    let w = World::of(fx);
+    w.fx.packer
+        .upstream_programs
+        .lock()
+        .unwrap()
+        .insert("gitleaks".into());
+    w.builder.0.lock().unwrap().clear();
+    let (outcome, _) = ok(w.run(true));
+    let git = outcome
+        .table
+        .iter()
+        .find(|(program, _)| program.name == "git")
+        .unwrap();
+    let gitleaks = outcome
+        .table
+        .iter()
+        .find(|(program, _)| program.name == "gitleaks")
+        .unwrap();
+    assert_eq!(git.0.rows[&ARM], RowState::Skipped);
+    assert_eq!(gitleaks.0.need(), [X86, ARM]);
+    assert!(w.fx.packer.legs().is_empty());
+}
+
 fn decision<'a>(o: &'a Outcome, p: &str) -> &'a Decision {
     &o.table
         .iter()

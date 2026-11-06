@@ -24,13 +24,31 @@ pub struct Anchor {
     pub kind: AnchorKind,
     /// The vendor release it was read on (a capture or the binary).
     pub since: &'static str,
+    /// The first vendor release whose build no longer carries it (read on that build's binary),
+    /// or `None` while every release since `since` does.
+    pub gone_in: Option<&'static str>,
 }
 
 impl Anchor {
-    /// Whether a build of `version` draws this anchor.
+    /// Whether a build of `version` draws this anchor: one of `since` or later, and older than
+    /// `gone_in` where it has one. A build of no known version is taken for the newest, which
+    /// draws no anchor a release dropped.
     #[must_use]
     pub fn drawn_by(&self, version: Option<&str>) -> bool {
-        version.is_none_or(|v| !newer_than(self.since, v))
+        match version {
+            Some(v) => {
+                !newer_than(self.since, v) && self.gone_in.is_none_or(|gone| newer_than(gone, v))
+            }
+            None => self.gone_in.is_none(),
+        }
+    }
+}
+
+/// `anchor`, which builds of `release` and later no longer carry ([`Anchor::gone_in`]).
+const fn gone(anchor: Anchor, release: &'static str) -> Anchor {
+    Anchor {
+        gone_in: Some(release),
+        ..anchor
     }
 }
 
@@ -40,6 +58,7 @@ const fn lit(id: &'static str, text: &'static str, since: &'static str) -> Ancho
         text,
         kind: AnchorKind::Literal,
         since,
+        gone_in: None,
     }
 }
 
@@ -49,6 +68,7 @@ const fn composed(id: &'static str, text: &'static str, since: &'static str) -> 
         text,
         kind: AnchorKind::Composed,
         since,
+        gone_in: None,
     }
 }
 
@@ -58,6 +78,7 @@ const fn hint(id: &'static str, text: &'static str, since: &'static str) -> Anch
         text,
         kind: AnchorKind::KeyHint,
         since,
+        gone_in: None,
     }
 }
 
@@ -1806,9 +1827,14 @@ pub const GROK_ANCHORS: &[Anchor] = &[
 /// texts 2.3.3's binary carries for a login it lacks or lost (`kimi.auth.*` beside the screen's
 /// `kimi.auth.llm_not_set`; where kimi builds the sentence from a template, the fixed part), whose
 /// texts aterm-agent's Kimi Code login-ended words are read from; and its own quota classifier's
-/// patterns and code (`kimi.wall.*`, `KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS` and
-/// `KIMI_QUOTA_EXHAUSTED_ERROR_CODES`, as their source writes them), which its limit words are
-/// (`docs/measured/kimi-review-2026-10-27.md` §8).
+/// patterns and codes (`kimi.wall.*`, as their source writes them), which its limit words are
+/// (`docs/measured/kimi-review-2026-10-27.md` §8). 2.3.3 classified a 429 by the server's
+/// message (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`) and code (`KIMI_QUOTA_EXHAUSTED_ERROR_CODES`);
+/// 2.5.0 and 2.5.1 carry no message patterns and classify by code alone
+/// (`exceeded_current_quota_error`, and for an OpenAI-type provider `insufficient_quota` too),
+/// fail at once with no retry, and show the error as `[provider.api_error] <server's message>`
+/// (`formatErrorPayload`): no code is drawn, so only the server's words, which 2.3.3's patterns
+/// matched, say a quota on screen.
 pub const KIMI_ANCHORS: &[Anchor] = &[
     lit("kimi.welcome", "Welcome to Kimi Code!", "2.3.1"),
     lit("kimi.footer.context", "context: ", "2.3.1"),
@@ -1866,19 +1892,34 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
         "not set, run /login or /provider",
         "2.3.3",
     ),
-    lit(
-        "kimi.wall.quota",
-        "exceeded your current (?:token )?quota",
-        "2.3.3",
+    gone(
+        lit(
+            "kimi.wall.quota",
+            "exceeded your current (?:token )?quota",
+            "2.3.3",
+        ),
+        "2.5.0",
     ),
-    lit("kimi.wall.balance", "check your account balance", "2.3.3"),
-    lit("kimi.wall.insufficient", "insufficient balance", "2.3.3"),
-    lit(
-        "kimi.wall.recharge",
-        "recharge your account|please recharge",
-        "2.3.3",
+    gone(
+        lit("kimi.wall.balance", "check your account balance", "2.3.3"),
+        "2.5.0",
     ),
-    lit("kimi.wall.arrears", "account (?:is )?in arrears", "2.3.3"),
+    gone(
+        lit("kimi.wall.insufficient", "insufficient balance", "2.3.3"),
+        "2.5.0",
+    ),
+    gone(
+        lit(
+            "kimi.wall.recharge",
+            "recharge your account|please recharge",
+            "2.3.3",
+        ),
+        "2.5.0",
+    ),
+    gone(
+        lit("kimi.wall.arrears", "account (?:is )?in arrears", "2.3.3"),
+        "2.5.0",
+    ),
     lit(
         "kimi.wall.quota_code",
         "exceeded_current_quota_error",
@@ -2401,6 +2442,64 @@ mod tests {
         assert!(!mark.exists(), "the build was never started");
     }
 
+    /// An anchor a release dropped is drawn from its `since` up to that release, not by it or
+    /// any later one, and not by a build of no known version (taken for the newest); one no
+    /// release dropped stays drawn from its `since` on. CONTROL: below `since` neither is drawn.
+    #[test]
+    fn an_anchor_a_release_dropped_is_drawn_only_before_it() {
+        let kept = lit("kept", "kept", "2.3.3");
+        let dropped = gone(lit("dropped", "dropped", "2.3.3"), "2.5.0");
+        for (version, drawn) in [
+            (Some("2.3.1"), (false, false)),
+            (Some("2.3.3"), (true, true)),
+            (Some("2.4.1"), (true, true)),
+            (Some("2.5.0"), (true, false)),
+            (Some("2.5.1"), (true, false)),
+            (None, (true, false)),
+        ] {
+            assert_eq!(
+                (kept.drawn_by(version), dropped.drawn_by(version)),
+                drawn,
+                "{version:?}"
+            );
+        }
+    }
+
+    /// Kimi Code 2.5.0 and 2.5.1 carry none of 2.3.3's quota message patterns, only its code and
+    /// the OpenAI-type code (measured on the store's 2.5.0 and 2.5.1 binaries): a build owes
+    /// exactly the `kimi.wall.*` anchors its classifier carries, so the `vendor_drift` canary
+    /// holds each build to its own words.
+    #[test]
+    fn a_kimi_build_owes_only_the_quota_words_its_classifier_carries() {
+        let owed = |version: Option<&str>| -> Vec<&str> {
+            KIMI_ANCHORS
+                .iter()
+                .filter(|a| a.id.starts_with("kimi.wall.") && a.drawn_by(version))
+                .map(|a| a.id)
+                .collect()
+        };
+        let codes = ["kimi.wall.quota_code"];
+        assert_eq!(owed(Some("2.5.0")), codes);
+        assert_eq!(owed(Some("2.5.1")), codes);
+        assert_eq!(
+            owed(None),
+            codes,
+            "a build of no known version is the newest"
+        );
+        assert_eq!(
+            owed(Some("2.4.0")),
+            [
+                "kimi.wall.quota",
+                "kimi.wall.balance",
+                "kimi.wall.insufficient",
+                "kimi.wall.recharge",
+                "kimi.wall.arrears",
+                "kimi.wall.quota_code",
+            ],
+            "CONTROL: 2.3.3's classifier, through the last build before 2.5.0"
+        );
+    }
+
     #[test]
     fn newer_than_orders_versions_by_number() {
         for (a, b) in [
@@ -2476,15 +2575,16 @@ mod tests {
         assert_eq!(version_in("Muse Code"), None);
     }
 
-    const ROLLOUTS: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-agent/src/harness/testdata/steps"
-    );
+    /// aterm-agent's committed step testdata, beside this package.
+    fn rollouts() -> std::path::PathBuf {
+        aterm_tempfile::manifest_dir().join("../aterm-agent/src/harness/testdata/steps")
+    }
 
     fn committed_rollouts(build: &str) -> Vec<u8> {
         let stem = rollout_reduction_stem(build);
         let leg = format!("{stem}-");
-        let mut names: Vec<String> = std::fs::read_dir(ROLLOUTS)
+        let dir = rollouts();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
             .expect("the step testdata")
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -2497,7 +2597,7 @@ mod tests {
         let head = format!("# codex {build} ");
         let mut out = Vec::new();
         for n in names {
-            let text = std::fs::read_to_string(format!("{ROLLOUTS}/{n}")).expect("a reduction");
+            let text = std::fs::read_to_string(dir.join(&n)).expect("a reduction");
             assert!(text.starts_with(&head), "{n} is a reduction of {build}");
             out.extend_from_slice(text.as_bytes());
         }
@@ -2569,7 +2669,7 @@ mod tests {
     /// Every codex-alab build a committed reduction's header names, so a build is held to the keys the
     /// fold reads the moment its reductions are committed, with no list to keep beside them.
     fn committed_alab_builds() -> Vec<String> {
-        let mut builds: Vec<String> = std::fs::read_dir(ROLLOUTS)
+        let mut builds: Vec<String> = std::fs::read_dir(rollouts())
             .expect("the step testdata")
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("codex-"))
@@ -2594,7 +2694,7 @@ mod tests {
             "codex-alab-0.164.0-dev.12521"
         );
         assert!(!committed_rollouts(ALAB_BUILD).is_empty());
-        for e in std::fs::read_dir(ROLLOUTS)
+        for e in std::fs::read_dir(rollouts())
             .expect("the step testdata")
             .filter_map(Result::ok)
         {

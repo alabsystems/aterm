@@ -85,8 +85,7 @@ impl Pattern {
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').collect();
-        let pattern: Vec<&str> = self.0.iter().map(String::as_str).collect();
-        segments(&pattern, &parts)
+        segments(&self.0, &parts)
     }
 
     /// Whether the pattern ignores everything under the directory `dir`: it is `X/**` and
@@ -96,8 +95,7 @@ impl Pattern {
         match self.0.split_last() {
             Some((last, head)) if last == "**" && !head.is_empty() => {
                 let parts: Vec<&str> = dir.split('/').collect();
-                let head: Vec<&str> = head.iter().map(String::as_str).collect();
-                segments(&head, &parts)
+                segments(head, &parts)
             }
             _ => false,
         }
@@ -105,10 +103,12 @@ impl Pattern {
 }
 
 /// Whether `pattern`'s segments match `path`'s.
-fn segments(pattern: &[&str], path: &[&str]) -> bool {
+fn segments(pattern: &[String], path: &[&str]) -> bool {
     match pattern.split_first() {
         None => path.is_empty(),
-        Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
+        Some((first, rest)) if first == "**" => {
+            (0..=path.len()).any(|skip| segments(rest, &path[skip..]))
+        }
         Some((first, rest)) => path.split_first().is_some_and(|(seg, more)| {
             segment(first.as_bytes(), seg.as_bytes()) && segments(rest, more)
         }),
@@ -198,18 +198,19 @@ pub fn list(
             if ignored(&rel) {
                 continue;
             }
+            let path = at.join(name);
             if kind.is_file() {
                 let bytes = match overlay.get(&rel) {
                     Some(bytes) => bytes.clone(),
-                    None => crate::durable::read_regular_bytes(&entry.path(), 64 * 1024 * 1024)
-                        .map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?,
+                    None => crate::durable::read_regular_bytes(&path, 64 * 1024 * 1024)
+                        .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
                 };
                 if super::key::holds_a_private_key(&bytes) {
                     return Err(format!(
                         "{} is a private key (a JSON key with a private_key, such as the \
                          deployer's service-account key): the site would serve it to anyone — \
                          move it out of public/ or name it in firebase.json's hosting.ignore",
-                        entry.path().display()
+                        path.display()
                     ));
                 }
                 found.insert(rel, bytes);
@@ -217,7 +218,7 @@ pub fn list(
                 return Err(format!(
                     "{} is not a regular file (a symbolic link or a special file): ship site \
                      deploys the files under public/ themselves",
-                    entry.path().display()
+                    path.display()
                 ));
             }
         }

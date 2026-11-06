@@ -98,17 +98,32 @@ pub struct Row {
 }
 
 /// The roster. A row allows only the duties aterm's built-in engine can stand down from for its
-/// agent: Grok Build has no relaunch or upgrade lane in aterm (`lanes()` is `Lanes::NONE`), so
-/// grok-alab's `relaunch` and `upgrade` take nothing anyone else does. A harness whose agent
-/// aterm supervises joins in the change that teaches the built-in engine to stand down from the
-/// scopes its row allows (§8.3).
-pub const ROSTER: &[Row] = &[Row {
-    id: "grok-alab",
-    program: Program::Grok,
-    package: "grok-alab",
-    vendor: "grok",
-    allows: &[Scope::Relaunch, Scope::Upgrade],
-}];
+/// agent. Grok Build has no relaunch or upgrade lane in aterm (`lanes()` is `Lanes::NONE`), so
+/// grok-alab's `relaunch` and `upgrade` take nothing anyone else does. Muse Code's built-in
+/// relaunch and upgrade lanes stand down from a session whose proven claim takes those duties
+/// (`SupervisorClaim::takes` and `SupervisorAuthority::builtin_keeps` in aterm-gui's
+/// `session_timeline.rs`, held by its unit tests). `lab harness-proof muse-alab`
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 2) does not measure that stand-down: it
+/// sees only that aterm logged no built-in act, which holds with no claim too, since in a tab
+/// the harness leads aterm sees no exit and its relaunch lane knows no conversation for the
+/// harness's pid. A harness whose agent aterm supervises joins in the change that teaches the
+/// built-in engine to stand down from the scopes its row allows (§8.3).
+pub const ROSTER: &[Row] = &[
+    Row {
+        id: "grok-alab",
+        program: Program::Grok,
+        package: "grok-alab",
+        vendor: "grok",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+    },
+    Row {
+        id: "muse-alab",
+        program: Program::Muse,
+        package: "muse-alab",
+        vendor: "muse",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+    },
+];
 
 /// The row and pid a holder `<id>@<pid>` names: a rostered id and a canonical pid above 1.
 #[must_use]
@@ -387,10 +402,11 @@ mod tests {
         assert!(SERVED.contains(&SCOPED));
     }
 
-    /// grok-alab is on the roster, for Grok Build, allowed exactly relaunch and upgrade; nothing
-    /// else is a rostered holder, codex-alab included (its v2 rule stays its own).
+    /// grok-alab and muse-alab are on the roster, for Grok Build and Muse Code, each allowed
+    /// exactly relaunch and upgrade; nothing else is a rostered holder, codex-alab included (its
+    /// v2 rule stays its own).
     #[test]
-    fn the_roster_names_grok_alab_for_relaunch_and_upgrade() {
+    fn the_roster_names_grok_alab_and_muse_alab_for_relaunch_and_upgrade() {
         let (row, pid) = holder("grok-alab@4242").expect("rostered");
         assert_eq!(
             (row.id, row.program, row.package, pid),
@@ -399,6 +415,14 @@ mod tests {
         assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
         assert_eq!(row_for(Program::Grok).map(|r| r.id), Some("grok-alab"));
         assert_eq!(row_named("Grok-Alab").map(|r| r.id), Some("grok-alab"));
+        let (row, pid) = holder("muse-alab@4243").expect("rostered");
+        assert_eq!(
+            (row.id, row.program, row.package, row.vendor, pid),
+            ("muse-alab", Program::Muse, "muse-alab", "muse", 4243)
+        );
+        assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
+        assert_eq!(row_for(Program::Muse).map(|r| r.id), Some("muse-alab"));
+        assert_eq!(row_named("MUSE-ALAB").map(|r| r.id), Some("muse-alab"));
         // Every row's id reads as its vendor (§8.1 item 5), so presence keeps the vendor's reader.
         for row in ROSTER {
             assert_eq!(
@@ -419,6 +443,9 @@ mod tests {
             "codex-alab@4242",
             "claude-code-alab@4242",
             "kimi-alab@4242",
+            "agy-alab@4242",
+            "muse-alab@1",
+            "muse@4242",
             "aterm-harness@4242",
             "GROK-ALAB@4242",
         ] {
@@ -427,6 +454,7 @@ mod tests {
         for p in [
             Program::Claude,
             Program::Codex,
+            Program::Agy,
             Program::Kimi,
             Program::Generic,
         ] {

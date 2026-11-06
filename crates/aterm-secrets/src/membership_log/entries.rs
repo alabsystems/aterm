@@ -663,7 +663,7 @@ fn seal_wrap(
         .map_err(|e| Error::new(format!("wrapping membership epoch key: {e}")))
 }
 
-fn open_wrap(
+pub(super) fn open_wrap(
     identity: &Identity,
     network: &RecordId,
     epoch: &RecordId,

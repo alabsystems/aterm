@@ -397,23 +397,26 @@ fn accounts_at(
     }
 }
 
-/// The Mac's own names the root half of the one password sets as two separate `[names]` rows
-/// (`scutil --set ComputerName` and `--set LocalHostName`), as `scutil --get` reads them now:
-/// `None` where a read failed, the name is unset, or the platform has none.
+/// The Mac's own names setup's naming rule sets (`ComputerName`, `LocalHostName` and
+/// `HostName`), as `scutil --get` reads them now: `None` where a read failed, the name is unset,
+/// or the platform has none.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OwnNames {
     /// `ComputerName`: what Finder, AirDrop and Sharing show.
     pub(crate) computer: Option<String>,
     /// `LocalHostName`: the Bonjour `.local` name.
     pub(crate) local_host: Option<String>,
+    /// `HostName`: the configured hostname.
+    pub(crate) host: Option<String>,
 }
 
 impl OwnNames {
-    /// Both names, `LocalHostName` first.
-    fn each(&self) -> [(&'static str, Option<&str>); 2] {
+    /// All three names, `LocalHostName` first.
+    fn each(&self) -> [(&'static str, Option<&str>); 3] {
         [
             ("Local hostname", self.local_host.as_deref()),
             ("Computer Name", self.computer.as_deref()),
+            ("Hostname", self.host.as_deref()),
         ]
     }
 }
@@ -435,6 +438,7 @@ fn own_names() -> OwnNames {
         OwnNames {
             computer: get("ComputerName"),
             local_host: get("LocalHostName"),
+            host: get("HostName"),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -464,15 +468,15 @@ fn local_hostnames(own: &OwnNames) -> Vec<String> {
 /// The two `aterm.toml` keys `sync.identity` keeps: `[ai] machine` and `[fleet] machine`.
 const MACHINE_KEYS: [&str; 2] = ["ai", "fleet"];
 
-/// What `[identity] name` says about this Mac's name (design §8.5, "Name": the person's name
-/// wins, `name = false` turns it off).
+/// What `[identity] name` says about this Mac's name: its earlier explicit name applies until
+/// Rename This Mac chooses a number; `name = false` turns identity naming off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NameChoice {
     /// Not set (or `true`): the swarm roster's label names this Mac.
     Roster,
     /// `name = false`: no pass names this Mac.
     Off,
-    /// The person's own name for this Mac, which wins over the roster's label.
+    /// An earlier explicit name, which wins over the roster until a machine number is chosen.
     Yours(String),
 }
 
@@ -832,26 +836,58 @@ struct IdentityOwed {
 
 type IdentityTarget = (String, Option<String>);
 
-/// The name `sync.identity` gives this Mac at `config_path` (the person's `[identity] name`, else
-/// the swarm `m<N>` label the vault's roster gave it at admission) and that label, or `None`
+/// The name `sync.identity` gives this Mac at `config_path` (its chosen machine number, else
+/// `[identity] name`, else the vault roster's label) and its projected number, or `None`
 /// where no name applies (swarm off, `[identity] name = false`, no label).
 #[cfg(target_os = "macos")]
 fn identity_target(
     config_path: &Path,
+    state: Option<&Path>,
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
     roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
 ) -> Result<Option<IdentityTarget>, String> {
     let snapshot =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
+    let Some(mut config) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(None);
     };
     if config.name == NameChoice::Off {
         return Ok(None);
     }
-    let label = name_label(paths, roster, hostnames)?;
+    let label = projected_machine_label(
+        state,
+        &mut config.name,
+        name_label(paths, roster, hostnames)?,
+    )?;
     Ok(identity_target_from(&config.name, label))
+}
+
+/// A number explicitly chosen through the machine-name editor is the local naming source.
+/// Older, automatically assigned names remain evidence for ownership of existing projections.
+/// Reading an absent file never creates a name or consults the vault. Callers inject the state
+/// directory, so tests and isolated instances never read the person's machine-name file.
+fn projected_machine_label(
+    state: Option<&Path>,
+    choice: &mut NameChoice,
+    roster_label: Option<String>,
+) -> Result<Option<String>, String> {
+    if *choice == NameChoice::Off {
+        return Ok(roster_label);
+    }
+    let Some(state) = state else {
+        return Ok(roster_label);
+    };
+    let chosen = aterm_agent::machine_name::file::read(state)
+        .map_err(|why| format!("this machine's name is unread: {why}"))?
+        .filter(|name| name.class == aterm_types::machine_name::Class::Chosen)
+        .and_then(|name| name.num);
+    if chosen.is_some() && *choice != NameChoice::Off {
+        // Rename This Mac is the newer explicit naming act; the older identity string is a
+        // projection source, while `false` remains an explicit hold on identity naming.
+        *choice = NameChoice::Roster;
+    }
+    Ok(chosen.map(|number| number.to_string()).or(roster_label))
 }
 
 fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<IdentityTarget> {
@@ -860,6 +896,26 @@ fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<Id
         (NameChoice::Yours(name), label) => Some((name.clone(), label)),
         (NameChoice::Roster, Some(label)) => Some((label.clone(), Some(label))),
     }
+}
+
+/// Re-read the naming choice immediately before projecting it outside the config file. A
+/// concurrent off choice after the config write stops both fleet and OS naming; a newer
+/// chosen number is read at the same boundary.
+fn projection_target_now(
+    config_path: &Path,
+    state: Option<&Path>,
+    roster_label: Option<String>,
+) -> Result<Option<IdentityTarget>, String> {
+    let snapshot =
+        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
+    let Some(mut identity) = read_enabled_identity_snapshot(&snapshot)? else {
+        return Ok(None);
+    };
+    if identity.name == NameChoice::Off {
+        return Ok(None);
+    }
+    let label = projected_machine_label(state, &mut identity.name, roster_label)?;
+    Ok(identity_target_from(&identity.name, label))
 }
 
 fn name_label(
@@ -881,16 +937,22 @@ fn name_label(
         .map_err(|why| why.to_string())
 }
 
-/// The swarm label the root half of the one password names the Mac by
-/// ([`aterm_machines::init_clt::CommandLineTools::with_name`]): the roster's own label for this
-/// Mac (no hostname fallback, which would name the Mac by what it is called already), where the
-/// person neither turned naming off nor named the Mac themselves; `None` before admission.
+/// The number the root half of the one password names the Mac by
+/// ([`aterm_machines::init_clt::CommandLineTools::with_name`]): its chosen machine number, else
+/// the roster's label (no hostname fallback), unless identity naming is off or names this Mac
+/// separately. `None` while neither source names a number.
 #[cfg(target_os = "macos")]
 pub(crate) fn mac_name_label() -> Option<String> {
     let config = aterm_types::dirs::aterm_config_path()?;
     let paths = vault_paths().ok()?;
     let roster = read_name_roster(&paths).ok()?;
-    match identity_target(&config, &paths, &[], roster.as_ref()) {
+    match identity_target(
+        &config,
+        aterm_types::dirs::account_state_dir().as_deref(),
+        &paths,
+        &[],
+        roster.as_ref(),
+    ) {
         Ok(Some((target, Some(label)))) if target == label => Some(label),
         _ => None,
     }
@@ -942,7 +1004,7 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     let config = aterm_types::dirs::aterm_config_path()
         .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
     let snapshot = aterm_uds::atomic_file::ConfigFile::open(&config).map_err(|e| e.to_string())?;
-    let Some(identity) = read_enabled_identity_snapshot(&snapshot)? else {
+    let Some(mut identity) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(MacName::Off("swarm off".to_owned()));
     };
     if matches!(identity.name, NameChoice::Off) {
@@ -952,12 +1014,17 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     let roster = read_name_roster(&paths)?;
     let own = own_names();
     let hostnames = local_hostnames(&own);
-    let label = name_label(&paths, roster.as_ref(), &hostnames)?;
+    let roster_label = name_label(&paths, roster.as_ref(), &hostnames)?;
+    let label = projected_machine_label(
+        aterm_types::dirs::account_state_dir().as_deref(),
+        &mut identity.name,
+        roster_label.clone(),
+    )?;
     let Some((target, label)) = identity_target_from(&identity.name, label) else {
         return Ok(MacName::Unlabelled);
     };
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
-        roster_gives(roster.as_ref(), label.as_deref(), word)
+        roster_gives(roster.as_ref(), roster_label.as_deref(), word)
     })?;
     let pending = own_name_pending(&target, label.as_deref(), &own)
         .filter(|_| cfg!(target_os = "macos"))
@@ -974,14 +1041,13 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     })
 }
 
-/// Where any of the Mac's own names (`own`: `ComputerName` and `LocalHostName`, each its own
-/// row, so one can take while the other fails) is not yet the roster's `label` and `target` is
-/// that label: what names it. macOS lets only root set them: setup's one early Mac password sets
-/// them where the roster gave the label by then (its argv carries it), and otherwise leaves the
+/// Where any of the Mac's own names (`ComputerName`, `LocalHostName` or `HostName`) differs
+/// from the projected `label` and `target` is that number: what names it. macOS lets only root
+/// set them: setup's one early Mac password
+/// sets them where a number was known by then (its argv carries it), and otherwise leaves the
 /// narrow rule through which `sync.identity` sets them with no password once admission gives the
-/// label ([`aterm_machines::root_steps::name_by_rule`], [`own_name_by_rule`]). `None` where both
-/// are the label, or the Mac is named by the person's own `[identity] name` (never set as the
-/// Mac's own).
+/// number ([`aterm_machines::root_steps::name_by_rule`], [`own_name_by_rule`]). `None` where all
+/// match, or a separate `[identity] name` differs from the projected number.
 pub(crate) fn own_name_pending(
     target: &str,
     label: Option<&str>,
@@ -1028,7 +1094,7 @@ fn own_name_by_rule(label: &str) -> Option<String> {
 }
 
 /// `read` (`sync.identity`'s `aterm.toml` keys) with the fleet name beside it (`fleet`, against
-/// `target`), and, where the Mac's own names (`own`: LocalHostName and ComputerName) are
+/// `target`), and, where the Mac's own names (`LocalHostName`, `ComputerName` and `HostName`) are
 /// not yet the roster's `label`, the record of what names it ([`own_name_pending`]): no pass asks
 /// for a password of its own.
 fn with_fleet_name(
@@ -1087,16 +1153,17 @@ fn identity_owed_at(
     hostnames: &[String],
 ) -> Result<IdentityOwed, String> {
     let roster = read_name_roster(paths)?;
-    Ok(identity_owed_from(config_path, record, paths, hostnames, roster.as_ref())?.0)
+    Ok(identity_owed_from(config_path, None, record, paths, hostnames, roster.as_ref())?.0)
 }
 
 fn identity_owed_from(
     config_path: &Path,
+    state: Option<&Path>,
     record: &Path,
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
     roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
-) -> Result<(IdentityOwed, Option<IdentityTarget>), String> {
+) -> Result<(IdentityOwed, Option<IdentityTarget>, Option<String>), String> {
     let off = |why: &str| {
         (
             IdentityOwed {
@@ -1104,22 +1171,24 @@ fn identity_owed_from(
                 write: None,
             },
             None,
+            None,
         )
     };
     let snapshot =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
+    let Some(mut config) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(off("off: [swarm] enabled = false"));
     };
     if config.name == NameChoice::Off {
         return Ok(off("off: [identity] name = false"));
     }
-    let label = name_label(paths, roster, hostnames)?;
+    let roster_label = name_label(paths, roster, hostnames)?;
+    let label = projected_machine_label(state, &mut config.name, roster_label.clone())?;
     let owed = identity_owed_for_config(&config, record, label.as_deref(), &|pair| {
-        roster_gives(roster, label.as_deref(), pair)
+        roster_gives(roster, roster_label.as_deref(), pair)
     })?;
     let target = identity_target_from(&config.name, label);
-    Ok((owed, target))
+    Ok((owed, target, roster_label))
 }
 
 /// Compare `config_path`'s `[ai] machine` and `[fleet] machine` with the name this Mac goes by:
@@ -1246,7 +1315,7 @@ fn write_identity_at(
     record: &Path,
     label: Option<&str>,
 ) -> Result<String, String> {
-    write_identity_after_read(config_path, record, label, &|_| true, || {})
+    write_identity_after_read(config_path, None, record, label, &|_| true, || {})
 }
 
 /// [`write_identity_at`] where `ours` says which roster labels the vault's roster gives this Mac
@@ -1254,6 +1323,7 @@ fn write_identity_at(
 /// Settings edit between that read and the write without a timed race.
 fn write_identity_after_read(
     config_path: &Path,
+    state: Option<&Path>,
     record: &Path,
     label: Option<&str>,
     ours: &dyn Fn(&str) -> bool,
@@ -1261,8 +1331,9 @@ fn write_identity_after_read(
 ) -> Result<String, String> {
     let config =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let snapshot = read_identity_snapshot(&config)?;
-    let owed = identity_owed_for_config(&snapshot, record, label, ours)?;
+    let mut snapshot = read_identity_snapshot(&config)?;
+    let label = projected_machine_label(state, &mut snapshot.name, label.map(str::to_owned))?;
+    let owed = identity_owed_for_config(&snapshot, record, label.as_deref(), ours)?;
     let Some((target, keys)) = owed.write else {
         return Ok(match owed.read {
             IdentityRead::NotApplicable(why) => format!("left as it is: {why}"),
@@ -1476,7 +1547,7 @@ impl Ports for Live {
     }
 
     fn build(&self) -> String {
-        aterm_types::version::build_id()
+        aterm_stamp::build_id()
     }
 
     fn routes(&self) -> Vec<String> {
@@ -1587,8 +1658,9 @@ impl Ports for Live {
         let roster = read_name_roster(&paths)?;
         let names = own_names();
         let hostnames = local_hostnames(&names);
-        let (owed, target) = identity_owed_from(
+        let (owed, target, roster_label) = identity_owed_from(
             &config,
+            self.state_dir().as_deref(),
             &identity_record()?,
             &paths,
             &hostnames,
@@ -1599,7 +1671,7 @@ impl Ports for Live {
             return Ok(read);
         };
         let fleet = aterm_agent::fleet_name_for(&target, &|word| {
-            roster_gives(roster.as_ref(), label.as_deref(), word)
+            roster_gives(roster.as_ref(), roster_label.as_deref(), word)
         })?;
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
@@ -1622,7 +1694,7 @@ impl Ports for Live {
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
         let snapshot =
             aterm_uds::atomic_file::ConfigFile::open(&config).map_err(|e| e.to_string())?;
-        let Some(identity) = read_enabled_identity_snapshot(&snapshot)? else {
+        let Some(mut identity) = read_enabled_identity_snapshot(&snapshot)? else {
             return Ok("left as it is: [swarm] enabled = false".to_owned());
         };
         if identity.name == NameChoice::Off {
@@ -1632,25 +1704,35 @@ impl Ports for Live {
         let roster = read_name_roster(&paths)?;
         let names = own_names();
         let hostnames = local_hostnames(&names);
-        let label = name_label(&paths, roster.as_ref(), &hostnames)?;
+        let roster_label = name_label(&paths, roster.as_ref(), &hostnames)?;
+        let label = projected_machine_label(
+            self.state_dir().as_deref(),
+            &mut identity.name,
+            roster_label.clone(),
+        )?;
         let keys = write_identity_after_read(
             &config,
+            self.state_dir().as_deref(),
             &identity_record()?,
             label.as_deref(),
-            &|pair| roster_gives(roster.as_ref(), label.as_deref(), pair),
+            &|pair| roster_gives(roster.as_ref(), roster_label.as_deref(), pair),
             || {},
         )?;
-        // The fleet name follows the same name: the vault's roster, the fleet and (under the
-        // one password) the Mac's own names say one name (DESIGN-alab-swarm §3.2).
-        let Some((target, label)) = identity_target_from(&identity.name, label) else {
+        // The fleet and OS projections follow the chosen machine number, or the roster while
+        // no explicit number is held. The roster still identifies older writes as ours.
+        let Some((target, os_label)) =
+            projection_target_now(&config, self.state_dir().as_deref(), roster_label.clone())?
+        else {
             return Ok(keys);
         };
+        #[cfg(not(target_os = "macos"))]
+        let _ = os_label;
         let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
-            roster_gives(roster.as_ref(), label.as_deref(), word)
+            roster_gives(roster.as_ref(), roster_label.as_deref(), word)
         })?;
         #[cfg(target_os = "macos")]
         if let Some(label) =
-            own_name_pending(&target, label.as_deref(), &names).and(label.as_deref())
+            own_name_pending(&target, os_label.as_deref(), &names).and(os_label.as_deref())
             && let Some(named) = own_name_by_rule(label)
         {
             return Ok(format!("{keys}; {fleet}; {named}"));
@@ -2235,6 +2317,7 @@ mod tests {
         let named_as = |local_host: &str, computer: &str| OwnNames {
             computer: Some(computer.to_owned()),
             local_host: Some(local_host.to_owned()),
+            host: Some(local_host.to_owned()),
         };
         let own = named_as("Andrews-MacBook-Pro", "Andrews-MacBook-Pro");
         let due = FleetName::Due {
@@ -2268,6 +2351,7 @@ mod tests {
             OwnNames {
                 computer: None,
                 local_host: Some("m42".to_owned()),
+                host: Some("m42".to_owned()),
             },
         ] {
             match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &half) {
@@ -2320,6 +2404,46 @@ mod tests {
         assert_eq!(own_name_due(current.clone(), Some("m42"), false), current);
         assert_eq!(own_name_due(current.clone(), None, true), current);
         assert_eq!(own_name_due(off.clone(), Some("m42"), true), off);
+    }
+
+    #[test]
+    fn hostname_only_drift_is_visible_and_makes_the_identity_repair_due() {
+        use aterm_agent::FleetName;
+
+        let keys = IdentityRead::Current("label m86 in [ai] and [fleet] machine".to_owned());
+        for host in [Some("m184"), None] {
+            let own = OwnNames {
+                computer: Some("m86".to_owned()),
+                local_host: Some("m86".to_owned()),
+                host: host.map(str::to_owned),
+            };
+            let pending = own_name_pending("m86", Some("m86"), &own)
+                .expect("HostName still needs repair while the other two names match");
+            assert!(pending.contains("(Hostname)"), "{pending}");
+            assert!(pending.contains(host.unwrap_or("unread")), "{pending}");
+            let row = with_fleet_name(keys.clone(), "m86", Some("m86"), &FleetName::Current, &own);
+            assert!(matches!(&row, IdentityRead::Current(words) if words.contains(&pending)));
+            assert!(matches!(
+                own_name_due(row, Some("m86"), true),
+                IdentityRead::Due { .. }
+            ));
+            assert_eq!(
+                own_name_pending("studio", Some("m86"), &own),
+                None,
+                "a separate identity name still leaves OS naming alone"
+            );
+        }
+        let repaired = OwnNames {
+            computer: Some("m86".to_owned()),
+            local_host: Some("m86".to_owned()),
+            host: Some("m86".to_owned()),
+        };
+        assert_eq!(own_name_pending("m86", Some("m86"), &repaired), None);
+        assert_eq!(
+            own_name_due(keys.clone(), None, true),
+            keys,
+            "all three repaired names leave the current identity row current"
+        );
     }
 
     /// `sync.awake` plans a start only where one keeps the Mac awake: never over a person's off
@@ -2870,6 +2994,165 @@ mod tests {
         read_identity_config(config).unwrap().machines
     }
 
+    #[test]
+    fn a_chosen_machine_number_drives_existing_identity_and_os_projections() {
+        use aterm_agent::machine_name::file::{self, MachineName};
+        use aterm_types::machine_name::{Class, Nickname, Number};
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().join("state");
+        aterm_uds::private_file::create_private_dir(&state).unwrap();
+        let mut name = MachineName::unnumbered(Nickname::parse("MissBunny").unwrap(), 1);
+        name.num = Some(Number::parse("m86").unwrap());
+        name.class = Class::Chosen;
+        file::read_or_create(&state, || Ok(name)).unwrap();
+        let mut choice = NameChoice::Roster;
+        let label =
+            projected_machine_label(Some(&state), &mut choice, Some("m184".to_owned())).unwrap();
+        assert_eq!(label.as_deref(), Some("m86"));
+        let config = scratch.path().join("aterm.toml");
+        let record = state.join("converge/identity-written.toml");
+        aterm_uds::atomic_file::write(
+            &config,
+            b"[ai]\nmachine = \"m184\"\n[fleet]\nmachine = \"m184\"\n",
+            0o600,
+        )
+        .unwrap();
+        // The roster's previous label still proves these unrecorded projections were ours.
+        write_identity_after_read(
+            &config,
+            Some(&state),
+            &record,
+            label.as_deref(),
+            &|word| word == "m184",
+            || {},
+        )
+        .unwrap();
+        assert_eq!(machines(&config), [Some("m86".into()), Some("m86".into())]);
+        let (target, os_label) = identity_target_from(&NameChoice::Roster, label.clone()).unwrap();
+        let old = OwnNames {
+            computer: Some("m184".into()),
+            local_host: Some("m184".into()),
+            host: Some("m184".into()),
+        };
+        assert!(own_name_pending(&target, os_label.as_deref(), &old).is_some());
+        let current = OwnNames {
+            computer: Some(target.clone()),
+            local_host: Some(target.clone()),
+            host: Some(target),
+        };
+        assert!(own_name_pending("m86", os_label.as_deref(), &current).is_none());
+        // A newer Rename supersedes the earlier identity string, including the runtime guard
+        // an older installed build needed. Turning naming off remains a hold.
+        file::replace(&state, |name| {
+            name.num = Some(Number::parse("m87").unwrap());
+            Ok(())
+        })
+        .unwrap();
+        aterm_uds::atomic_file::write(
+            &config,
+            b"[identity]\nname = \"m86\"\n[ai]\nmachine = \"m86\"\n[fleet]\nmachine = \"m86\"\n",
+            0o600,
+        )
+        .unwrap();
+        let mut choice = NameChoice::Yours("m86".into());
+        let label =
+            projected_machine_label(Some(&state), &mut choice, Some("m184".into())).unwrap();
+        let (target, os_label) = identity_target_from(&choice, label.clone()).unwrap();
+        assert_eq!(target, "m87");
+        assert_eq!(os_label.as_deref(), Some("m87"));
+        assert!(own_name_pending(&target, os_label.as_deref(), &current).is_some());
+        write_identity_after_read(
+            &config,
+            Some(&state),
+            &record,
+            label.as_deref(),
+            &|_| false,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(machines(&config), [Some("m87".into()), Some("m87".into())]);
+        let mut off = NameChoice::Off;
+        let label = projected_machine_label(Some(&state), &mut off, None).unwrap();
+        assert!(identity_target_from(&off, label).is_none());
+    }
+
+    #[test]
+    fn automatic_machine_numbers_leave_roster_naming_in_charge() {
+        use aterm_agent::machine_name::file::{self, MachineName};
+        use aterm_types::machine_name::{Class, Nickname, Number};
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path();
+        let fallback = || Some("m184".to_owned());
+        let mut choice = NameChoice::Roster;
+        assert_eq!(
+            projected_machine_label(None, &mut choice, fallback()).unwrap(),
+            fallback()
+        );
+        assert_eq!(
+            projected_machine_label(Some(state), &mut choice, fallback()).unwrap(),
+            fallback()
+        );
+        let mut name = MachineName::unnumbered(Nickname::parse("Heron").unwrap(), 1);
+        name.num = Some(Number::parse("m8").unwrap());
+        file::read_or_create(state, || Ok(name)).unwrap();
+        for class in [Class::Auto, Class::Seeded] {
+            file::replace(state, |held| {
+                held.class = class;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                projected_machine_label(Some(state), &mut choice, fallback()).unwrap(),
+                fallback()
+            );
+        }
+    }
+
+    #[test]
+    fn an_off_choice_after_identity_keys_are_written_stops_external_projections() {
+        use aterm_agent::machine_name::file::{self, MachineName};
+        use aterm_types::machine_name::{Class, Nickname, Number};
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().join("state");
+        aterm_uds::private_file::create_private_dir(&state).unwrap();
+        let mut name = MachineName::unnumbered(Nickname::parse("MissBunny").unwrap(), 1);
+        name.num = Some(Number::parse("m86").unwrap());
+        name.class = Class::Chosen;
+        file::read_or_create(&state, || Ok(name)).unwrap();
+        let config = scratch.path().join("aterm.toml");
+        let record = state.join("converge/identity-written.toml");
+        for off in ["[identity]\nname = false\n", "[swarm]\nenabled = false\n"] {
+            aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+            write_identity_after_read(
+                &config,
+                Some(&state),
+                &record,
+                Some("m184"),
+                &|_| true,
+                || {},
+            )
+            .unwrap();
+            assert_eq!(
+                projection_target_now(&config, Some(&state), Some("m184".into()))
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                "m86"
+            );
+            // Deterministically place the person's off edit between the config write and the
+            // boundary that would otherwise proceed to fleet and OS calls with stale choices.
+            aterm_uds::atomic_file::write(&config, off.as_bytes(), 0o600).unwrap();
+            assert!(
+                projection_target_now(&config, Some(&state), Some("m184".into()))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     /// Design §3 principle 4, "the person's choices win": a machine key the person set (here
     /// before aterm ever wrote one, so no record names it) is kept as they set it, on every pass;
     /// only the unset key takes the roster's label, and the row reads settled, never a change.
@@ -2966,7 +3249,7 @@ mod tests {
             let backup_before = std::fs::read(&backup).ok();
             let mut reached = false;
             let result =
-                write_identity_after_read(&config, &record, Some("m112"), &|_| true, || {
+                write_identity_after_read(&config, None, &record, Some("m112"), &|_| true, || {
                     reached = true;
                     std::fs::write(&config, changed).unwrap();
                 });

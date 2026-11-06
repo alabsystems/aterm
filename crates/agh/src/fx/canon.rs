@@ -515,7 +515,7 @@ pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
     Ok(decision)
 }
 
-/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `clone-mirror`, `fetch`, `fetch-main`,
+/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `clone-mirror`, `fetch`, `fetch-main`, `fetch-ref`,
 /// `ls-remote`, `push-delete`), then the op's own words, one per line (`depth {n}`,
 /// `into {ref}`, `ref {name}`, `expect {sha}`). Never the URL (the tape's header names the endpoints), the environment,
 /// the grant's nonce or a path.
@@ -530,6 +530,12 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
         },
         GitOp::Fetch { .. } => format!("git fetch {slug}"),
         GitOp::FetchMain { into, .. } => format!("git fetch-main {slug}\ninto {into}"),
+        GitOp::FetchRef {
+            reference,
+            into,
+            anonymous,
+            ..
+        } => format!("git fetch-ref {slug}\nref {reference}\ninto {into}\nanonymous {anonymous}"),
         GitOp::LsRemote { reference } => match reference {
             Some(reference) => format!("git ls-remote {slug}\nref {reference}"),
             None => format!("git ls-remote {slug}"),
@@ -975,6 +981,47 @@ mod tests {
                     "PATCH /repos/o/r\norigin api\nas dev\nbody {}",
                     request_digest(body)
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn exact_fetch_identity_keeps_refs_and_auth_mode_but_not_local_paths() {
+        use crate::git::GitRun;
+        use std::path::Path;
+
+        let slug = crate::slug::Slug::new("owner", "repo").unwrap();
+        let request = |path: &str, source: &str, into: &str, anonymous: bool| {
+            super::git_request(&GitRun::fetch_ref(
+                &slug,
+                Path::new(path),
+                source,
+                into,
+                anonymous,
+            ))
+        };
+        let expected = request("/first/checkout", "refs/heads/main", "refs/agh/exact", true);
+        assert_eq!(
+            expected,
+            b"git fetch-ref owner/repo\nref refs/heads/main\ninto refs/agh/exact\nanonymous true"
+        );
+        assert_eq!(
+            expected,
+            request(
+                "/another/checkout",
+                "refs/heads/main",
+                "refs/agh/exact",
+                true
+            )
+        );
+        for (source, into, anonymous) in [
+            ("refs/tags/v1", "refs/agh/exact", true),
+            ("refs/heads/main", "refs/agh/other", true),
+            ("refs/heads/main", "refs/agh/exact", false),
+        ] {
+            assert_ne!(
+                expected,
+                request("/first/checkout", source, into, anonymous)
             );
         }
     }

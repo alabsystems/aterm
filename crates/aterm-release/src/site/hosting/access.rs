@@ -53,18 +53,24 @@ pub fn check(
     let name = doc["name"]
         .as_str()
         .ok_or_else(|| unavailable("Hosting returned no site name"))?;
-    let parts: Vec<_> = name.split('/').collect();
-    let project = match parts.as_slice() {
-        ["projects", project, "sites", found]
-            if *found == site
-                && *project != "-"
+    let mut parts = name.split('/');
+    let project = match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("projects"), Some(project), Some("sites"), Some(found), None)
+            if found == site
+                && project != "-"
                 && !project.is_empty()
                 && project.len() <= 128
                 && project
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
         {
-            *project
+            project
         }
         _ => {
             return Err(unavailable(

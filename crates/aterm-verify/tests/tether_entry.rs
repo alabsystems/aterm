@@ -8,7 +8,6 @@
 
 #![cfg(unix)]
 
-use std::path::Path;
 use std::time::Instant;
 
 use aterm_spec::wait::MUST_HAPPEN;
@@ -16,10 +15,10 @@ use aterm_spec::wait::MUST_HAPPEN;
 /// `aterm-verify __tether <parent> /bin/sh /bin/sh -c 'echo ran'` under the `argv[0]` a tethered
 /// spawn gives it (`aterm_uds::tether::NAME`), run as this test's own child.
 fn tether_through_verify(parent: &str) -> std::process::Output {
-    let verify = Path::new(env!("CARGO_BIN_EXE_aterm-verify"));
-    aterm_spec::wait::first_exec(verify, &["--help"]);
+    let verify = aterm_tempfile::bin_exe("aterm-verify");
+    aterm_spec::wait::first_exec(&verify, &["--help"]);
     aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(verify)
+        aterm_uds::spawnfd::command(&verify)
             .arg0(aterm_uds::tether::NAME)
             .args([aterm_uds::tether::VERB, parent])
             .args(["/bin/sh", "/bin/sh", "-c", "echo ran"]),

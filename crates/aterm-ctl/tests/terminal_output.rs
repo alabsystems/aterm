@@ -67,7 +67,7 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     listener.set_nonblocking(true).expect("non-blocking");
     let mut pty = Pty::open();
     let slave = pty.slave.try_clone().expect("a slave copy");
-    let mut command = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-ctl"));
+    let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         if aterm_uds::process::stripped_from_child(&key) {
             command.env_remove(key);

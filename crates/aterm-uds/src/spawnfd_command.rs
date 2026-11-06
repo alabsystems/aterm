@@ -134,7 +134,7 @@ impl Env {
     /// `environ`'s order) when nothing was edited, else this process's (or
     /// none, after `env_clear`) with the edits applied, sorted by key —
     /// exactly the block `std` hands the child.
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn capture(&self) -> Vec<(OsString, OsString)> {
         if !self.clear && self.vars.is_empty() {
             return std::env::vars_os().collect();
@@ -181,6 +181,8 @@ pub struct Command {
     disclaim: Option<&'static CStr>,
     /// Start the child stopped at its exec ([`Self::start_suspended`]).
     suspended: bool,
+    /// Run the program's own image, never a shell over it ([`super::NativeImage`]).
+    native_image: bool,
     /// The task type the child starts as ([`Self::leave_background_band`]).
     task: Option<super::TaskType>,
     /// End the child when this process dies ([`super::Tether`]).
@@ -244,6 +246,7 @@ impl Command {
             setsid: false,
             disclaim: None,
             suspended: false,
+            native_image: false,
             task: None,
             tether: false,
             #[cfg(all(test, target_os = "linux"))]
@@ -746,6 +749,13 @@ impl super::Tether for Command {
     }
 }
 
+impl super::NativeImage for Command {
+    fn native_image(&mut self, native: bool) -> &mut Self {
+        self.native_image = native;
+        self
+    }
+}
+
 impl fmt::Debug for Command {
     /// `std`'s shape: `cd "dir" && env -i K="v" "program" "arg"`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1223,6 +1233,12 @@ impl Command {
                 "tethered commands do not forward explicit guards",
             ));
         }
+        if self.tether && self.native_image {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a tethered command starts its helper, not a native image",
+            ));
+        }
         let routed = if self.tether {
             crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)
         } else {
@@ -1355,7 +1371,7 @@ impl Command {
                 replace,
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: self.inherit_all,
-                native_image: false,
+                native_image: self.native_image,
                 disclaim: self.disclaim,
                 suspended: self.suspended,
                 task: self.task,
@@ -1662,6 +1678,54 @@ impl Command {
                 Ok(())
             });
         }
+        if self.native_image {
+            self.native_hook(&mut command)?;
+        }
         Ok(command)
+    }
+
+    /// The last hook of a native-image spawn ([`super::NativeImage`]): the child `execve`s the
+    /// image prepared here, and a failed exec fails the spawn with its error, before `std`'s
+    /// `execvp` could hand the file to the system shell.
+    #[cfg(target_os = "linux")]
+    fn native_hook(&self, command: &mut super::StdCommand) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        if self.tether {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a tethered command is not started as a native image",
+            ));
+        }
+        // The search runs here, before the fork, against this process's directory, where the
+        // child's `execvp` would search against the one it moved to.
+        if self.cwd.is_some() && !self.program.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a native image started in another directory is named by its path",
+            ));
+        }
+        let native = super::platform::NativeExec::prepare(
+            &self.program,
+            self.arg0.as_deref(),
+            &self.args,
+            &self.env.capture(),
+        )?;
+        // SAFETY: added after every other hook, it runs last between fork and exec, once stdio,
+        // the working directory, the strip, the mask, the session and the guards are in place,
+        // and calls only `NativeExec::exec` (an `execve` over what `native` owns, then errno).
+        unsafe {
+            command.pre_exec(move || Err(native.exec()));
+        }
+        Ok(())
+    }
+
+    /// A native-image spawn is macOS's and Linux's ([`super::NativeImage`]).
+    #[cfg(not(target_os = "linux"))]
+    fn native_hook(&self, _command: &mut super::StdCommand) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a native-image spawn is macOS's and Linux's",
+        ))
     }
 }

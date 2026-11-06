@@ -6712,10 +6712,8 @@ mod font_enum_tests {
 
     #[test]
     fn face_info_matches_live_renderer_geometry() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetbrains-mono.ttf"
-        );
+        let file = aterm_tempfile::manifest_dir().join("tests/fixtures/jetbrains-mono.ttf");
+        let path = file.to_str().expect("a UTF-8 package directory");
         let bytes = std::fs::read(path).expect("committed JetBrains Mono fixture");
         let live =
             super::Renderer::from_bytes(&bytes, super::FaceInfo::PROBE_PX, super::Theme::default())
@@ -24227,7 +24225,10 @@ mod tests {
     }
 
     fn asset_path(rel: &str) -> String {
-        format!("{}/assets/{rel}", env!("CARGO_MANIFEST_DIR"))
+        let file = aterm_tempfile::manifest_dir().join("assets").join(rel);
+        file.into_os_string()
+            .into_string()
+            .expect("a UTF-8 package directory")
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -25412,13 +25413,14 @@ mod tests {
     }
 
     fn bundled_path_backed_renderer() -> Renderer {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/bundled/JetBrainsMono-Regular.ttf"
-        );
+        let path = aterm_tempfile::manifest_dir().join("assets/bundled/JetBrainsMono-Regular.ttf");
         let mut r = Renderer::from_bytes(BUNDLED_MONO, 32.0, Theme::default())
             .expect("the bundled face builds a renderer");
-        r.primary_path = Some(path.to_string());
+        r.primary_path = Some(
+            path.into_os_string()
+                .into_string()
+                .expect("a UTF-8 package directory"),
+        );
         r
     }
 
@@ -27610,11 +27612,9 @@ mod tests {
     #[cfg(feature = "embedded-font")]
     #[test]
     fn injected_bold_face_routes_bold_cells_to_a_real_weight() {
-        let bold_bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetbrains-mono.ttf"
-        ))
-        .expect("committed JetBrains Mono fixture");
+        let bold_bytes =
+            std::fs::read(aterm_tempfile::manifest_dir().join("tests/fixtures/jetbrains-mono.ttf"))
+                .expect("committed JetBrains Mono fixture");
 
         let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).unwrap();
         let synth = r.glyph_key_styled('M', StyleBits::BOLD);
@@ -28354,11 +28354,9 @@ mod tests {
     #[cfg(feature = "embedded-font")]
     #[test]
     fn set_primary_font_swaps_the_face_and_rerasterizes() {
-        let jetbrains = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetbrains-mono.ttf"
-        ))
-        .expect("committed JetBrains Mono fixture");
+        let jetbrains =
+            std::fs::read(aterm_tempfile::manifest_dir().join("tests/fixtures/jetbrains-mono.ttf"))
+                .expect("committed JetBrains Mono fixture");
 
         let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).unwrap();
         let dejavu_m = {
@@ -33194,10 +33192,9 @@ mod emoji_oracle {
     fn each_emoji_line(
         mut check: impl FnMut(&crate::font::FaceBytes, &aterm_font::Face<'_>, &corpus::Line),
     ) {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/font-oracle/shaping.txt"
-        ))
+        let text = std::fs::read_to_string(
+            aterm_tempfile::manifest_dir().join("tests/fixtures/font-oracle/shaping.txt"),
+        )
         .expect("the shaping corpus");
         let lines: Vec<corpus::Line> = text
             .lines()

@@ -544,8 +544,7 @@ mod tests {
     /// definite state for every light it shows, or (a box up) no screen at all.
     #[test]
     fn every_recorded_screen_reads_definitely_or_not_at_all() {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
         let mut readable = 0;
         for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {
             let path = entry.unwrap().path();
@@ -583,8 +582,7 @@ mod tests {
     /// rule gives the same reading.
     #[test]
     fn the_lights_reading_is_the_screens_without_its_turn() {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
         let (mut framed, mut bare) = (0, 0);
         for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {
             let path = entry.expect("a fixture").path();
@@ -618,8 +616,7 @@ mod tests {
     /// as a mode.
     #[test]
     fn every_captured_footer_screen_of_every_build_is_read() {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
         let mut builds = std::collections::BTreeSet::new();
         let mut screens = 0;
         for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {
@@ -740,8 +737,7 @@ mod tests {
             ("after-turn", Mode::Auto, false),
             ("bypass-idle", Mode::Bypass, false),
         ];
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
         for build in ["2.1.307", "2.1.308"] {
             for (name, mode, busy) in cases {
                 let file = format!("claude-{build}-footer-{name}.txt");

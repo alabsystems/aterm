@@ -85,8 +85,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn frame(file: &str) -> Vec<u8> {
-    let path = format!("{}/tests/recorded/cli/{file}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    let path = aterm_tempfile::manifest_dir()
+        .join("tests/recorded/cli")
+        .join(file);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// The recording holds: each input regenerates to the recorded digest, so

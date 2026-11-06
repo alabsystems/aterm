@@ -307,7 +307,7 @@ impl TcpState {
         }
     }
 
-    /// Linux's `/proc/net/tcp` `st` column (`TCP_ESTABLISHED` 1 … `TCP_CLOSING` 11, `include/net/tcp_states.h`).
+    /// Linux's state number, a `sock_diag` record's `idiag_state` and `/proc/net/tcp`'s `st` column (`TCP_ESTABLISHED` 1 … `TCP_CLOSING` 11, `include/net/tcp_states.h`).
     #[must_use]
     pub const fn from_linux(state: u8) -> Self {
         match state {
@@ -623,6 +623,11 @@ pub fn fresh_dylib(path: &[u8], mtime_s: i64, start_us: Option<u64>) -> bool {
 /// How long since its fork a process whose one thread never ran must have stood before it reads as held at macOS's program check: a normal exec reads its first thread's handle as `0` for under 0.3 ms (M2).
 pub const PROGRAM_CHECK_AGE_MS: u64 = 20_000;
 
+/// The most CPU a process may have used for a reader of many to ask its start ([`read_start`]). A
+/// held one has used about 2 ms, the fork child's work before its exec (leftover M4), so its
+/// counters cannot tell it from an idle one: CPU only selects rows, and the thread call decides.
+pub const HELD_CPU_NS: u64 = 20_000_000;
+
 /// Where a process stands at its start (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), judged by [`judge_start`] from its [`StartFacts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtStart {
@@ -658,6 +663,10 @@ pub struct StartFacts {
     pub local: Option<bool>,
     /// Milliseconds since its fork; `None` when unread.
     pub age_ms: Option<u64>,
+    /// When it forked, µs since the epoch on the clock [`now_us`] reads (the kernel's `p_start`,
+    /// which also dates the syspolicyd running now); `None` when unread. An exec in the same pid
+    /// keeps it, so it dates the fork, not the exec whose check holds it.
+    pub start_us: Option<u64>,
 }
 
 /// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never
@@ -681,6 +690,51 @@ pub fn judge_start(f: &StartFacts) -> AtStart {
     } else {
         AtStart::Held
     }
+}
+
+/// How long the syspolicyd running now must have run before a program whose check was sent
+/// before its start reads [`stranded`]: the bound on a first exec (aterm-uds'
+/// `deadline::FIRST_EXEC_HANG`, 10 min). A check sent before a crash that waited in the service's
+/// queue goes to the new daemon, which answers it as any other, so until then nothing tells it
+/// from one the dead daemon took with it.
+pub const STRANDED_AFTER_US: u64 = 600_000_000;
+
+/// Whether a held process whose check was sent by `sent_by_us` sent it to a syspolicyd that is no
+/// longer running: `sent_by_us` is strictly before `daemon_start_us`, the start of the one running
+/// now (µs since the epoch, as [`StartFacts::start_us`]), and that daemon has run
+/// [`STRANDED_AFTER_US`] at `now_us`. `sent_by_us` is a time its exec had come by: a read then
+/// found its one thread unrun ([`StartFacts::lone_zero`]), and none since found that it ran. Its
+/// fork is not one, since an exec in the same pid keeps it. `false` for an unread time and for a
+/// daemon whose start reads after now.
+#[must_use]
+pub fn before_daemon(sent_by_us: Option<u64>, daemon_start_us: u64, now_us: u64) -> bool {
+    sent_by_us.is_some_and(|s| s < daemon_start_us)
+        && now_us
+            .checked_sub(daemon_start_us)
+            .is_some_and(|up| up >= STRANDED_AFTER_US)
+}
+
+/// Whether a process with `f`, its check sent by `sent_by_us`, is stranded at macOS's program
+/// check: [`judge_start`] calls it [`AtStart::Held`], it is [`before_daemon`] the syspolicyd
+/// running now (started at `daemon_start_us`), and that daemon answers alone: its pool reads not
+/// full (`pool_full`, `Some(false)`) and no held program of this user forked at or after its start
+/// (`held_since_daemon`, `Some(0)`). A first exec whose check went to the daemon running now is
+/// never stranded, however slow; one queued for it before it started is, once it has run
+/// [`STRANDED_AFTER_US`] without answering it. A full pool, a backlog or an unread one gives no
+/// verdict (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1).
+#[must_use]
+pub fn stranded(
+    f: &StartFacts,
+    sent_by_us: Option<u64>,
+    daemon_start_us: u64,
+    now_us: u64,
+    pool_full: Option<bool>,
+    held_since_daemon: Option<usize>,
+) -> bool {
+    judge_start(f) == AtStart::Held
+        && before_daemon(sent_by_us, daemon_start_us, now_us)
+        && pool_full == Some(false)
+        && held_since_daemon == Some(0)
 }
 
 /// The [`StartFacts`] of `pid` at `now_us` (µs since the epoch, [`now_us`]): one two-slot thread list, and for a lone `0` only its BSD record, its arch and its executable's mount. `None` when the list or a record the judgment needs cannot be read (gone, another user's), and off macOS. Nothing of its arguments or environment is read: such a read of a program held mid-start can hang (M29).
@@ -832,6 +886,12 @@ pub struct JobsReader {
     /// with its short name then: the exec'd ones whose sockets this pass may read
     /// (`macos::settled`). Each pass replaces it, so a process a pass leaves out is new to the next.
     execd: HashMap<(u32, u64), String>,
+    /// The Linux arm's TCP sockets: the process's shared all-states dump on this machine
+    /// ([`crate::linux::tcp::newest_within`]), none for a fixture tree. Two epochs old at most, so
+    /// while a window in view reads the stream the pass reads the dump its readings take after
+    /// they publish; with none that fresh (no window in view, so the dumps are a minute
+    /// apart) it takes one on its own path, at most once an epoch.
+    tcp: fn() -> Option<std::sync::Arc<crate::linux::tcp::TcpDump>>,
 }
 
 /// An output file's identity for the tail check.
@@ -847,7 +907,11 @@ impl JobsReader {
     /// A reader of this machine.
     #[must_use]
     pub fn new() -> Self {
-        Self::at_root(Path::new("/proc"), linux::clock_ticks())
+        Self {
+            #[cfg(target_os = "linux")]
+            tcp: || crate::linux::tcp::newest_within(2 * crate::linux::tcp::EPOCH),
+            ..Self::at_root(Path::new("/proc"), linux::clock_ticks())
+        }
     }
 
     /// A reader whose Linux arm reads `root` as `/proc`, with `hz` clock ticks per second: a fixture tree in tests (the macOS arm ignores it).
@@ -859,6 +923,7 @@ impl JobsReader {
             lanes: None,
             tails: HashMap::new(),
             execd: HashMap::new(),
+            tcp: || None,
         }
     }
 
@@ -957,7 +1022,7 @@ impl JobsReader {
     ) -> Option<(ProcFacts, Option<StartFacts>, bool)> {
         #[cfg(target_os = "macos")]
         {
-            let _ = (&self.root, self.hz);
+            let _ = (&self.root, self.hz, self.tcp);
             let execd_then = |start, name: &str| {
                 self.execd
                     .get(&facts_key(pid, start))
@@ -969,7 +1034,7 @@ impl JobsReader {
         {
             let _ = (lanes, now_us, &self.execd);
             if cfg!(target_os = "linux") || self.root != Path::new("/proc") {
-                linux::read(&self.root, pid, fds, self.hz).map(|f| (f, None, false))
+                linux::read(&self.root, pid, fds, self.hz, &self.tcp).map(|f| (f, None, false))
             } else {
                 #[cfg(windows)]
                 {

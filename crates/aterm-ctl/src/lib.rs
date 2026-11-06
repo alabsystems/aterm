@@ -214,6 +214,10 @@ STDIN PAYLOADS:
                   Each worker it starts, here or with --host, gets a row on
                   this Mac's board (`board`), with label=<word> (1-64 of
                   A-Z a-z 0-9 . _ -), which it never sends.
+    spawn program=<p> [arg=<a>]... [cwd=<path>] [label=<word>] -
+                  the same, for a program no harness reads: its task file is
+                  the program's standard input, and each of program= and arg=
+                  goes as one word whatever it holds.
     board [--json] [from=<sid>] [label=<word>|<prefix>*]
                   this Mac's board, read from its state folder (with --host,
                   that Mac's, over a drive); `board accept <@sid|label>
@@ -3768,7 +3772,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
             stderr_line(&format!(
                 "the aterm that answered predates `{name}` ({status}); the entry above is this \
                  client's (aterm {}), and that aterm will refuse the verb",
-                aterm_types::version::app_version()
+                aterm_stamp::app_version()
             ))?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -3868,10 +3872,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             drop(out);
             return Ok(ExitCode::SUCCESS);
         } else if arg == "-V" || arg == "--version" {
-            print_stdout_line(&format!(
-                "aterm-ctl {}",
-                aterm_types::version::app_version()
-            ))?;
+            print_stdout_line(&format!("aterm-ctl {}", aterm_stamp::app_version()))?;
             return Ok(ExitCode::SUCCESS);
         } else if arg == "--completions" {
             let shell = args.next().ok_or_else(|| {
@@ -4120,7 +4121,11 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         let prefix = binary_frame_prefix(selector, frame_verb);
         return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
-    if verb_tok == Some("spawn") && verb_args.iter().any(|a| a.starts_with("agent=")) {
+    if verb_tok == Some("spawn")
+        && verb_args
+            .iter()
+            .any(|a| a.starts_with("agent=") || a.starts_with("program="))
+    {
         let (mut verb_args, label) = board::take_label(verb_args)?;
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let selector = worker_selector(selector, pinned, starter.as_deref());
@@ -4407,13 +4412,13 @@ fn validate_task_payload(task: &[u8]) -> io::Result<()> {
     if task.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "spawn agent=: the task on stdin is empty",
+            "spawn: the task on stdin is empty",
         ));
     }
     if task.len() > MAX_TASK_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("spawn agent=: the task on stdin is over {MAX_TASK_BYTES} bytes"),
+            format!("spawn: the task on stdin is over {MAX_TASK_BYTES} bytes"),
         ));
     }
     Ok(())
@@ -4461,8 +4466,9 @@ fn worker_spawn_head(
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "spawn agent=: {why} (aterm ctl @self spawn agent=claude [model=<m>] [cwd=<path>] \
-                 [label=<word>] - < task)"
+                "spawn: {why} (aterm ctl @self spawn agent=claude [model=<m>] [cwd=<path>] \
+                 [label=<word>] - < task, or spawn program=<path|word> [arg=<word>]... \
+                 [cwd=<path>] [label=<word>] - < task)"
             ),
         )
     };
@@ -4485,8 +4491,20 @@ fn worker_spawn_head(
                 .and_then(|v| v.strip_suffix('"'))
                 .unwrap_or(v)
         });
-        parts.push(match given {
-            Some(dir) if !dir.is_empty() && Path::new(dir).is_relative() => {
+        // A program's and its arguments' words go percent-encoded, one token each whatever they
+        // hold, as the server decodes them; a quote too, which the server's split would read as
+        // one opening a value.
+        let word = ["program=", "arg="]
+            .into_iter()
+            .find_map(|key| Some((key, arg.strip_prefix(key)?)));
+        parts.push(match (given, word) {
+            (_, Some((key, value))) => {
+                format!(
+                    "{key}{}",
+                    aterm_codec::pct::encode(value).replace('"', "%22")
+                )
+            }
+            (Some(dir), None) if !dir.is_empty() && Path::new(dir).is_relative() => {
                 let dir: PathBuf = here()?.join(dir).components().collect();
                 if !dir.is_absolute() {
                     return Err(usage("a folder on another drive: say an absolute cwd="));
@@ -4494,7 +4512,7 @@ fn worker_spawn_head(
                 worker_cwd_arg(&dir)
                     .map_err(|why| usage(&format!("{why}: say an absolute cwd=")))?
             }
-            _ => arg.clone(),
+            (_, None) => arg.clone(),
         });
     }
     if let Some(sid) = starter

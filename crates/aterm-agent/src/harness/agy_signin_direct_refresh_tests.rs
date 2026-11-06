@@ -8,7 +8,7 @@ use std::cell::Cell;
 
 const OLD: &[u8] = br#"{"auth_method":"consumer","token":{"access_token":"old-access","refresh_token":"old-refresh","expiry":"2100-01-01T00:00:00Z"}}"#;
 
-fn installed(state: &Path, home: &Path, program: &Path, deadline: Instant) -> PathBuf {
+fn installed(state: &Path, home: &Path, program: &Path, deadline: WakeDeadline) -> PathBuf {
     let grant = super::super::direct_with(
         program,
         state,
@@ -30,14 +30,18 @@ fn direct_refresh_publishes_only_a_verified_replacement_under_the_original_claim
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, identity) = setup(root.path());
         let program = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let path = installed(&state, &home, &program, deadline);
         let profile = native_profile(&state, "one", &identity);
         let record = super::super::direct_tests::direct_file(&state);
         let before = std::fs::read(&record).unwrap();
         let called = Cell::new(false);
         let _held = (case == 9).then(|| ProfileLock::claim(&profile).unwrap());
-        let request_deadline = if case == 10 { Instant::now() } else { deadline };
+        let request_deadline = if case == 10 {
+            WakeDeadline::after(Duration::ZERO)
+        } else {
+            deadline
+        };
         let result = run_with(
             &program,
             &state,
@@ -114,7 +118,7 @@ fn direct_refresh_publishes_only_a_verified_replacement_under_the_original_claim
         if let Ok(grant) = result {
             assert_eq!(grant.path(), path);
             let verified = grant
-                .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+                .verify_with_retry(|| deadline.remaining(), proof, |_| {})
                 .unwrap();
             verified.finish_recovery().unwrap();
             assert!(!record.exists());
@@ -148,7 +152,7 @@ fn direct_refresh_resumes_a_completed_native_effect_after_verification_outage_or
         let root = aterm_tempfile::tempdir().unwrap();
         let (state, home, _) = setup(root.path());
         let program = std::env::current_exe().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let path = installed(&state, &home, &program, deadline);
         let result = run_with(
             &program,
@@ -186,7 +190,7 @@ fn direct_refresh_resumes_a_completed_native_effect_after_verification_outage_or
         assert_eq!(grant.path(), path);
         assert_ne!(std::fs::read(&path).unwrap(), OLD);
         grant
-            .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+            .verify_with_retry(|| deadline.remaining(), proof, |_| {})
             .unwrap()
             .finish_recovery()
             .unwrap();
@@ -203,7 +207,7 @@ fn direct_refresh_crash_stand_in() {
         &root.join("state"),
         &root.join("home"),
         "one",
-        Instant::now() + Duration::from_secs(60),
+        WakeDeadline::after(Duration::from_secs(60)),
         |token, _, _| {
             if token == "old-access" {
                 return Err(google_profile::Error::CredentialRejected);
@@ -222,7 +226,7 @@ fn direct_refresh_survives_process_death_before_live_publication() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
     let program = std::env::current_exe().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let path = installed(&state, &home, &program, deadline);
     let mut child = aterm_uds::spawnfd::command(&program);
     child
@@ -260,7 +264,7 @@ fn direct_refresh_survives_process_death_before_live_publication() {
     assert_eq!(grant.path(), path);
     assert_ne!(std::fs::read(&path).unwrap(), OLD);
     grant
-        .verify_with_retry(deadline, proof, |_| {}, Instant::now)
+        .verify_with_retry(|| deadline.remaining(), proof, |_| {})
         .unwrap()
         .finish_recovery()
         .unwrap();
@@ -274,7 +278,7 @@ fn rejected_direct_refresh_reaches_native_auth_without_changing_live_credentials
         .unwrap();
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, home, _) = setup(root.path());
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let path = installed(&state, &home, &program, deadline);
     let observed = Cell::new(false);
     let result = run_with(

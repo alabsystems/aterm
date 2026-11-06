@@ -978,10 +978,11 @@ fn another_processs_key_or_click_still_reaches_the_persons_clipboard() {
 }
 
 /// A KEY `hwkey` POSTED INTO THE STATS LENS COPIES NOTHING: a keyboard lens takes ⌘⇧C (its CPU
-/// diagnostic report) and ⌘C or a Copy binding (its sentence) before any binding, by the key
-/// path an `hwkey` key arrives on ([`App::dispatch_hw_key`]); neither chord is an Edit item's key
-/// equivalent while the lens has it, so the lens itself refuses the controller mark: the
-/// clipboard keeps what it held. The person's ⌘⇧C and ⌘C copy the report and the sentence.
+/// diagnostic report, where the lens binds it: `cpu_report_key`; on Linux the chord is its ⌘C)
+/// and ⌘C or a Copy binding (its sentence) before any binding, by the key path an `hwkey` key
+/// arrives on ([`App::dispatch_hw_key`]); neither chord is an Edit item's key equivalent while the
+/// lens has it, so the lens itself refuses the controller mark: the clipboard keeps what it held.
+/// The person's ⌘⇧C and ⌘C copy the report (the sentence on Linux) and the sentence.
 /// NEGATIVE CONTROL: with the lens's two copies unguarded (as on main, `147b22abdc`), the posted
 /// ⌘⇧C put the CPU report on the board.
 #[test]
@@ -1015,8 +1016,13 @@ fn a_key_hwkey_posted_into_the_stats_lens_copies_nothing() {
     assert_eq!(board().as_deref(), Some(SECRET), "hwkey's ⌘C");
 
     hw_key(&mut app, "c", shift_cmd, false);
-    assert_eq!(board(), Some(report), "the person's ⌘⇧C");
     let sentence = app.stats_lens_sentence(WID).expect("a sentence");
+    let bound = crate::stats_lens::cpu_report_key(aterm_vitals::words::Platform::host());
+    assert_eq!(
+        board(),
+        Some(if bound { report } else { sentence.clone() }),
+        "the person's ⌘⇧C"
+    );
     hw_key(&mut app, "c", ModifiersState::SUPER, false);
     assert_eq!(board(), Some(sentence), "the person's ⌘C");
     set_board(None);

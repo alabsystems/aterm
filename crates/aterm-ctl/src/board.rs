@@ -1242,14 +1242,14 @@ pub(crate) fn take_label(args: &[String]) -> io::Result<(Vec<String>, Option<Str
         if label.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "spawn agent=: label= at most once",
+                "spawn: label= at most once",
             ));
         }
         if !valid_name(word) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "spawn agent=: label= takes 1-{WORD_MAX} of A-Z a-z 0-9 . _ - (not `-` \
+                    "spawn: label= takes 1-{WORD_MAX} of A-Z a-z 0-9 . _ - (not `-` \
                      alone), not `{}`",
                     one_line(word)
                 ),
@@ -1298,10 +1298,11 @@ pub(crate) fn spawned(
         label,
         node: placed.node,
         host: placed.host,
-        program: arg("agent"),
+        program: arg("agent").or_else(|| arg("program")),
         model: arg("model"),
         account: placed.account,
-        autopilot: arg("autopilot").or_else(|| Some("land".to_owned())),
+        // A program worker runs under no Autopilot: no harness of its reads it.
+        autopilot: arg("autopilot").or_else(|| arg("agent").map(|_| "land".to_owned())),
         cwd: arg("cwd"),
         brief: Some(brief_digest(task)),
         brief_bytes: task.len() as u64,

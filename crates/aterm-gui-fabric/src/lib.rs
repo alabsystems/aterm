@@ -2977,7 +2977,7 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     let Some(lane) = lane else {
         return HELLO_USAGE.to_string();
     };
-    let own = aterm_types::version::build_id();
+    let own = aterm_stamp::build_id();
     let answer = format!(
         "lane={} build={own}",
         aterm_types::control_verbs::BRIDGE_LANE

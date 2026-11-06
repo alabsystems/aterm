@@ -1408,7 +1408,7 @@ fn running_build(run: &Run) -> String {
 }
 
 /// `<version>+g<commit>` from a `ctl version` reply (`OK version=… build=… commit=… …`): the
-/// token the instance's harness tapes carry as `build=` (`aterm_types::version::build_id`),
+/// token the instance's harness tapes carry as `build=` (`aterm_stamp::build_id`),
 /// `-dirty` suffixed for a build of an uncommitted tree; `None` when either word is missing.
 pub(crate) fn build_named(reply: &str) -> Option<String> {
     let line = reply.lines().next()?.strip_prefix("OK ")?;

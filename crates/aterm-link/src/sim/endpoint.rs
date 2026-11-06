@@ -68,6 +68,9 @@ pub(crate) struct Post {
     pub(crate) re: Option<u64>,
     /// An ask's deadline, in ms (`dl=`).
     pub(crate) dl: Option<u64>,
+    /// The caller's idempotency key (`key=`, critic item F23): a later post of its session under
+    /// the same key is its re-post.
+    pub(crate) key: Option<String>,
     pub(crate) body: Vec<u8>,
     /// The retirement the bridge sent (`off=<n>[ dup=1]` or `off=- reason=…`).
     pub(crate) retired: Option<String>,
@@ -517,7 +520,8 @@ impl Endpoint {
         lock(&self.state).sessions.keys().copied().collect()
     }
 
-    /// Session `local` queues a post, an ask with a deadline of `dl` ms where one is given.
+    /// Session `local` queues a post, an ask with a deadline of `dl` ms where one is given, under
+    /// the caller's idempotency key `key` where one is given (`post key=`).
     pub(crate) fn post(
         &self,
         local: u64,
@@ -525,6 +529,7 @@ impl Endpoint {
         kind: &str,
         text: &str,
         dl: Option<u64>,
+        key: Option<&str>,
     ) -> Option<u64> {
         let mut s = lock(&self.state);
         let session = s.sessions.get_mut(&local)?;
@@ -536,6 +541,7 @@ impl Endpoint {
             kind: kind.to_string(),
             re: None,
             dl,
+            key: key.map(str::to_string),
             body: text.as_bytes().to_vec(),
             retired: None,
         });
@@ -861,6 +867,9 @@ impl EpState {
                 }
                 if let Some(dl) = p.dl {
                     frame.push_str(&format!(" dl={dl}"));
+                }
+                if let Some(key) = &p.key {
+                    frame.push_str(&format!(" key={key}"));
                 }
                 frame.push_str(&format!(" len={}\n", p.body.len()));
                 frame.push_str(&String::from_utf8_lossy(&p.body));

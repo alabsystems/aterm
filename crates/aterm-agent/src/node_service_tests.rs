@@ -42,6 +42,9 @@ fn mesh_node_hosts_local_fabric_without_swarm_or_membership() {
 
 type Release = (u64, u64, u64);
 
+/// The release the fake's node implementation is ([`ServiceSupervisor::required_release`]).
+const REQUIRED: Release = (0, 156, 0);
+
 struct FakeSupervisor {
     pid: RefCell<Option<u32>>,
     loads: RefCell<usize>,
@@ -94,8 +97,12 @@ impl ServiceSupervisor for FakeSupervisor {
             .borrow()
             .get(program)
             .copied()
-            .unwrap_or(Some(required_node_release().unwrap()))
+            .unwrap_or(Some(REQUIRED))
             .ok_or_else(|| "program did not identify as aterm".to_owned())
+    }
+
+    fn required_release(&self) -> Result<Release, String> {
+        Ok(REQUIRED)
     }
 
     fn load_and_start(&self, _unit_path: &Path) -> Result<(), String> {
@@ -1271,11 +1278,7 @@ fn node_off_serializes_with_an_in_progress_service_change() {
 #[test]
 fn fresh_node_requires_a_verified_compatible_destination_before_mutation() {
     for has_unit in [false, true] {
-        for release in [
-            None,
-            Some((0, 91, 0)),
-            Some(required_node_release().unwrap()),
-        ] {
+        for release in [None, Some((0, 91, 0)), Some(REQUIRED)] {
             let tmp = aterm_tempfile::tempdir().unwrap();
             let home = tmp.path().join("home");
             let state = tmp.path().join("state");
@@ -1295,7 +1298,7 @@ fn fresh_node_requires_a_verified_compatible_destination_before_mutation() {
             }
             let before = std::fs::read(&unit).ok();
             let result = ensure_for_sync_with(&home, &state, None, Some(&proposed), false, &sup);
-            if release == Some(required_node_release().unwrap()) {
+            if release == Some(REQUIRED) {
                 assert!(result.is_ok(), "{has_unit} {release:?}: {result:?}");
                 assert_eq!(*sup.loads.borrow(), 1);
             } else {
@@ -1351,4 +1354,58 @@ fn systemd_exec_start_program_round_trips_quotes_and_backslashes() {
         Some(tricky),
         "{unit}"
     );
+}
+
+/// A line break in the program's path or in the home cannot add a line to the systemd unit: every
+/// control character is written as its C escape inside its quoted word, so the unit holds one
+/// `ExecStart=` and its two `Environment=` lines, and the program reads back whole from both the
+/// unit and the plist. CONTROL: a plain path round-trips and keeps its words as they are.
+#[test]
+fn a_line_break_in_the_program_or_home_adds_no_line_to_the_unit() {
+    let state = Path::new("/var/tmp/state");
+    let plain = Path::new("/opt/aterm/bin/aterm");
+    let unit = node_systemd_unit_text(plain, Path::new("/home/alice"));
+    assert!(
+        unit.contains("ExecStart=\"/opt/aterm/bin/aterm\" \"node\" \"serve\"\n"),
+        "CONTROL: {unit}"
+    );
+    assert!(
+        unit.contains("Environment=\"HOME=/home/alice\"\n"),
+        "CONTROL: {unit}"
+    );
+    for raw in [
+        "/opt/aterm/bin/aterm",
+        "/opt/a\"quote\"/b\\slash/\\$lit/\\%pct/$$two/aterm",
+        "/opt/&amp;/<tag>/'apos'/\"quot\"/aterm",
+        "/opt/injected\nExecStart=/bin/evil\r\t\x07\u{0085}/aterm",
+        "/opt/cr\rExecStart=/bin/evil/aterm",
+        "/opt/\\x41\\u0042\\n/aterm",
+    ] {
+        let program = Path::new(raw);
+        let home = Path::new("/home/user\nEnvironment=LD_PRELOAD=/tmp/evil\r\t%i$HOME");
+        let plist = node_plist_text(program, home, state, Some("systems.alab.aterm"));
+        assert_eq!(
+            kept_program_in_unit(&plist).as_deref(),
+            Some(program),
+            "{raw:?}: {plist}"
+        );
+        let unit = node_systemd_unit_text(program, home);
+        let lines: Vec<&str> = unit.split(['\n', '\r']).collect();
+        for (directive, count) in [("ExecStart=", 1), ("Environment=", 2)] {
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with(directive)).count(),
+                count,
+                "{raw:?}: {unit:?}"
+            );
+        }
+        assert!(
+            unit.chars().all(|c| !c.is_control() || c == '\n'),
+            "{raw:?}: {unit:?}"
+        );
+        assert_eq!(
+            kept_program_in_unit(&unit).as_deref(),
+            Some(program),
+            "{raw:?}: {unit}"
+        );
+    }
 }

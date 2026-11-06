@@ -32,6 +32,7 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         state: ProcState::Run,
         disk_read: None,
         disk_written: cpu_ms.map(|ms| ms * 1000),
+        energy_nj: None,
         runnable_ns: cpu_ms.map(|ms| ms * 1_200_000),
         peak: Some((mib + 10) << 20),
         at_ns: None,
@@ -102,6 +103,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             renderer_pct: Some(3),
             tiler_pct: Some(1),
             in_use_bytes: Some(512 << 20),
+            unified: true,
             ..GpuSample::default()
         }),
         volume: Some(VolumeSample {
@@ -2191,6 +2193,66 @@ fn sys_net_prints_the_hosts_network_place_as_it_came() {
     assert_eq!(j.get("place"), Some(&Jv::why("not_sampled")));
 }
 
+/// A Linux reading with only the kernel's counters read (no all-states dump yet, or its
+/// self-check retired it) gives every other TCP state as not sampled, in both shapes, not as 0.
+/// NEGATIVE CONTROL: the whole reading in the test below gives them as numbers.
+#[test]
+fn sys_net_gives_tcp_states_only_a_dump_reads_as_not_sampled_before_one() {
+    let mut s = snapshot();
+    s.net.as_mut().expect("net view").tcp = Some(TcpCounts {
+        established: 12,
+        time_wait: 2,
+        counters_only: true,
+        ..TcpCounts::default()
+    });
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Net, false), &c));
+    assert!(
+        text.contains(
+            "tcp 12 established or close_wait, 2 time_wait or orphaned fin_wait2 (other states not_sampled)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("tcp     total=unavailable(not_sampled) established=\u{2264}12 listen=unavailable(not_sampled) time_wait=\u{2264}2 close_wait=unavailable(not_sampled)"),
+        "{text}"
+    );
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(
+        overview.contains("12 TCP established or close-wait"),
+        "{overview}"
+    );
+    let j = render_json(&query(View::Net, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let tcp = j.get("net").and_then(|n| n.get("tcp")).expect("tcp");
+    assert_eq!(
+        tcp.get("established"),
+        Some(&Jv::at_most(12, "close_wait_counted")),
+        "the counter may hold close-wait too"
+    );
+    assert_eq!(
+        tcp.get("time_wait"),
+        Some(&Jv::at_most(2, "fin_wait2_counted")),
+        "the counter holds orphaned fin-wait-2 too"
+    );
+    for key in [
+        "total",
+        "listen",
+        "close_wait",
+        "connecting",
+        "closing_total",
+    ] {
+        assert_eq!(tcp.get(key), Some(&Jv::why("not_sampled")), "{key}");
+    }
+    let j = render_json(&query(View::Global, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    assert_eq!(
+        j.get("global").and_then(|g| g.get("tcp_established")),
+        Some(&Jv::at_most(12, "close_wait_counted"))
+    );
+}
+
 #[test]
 fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
     let s = snapshot();
@@ -2453,6 +2515,37 @@ fn a_pane_of_a_split_tab_reads_its_tabs_programs() {
     apart.target.window_sessions = vec![9];
     let text = all_text(&render_text(&q, &ctx(&apart, Some(&s), true, true)));
     assert!(!text.contains("program exe=cargo"), "{text}");
+}
+
+/// A3 L4 (D7): `sys` says a GPU uses unified system memory where its reader says it works in the
+/// system's memory (`GpuSample::unified`), as NVML says of a GB10, not by its name. NEGATIVE
+/// CONTROL: an Apple-named GPU whose reading carries no such fact says nothing of it.
+#[test]
+fn unified_memory_words_key_on_the_readers_fact_not_the_platform() {
+    let w = world();
+    let said = |name: &str, unified: bool| {
+        let mut s = snapshot();
+        let g = s.facts.gpu.as_mut().expect("fixture GPU");
+        g.name = Some(name.into());
+        g.unified = unified;
+        all_text(&render_text(
+            &query(View::Gpu, false),
+            &ctx(&w, Some(&s), true, true),
+        ))
+    };
+    for (name, unified) in [
+        ("NVIDIA GB10", true),
+        ("Apple M5", true),
+        ("Apple M5", false),
+    ] {
+        let text = said(name, unified);
+        assert!(text.contains(name), "{text}");
+        assert_eq!(
+            text.contains("(unified system memory)"),
+            unified,
+            "{name} {unified}: {text}"
+        );
+    }
 }
 
 #[test]

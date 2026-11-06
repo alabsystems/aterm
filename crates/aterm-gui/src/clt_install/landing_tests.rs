@@ -37,6 +37,18 @@ thread_local! {
     static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_EXTERNAL_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_FDA_DIALOG_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many times a wait of the tab's armed the window's wake for the dialog slot's end
+    /// ([`StepsReach::wake_when_no_dialog`]).
+    static INSTALL_DIALOG_WAKES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// [`StepsReach::wake_when_no_dialog`] that counts each arm ([`INSTALL_DIALOG_WAKES`]).
+fn count_dialog_wake() {
+    INSTALL_DIALOG_WAKES.with(|count| count.set(count.get() + 1));
+}
+
+fn dialog_wakes() -> u32 {
+    INSTALL_DIALOG_WAKES.with(std::cell::Cell::get)
 }
 
 fn external_installer_running() -> Reading {
@@ -424,6 +436,52 @@ fn clt_landing_defers_a_new_dialog_without_losing_the_install() {
     assert_retry_lands_once(&mut app, wid, 4);
 }
 
+/// A landing deferred behind another macOS dialog of this process, and the automatic tab's look
+/// that waits behind it, have the window woken at that dialog's end ([`crate::Wake::NoMacosDialog`],
+/// whose turn looks again): nothing else does where the setup run is parked on this tab. E3's
+/// first launch waited out its whole run so, the tab deferred behind the Commons runtime's Local
+/// Network question, whose hold ended 30 s on with no status read to follow (2026-11-05).
+/// NEGATIVE CONTROL: a look and a landing with the slot free arm nothing, and a look held for
+/// another reason (a key just typed) arms nothing either.
+#[test]
+fn clt_a_tab_behind_another_dialog_has_the_window_woken_at_its_end() {
+    let (mut app, wid) = page();
+    let id = book(&mut app, wid, 4);
+    app.access_steps.set_reach(StepsReach {
+        dialog_up: || true,
+        wake_when_no_dialog: count_dialog_wake,
+        ..StepsReach::INERT
+    });
+    INSTALL_DIALOG_WAKES.with(|count| count.set(0));
+    assert_deferred(&mut app, wid, id, Install::Wanted(4));
+    let deferred = dialog_wakes();
+    assert!(deferred >= 1, "the deferral arms the wake");
+    assert!(app.begin_developer_tools_install(aterm).is_none());
+    assert_eq!(
+        app.workstation_setup.developer_tools_held_said.get(),
+        Some(DIALOG_UP)
+    );
+    assert!(
+        dialog_wakes() > deferred,
+        "the tab's look behind it arms it"
+    );
+
+    // Held by a key just typed, with the slot up: the keyboard's rest is not the slot's end.
+    app.last_keystroke_at = Some(std::time::Instant::now());
+    let armed = dialog_wakes();
+    assert!(app.begin_developer_tools_install(aterm).is_none());
+    assert_eq!(dialog_wakes(), armed, "a key's hold arms nothing");
+    app.last_keystroke_at = None;
+
+    app.access_steps.set_reach(StepsReach {
+        wake_when_no_dialog: count_dialog_wake,
+        ..StepsReach::INERT
+    });
+    let free = dialog_wakes();
+    assert_retry_lands_once(&mut app, wid, 4);
+    assert_eq!(dialog_wakes(), free, "a free slot arms nothing");
+}
+
 #[test]
 fn clt_landing_a_newer_request_survives_the_old_shells_completion() {
     let (mut app, wid) = page();
@@ -743,7 +801,7 @@ fn clt_landing_the_follow_ups_ask_on_this_build_spends_the_automatic_tab() {
         let (mut app, _) = page();
         app.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
         let build = if asked {
-            aterm_types::version::build_id()
+            aterm_stamp::build_id()
         } else {
             "0.1.0+gdeadbeef".to_owned()
         };
@@ -789,7 +847,7 @@ fn clt_landing_a_claim_the_follow_up_won_lands_no_tab_and_keeps_its_line() {
                 aterm_types::clt_mark::claim(
                     &aterm_types::clt_mark::Live,
                     &mark,
-                    &aterm_types::version::build_id(),
+                    &aterm_stamp::build_id(),
                 )
                 .unwrap()
             );
@@ -858,7 +916,7 @@ fn a_pressed_tab_never_takes_back_a_line_it_did_not_add() {
                 aterm_types::clt_mark::claim(
                     &aterm_types::clt_mark::Live,
                     &mark,
-                    &aterm_types::version::build_id(),
+                    &aterm_stamp::build_id(),
                 )
                 .unwrap()
             );
@@ -1026,9 +1084,11 @@ fn clt_landing_a_press_during_full_disk_access_queues_with_reason_and_runs_once_
     app.workstation_setup.developer_tools_mark = Mark::at(mark);
     app.access_steps.set_reach(StepsReach {
         dialog_up: || INSTALL_FDA_DIALOG_UP.with(std::cell::Cell::get),
+        wake_when_no_dialog: count_dialog_wake,
         ..StepsReach::INERT
     });
     INSTALL_FDA_DIALOG_UP.with(|up| up.set(true));
+    INSTALL_DIALOG_WAKES.with(|count| count.set(0));
 
     let plan = Plan::default();
     let mut status = app.system_state_host.latest_status().clone();
@@ -1099,9 +1159,14 @@ fn clt_landing_a_press_during_full_disk_access_queues_with_reason_and_runs_once_
         Some(ToolsInstall::Queued),
         "System State republishes immediately so the Repositories row says why it waits"
     );
+    let armed = dialog_wakes();
     assert!(
         app.begin_developer_tools_install(aterm).is_none(),
         "still held while Full Disk Access owns the dialog slot"
+    );
+    assert!(
+        dialog_wakes() > armed,
+        "the queued press has the window woken at the slot's end"
     );
 
     // Full Disk Access releases the dialog slot: the queued press runs even with `Mark::opened`.

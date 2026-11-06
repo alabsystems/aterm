@@ -32,7 +32,7 @@ const GHOST: &str = "ffffffffffffffffffffffffffffffffffffffff";
 const PAGES_WITH_PICKS: [&str; 2] = ["aterm.html", "terminal.html"];
 
 fn fixture(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("tests/fixtures/site")
         .join(rel)
 }
@@ -53,7 +53,7 @@ fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, case: impl Fn(T) + Sync)
 }
 
 fn installer() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("../..")
         .join(crate::site::INSTALLER_SOURCE)
 }
@@ -63,8 +63,8 @@ fn read(path: &Path) -> String {
 }
 
 fn toy_module() -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../aterm-wasm-abi/tests/toy/aterm_wasm_abi_toy.wasm");
+    let path =
+        aterm_tempfile::manifest_dir().join("../aterm-wasm-abi/tests/toy/aterm_wasm_abi_toy.wasm");
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 

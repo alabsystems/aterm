@@ -2051,6 +2051,86 @@ fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
     assert_eq!(triggers(), fired, "another macOS dialog is up");
 }
 
+/// The Local Network step lets the Mac Setup tab go first, as the walk that starts by itself
+/// does: while the launch's reading of the elevation's steps is out, while the want it brings is
+/// due, while the tab's shell is booked (E3's clock-back row, 2026-11-05: the alert took the
+/// dialog slot 193 ms after the booking and deferred the tab's landing, so setup's one Mac
+/// password stood owed behind an alert nobody answered) and while the tab runs, the step asks
+/// nothing and names what holds it; it asks at the first look after the tab ended, or after the
+/// reading said nothing is owed. The yield is the one-gesture rule's, which a control verb's page
+/// reads too (`App::control_ask_moment`). The tab itself does not open here (a headless App), so nothing but the yield holds the step.
+/// NEGATIVE CONTROL: with no reading out and no want, the first look asks.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_local_network_step_lets_the_mac_setup_tab_go_first() {
+    use crate::clt_install::{Install, LAUNCH_WANT};
+    const FIRST: &str = "the Mac Setup tab goes first (setup's one Mac password)";
+    let now = Instant::now();
+    let cold = |awaited| {
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(stepping());
+        app.workstation_setup.root_steps_awaited = awaited;
+        approve(&mut app, 5);
+        app
+    };
+    let fired = triggers();
+    let mut control = cold(false);
+    assert!(
+        control.no_gesture_up(now),
+        "precondition: the one-gesture rule holds"
+    );
+    control.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1, "nothing to yield to: the step asks");
+
+    let fired = triggers();
+    let mut app = cold(true);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        triggers(),
+        fired,
+        "the elevation's reading is out: nothing asked"
+    );
+    assert_eq!(app.local_network_holds(now), [FIRST]);
+    app.root_steps_owed(true);
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::Wanted(LAUNCH_WANT),
+        "precondition: a root step owed wants the tab"
+    );
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "the tab is due: nothing asked");
+    app.workstation_setup.developer_tools = Install::Opening {
+        wanted: Some(LAUNCH_WANT),
+    };
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "its shell is booked: nothing asked");
+    assert_eq!(app.local_network_holds(now), [FIRST]);
+    assert!(
+        !app.no_gesture_up(now),
+        "the one-gesture rule, which a control verb's page reads too, waits for the booked tab"
+    );
+    app.workstation_setup.developer_tools = Install::Opened;
+    app.land_install_session_for_test(7);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "the tab runs: nothing asked");
+    assert_eq!(
+        app.local_network_holds(now),
+        ["the Developer Tools installer is up"],
+        "a landed tab is the installer's hold, not the yield"
+    );
+    assert!(app.finish_developer_tools_install(7));
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1, "the step follows the tab");
+
+    let fired = triggers();
+    let mut nothing_owed = cold(true);
+    nothing_owed.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "the reading is out");
+    nothing_owed.root_steps_owed(false);
+    nothing_owed.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1, "nothing owed: the step asks");
+}
+
 /// A Local Network step held from its moment says in aterm.log what holds it, once per change of
 /// that set and never once per look, on an instance whose step can run: the revision, which part
 /// of System State in front fails, and, with System State in front, which part of the quiet
@@ -2721,7 +2801,7 @@ fn the_markers_are_bound_to_the_approved_revision() {
     let mut app = App::headless_for_test();
     let marks = app.access_marks();
     assert_eq!(marks.revision, None);
-    assert_eq!(marks.devtools, aterm_types::version::app_version());
+    assert_eq!(marks.devtools, aterm_stamp::app_version());
     approve(&mut app, 12);
     let marks = app.access_marks();
     assert_eq!(marks.revision, Some(12));
@@ -4639,7 +4719,7 @@ fn a_developer_tools_reading_asks_for_the_page_only_while_the_record_holds_no_ha
     fn subject() -> Option<&'static str> {
         Some(test_arms::SUBJECT)
     }
-    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    let doctors = test_arms::marked(|| Some((aterm_stamp::app_version().to_owned(), 1)));
     for (handed, asks) in [(false, true), (true, false)] {
         set_front(true);
         let mut app = new_mac(doctors, test_arms::fda_opening());
@@ -4684,7 +4764,7 @@ fn a_revision_whose_developer_tools_page_came_up_is_not_asked_again_in_this_proc
     use crate::devtools_helper::{Origin, test_arms};
     use aterm_containment::DevToolGrant;
     set_front(true);
-    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    let doctors = test_arms::marked(|| Some((aterm_stamp::app_version().to_owned(), 1)));
     let mut app = new_mac(doctors, test_arms::fda_opening());
     app.access_steps.set_reach(StepsReach {
         handed: |revision, access| (revision, access) == (2, Access::DeveloperTools),
@@ -5221,7 +5301,7 @@ fn a_developer_tools_reading_with_no_revision_queues_the_step_for_the_revision()
         Some(test_arms::SUBJECT)
     }
     set_front(true);
-    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    let doctors = test_arms::marked(|| Some((aterm_stamp::app_version().to_owned(), 1)));
     let mut app = new_mac(doctors, test_arms::fda_opening());
     let (tx, rx) = std::sync::mpsc::channel();
     let mut consent = reread(FdaState::Granted);
@@ -5853,14 +5933,21 @@ fn a_full_disk_access_grant_brings_the_developer_tools_page_in_the_same_process(
             "not on the list: the page is asked for in this process"
         );
         let opens = test_arms::opens();
-        set_front(false);
+        // The run ahead ends with nothing riding it: its end is taken as the lane takes it, and
+        // no moment is judged before it ends. A tick here would judge the step's moment, which
+        // no longer waits for System State to be frontmost (`set_front` holds nothing back).
+        // On a loaded machine that moment comes while the run is still out and rides it, so a
+        // tick loop would end before `spctl` ran.
         let start = Instant::now();
         while app.devtools_helper.listing_ahead() {
             assert!(start.elapsed() < Duration::from_secs(60), "hang");
-            app.tick_devtools_hand_over(t);
+            assert_eq!(
+                app.devtools_helper.take_listed(),
+                None,
+                "a run ahead gives nothing back"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-        set_front(true);
         assert_eq!(
             RUNS.load(Ordering::SeqCst),
             runs + 1,
@@ -7259,9 +7346,13 @@ fn local_network_grant_probe_frees_the_dialog_slot_before_recording_granted() {
 /// goes up, after the record says `triggered` (which the access record keeps as asked, so a look
 /// from then on reads past "has not asked"), and once as the re-probe ends, whatever it heard: a
 /// grant, a Don't Allow, or nothing in its 30 s (no ALab vault on this network, as on e2e145, or
-/// an answer after the probe gave up). Another revision's probe tells nothing.
+/// an answer after the probe gave up). Another revision's probe tells nothing, and so does a
+/// recheck that hears nothing after a probe that heard nothing (E3, 2026-11-05: a guest whose
+/// question nobody answered ran its converge pass and account upkeep every 90 s on it); an
+/// answer a later recheck hears tells again.
 /// NEGATIVE CONTROL: the rule before this (a nudge only for a heard grant or refusal) fails the
-/// question's case, and the probe's end that heard nothing, the one e2e145 met.
+/// question's case, and the probe's end that heard nothing, the one e2e145 met; a nudge at every
+/// probe's end fails the silent recheck's.
 #[test]
 fn local_network_steps_tell_the_lan_readers_each_time_the_answer_moves() {
     use super::LocalNetworkProbe;
@@ -7324,6 +7415,23 @@ fn local_network_steps_tell_the_lan_readers_each_time_the_answer_moves() {
             2,
             "{probe:?}: the re-probe ended"
         );
+
+        if probe == LocalNetworkProbe::Unanswered {
+            OUTCOME.with(|outcome| outcome.set(Some((91, LocalNetworkProbe::Unanswered))));
+            app.on_local_network_probe_ready(now + Duration::from_secs(121));
+            assert_eq!(
+                NUDGES.with(std::cell::Cell::get),
+                2,
+                "a recheck that heard nothing again moved nothing"
+            );
+            OUTCOME.with(|outcome| outcome.set(Some((91, LocalNetworkProbe::Granted))));
+            app.on_local_network_probe_ready(now + Duration::from_secs(211));
+            assert_eq!(
+                NUDGES.with(std::cell::Cell::get),
+                3,
+                "a later recheck's answer moved it"
+            );
+        }
     }
 }
 

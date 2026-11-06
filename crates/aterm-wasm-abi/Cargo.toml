@@ -10,7 +10,7 @@
 [package]
 name = "aterm-wasm-abi"
 description = "The host boundary of aterm's wasm modules, with no third-party dependency: the export layer that replaces wasm-bindgen (marshalling, handles, the descriptor `verify glue` reads) and the panic hook that reports to the host console (derived from console_error_panic_hook 0.1.7, MIT OR Apache-2.0 upstream)."
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

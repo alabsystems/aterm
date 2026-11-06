@@ -4580,7 +4580,7 @@ fn fabric_status_line() -> String {
         u8::from(supervised),
         n(rtt),
         n(age),
-        aterm_types::version::build_id(),
+        aterm_stamp::build_id(),
         n(lane.map(u64::from)),
         bridge_build.as_deref().unwrap_or("-"),
     )
@@ -7385,7 +7385,8 @@ const DRIVE_WORKER_FILE_AGE: std::time::Duration = std::time::Duration::from_sec
 
 /// Records a driven worker for [`drive_owned`] and removes the files of workers `store` no longer
 /// hosts once past [`DRIVE_WORKER_FILE_AGE`]. A write that fails costs only the close after an
-/// update, which then says it is refused.
+/// update, which then says it is refused. The file is whole by its rename and flushed by nothing:
+/// it serves a worker that outlives an update, and no worker outlives a power loss.
 #[cfg(any(unix, test))]
 fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
     let Some(file) = drive_worker_file(sid) else {
@@ -7414,7 +7415,7 @@ fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
         }
     }
     let _ = std::fs::create_dir_all(dir)
-        .and_then(|()| aterm_uds::atomic_file::write(&file, node.as_bytes(), 0o600));
+        .and_then(|()| aterm_uds::atomic_file::write_flushed(&file, node.as_bytes(), 0o600, None));
 }
 
 #[cfg(any(unix, test))]
@@ -8458,12 +8459,13 @@ fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
     let tokens = control_media::split_quoted_tokens(rest)
         .unwrap_or_else(|| rest.split_whitespace().map(str::to_string).collect());
     let named = tokens.iter().find_map(|tok| tok.strip_prefix("agent="));
-    let agent = crate::task_launch::worker_word(named);
+    let program = tokens.iter().find_map(|tok| tok.strip_prefix("program="));
     let len = tokens.iter().find_map(|tok| tok.strip_prefix("len="))?;
     if let Some(refusal) = crate::task_launch::retired_worker(named) {
         return Some(Err(refusal));
     }
-    Some(crate::task_launch::frame_len(len, agent))
+    let form = crate::task_launch::spawn_form_word(named, program);
+    Some(crate::task_launch::frame_len(len, &form))
 }
 
 fn read_worker_task(
@@ -8484,11 +8486,12 @@ fn read_worker_task(
 
 fn worker_frame_refusal(head: &Head<'_>, store: &Store) -> Option<String> {
     spawn_frame_len(head)?.ok()?;
-    let agent = crate::task_launch::worker_word(
+    let word = |key: &str| {
         head.rest
             .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("agent=")),
-    );
+            .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+    };
+    let form = crate::task_launch::spawn_form_word(word("agent"), word("program"));
     let Some(selector @ Selector::Sid(sid)) = head.selector else {
         return None;
     };
@@ -8499,8 +8502,8 @@ fn worker_frame_refusal(head: &Head<'_>, store: &Store) -> Option<String> {
         .is_some();
     (!hosted).then(|| {
         format!(
-            "ERR spawn agent={agent}: @{} is not a session of this instance; ask the one that \
-             hosts it\n",
+            "ERR spawn {form}: @{} is not a session of this instance; ask the one that hosts \
+             it\n",
             sid.as_str()
         )
     })

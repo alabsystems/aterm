@@ -235,10 +235,8 @@ fn shared_guard_keeps_typed_provider_facts_even_when_publication_is_deferred() {
                 report.renewal,
                 if stop {
                     Renewal::Deferred
-                } else if capture {
-                    Renewal::Failed
                 } else {
-                    Renewal::AuthFailed
+                    Renewal::BotCheck
                 }
             );
             let observation = report
@@ -280,6 +278,14 @@ fn shared_guard_keeps_typed_provider_facts_even_when_publication_is_deferred() {
             assert_eq!(binding.proved_email, None);
             assert_eq!(binding.proved_dir, None);
             assert_eq!(binding.sign_in_attempt, prior_binding.sign_in_attempt);
+            assert_eq!(
+                accounts::sign_in_tasks(&records.raw_roster, &records.logins),
+                if stop {
+                    Vec::new()
+                } else {
+                    vec![("shared".into(), accounts::SignInAction::Login)]
+                }
+            );
             let again = fixture.background();
             assert_eq!(again.renewal, Renewal::Deferred);
             assert!(

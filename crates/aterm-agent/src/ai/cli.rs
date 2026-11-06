@@ -1454,6 +1454,9 @@ fn parse_review(args: &[String]) -> Result<ReviewArgs, String> {
     if r.with.is_some() && r.all {
         return Err("--with and --all are one or the other".to_string());
     }
+    if r.words_stdin && !words.is_empty() {
+        return Err("what to look for comes inline or on stdin (`-`), not both".to_string());
+    }
     if !words.is_empty() {
         r.words = Some(words.join(" "));
     }
@@ -1511,6 +1514,26 @@ fn review_verb(
 ) -> ExitCode {
     let read = crate::harness::accounts_pool::LiveUsage;
     review_reading(env, runner, args, out, err, &read)
+}
+
+/// What to look for, as `aterm ai review -` reads it from `input`: at most [`WORDS_MAX`] bytes of
+/// UTF-8 text. A read that fails, even after some of the text arrived, refuses the review rather
+/// than starting it on the part it read.
+fn words_read_from(input: impl io::Read) -> Result<String, String> {
+    let mut buf = Vec::new();
+    input
+        .take(WORDS_MAX as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            format!(
+                "what to look for could not be read from stdin: {}",
+                crate::harness::one_line(&e.to_string(), 120)
+            )
+        })?;
+    if buf.len() > WORDS_MAX {
+        return Err(format!("what to look for is over {} KiB", WORDS_MAX / 1024));
+    }
+    String::from_utf8(buf).map_err(|_| "what to look for is not UTF-8 text".to_string())
 }
 
 /// [`review_verb`], with what reads a row's usage.
@@ -1628,17 +1651,9 @@ pub(super) fn review_reading(
         Err(why) => return refuse(err, why),
     };
     let words = if a.words_stdin {
-        let mut buf = Vec::new();
-        let _ = io::stdin().take(WORDS_MAX as u64 + 1).read_to_end(&mut buf);
-        if buf.len() > WORDS_MAX {
-            return refuse(
-                err,
-                &format!("what to look for is over {} KiB", WORDS_MAX / 1024),
-            );
-        }
-        match String::from_utf8(buf) {
+        match words_read_from(io::stdin()) {
             Ok(text) => Some(text),
-            Err(_) => return refuse(err, "what to look for is not UTF-8 text"),
+            Err(why) => return refuse(err, &why),
         }
     } else {
         a.words.clone()
@@ -2077,18 +2092,34 @@ pub fn run(
 ) -> ExitCode {
     let flag = |f: &str| args.iter().any(|a| a == f);
     match args.first().map(String::as_str) {
-        None | Some("status") => {
+        None | Some("status" | "--json") => {
+            // `status` and `--json`, each at most once and in either order: any other word, or
+            // one of them twice, is a mistyped command, which reads nothing.
+            let refuse = |err: &mut dyn Write, arg: &str, why: &str| {
+                let _ = writeln!(
+                    err,
+                    "aterm ai: `{}` {why}\n\n{USAGE}",
+                    crate::harness::one_line(arg, 40)
+                );
+                ExitCode::from(2)
+            };
+            let (mut status, mut json) = (false, false);
+            for arg in args {
+                let seen = match arg.as_str() {
+                    "status" => &mut status,
+                    "--json" => &mut json,
+                    _ => return refuse(err, arg, "is not a word of `aterm ai [status] [--json]`"),
+                };
+                if std::mem::replace(seen, true) {
+                    return refuse(err, arg, "comes twice");
+                }
+            }
             let l = look(env);
-            if flag("--json") {
+            if json {
                 let _ = writeln!(out, "{}", render_json(&l, env.now, &next_act(&l)));
             } else {
                 render_text(out, &l, false, &next_act(&l));
             }
-            ExitCode::SUCCESS
-        }
-        Some("--json") => {
-            let l = look(env);
-            let _ = writeln!(out, "{}", render_json(&l, env.now, &next_act(&l)));
             ExitCode::SUCCESS
         }
         Some("doctor") => {

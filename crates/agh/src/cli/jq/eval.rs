@@ -484,8 +484,9 @@ fn add(a: &Value, b: &Value) -> Result<Value> {
         (Value::Number(x), Value::Number(y)) => Ok(arith(x, y, |p, q| p + q, |p, q| p + q)),
         (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{x}{y}"))),
         (Value::Array(x), Value::Array(y)) => {
-            let mut items = x.clone();
-            items.extend(y.iter().cloned());
+            let mut items = Vec::with_capacity(x.len() + y.len());
+            items.extend_from_slice(x);
+            items.extend_from_slice(y);
             Ok(Value::Array(items))
         }
         (Value::Object(x), Value::Object(y)) => {

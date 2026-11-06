@@ -11,7 +11,8 @@
 //!
 //! * It starts by itself once, on a cold first launch or in an update's successor
 //!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before and no typing
-//!   ([`START_KEYS_QUIET`]), System Settings
+//!   ([`START_KEYS_QUIET`]), the Mac Setup tab not the window's next macOS ask
+//!   (`App::mac_setup_tab_comes_next`: setup's one password goes first), System Settings
 //!   asking nothing (`App::system_settings_may_ask`), and System State's Local Network step run
 //!   and its alert's hold over ([`App::local_network_step_to_come`]): macOS's answer heard by the
 //!   LAN re-probe, the alert seen answered by the window-list watch, a new window of its owner
@@ -1099,7 +1100,9 @@ impl App {
     /// automatic hand-overs). A walk the setup run has not admitted (no approved revision, a
     /// `[privacy]` switch off) never starts by itself, nor one while another of the window's
     /// gestures (the Local Network alert's hold among them) or a macOS dialog of aterm's is up, nor
-    /// one while System Settings asks something ([`Self::system_settings_may_ask`], a question
+    /// one while the Mac Setup tab is the window's next macOS ask
+    /// ([`Self::mac_setup_tab_comes_next`]: setup's one password goes first, and the walk follows
+    /// once the tab gave the dialog slot back), nor one while System Settings asks something ([`Self::system_settings_may_ask`], a question
     /// seen asking that lapsed off screen among them: the walk opens its pages), nor one before
     /// the approved revision's Local Network step has run or is found on record
     /// ([`Self::local_network_step_to_come`]): that step goes first in the run, at its own moment,
@@ -1134,7 +1137,10 @@ impl App {
                 .last_keystroke_at
                 .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
         };
-        let ready = starts(facts) && !self.access_gesture_up(now) && !self.access_dialog_up();
+        let ready = starts(facts)
+            && !self.access_gesture_up(now)
+            && !self.access_dialog_up()
+            && !self.mac_setup_tab_comes_next();
         if !ready {
             self.restart_local_network_wait();
             return;

@@ -671,9 +671,7 @@ impl Terminal {
         }
         if !self.transient.kitty_floating.is_empty() {
             out.extend(
-                self.kitty_floating_tiles()
-                    .into_iter()
-                    .filter(|&(row, ..)| row == screen_row)
+                self.kitty_floating_tiles(screen_row..screen_row.saturating_add(1))
                     .map(|(_, col, tile)| (usize::from(col), tile)),
             );
             order_image_layers(out);
@@ -732,7 +730,8 @@ impl Terminal {
         let max_screen_row = usize::from(grid.rows());
         let has_kitty = !self.transient.kitty_images.is_empty();
         if !self.transient.kitty_floating.is_empty() {
-            for (row, col, tile) in self.kitty_floating_tiles() {
+            let screen_rows = u16::try_from(rows.saturating_sub(offset)).unwrap_or(u16::MAX);
+            for (row, col, tile) in self.kitty_floating_tiles(0..screen_rows) {
                 if let Some(r) = usize::from(row).checked_add(offset)
                     && r < rows
                 {
@@ -804,21 +803,21 @@ impl Terminal {
         }
     }
 
-    fn kitty_floating_tiles(&self) -> Vec<(u16, u16, aterm_grid::ImageRef)> {
+    fn kitty_floating_tiles(
+        &self,
+        rows: std::ops::Range<u16>,
+    ) -> impl Iterator<Item = (u16, u16, aterm_grid::ImageRef)> + '_ {
         let floating = &self.transient.kitty_floating;
-        super::kitty_floating::floating_tiles(self.grid(), &self.transient)
-            .into_iter()
-            .map(|tile| {
-                let placement = &floating[tile.index];
-                let image = aterm_grid::ImageRef {
-                    image: std::sync::Arc::clone(&placement.image),
-                    cell_row: tile.cell_row,
-                    cell_col: tile.cell_col,
-                    kitty: Some(placement.tag),
-                };
-                (tile.row, tile.col, image)
-            })
-            .collect()
+        super::kitty_floating::floating_tiles(self.grid(), &self.transient, rows).map(|tile| {
+            let placement = &floating[tile.index];
+            let image = aterm_grid::ImageRef {
+                image: std::sync::Arc::clone(&placement.image),
+                cell_row: tile.cell_row,
+                cell_col: tile.cell_col,
+                kitty: Some(placement.tag),
+            };
+            (tile.row, tile.col, image)
+        })
     }
 
     /// Build the engine's render snapshot for one frame.
@@ -1676,6 +1675,111 @@ mod tests {
             total += got.len();
         }
         total
+    }
+
+    #[test]
+    fn floating_origins_keep_referenced_parents_among_many_unrelated_ones() {
+        let count = super::super::kitty_floating::MAX_KITTY_FLOATING + 4;
+        let cols = u16::try_from(count + 4).unwrap();
+        let mut term = Terminal::new(6, cols);
+        term.set_cell_pixel_size(1, 1);
+        for placement in 1..=count {
+            term.process(format!("\x1b_Ga=t,f=32,s=1,v=1,i={placement},q=2;/wAA/w==\x1b\\\x1b_Ga=p,U=1,i={placement},p=7,c=1,r=1,q=2\x1b\\\x1b[1;{placement}H\x1b[38;5;{placement}m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m").as_bytes());
+        }
+        assert_eq!(
+            term.transient
+                .kitty_virtual
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            count
+        );
+        let child = count + 1;
+        term.process(
+            format!("\x1b_Ga=t,f=32,s=1,v=1,i={child},q=2;/wAA/w==\x1b\\\x1b_Ga=p,i={child},p=5,P={count},Q=7,H=-1,V=1,c=2,r=2,z=1,q=2\x1b\\").as_bytes(),
+        );
+        let left = u16::try_from(count - 2).unwrap();
+        let origins = super::super::kitty_floating::floating_origins(term.grid(), &term.transient);
+        assert_eq!(origins.as_slice(), &[Some((1, i32::from(left)))]);
+        let tiles: Vec<_> = term
+            .kitty_floating_tiles(0..6)
+            .map(|(r, c, _)| (r, c))
+            .collect();
+        assert_eq!(tiles, [(1, left), (1, left + 1), (2, left), (2, left + 1)]);
+    }
+
+    #[test]
+    fn floating_tile_walk_clips_rows_and_clones_only_yielded_images() {
+        use std::sync::Arc;
+        let mut term = Terminal::new(6, 12);
+        term.set_cell_pixel_size(1, 1);
+        term.process(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2,q=2;/wAA/w==\x1b\\");
+        term.process("\x1b_Ga=p,U=1,i=1,p=7,c=1,r=1,q=2\x1b\\\x1b[1;1H\x1b[38;5;1m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m\x1b_Ga=p,i=2,p=5,P=1,Q=7,c=20,r=8,z=1,q=2\x1b\\".as_bytes());
+        assert_eq!(term.transient.kitty_floating.len(), 1);
+        let footprint = &term.transient.kitty_floating[0].image;
+        let (height, width) = (i64::from(footprint.rows), i64::from(footprint.cols));
+        assert!(height > 0 && width > 0);
+        for (dx, dy) in [
+            (0, 0),
+            (-4, -2),
+            (3, 1),
+            (i32::MIN, i32::MAX),
+            (i32::MAX, i32::MIN),
+        ] {
+            term.transient.kitty_floating[0].dx = dx;
+            term.transient.kitty_floating[0].dy = dy;
+            for range in [0..0, 0..1, 1..3, 4..6, 6..10, 4..2, 0..u16::MAX] {
+                let actual: Vec<_> = super::super::kitty_floating::floating_tiles(
+                    term.grid(),
+                    &term.transient,
+                    range.clone(),
+                )
+                .map(|tile| (tile.row, tile.col, tile.cell_row, tile.cell_col))
+                .collect();
+                let mut expected = Vec::new();
+                for row in 0..6_u16 {
+                    for col in 0..12_u16 {
+                        let r = i64::from(row) - i64::from(dy);
+                        let c = i64::from(col) - i64::from(dx);
+                        if range.contains(&row)
+                            && (0..height).contains(&r)
+                            && (0..width).contains(&c)
+                        {
+                            expected.push((
+                                row,
+                                col,
+                                u16::try_from(r).unwrap(),
+                                u16::try_from(c).unwrap(),
+                            ));
+                        }
+                    }
+                }
+                assert_eq!(actual, expected, "offset ({dx}, {dy}), rows {range:?}");
+            }
+        }
+        term.transient.kitty_floating[0].dx = 0;
+        term.transient.kitty_floating[0].dy = 0;
+        let image = Arc::clone(&term.transient.kitty_floating[0].image);
+        let owners = Arc::strong_count(&image);
+        let mut tiles = term.kitty_floating_tiles(2..3);
+        assert_eq!(
+            Arc::strong_count(&image),
+            owners,
+            "constructing a walk must clone no tile"
+        );
+        let first = tiles.next().expect("the requested row is present");
+        assert_eq!(
+            (first.0, first.1, first.2.cell_row, first.2.cell_col),
+            (2, 0, 2, 0)
+        );
+        assert_eq!(Arc::strong_count(&image), owners + 1);
+        assert_eq!(
+            tiles.count(),
+            11,
+            "only the other columns of one row are walked"
+        );
+        drop(first);
+        assert_eq!(Arc::strong_count(&image), owners);
     }
 
     #[test]

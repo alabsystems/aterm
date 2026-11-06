@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Harness agent upgrade driver (`aterm agent upgrade`, live relaunch, and transcript inspection).
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -2625,7 +2625,14 @@ pub(crate) const HAND_RENEW: Duration = Duration::from_secs(20);
 /// The holder name of this process's hand ([`Hand`]).
 #[must_use]
 pub fn hand_name() -> String {
-    format!("{HOST_HOLDER}{}", std::process::id())
+    hand_name_of(std::process::id())
+}
+
+/// The holder name of process `pid`'s hand: aterm's built-in host in that aterm (`status
+/// supervisor=aterm-harness@<pid>` while its own lanes hold a tab).
+#[must_use]
+pub fn hand_name_of(pid: u32) -> String {
+    format!("{HOST_HOLDER}{pid}")
 }
 
 const HOST_HOLDER: &str = "aterm-harness@";
@@ -6927,6 +6934,7 @@ pub(super) fn load(opts: &Opts, session: &str) -> Option<St> {
 #[cfg(all(test, unix))]
 pub(super) use record::{native_writer_for_test, ordinary_write_for_test};
 
+/// Best-effort event row, framed and appended under the ledger-cut path lock.
 pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
     if opts.dry_run {
         return;
@@ -6948,20 +6956,11 @@ pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
         return;
     };
     let path = dir.join("ledger.jsonl");
-    let mut open = std::fs::OpenOptions::new();
-    open.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    if let Ok(mut f) = open.open(&path) {
-        let _ = writeln!(
-            f,
-            "{}",
-            aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
-        );
+    let Ok(row) = aterm_json::to_string(&Value::Object(o)) else {
+        return;
+    };
+    if aterm_uds::line_log::append(&path, &row).is_err() {
+        return;
     }
     let _ = super::cli::bound_ledger(&path, LEDGER_MAX_BYTES, LEDGER_KEEP_ROWS);
 }

@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-lab-clock"
-version.workspace = true
+version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -24,6 +24,8 @@ name = "lab-clock-probe"
 path = "src/bin/lab-clock-probe.rs"
 
 [dev-dependencies]
+# The live test's package directory, probe binary and scratch, read when it runs.
+aterm-tempfile = { workspace = true }
 # The one spawn seam: the probe child is started by it.
 aterm-uds = { workspace = true }
 

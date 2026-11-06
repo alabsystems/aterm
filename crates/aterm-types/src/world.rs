@@ -13,8 +13,13 @@
 //! (no development seams, [`crate::dev_seam!`]) reads only some of them:
 //! - its environment carries [`MARKER`] at [`state_home`], which the lanes that reach the local
 //!   network read as a plain environment variable in every build: the converge runner's window
-//!   lane, the `_alab._tcp` browse, the Commons runtime and the fleet listener;
+//!   lane, the `_alab._tcp` browse, the Commons runtime, and the node job's updater and account
+//!   claims;
 //! - its `aterm.toml` carries [`LANES_OFF`], each table the product's own switch for one lane.
+//!
+//! The fleet listener reads neither: which vault it reads follows where its state root resolved
+//! ([`crate::dirs::runs_under_private_state_root`]), so a release build in a world reads its
+//! HOME's vault, and `[swarm]` in [`LANES_OFF`] keeps it from listening.
 //!
 //! verify measure's world, the GUI smoke's sandbox and the perf arena's windowed lanes take
 //! both. The lab's worlds (`aterm-lab`'s `instance::World`) carry the marker at this folder and

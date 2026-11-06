@@ -5,10 +5,9 @@
 
 use super::*;
 use aterm_phase::agents_panel::parse_row;
-use std::path::Path;
 
 fn rows(name: &str) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("src/harness/testdata/flight")
         .join(name);
     std::fs::read_to_string(path)
@@ -20,7 +19,7 @@ fn rows(name: &str) -> Vec<String> {
 }
 
 fn screen(name: &str) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures")
         .join(name);
     std::fs::read_to_string(path)

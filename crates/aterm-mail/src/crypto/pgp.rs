@@ -145,13 +145,14 @@ pub(super) fn unlock_packet(bytes: &[u8], password: &[u8]) -> Result<Zeroizing<V
         }
         _ => return Err("Unsupported private-key derivation".into()),
     };
-    let mut key = Zeroizing::new(Vec::with_capacity(64));
     let length = key_len(cipher)?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    let mut filled = 0usize;
     let mut input = Zeroizing::new(Vec::with_capacity(salt.len() + password.len()));
     input.extend_from_slice(salt);
     input.extend_from_slice(password);
     for prefix in 0..4 {
-        if key.len() >= length {
+        if filled >= length {
             break;
         }
         let mut digest = ring::digest::Context::new(algorithm);
@@ -165,14 +166,16 @@ pub(super) fn unlock_packet(bytes: &[u8], password: &[u8]) -> Result<Zeroizing<V
             digest.update(&input[..n]);
             left -= n;
         }
-        key.extend_from_slice(digest.finish().as_ref());
+        let finished = digest.finish();
+        let take = (length - filled).min(finished.as_ref().len());
+        key[filled..filled + take].copy_from_slice(&finished.as_ref()[..take]);
+        filled += take;
     }
-    key.truncate(length);
     let iv = bytes
         .get(offset..offset + 16)
         .ok_or("Truncated private-key IV")?;
     let mut plain = aes::cfb(
-        &key,
+        &key[..length],
         iv,
         bytes.get(offset + 16..).ok_or("Truncated private key")?,
     )?;
@@ -266,10 +269,13 @@ fn session_key(bytes: &[u8], key: &Key) -> Result<Zeroizing<Vec<u8>>, String> {
     digest.update(&[18, 3, 1, key.hash, key.cipher]);
     digest.update(b"Anonymous Sender    ");
     digest.update(&key.fingerprint);
-    let derived = Zeroizing::new(digest.finish().as_ref().to_vec());
+    let klen = key_len(key.cipher)?;
+    let finished = digest.finish();
+    let mut derived = Zeroizing::new([0u8; 32]);
+    derived[..klen].copy_from_slice(&finished.as_ref()[..klen]);
     let length = usize::from(*bytes.first().ok_or("Missing wrapped key size")?);
     let wrapped = bytes.get(1..1 + length).ok_or("Truncated wrapped key")?;
-    let mut plain = aes::unwrap(&derived[..key_len(key.cipher)?], wrapped)?;
+    let mut plain = aes::unwrap(&derived[..klen], wrapped)?;
     let padding = usize::from(*plain.last().ok_or("Empty wrapped key")?);
     if padding == 0
         || padding > plain.len()

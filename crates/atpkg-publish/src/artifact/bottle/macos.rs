@@ -1,21 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Git must bootstrap on the oldest macOS supported by aterm.
+//! Bootstrap and signing tools must run on the oldest supported macOS.
 
 const MACOS_11: u32 = 11 << 16;
 
-/// Hold a Git object to the bootstrap deployment floor.
+/// Hold an object to the shared macOS deployment floor.
 ///
 /// # Errors
 /// A newer minimum macOS version, malformed load commands or a fat object that
 /// must first be split into the package's target architecture.
-pub(super) fn check(bytes: &[u8]) -> Result<(), String> {
+pub(super) fn check(bytes: &[u8], program: &str) -> Result<(), String> {
     if let Some(version) = minimum(bytes)?
         && version > MACOS_11
     {
         return Err(format!(
-            "Git requires macOS {}.{}.{}; build it for macOS 11.0 or earlier so it can bootstrap every supported Mac",
+            "{program} requires macOS {}.{}.{}; build it for macOS 11.0 or earlier so it can run on every supported Mac",
             version >> 16,
             (version >> 8) & 255,
             version & 255,
@@ -30,20 +30,20 @@ fn minimum(bytes: &[u8]) -> Result<Option<u32>, String> {
             .get(at..at + 4)
             .and_then(|part| <[u8; 4]>::try_from(part).ok())
             .map(u32::from_le_bytes)
-            .ok_or_else(|| "truncated Git Mach-O header".to_string())
+            .ok_or_else(|| "truncated Mach-O header".to_string())
     };
     let header = match bytes.get(..4) {
         Some([0xcf, 0xfa, 0xed, 0xfe]) => 32,
         Some([0xce, 0xfa, 0xed, 0xfe]) => 28,
         Some([0xca, 0xfe, 0xba, 0xbe | 0xbf]) => {
-            return Err("pack Git as one thin Mach-O architecture per target".into());
+            return Err("pack one thin Mach-O architecture per target".into());
         }
         _ => return Ok(None),
     };
     let count = word(16)?;
     let end = header + word(20)? as usize;
     if end > bytes.len() {
-        return Err("truncated Git Mach-O load commands".into());
+        return Err("truncated Mach-O load commands".into());
     }
     let mut at = header;
     let mut minimum = None;
@@ -51,13 +51,13 @@ fn minimum(bytes: &[u8]) -> Result<Option<u32>, String> {
         let command = word(at)?;
         let size = word(at + 4)? as usize;
         if size < 8 || size > end.saturating_sub(at) {
-            return Err("invalid Git Mach-O load command size".into());
+            return Err("invalid Mach-O load command size".into());
         }
         let version = match command {
             0x32 if size >= 24 && word(at + 8)? == 1 => Some(word(at + 12)?),
-            0x32 => return Err("Git has an invalid macOS build-version command".into()),
+            0x32 => return Err("invalid macOS build-version command".into()),
             0x24 if size >= 16 => Some(word(at + 8)?),
-            0x24 => return Err("Git has a truncated macOS minimum-version command".into()),
+            0x24 => return Err("truncated macOS minimum-version command".into()),
             _ => None,
         };
         if let Some(version) = version {
@@ -66,7 +66,7 @@ fn minimum(bytes: &[u8]) -> Result<Option<u32>, String> {
         at += size;
     }
     if at != end {
-        return Err("Git Mach-O load-command count does not match its size".into());
+        return Err("Mach-O load-command count does not match its size".into());
     }
     Ok(minimum)
 }
@@ -94,20 +94,20 @@ mod tests {
     #[test]
     fn bootstrap_accepts_macos_11_and_rejects_newer_bottle_deployment_targets() {
         for command in [0x32, 0x24] {
-            assert!(check(&object(command, MACOS_11)).is_ok());
-            assert!(check(&object(command, (10 << 16) | (15 << 8))).is_ok());
+            assert!(check(&object(command, MACOS_11), "git").is_ok());
+            assert!(check(&object(command, (10 << 16) | (15 << 8)), "git").is_ok());
             assert!(
-                check(&object(command, 14 << 16))
+                check(&object(command, 14 << 16), "git")
                     .unwrap_err()
                     .contains("14.0.0")
             );
-            assert!(check(&object(command, 15 << 16)).is_err());
+            assert!(check(&object(command, 15 << 16), "openssl-signing").is_err());
         }
         let mut truncated = object(0x32, MACOS_11);
         truncated.truncate(48);
-        assert!(check(&truncated).is_err());
+        assert!(check(&truncated, "git").is_err());
         let mut wrong_platform = object(0x32, MACOS_11);
         wrong_platform[40..44].copy_from_slice(&2_u32.to_le_bytes());
-        assert!(check(&wrong_platform).is_err());
+        assert!(check(&wrong_platform, "git").is_err());
     }
 }

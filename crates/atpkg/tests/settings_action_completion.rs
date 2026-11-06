@@ -31,7 +31,7 @@ fn run_with_deadline(
     registry: &Path,
     args: &[&str],
 ) -> ExitStatus {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let mut child = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)
@@ -125,7 +125,7 @@ fn help_spellings_dispatch_as_advertised() {
 /// would be fragile: `install --default-set` legitimately exits 2 on an arch with no
 /// published build.
 fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let out = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)

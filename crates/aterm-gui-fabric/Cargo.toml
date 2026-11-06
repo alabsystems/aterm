@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-gui-fabric"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -31,6 +31,7 @@ aterm-log = { workspace = true }
 aterm-messages = { workspace = true }
 aterm-session = { workspace = true }
 # The fabric's word grammar and the env seams.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # The seamless carry rides the update's TOML manifest
 # (`#[derive(Serialize, Deserialize)]`, so the row asks for the derive).

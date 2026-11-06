@@ -7,8 +7,15 @@
 
 use super::*;
 
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-slog/tests/sequences");
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-phase/src/fixtures");
+/// aterm-slog's sequence corpus.
+fn corpus_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-slog/tests/sequences")
+}
+
+/// aterm-phase's recorded screens.
+fn fixtures_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures")
+}
 
 /// One `see … fixture=` line.
 #[derive(Clone, Debug)]
@@ -62,8 +69,9 @@ fn seen(name: &str, text: &str) -> Vec<Seen> {
 /// What presence's adapter reads the line's screen as, against what the
 /// line says.
 fn check(s: &Seen) -> Result<(), String> {
-    let path = format!("{FIXTURES}/{}.txt", s.fixture);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {path}: {e}", s.at))?;
+    let path = fixtures_dir().join(format!("{}.txt", s.fixture));
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("{}: {}: {e}", s.at, path.display()))?;
     let rows = aterm_phase::prompt::fixtures::screen(&text);
     let v = agent_verdict(
         Some(&s.program),
@@ -89,7 +97,7 @@ fn check(s: &Seen) -> Result<(), String> {
 
 /// Every `.seq` file of the corpus, by name.
 fn corpus() -> Vec<(String, String)> {
-    let mut all: Vec<(String, String)> = std::fs::read_dir(CORPUS)
+    let mut all: Vec<(String, String)> = std::fs::read_dir(corpus_dir())
         .expect("the corpus")
         .map(|e| e.expect("an entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "seq"))

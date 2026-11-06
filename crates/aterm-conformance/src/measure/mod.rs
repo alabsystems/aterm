@@ -82,12 +82,13 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// The release `aterm` named by the first of `vars` that is set.
+    /// The release `aterm` named by the first of `vars` that is set, with the stand-in TUI at
+    /// `fake_tui`.
     /// # Panics
     /// None of `vars` is set, or it names no file: a measuring row with nothing to measure is red,
     /// never "not measured".
     #[must_use]
-    pub fn release(vars: &[&str], fake_tui: &str) -> Self {
+    pub fn release(vars: &[&str], fake_tui: PathBuf) -> Self {
         let aterm = vars
             .iter()
             .find_map(|v| std::env::var_os(v).map(PathBuf::from))
@@ -99,10 +100,7 @@ impl Rig {
                 )
             });
         assert!(aterm.is_file(), "{} is not a file", aterm.display());
-        Self {
-            aterm,
-            fake_tui: PathBuf::from(fake_tui),
-        }
+        Self { aterm, fake_tui }
     }
 }
 

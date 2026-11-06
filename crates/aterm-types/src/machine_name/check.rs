@@ -55,6 +55,13 @@ pub enum Verdict {
         /// The holder.
         by: NodeId,
     },
+    /// Another Mac's vault label names it: a roster label, alias or claim, a log seat, a denied
+    /// label or a role the policy keeps (a [`Kept::Label`], or another node's [`super::Labels`]).
+    /// Other Macs reach that Mac or role by it, so neither a rename nor a take applies.
+    Labelled {
+        /// The node the label is bound to, where known.
+        by: Option<NodeId>,
+    },
     /// An unknown claim names it, whose record has not reached this machine.
     Unconfirmed {
         /// The unknown claimants.
@@ -191,6 +198,25 @@ fn classify(fleet: &Fleet<'_>, me: NodeId, num: Number) -> Verdict {
         Some(Holder::Unconfirmed(by)) => return Verdict::Unconfirmed { by: by.clone() },
         Some(Holder::Node(by)) if !settled.same_machine(me, *by) => return held_by(fleet, *by),
         _ => {}
+    }
+    let mine = |node: NodeId| settled.same_machine(me, node);
+    let labelled = fleet
+        .labels
+        .iter()
+        .find(|(node, labels)| {
+            !mine(**node) && (labels.admission == Some(num) || labels.roster == Some(num))
+        })
+        .map(|(node, _)| Some(*node))
+        .or_else(|| {
+            fleet.kept.iter().find_map(|kept| match kept {
+                Kept::Label { num: label, node } if *label == num && !node.is_some_and(mine) => {
+                    Some(*node)
+                }
+                _ => None,
+            })
+        });
+    if let Some(by) = labelled {
+        return Verdict::Labelled { by };
     }
     let anchor = match fleet.view.get(&me) {
         Some(Entry::Record(record)) => record.anchor,

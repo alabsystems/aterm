@@ -61,7 +61,7 @@ impl Fixture {
     /// The dev `atpkg` with `args` over this fixture, as the owner's process (no private
     /// state root), stdin closed.
     fn command(&self, args: &[&str]) -> aterm_uds::spawnfd::Command {
-        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
         cmd.args(args)
             .current_dir(self.root.path())
             .env("HOME", self.root.path().join("home"))
@@ -324,7 +324,7 @@ fn a_pass_edge_does_not_wait_out_another_machine_apply() {
     queue
         .try_lock()
         .expect("the test holds the [machine] queue");
-    let mut child = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"))
+    let mut child = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"))
         .arg("seed")
         .current_dir(fx.root.path())
         .env("HOME", fx.root.path().join("home"))

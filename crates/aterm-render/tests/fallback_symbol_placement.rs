@@ -6,10 +6,11 @@
 use aterm_render::{GlyphImage, Renderer, StyleBits, Theme};
 
 fn asset(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/assets/bundled/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
+    std::fs::read(
+        aterm_tempfile::manifest_dir()
+            .join("assets/bundled")
+            .join(name),
+    )
     .expect("bundled asset")
 }
 

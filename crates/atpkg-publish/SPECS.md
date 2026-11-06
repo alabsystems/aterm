@@ -112,6 +112,18 @@ API results before the fetch changes an existing record ref.
 > `a_head_program_the_table_lacks_keeps_the_heads_block` now raises the pin of the row whose repo it moves.
 > Counts elsewhere were taken before.
 
+> Status 2026-11-05 (A14 and A16 of `docs/DESIGN-fast-build-release-2026-11-05.md`): `adopt trust=<N>` is
+> new. In the worktree `<repo>-adopt-trust-<N>` on `adopt/trust-<N>`, it writes the sealed `trust.lock` for
+> store build N: the build's recorded (or folded and recorded) tree root, which the verified head index must
+> sign for N, plus the compiler commit and receipt that its `LINEAGE` names and its `trustc -vV` must answer,
+> and the `[stock]` of the branch head's lock unless `--stock` names one. It also adds the lock's
+> `.gitattributes` row. `TRUST_STAGE2_BIN`, and a `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` naming another
+> compiler, are refused. When discovery there resolves the locked build and its compiler differs from the one
+> the branch's head compiles with, it runs `publish/config.sh`'s `TOOLCHAIN_ACCEPT_CMD_DEFAULT` on that build,
+> each `targo` step placed and admitted as the shim's hop would run it. It commits the lock only once that key
+> is green or skipped and the branch's head and changes are what it judged, and it pushes nothing. New tests,
+> not yet specs: the fourteen of `tests/adopt.rs`. Counts elsewhere were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 140 specs below is proved
 > through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. The
 > 6 tests in §4 sample no spec and are deleted or moved to a bench now. Nothing here is proved yet.

@@ -102,6 +102,8 @@ pub mod linkmode;
 #[cfg(unix)]
 pub mod local_harness;
 pub mod lock;
+/// Read-only structured lookup of an installed tool, without launching or provisioning it.
+pub mod lookup;
 pub mod machine;
 /// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate.
 pub mod macho;
@@ -166,6 +168,9 @@ pub(crate) mod testdir;
 /// THE toolchain resolution order (`aterm help rust`, `verify`, the release cutter), re-exported from `aterm-toolchain`, where its tests run.
 pub mod toolchain;
 pub mod tree;
+/// A tree's `trust.lock` in this store: its build's standing, the shim hop's locked target, and
+/// whether this Mac's shim honours locks (A14).
+pub mod trust_lock;
 pub mod upstream_identity;
 /// Per-protocol row admission (`https`: host allow-list + payload shape), the `system = "<bin>"` satisfaction probe and the PATH-shadow probe.
 pub mod vendor;

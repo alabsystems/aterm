@@ -482,31 +482,41 @@ pub(crate) enum Mutant {
     /// A reservation's answer its read back cannot vouch for drops the broker link
     /// (`reason=read`), as every build before critic item F21 dropped it
     /// (`Bridge::unverified_publication`): every drain ends at that reservation, and every
-    /// other sender's posts wait with it until retention cuts its record. The seeded worlds
-    /// meet no such answer, so its control is a bridge unit test on a real broker
+    /// other sender's posts wait with it until retention cuts its record. Its controls are the
+    /// stray world's seed 115 ([`Opts::strays`], a sender's later post on the bus ahead of the
+    /// held one: `each_rule_switched_off_is_caught`) and a bridge unit test on a real broker
     /// (`an_unverifiable_reservation_holds_only_its_own_sender`).
     UnverifiableDropsTheLink,
     /// A reservation's answer its read back cannot vouch for holds nothing
     /// (`Bridge::post_refused`, critic item F21): the drain goes on to its sender's later
-    /// posts, which land ahead of its retry. Its control is the same bridge unit test.
+    /// posts, which land ahead of its retry. Its controls are the stray world's seed 6 and the
+    /// same bridge unit test.
     UnverifiableHoldsNothing,
     /// The attach's replay publishes a sender's later entries past one whose answer its read
     /// back cannot vouch for (`Bridge::replay_in_flight`'s point 5, critic item F21): a later
-    /// post lands ahead of the held one's retry. Its control is a bridge unit test
-    /// (`the_attachs_replay_holds_an_unverifiable_entrys_sender`).
+    /// post lands ahead of the held one's retry. Its controls are the stray world's seed 115
+    /// and a bridge unit test (`the_attachs_replay_holds_an_unverifiable_entrys_sender`).
     ReplayPastAnUnverifiableEntry,
     /// A held lane's post, keyed or not, or owed receipt whose record the attach's replay read
     /// back on the bus waits for the hold (`Bridge::landed_behind_an_unverifiable_hold`, critic
     /// item F21): its record is not delivered, and each delivery that meets it drops the link,
-    /// for as long as the hold lasts. Its controls are the replay's bridge unit test and
+    /// for as long as the hold lasts. No sim world meets it (3,000 seeds of the stray world:
+    /// `each_rule_switched_off_is_caught` says why), so its controls are the replay's bridge
+    /// unit test and
     /// `a_held_lanes_receipt_or_keyed_post_the_replay_read_back_is_retired_where_it_landed`.
     HeldRecordWaitsForTheHold,
     /// The attach's replay holds a later entry by its record's `from=`, whatever aterm's outbox
     /// lists (`Bridge::replay_in_flight`'s point 5 as F21 first cut it): an entry whose post
     /// already left the outbox, its record given up by retention, is dropped and never
-    /// published again. Its control is a bridge unit test
+    /// published again. No sim world meets it (as `HeldRecordWaitsForTheHold`), so its control
+    /// is a bridge unit test
     /// (`an_entry_whose_post_left_the_outbox_is_published_behind_an_unverifiable_one`).
     HoldPastTheListing,
+    /// A keyed re-post is published at its pin with no read back of its key's winner, as every
+    /// build before the F23 sim's keyed world (`Bridge::keyed_winner_at`): past a cut that
+    /// carried the winner's record below the base, unread, and dropped its dedup key, the
+    /// re-post lands a second copy of its key beside the one its reader is still handed.
+    KeyedRepostWithoutReadingBack,
 }
 
 /// What one run is.
@@ -606,7 +616,42 @@ pub(crate) struct Opts {
     /// barriers and the broker's settle. Every committed world's log is on another device,
     /// where the bridge flushes the pin itself.
     pub(crate) same_device: bool,
+    /// KEYED RE-POSTS AND A CUT BETWEEN A DEDUP ANSWER AND ITS READ BACK (critic item F23), from
+    /// streams of their own: half the sessions' notes carry an idempotency key (`post key=`), a
+    /// session posts again under the key of one of its earlier keyed notes (an agent retrying a
+    /// post it may have sent, [`World::repost`]), and one dedup answer of the node's in two is
+    /// followed by a cut just past the answered record before the next request is served
+    /// ([`bus::State::cut_after_dedup`]): a byte bound the traffic reaches landing between the
+    /// answer and the read back that vouches for it. A keyed re-post's words are its own, so no
+    /// read back of them precedes its publish at its pin: these are the worlds that could meet
+    /// `Bridge::unverified_publication`'s case 4. Its key's winner, read back first
+    /// (`Bridge::keyed_winner_at`), leaves the dedup only to a winner still in aterm's outbox,
+    /// unread, which aterm's rules give up only past the mail rule's bytes or a week: so case 4
+    /// is rare here, not impossible, and likeliest in the scaled seeds ([`Opts::scaled`]),
+    /// whose mail bytes hold a few records and whose cut after the answer can give the winner
+    /// up. The key's law is [`World::key_copies`].
+    pub(crate) keys: bool,
+    /// ANOTHER WRITER UNDER THE NODE'S PRODUCER ID AND A CUT AFTER A DEDUP ANSWER (critic item
+    /// F23, from streams of their own): one refused publish of the node's in two is followed
+    /// at once by that writer's record at the sequence the refusal named, on a face of its own
+    /// ([`bus::State::stray`]: a sibling bridge under this node's id at this incarnation, as
+    /// [`Opts::alias`]'s, one record of its), and one dedup answer in two by a cut just past
+    /// the answered record ([`bus::State::cut_after_dedup`]). The node's retry at its pin meets
+    /// a dedup answer with none of the pin's faces' records (`Bridge::unverified_publication`'s
+    /// case 5), or that answer cut before its read back (case 4): the worlds in which F21's
+    /// hold of an unverifiable reservation's own sender is judged by every law, its order
+    /// and liveness included. The settle lets a week pass while a queued post or owed receipt
+    /// waits on a stray record whose dedup key stands ([`World::waits_on_a_stray`]), as aterm's
+    /// rules give it up then, and the hold's next retry appends anew. Its broker opens with
+    /// rules every time ([`World::broker_start`]): on one that set none (`aterm link broker`'s
+    /// fallback when setting them fails) nothing drops a stray's key, and the sender it holds
+    /// waits for good, which the world's first census met in seeds 75 and 98 (a limit of
+    /// `Bridge::unverified_publication`'s case 5 the F23 report records, not a law to judge).
+    pub(crate) strays: bool,
 }
+
+/// The session the other writer under the node's producer id posts from ([`Opts::strays`]).
+pub(crate) const STRAY_SID: &str = "s-stray";
 
 /// The deadlines an ask draws ([`Opts::deadlines`]), in ms: from one that passes before its
 /// target can decide it to one a decision meets in time.
@@ -740,6 +785,8 @@ impl Opts {
             off_boot_volume: false,
             rate_limit: Some(crate::broker_rules::rate_limit()),
             same_device: false,
+            keys: false,
+            strays: false,
         }
     }
 
@@ -934,6 +981,28 @@ pub(crate) struct Stats {
     pub(crate) refill_together_sessions: u64,
     /// Sessions that read their own lanes below the node inbox's oldest before the shared read.
     pub(crate) refills_below_oldest: u64,
+    /// RESERVATIONS PUBLISHED AT THEIR PINS that asked for a verdict (critic item F23,
+    /// [`crate::fx::ReservationTap`]): a dedup answer the read back verified, one another
+    /// writer's record answered, and the answers of each of `Bridge::unverified_publication`'s
+    /// five cases (index 0 is case 1).
+    pub(crate) reservations_verified: u64,
+    pub(crate) reservation_collisions: u64,
+    pub(crate) unverifiable: [u64; 5],
+    /// KEYED RE-POSTS ([`Opts::keys`]): posts under an earlier note's key; of them, the ones
+    /// aterm was told landed as their key's earlier record (`dup=1`) and the ones that landed a
+    /// copy of their own (their key's earlier records given up); and the cuts that landed
+    /// between a dedup answer and the next request ([`bus::State::cut_after_dedup`]).
+    pub(crate) reposts: u64,
+    pub(crate) reposts_deduped: u64,
+    pub(crate) reposts_appended: u64,
+    pub(crate) cuts_after_dedup: u64,
+    /// Keyed re-posts' entries the attach's replay settled at their key's winner, read back
+    /// (`Bridge::keyed_winner_at`).
+    pub(crate) replayed_at_the_winner: u64,
+    /// Records the other writer under the node's producer id wrote at a refused publish's
+    /// sequence ([`Opts::strays`]), and the weeks the settle let pass for one of them.
+    pub(crate) strays: u64,
+    pub(crate) stray_weeks: u64,
     /// FETCHES BY OFFSET ([`Opts::fetches`], finding F3): asked; answered with the record,
     /// and of those the ones below their lane's oldest (read again told); answered
     /// `retained`; answered `no-record`.
@@ -1179,6 +1248,24 @@ struct World {
     follows: Vec<Follow>,
     /// The model broker's log as the laws last read it ([`World::log`]).
     seen: std::cell::RefCell<Vec<Seen>>,
+    /// The keyed re-posts ([`Opts::keys`]), a stream of their own.
+    key_rng: Rng,
+    /// Every key a note was posted under, by its name: who posted it, to whom, and the markers
+    /// of its posts, first to last ([`World::repost`], [`World::key_copies`]).
+    keyed: BTreeMap<String, Keyed>,
+}
+
+/// The posts of one idempotency key ([`Opts::keys`]).
+#[derive(Debug)]
+struct Keyed {
+    /// The posting session's local id and sid.
+    local: u64,
+    from: String,
+    /// The note's address and its recipient session, if one.
+    to: String,
+    target: Option<String>,
+    /// Its posts' markers, in the order they were posted.
+    markers: Vec<String>,
 }
 
 /// The prefix of every subject of session `sid`'s mail on this node: the filter a fetch of
@@ -1281,6 +1368,16 @@ impl World {
         if opts.hold_acks {
             broker.hold_acks(Rng::new(opts.seed ^ 0x0a0c_4e1d_ac45));
         }
+        if opts.keys || opts.strays {
+            lock(&broker.state).cut_after_dedup = Some(Rng::new(opts.seed ^ 0x0c07_afde_d0f2_3000));
+        }
+        if opts.strays {
+            lock(&broker.state).stray = Some(bus::Stray {
+                draw: Rng::new(opts.seed ^ 0x057a_4e77_e1f2_3005),
+                subject: format!("/f/{FLEET}/in/{PEER}/s-p/{NODE}/note"),
+                body: format!("v=1 t=1 from={STRAY_SID} text=stray").into_bytes(),
+            });
+        }
         for p in [NODE, PEER, PERSON] {
             broker.name_producer(producer(p), p);
         }
@@ -1377,6 +1474,8 @@ impl World {
             says: BTreeMap::new(),
             follows: Vec::new(),
             seen: std::cell::RefCell::new(Vec::new()),
+            key_rng: Rng::new(seed ^ 0x0ce7_5eed_4e75_0f23),
+            keyed: BTreeMap::new(),
         };
         // The first open's tick, asked for at once when its rules are set.
         w.tick_now();
@@ -1808,8 +1907,67 @@ impl World {
     }
 
     /// Session `local` (`from`) posts `kind` to `to` (session `target`, if one). In a world of
-    /// deadlines an ask to a session carries one three times in four ([`DEADLINES_MS`]).
+    /// deadlines an ask to a session carries one three times in four ([`DEADLINES_MS`]); in one
+    /// of keys a note carries a key of its own one time in two ([`Opts::keys`]).
     fn post_as(&mut self, local: u64, from: &str, to: &str, kind: &str, target: Option<String>) {
+        let key = (self.opts.keys && kind == "note" && self.key_rng.chance(1, 2))
+            .then(|| format!("k{}", self.keyed.len() + 1));
+        if let Some(key) = &key {
+            self.keyed.insert(
+                key.clone(),
+                Keyed {
+                    local,
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    target: target.clone(),
+                    markers: Vec::new(),
+                },
+            );
+        }
+        self.post_keyed(local, from, to, kind, target, key);
+    }
+
+    /// A KEYED RE-POST ([`Opts::keys`]): a session posts its note again under the key of one of
+    /// its earlier keyed notes, to the same address, as an agent retries a post it may have sent
+    /// already. Its words are its own (a marker of its own), so the bus says which of the key's
+    /// posts a copy is; the key's law is [`World::key_copies`].
+    fn repost(&mut self) {
+        let live: BTreeSet<u64> = self.sessions().into_iter().map(|(l, _)| l).collect();
+        let keys: Vec<String> = self
+            .keyed
+            .iter()
+            .filter(|(_, k)| live.contains(&k.local))
+            .map(|(key, _)| key.clone())
+            .collect();
+        // The newest key one time in two: a retry soon after the post, often in its drain.
+        let key = if self.key_rng.chance(1, 2) {
+            keys.iter()
+                .max_by_key(|key| key.trim_start_matches('k').parse::<u64>().unwrap_or(0))
+                .cloned()
+        } else {
+            self.key_rng.pick(&keys).cloned()
+        };
+        let Some(key) = key else {
+            return;
+        };
+        let (local, from, to, target) = {
+            let k = &self.keyed[&key];
+            (k.local, k.from.clone(), k.to.clone(), k.target.clone())
+        };
+        self.stats.reposts += 1;
+        self.post_keyed(local, &from, &to, "note", target, Some(key));
+    }
+
+    /// [`World::post_as`], under `key` where one is given.
+    fn post_keyed(
+        &mut self,
+        local: u64,
+        from: &str,
+        to: &str,
+        kind: &str,
+        target: Option<String>,
+        key: Option<String>,
+    ) {
         let marker = self.next_marker();
         let dl = if self.opts.deadlines
             && kind == "ask"
@@ -1820,10 +1978,13 @@ impl World {
         } else {
             None
         };
-        let Some(id) = self.ep.post(local, to, kind, &marker, dl) else {
+        let Some(id) = self.ep.post(local, to, kind, &marker, dl, key.as_deref()) else {
             return;
         };
         self.stats.posts += 1;
+        if let Some(k) = key.as_ref().and_then(|key| self.keyed.get_mut(key)) {
+            k.markers.push(marker.clone());
+        }
         if let (Some(dl), Some(target)) = (dl, target.as_ref()) {
             self.asks.insert(
                 marker.clone(),
@@ -1838,8 +1999,9 @@ impl World {
             );
         }
         let dl_word = dl.map_or_else(String::new, |dl| format!(" dl={dl}"));
+        let key_word = key.map_or_else(String::new, |key| format!(" key={key}"));
         self.note(format!(
-            "post {from} #{id} {marker} to={to} kind={kind}{dl_word}"
+            "post {from} #{id} {marker} to={to} kind={kind}{dl_word}{key_word}"
         ));
         self.sent.insert(
             marker,
@@ -2583,7 +2745,10 @@ impl World {
     /// is asked for when its rules are set.
     fn broker_start(&mut self) {
         let drawn = self.opts.retained && self.opts.cuts;
-        if drawn && self.ret_rng.chance(1, 4) {
+        // A world of strays opens with rules every time: on a broker that set none nothing
+        // drops a stray record's dedup key, so nothing ends the hold it puts on a sender
+        // ([`Opts::strays`]).
+        if drawn && !self.opts.strays && self.ret_rng.chance(1, 4) {
             self.stats.unretained_starts += 1;
             self.core.broker.start_unretained();
         } else if drawn && self.rules_rng.chance(1, 4) {
@@ -2751,6 +2916,9 @@ impl World {
         if alive && self.opts.handoffs {
             menu.push((1, 23));
         }
+        if self.opts.keys {
+            menu.push((3, 24));
+        }
         let total: u64 = menu.iter().map(|(w, _)| w).sum();
         let mut draw = self.rng.below(total);
         let mut action = 0;
@@ -2822,6 +2990,7 @@ impl World {
             21 => self.say(),
             22 => self.follow(),
             23 => self.handoff(),
+            24 => self.repost(),
             _ => {
                 let d = Duration::from_millis(100 + self.rng.below(20_000));
                 self.note(format!("time +{}ms", d.as_millis()));
@@ -2910,6 +3079,23 @@ impl World {
                     let d = crate::broker_rules::MAX_AGE + Duration::from_secs(86_400);
                     self.note(format!(
                         "time +{}h (a week passes: the mirror waits on its window budget)",
+                        d.as_secs() / 3_600
+                    ));
+                    self.core.advance(d);
+                    started += d;
+                    self.tick_now();
+                    still = 0;
+                    continue;
+                }
+                // A SENDER HELD BEHIND A STRAY RECORD'S DEDUP KEY in a quiet world waits for
+                // the cut that drops that key (`Bridge::unverified_publication`'s case 5): a
+                // week passes, as for the mirror, and the hold's next retry appends anew.
+                if still >= 60 && weeks < 2 && self.waits_on_a_stray(now) {
+                    weeks += 1;
+                    self.stats.stray_weeks += 1;
+                    let d = crate::broker_rules::MAX_AGE + Duration::from_secs(86_400);
+                    self.note(format!(
+                        "time +{}h (a week passes: a sender waits on a stray record's key)",
                         d.as_secs() / 3_600
                     ));
                     self.core.advance(d);
@@ -3369,6 +3555,17 @@ impl World {
         self.opts.retained && lock(&self.ep.state).mirror_said == "budget"
     }
 
+    /// Whether a post stands queued or a receipt owed, in the world `now` fingerprints
+    /// ([`World::fingerprint`]), while a stray record's dedup key stands at or above the base
+    /// ([`Opts::strays`]) over a retained broker: what a sender held behind it waits for.
+    fn waits_on_a_stray(&self, now: (usize, usize, usize, usize, usize)) -> bool {
+        if !self.opts.strays || !self.opts.retained || (now.2 == 0 && now.3 == 0) {
+            return false;
+        }
+        let base = self.core.broker.base();
+        self.core.broker.strays().iter().any(|&off| off >= base)
+    }
+
     /// Whether the mirror is owed its sessions' logs once settled: a `turns` mirror always,
     /// an `auto` one over a broker whose last attach found it retaining.
     fn mirror_owed(&self) -> bool {
@@ -3473,6 +3670,7 @@ impl World {
             bad.extend(self.topic_rows());
         }
         bad.extend(self.routed_after_exit());
+        bad.extend(self.key_copies());
         let gone = self.core.broker.gone();
         for (marker, records) in self.bus_markers() {
             // Every copy but the newest given up by retention (sim item B05): the replay of an
@@ -3511,6 +3709,41 @@ impl World {
                 self.violations.push(b);
             }
         }
+    }
+
+    /// THE KEY'S LAW (critic item F23, [`Opts::keys`]): a key's posts are one post on the bus. A
+    /// re-post astream's dedup answers lands nothing of its own (aterm is told it landed at its
+    /// key's record, `dup=1`); one sent after retention gave that record up, its dedup key with
+    /// it, lands anew. So a key's copies are one where every older copy went with retention.
+    fn key_copies(&self) -> Vec<String> {
+        if self.keyed.is_empty() {
+            return Vec::new();
+        }
+        let markers = self.bus_markers();
+        let gone = self.core.broker.gone();
+        self.keyed
+            .iter()
+            .filter_map(|(key, k)| {
+                let mut copies: Vec<u64> = k
+                    .markers
+                    .iter()
+                    .filter_map(|m| markers.get(m))
+                    .flatten()
+                    .copied()
+                    .collect();
+                copies.sort_unstable();
+                let once = copies
+                    .split_last()
+                    .is_none_or(|(_, older)| older.iter().all(|off| gone.contains(off)));
+                (!once).then(|| {
+                    format!(
+                        "key: {}'s key {key} is on the bus {} times {copies:?}",
+                        k.from,
+                        copies.len()
+                    )
+                })
+            })
+            .collect()
     }
 
     /// THE DOOR LOOKS BEFORE IT COMMITS (69979209f1): a post first listed after its recipient
@@ -4071,6 +4304,43 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         w.stats.refill_together_sessions = law.together_sessions;
         w.stats.refills_below_oldest = law.below_oldest;
         w.violations.append(&mut law.violations);
+    }
+    w.stats.cuts_after_dedup = w.core.broker.cuts_after_dedup();
+    w.stats.strays = w.core.broker.strays().len() as u64;
+    if !w.keyed.is_empty() {
+        let on_bus = w.bus_markers();
+        let reposts: BTreeSet<&String> = w
+            .keyed
+            .values()
+            .flat_map(|k| k.markers.iter().skip(1))
+            .collect();
+        w.stats.reposts_appended =
+            reposts.iter().filter(|m| on_bus.contains_key(**m)).count() as u64;
+        let ep = lock(&w.ep.state);
+        w.stats.reposts_deduped = ep
+            .sessions
+            .values()
+            .chain(ep.gone.iter())
+            .flat_map(|session| session.posts.iter())
+            .filter(|p| {
+                p.key.is_some() && p.retired.as_deref().is_some_and(|r| r.contains("dup=1"))
+            })
+            .count() as u64;
+    }
+    for (&tap, &n) in lock(&w.core.reservations).iter() {
+        match tap {
+            crate::fx::ReservationTap::Verified => w.stats.reservations_verified += n,
+            crate::fx::ReservationTap::Collision => w.stats.reservation_collisions += n,
+            crate::fx::ReservationTap::ReplayedAtTheWinner => w.stats.replayed_at_the_winner += n,
+            crate::fx::ReservationTap::Unverifiable(case) => {
+                if let Some(slot) = usize::from(case)
+                    .checked_sub(1)
+                    .and_then(|i| w.stats.unverifiable.get_mut(i))
+                {
+                    *slot += n;
+                }
+            }
+        }
     }
     let errors = w.core.device.write_errors();
     w.stats.writes_failed = errors.writes;

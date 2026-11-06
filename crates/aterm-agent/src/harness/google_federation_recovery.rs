@@ -221,15 +221,19 @@ impl Journal {
         request: &login_drive::Request<'_>,
         scope: &FederationScope,
         now: i64,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<Option<KimiProof>, KimiNativeError> {
         let journal = std::cell::RefCell::new(self);
+        // Kimi's native refresh is a leaf that takes an `Instant`, so it measures what is left of
+        // `deadline` on the clock that stops in sleep: each of its account checks takes 20 s at
+        // most, but its token refresh request has no cap of its own (KI-1105-14). The checks
+        // around it read both clocks.
         verify_or_refresh_kimi_with_rejection(
             request.staging,
             scope.region,
             &scope.expected,
             now,
-            deadline,
+            deadline.instant(),
             std::sync::Arc::new(RefreshGuard(scope.clone())),
             &|| journal.borrow_mut().checkpoint_rejected(request),
         )
@@ -241,7 +245,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         use super::super::cli::shared_provider::{ObservationError, kimi_observation_error};
         self.check_context(request)
@@ -497,7 +501,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         self.observe_existing_with(request, home, deadline, |journal, scope, now| {
             journal.renew_recorded(request, scope, now, deadline)
@@ -509,7 +513,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         self.observe_existing_with(request, home, deadline, |_, scope, now| read(scope, now))
@@ -519,7 +523,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
         read: impl FnOnce(
             &mut Self,
             &FederationScope,
@@ -541,7 +545,7 @@ impl Journal {
         let Some(candidate) = self.candidate.take() else {
             return Ok(None);
         };
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err(ObservationError::Unavailable(
                 "Kimi recovery deadline expired".into(),
             ));
@@ -580,7 +584,7 @@ impl Journal {
         for (path, bytes, predecessor) in replacements {
             self.check_context(request)
                 .map_err(ObservationError::Unavailable)?;
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return Err(ObservationError::Unavailable(
                     "Kimi recovery deadline expired".into(),
                 ));
@@ -598,7 +602,7 @@ impl Journal {
         for (path, bytes) in missing {
             self.check_context(request)
                 .map_err(ObservationError::Unavailable)?;
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return Err(ObservationError::Unavailable(
                     "Kimi recovery deadline expired".into(),
                 ));
@@ -617,7 +621,7 @@ impl Journal {
             }
         }
         self.check(request).map_err(ObservationError::Unavailable)?;
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err(ObservationError::Unavailable(
                 "Kimi recovery deadline expired".into(),
             ));
@@ -704,7 +708,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<Option<PendingFederation>, String> {
         self.resume_with(request, home, deadline, |journal, scope, now| {
             if scope
@@ -715,12 +719,13 @@ impl Journal {
             {
                 return journal.renew_recorded(request, scope, now, deadline);
             }
+            // As in `renew_recorded`: a leaf that takes an `Instant`.
             verify_native_kimi_classified(
                 request.staging,
                 scope.region,
                 &scope.expected,
                 now,
-                deadline,
+                deadline.instant(),
             )
         })
     }
@@ -730,7 +735,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<PendingFederation>, String> {
         self.resume_with(request, home, deadline, |_, scope, now| read(scope, now))
@@ -740,7 +745,7 @@ impl Journal {
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
-        deadline: Instant,
+        deadline: WakeDeadline,
         read: impl FnOnce(
             &mut Self,
             &FederationScope,
@@ -763,7 +768,7 @@ impl Journal {
         let Some(candidate) = self.candidate.take() else {
             return Ok(None);
         };
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err("Kimi recovery deadline expired".into());
         }
         let credential_path = kimi_credential_path(request.staging, self.scope.region);
@@ -796,7 +801,7 @@ impl Journal {
         let scope = self.scope.clone();
         let result = read(self, &scope, now);
         self.check(request)?;
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err("Kimi recovery deadline expired".into());
         }
         let native = match result {

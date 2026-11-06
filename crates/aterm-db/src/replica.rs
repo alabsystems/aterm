@@ -1782,7 +1782,7 @@ impl Round<'_> {
         for key in keys {
             stream.write_all(&[u8::from(key.is_some())])?;
             if let Some(key) = key {
-                control::send_frame(stream, &key)?;
+                control::write_frame(stream, &key)?;
                 report.keys_sent += 1;
             }
         }
@@ -2129,7 +2129,7 @@ impl Round<'_> {
         })?;
         stream.write_all(&(batch.len() as u32).to_le_bytes())?;
         for wire in &batch {
-            control::send_frame(stream, wire)?;
+            control::write_frame(stream, wire)?;
         }
         stream.flush()?;
         for wire in &batch {

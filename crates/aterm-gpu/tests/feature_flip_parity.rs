@@ -15,12 +15,9 @@ fn ligature_test_font() -> (std::path::PathBuf, bool) {
     {
         return (p, false);
     }
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-    );
-    let p = std::path::PathBuf::from(FIXTURE);
-    assert!(p.exists(), "{FIXTURE}: missing (a committed fixture)");
+    let p =
+        aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf");
+    assert!(p.exists(), "{}: missing (a committed fixture)", p.display());
     (p, true)
 }
 

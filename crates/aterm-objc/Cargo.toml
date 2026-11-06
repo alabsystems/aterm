@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-objc"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -43,7 +43,8 @@ harness = false
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
-# Scratch directories for the SDK-constant probes.
+# Scratch directories for the SDK-constant probes, and the checkout's sources the
+# tests read, found at run time.
 aterm-tempfile = { workspace = true }
 
 [[test]]

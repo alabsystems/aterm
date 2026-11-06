@@ -1814,18 +1814,13 @@ fn armed_frames_hold_to_their_cpu_twins() {
     end_unless_the_colour_row_ran();
 }
 
-const IOSEVKA_SEMIBOLD_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/assets/bundled/IosevkaTerm-SemiBold.ttf"
-);
-const IOSEVKA_REGULAR_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/assets/bundled/IosevkaTerm-Regular.ttf"
-);
-const JETBRAINS_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf"
-);
+/// The checked-in bundled face `file`'s path.
+fn bundled_face(file: &str) -> String {
+    let path = aterm_tempfile::manifest_dir()
+        .join("../aterm-render/assets/bundled")
+        .join(file);
+    path.to_str().expect("a UTF-8 font path").to_owned()
+}
 
 /// Every twinned frame also holds to its CPU twin under the bundled primary
 /// faces (including Windows' Iosevka Term Semibold + ExtraBold pair and, when
@@ -1835,21 +1830,24 @@ const JETBRAINS_FONT: &str = concat!(
 fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
     let arch = std::env::consts::ARCH;
     let adapter = native_adapter();
-    let mut faces = vec![
-        ("IosevkaTerm-SemiBold.ttf", IOSEVKA_SEMIBOLD_FONT),
-        ("IosevkaTerm-Regular.ttf", IOSEVKA_REGULAR_FONT),
-        ("JetBrainsMono-Regular.ttf", JETBRAINS_FONT),
-    ];
+    let mut faces: Vec<(&str, String)> = [
+        "IosevkaTerm-SemiBold.ttf",
+        "IosevkaTerm-Regular.ttf",
+        "JetBrainsMono-Regular.ttf",
+    ]
+    .into_iter()
+    .map(|file| (file, bundled_face(file)))
+    .collect();
     if aterm_render::bundled::IOSEVKA_ACTIVE {
         faces.push((
             "bundled:Iosevka Term",
-            aterm_render::bundled::IOSEVKA_FAMILY,
+            aterm_render::bundled::IOSEVKA_FAMILY.to_owned(),
         ));
     }
     if aterm_render::bundled::IOSEVKA_SEMIBOLD_ACTIVE {
         faces.push((
             "bundled:Iosevka Term Semibold",
-            aterm_render::bundled::IOSEVKA_SEMIBOLD_FAMILY,
+            aterm_render::bundled::IOSEVKA_SEMIBOLD_FAMILY.to_owned(),
         ));
     }
     for (label, family) in faces {
@@ -1858,7 +1856,7 @@ fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
             distinct,
             twins,
             shapes,
-        } = draw_frames_with(Some(family));
+        } = draw_frames_with(Some(&family));
         let drawn = rows_of(&frames);
         let digests: std::collections::BTreeMap<&str, &str> = drawn
             .iter()

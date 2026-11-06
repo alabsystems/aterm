@@ -112,6 +112,21 @@ fn prepared(paths: &Paths) -> crate::Result<Option<Descriptor>> {
     Descriptor::decode(bytes.as_slice()).map(Some)
 }
 
+/// The names a founding's own history leaves in `commons/` before the vault describes it: the
+/// runtime's lease and the device custody `prepare` writes.
+const OWN_HISTORY: [&str; 3] = ["runtime.lock", "device.age", "device.claim"];
+
+/// Whether `name` in `commons` is a founding's own: one of [`OWN_HISTORY`], or a temporary a
+/// write of one left behind (`aterm_uds::atomic_file::create_temp_beside`'s
+/// `.<name>.tmp.<pid>.<salt>`, which `fsx::write_new` writes each through), which a kill or
+/// power loss mid-write leaves for good.
+fn own_history(commons: &Path, name: &std::ffi::OsStr) -> bool {
+    OWN_HISTORY.iter().any(|own| {
+        name.to_str() == Some(own)
+            || aterm_uds::atomic_file::temp_writer(&commons.join(own), name).is_some()
+    })
+}
+
 fn refuse_unrelated_history(paths: &Paths) -> crate::Result<()> {
     let commons = paths.dir.join("commons");
     match fsx::kind(&commons)? {
@@ -127,10 +142,7 @@ fn refuse_unrelated_history(paths: &Paths) -> crate::Result<()> {
         .map_err(|error| Error::new(format!("{}: {error}", commons.display())))?;
     for entry in entries {
         let entry = entry.map_err(|error| Error::new(format!("{}: {error}", commons.display())))?;
-        if !matches!(
-            entry.file_name().to_str(),
-            Some("runtime.lock" | "device.age" | "device.claim")
-        ) {
+        if !own_history(&commons, &entry.file_name()) {
             return Err(Error::new(format!(
                 "Commons foundation cannot replace existing local history: {}",
                 entry.path().display()

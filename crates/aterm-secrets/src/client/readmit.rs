@@ -605,6 +605,9 @@ pub(super) fn sign_seat_move(
         &log_entries::Rotation {
             everyone: None,
             hosts: true,
+            // A seat move is no removal; it holds no `Paths` to read the fold's gate from, so it
+            // rotates Commons as before the fold (B11's note to B12).
+            fold: false,
         },
         &mut signed,
     )?;

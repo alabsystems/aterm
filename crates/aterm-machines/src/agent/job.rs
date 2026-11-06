@@ -1020,6 +1020,10 @@ mod tests {
         assert!(find_executable(&fake, Path::new("/P")).is_err());
     }
 
+    /// The version the upgrade names and the staged helper reports: equal, as for a sound
+    /// payload.
+    const HELPER_VERSION: &str = "0.156.0";
+
     /// A host mid-upgrade.
     fn upgrading_at(rel: &str, exe_uid: u32) -> (Fake, Envelope) {
         let fake = Fake::root();
@@ -1077,7 +1081,7 @@ mod tests {
         }
         fake.on(
             &format!("{} machines agent version", crate::port::shell_word(&exe)),
-            Ran::ok(&format!("{}\n", env!("CARGO_PKG_VERSION"))),
+            Ran::ok(&format!("{HELPER_VERSION}\n")),
         );
         fake.on(
             "/usr/sbin/visudo -cf /A/stage/sudoers.check",
@@ -1087,7 +1091,7 @@ mod tests {
         e.upgrade = Some(envelope::Upgrade {
             sha256: sha,
             kind: "dev-zip".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: HELPER_VERSION.into(),
         });
         (fake, e)
     }

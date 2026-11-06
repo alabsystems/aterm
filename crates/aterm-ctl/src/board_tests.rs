@@ -277,6 +277,26 @@ fn a_spawned_row_keeps_the_brief_by_digest_never_its_text() {
     assert_eq!((row.state.as_str(), row.rev), ("working", 0));
 }
 
+/// A PROGRAM WORKER'S ROW NAMES ITS PROGRAM AND NO AUTOPILOT: none reads it. CONTROL: an agent's
+/// row above defaults to Land.
+#[test]
+fn a_program_workers_row_names_its_program_and_no_autopilot() {
+    let args: Vec<String> = ["program=/opt/my tools/run", "arg=-x", "cwd=/w"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let row = spawned("s-0a2", Placed::default(), None, (&args, b"t"), None, 42);
+    assert_eq!(row.program.as_deref(), Some("/opt/my tools/run"));
+    assert_eq!(row.autopilot, None);
+    assert_eq!(row.model, None);
+    let back = Row::parse(&row.line()).expect("a row");
+    assert_eq!(
+        back.program.as_deref(),
+        Some("/opt/my tools/run"),
+        "one field, read back"
+    );
+}
+
 #[test]
 fn brief_digest_is_sha256() {
     assert_eq!(

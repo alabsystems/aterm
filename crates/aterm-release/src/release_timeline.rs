@@ -272,25 +272,49 @@ impl Timeline {
             if n == 0 {
                 return Ok(()); // A partial final line is not a record.
             }
-            for &byte in &bytes[..n] {
-                if byte != b'\n' {
-                    if line.len() < LINE_LIMIT && !overflow {
-                        line.push(byte);
-                    } else {
-                        overflow = true;
+            let mut rest = &bytes[..n];
+            while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+                let seg = &rest[..pos];
+                if line.is_empty() && !overflow {
+                    if seg.len() <= LINE_LIMIT
+                        && let Some(json) = seg
+                            .strip_prefix(b"verify-event: ")
+                            .or_else(|| seg.strip_prefix(b"release-event: "))
+                        && let Ok(event) = aterm_json::from_slice::<aterm_json::Value>(json)
+                    {
+                        self.observe(log, &event);
                     }
-                    continue;
+                } else {
+                    if !overflow && line.len() + seg.len() <= LINE_LIMIT {
+                        line.extend_from_slice(seg);
+                        if let Some(json) = line
+                            .strip_prefix(b"verify-event: ")
+                            .or_else(|| line.strip_prefix(b"release-event: "))
+                            && let Ok(event) = aterm_json::from_slice::<aterm_json::Value>(json)
+                        {
+                            self.observe(log, &event);
+                        }
+                    }
+                    line.clear();
+                    overflow = false;
                 }
-                if !overflow
-                    && let Some(json) = line
-                        .strip_prefix(b"verify-event: ")
-                        .or_else(|| line.strip_prefix(b"release-event: "))
-                    && let Ok(event) = aterm_json::from_slice::<aterm_json::Value>(json)
-                {
-                    self.observe(log, &event);
+                rest = &rest[pos + 1..];
+            }
+            if !rest.is_empty() && !overflow {
+                let starts_like_event = if line.is_empty() {
+                    rest.starts_with(b"verify-event: ")
+                        || rest.starts_with(b"release-event: ")
+                        || b"verify-event: ".starts_with(rest)
+                        || b"release-event: ".starts_with(rest)
+                } else {
+                    true
+                };
+                if starts_like_event && line.len() + rest.len() <= LINE_LIMIT {
+                    line.extend_from_slice(rest);
+                } else {
+                    line.clear();
+                    overflow = true;
                 }
-                line.clear();
-                overflow = false;
             }
         }
     }
@@ -345,7 +369,7 @@ impl Timeline {
             .find(|row| row.step == crate::release::Step::Publish.name())
             .and_then(|row| row.started_at_unix_s)
             .map(|s| s.saturating_mul(1000));
-        let mut phases = Vec::new();
+        let mut phases = Vec::with_capacity(headers.len() + 1);
         // The engine replays promote's sections only after promote ends, so the span before
         // its first section header is promote itself: its guards, hooks and public push.
         phases.push(aterm_json::json!({
@@ -388,14 +412,12 @@ impl Timeline {
                 })
             })
             .collect();
-        let ended: Vec<f64> = self
-            .steps
-            .iter()
-            .filter_map(|row| row.execution_s)
-            .collect();
         // Before the qualify graph runs branches beside each other, the steps run one after
         // another, so the critical path is their summed execution (owner waits excluded).
-        let critical_path_s = (!ended.is_empty()).then(|| ended.iter().sum::<f64>());
+        let mut critical_path_s = None;
+        for s in self.steps.iter().filter_map(|row| row.execution_s) {
+            *critical_path_s.get_or_insert(0.0) += s;
+        }
         let time_to_first_red_s = self
             .first_red_at_unix_ms
             .zip(self.run_started_at_unix_s)

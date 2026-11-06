@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-stamp"
+# A constant version: a product version here would make every bump an input of each crate
+# that depends on this one. The product version is `[workspace.package] version`, which the
+# record carries.
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The aterm binary's identity record: the version, commit, build and index hint a library reads at run time instead of compiling in."
+
+# No dependencies: the record's writer (crates/aterm/build.rs) builds against it too.
+[dependencies]
+
+[lints]
+workspace = true

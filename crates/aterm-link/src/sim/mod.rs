@@ -137,6 +137,9 @@ pub(crate) struct Core {
     pub(crate) idle_held: Mutex<Vec<(u64, String, Vec<u8>)>>,
     /// The refill law's findings ([`refill`]).
     pub(crate) refills: Mutex<refill::Law>,
+    /// What every reservation's publish at its pin came to where a verdict was asked for
+    /// ([`crate::fx::ReservationTap`], critic item F23), by kind.
+    pub(crate) reservations: Mutex<std::collections::BTreeMap<crate::fx::ReservationTap, u64>>,
 }
 
 impl Core {
@@ -156,6 +159,7 @@ impl Core {
             mutants: Mutex::new(BTreeSet::new()),
             idle_held: Mutex::new(Vec::new()),
             refills: Mutex::new(refill::Law::default()),
+            reservations: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -316,6 +320,13 @@ impl Process {
                 .collect();
             (records, self.core.broker.gone())
         });
+    }
+
+    /// What one of this process's reservations came to at its pin (critic item F23).
+    pub(crate) fn reservation_tap(&self, tap: crate::fx::ReservationTap) {
+        self.core
+            .note(format!("reservation pid={} {tap:?}", self.pid));
+        *lock(&self.core.reservations).entry(tap).or_default() += 1;
     }
 
     /// Whether this process still runs.

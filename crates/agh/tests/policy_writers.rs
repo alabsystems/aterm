@@ -368,6 +368,241 @@ fn run(
     (exit, captured.stdout_text(), captured.stderr_text())
 }
 
+fn grant_vault(root: &Path, fake: &FakeGithub, recorded: bool) -> Dirs {
+    use agh::identity::vault::{self, Slot};
+    let dirs = Dirs::under(root);
+    aterm_uds::private_file::create_private_dir(&dirs.home).unwrap();
+    let dev = agh_fake::token("first-grant-dev");
+    let release = agh_fake::token("first-grant-release");
+    fake.add_token(&dev, "fixture-dev");
+    fake.add_token(&release, "fixture-release-bot");
+    common::write_token(&dirs.home.join(".secrets"), "gh_access_token", &dev);
+    common::write_token(
+        &dirs.home.join(".secrets"),
+        "gh_access_token_alabsystems",
+        &release,
+    );
+    if recorded {
+        vault::record_for_tests(
+            &dirs,
+            &[
+                (
+                    Slot::Dev,
+                    &identity::fingerprint(dev.as_bytes()),
+                    "fixture-dev",
+                ),
+                (
+                    Slot::Release,
+                    &identity::fingerprint(release.as_bytes()),
+                    "fixture-release-bot",
+                ),
+            ],
+        )
+        .unwrap();
+    }
+    dirs
+}
+
+#[test]
+fn first_grant_preserves_recorded_vault_routing_without_learning() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = common::scratch("first-grant");
+    let fake = FakeGithub::start();
+    let dirs = grant_vault(root.path(), &fake, true);
+    let recorded: Vec<_> = std::fs::read_dir(&dirs.config)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    let args = ["policy", "grant", "atpkg-publish", "alabsystems/aterm"];
+    {
+        let _held = identity::provision::hold_auth_edit_for_tests(&dirs).unwrap();
+        let (exit, _, _) = run(root.path(), &fake, (false, false), &args);
+        assert_eq!(exit, 1, "first creation respects the auth edit lock");
+        assert!(!dirs.config_file().exists());
+    }
+    let (exit, stdout, stderr) = run(root.path(), &fake, (false, false), &args);
+    assert_eq!(exit, 0, "{stdout}{stderr}");
+    let value: aterm_toml::Value =
+        aterm_toml::from_str(&std::fs::read_to_string(dirs.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        value.get("vault").and_then(aterm_toml::Value::as_bool),
+        Some(true)
+    );
+    for absent in ["profiles", "owners", "targets", "default"] {
+        assert!(value.get(absent).is_none(), "no implicit {absent}");
+    }
+    assert_eq!(
+        granted(&dirs),
+        [row("atpkg-publish", &["alabsystems/aterm"])]
+    );
+    assert_eq!(
+        std::fs::metadata(dirs.config_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&dirs.config)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let view = agh::routing::view(&dirs, &common::env()).unwrap();
+    let router = view.router().unwrap();
+    assert_eq!(router.writer_of("fixture-dev"), Some("dev"));
+    assert_eq!(router.writer_of("alabsystems"), Some("release"));
+    assert!(
+        router
+            .grant("atpkg-publish", &common::slug("alabsystems/aterm"))
+            .is_ok()
+    );
+    assert!(
+        router
+            .grant("atpkg-publish", &common::slug("alabsystems/other"))
+            .is_err()
+    );
+    let (exit, stdout, stderr) = run(root.path(), &fake, (false, false), &args);
+    assert_eq!(exit, 0, "{stderr}");
+    assert!(stdout.contains("\"change\":\"unchanged\""));
+    assert!(
+        fake.seen().is_empty(),
+        "grant must never learn credentials over HTTP"
+    );
+    for (path, before) in recorded {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "adoption record unchanged"
+        );
+    }
+}
+
+#[test]
+fn first_grant_allows_one_recorded_vault_identity_without_its_partner() {
+    use agh::identity::vault::Slot;
+    for absent in Slot::ALL {
+        let root = common::scratch("first-grant-single-identity");
+        let fake = FakeGithub::start();
+        let dirs = grant_vault(root.path(), &fake, true);
+        std::fs::remove_file(absent.path(&dirs.home)).unwrap();
+        let (exit, stdout, stderr) = run(
+            root.path(),
+            &fake,
+            (false, false),
+            &["policy", "grant", "atpkg-publish", "alabsystems/aterm"],
+        );
+        assert_eq!(exit, 0, "{absent:?}: {stdout}{stderr}");
+        assert_eq!(
+            granted(&dirs),
+            [row("atpkg-publish", &["alabsystems/aterm"])]
+        );
+        assert!(fake.seen().is_empty());
+    }
+}
+
+#[test]
+fn first_grant_refuses_unrecorded_rotated_or_unsafe_vault_credentials() {
+    use agh::identity::vault::Slot;
+    use std::os::unix::fs::PermissionsExt;
+    for state in ["unrecorded", "rotated", "loose", "absent", "damaged"] {
+        let root = common::scratch("first-grant-refused");
+        let fake = FakeGithub::start();
+        let dirs = if state == "absent" {
+            Dirs::under(root.path())
+        } else {
+            grant_vault(root.path(), &fake, state != "unrecorded")
+        };
+        if state == "rotated" {
+            std::fs::write(Slot::Dev.path(&dirs.home), agh_fake::token("rotated")).unwrap();
+        } else if state == "loose" {
+            std::fs::set_permissions(
+                Slot::Dev.path(&dirs.home),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        } else if state == "damaged" {
+            std::fs::write(
+                dirs.config.join(agh::identity::vault::RECORD_FILE),
+                "[broken\n",
+            )
+            .unwrap();
+        }
+        let (exit, stdout, stderr) = run(
+            root.path(),
+            &fake,
+            (false, false),
+            &["policy", "grant", "atpkg-publish", "alabsystems/aterm"],
+        );
+        assert_eq!(exit, 1, "{state}: {stdout}{stderr}");
+        assert!(!dirs.config_file().exists(), "{state}");
+        assert!(fake.seen().is_empty(), "{state}: no credential learning");
+    }
+}
+
+#[test]
+fn revoke_and_malformed_grants_do_not_initialize_a_vault_config() {
+    let root = common::scratch("first-grant-input");
+    let fake = FakeGithub::start();
+    let dirs = grant_vault(root.path(), &fake, true);
+    for (args, expected) in [
+        (
+            ["policy", "revoke", "atpkg-publish", "alabsystems/aterm"],
+            1,
+        ),
+        (["policy", "grant", "Bad_Caller", "alabsystems/aterm"], 2),
+        (["policy", "grant", "atpkg-publish", "@target"], 2),
+    ] {
+        let (exit, stdout, stderr) = run(root.path(), &fake, (false, false), &args);
+        assert_eq!(exit, expected, "{stdout}{stderr}");
+        assert!(!dirs.config_file().exists());
+    }
+    assert!(fake.seen().is_empty());
+}
+
+#[test]
+fn first_grant_does_not_replace_unsafe_or_malformed_existing_config() {
+    use std::os::unix::fs::PermissionsExt;
+    for state in ["symlink", "loose", "invalid", "not-utf8"] {
+        let root = common::scratch("first-grant-config");
+        let fake = FakeGithub::start();
+        let dirs = grant_vault(root.path(), &fake, true);
+        let content: &[u8] = match state {
+            "invalid" => b"[broken\n",
+            "not-utf8" => &[0xff],
+            _ => b"vault = true\n",
+        };
+        let protected = if state == "symlink" {
+            root.path().join("elsewhere")
+        } else {
+            dirs.config_file()
+        };
+        std::fs::write(&protected, content).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if state == "symlink" {
+            std::os::unix::fs::symlink(&protected, dirs.config_file()).unwrap();
+        } else if state == "loose" {
+            std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (exit, _, _) = run(
+            root.path(),
+            &fake,
+            (false, false),
+            &["policy", "grant", "atpkg-publish", "alabsystems/aterm"],
+        );
+        assert_ne!(exit, 0, "{state}");
+        assert_eq!(std::fs::read(protected).unwrap(), content, "{state}");
+        assert!(fake.seen().is_empty());
+    }
+}
+
 #[test]
 fn policy_grant_and_revoke_edit_writers() {
     let root = common::scratch("writers-cli");

@@ -109,11 +109,19 @@ fn go(mut held: &File) {
     held.write_all(b"g").expect("the go");
 }
 
+/// This package's `aterm-lab`, as a job's program line spells it.
+fn lab_exe() -> String {
+    aterm_tempfile::bin_exe("aterm-lab")
+        .into_os_string()
+        .into_string()
+        .expect("utf-8")
+}
+
 /// `band-launch` of `program` in `dir`'s world as the job `label`, its log `dir/log`.
 fn band_launch(dir: &Path, label: &str, program: &[&str]) {
     let d = dir.to_str().expect("utf-8");
     let log = dir.join("log");
-    let launched = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"))
+    let launched = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"))
         .args([
             "band-launch",
             d,
@@ -133,7 +141,7 @@ fn band_launch(dir: &Path, label: &str, program: &[&str]) {
 
 #[test]
 fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_removed_once_it_ends() {
-    let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+    let owned_world = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
         .expect("exclusive scratch world");
     let dir = real_path(owned_world.path());
     let held = world(&dir);
@@ -143,7 +151,8 @@ fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_remove
             .expect("exclusive world basename")
             .to_string_lossy()
     );
-    let lab = env!("CARGO_BIN_EXE_aterm-lab");
+    let lab = lab_exe();
+    let lab = lab.as_str();
     let (runs, log) = (dir.join("runs"), dir.join("log"));
     band_launch(
         &dir,
@@ -246,7 +255,7 @@ impl KeptJob {
     /// `tag`'s job; `disclaim`, its keeper runs as a windowed `lab instance`'s does (`keeper
     /// --disclaim`), else as plain `keeper`.
     fn start(tag: &str, disclaim: bool) -> KeptJob {
-        let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+        let owned_world = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
             .expect("exclusive scratch world");
         let dir = real_path(owned_world.path());
         let held = world(&dir);
@@ -256,7 +265,8 @@ impl KeptJob {
                 .expect("exclusive world basename")
                 .to_string_lossy()
         );
-        let lab = env!("CARGO_BIN_EXE_aterm-lab");
+        let lab = lab_exe();
+        let lab = lab.as_str();
         let (runs, log) = (dir.join("runs"), dir.join("log"));
         let mut program = vec![lab, "keeper"];
         program.extend(disclaim.then_some("--disclaim"));
@@ -307,12 +317,13 @@ fn a_keeper_job_holds_its_program_in_the_jobs_own_coalition_and_ends_with_its_li
     let ours = coalition(i32::try_from(std::process::id()).expect("pid"));
     let children = aterm_uds::process::child_pids(job.keeper);
     let (keeper, kept) = (coalition(job.keeper), coalition(job.kept));
-    let control_dir = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+    let control_dir = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
         .expect("the control's scratch dir");
     let (lifeline, far) =
         aterm_uds::lifeline::Lifeline::open(control_dir.path()).expect("the control's lifeline");
     let control_runs = control_dir.path().join("runs");
-    let lab = env!("CARGO_BIN_EXE_aterm-lab");
+    let lab = lab_exe();
+    let lab = lab.as_str();
     let mut control = aterm_uds::spawnfd::command(lab)
         .args(["keeper", "--", lab, "band-standin"])
         .arg(&control_runs)
@@ -391,7 +402,7 @@ fn a_keeper_jobs_program_killed_by_its_pid_ends_the_job() {
 /// starting its program, and launchd's restart removes it.
 #[test]
 fn a_job_whose_launcher_is_gone_before_its_go_never_starts_its_program() {
-    let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+    let owned_world = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
         .expect("exclusive scratch world");
     let dir = real_path(owned_world.path());
     let held = world(&dir);
@@ -401,7 +412,8 @@ fn a_job_whose_launcher_is_gone_before_its_go_never_starts_its_program() {
             .expect("exclusive world basename")
             .to_string_lossy()
     );
-    let lab = env!("CARGO_BIN_EXE_aterm-lab");
+    let lab = lab_exe();
+    let lab = lab.as_str();
     let runs = dir.join("runs");
     band_launch(
         &dir,

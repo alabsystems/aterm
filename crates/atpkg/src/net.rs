@@ -219,9 +219,6 @@ pub fn newest_index(
     }
 }
 
-/// The environment variable a release build compiles [`compiled_index_hint`] from.
-pub const INDEX_HINT_ENV: &str = "ATPKG_INDEX_HINT";
-
 /// What the discovery rounds may GUESS the channel publishes ([`ahead_of_walk`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexHint {
@@ -254,10 +251,11 @@ impl std::fmt::Display for IndexHint {
     }
 }
 
-/// The published run this binary's release cut compiled in ([`INDEX_HINT_ENV`]).
+/// The published run this binary's release cut stamped into its identity record
+/// ([`aterm_stamp::Stamp::index_hint`]); a binary built outside a release carries none.
 #[must_use]
-pub fn compiled_index_hint() -> Option<IndexHint> {
-    option_env!("ATPKG_INDEX_HINT").and_then(IndexHint::parse)
+pub fn stamped_index_hint() -> Option<IndexHint> {
+    IndexHint::parse(aterm_stamp::current().index_hint)
 }
 
 /// The shipped channel's published run, found as a store that has verified nothing finds it.
@@ -2248,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compiled_index_hint_reads_back_or_is_no_hint() {
+    fn a_stamped_index_hint_reads_back_or_is_no_hint() {
         let run = IndexHint {
             low: Some(8),
             newest: 72,

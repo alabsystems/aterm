@@ -509,6 +509,9 @@ pub struct RunClaim {
     /// This run took the claim over from the run of this release that started it as R's own
     /// cutter ([`RunClaim::hand`]).
     pub adopted: bool,
+    /// The line exists before qualify takes any resource claims. Its rank ends Background
+    /// samples on this host even during steps which need no CPU or memory reservation.
+    priority: Option<aterm_capacity::Claim>,
 }
 
 impl Drop for RunClaim {
@@ -624,6 +627,7 @@ impl RunClaim {
             path: path.to_path_buf(),
             me: (me.0, me.1.to_string()),
             adopted,
+            priority: None,
         };
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| Err(format!("create {}: {e}", dir.display())))?;
@@ -694,7 +698,10 @@ impl RunClaim {
             return Err(format!("{} does not name this run", self.path.display()));
         }
         crate::durable::open_append(&self.path, false)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{HANDED}\n").as_bytes()))
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, HANDED.as_bytes())
+                    .and_then(|()| std::io::Write::write_all(&mut f, b"\n"))
+            })
             .map_err(|e| format!("write {}: {e}", self.path.display()))
     }
 }
@@ -703,7 +710,7 @@ impl RunClaim {
 /// Returns the upper median (`sorted[len / 2]`) of the last ≤ 5 valid durations per step.
 #[must_use]
 pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
-    let mut runs: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut runs: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
     for line in tsv.lines() {
         let mut cols = line.split('\t');
         if let (Some(_), Some(_), Some(step), Some(secs), None) = (
@@ -717,7 +724,7 @@ pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
             && s.bytes().all(|b| b.is_ascii_digit())
             && let Ok(secs) = s.parse::<u64>()
         {
-            runs.entry(step.to_string()).or_default().push(secs);
+            runs.entry(step).or_default().push(secs);
         }
     }
     runs.into_iter()
@@ -725,7 +732,7 @@ pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
             let mut last: Vec<u64> = all[all.len().saturating_sub(5)..].to_vec();
             last.sort_unstable();
             let upper_median = last[last.len() / 2];
-            (step, upper_median)
+            (step.to_string(), upper_median)
         })
         .collect()
 }
@@ -848,8 +855,8 @@ pub struct Facts {
     pub staged_by: Option<String>,
     /// The journal's bundle: COMPLETE in the release cache, its bytes re-proved, built by the release's prover.
     pub built: Answer,
-    /// Whether `verify release` passed for R's tree on that bundle's executable (the record `verify` writes, [`crate::gates::verified`]).
-    pub verified: Answer,
+    /// Each check's record of R's tree under this run's seal, the bundle's on that bundle's executable ([`crate::check_record::checks`]): complete, or what is missing and what FAILED.
+    pub checks: crate::check_record::Checks,
     /// The release's own handoff fixtures on origin/main, as the next cut's gate judges them (`fixtures::on_commit`).
     pub fixtures: Answer,
 }
@@ -897,6 +904,32 @@ pub trait Backend {
     fn say(&mut self, line: &str);
     fn interrupted(&mut self) -> Option<i32>;
     fn entered(&mut self, _step: Step) {}
+    /// Claim the version across the fleet, adopting its existing candidate line.
+    fn fleet_line(
+        &mut self,
+        line: &crate::line::Line,
+        _handed: bool,
+    ) -> Result<crate::line::Line, String> {
+        Ok(line.clone())
+    }
+    /// Read the existing version line before judging a freshly selected main tip.
+    fn fleet_existing(&mut self, _version: &str) -> Result<Option<crate::line::Line>, String> {
+        Ok(None)
+    }
+    /// Record a step boundary and detect an adopted lease before starting more work.
+    fn fleet_boundary(&mut self, _line: &crate::line::Line, _step: Step) -> Result<(), String> {
+        Ok(())
+    }
+    /// The publication fence is entered only by the fleet line's current holder.
+    fn fleet_audit(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Stop this process's monitor before handing ownership to its own cutter.
+    fn fleet_hand(&mut self) {}
+    /// Register a real line with the host's scheduler. A model backend owns no host claim.
+    fn line_priority(&mut self) -> Option<aterm_capacity::Claim> {
+        None
+    }
     /// Record bounded operational observations before any release preparation.
     fn observe_operational(&mut self) {}
     fn log_path(&mut self, step: Step) -> PathBuf;
@@ -1011,11 +1044,15 @@ pub trait Backend {
         prover: &Prover,
         fixtures: bool,
     ) -> Built;
+    /// Run `verify release` on `artifact` in the clone at R: the checks `run` names (every one,
+    /// or a resume's missing ones, with the test binaries that passed), then keep one record per
+    /// check it finished ([`crate::check_record::write_run`]).
     fn verify(
         &mut self,
         c: &Candidate,
         prover: &Prover,
         artifact: &Artifact,
+        run: &crate::check_record::VerifyRun,
     ) -> Result<Ran, Refusal>;
     fn stage(
         &mut self,
@@ -1250,6 +1287,10 @@ impl Run<'_> {
         if let Some(why) = self.claimed_words() {
             self.skip(&why);
         } else {
+            // The FAIL rule (A19) comes first: a FAILed tree is refused at once, exit 1, before
+            // the live world is asked again or room is sought for work it can never pass.
+            self.verification_answer()?;
+            self.fail_rule()?;
             // a PREPARED release asks the live world again before anything else.
             if let Some(prep) = self.pending_reask() {
                 self.reask_prepared(&prep)?;
@@ -1389,6 +1430,14 @@ impl Run<'_> {
     }
 
     fn begin(&mut self, step: Step) -> Flow {
+        if !self.dry
+            && let Some(journal) = &self.journal
+            && let Err(why) = self.b.fleet_boundary(&journal.line(), step)
+        {
+            return self.refuse(
+                Refusal::new(why, "resume the adopted line on its holder").could_not_run(),
+            );
+        }
         self.cur = step;
         self.b.entered(step);
         self.waited = 0;
@@ -1406,6 +1455,11 @@ impl Run<'_> {
     }
 
     fn halt_if_interrupted(&mut self) -> Flow {
+        if let Some(why) = crate::line_claim::failure() {
+            return self.refuse(
+                Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),
+            );
+        }
         let Some(sig) = self.b.interrupted() else {
             return Ok(());
         };
@@ -1817,7 +1871,10 @@ impl Run<'_> {
 
         let facts = [
             ("the bundle built once", self.facts.built.clone()),
-            ("the `verify release` record", self.facts.verified.clone()),
+            (
+                "the `verify release` records",
+                self.facts.checks.answer().clone(),
+            ),
         ];
         for (name, answer) in facts {
             if answer.unanswered {
@@ -1949,7 +2006,7 @@ impl Run<'_> {
         let mut missing: Vec<String> = Vec::new();
         for (name, answer) in [
             ("built once", &self.facts.built),
-            ("verified", &self.facts.verified),
+            ("verified", self.facts.checks.answer()),
         ] {
             if !answer.yes {
                 missing.push(format!("{name}: {}", answer.words));
@@ -2104,7 +2161,10 @@ impl Run<'_> {
             &ancestors,
         );
         match taken {
-            Ok(claim) => self.claim = Some(claim),
+            Ok(mut claim) => {
+                claim.priority = self.b.line_priority();
+                self.claim = Some(claim);
+            }
             Err(Ok(h)) => self.claim_refused = Some(running_refusal(&h)),
             Err(Err(why)) => {
                 self.claim_refused = Some(Refusal::new(
@@ -2483,6 +2543,12 @@ impl Run<'_> {
         if cand.version.is_empty() {
             cand.version = self.b.version_at(&cand.commit).unwrap_or_default();
         }
+        if public_version(&cand.version).is_some()
+            && let Err(why) = crate::line_claim::follow(self.b, &mut cand, &mut self.journal)
+        {
+            return self
+                .refuse_hard(Refusal::new(why, "retry the fleet line read").could_not_run());
+        }
         self.cand = Some(cand.clone());
         let (r, v) = (cand.commit.clone(), cand.version.clone());
         if public_version(&v).is_none() {
@@ -2797,6 +2863,26 @@ impl Run<'_> {
                 }
             }
         }
+        if let Err(why) = crate::line_claim::select(
+            self.b,
+            self.claim.as_ref().is_some_and(|claim| claim.adopted),
+            &mut cand,
+            &mut self.journal,
+            self.t_start,
+        ) {
+            let code = if why.starts_with("CUTTING ELSEWHERE:") {
+                4
+            } else if why.starts_with("COULD NOT RUN:") {
+                3
+            } else {
+                2
+            };
+            self.last = why;
+            let last = self.last.clone();
+            self.say(&last);
+            return Err(Halt::Said(code));
+        }
+        self.cand = Some(cand.clone());
         let mut carried = None;
         if !cand.carry.is_empty() {
             let mut line = self.journal.as_ref().map_or_else(
@@ -2928,6 +3014,7 @@ impl Run<'_> {
                         "check the permissions of the clone's .git/aterm-release, then re-run",
                     ));
                 }
+                self.b.fleet_hand();
                 let ran = self.b.reexec(&prover);
                 // A signal this run caught stops the release here, at this step, when the claim
                 // still names this run as the re-run ends: no re-run took it over. A re-run that
@@ -2954,14 +3041,14 @@ impl Run<'_> {
             return;
         };
         if self.dry && (c.bump_from.is_some() || !c.carry.is_empty()) {
-            let pending = Answer::no(if c.bump_from.is_some() {
+            let pending = if c.bump_from.is_some() {
                 "the bump commit is not made yet"
             } else {
                 "the line's new head is not made yet"
-            });
+            };
             self.facts = Facts {
-                built: pending.clone(),
-                verified: pending,
+                built: Answer::no(pending),
+                checks: crate::check_record::Checks::no(pending),
                 ..Facts::default()
             };
             return;
@@ -2975,12 +3062,9 @@ impl Run<'_> {
         if facts.cut.is_none()
             && let Some(spent) = self.spent()
         {
-            let stale = Answer::no(format!(
-                "{}; step 5 reserves anew and builds again",
-                spent.words()
-            ));
-            facts.built = stale.clone();
-            facts.verified = stale;
+            let stale = format!("{}; step 5 reserves anew and builds again", spent.words());
+            facts.built = Answer::no(stale.clone());
+            facts.checks = facts.checks.bundle_stale(stale);
         }
         self.facts = facts;
         if c.bump_from.is_none() {
@@ -3014,10 +3098,8 @@ impl Run<'_> {
 
     fn skip_verify(&self) -> Option<String> {
         self.claimed_words().or_else(|| {
-            self.facts
-                .verified
-                .yes
-                .then(|| self.facts.verified.words.clone())
+            let checks = &self.facts.checks;
+            checks.complete().then(|| checks.line().to_owned())
         })
     }
 
@@ -3205,7 +3287,7 @@ impl Run<'_> {
     /// than [`crate::release_disk::WARM`] where the clone's build is warm, or
     /// [`crate::release_disk::COLD`]. Nothing is walked to size it.
     fn disk_still_needed(&mut self) -> Flow {
-        if self.facts.verified.yes {
+        if self.facts.checks.complete() {
             return Ok(());
         }
         let (_, warm) = self.b.disk();
@@ -3245,7 +3327,6 @@ impl Run<'_> {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
-        self.verification_answer()?;
         if let Some(why) = self.stage_done() {
             self.skip(&why);
             return Ok(());
@@ -3365,19 +3446,27 @@ impl Run<'_> {
     }
 
     fn verification_answer(&mut self) -> Flow {
-        if !self.facts.verified.unanswered {
+        let answer = self.facts.checks.answer();
+        if !answer.unanswered {
             return Ok(());
         }
+        let words = answer.words.clone();
         self.refuse(
             Refusal::new(
-                format!(
-                    "the cutter's own judge could not answer: {}",
-                    self.facts.verified.words
-                ),
+                format!("the cutter's own judge could not answer: {words}"),
                 format!("run {RELEASE_COMMAND} again once it answers (the candidate is kept)"),
             )
             .could_not_run(),
         )
+    }
+
+    /// The FAIL rule (A19): a FAIL record of R's tree under this seal refuses the tree at once,
+    /// exit 1, before anything is staged, built or verified again; only a new hop changes it.
+    fn fail_rule(&mut self) -> Flow {
+        match self.facts.checks.fail_refusal(&self.commit_r()) {
+            Some(refusal) => self.refuse(refusal),
+            None => Ok(()),
+        }
     }
 
     fn stage_verdict(
@@ -3743,7 +3832,7 @@ impl Run<'_> {
             }
             if !said_waiting {
                 let (v, r) = (self.version(), self.commit_r());
-                let ready = if self.facts.verified.yes {
+                let ready = if self.facts.checks.complete() {
                     "READY (built once, verified)"
                 } else {
                     "not yet READY"
@@ -3971,10 +4060,24 @@ impl Run<'_> {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
-        let words = self.facts.verified.words.clone();
+        self.fail_rule()?;
+        // A resume runs only the checks with no passing record, carrying the test binaries that
+        // passed (A19); a FAIL refused above, so none of them failed in this tree.
+        let run = self.facts.checks.run();
+        let words = self.facts.checks.line().to_owned();
+        let only = if run.strict_subset() {
+            format!(" --checks {}", run.checks.join(","))
+        } else {
+            String::new()
+        };
         if self.dry {
+            let app = if run.reads_the_bundle() {
+                " --app <the bundle step 5 built>"
+            } else {
+                ""
+            };
             self.finish(&format!(
-                "would run `targo {} --app <the bundle step 5 built>` in the clone ({words})",
+                "would run `targo {}{only}{app}` in the clone ({words})",
                 VERIFY_ARGS.join(" ")
             ));
             return Ok(());
@@ -3986,11 +4089,30 @@ impl Run<'_> {
                 format!("{RELEASE_COMMAND} (step 5 builds it)"),
             ));
         };
-        let rerun = verify_command(&artifact.app.display().to_string());
+        let app = artifact.app.display().to_string();
+        let rerun = verify_command(&app);
         let log = self.b.log_path(Step::Verify);
-        self.say(&format!("        runs: {rerun}"));
+        if run.strict_subset() {
+            let carried = match run.passed_binaries.len() {
+                0 => String::new(),
+                1 => ", carrying the 1 test binary that passed (--passed-binaries)".into(),
+                n => format!(", carrying the {n} test binaries that passed (--passed-binaries)"),
+            };
+            let app = if run.reads_the_bundle() {
+                format!(" --app {}", shell_word(&app))
+            } else {
+                String::new()
+            };
+            self.say(&format!(
+                "        runs: targo {}{only}{app} — the checks with no passing record of this \
+                 tree under this seal{carried}",
+                VERIFY_ARGS.join(" "),
+            ));
+        } else {
+            self.say(&format!("        runs: {rerun}"));
+        }
         self.say(&format!("        log: {}", log.display()));
-        let ran = self.b.verify(&c, &p, &artifact);
+        let ran = self.b.verify(&c, &p, &artifact, &run);
         self.refresh();
         if let Some(spent) = self.spent() {
             return self.refuse(
@@ -4011,21 +4133,31 @@ impl Run<'_> {
             Ok(ran) => ran,
             Err(refusal) => return self.refuse(refusal),
         };
-        if self.facts.verified.yes {
-            let words = self.facts.verified.words.clone();
+        if self.facts.checks.complete() {
+            let words = self.facts.checks.line().to_owned();
             self.finish(&words);
             return Ok(());
         }
-        let words = self.facts.verified.words.clone();
+        if let Some(refusal) = self.facts.checks.fail_refusal(&c.commit) {
+            return self.refuse(refusal.detail(ran.detail));
+        }
+        let words = self.facts.checks.line().to_owned();
+        let missing = self.facts.checks.missing.join(", ");
         let r = short(&c.commit).to_string();
         let refusal = match ran.code {
             0 => Refusal::new(
-                format!("`verify release` passed for {r}, and its record cannot be read: {words}"),
-                format!("run {RELEASE_COMMAND} again once it reads (the candidate is kept)"),
+                format!(
+                    "`verify release` passed for {r}, and the records of {missing} cannot be \
+                     read: {words}"
+                ),
+                format!("run {RELEASE_COMMAND} again once they read (the candidate is kept)"),
             )
             .could_not_run(),
             1 => Refusal::new(
-                format!("`verify release` failed for {r} (exit 1)"),
+                format!(
+                    "`verify release` failed for {r} (exit 1), and no FAIL record of it reads: \
+                     {words}"
+                ),
                 format!(
                     "`{rerun}` in the clone runs it again; {}",
                     fix_remedy(&c.commit)
@@ -4034,7 +4166,8 @@ impl Run<'_> {
             code => Refusal::new(
                 format!(
                     "`verify release` could not run every check for {r} (exit {code}: {}) — \
-                     a release needs every check; its log retains completed results",
+                     a release needs every check, and {missing} have no passing record; the \
+                     next run resumes only those",
                     match code {
                         3 => "a check could not run or was skipped",
                         2 => "its command line was refused",
@@ -4053,8 +4186,8 @@ impl Run<'_> {
 
     fn records_stand(&mut self, what_refuses: &str) -> Flow {
         let r = short(&self.commit_r()).to_string();
-        if !self.facts.verified.yes {
-            let words = self.facts.verified.words.clone();
+        if !self.facts.checks.complete() {
+            let words = self.facts.checks.line().to_owned();
             self.refuse(Refusal::new(
                 format!(
                     "`verify release` has not passed for the bundle of {r} ({words}) — \
@@ -4069,8 +4202,8 @@ impl Run<'_> {
     fn ready(&mut self) -> Flow {
         if self.dry {
             self.finish(
-                "would require the `verify release` record to stand for R: READY, or nothing \
-                 goes public",
+                "would require every check's `verify release` record to stand for R: READY, or \
+                 nothing goes public",
             );
             return Ok(());
         }
@@ -4103,6 +4236,11 @@ impl Run<'_> {
             return Ok(());
         }
         self.records_stand("the cut would refuse after the publish")?;
+        if let Err(why) = self.b.fleet_audit() {
+            return self.refuse(
+                Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),
+            );
+        }
         self.provision(true)?;
         self.still_possible(&c, Some("publish"))?;
         self.engine_still_staged(&c, &p)?;
@@ -4170,6 +4308,11 @@ impl Run<'_> {
             ));
             return Ok(());
         }
+        if let Err(why) = self.b.fleet_audit() {
+            return self.refuse(
+                Refusal::new(why, "resume the line on its current holder").could_not_run(),
+            );
+        }
         self.still_possible(&c, Some("cut"))?;
         if let Err(r) = self.b.source_publication(&c) {
             return self.refuse(r);
@@ -4205,6 +4348,11 @@ impl Run<'_> {
                 args.join(" ")
             ));
             return Ok(());
+        }
+        if let Err(why) = self.b.fleet_audit() {
+            return self.refuse(
+                Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),
+            );
         }
         if matches!(mode, CutMode::Fresh) {
             // the engine as the cut will read it: R must be its newest aterm row.
@@ -4488,6 +4636,43 @@ fn newer(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_line_has_release_rank_before_resource_work_and_releases_it_on_drop() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join(RUNNING_FILE);
+        let mut claim = RunClaim::take(
+            &path,
+            (std::process::id(), "test-start"),
+            dir.path(),
+            &mut |_| None,
+            &[],
+        )
+        .unwrap();
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("capacity"));
+        claim.priority = crate::release_steps::line_priority_with(|need, mode| {
+            aterm_capacity::admit_with(
+                &ledger,
+                &aterm_capacity::Live,
+                need,
+                mode,
+                aterm_capacity::Pace::default(),
+                &mut |_| {},
+            )
+        });
+        let priority = claim
+            .priority
+            .as_ref()
+            .expect("line recorded in capacity ledger");
+        assert_eq!(priority.record().need.rank, aterm_capacity::Rank::Release);
+        let ledger_path = priority.path().to_owned();
+        assert!(ledger_path.exists());
+        drop(claim);
+        assert!(
+            !ledger_path.exists(),
+            "a finished line must no longer cancel Background work"
+        );
+    }
 
     /// A run's end removes its claim while the claim names this run, and leaves one a re-run
     /// took over (it now names that live process) to the re-run. NEGATIVE CONTROL: remove the

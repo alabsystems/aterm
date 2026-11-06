@@ -108,3 +108,6 @@ pub const PROBE_LAST_SLEEP: &str = "probe.last_sleep";
 
 /// Probe for the wake the machine is in: a full one (graphics up) or macOS's dark wake.
 pub const PROBE_FULL_WAKE: &str = "probe.full_wake";
+
+/// Approval-policy probe walking a tree a reader descends, held to the secret rules.
+pub const PROBE_BELOW_TREE: &str = "probe.below_tree";

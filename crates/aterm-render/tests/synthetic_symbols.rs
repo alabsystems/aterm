@@ -7,11 +7,8 @@ use aterm_render::procedural::{covers_symbol, symbol_coverage};
 use aterm_render::{FaceId, GlyphClass, GlyphImage, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
 
 fn dejavu() -> Vec<u8> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/DejaVuSansMono.ttf"
-    ))
-    .expect("bundled DejaVu asset")
+    std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+        .expect("bundled DejaVu asset")
 }
 
 fn renderer(runtime: bool, sealed: bool) -> Renderer {

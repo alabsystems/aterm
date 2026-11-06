@@ -54,17 +54,59 @@ fn the_lanes_are_the_one_fleets_and_the_push_follows_the_mail_rules_reader() {
         reader,
         "a mail push follows under the group the mail rule holds the lane for"
     );
-    assert_eq!(addressee(&lane(dst, me), me), Some(dst));
-    for not_ours in [
-        lane(dst, "n-00000000000000cc"),
+    assert_eq!(mail_lane(&lane(dst, me)), Some((dst, me)));
+    for not_a_nodes in [
         lane(dst, "h-owner"),
         lane("h-owner", me),
         format!("/f/local/in/{dst}/s-1/{me}/note"),
         format!("/f/{FLEET}/in/{dst}/s-1/{me}"),
         format!("/f/{FLEET}/in/{dst}/s-1/{me}/note/more"),
     ] {
-        assert_eq!(addressee(&not_ours, me), None, "{not_ours}");
+        assert_eq!(mail_lane(&not_a_nodes), None, "{not_a_nodes}");
     }
+    // A push carries its own lanes exactly, and with retired nodes follows its group over every
+    // lane to the addressee and carries each of its nodes' lanes within it.
+    let mail = Lane::Mail { dst: dst.into() };
+    assert_eq!(
+        mail.records(me, &BTreeSet::new(), false),
+        (mail_lanes(dst, me), Vec::new())
+    );
+    let old = "n-00000000000000a0";
+    let olds = BTreeSet::from([old.to_owned()]);
+    assert_eq!(
+        mail.records(me, &olds, false),
+        (
+            format!("/f/alab/in/{dst}/*/*/*"),
+            vec![mail_lanes(dst, me), mail_lanes(dst, old)]
+        )
+    );
+    let moved = Lane::Move {
+        old: "n-00000000000000b0".into(),
+        new: dst.into(),
+    };
+    assert_eq!(
+        moved.records(me, &olds, false).1,
+        vec![
+            mail_lanes("n-00000000000000b0", me),
+            mail_lanes("n-00000000000000b0", old)
+        ]
+    );
+    assert_eq!(
+        Lane::Say { dst: dst.into() }.records(me, &olds, false),
+        (say_lanes(me), Vec::new()),
+        "topics written under a retired node are not carried"
+    );
+    // The far end's ring takes the peer's mail under its retired nodes, and only to itself.
+    let ring = peer_ring(FLEET, dst, me, &olds);
+    assert_eq!(ring.len(), 6);
+    assert_eq!(ring[0], format!("rw,p={me}:/f/alab/in/{dst}/*/{me}/*"));
+    assert_eq!(ring[5], format!("rw,p={me}:/f/alab/in/{dst}/*/{old}/*"));
+    let many: BTreeSet<String> = (0..20).map(|i| format!("n-{i:016x}")).collect();
+    assert_eq!(
+        peer_ring(FLEET, dst, me, &many).len(),
+        5 + RING_OLDS_MAX,
+        "bounded"
+    );
     assert!(is_node(me) && !is_node("n-AA00000000000000") && !is_node("n-aa"));
 }
 
@@ -143,6 +185,19 @@ fn a_hand_off_reads_back_and_follows_each_rotation_to_a_member() {
         ..handoff.clone()
     };
     assert_eq!(cycle.current("n-00000000000000e1"), None, "a cycle ends");
+    assert_eq!(
+        handoff.retired("n-000000000000000c"),
+        BTreeSet::from([
+            "n-00000000000000b1".to_owned(),
+            "n-00000000000000b2".to_owned()
+        ]),
+        "every node a seat held before, through each rotation"
+    );
+    assert!(handoff.retired("n-000000000000000a").is_empty());
+    assert!(
+        cycle.retired("n-00000000000000e1").is_empty(),
+        "a cycle names no seat"
+    );
 
     let dir = aterm_tempfile::tempdir().expect("scratch");
     aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
@@ -175,7 +230,7 @@ fn the_plan_pushes_only_to_members_this_mac_wrote_to() {
         .into();
     let mail = |dst: &str| Lane::Mail { dst: dst.into() };
     assert_eq!(
-        plan(me, &handoff, &holders, &written, false),
+        plan(me, &BTreeSet::new(), &handoff, &holders, &written, false),
         [
             mail("n-000000000000000b"),
             Lane::Move {
@@ -190,8 +245,24 @@ fn the_plan_pushes_only_to_members_this_mac_wrote_to() {
         "no push to itself, to a node that is no member, or to a member it wrote nothing"
     );
     assert!(
-        plan(me, &handoff, &holders, &written, true).contains(&mail("n-000000000000000c")),
+        plan(me, &BTreeSet::new(), &handoff, &holders, &written, true)
+            .contains(&mail("n-000000000000000c")),
         "the control pushes to every member"
+    );
+    let olds = BTreeSet::from(["n-00000000000000a0".to_owned()]);
+    assert!(
+        plan(
+            me,
+            &olds,
+            &handoff,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false
+        )
+        .contains(&Lane::Inbox {
+            old: "n-00000000000000a0".into()
+        }),
+        "a retired node of this Mac's own gets its unread mail moved, written to or not"
     );
 }
 
@@ -254,6 +325,19 @@ impl Mac {
     pub(crate) fn rekeyed(&self, tag: u8) -> (String, [u8; 32]) {
         let key = key_of(tag);
         (node_of(&key), key)
+    }
+
+    /// This Mac after its node key rotated to Mac `tag`'s, as its bridge sees it: the same
+    /// `bus.log` under the same secret, the new key's node.
+    pub(crate) fn rotated(&self, tag: u8) -> Self {
+        let key = key_of(tag);
+        Self {
+            key,
+            node: node_of(&key),
+            secret: self.secret.clone(),
+            broker: Arc::clone(&self.broker),
+            _dir: aterm_tempfile::tempdir().expect("scratch"),
+        }
     }
 
     pub(crate) fn mint(secret: &[u8], grant: &str) -> io::Result<Capability> {
@@ -417,7 +501,39 @@ impl Peer {
 /// `from`'s pushes to `peers` over `net`. With `wide` each peer serves `from` the mail grant of
 /// the ring before C3, which took a peer's mail for any Mac.
 pub(crate) fn routes_of(from: &Mac, peers: Vec<Peer>, net: &Arc<Net>, wide: bool) -> Routes {
-    let (me, key) = (from.node.clone(), from.key);
+    routes_as(
+        from,
+        (&from.node, from.key),
+        &BTreeSet::new(),
+        peers,
+        net,
+        wide,
+    )
+}
+
+/// [`routes_of`] for `from` under the node and key `(me, key)`, whose seat the peers know held
+/// `olds` before: what a rotated Mac's node service runs on the same `bus.log`.
+pub(crate) fn routes_as(
+    from: &Mac,
+    me: (&str, [u8; 32]),
+    olds: &BTreeSet<String>,
+    peers: Vec<Peer>,
+    net: &Arc<Net>,
+    wide: bool,
+) -> Routes {
+    routes_noting(from, me, olds, (peers, net, wide), Arc::new(|_| {}))
+}
+
+/// [`routes_as`], journaling to `note`.
+fn routes_noting(
+    from: &Mac,
+    (me, key): (&str, [u8; 32]),
+    olds: &BTreeSet<String>,
+    (peers, net, wide): (Vec<Peer>, &Arc<Net>, bool),
+    note: NoteFn,
+) -> Routes {
+    let me = me.to_owned();
+    let olds = olds.clone();
     let secret = from.secret.clone();
     let net = Arc::clone(net);
     Routes::start(RoutesConfig {
@@ -435,7 +551,7 @@ pub(crate) fn routes_of(from: &Mac, peers: Vec<Peer>, net: &Arc<Net>, wide: bool
                 .iter()
                 .find(|peer| peer.node == node)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such Mac"))?;
-            let mut ring = peer_ring(FLEET, &peer.node, &me);
+            let mut ring = peer_ring(FLEET, &peer.node, &me, &olds);
             if wide {
                 ring[0] = format!("rw,p={me}:/f/{FLEET}/in/*/*/{me}/*");
             }
@@ -451,7 +567,7 @@ pub(crate) fn routes_of(from: &Mac, peers: Vec<Peer>, net: &Arc<Net>, wide: bool
                     .collect::<io::Result<_>>()?,
             })
         }),
-        note: Arc::new(|_| {}),
+        note,
     })
     .expect("the routes start")
 }
@@ -698,6 +814,236 @@ fn held_mail_moves_to_a_rotated_macs_new_node_once() {
             || a.broker.group_start(&mail_group(&b.node)) > late,
         );
         let _ = new_key;
+        drop(routes);
+    }
+}
+
+/// A's hand-off after A rotated from `a.node` to `new`: B and the new node the members, the old
+/// node moved to the new one.
+fn rotated_from(a: &Mac, new: &str, b: &Mac) -> Handoff {
+    Handoff {
+        me: new.to_owned(),
+        members: [new.to_owned(), b.node.clone()].into(),
+        moved: [(a.node.clone(), new.to_owned())].into(),
+    }
+}
+
+/// **A MAC CARRIES THE RETIRED NODES A PEER'S RING NAMES, AND SAYS WHICH IT DOES NOT** (§11 C3b):
+/// a peer's ring names the first [`RING_OLDS_MAX`] nodes a key rotation retired of a seat, and a
+/// lane it refuses would stop a push at its first record, all its mail with it; so with one more
+/// retired node than that, this Mac's pushes take the same first ones (its own-inbox moves
+/// among them) and the journal names the one left, once.
+/// NEGATIVE CONTROL: with [`RING_OLDS_MAX`] retired nodes, every one is taken and nothing said.
+#[test]
+fn a_mac_carries_the_retired_nodes_a_peers_ring_names_and_says_which_it_does_not() {
+    let a = Mac::new(20);
+    let net = Arc::new(Net::default());
+    for count in [RING_OLDS_MAX + 1, RING_OLDS_MAX] {
+        let case = format!("count={count}");
+        let olds: BTreeSet<String> = (0..count)
+            .map(|i| node_of(&key_of(100 + u8::try_from(i).unwrap())))
+            .collect();
+        let notes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let noted = Arc::clone(&notes);
+        let routes = routes_noting(
+            &a,
+            (&a.node, a.key),
+            &olds,
+            (Vec::new(), &net, false),
+            Arc::new(move |line| noted.lock().unwrap().push(line.to_owned())),
+        );
+        let handoff = Handoff {
+            me: a.node.clone(),
+            members: [a.node.clone()].into(),
+            moved: olds
+                .iter()
+                .map(|old| (old.clone(), a.node.clone()))
+                .collect(),
+        };
+        routes.set(&handoff, &BTreeSet::new());
+        routes.set(&handoff, &BTreeSet::new());
+        let moves: BTreeSet<String> = routes
+            .status()
+            .into_keys()
+            .filter_map(|lane| match lane {
+                Lane::Inbox { old } => Some(old),
+                _ => None,
+            })
+            .collect();
+        let named: BTreeSet<String> = olds.iter().take(RING_OLDS_MAX).cloned().collect();
+        assert_eq!(moves, named, "{case}: the ring's first nodes, moved");
+        let ring = peer_ring(FLEET, &node_of(&key_of(99)), &a.node, &olds);
+        for old in &olds {
+            let grant = format!(
+                "rw,p={}:/f/{FLEET}/in/{}/*/{old}/*",
+                a.node,
+                node_of(&key_of(99))
+            );
+            assert_eq!(ring.contains(&grant), named.contains(old), "{case}: {old}");
+        }
+        let said = notes.lock().unwrap().clone();
+        let left = olds.iter().last().unwrap();
+        if count > RING_OLDS_MAX {
+            assert_eq!(said.len(), 1, "{case}: once: {said:?}");
+            assert!(
+                said[0].contains(left.as_str()),
+                "{case}: names {left}: {said:?}"
+            );
+        } else {
+            assert!(said.is_empty(), "{case}: {said:?}");
+        }
+        drop(routes);
+    }
+}
+
+/// **A ROTATED SENDER CARRIES WHAT IT HELD UNDER ITS OLD NODE, ONCE** (§11 C3b): A held notes
+/// for B while B was cut off, then rotated its node key, on the same `bus.log`. Its push to B,
+/// now under its new node and producer, carries those notes under their subjects (B's ring takes
+/// A's mail under the node its seat held before) and a note A writes after, each once and in
+/// order, once B is back; A's group for B, the mail rule's reader of every one of those lanes,
+/// passes all of them.
+/// NEGATIVE CONTROL: [`ONE_NODE`], the pushes before C3b, counts and carries the new node's lanes
+/// alone: the late note lands and the held ones never do, while the group that held them passes
+/// them unsent.
+#[test]
+fn a_rotated_sender_carries_the_mail_it_held_under_its_old_node_once() {
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (a, b) = (Mac::new(8), Mac::new(9));
+        let (new_node, new_key) = a.rekeyed(18);
+        let net = Arc::new(Net::default());
+        net.cut(&b.node);
+        let routes = routes_of(&a, vec![Peer::of(&b)], &net, false);
+        routes.set(&members(&a, &[&a.node, &b.node]), &BTreeSet::new());
+        let held = [a.post(&b.node, 1, b"held 1"), a.post(&b.node, 2, b"held 2")];
+        until(&format!("{case}: the watch saw the notes"), || {
+            routes.written().contains(&b.node)
+        });
+        drop(routes);
+
+        // A's node key rotates: the node service's next generation, on the same bus.log.
+        let olds = BTreeSet::from([a.node.clone()]);
+        ONE_NODE.with(|on| on.set(control));
+        let routes = routes_as(
+            &a,
+            (&new_node, new_key),
+            &olds,
+            vec![Peer::of(&b)],
+            &net,
+            false,
+        );
+        ONE_NODE.with(|on| on.set(false));
+        routes.set(&rotated_from(&a, &new_node, &b), &BTreeSet::new());
+        net.heal(&b.node);
+        routes.kick();
+        let mut client = a.client(
+            new_key,
+            &[format!("rw,p={new_node}:{}", written_lanes(&new_node))],
+        );
+        let late = client
+            .publish(pid(&new_node), 3, &lane(&b.node, &new_node), b"late")
+            .expect("the new node's bridge posts")
+            .0;
+        until(&format!("{case}: the late note lands"), || {
+            b.mail_for(&b.node).contains(&b"late".to_vec())
+        });
+        until(
+            &format!("{case}: A's group for B passes the late note"),
+            || a.broker.group_start(&mail_group(&b.node)) > late,
+        );
+        let landed: Vec<(String, Vec<u8>)> = b
+            .holds(&format!("/f/{FLEET}/in/{}/>", b.node))
+            .into_iter()
+            .map(|(_, subject, body, _)| (subject, body))
+            .collect();
+        if control {
+            assert_eq!(
+                landed,
+                [(lane(&b.node, &new_node), b"late".to_vec())],
+                "{case}: the held notes are never carried"
+            );
+            assert!(
+                a.broker.group_start(&mail_group(&b.node)) > held[1],
+                "{case}: and the group that held them has passed them"
+            );
+        } else {
+            assert_eq!(
+                landed,
+                [
+                    (lane(&b.node, &a.node), b"held 1".to_vec()),
+                    (lane(&b.node, &a.node), b"held 2".to_vec()),
+                    (lane(&b.node, &new_node), b"late".to_vec()),
+                ],
+                "{case}: each once, in order, under the subjects A wrote"
+            );
+        }
+        drop(routes);
+    }
+}
+
+/// **A BURST THE OLD NODE LANDED AND NEVER COMMITTED LANDS ONCE**: A's push under its old node
+/// had B take its held notes when the generation ended, before A's group for B moved past them
+/// (a stop mid-burst). The new node's push sends them again under its new producer, and B, told
+/// the new node continues the old one's sequence (as aterm-mesh's `lineage` tells `bus.log` from
+/// the standings), answers them from the records it holds: each lands once.
+/// NEGATIVE CONTROL: B told nothing appends each a second time.
+#[test]
+fn a_burst_the_old_node_landed_and_never_committed_lands_once() {
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (a, b) = (Mac::new(10), Mac::new(11));
+        let (new_node, new_key) = a.rekeyed(20);
+        let held = [a.post(&b.node, 1, b"held 1"), a.post(&b.node, 2, b"held 2")];
+        // What the old push left on B: its burst appended, numbered by A's offsets.
+        let mut old_push = b.client(
+            a.key,
+            &peer_ring(FLEET, &b.node, &a.node, &BTreeSet::new())[..1],
+        );
+        for (off, body) in held.iter().zip([&b"held 1"[..], b"held 2"]) {
+            old_push
+                .publish(pid(&a.node), *off, &lane(&b.node, &a.node), body)
+                .expect("the old push's burst lands on B");
+        }
+        assert_eq!(a.broker.group_start(&mail_group(&b.node)), 0, "{case}");
+        if !control {
+            b.broker
+                .set_producer_lineage([(pid(&new_node), vec![pid(&a.node)])]);
+        }
+
+        let net = Arc::new(Net::default());
+        let olds = BTreeSet::from([a.node.clone()]);
+        let routes = routes_as(
+            &a,
+            (&new_node, new_key),
+            &olds,
+            vec![Peer::of(&b)],
+            &net,
+            false,
+        );
+        routes.set(&rotated_from(&a, &new_node, &b), &BTreeSet::new());
+        until(&format!("{case}: A's group for B passes the burst"), || {
+            a.broker.group_start(&mail_group(&b.node)) > held[1]
+        });
+        let want: Vec<Vec<u8>> = if control {
+            vec![
+                b"held 1".to_vec(),
+                b"held 2".to_vec(),
+                b"held 1".to_vec(),
+                b"held 2".to_vec(),
+            ]
+        } else {
+            vec![b"held 1".to_vec(), b"held 2".to_vec()]
+        };
+        assert_eq!(b.mail_for(&b.node), want, "{case}");
+        let status = routes.status();
+        let pushed = &status[&Lane::Mail {
+            dst: b.node.clone(),
+        }];
+        assert_eq!(
+            (pushed.appended, pushed.deduped),
+            if control { (2, 0) } else { (0, 2) },
+            "{case}"
+        );
         drop(routes);
     }
 }

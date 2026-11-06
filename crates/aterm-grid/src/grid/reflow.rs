@@ -841,10 +841,12 @@ impl Grid {
             if from_front > 0 {
                 // Stage front rows when a retaining store is attached (without one `drain_lazy_buffer` would discard them) or detached for an off-thread reflow (flushed on re-attach).
                 if self.storage.stages_evicted_rows() {
-                    let drained_rows: Vec<Row> = self.storage.rows.drain(..from_front).collect();
-                    for row in drained_rows {
-                        let extracted =
-                            Self::extract_row_extras(&row, &self.storage.extras, u16::MAX);
+                    for row in self.storage.rows.drain(..from_front) {
+                        let extracted = Self::extract_row_extras(
+                            &row,
+                            &self.storage.cursor_state.extras,
+                            u16::MAX,
+                        );
                         self.storage.lazy_buffer.push_row(&row, extracted);
                         // SAFETY: these rows came from storage.rows, and staging copied their content before returning their allocations.
                         unsafe { row.recycle(&mut self.storage.pages) };
@@ -858,11 +860,13 @@ impl Grid {
                 if self.storage.stages_evicted_rows() {
                     let start = self.storage.rows.len() - from_back;
                     let remaining_scrollback = scrollback.saturating_sub(from_front);
-                    let drained_rows: Vec<Row> = self.storage.rows.drain(start..).collect();
-                    for (i, row) in drained_rows.into_iter().enumerate() {
+                    for (i, row) in self.storage.rows.drain(start..).enumerate() {
                         let external_row = row_u16(start + i - remaining_scrollback);
-                        let extracted =
-                            Self::extract_row_extras(&row, &self.storage.extras, external_row);
+                        let extracted = Self::extract_row_extras(
+                            &row,
+                            &self.storage.cursor_state.extras,
+                            external_row,
+                        );
                         self.storage.lazy_buffer.push_row(&row, extracted);
                         // SAFETY: the removed row belongs to storage.pages; the lazy buffer owns its content before this transfer.
                         unsafe { row.recycle(&mut self.storage.pages) };
@@ -1372,8 +1376,7 @@ impl Grid {
             0
         };
         if push_count > 0 {
-            let drained_rows: Vec<Row> = result.rows.drain(..push_count).collect();
-            for (i, row) in drained_rows.into_iter().enumerate() {
+            for (i, row) in result.rows.drain(..push_count).enumerate() {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
                 let extracted = Self::extract_row_extras(&row, &result.extras, row_idx);
                 self.storage.lazy_buffer.push_row(&row, extracted);
@@ -1394,21 +1397,20 @@ impl Grid {
         let mut seams = Seams::default();
         if pushed > 0 {
             let end = (target_rows + pushed).min(result.rows.len());
-            let mut bottom: Vec<Row> = result.rows.drain(target_rows..end).collect();
-            if let Some(first) = bottom.first_mut().filter(|row| row.is_wrapped()) {
-                first.set_wrapped(false);
-                seams.bottom = true;
-            }
-            if let Some(top) = result.rows.first_mut().filter(|row| row.is_wrapped()) {
-                top.set_wrapped(false);
-                seams.top = true;
-            }
-            for (i, row) in bottom.into_iter().enumerate() {
+            for (i, mut row) in result.rows.drain(target_rows..end).enumerate() {
+                if i == 0 && row.is_wrapped() {
+                    row.set_wrapped(false);
+                    seams.bottom = true;
+                }
                 let extracted =
                     Self::extract_row_extras(&row, &result.extras, row_u16(target_rows + i));
                 self.storage.lazy_buffer.push_row(&row, extracted);
                 // SAFETY: Reflow built these rows in result.pages; the lazy buffer now owns the preserved data.
                 unsafe { row.recycle(&mut result.pages) };
+            }
+            if let Some(top) = result.rows.first_mut().filter(|row| row.is_wrapped()) {
+                top.set_wrapped(false);
+                seams.top = true;
             }
         }
 

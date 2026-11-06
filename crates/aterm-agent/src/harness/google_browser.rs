@@ -7,12 +7,13 @@
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aterm_json::{Value, json};
 
 use super::google_identity::{Identity, Session};
 use super::headless_oauth::{BrowserChild, CdpClient, HeadlessBrowser};
+use super::wake_deadline::WakeDeadline;
 
 /// A bounded browser bootstrap failure; none contains a URL, token or password.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +113,7 @@ pub struct MemoryBrowser {
     _child: BrowserChild,
     cdp: CdpClient,
     context: String,
-    deadline: Instant,
+    deadline: WakeDeadline,
     _profile: aterm_tempfile::TempDir,
     _identity: Option<Session>,
     identity: Identity,
@@ -281,7 +282,7 @@ impl MemoryBrowser {
         identity: &Identity,
         machine_state: &Path,
         home: Option<&Path>,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<Self, Error> {
         Self::start_scoped(identity, machine_state, home, deadline, None)
     }
@@ -291,7 +292,7 @@ impl MemoryBrowser {
         identity: &Identity,
         machine_state: &Path,
         home: Option<&Path>,
-        deadline: Instant,
+        deadline: WakeDeadline,
         work: Option<super::account_work::Scope>,
     ) -> Result<Self, Error> {
         if work
@@ -300,7 +301,7 @@ impl MemoryBrowser {
         {
             return Err(Error::Prepare);
         }
-        remaining(deadline)?;
+        unpassed(deadline)?;
         let claim = identity
             .claim(machine_state)
             .map_err(|_| Error::IdentityBusy)?;
@@ -310,14 +311,14 @@ impl MemoryBrowser {
             home,
             &mut super::headless_fetch::Curl,
             &|| {
-                Instant::now() >= deadline
+                deadline.passed()
                     || work
                         .as_ref()
                         .is_some_and(super::account_work::Scope::cancelled)
             },
         )
         .map_err(|_| Error::Prepare)?;
-        remaining(deadline)?;
+        unpassed(deadline)?;
         let profile = aterm_tempfile::tempdir().map_err(|_| Error::Prepare)?;
         let browser = HeadlessBrowser {
             path: browser,
@@ -344,18 +345,18 @@ impl MemoryBrowser {
         let child = BrowserChild::new(child);
         let mut cdp = CdpClient::new_scoped(to_browser, from_browser, work.clone())
             .map_err(|_| Error::Launch)?;
-        let context = cdp
-            .call(
-                None,
-                "Target.createBrowserContext",
-                json!({"disposeOnDetach":true}),
-                remaining(deadline)?,
-            )
-            .map_err(|_| Error::Protocol)?
-            .get("browserContextId")
-            .and_then(Value::as_str)
-            .ok_or(Error::Protocol)?
-            .to_owned();
+        let context = call_within(
+            &mut cdp,
+            deadline,
+            CALL_WAIT,
+            None,
+            "Target.createBrowserContext",
+            json!({"disposeOnDetach":true}),
+        )?
+        .get("browserContextId")
+        .and_then(Value::as_str)
+        .ok_or(Error::Protocol)?
+        .to_owned();
         if context.is_empty() {
             return Err(Error::Protocol);
         }
@@ -668,9 +669,14 @@ impl MemoryBrowser {
     }
 
     fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value, Error> {
-        self.cdp
-            .call(session, method, params, remaining(self.deadline)?)
-            .map_err(|_| Error::Protocol)
+        call_within(
+            &mut self.cdp,
+            self.deadline,
+            CALL_WAIT,
+            session,
+            method,
+            params,
+        )
     }
 }
 
@@ -813,18 +819,83 @@ impl Drop for MemoryBrowser {
     }
 }
 
-fn remaining(deadline: Instant) -> Result<Duration, Error> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
+/// The longest one browser call waits for its answer.
+const CALL_WAIT: Duration = Duration::from_secs(10);
+
+/// [`Error::Deadline`] once `deadline`, which counts the time the host slept, has passed.
+fn unpassed(deadline: WakeDeadline) -> Result<(), Error> {
+    if deadline.passed() {
         Err(Error::Deadline)
     } else {
-        Ok(left.min(Duration::from_secs(10)))
+        Ok(())
     }
+}
+
+/// One DevTools call within `deadline`, which counts the time the host slept, and at most `cap`
+/// ([`WakeDeadline::within`]): its waits look at both clocks at least every
+/// [`super::wake_deadline::SLEEP_CHECK`] ([`CdpClient::call_until`]), so a call the host slept
+/// past ends within that of its waking. [`Error::Deadline`] where `deadline` has passed before it
+/// is sent.
+fn call_within(
+    cdp: &mut CdpClient,
+    deadline: WakeDeadline,
+    cap: Duration,
+    session: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<Value, Error> {
+    unpassed(deadline)?;
+    cdp.call_until(session, method, params, deadline.within(cap))
+        .map_err(|_| Error::Protocol)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// A GOOGLE BROWSER CALL ITS HOST SLEPT THROUGH ENDS AT ITS NEXT LOOK (KI-1105-14): a call
+    /// given an hour, to a browser that reads it and never answers, whose host slept two hours
+    /// once it was sent, ends then. NEGATIVE CONTROL: a call that took what was left of its
+    /// deadline as one span, on the clock that stops in sleep, waited the hour out, which the
+    /// one-minute hang detector reports.
+    #[test]
+    fn a_browser_call_its_host_slept_through_ends_at_its_next_look() {
+        const HOUR: Duration = Duration::from_secs(3600);
+        let (said, called) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let seam = super::super::wake_deadline::SleepSeam::hold();
+            let sleeper = seam.sleeper();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (mut commands, to_browser) = std::io::pipe().unwrap();
+            let (from_browser, answers) = std::io::pipe().unwrap();
+            let browser = std::thread::spawn(move || {
+                let mut byte = [0u8; 1];
+                // A command ends at its NUL.
+                while std::io::Read::read(&mut commands, &mut byte).unwrap() == 1 && byte[0] != 0 {}
+                sleeper.slept(2 * HOUR);
+                // Never answers while the call runs.
+                let _ = released.recv();
+                drop(answers);
+            });
+            let mut cdp = CdpClient::new(to_browser, from_browser);
+            let got = call_within(
+                &mut cdp,
+                WakeDeadline::after(HOUR),
+                HOUR,
+                None,
+                "Runtime.evaluate",
+                json!({"expression":"1"}),
+            );
+            drop(release);
+            browser.join().expect("stand-in browser");
+            let _ = said.send(got);
+        });
+        let got = called
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the call waited on the clock that stops in sleep, past the deadline its host slept through");
+        assert_eq!(got.err(), Some(Error::Protocol));
+    }
 
     #[test]
     fn pending_google_cookies_retain_work_until_the_identity_claim_retires() {
@@ -931,8 +1002,13 @@ mod tests {
         let identity = registry.resolve("fixture", "one").unwrap().0;
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut browser =
-            MemoryBrowser::start(identity, root.path(), home.as_deref(), deadline).unwrap();
+        let mut browser = MemoryBrowser::start(
+            identity,
+            root.path(),
+            home.as_deref(),
+            WakeDeadline::after(Duration::from_secs(60)),
+        )
+        .unwrap();
         let listener = aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -998,8 +1074,13 @@ mod tests {
         let identity = registry.resolve("fixture", "one").unwrap().0;
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut browser =
-            MemoryBrowser::start(identity, root.path(), home.as_deref(), deadline).unwrap();
+        let mut browser = MemoryBrowser::start(
+            identity,
+            root.path(),
+            home.as_deref(),
+            WakeDeadline::after(Duration::from_secs(60)),
+        )
+        .unwrap();
         let page = browser.open("about:blank").unwrap();
         browser
             .evaluate(
@@ -1077,7 +1158,7 @@ mod tests {
         let registry = super::super::google_identity::Registry::parse("[[identities]]\nid='encrypted-fixture'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='fixture'\naccount='one'\nidentity='encrypted-fixture'\nexpected_email='fixture@example.invalid'\n").unwrap();
         let identity = registry.resolve("fixture", "one").unwrap().0;
         let browser_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let mut browser =
             MemoryBrowser::start(identity, root.path(), browser_home.as_deref(), deadline).unwrap();
         assert!(!browser.restore_session(store_home.path()).unwrap());
@@ -1129,7 +1210,7 @@ mod tests {
         let registry = super::super::google_identity::Registry::parse(text).unwrap();
         let identity = registry.resolve("agy", "one").unwrap().0;
         let browser_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = WakeDeadline::after(Duration::from_secs(60));
         let mut browser =
             MemoryBrowser::start(identity, state.path(), browser_home.as_deref(), deadline)
                 .unwrap();
@@ -1248,7 +1329,7 @@ mod tests {
             identity,
             root.path(),
             home.as_deref(),
-            Instant::now() + Duration::from_secs(300),
+            WakeDeadline::after(Duration::from_secs(300)),
         )
         .unwrap();
         let page = browser.open("about:blank").unwrap();
@@ -1278,7 +1359,7 @@ mod tests {
             identity,
             root.path(),
             home.as_deref(),
-            Instant::now() + Duration::from_secs(60),
+            WakeDeadline::after(Duration::from_secs(60)),
         )
         .unwrap();
         let cookies = restarted

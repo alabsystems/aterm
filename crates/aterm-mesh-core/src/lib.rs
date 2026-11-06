@@ -52,6 +52,7 @@ pub mod capacity;
 pub mod gap_heal;
 pub mod no_lost_edit;
 pub mod relay;
+pub mod relay_live;
 
 // Each property's binding island names `trust_import_` terms (the compiled kernels), which defers
 // it and every island after it, so the binding islands come last, after every spec island.
@@ -72,4 +73,9 @@ verify_island! {
     #[rustfmt::skip]
     #[path = "no_lost_edit_binding_island.rs"]
     mod no_lost_edit_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "relay_live_binding_island.rs"]
+    mod relay_live_binding;
 }

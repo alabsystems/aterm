@@ -103,8 +103,8 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn atpkg() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_atpkg"))
+fn atpkg() -> PathBuf {
+    aterm_tempfile::bin_exe("atpkg")
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
          if [ -f {marker} ]; then\n  __atpkg={atpkg}\n  if [ -x \"$__atpkg\" ]; then exec \
          \"$__atpkg\" __landing 'claude' {prefix} -- \"$@\"; fi\nfi\n\
          exec {store} \"$@\"\n",
-        atpkg = q(atpkg()),
+        atpkg = q(&atpkg()),
         prefix = q(&fx.prefix),
         marker = q(&marker),
         store = q(&store),
@@ -155,7 +155,7 @@ fn a_pass_sweeps_every_landing_marker() {
     fx.install_claude(2026091601);
     let marker = fx.stand_marker();
     std::fs::write(fx.layout().landing_dir().join("codex"), b"junk\n").unwrap();
-    let out = fx.run(atpkg(), &[OsString::from("gc")]);
+    let out = fx.run(&atpkg(), &[OsString::from("gc")]);
     assert!(out.status.success(), "{out:?}");
     assert!(!marker.exists(), "{out:?}");
     assert!(

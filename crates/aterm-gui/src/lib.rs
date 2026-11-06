@@ -229,9 +229,11 @@ pub use fleet_listen::judge_mesh_dials;
 #[cfg(unix)]
 pub use fleet_listen::node_serve::dial_units;
 #[cfg(unix)]
-pub use fleet_listen::node_serve::{
-    NodeBoot, WindowLauncher, apply_node_update_at_boot, run_node_serve,
-};
+pub use fleet_listen::node_serve::{WindowLauncher, run_node_serve_owning};
+#[cfg(unix)]
+pub use fleet_listen::vault_here;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use fleet_listen::vault_reading;
 pub use qos::{hold_process_as_background_work, hold_process_as_housekeeping};
 pub use update_words::DevSharedWrites;
 
@@ -934,6 +936,7 @@ mod peer_watch;
 mod platform;
 #[cfg(target_os = "linux")]
 mod portal_settings;
+mod program_worker;
 #[cfg(test)]
 mod settings_page_scroll_conformance;
 mod settings_preview;
@@ -1037,7 +1040,9 @@ mod stats_needle;
 mod stats_paint;
 mod stats_plan;
 mod stats_sill;
+mod stats_skyline;
 mod stats_steam;
+mod stats_units;
 mod strain_script;
 mod submit_count;
 mod subscribe;
@@ -3618,6 +3623,9 @@ enum Wake {
     LocalNetworkAlertWatch,
     DebuggerAccessResult,
     DevToolsHandOver,
+    /// No macOS dialog of this process is up any more, after a gesture of the window's found one
+    /// up and waits for it ([`App::wake_when_no_access_dialog`]): the Mac Setup tab looks again.
+    NoMacosDialog,
     ProtectedRead {
         session: u64,
         path: std::path::PathBuf,
@@ -4082,10 +4090,10 @@ enum Wake {
     /// reader: the menu bar's machine title follows it.
     #[cfg(target_os = "macos")]
     MachineName(machine_title::MachineView),
-    /// The nickname the person chose in Change Nickname… was not set, and why: the next press
-    /// shows the reason ([`App::nickname_not_set`]).
+    /// A machine-name edit failed: the next matching menu press shows the reason
+    /// ([`App::machine_name_not_set`]).
     #[cfg(target_os = "macos")]
-    NicknameNotSet(machine_title::NickUnset),
+    MachineNameNotSet(machine_title::NameUnset),
     #[cfg(target_os = "macos")]
     SiblingRaised {
         pid: u32,
@@ -10598,13 +10606,16 @@ struct App {
     /// The machine title's view, from [`Wake::MachineName`]; `None` until its reader's first read.
     #[cfg(target_os = "macos")]
     machine_view: Option<machine_title::MachineView>,
-    /// The last nickname set's failure, kept for the next Change Nickname… to show.
+    /// The last machine-name edit's failure, kept for its next menu press.
     #[cfg(target_os = "macos")]
-    nickname_unset: Option<machine_title::NickUnset>,
-    /// How many nickname sets Change Nickname… has started: each failure names its own, so one a
+    machine_unset: Option<machine_title::NameUnset>,
+    /// How many machine-name edits have started: each failure names its own, so one a
     /// later press superseded is dropped.
     #[cfg(target_os = "macos")]
-    nickname_sets: u64,
+    machine_sets: u64,
+    /// One queue preserves the order of edits submitted by the machine menus.
+    #[cfg(target_os = "macos")]
+    machine_writer: Option<machine_title::NameWriter>,
     _status_item: Option<status_item::StatusItemHandle>,
     status_fingerprint: Option<u64>,
     status_drawn: Vec<status_item::Glance>,
@@ -12572,7 +12583,7 @@ impl App {
     /// none is approved) keyed to this bundle's TCC identity and this Mac.
     pub(crate) fn fda_opened_key(revision: Option<u64>) -> String {
         let step = revision.map_or_else(
-            || aterm_types::version::app_version().to_owned(),
+            || aterm_stamp::app_version().to_owned(),
             atpkg::devtools::revision_key,
         );
         match (
@@ -15719,9 +15730,11 @@ impl App {
             #[cfg(target_os = "macos")]
             machine_view: None,
             #[cfg(target_os = "macos")]
-            nickname_unset: None,
+            machine_unset: None,
             #[cfg(target_os = "macos")]
-            nickname_sets: 0,
+            machine_sets: 0,
+            #[cfg(target_os = "macos")]
+            machine_writer: None,
             _status_item: None,
             status_fingerprint: None,
             status_drawn: Vec::new(),
@@ -19872,7 +19885,7 @@ impl App {
                 let captures_waiting = self.has_deferred_gpu_capture(window);
                 let mut redraw_hidden = false;
                 let mut service_captures = false;
-                if let Some(ws) = self.windows.get_mut(&window) {
+                if let Some(ws) = self.windows.get(&window) {
                     let current = ws.current_gpu_acquire_id();
                     let os_window = ws.os_window.clone();
                     let deferred_reveal = ws.pending_reveal.is_some();
@@ -19881,23 +19894,22 @@ impl App {
                             .win_px
                             .is_none_or(|size| size.width > 0 && size.height > 0)
                         && matches!(ws.present.as_ref(), Some(PresentTarget::Gpu { window_gpu, .. }) if deferred_reveal || !window_gpu.occluded_hint());
-                    let accepted =
-                        ws.finish_gpu_acquire_wait(current, surface, presentable, || {
+                    let accepted = self.finish_gpu_acquire_wait_in(
+                        window,
+                        current,
+                        surface,
+                        presentable,
+                        || {
                             if !deferred_reveal
                                 && !captures_waiting
                                 && let Some(window) = os_window
                             {
                                 window.request_redraw();
                             }
-                        });
+                        },
+                    );
                     service_captures = accepted && presentable && captures_waiting;
                     redraw_hidden = accepted && presentable && deferred_reveal;
-                    if accepted
-                        && !presentable
-                        && let Some(PresentTarget::Gpu { gpu_surface, .. }) = ws.present.as_mut()
-                    {
-                        gpu_surface.discard_pending_acquire();
-                    }
                 }
                 let capture_serviced =
                     service_captures && self.resume_deferred_gpu_captures(window, surface);
@@ -19916,6 +19928,7 @@ impl App {
             }
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
+            Wake::NoMacosDialog => self.tick_developer_tools_install(),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
             Wake::DeveloperToolsWatch(reading) => self.developer_tools_watch(reading),
             Wake::DeveloperToolsLowData(on) => self.developer_tools_low_data(on),
@@ -21155,7 +21168,7 @@ impl App {
             #[cfg(target_os = "macos")]
             Wake::MachineName(view) => self.machine_name_read(view),
             #[cfg(target_os = "macos")]
-            Wake::NicknameNotSet(unset) => self.nickname_not_set(unset),
+            Wake::MachineNameNotSet(unset) => self.machine_name_not_set(unset),
             #[cfg(target_os = "macos")]
             Wake::NativeTerminateRequested { generation } => {
                 self.on_native_terminate_requested(el, generation);
@@ -26230,6 +26243,8 @@ fn build_event_loop(headless: bool, successor: bool) -> BuiltLoop {
     }
 }
 
+/// Hold the event loop's build until a test releases it. The test waits on each marker's being
+/// there while this process runs, so each is whole by its rename and flushed by nothing.
 fn hold_loop_build_for_test() {
     let Some(path) = aterm_types::dev_seam!("ATERM_DEBUG_LOOP_BUILD_HOLD") else {
         return;
@@ -26239,13 +26254,13 @@ fn hold_loop_build_for_test() {
         marker.push(suffix);
         std::path::PathBuf::from(marker)
     };
-    let _ = aterm_uds::atomic_file::write(&marker(".held"), b"", 0o600);
+    let _ = aterm_uds::atomic_file::write_flushed(&marker(".held"), b"", 0o600, None);
     let release = std::path::PathBuf::from(&path);
     let until = Instant::now() + std::time::Duration::from_secs(60);
     while !release.exists() && Instant::now() < until {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let _ = aterm_uds::atomic_file::write(&marker(".passed"), b"", 0o600);
+    let _ = aterm_uds::atomic_file::write_flushed(&marker(".passed"), b"", 0o600, None);
 }
 
 /// Mark this composed executable as implementing the resource-run front door.
@@ -28427,9 +28442,11 @@ pub fn main_entry_with_network(
         #[cfg(target_os = "macos")]
         machine_view: None,
         #[cfg(target_os = "macos")]
-        nickname_unset: None,
+        machine_unset: None,
         #[cfg(target_os = "macos")]
-        nickname_sets: 0,
+        machine_sets: 0,
+        #[cfg(target_os = "macos")]
+        machine_writer: None,
         _status_item: None,
         status_fingerprint: None,
         status_drawn: Vec::new(),

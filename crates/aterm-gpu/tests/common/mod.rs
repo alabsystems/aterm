@@ -85,10 +85,11 @@ pub fn count_exceeding_frame(a: &Frame, b: &Frame, tol: i32) -> usize {
 }
 
 /// Checked-in JetBrains Mono fixture path.
-pub const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
+pub fn fixture_font() -> String {
+    let path =
+        aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf");
+    path.to_str().expect("a UTF-8 font path").to_owned()
+}
 
 /// A GPU renderer at `px`/`theme` on `font`. A host with no usable GPU could
 /// not run the test (`aterm_spec::host::could_not_run`), which is no pass;
@@ -148,19 +149,19 @@ fn cpu_on(font: &str, px: f32, theme: Theme) -> Renderer {
         .unwrap_or_else(|| panic!("{font} does not load"))
 }
 
-/// The CPU and GPU renderers under test, both on [`FIXTURE_FONT`] and font-settled.
+/// The CPU and GPU renderers under test, both on [`fixture_font`] and font-settled.
 pub fn backends(px: f32, theme: Theme) -> (Renderer, aterm_gpu::GpuRenderer) {
-    backends_with_font(std::path::Path::new(FIXTURE_FONT), px, theme)
+    backends_with_font(std::path::Path::new(&fixture_font()), px, theme)
 }
 
-/// A CPU renderer at `px`/`theme` on [`FIXTURE_FONT`].
+/// A CPU renderer at `px`/`theme` on [`fixture_font`].
 pub fn cpu(px: f32, theme: Theme) -> Renderer {
-    cpu_on(FIXTURE_FONT, px, theme)
+    cpu_on(&fixture_font(), px, theme)
 }
 
-/// A GPU renderer at `px`/`theme` on [`FIXTURE_FONT`].
+/// A GPU renderer at `px`/`theme` on [`fixture_font`].
 pub fn gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
-    gpu_on(FIXTURE_FONT, px, theme)
+    gpu_on(&fixture_font(), px, theme)
 }
 
 /// [`backends`], with both renderers built on the font file at `font`.
@@ -200,7 +201,7 @@ pub fn backends_fontdue(px: f32, theme: Theme) -> (Renderer, aterm_gpu::GpuRende
     let mut gpu = gpu(px, theme);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
-    font_settled(cpu_on(FIXTURE_FONT, px, theme), gpu)
+    font_settled(cpu_on(&fixture_font(), px, theme), gpu)
 }
 
 /// Hidden-cursor `rows`×`cols` terminal whose rows `block_rows` carry 30 full blocks.

@@ -110,7 +110,7 @@ impl Fixture {
     fn atpkg_run(&self, args: &[&str]) -> Output {
         let mut argv = vec!["run", "claude", "--"];
         argv.extend_from_slice(args);
-        self.run(std::path::Path::new(env!("CARGO_BIN_EXE_atpkg")), &argv)
+        self.run(&aterm_tempfile::bin_exe("atpkg"), &argv)
     }
 }
 

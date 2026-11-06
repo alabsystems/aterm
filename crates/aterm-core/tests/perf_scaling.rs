@@ -9,12 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if ACTIVE.load(Ordering::Relaxed) {
             ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
         }
         // SAFETY: forwarding to System with the same layout.
         unsafe { System.alloc(l) }
@@ -72,6 +74,41 @@ fn count_allocations(f: impl FnOnce()) -> u64 {
     f();
     ACTIVE.store(false, Ordering::Relaxed);
     ALLOC_CALLS.load(Ordering::Relaxed)
+}
+
+fn floating_frame_reuses_warm_storage() {
+    use aterm_core::render::RenderInput;
+    use aterm_core::terminal::Terminal;
+    for (rows, cols) in [(4_u16, 16_u16), (24, 80)] {
+        let mut term = Terminal::new(rows, cols);
+        term.set_cell_pixel_size(1, 1);
+        term.process(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2,q=2;/wAA/w==\x1b\\");
+        term.process("\x1b_Ga=p,U=1,i=1,p=7,c=1,r=1,q=2\x1b\\\x1b[1;1H\x1b[38;5;1m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m".as_bytes());
+        term.process(
+            format!("\x1b_Ga=p,i=2,p=5,P=1,Q=7,c={cols},r={rows},z=1,q=2\x1b\\").as_bytes(),
+        );
+        let mut frame = RenderInput::empty();
+        term.cell_frame_into(&mut frame, usize::from(rows), usize::from(cols));
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        let calls = count_allocations(|| {
+            for _ in 0..64 {
+                term.cell_frame_into(&mut frame, usize::from(rows), usize::from(cols));
+            }
+        });
+        let measured = (calls, ALLOC_BYTES.load(Ordering::Relaxed));
+        let tiles = frame
+            .images
+            .iter()
+            .flatten()
+            .filter(|(_, image)| image.kitty.is_some_and(|tag| tag.image_id == 2))
+            .count();
+        assert_eq!(tiles, usize::from(rows) * usize::from(cols));
+        assert_eq!(
+            measured,
+            (0, 0),
+            "64 warm floating-image refills allocated heap storage"
+        );
+    }
 }
 
 fn render_extras_avoid_temporary_allocations() {
@@ -159,6 +196,50 @@ fn render_extras_avoid_temporary_allocations() {
 
 const CEILING: u64 = 64;
 
+fn selective_truecolor_erase_reuses_warm_storage() {
+    use aterm_core::terminal::Terminal;
+    let mut worst = 0;
+    for (rows, cols) in [(4, 80), (24, 160)] {
+        for protected in [false, true] {
+            let mut term = Terminal::new(rows, cols);
+            term.process(b"\x1b[48;2;10;20;30m");
+            if protected {
+                term.process(b"\x1b[1\"qP\x1b[0\"q");
+            }
+            term.process(b"\x1b[?2J");
+            let allocations = count_allocations(|| {
+                for step in 0..64 {
+                    term.process(if step % 2 == 0 {
+                        b"\x1b[48;2;40;50;60m\x1b[?2J"
+                    } else {
+                        b"\x1b[48;2;70;80;90m\x1b[?2J"
+                    });
+                }
+            });
+            eprintln!(
+                "selective_bce rows={rows} cols={cols} protected={protected} erases=64 allocations={allocations}"
+            );
+            worst = worst.max(allocations);
+            for row in 0..rows {
+                for col in 0..cols {
+                    let kept = protected && row == 0 && col == 0;
+                    assert_eq!(
+                        term.grid().bg_rgb_at(row, col),
+                        Some(if kept { [10, 20, 30] } else { [70, 80, 90] })
+                    );
+                    if kept {
+                        assert_eq!(term.grid().cell(row, col).unwrap().char(), 'P');
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        worst, 0,
+        "warm selective erases should not allocate column scratch"
+    );
+}
+
 fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
     use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
     const ROWS: usize = 4_096;
@@ -197,6 +278,8 @@ fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
 
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    floating_frame_reuses_warm_storage();
+    selective_truecolor_erase_reuses_warm_storage();
     hot_scrollback_walks_allocate_only_owned_line_payloads();
     let measure = 2_000;
 

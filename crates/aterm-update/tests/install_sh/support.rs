@@ -59,9 +59,9 @@ pub fn system_path() -> &'static str {
     })
 }
 
-/// The checkout this test binary was built from.
+/// The checkout of the package under test (its `CARGO_MANIFEST_DIR`, read when the test runs).
 pub fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("../..")
         .canonicalize()
         .expect("the checkout root")
@@ -185,7 +185,7 @@ pub fn scratch_root() -> &'static Path {
         #[cfg(target_os = "macos")]
         let target = std::env::temp_dir();
         #[cfg(not(target_os = "macos"))]
-        let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let target = aterm_tempfile::target_tmpdir();
         #[cfg(target_os = "linux")]
         if let Err(why) = aterm_update::linux::install_path::refusal(&target) {
             use std::os::unix::fs::MetadataExt as _;

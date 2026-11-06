@@ -342,7 +342,7 @@ impl Directory {
                 None => seen.remove(&id).is_some(),
             };
             match decision {
-                Ok(()) => doomed.push(scope),
+                Ok(()) => doomed.push((id, scope)),
                 Err(kept) => released.kept.push((id, kept)),
             }
         }
@@ -354,19 +354,21 @@ impl Directory {
         if doomed.is_empty() {
             return Ok(released);
         }
-        for scope in &doomed {
-            remove_storage(&self.primary().path(*scope)?)?;
-            remove_storage(&self.recovery().path(*scope)?)?;
-            for region in [Region::Primary, Region::Recovery] {
-                remove_claim(&region.claims(session)?, &claim_name(*scope))?;
+        let recovery_claims = Region::Recovery.claims(session)?;
+        for &(id, scope) in &doomed {
+            remove_storage(&self.primary().path(scope)?)?;
+            remove_storage(&self.recovery().path(scope)?)?;
+            let name = claim_name(scope);
+            for dir in [&claims, &recovery_claims] {
+                remove_claim(dir, &name)?;
             }
-            released.released.push(scope.digest());
+            released.released.push(id);
         }
         for dir in [
             &self.primary().root,
             &self.recovery().root,
             &claims,
-            &Region::Recovery.claims(session)?,
+            &recovery_claims,
         ] {
             if dir.try_exists()? {
                 aterm_durable::durable_dir(dir)?;

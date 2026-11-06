@@ -82,6 +82,9 @@ pub struct ProcSample {
     pub disk_read: Option<u64>,
     /// Cumulative bytes written to storage, or `None` if unreadable.
     pub disk_written: Option<u64>,
+    /// Cumulative energy its threads used, nanojoules (macOS `ri_energy_nj`); `None` where
+    /// unread, and off macOS.
+    pub energy_nj: Option<u64>,
     /// Its real user, where read.
     pub uid: Option<u32>,
     /// Its process group (0: unknown).
@@ -522,6 +525,9 @@ pub struct GpuSample {
     pub renderer_pct: Option<u8>,
     /// Tiler utilization, whole percent.
     pub tiler_pct: Option<u8>,
+    /// Whether it has no memory of its own and works in the system's, as its reader says
+    /// (`aterm_sysprobe::GpuReading::unified`).
+    pub unified: bool,
 }
 
 /// The volume a path lives on, bytes.
@@ -728,10 +734,27 @@ pub struct TcpCounts {
     pub listen: u32,
     /// `CLOSING` sockets.
     pub closing: u32,
+    /// Only `established` and `time_wait` were read, from the kernel's counters: Linux before its
+    /// first all-states dump, or once that dump's self-check retired it. Every other state is
+    /// unread, not 0 ([`Self::other`]), and `established` may hold `CLOSE_WAIT`.
+    pub counters_only: bool,
 }
 
 impl TcpCounts {
-    /// Total TCP sockets across all states.
+    /// `n`, a state other than `established` and `time_wait`, when it was read.
+    #[must_use]
+    pub const fn other(&self, n: u32) -> Option<u32> {
+        if self.counters_only { None } else { Some(n) }
+    }
+
+    /// [`Self::total`] when every state was read.
+    #[must_use]
+    pub const fn known_total(&self) -> Option<u32> {
+        self.other(self.total())
+    }
+
+    /// Total TCP sockets across all states (with [`Self::counters_only`], `established` and
+    /// `time_wait` alone).
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.established
@@ -845,7 +868,9 @@ pub struct NetView {
     pub window_ns: Option<u64>,
     /// Machine-wide TCP socket counts by state, where readable.
     pub tcp: Option<TcpCounts>,
-    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers.
+    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers
+    /// (on Linux, at most 64 followed connections, the first to each destination prefix first:
+    /// `aterm_sysprobe::TcpSummary::srtt_ms`).
     pub srtt_ms: Option<f32>,
     /// Live connectivity state across counted links.
     pub state: NetState,
@@ -905,13 +930,27 @@ pub struct StripEvent {
     pub label: String,
 }
 
-/// The most processes the machine and one user may run.
+/// What the machine's task tables hold and the most each may hold, as the host read them
+/// (`aterm_sysprobe::TaskRoom`): the Processes row's count and limit, and the Room's four
+/// pairs (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §8.1). `None` where the OS does not say.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProcLimits {
-    /// The whole machine's limit (threads on Linux).
-    pub system: Option<u64>,
-    /// One user's limit; `None` where unknown or unlimited.
-    pub per_user: Option<u64>,
+pub struct TaskRoom {
+    /// Processes on the machine (tasks on Linux, where each thread takes a pid).
+    pub procs: Option<u64>,
+    /// The most [`Self::procs`] may be (on Linux the smaller of `pid_max` and `threads-max`).
+    pub procs_max: Option<u64>,
+    /// Processes this user runs.
+    pub user_procs: Option<u64>,
+    /// The most one user may run; `None` where unknown or unlimited.
+    pub user_procs_max: Option<u64>,
+    /// Threads on the machine.
+    pub threads: Option<u64>,
+    /// The most [`Self::threads`] may be.
+    pub threads_max: Option<u64>,
+    /// Open files on the machine.
+    pub files: Option<u64>,
+    /// The most [`Self::files`] may be.
+    pub files_max: Option<u64>,
 }
 
 /// Disk-watch and directory-survey status copied from the harness.
@@ -1022,10 +1061,11 @@ pub struct Sample {
     pub links: Option<Vec<LinkSample>>,
     /// Machine-wide TCP socket counts by state, where readable.
     pub tcp: Option<TcpCounts>,
-    /// The process limits.
-    pub proc_limits: ProcLimits,
-    /// Total machine processes (or tasks on Linux) and processes owned by this user.
-    pub pid_counts: (Option<u64>, Option<u64>),
+    /// The machine's task tables: the Processes row's counts and limits.
+    pub room: TaskRoom,
+    /// The machine's process start counter, read at every reading where one reads: macOS's
+    /// coalitions while their lane is on, Linux's forks ([`crate::starts`]).
+    pub starts: Option<crate::starts::StartCount>,
     /// This process's user: only its processes' writes are counted.
     pub self_uid: Option<u32>,
     /// The disk watch's facts; `None` where the host read none.
@@ -1043,7 +1083,8 @@ pub struct Sample {
     pub load: Option<[f64; 3]>,
     /// Whether the process sweep stopped at its cap.
     pub procs_truncated: bool,
-    /// Resource coalition counters (sampled on split ticks only).
+    /// Resource coalition counters for the split, on split ticks only (the host reads them at
+    /// every reading for [`Self::starts`], and hands the split the same read on its ticks).
     pub coalitions: Option<crate::explain::CoalSample>,
     /// Coalition lead process identities read alongside [`Self::coalitions`].
     pub leads: Vec<crate::explain::LeadIdentity>,
@@ -1053,7 +1094,9 @@ pub struct Sample {
     pub coal_lane: crate::explain::CoalLane,
     /// Hardware processor brand/chip string (e.g. `"Apple M5 Max"`), where known.
     pub cpu_brand: Option<String>,
-    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers.
+    /// Passive kernel TCP smoothed RTT median in milliseconds across established remote peers
+    /// (on Linux, at most 64 followed connections, the first to each destination prefix first:
+    /// `aterm_sysprobe::TcpSummary::srtt_ms`).
     pub tcp_srtt_ms: Option<f32>,
     /// Open socket descriptors across `aterm` and its tab subtrees, where sampled.
     pub aterm_sockets: Option<u32>,
@@ -1713,16 +1756,20 @@ impl ScopeFig {
         let run = (first..=run_k)
             .map(|k| {
                 let mut cell = Cell::default();
+                // The panes read at the same times: the tab's bucket holds as many readings as
+                // its fullest pane's, and as many over as its most over pane's.
                 for c in read.iter().filter_map(|f| f.run_cell(k)) {
                     cell.mean = add(cell.mean, c.mean);
                     cell.max = add(cell.max, c.max);
-                    cell.over |= c.over;
+                    cell.n = cell.n.max(c.n);
+                    cell.over_n = cell.over_n.max(c.over_n);
                 }
                 let all = within.run_cell(k);
                 Cell {
                     mean: held(cell.mean, all.and_then(|c| c.mean)),
                     max: held(cell.max, all.and_then(|c| c.max)),
-                    over: cell.over,
+                    n: cell.n,
+                    over_n: cell.over_n.min(cell.n),
                 }
             })
             .collect();
@@ -1810,10 +1857,11 @@ pub struct ResourceView {
 pub struct HeatCell {
     /// The column's mean as a share of capacity now; `None` is hollow.
     pub heat: Option<f32>,
-    /// Its largest reading as a share of capacity now.
+    /// Its largest reading as a share of capacity now: the box's peak tick.
     pub max: Option<f32>,
-    /// Over the resource's maximum.
-    pub over: bool,
+    /// The share of its readings over the resource's maximum, `0..=1`: the over cap's length
+    /// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3); 0 where none was.
+    pub over: f32,
     /// Discontinuity kind when this cell spans a sleep, crash, or pause gap.
     pub gap: Option<GapKind>,
 }
@@ -1823,7 +1871,7 @@ pub struct HeatCell {
 pub struct HeatSlot {
     /// Heat values and discontinuity marker for this box.
     pub cell: HeatCell,
-    /// Normalized horizontal bounds and age window of this box.
+    /// The box's age window, weight and band.
     pub slot: ProgSlot,
 }
 
@@ -1848,7 +1896,7 @@ impl ResourceView {
             for (a, b) in out.iter_mut().zip(cells(second)) {
                 a.heat = larger(a.heat, b.heat);
                 a.max = larger(a.max, b.max);
-                a.over |= b.over;
+                a.over = a.over.max(b.over);
             }
         }
         out
@@ -1870,7 +1918,7 @@ impl ResourceView {
             cell: HeatCell {
                 heat: heat_of(sc.cell.mean, cap).map(|h| h.min(ceiling)),
                 max: heat_of(sc.cell.max, cap).map(|h| h.min(ceiling)),
-                over: sc.cell.over,
+                over: sc.cell.over_share() as f32,
                 gap: sc.gap,
             },
             slot: sc.slot,
@@ -1893,10 +1941,10 @@ impl ResourceView {
             for (a, b) in out.iter_mut().zip(slots_for(second)) {
                 a.cell.heat = larger(a.cell.heat, b.cell.heat);
                 a.cell.max = larger(a.cell.max, b.cell.max);
-                a.cell.over |= b.cell.over;
+                a.cell.over = a.cell.over.max(b.cell.over);
                 a.cell.gap = a.cell.gap.or(b.cell.gap);
                 if a.cell.gap.is_some() && b.cell.heat.is_none() && a.cell.heat.is_none() {
-                    a.cell.over = false;
+                    a.cell.over = 0.0;
                 }
             }
         }
@@ -1909,10 +1957,52 @@ impl ResourceView {
             .map(|c| HeatCell {
                 heat: heat_of(c.mean, capacity).map(|h| h.min(ceiling)),
                 max: heat_of(c.max, capacity).map(|h| h.min(ceiling)),
-                over: c.over,
+                over: c.over_share() as f32,
                 gap: None,
             })
             .collect()
+    }
+
+    /// `cells` of the first series (a lens trace's columns, [`Self::columns`]) as heat against
+    /// its capacity now, as its strip boxes draw them: each column's mean and largest reading as
+    /// shares, and its over share.
+    #[must_use]
+    pub fn heat_cells(&self, cells: Vec<Cell>) -> Vec<HeatCell> {
+        self.heat_of_columns(cells, self.capacity)
+    }
+
+    /// The live box's peak tick and over cap (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3,
+    /// "Live box"): the largest reading of the trailing [`NOW_WINDOW_MS`] as a share of capacity
+    /// now, the larger series' on a two-series row as [`Self::heat_now`] takes, and the share of
+    /// those readings over the resource's maximum. Its column is [`Self::heat_now`], the 10 s
+    /// mean.
+    #[must_use]
+    pub fn live_box(&self, now_unix_ms: i64) -> (Option<f32>, f32) {
+        let ceiling = self.basis.heat_ceiling();
+        let cutoff = i128::from(now_unix_ms) - i128::from(NOW_WINDOW_MS);
+        let of = |recent: &[Reading], cap: Option<f64>| {
+            let inside = || {
+                recent
+                    .iter()
+                    .filter(|r| i128::from(r.at_ms) > cutoff && r.at_ms <= now_unix_ms)
+                    .filter(|r| r.v.is_finite())
+            };
+            let n = inside().count();
+            let peak = inside().map(|r| r.v).reduce(f64::max);
+            let over = inside().filter(|r| r.over).count();
+            (
+                heat_of(peak, cap).map(|h| h.min(ceiling)),
+                if n > 0 { over as f32 / n as f32 } else { 0.0 },
+            )
+        };
+        let (peak, over) = of(&self.recent, self.capacity);
+        match self.second.as_ref() {
+            Some(s) => {
+                let (p2, o2) = of(&s.recent, s.capacity);
+                (larger(peak, p2), over.max(o2))
+            }
+            None => (peak, over),
+        }
     }
 
     /// The first series, as [`Series`].
@@ -2040,10 +2130,12 @@ pub struct RowFacts {
     pub tokens_read_s: u32,
     /// Tokens: the plan's usage, while current.
     pub plan: Option<PlanFact>,
-    /// Processes: running on the machine and as this user.
-    pub pid_counts: (Option<u64>, Option<u64>),
-    /// Processes: the limits.
-    pub proc_limits: ProcLimits,
+    /// Processes: the task tables, their counts and limits.
+    pub room: TaskRoom,
+    /// Processes: starts and exits a second over this reading's interval
+    /// ([`crate::starts::TaskFlow`]); `None` where no start counter read at both ends, or no
+    /// rate spans the interval.
+    pub flow: Option<crate::starts::TaskFlow>,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -2350,14 +2442,19 @@ impl Snapshot {
                         .map(|(_, n)| *n)
                         .sum::<u32>()
                         .min(a);
-                    let sys = net.tcp.map(|tcp| tcp.total()).unwrap_or(0).max(a).max(1);
+                    let sys = net
+                        .tcp
+                        .and_then(|tcp| tcp.known_total())
+                        .unwrap_or(0)
+                        .max(a)
+                        .max(1);
                     (f64::from(a), f64::from(t), f64::from(sys))
                 } else if let Some(a) = view.aterm.now {
                     let t = view.tab.now.unwrap_or(0.0).min(a);
                     let sys = self
                         .net
                         .as_ref()
-                        .and_then(|n| n.tcp.map(|tcp| f64::from(tcp.total())))
+                        .and_then(|n| n.tcp.and_then(|tcp| tcp.known_total()).map(f64::from))
                         .unwrap_or(a)
                         .max(a)
                         .max(1.0);
@@ -2754,6 +2851,8 @@ struct Rows {
     link_lead: Option<(String, u32)>,
     /// Swap's counter and when it was read.
     swap: Option<(Stamp, u64)>,
+    /// The start counter at the last reading that read one, and when ([`RowFacts::flow`]).
+    starts: Option<(Stamp, crate::starts::StartCount)>,
     sessions: HashMap<String, Session>,
     /// Monotonic timestamp (ms) since which `rate60` disk filling has been positive.
     filling_since: Option<u64>,
@@ -4012,8 +4111,7 @@ impl Rows {
             gpu: s.gpu.clone(),
             disk: s.disk.clone(),
             plan: s.plan.clone(),
-            pid_counts: s.pid_counts,
-            proc_limits: s.proc_limits,
+            room: s.room,
             ..RowFacts::default()
         };
 
@@ -4096,9 +4194,23 @@ impl Rows {
         facts.tokens_in = self.tokens_in.mean(now, TOKENS_WINDOW_MS);
         facts.agents = tokens.agents;
 
-        let (all, yours) = s.pid_counts;
-        self.rings[Processes.index()].push(now, all.map(|n| n as f64), false);
-        self.yours.push(now, yours.map(|n| n as f64), false);
+        self.rings[Processes.index()].push(now, s.room.procs.map(|n| n as f64), false);
+        self.yours
+            .push(now, s.room.user_procs.map(|n| n as f64), false);
+        facts.flow = match s.starts.as_ref() {
+            Some(count) => {
+                let flow = self.starts.as_ref().and_then(|(then, before)| {
+                    let dt = stamp.rate_dt(Some(*then))?;
+                    crate::starts::TaskFlow::of(crate::starts::moved(before, count)?, dt)
+                });
+                self.starts = Some((stamp, count.clone()));
+                flow
+            }
+            None => {
+                self.starts = None;
+                None
+            }
+        };
 
         let today = day_of(now);
         let link_cap = facts
@@ -4216,7 +4328,7 @@ impl Rows {
             let (capacity, basis) = match res {
                 Network => (rx_cap, net_basis),
                 Tokens => (tok_cap, tok_basis),
-                Processes => (s.proc_limits.system.map(|n| n as f64), CapBasis::Fixed),
+                Processes => (s.room.procs_max.map(|n| n as f64), CapBasis::Fixed),
                 _ => (self.caps[i], CapBasis::Fixed),
             };
             let second = match res {
@@ -4225,7 +4337,7 @@ impl Rows {
                     &self.yours,
                     now,
                     NOW_WINDOW_MS,
-                    s.proc_limits.per_user.map(|n| n as f64),
+                    s.room.user_procs_max.map(|n| n as f64),
                 )),
                 _ => None,
             };
@@ -4763,6 +4875,68 @@ pub fn gib(bytes: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live box (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): its tick is the largest
+    /// reading of the last 10 s and its cap the share of them over, the larger series' on a
+    /// two-series row; a reading older than the window or ahead of now counts for neither.
+    /// CONTROL: those left out are the minute's largest, so counting them would change both.
+    #[test]
+    fn the_live_box_ticks_its_ten_second_max_and_caps_its_over_share() {
+        const NOW: i64 = 1_792_000_000_000;
+        let reading = |back_s: i64, v: f64, over: bool| Reading {
+            at_ms: NOW - back_s * 1000,
+            v,
+            over,
+        };
+        let recent: Arc<[Reading]> = vec![
+            reading(40, 9.5, true),
+            reading(12, 9.0, true),
+            reading(9, 2.0, false),
+            reading(6, 6.0, true),
+            reading(3, 3.0, false),
+            reading(0, 4.0, true),
+            reading(-3, 9.9, true),
+        ]
+        .into();
+        let view = ResourceView {
+            capacity: Some(10.0),
+            recent,
+            ..ResourceView::default()
+        };
+        let (peak, over) = view.live_box(NOW);
+        assert!(
+            peak.is_some_and(|p| (p - 0.6).abs() < 1e-6),
+            "the 10 s max: {peak:?}"
+        );
+        assert!(
+            (over - 0.5).abs() < 1e-6,
+            "two of four readings over: {over}"
+        );
+        let (earlier, earlier_over) = view.live_box(NOW - 2_000);
+        assert!(
+            earlier.is_some_and(|p| (p - 0.6).abs() < 1e-6),
+            "the window ending 2 s ago: {earlier:?}"
+        );
+        assert!(
+            (earlier_over - 1.0 / 3.0).abs() < 1e-6,
+            "one of three: {earlier_over}"
+        );
+        let mut two = view.clone();
+        two.second = Some(Series {
+            capacity: Some(4.0),
+            recent: vec![reading(2, 3.0, true)].into(),
+            ..Series::default()
+        });
+        let (peak2, over2) = two.live_box(NOW);
+        assert!(
+            peak2.is_some_and(|p| (p - 0.75).abs() < 1e-6),
+            "the larger series' max: {peak2:?}"
+        );
+        assert!(
+            (over2 - 1.0).abs() < 1e-6,
+            "the larger series' over share: {over2}"
+        );
+    }
 
     /// A kernel record's cut name (16 bytes) and a client's are the sweep's whole one or its
     /// marked one, and the record's cut through a character is too; a whole name that begins
@@ -5791,11 +5965,13 @@ mod tests {
                 rate_bps: Some(100_000_000),
                 ..LinkSample::default()
             }]),
-            proc_limits: ProcLimits {
-                system: Some(16_000),
-                per_user: Some(10_666),
+            room: TaskRoom {
+                procs: Some(900),
+                procs_max: Some(16_000),
+                user_procs: Some(500),
+                user_procs_max: Some(10_666),
+                ..TaskRoom::default()
             },
-            pid_counts: (Some(900), Some(500)),
             self_uid: Some(501),
             tokens: vec![TabTokens {
                 key: 7,
@@ -5978,7 +6154,7 @@ mod tests {
                 .binds
         );
         let mut crowded = at(6000, 1000);
-        crowded.pid_counts = (Some(900), Some(9_000));
+        crowded.room.user_procs = Some(9_000);
         let s = v.absorb(&crowded);
         let yours = s.resources[Processes.index()]
             .second
@@ -6828,13 +7004,85 @@ mod tests {
         assert_eq!(s.resource(Memory, &[7]).tab.run.len(), 5);
     }
 
+    /// `t_ms` on both clocks at a 1 s cadence, reading `forks` on the start counter.
+    fn forks_at(t_ms: u64, wall_ms: i64, forks: Option<u64>) -> Sample {
+        Sample {
+            starts: forks.map(crate::starts::StartCount::Forks),
+            ..rig(t_ms, wall_ms, 1000)
+        }
+    }
+
+    /// The flow is the start counter's growth over the reading's interval, from the second
+    /// reading that reads one; a reading that reads none leaves the next without a base.
+    #[test]
+    fn the_flow_is_the_start_counters_growth_over_each_readings_interval() {
+        let mut v = Vitals::new();
+        let flow = |s: &Snapshot| s.facts.flow.map(|f| (f.starts_ps, f.exits_ps));
+        assert_eq!(flow(&v.absorb(&forks_at(1_000, 1_000, Some(100)))), None);
+        assert_eq!(
+            flow(&v.absorb(&forks_at(3_000, 3_000, Some(140)))),
+            Some((20.0, None))
+        );
+        assert_eq!(flow(&v.absorb(&forks_at(4_000, 4_000, None))), None);
+        assert_eq!(
+            flow(&v.absorb(&forks_at(5_000, 5_000, Some(150)))),
+            None,
+            "no base: the reading before read no counter"
+        );
+        assert_eq!(
+            flow(&v.absorb(&forks_at(6_000, 6_000, Some(157)))),
+            Some((7.0, None))
+        );
+    }
+
+    /// NO RATE ACROSS A SLEEP: the wall clock ran 60 s while the monotonic one (which stops
+    /// while the Mac sleeps) ran 1 s, so the counter's growth spans time no interval measures.
+    /// NEGATIVE CONTROL: the same growth with the clocks together is a rate.
+    #[test]
+    fn a_reading_across_sleep_gives_no_start_rate() {
+        let mut v = Vitals::new();
+        v.absorb(&forks_at(1_000, 1_000, Some(100)));
+        let slept = v.absorb(&forks_at(2_000, 61_000, Some(400)));
+        assert_eq!(slept.facts.flow, None);
+        let awake = v.absorb(&forks_at(3_000, 62_000, Some(430)));
+        assert_eq!(awake.facts.flow.map(|f| f.starts_ps), Some(30.0));
+
+        let mut control = Vitals::new();
+        control.absorb(&forks_at(1_000, 1_000, Some(100)));
+        let s = control.absorb(&forks_at(2_000, 2_000, Some(400)));
+        assert_eq!(s.facts.flow.map(|f| f.starts_ps), Some(300.0));
+    }
+
+    /// No meaning change: the Processes row is the processes against the machine's limit, and
+    /// its second series this user's against theirs, whatever the start counter says.
+    #[test]
+    fn the_processes_row_keeps_its_count_against_its_limit_beside_the_flow() {
+        let mut quiet = Vitals::new();
+        let mut busy = Vitals::new();
+        let (mut a, mut b) = (Snapshot::default(), Snapshot::default());
+        for i in 0..6u64 {
+            let t = 1_000 * (i + 1);
+            a = quiet.absorb(&forks_at(t, t as i64, None));
+            b = busy.absorb(&forks_at(t, t as i64, Some(10_000 * i)));
+        }
+        assert_eq!(a.facts.flow, None);
+        assert_eq!(b.facts.flow.map(|f| f.starts_ps), Some(10_000.0));
+        for r in [Processes, Cpu, Memory, Gpu, Disk, Network, Tokens] {
+            assert_eq!(a.resources[r.index()], b.resources[r.index()], "{r:?}");
+        }
+        assert!(close(
+            b.resources[Processes.index()].heat_now.map(f64::from),
+            900.0 / 16_000.0
+        ));
+    }
+
     #[test]
     fn the_per_user_limit_binds_processes_and_a_writes_run_is_carried_raw() {
         let mut v = Vitals::new();
         let mut s = Snapshot::default();
         for i in 0..12 {
             let mut r = whole(10 * i);
-            r.proc_limits.per_user = Some(1_000);
+            r.room.user_procs_max = Some(1_000);
             s = v.absorb(&r);
         }
         assert_eq!(

@@ -392,7 +392,7 @@ impl Resizes {
         assert_eq!(r2.get("at"), Some(at), "one caller for both: {r1:?} {r2:?}");
         let (file, line) = at.rsplit_once(':').expect("at=<file>:<line>");
         let line: usize = line.parse().expect("a line number");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = aterm_tempfile::manifest_dir().join("../..");
         let source = std::fs::read_to_string(root.join(file))
             .unwrap_or_else(|e| panic!("at={at} names no file of this checkout: {e}"));
         let text = source.lines().nth(line - 1).unwrap_or_default();

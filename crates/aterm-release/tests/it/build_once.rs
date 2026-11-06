@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for single-build release artifact caching, bundle digest verification, and `verify release` tree records.
+//! Tests for single-build release artifact caching, bundle digest verification, and `verify release`'s per-check records.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -317,9 +317,12 @@ fn a_record_larger_than_any_read_bound_is_placed_whole() {
     );
 }
 
-/// `gates::verified` checks the verification record stored for the commit's tree against the executable SHA-256.
+/// `gates::verified` answers from one record per check of the commit's tree under the seal, the
+/// bundle's `measure` on these bytes: its words name what is missing; another seal, another
+/// tree or a garbled record stands for nothing, and a legacy single record at
+/// `verified/<tree>` is replaced by the next run's records.
 #[test]
-fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
+fn the_verified_judge_reads_each_checks_record_of_the_tree_on_these_bytes() {
     let dir = scratch();
     let repo = dir.path().join("work");
     fs::create_dir_all(&repo).unwrap();
@@ -328,6 +331,7 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     git(&repo, &["add", "README"]);
     git(&repo, &["commit", "-q", "-m", "R"]);
     let r = git(&repo, &["rev-parse", "HEAD"]);
+    let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree"]);
     let twin = git(&repo, &["rev-parse", "HEAD"]);
     fs::write(repo.join("README"), "another tree\n").unwrap();
@@ -335,33 +339,60 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     let other = git(&repo, &["rev-parse", "HEAD"]);
     let g = Git::new(&repo);
     let macho = "ab".repeat(32);
+    let inputs = compilers().inputs;
     let judge = |commit: &str| {
         crate::gates::verified_with_inputs(&g, commit, &macho, || Ok(compilers().inputs)).unwrap()
     };
+    let missing = |commit: &str| {
+        crate::check_record::checks(&g, commit, Some(&macho), || Ok(compilers().inputs))
+            .unwrap()
+            .missing
+    };
+    let ok = |_: &str| Some("ok");
 
+    assert!(!judge(&r).0);
+    assert_eq!(missing(&r), crate::check_record::release_names());
+    crate::check_record::record_run(&g, &r, &"cd".repeat(32), &inputs, 0, ok);
     let (yes, why) = judge(&r);
-    assert!(!yes, "{why}");
-    let at = crate::gates::record_verified(&g, &r, &"cd".repeat(32), &compilers().inputs).unwrap();
-    let (yes, why) = judge(&r);
-    assert!(!yes, "{why}");
-    fs::write(&at, "not a record").unwrap();
-    let (yes, why) = judge(&r);
-    assert!(!yes, "{why}");
+    assert!(!yes, "another executable's measure: {why}");
+    assert_eq!(missing(&r), ["measure"]);
 
-    crate::gates::record_verified(&g, &r, &macho, &compilers().inputs).unwrap();
+    crate::check_record::record_run(&g, &r, &macho, &inputs, 0, ok);
+    let (yes, why) = judge(&r);
+    assert!(yes, "{why}");
     assert!(
         !crate::gates::verified_with_inputs(&g, &r, &macho, || Ok("changed compiler bytes".into()))
             .unwrap()
-            .0
+            .0,
+        "another seal"
     );
-    let (yes, why) = judge(&r);
-    assert!(yes, "{why}");
-    fs::write(&at, format!("commit = {r:?}\nexecutable = {macho:?}\n")).unwrap();
-    assert!(!judge(&r).0, "a legacy receipt has no input identity");
-    crate::gates::record_verified(&g, &r, &macho, &compilers().inputs).unwrap();
-    assert!(judge(&twin).0, "the same tree is the same record");
+    assert!(judge(&twin).0, "the same tree is the same records");
     let (yes, why) = judge(&other);
     assert!(!yes, "another tree: {why}");
+
+    let verified = repo.join(".git/aterm-release/verified");
+    fs::write(
+        crate::check_record::path(&verified, &tree, &inputs, "lint", None),
+        "not a record",
+    )
+    .unwrap();
+    assert!(!judge(&r).0);
+    assert_eq!(missing(&r), ["lint"]);
+
+    fs::remove_dir_all(verified.join(&tree)).unwrap();
+    fs::write(
+        verified.join(&tree),
+        format!("commit = {r:?}\nexecutable = {macho:?}\ninputs = {inputs:?}\n"),
+    )
+    .unwrap();
+    let (yes, why) = judge(&r);
+    assert!(!yes, "a legacy single record stands for no check: {why}");
+    crate::check_record::record_run(&g, &r, &macho, &inputs, 0, ok);
+    assert!(
+        verified.join(&tree).is_dir(),
+        "replaced by the run's records"
+    );
+    assert!(judge(&r).0);
 }
 
 /// Scratch git clone with a published commit, release journal reservation, and completed artifact store entry.
@@ -422,14 +453,17 @@ impl Clone {
             .join(crate::release::JOURNAL_FILE)
     }
 
+    /// Every check a release requires recorded ok for the published commit's tree, the bundle's
+    /// on `macho`.
     fn verify(&self, macho: &str) {
-        crate::gates::record_verified(
+        crate::check_record::record_run(
             &Git::new(&self.repo),
             &self.source,
             macho,
             &compilers().inputs,
-        )
-        .unwrap();
+            0,
+            |_| Some("ok"),
+        );
     }
 
     /// The bundle a cut whose prover is `toolchain` would sign.

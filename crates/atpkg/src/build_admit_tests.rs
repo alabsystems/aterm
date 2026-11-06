@@ -953,6 +953,13 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
 /// The descriptor that holds `path` open in this process, found by what it opens (`fstat`'s
 /// device and inode).
 #[cfg(unix)]
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::useless_conversion,
+        reason = "dev_t is u64 on Linux and i32 on macOS"
+    )
+)]
 fn descriptor_of(path: &Path) -> i32 {
     use std::os::unix::fs::MetadataExt as _;
     let want = std::fs::metadata(path).expect("the claim file");
@@ -1267,6 +1274,13 @@ const KEY_STANDIN: &str = "ATPKG_BUILD_ADMIT_KEY_STANDIN";
 /// job it then leads, and say whether a key's signal passes on there, then with the terminal's
 /// foreground handed to another group. Run alone, it does nothing.
 #[cfg(unix)]
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::useless_conversion,
+        reason = "TIOCSCTTY is ioctl's own request type on Linux and a c_uint on macOS"
+    )
+)]
 #[test]
 fn standin_reads_key_passes_on_its_terminal() {
     if std::env::var_os(KEY_STANDIN).is_none() {
@@ -1653,7 +1667,7 @@ fn stand_in_cargo(dir: &Path, code: u8) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nprintf '%s|%s' \"${{ATPKG_ROUTED-unset}}\" \"$*\" > '{}'\nexit {code}\n",
+            "#!/bin/sh\nprintf '%s|%s|%s' \"${{ATPKG_ROUTED-unset}}\" \"$*\" \"$(pwd -P)\" > '{}'\nexit {code}\n",
             ran.display()
         ),
     )
@@ -1662,8 +1676,8 @@ fn stand_in_cargo(dir: &Path, code: u8) -> PathBuf {
     path
 }
 
-/// A routed cargo build claims, runs under its claim with the variables its route sets, ends as
-/// it ended, and keeps its peak under `cargo build`. NEGATIVE CONTROL: a routed `cargo run`
+/// A routed cargo build claims, runs under its claim in the directory it was claimed for with
+/// the variables its route sets, ends as it ended, and keeps its peak under `cargo build`. NEGATIVE CONTROL: a routed `cargo run`
 /// claims nothing and is left to the route's own exec (the stand-in never runs here).
 #[cfg(unix)]
 #[test]
@@ -1686,7 +1700,11 @@ fn a_routed_cargo_build_runs_under_its_claim_and_a_run_is_left_alone() {
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("ran")).expect("it ran"),
-        "1|build -p a"
+        format!(
+            "1|build -p a|{}",
+            dir.path().canonicalize().expect("canonical").display()
+        ),
+        "it runs in the directory it was claimed for, not this process's"
     );
     let kept = Records::load(&dir.path().join("targo-memory.json"));
     assert_eq!(kept.rows().len(), 1);

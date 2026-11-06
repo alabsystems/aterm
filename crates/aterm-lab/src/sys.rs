@@ -1369,6 +1369,66 @@ pub fn thread_cpu_ns(pid: i32) -> Option<Vec<ThreadCpu>> {
     )
 }
 
+/// `PROC_PIDTHREADCOUNTS` (`<sys/proc_info.h>`, macOS 13): one thread's counters, a row per CPU
+/// performance level.
+#[cfg(target_os = "macos")]
+const PROC_PIDTHREADCOUNTS: libc::c_int = 34;
+
+/// `struct proc_threadcounts_data`: one performance level's counts for a thread.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ThreadCountsData {
+    instructions: u64,
+    cycles: u64,
+    user_time_mach: u64,
+    system_time_mach: u64,
+    energy_nj: u64,
+}
+
+/// `struct proc_threadcounts` with room for four performance levels (Apple silicon has two or
+/// three): `len` is how many rows the kernel filled.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ThreadCounts {
+    len: u16,
+    reserved0: u16,
+    reserved1: u32,
+    counts: [ThreadCountsData; 4],
+}
+
+/// The instructions thread `tid` (`PROC_PIDLISTTHREADIDS`) of `pid` has retired, every
+/// performance level together (`PROC_PIDTHREADCOUNTS`); `None` where the kernel answers no row
+/// (an older macOS, a thread that exited, a machine without the counters).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn thread_instructions(pid: i32, tid: u64) -> Option<u64> {
+    let zero = ThreadCountsData {
+        instructions: 0,
+        cycles: 0,
+        user_time_mach: 0,
+        system_time_mach: 0,
+        energy_nj: 0,
+    };
+    let mut c = ThreadCounts {
+        len: 0,
+        reserved0: 0,
+        reserved1: 0,
+        counts: [zero; 4],
+    };
+    let size = libc::c_int::try_from(std::mem::size_of_val(&c)).ok()?;
+    // SAFETY: `c` is a writable buffer of exactly `size` bytes for the call, which fills at most
+    // that many.
+    let got =
+        unsafe { libc::proc_pidinfo(pid, PROC_PIDTHREADCOUNTS, tid, (&raw mut c).cast(), size) };
+    let rows = c.counts.get(..usize::from(c.len))?;
+    (got > 0 && !rows.is_empty()).then(|| {
+        rows.iter()
+            .map(|d| d.instructions)
+            .fold(0, u64::saturating_add)
+    })
+}
+
 /// The CPU time `pid` has run, user plus system, every thread it ever had, in ns
 /// (`PROC_PIDTASKINFO`'s totals, which count host ticks: converted by [`mach_timebase`]).
 #[cfg(target_os = "macos")]

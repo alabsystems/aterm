@@ -40,25 +40,32 @@ struct Epoch {
 }
 
 impl Epoch {
-    fn encode(self, nonce: &str) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(RECORD_LEN);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(nonce.as_bytes());
-        bytes.extend_from_slice(&self.sequence.to_be_bytes());
-        bytes.extend_from_slice(&self.generation.0);
+    fn encode(self, nonce: &str) -> [u8; RECORD_LEN] {
+        let mut bytes = [0u8; RECORD_LEN];
+        bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+        bytes[MAGIC.len()..MAGIC.len() + 32].copy_from_slice(nonce.as_bytes());
+        bytes[MAGIC.len() + 32..MAGIC.len() + 40].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[MAGIC.len() + 40..].copy_from_slice(&self.generation.0);
         bytes
     }
     fn read(parent: &File, namespace: &Namespace) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         let (_, private) = aterm_uds::private_file::open_private(&namespace.backend(), STATE)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let file = namespace::regular(parent, STATE)?;
-        let actual = file.metadata()?;
-        if (actual.dev(), actual.ino()) != (private.dev(), private.ino()) {
+        let (file, actual) = namespace::regular(parent, STATE)?;
+        if actual != (private.dev(), private.ino()) {
             return Err(refused("private host epoch changed during open"));
         }
-        let mut bytes = Vec::with_capacity(RECORD_LEN + 1);
-        file.take((RECORD_LEN + 1) as u64).read_to_end(&mut bytes)?;
+        let mut buf = [0u8; RECORD_LEN + 1];
+        let mut len = 0;
+        let mut reader = file.take((RECORD_LEN + 1) as u64);
+        while len < buf.len() {
+            match reader.read(&mut buf[len..])? {
+                0 => break,
+                n => len += n,
+            }
+        }
+        let bytes = &buf[..len];
         if bytes.len() != RECORD_LEN
             || !bytes.starts_with(MAGIC)
             || &bytes[MAGIC.len()..MAGIC.len() + 32] != namespace.nonce().as_bytes()
@@ -152,7 +159,8 @@ impl Fence {
     /// incomplete/overflowed epoch, private-file, random or durability failure.
     pub fn acquire(namespace: &Namespace, deadline: Instant) -> io::Result<Self> {
         let backend = namespace.open_backend()?;
-        let lock = aterm_uds::kept_out(|| namespace.open_host_lock())?;
+        let lock =
+            aterm_uds::kept_out(|| namespace.open_host_lock_in(&backend).map(|(lock, _)| lock))?;
         aterm_uds::file_lock::lock_exclusive_until(
             &lock,
             deadline,
@@ -208,18 +216,17 @@ impl Fence {
     }
 
     fn check_namespace(&self) -> io::Result<()> {
-        self.namespace.validate()?;
+        let current_backend = self.namespace.open_backend()?;
         // Validate ACL/privacy through the shared reader as well as retained
         // dirfd/inode identity. Neither a new lock nor a path alias is authority.
         aterm_uds::private_file::open_private(&self.namespace.backend(), LOCK)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let current = self.namespace.open_host_lock()?;
+        let (_, named) = self.namespace.open_host_lock_in(&current_backend)?;
         use std::os::unix::fs::MetadataExt as _;
         let original = self.lock.metadata()?;
-        let named = current.metadata()?;
         let backend = self.backend.metadata()?;
-        let current_backend = self.namespace.open_backend()?.metadata()?;
-        if (original.dev(), original.ino()) != (named.dev(), named.ino())
+        let current_backend = current_backend.metadata()?;
+        if (original.dev(), original.ino()) != named
             || (backend.dev(), backend.ino()) != (current_backend.dev(), current_backend.ino())
         {
             return Err(refused("host leadership physical identity changed"));

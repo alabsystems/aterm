@@ -3,7 +3,7 @@
 
 [package]
 name = "agh"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -37,6 +37,7 @@ aterm-digest = { workspace = true }
 # Secret, private_file, atomic_file and the stdout door.
 aterm-uds = { workspace = true }
 # dirs (config, state, home), channel::PUBLIC_OWNER (the release floor), rfc3339.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # THE effect seam (`fx`): every clock read, sleep, GitHub round trip and stdout write crosses
 # its EffectSeam, so a run is taped (--record) and replayed offline (--replay); design §21.

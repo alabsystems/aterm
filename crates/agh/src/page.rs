@@ -385,22 +385,21 @@ fn segments(path: &str) -> Vec<&str> {
 }
 
 /// Every value a query gives `name`, in appearance order.
-fn query_values<'a>(query: &'a str, name: &str) -> Vec<&'a str> {
-    if query.is_empty() {
-        return Vec::new();
-    }
+fn query_values<'a, 'n>(
+    query: &'a str,
+    name: &'n str,
+) -> impl Iterator<Item = &'a str> + use<'a, 'n> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .filter(|(key, _)| *key == name)
+        .filter(move |(key, _)| *key == name)
         .map(|(_, value)| value)
-        .collect()
 }
 
 /// The first value a query gives `name`.
 fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
-    query_values(query, name).into_iter().next()
+    query_values(query, name).next()
 }
 
 /// Whether a next link's path is one `LinkScope::Repo(slug)` accepts: `/repos/{o}/{r}` with
@@ -496,24 +495,25 @@ pub fn next_link(
         LinkScope::Exact => Err("its path is not the listing's".to_string()),
     };
     scoped.map_err(|reason| refuse(&reason))?;
-    let pages = query_values(query, "page");
-    if pages.len() > 1 {
+    let mut pages = query_values(query, "page");
+    let first_page = pages.next();
+    if pages.next().is_some() {
         return Err(refuse("it names more than one page"));
     }
-    let page = pages
-        .first()
-        .and_then(|v| crate::path::digits::<u32>(v))
+    let page = first_page
+        .and_then(crate::path::digits::<u32>)
         .ok_or_else(|| unnumbered_link(next_url, query))?;
     if page <= last_page {
         return Err(refuse(&format!(
             "page {page} does not follow page {last_page}"
         )));
     }
-    let per_pages = query_values(query, "per_page");
-    if per_pages.len() > 1 {
+    let mut per_pages = query_values(query, "per_page");
+    let first_per_page = per_pages.next();
+    if per_pages.next().is_some() {
         return Err(refuse("it names more than one per_page"));
     }
-    if let Some(&per_page) = per_pages.first() {
+    if let Some(per_page) = first_per_page {
         let per_page = crate::path::digits::<u64>(per_page)
             .ok_or_else(|| refuse("its per_page is not a number"))?;
         if per_page == 0 {

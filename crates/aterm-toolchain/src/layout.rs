@@ -35,6 +35,11 @@ pub const COMPAT_DIR: &str = "compat";
 /// `<prefix>/rustup` — the seam's views, one per rustup toolchain name.
 pub const VIEWS_DIR: &str = "rustup";
 
+/// The suffix of the marker beside a store build that says its install completed:
+/// `<prefix>/store/<program>/<build>.ready`. A build without it is not installed, whatever its
+/// tree holds (a stage cut short, or a build its resolve check refused).
+pub const READY_SUFFIX: &str = ".ready";
+
 /// `<prefix>/store/<program>/<build>`.
 #[inline]
 #[must_use]

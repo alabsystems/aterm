@@ -3,6 +3,8 @@
 
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::Arc;
 
 use super::*;
 #[cfg(unix)]
@@ -410,6 +412,7 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
         translated: false,
         local: Some(true),
         age_ms: Some(21_000),
+        start_us: None,
     };
     let rows = [
         ("M1: one unstarted thread, 21 s", m1, AtStart::Held),
@@ -544,6 +547,179 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
     for (row, facts, want) in rows {
         assert_eq!(judge_start(&facts), want, "{row}: {facts:?}");
     }
+}
+
+/// A held start whose check was sent before the syspolicyd running now started reads stranded
+/// once that daemon has answered alone for [`STRANDED_AFTER_US`], the bound on a first exec
+/// (aterm-uds' `FIRST_EXEC_HANG`): its pool not full and no held program forked since it started.
+/// Each guard flipped reads not stranded: a check sent to the running daemon (a slow first exec),
+/// one forked before it but exec'd after it (an exec in the same pid keeps the fork), an undated
+/// one, a check queued for the new daemon short of the bound, a daemon whose start reads after
+/// now, a full or unread pool, a backlog or an unread one, and each guard of [`judge_start`].
+#[test]
+fn a_held_start_older_than_the_running_syspolicyd_is_stranded_once_that_daemon_answers_alone() {
+    #[derive(Clone, Copy)]
+    struct Case {
+        facts: StartFacts,
+        sent_by: Option<u64>,
+        now: u64,
+        pool_full: Option<bool>,
+        held_since: Option<usize>,
+    }
+    /// The running daemon's start, µs since the epoch.
+    const T: u64 = 1_800_000_000_000_000;
+    assert_eq!(
+        std::time::Duration::from_micros(STRANDED_AFTER_US),
+        aterm_uds::deadline::FIRST_EXEC_HANG
+    );
+    let held = StartFacts {
+        lone_zero: true,
+        stopped: false,
+        traced: false,
+        translated: false,
+        local: Some(true),
+        age_ms: Some(608_000),
+        start_us: Some(T - 8_000_000),
+    };
+    let alone = Case {
+        facts: held,
+        sent_by: Some(T - 3_000_000),
+        now: T + STRANDED_AFTER_US,
+        pool_full: Some(false),
+        held_since: Some(0),
+    };
+    let sent = |sent_by| Case { sent_by, ..alone };
+    let facts = |facts| Case { facts, ..alone };
+    let rows = [
+        (
+            "seen unrun 3 s before the daemon started, 10 m into its run",
+            alone,
+            true,
+        ),
+        (
+            "seen unrun first 1 µs after it started: sent to the running daemon",
+            sent(Some(T + 1)),
+            false,
+        ),
+        ("seen unrun first as it started", sent(Some(T)), false),
+        (
+            "forked before it, seen unrun first after it: an exec in the same pid",
+            sent(Some(T + 5_000_000)),
+            false,
+        ),
+        ("never seen unrun", sent(None), false),
+        (
+            "a check queued for the new daemon, 9 m 59.999 s into its run",
+            Case {
+                now: T + STRANDED_AFTER_US - 1000,
+                ..alone
+            },
+            false,
+        ),
+        (
+            "a daemon whose start reads after now",
+            Case {
+                now: T - 1,
+                ..alone
+            },
+            false,
+        ),
+        (
+            "a full pool",
+            Case {
+                pool_full: Some(true),
+                ..alone
+            },
+            false,
+        ),
+        (
+            "an unread pool",
+            Case {
+                pool_full: None,
+                ..alone
+            },
+            false,
+        ),
+        (
+            "one held program forked since the daemon started",
+            Case {
+                held_since: Some(1),
+                ..alone
+            },
+            false,
+        ),
+        (
+            "an unread backlog",
+            Case {
+                held_since: None,
+                ..alone
+            },
+            false,
+        ),
+        (
+            "stopped",
+            facts(StartFacts {
+                stopped: true,
+                ..held
+            }),
+            false,
+        ),
+        (
+            "traced",
+            facts(StartFacts {
+                traced: true,
+                ..held
+            }),
+            false,
+        ),
+        (
+            "x86_64 on arm64",
+            facts(StartFacts {
+                translated: true,
+                ..held
+            }),
+            false,
+        ),
+        (
+            "a remote volume",
+            facts(StartFacts {
+                local: Some(false),
+                ..held
+            }),
+            false,
+        ),
+        (
+            "a thread that ran",
+            facts(StartFacts {
+                lone_zero: false,
+                ..held
+            }),
+            false,
+        ),
+        (
+            "19.999 s since its fork",
+            facts(StartFacts {
+                age_ms: Some(19_999),
+                ..held
+            }),
+            false,
+        ),
+    ];
+    for (row, c, want) in rows {
+        assert_eq!(
+            stranded(&c.facts, c.sent_by, T, c.now, c.pool_full, c.held_since),
+            want,
+            "{row}: {:?} sent by {:?} at {}, pool full {:?}, held since {:?}",
+            c.facts,
+            c.sent_by,
+            c.now,
+            c.pool_full,
+            c.held_since
+        );
+    }
+    assert!(before_daemon(alone.sent_by, T, T + STRANDED_AFTER_US));
+    assert!(!before_daemon(alone.sent_by, T, T + STRANDED_AFTER_US - 1));
+    assert!(!before_daemon(None, T, T + STRANDED_AFTER_US));
 }
 
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
@@ -681,26 +857,100 @@ fn fd_links_and_fdinfo_parse() {
     assert!(!e.write_only());
 }
 
+/// A namespace's `net/tcp` table naming inode 2222 established to 192.0.2.10:8080.
+#[cfg(unix)]
 const NET_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 1111 1 0\n\
-   1: 0100007F:C3A1 0A0200C0:1F90 01 00000000:00000000 00:00000000 00000000   501        0 2222 1 0\n\
-   2: 0100007F:C3A2 0A0200C0:1F90 02 00000000:0000000";
+   1: 0100007F:C3A1 0A0200C0:1F90 01 00000000:00000000 00:00000000 00000000   501        0 2222 1 0\n";
 
+/// A dump naming `row` alone.
+#[cfg(unix)]
+fn tcp_dump(row: linux::TcpRow) -> Arc<crate::linux::tcp::TcpDump> {
+    Arc::new(crate::linux::tcp::TcpDump {
+        sockets: HashMap::from([(row.inode, row)]),
+        ..crate::linux::tcp::TcpDump::default()
+    })
+}
+
+/// NO JOB PASS READS `/proc/net/tcp` (A3 D12): a socket is TCP when the process's shared dump
+/// names its inode, whatever the namespace's `net/tcp` table beside it says. NEGATIVE CONTROL:
+/// with no dump, the socket that table names established reads as a socket of no known kind. A
+/// process in another network namespace, which this namespace's dump cannot see, has its sockets
+/// named from that namespace's own table, read after a reading publishes, while a dump is held.
+#[cfg(unix)]
 #[test]
-fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {
-    let rows = linux::parse_net_tcp(NET_TCP, false);
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[0].state, TcpState::Listen);
-    assert_eq!((rows[0].local_port, rows[0].remote), (8080, None));
-    assert_eq!(rows[1].state, TcpState::Established);
-    assert_eq!(rows[1].remote, Some("192.0.2.10:8080".parse().unwrap()));
-    assert_eq!((rows[1].inode, rows[1].rx_queue), (2222, 0));
-    let v6 = "  sl  local remote st q\n\
-   0: 00000000000000000000000001000000:1F90 B80D0120000000000000000001000000:01BB 01 00000000:00000005 00:0 0 501 0 3333 1\n";
-    let rows = linux::parse_net_tcp(v6, true);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].remote, Some("[2001:db8::1]:443".parse().unwrap()));
-    assert_eq!(rows[0].rx_queue, 5);
+fn no_job_pass_reads_proc_net_tcp() {
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let r = dir.path();
+    write(r, "4711/stat", STAT);
+    link(r, "4711/fd/3", "socket:[2222]");
+    write(r, "4711/net/tcp", NET_TCP);
+    let listening = tcp_dump(linux::TcpRow {
+        inode: 2222,
+        state: TcpState::Listen,
+        local_port: 8080,
+        remote: None,
+        rx_queue: 0,
+    });
+    let kind = |tcp: &dyn Fn() -> Option<Arc<crate::linux::tcp::TcpDump>>| {
+        linux::read(r, 4711, true, 100, tcp)
+            .and_then(|f| f.fds)
+            .and_then(|fds| fds.into_iter().find(|fd| fd.fd == 3))
+            .map(|fd| fd.kind)
+    };
+    assert_eq!(
+        kind(&|| Some(Arc::clone(&listening))),
+        Some(FdKind::Tcp {
+            state: TcpState::Listen,
+            remote: None,
+            local_port: 8080,
+            queued_read: Some(0),
+        }),
+        "the dump's word, not net/tcp's"
+    );
+    assert_eq!(kind(&|| None), Some(FdKind::Socket));
+    link(r, "self/ns/net", "net:[4026531840]");
+    link(r, "4711/ns/net", "net:[4026531840]");
+    let empty = Arc::new(crate::linux::tcp::TcpDump::default());
+    assert_eq!(
+        kind(&|| Some(Arc::clone(&empty))),
+        Some(FdKind::Socket),
+        "this namespace: the dump's word alone"
+    );
+
+    let sandbox = aterm_tempfile::tempdir().expect("scratch root");
+    let r = sandbox.path();
+    write(r, "4711/stat", STAT);
+    link(r, "4711/fd/3", "socket:[2222]");
+    write(r, "4711/net/tcp", NET_TCP);
+    link(r, "self/ns/net", "net:[4026531840]");
+    link(r, "4711/ns/net", "net:[4026532999]");
+    let kind = |tcp: &dyn Fn() -> Option<Arc<crate::linux::tcp::TcpDump>>| {
+        linux::read(r, 4711, true, 100, tcp)
+            .and_then(|f| f.fds)
+            .and_then(|fds| fds.into_iter().find(|fd| fd.fd == 3))
+            .map(|fd| fd.kind)
+    };
+    assert_eq!(
+        kind(&|| Some(Arc::clone(&empty))),
+        Some(FdKind::Socket),
+        "asked for on the pass's path, its table not yet read"
+    );
+    crate::linux::tcp::read_namespaces_now();
+    assert_eq!(
+        kind(&|| Some(Arc::clone(&empty))),
+        Some(FdKind::Tcp {
+            state: TcpState::Established,
+            remote: Some("192.0.2.10:8080".parse().unwrap()),
+            local_port: 50_081,
+            queued_read: Some(0),
+        }),
+        "another namespace: its own table"
+    );
+    assert_eq!(
+        kind(&|| None),
+        Some(FdKind::Socket),
+        "no dump held: no table read"
+    );
 }
 
 #[cfg(unix)]
@@ -785,7 +1035,6 @@ fn the_linux_arm_reads_a_fixture_tree() {
             linux::READ_WRITE[0]
         ),
     );
-    write(r, "4711/net/tcp", NET_TCP);
     write(
         r,
         "4713/stat",
@@ -797,7 +1046,14 @@ fn the_linux_arm_reads_a_fixture_tree() {
         "4714 (other) S 1 4714 4714 0 -1 0 0 0 0 0 5 5 0 0 20 0 1 0 9 0 0",
     );
 
-    let f = linux::read(r, 4711, true, 100).unwrap();
+    let dump = tcp_dump(linux::TcpRow {
+        inode: 2222,
+        state: TcpState::Established,
+        local_port: 50_081,
+        remote: Some("192.0.2.10:8080".parse().unwrap()),
+        rx_queue: 0,
+    });
+    let f = linux::read(r, 4711, true, 100, &|| Some(Arc::clone(&dump))).unwrap();
     assert_eq!(
         (f.ppid, f.pgid, f.sid, f.start),
         (4700, 4711, Some(4600), Some(123_456))
@@ -885,13 +1141,13 @@ fn the_linux_arm_reads_a_fixture_tree() {
     );
     assert_eq!(kind(5), Some(FdKind::Watch));
 
-    let z = linux::read(r, 4713, true, 100).unwrap();
+    let z = linux::read(r, 4713, true, 100, &|| None).unwrap();
     assert_eq!(z.state, RunState::Zombie);
     assert!(z.counters.is_none() && z.threads.is_none() && z.fds.is_none());
-    let o = linux::read(r, 4714, false, 100).unwrap();
+    let o = linux::read(r, 4714, false, 100, &|| None).unwrap();
     assert!(o.counters.is_none());
     assert!(o.fds.is_none());
-    assert!(linux::read(r, 9999, false, 100).is_none());
+    assert!(linux::read(r, 9999, false, 100, &|| None).is_none());
 }
 
 #[cfg(unix)]
@@ -1610,15 +1866,20 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
 /// job probe reads the same facts, and a reader handed a mount table places the executable by that
 /// table. A child runs translated exactly when this process does (the universal `/bin/sleep`
 /// follows its parent's architecture under Rosetta 2), and a translated one, unstopped, reads as
-/// translating, not held.
+/// translating, not held. Its fork reads on the clock [`now_us`] reads, between the reads before
+/// and after its spawn. Its exec had come by the read after the spawn returned, so a check sent by
+/// then is [`before_daemon`] only a daemon that started after it, and never the syspolicyd
+/// running now, which a fresh exec goes to.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
     let translated =
         aterm_uds::process::translation() == aterm_uds::process::Translation::Translated;
+    let before = now_us();
     let held =
         aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command("/bin/sleep").arg("30"))
             .expect("a start-suspended sleep");
+    let after = now_us();
     let pid = held.id();
     let later = now_us() + 21_000_000;
     let facts = read_start(pid, later).expect("the child reads");
@@ -1626,6 +1887,28 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         facts.lone_zero && facts.stopped && !facts.traced && facts.translated == translated,
         "translated={translated}: {facts:?}"
     );
+    let forked = facts.start_us.expect("a lone 0 reads its fork");
+    assert!(
+        (before..=after).contains(&forked),
+        "forked at {forked}, spawned between {before} and {after}"
+    );
+    assert!(before_daemon(
+        Some(after),
+        after + 1,
+        after + 1 + STRANDED_AFTER_US
+    ));
+    assert!(!before_daemon(
+        Some(after),
+        after,
+        after + STRANDED_AFTER_US
+    ));
+    if let Ok(d) = aterm_uds::program_check::running() {
+        let daemon_us = d.start_s * 1_000_000 + u64::from(d.start_us);
+        assert!(
+            !before_daemon(Some(after), daemon_us, now_us()),
+            "a fresh child is never older than the syspolicyd running now ({d:?}): {facts:?}"
+        );
+    }
     assert_eq!(
         facts.local,
         Some(true),

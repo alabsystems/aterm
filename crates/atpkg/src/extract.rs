@@ -1273,6 +1273,8 @@ pub(crate) fn extract_zip_tree(
 /// Archive container format for [`extract_tree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
+    /// Zstandard-compressed tar (`.tar.zst`).
+    TarZst,
     /// Gzip-compressed tar (`.tar.gz`, `.tgz`).
     TarGz,
     /// Uncompressed tar (`.tar`).
@@ -1294,6 +1296,14 @@ pub fn extract_tree(
     require_empty_destination(dest_root)?;
     let entries = crate::install::MAX_ENTRIES;
     match container {
+        Container::TarZst => extract_tar_zst_tree(
+            archive,
+            dest_root,
+            max_total_bytes,
+            entries,
+            opts,
+            FrameChecksum::IfPresent,
+        ),
         Container::TarGz => extract_tar_gz_tree(archive, dest_root, max_total_bytes, entries, opts),
         Container::Tar => extract_tar_tree(archive, dest_root, max_total_bytes, entries, opts),
         Container::Zip => extract_zip_tree(archive, dest_root, max_total_bytes, entries, opts),
@@ -2209,6 +2219,91 @@ mod tests {
         let path = dir.join(format!("{label}.tar.zst"));
         std::fs::write(&path, zstd_bytes(&tar_bytes(entries))).unwrap();
         path
+    }
+
+    #[test]
+    fn generic_zstd_extraction_keeps_strip_and_byte_bounds() {
+        let d = dest("generic-zstd");
+        let archive = make_archive(
+            d.as_path(),
+            "good",
+            &[("release/lib/Std.olean", b'0', "", b"module")],
+        );
+        let opts = ExtractOptions {
+            strip_components: 1,
+            ..ExtractOptions::default()
+        };
+        let stage = d.as_path().join("stage");
+        extract_tree(&archive, &stage, Container::TarZst, 4096, opts).unwrap();
+        assert_eq!(
+            std::fs::read(stage.join("lib/Std.olean")).unwrap(),
+            b"module"
+        );
+        assert!(!stage.join("release").exists());
+        assert!(matches!(
+            extract_tree(
+                &archive,
+                &d.as_path().join("small"),
+                Container::TarZst,
+                1,
+                opts
+            ),
+            Err(ExtractError::TooLarge(_))
+        ));
+        let bad = make_archive(
+            d.as_path(),
+            "escape",
+            &[("release/../outside", b'0', "", b"escape")],
+        );
+        assert!(matches!(
+            extract_tree(
+                &bad,
+                &d.as_path().join("bad"),
+                Container::TarZst,
+                4096,
+                opts
+            ),
+            Err(ExtractError::Rejected(ExtractReject::ParentTraversal, _))
+        ));
+        assert!(!d.as_path().join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_zstd_extraction_keeps_the_requested_link_policy() {
+        let d = dest("generic-zstd-links");
+        let archive = make_archive(
+            d.as_path(),
+            "links",
+            &[
+                ("release/bin/lean", b'0', "", b"compiler"),
+                ("release/bin/alias", b'2', "lean", b""),
+            ],
+        );
+        let opts = ExtractOptions {
+            strip_components: 1,
+            symlinks: SymlinkPolicy::InRoot,
+            ..ExtractOptions::default()
+        };
+        let stage = d.as_path().join("stage");
+        extract_tree(&archive, &stage, Container::TarZst, 4096, opts).unwrap();
+        assert_eq!(
+            std::fs::read_link(stage.join("bin/alias")).unwrap(),
+            Path::new("lean")
+        );
+        assert!(matches!(
+            extract_tree(
+                &archive,
+                &d.as_path().join("refused"),
+                Container::TarZst,
+                4096,
+                ExtractOptions {
+                    symlinks: SymlinkPolicy::Refuse,
+                    ..opts
+                }
+            ),
+            Err(ExtractError::Rejected(ExtractReject::DisallowedKind, _))
+        ));
     }
 
     /// The env that turns [`probe_stages_its_directories_0755_under_an_open_umask_if_asked`] on:

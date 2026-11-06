@@ -665,19 +665,17 @@ pub fn disarm(ctx: &Ctx, kind: LaneKind, machine: &Machine) -> Result<()> {
     Ok(())
 }
 
-/// What a build of `repo` reads, as of now: HEAD, the build inputs' diff against it, and
-/// each untracked input's hash.
+/// What a build of `repo` reads, as of now: HEAD, the hash of the build inputs' diff against it,
+/// and each untracked input's hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Inputs {
     commit: String,
-    diff: String,
+    diff_sha256: String,
     untracked: Vec<(String, String)>,
 }
 
 impl Inputs {
     fn read(repo: &Path) -> Result<Self> {
-        let mut diff_args = vec!["diff", "--binary", "HEAD", "--"];
-        diff_args.extend(BUILD_INPUTS.iter().copied());
         let mut untracked_args = vec!["ls-files", "--others", "--exclude-standard", "--"];
         untracked_args.extend(BUILD_INPUTS.iter().copied());
         let untracked = crate::git::run(repo, &untracked_args)?
@@ -690,10 +688,33 @@ impl Inputs {
             .collect::<Result<_>>()?;
         Ok(Self {
             commit: crate::git::head(repo)?,
-            diff: crate::git::run(repo, &diff_args)?,
+            diff_sha256: diff_sha256(repo)?,
             untracked,
         })
     }
+}
+
+/// The SHA-256 of the build inputs' binary diff against HEAD. git writes the diff to a scratch
+/// file that is hashed as it is read, so a diff of any size (an edited vendored binary's too) is
+/// compared whole, never held in memory or cut to what a git query's stdout may hold.
+fn diff_sha256(repo: &Path) -> Result<String> {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("lane-inputs.")
+        .tempdir()
+        .map_err(|e| Error::io("create a scratch folder for the build inputs' diff", &e))?;
+    let diff = scratch.path().join("inputs.diff");
+    let Some(to) = diff.to_str() else {
+        return Err(Error::cannot_run(format!(
+            "the scratch path {} is not UTF-8, so git cannot be told to write the build inputs' \
+             diff there",
+            diff.display()
+        )));
+    };
+    let output = format!("--output={to}");
+    let mut args = vec!["diff", "--binary", output.as_str(), "HEAD", "--"];
+    args.extend(BUILD_INPUTS.iter().copied());
+    crate::git::run(repo, &args)?;
+    atpkg::tree::sha256_file(&diff).map_err(|e| Error::io("hash the build inputs' diff", &e))
 }
 
 /// The build inputs that differ from HEAD: changed against it, or untracked.

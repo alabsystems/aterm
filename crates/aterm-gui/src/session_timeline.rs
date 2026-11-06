@@ -4731,6 +4731,22 @@ impl SessionTimeline {
         self.task = Some(record);
     }
 
+    /// Note the shell block a program worker's launcher typed its program into
+    /// ([`crate::task_record::note_program_block`]): taken where the record is a program worker's,
+    /// still `working` or `stalled`, with none noted. Moves no rev.
+    pub(crate) fn note_program_block(&mut self, block: u64) -> bool {
+        use crate::task_record::TaskState;
+        let Some(task) = self.task.as_mut().filter(|task| {
+            task.runs_a_program()
+                && task.program_block.is_none()
+                && matches!(task.state, TaskState::Working | TaskState::Stalled)
+        }) else {
+            return false;
+        };
+        task.program_block = Some(block);
+        true
+    }
+
     /// Name the agent a worker's spawn started on its task record.
     pub(crate) fn set_task_worker(
         &mut self,

@@ -1729,7 +1729,11 @@ impl TerminalHandler<'_> {
     }
 
     fn kitty_image_shown(&self, id: u32) -> bool {
-        if self.kitty_image_on_screen(id) || !self.kitty_floating_cells(id).is_empty() {
+        if self.kitty_image_on_screen(id)
+            || (self.kitty_image_floating(id)
+                && kitty_floating::floating_tiles(self.grid, self.transient, 0..self.grid.rows())
+                    .any(|tile| self.transient.kitty_floating[tile.index].tag.image_id == id))
+        {
             return true;
         }
         if !self.transient.kitty_virtual.contains_key(&id) {
@@ -1835,23 +1839,15 @@ impl TerminalHandler<'_> {
                     self.transient.kitty_floating[index].image = image;
                 }
             }
-            for (row, col) in self.kitty_floating_cells(id) {
-                self.grid.damage_mut().mark_cell(row, col);
+            let transient = &*self.transient;
+            let grid = &mut *self.grid;
+            for tile in kitty_floating::floating_tiles(grid, transient, 0..grid.rows()) {
+                if transient.kitty_floating[tile.index].tag.image_id == id {
+                    grid.damage_mut().mark_cell(tile.row, tile.col);
+                }
             }
         }
         self.damage_kitty_placeholders(id);
-    }
-
-    fn kitty_floating_cells(&self, id: u32) -> Vec<(u16, u16)> {
-        let t = &*self.transient;
-        if !self.kitty_image_floating(id) {
-            return Vec::new();
-        }
-        kitty_floating::floating_tiles(self.grid, t)
-            .into_iter()
-            .filter(|tile| t.kitty_floating[tile.index].tag.image_id == id)
-            .map(|tile| (tile.row, tile.col))
-            .collect()
     }
 
     fn kitty_frame_for(

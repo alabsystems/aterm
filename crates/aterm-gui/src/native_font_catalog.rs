@@ -1575,7 +1575,7 @@ mod tests {
 
     #[test]
     fn prepared_catalog_carries_exact_admitted_toy_pack_consumers() {
-        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let pack = aterm_tempfile::manifest_dir()
             .join("../aterm-effects/toy-packs/community/tiny-triumphs/pack.toml");
         let request = request_with_text(
             12,
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     fn prepared_catalog_distinguishes_observed_no_consumers_from_unobserved() {
-        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let pack = aterm_tempfile::manifest_dir()
             .join("../aterm-effects/toy-packs/community/tiny-triumphs/pack.toml");
         let request = request_with_text(
             14,

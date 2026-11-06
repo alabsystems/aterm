@@ -2184,3 +2184,51 @@ fn a_codex_starters_own_config_decides_a_posture_its_argv_leaves_unnamed() {
         "what no relaunch could resume lends its config's posture alone"
     );
 }
+
+#[test]
+fn a_program_workers_line_types_the_program_with_the_task_file_as_its_stdin() {
+    let args = vec!["-c".to_string(), "it's one word".to_string()];
+    for (dialect, quoted) in [
+        (Dialect::Zsh, r"'it'\''s one word'"),
+        (Dialect::Bash, r"'it'\''s one word'"),
+        (Dialect::Fish, r"'it\'s one word'"),
+    ] {
+        let line = program_line(dialect, Path::new("/bin/sh"), &args).expect("a line");
+        assert_eq!(
+            line,
+            format!(r#" '/bin/sh' '-c' {quoted} < "$ATERM_TASK_FILE""#),
+            "{dialect:?}: the program and its words, quoted, read the task file"
+        );
+    }
+    assert_eq!(
+        program_line(Dialect::Zsh, Path::new("kimi"), &[]).expect("a line"),
+        r#" 'kimi' < "$ATERM_TASK_FILE""#,
+        "a bare word is the shell's to find on its PATH"
+    );
+    assert!(
+        program_line(Dialect::Zsh, Path::new("/bin/sh"), &["a\nb".to_string()]).is_err(),
+        "a control character in an argument is refused, never typed"
+    );
+    assert!(
+        program_line(Dialect::Zsh, Path::new("/bin/sh"), &["x".repeat(4096)]).is_err(),
+        "a line over the terminal's budget is refused"
+    );
+}
+
+#[test]
+fn a_program_with_a_harness_here_is_its_agent_forms_and_any_other_is_not() {
+    for word in started_words().split('|') {
+        let row = harness_of_program(word).unwrap_or_else(|| panic!("{word} has a harness"));
+        assert_eq!(row.word, word);
+        assert!(
+            harness_of_program(&format!("/opt/bin/{word}")).is_some(),
+            "{word} by a path is still that CLI"
+        );
+    }
+    for other in ["/bin/sh", "kimi", "grok", "python3", "claude-wrapper", ""] {
+        assert!(
+            harness_of_program(other).is_none(),
+            "{other:?} has no harness that concludes it"
+        );
+    }
+}

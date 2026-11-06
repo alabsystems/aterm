@@ -591,7 +591,7 @@ impl Fx {
     ) -> Result<Fx> {
         records.retain(|record| !matches!(record, EffectRecord::Emit { .. }));
         let renewed = tape::TapeHeader {
-            agh_version: crate::VERSION.to_string(),
+            agh_version: crate::version().to_string(),
             ..header.clone()
         };
         let to = tape::TapeSink::create(new, &renewed)?;

@@ -62,12 +62,15 @@ pub const USAGE: &str = "\
                 REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
                 (each window owner that appears, the guest helper polling the window list every 250 ms with
-                no Screen Recording grant), tccd's consent prompts, xcode-select -p, and the ALab guard:
+                no Screen Recording grant; where it saw a Gatekeeper window, syspolicyd's and
+                CoreServicesUIAgent's lines about it and the files of aterm's carrying macOS's quarantine
+                mark), tccd's consent prompts, xcode-select -p, and the ALab guard:
                 alab-secrets.local unreached and no _alab-vault._tcp or _alab._tcp (ALab's members) advert
                 in the guest, none of either from a guest on this Mac's tart bridge (an advert whose host
                 resolves to this Mac's own addresses is this Mac's, named and never a failure; the vault
                 port 7484 and the members' port 7100 are null-routed in every guest but to loopback and
-                tart's own network). Rows (default all), each step under a 300 s hang detector:
+                tart's own network, and a clone --keep kept loads that guard again at each later boot).
+                Rows (default all), each step under a 300 s hang detector:
                   init-apply       aterm init --json on a terminal, each prompt answered with its default
                                    (a vault join password with none): first byte, end, prompts, lines,
                                    exit, every row's elapsed_ms (the slowest named), Dock/Finder/
@@ -127,18 +130,23 @@ pub const USAGE: &str = "\
                                    SecurityAgent, Apple's install dialog, ...), a relaunch, and
                                    setup=done (or the wait's end), copied back with a contact sheet
                                    into <record>-frames/ beside --record FILE (else the lab's state
-                                   folder, mac-nux/frames/)
+                                   folder, mac-nux/frames/); once setup's wait ended, the first tab's
+                                   fleet=, aterm members status, and a no-URL aterm members join
+                                   --no-wait, FAILED unless it refuses as a lab identity before it
+                                   dials (a guest is a virtual machine: A12)
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
-                  vault            aterm init --only workstation off the ALab network, Enter at each vault
-                                   prompt: time to the vault prompt and the silence before it, the mDNS
-                                   questions for the ALab vault, the end (a guest that can reach an ALab
-                                   vault is NOT RUN)
+                  vault            aterm init --only workstation off the ALab network: its vault
+                                   questions (target 0: init asks none since f83256665c; FAILED on
+                                   any), the mDNS questions for the ALab vault, its vault step, the
+                                   end (a guest that can reach an ALab vault is NOT RUN)
                   vault-local      a vault served in the guest on 127.0.0.1 only (never advertised) by a
                                    second identity that approves joins: aterm init --only workstation
-                                   --vault <it> with its join password typed: to the password prompt,
-                                   typed to a synced secret on disk, typed to the end
+                                   --vault <it> (it asks nothing), then aterm secrets join <it>
+                                   --password-stdin with its join password piped: to the vault's
+                                   entry on disk; FAILED unless it lands, the admin's bytes, within
+                                   60 s
                   vault-phrase     a new Mac let in by a member's Allow and the phrase it shows (F10),
                                    found by its own browse: a seed identity founds a vault on
                                    127.0.0.1 (never advertised) with a synthetic GitHub token, publish
@@ -152,7 +160,7 @@ pub const USAGE: &str = "\
                                    read off its record, never a window); a third, with
                                    ATERM_LAB_MEMBER_SERVICE naming that service and no --at, runs
                                    aterm members join --no-wait (install.sh's ask), aterm members join
-                                   with the phrase typed at its prompt, then its subscriber: the ask
+                                   <phrase>, then its subscriber: the ask
                                    to the member's row, to the phrase shown and typed, to each file on
                                    disk, to members status reading In; FAILED unless the phrase came
                                    from that member, every file is the seed's value, the joiner reads
@@ -162,7 +170,15 @@ pub const USAGE: &str = "\
                                    on loopback, and every _alab-vault._tcp and _alab._tcp browse, in
                                    the guest and on this Mac, ran and heard no guest advert (NOT RUN,
                                    nothing of the joiner's run, on an app that does not name the
-                                   variable)
+                                   variable); and the lab's table: once the member is in, the seed
+                                   signs Genesis v2 (the lab's first [everyone] epoch), imports a
+                                   one-row emails sheet (aterm db alab import --apply) and seals a
+                                   random password into it (aterm db emails set … --stdin); once
+                                   the joiner reads In, the guest helper's repair moves the Commons
+                                   tables to it over loopback (two homes in one guest share its
+                                   address, whose beacons a Commons runtime drops as its own), and
+                                   the row FAILS unless the joiner's aterm db emails --digest is the
+                                   seed's: one epoch, the row and its password, one digest
                   successor        install.sh --version N (the release before the latest), then the
                                    updater to the latest with a window open, and the successor's setup
                                    and Full Disk Access lines in its first 30 s
@@ -199,6 +215,19 @@ pub const USAGE: &str = "\
                                    SSH (prompts, Dock and defaults calls, the secret on disk)
                   clock-back       the guest's clock moved back an hour once a stage runs: setup's end,
                                    any done stage re-run, rows not in place
+                Tree rows (`tree`, or each by name; never in all), each on the person base whatever the flags
+                (its helper holds Accessibility by its identifier) and with no app:
+                  reveal-tab       lab reveal-tab's world in the guest (synthetic logins sealed in a scratch
+                                   Commons, aterm db emails --show-passwords outside aterm and in a windowed
+                                   instance's tab), run by this lab's own debug image against the aterm
+                                   under test (LAB_ATERM or target/debug/aterm, a debug build) as an agent
+                                   of the console's session, the window's accessibility tree read by the
+                                   guest helper's ax-texts (started disclaimed, so tccd judges its grant);
+                                   the run's evidence judged here, check by check; FAILED unless every
+                                   check holds, the tree's three (the grid, every login, no value) among them
+                  reveal-tab-control  the same with the GUI's plain-publication negative control on in the
+                                   instance (each Editor publishes as though nothing were concealed): FAILED
+                                   unless the tree's no-value check fails and every check off the tree holds
                 Prints a markdown table; --record FILE appends it (--record alone: docs/measured/
                 mac-nux-<date>.md in this checkout). Exit 0 every row measured, 1 a row
                 failed (a hang detector fired, a guest step failed), 3 NOT RUN (a row the guest could not
@@ -248,6 +277,34 @@ pass out quick proto tcp from any to 192.168.64.0/24 port 7100
 block return out quick proto tcp from any to any port 7100
 ";
 
+/// Where the guest keeps [`PF_GUARD`] for its later boots ([`pf_guard_at_boot`]): root's, outside
+/// the lane's folder, which a fault row's own rules replace.
+const PF_GUARD_BOOT: &str = "/var/db/aterm-nux-pf-guard.conf";
+
+/// The guest's boot daemon that loads [`PF_GUARD_BOOT`] ([`pf_guard_at_boot`]).
+const PF_GUARD_DAEMON: &str = "/Library/LaunchDaemons/com.aterm.nux.pf-guard.plist";
+
+/// The script, as root, that keeps [`PF_GUARD`] across a kept clone's later boots ([`run_row`]):
+/// one booted again comes up with its packet filter off, and an aterm open at its shutdown
+/// reopens at login, so a boot daemon loads the guard again. Measured 2026-11-05 (E3): a kept
+/// clone booted again ran five aterm processes for two minutes before a hand loaded the guard.
+/// It ends in `sync`: the lane stops a kept clone soon after, and a boot of one stopped without
+/// it found neither file.
+fn pf_guard_at_boot() -> String {
+    format!(
+        "set -e; cat > {PF_GUARD_BOOT} <<'EOF'\n{PF_GUARD}EOF\n\
+         cat > {PF_GUARD_DAEMON} <<'EOF'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\
+         <key>Label</key><string>com.aterm.nux.pf-guard</string>\
+         <key>ProgramArguments</key><array><string>/sbin/pfctl</string><string>-E</string>\
+         <string>-f</string><string>{PF_GUARD_BOOT}</string></array>\
+         <key>RunAtLoad</key><true/></dict></plist>\nEOF\n\
+         chown root:wheel {PF_GUARD_BOOT} {PF_GUARD_DAEMON}; chmod 644 {PF_GUARD_BOOT} {PF_GUARD_DAEMON}; \
+         /usr/bin/plutil -lint -s {PF_GUARD_DAEMON}; /bin/sync"
+    )
+}
+
 /// The ports [`PF_GUARD`] refuses: the vault's and the members' (fleet) port.
 const PF_GUARDED: [u16; 2] = [
     aterm_secrets::DEFAULT_PORT,
@@ -293,8 +350,7 @@ const ALAB_MEMBER_SERVICE: &str = aterm_secrets::discover::MEMBER_SERVICE;
 /// The pty driver: `drive.exp <record> <limit_s> <cmd> [arg...]`. A known prompt is answered at
 /// once; any other partial line left 1.5 s is a prompt, answered with Enter (its default). Each
 /// prompt's record names when it came and how long the command was silent before it.
-/// `$NUX_JOIN` answers a vault join password (default `none`), `$NUX_PHRASE` the join phrase
-/// `aterm members join` asks for (`vault-phrase`), `$NUX_SUDO` a sudo password. With
+/// `$NUX_JOIN` answers a vault join password (default `none`), `$NUX_SUDO` a sudo password. With
 /// `$NUX_SHELL` (a shell session's run), the first [`SHELL_READY`] line is its shell's first
 /// prompt: recorded, then answered with `exit`; nothing unknown is answered.
 pub const DRIVE: &str = r#"set record [lindex $argv 0]
@@ -304,8 +360,6 @@ proc rec {args} { global f; puts $f [join $args " "]; flush $f }
 proc ms {} { global t0; expr {[clock milliseconds] - $t0} }
 set join none
 if {[info exists env(NUX_JOIN)]} { set join $env(NUX_JOIN) }
-set phrase ""
-if {[info exists env(NUX_PHRASE)]} { set phrase $env(NUX_PHRASE) }
 set sudo admin
 if {[info exists env(NUX_SUDO)]} { set sudo $env(NUX_SUDO) }
 set shell [info exists env(NUX_SHELL)]
@@ -345,7 +399,6 @@ while {1} {
         }
         -re {[^\r\n]*Vault join password[^\r\n]*: $} { answer $expect_out(0,string) $join }
         -re {[^\r\n]*Retype the join password[^\r\n]*: $} { answer $expect_out(0,string) $join }
-        -re {[^\r\n]*The phrase [^\r\n]* shows: $} { answer $expect_out(0,string) $phrase }
         -re {[^\r\n]*\(Enter keeps [^\r\n]*\): $} { answer $expect_out(0,string) "" }
         -re {[^\r\n]*\[y/N\] $} { answer $expect_out(0,string) "" }
         -re {[^\r\n]*[Pp]assword[^\r\n]*: $} { answer $expect_out(0,string) $sudo }
@@ -438,6 +491,8 @@ pub enum Scenario {
     Dmg,
     AgentSsh,
     ClockBack,
+    RevealTab,
+    RevealTabControl,
 }
 
 /// Every row, in the order a run takes them.
@@ -477,9 +532,14 @@ pub const FAULTS: [Scenario; 13] = [
     Scenario::ClockBack,
 ];
 
-/// Every row [`ALL`] and [`FAULTS`] name, in run order.
+/// The rows that read a window's accessibility tree (`tree`; `mac_nux_reveal.rs`, one-mesh design
+/// §11 A17c), after [`FAULTS`]': `lab reveal-tab`'s world in the person base, and its negative
+/// control.
+pub const TREE: [Scenario; 2] = [Scenario::RevealTab, Scenario::RevealTabControl];
+
+/// Every row [`ALL`], [`FAULTS`] and [`TREE`] name, in run order.
 fn every() -> impl Iterator<Item = Scenario> {
-    ALL.into_iter().chain(FAULTS)
+    ALL.into_iter().chain(FAULTS).chain(TREE)
 }
 
 impl Scenario {
@@ -515,6 +575,8 @@ impl Scenario {
             Scenario::Dmg => "dmg",
             Scenario::AgentSsh => "agent-ssh",
             Scenario::ClockBack => "clock-back",
+            Scenario::RevealTab => "reveal-tab",
+            Scenario::RevealTabControl => "reveal-tab-control",
         }
     }
 
@@ -552,18 +614,42 @@ impl Scenario {
         )
     }
 
-    /// Whether it runs the app this run built or was handed (the others install a public release).
+    /// Whether it runs the app this run built or was handed (the others install a public release,
+    /// or run this checkout's debug aterm).
     #[must_use]
     pub const fn needs_app(self) -> bool {
         !matches!(
             self,
-            Scenario::Successor | Scenario::InstallSh | Scenario::DevtoolsControl
+            Scenario::Successor
+                | Scenario::InstallSh
+                | Scenario::DevtoolsControl
+                | Scenario::RevealTab
+                | Scenario::RevealTabControl
         )
+    }
+
+    /// The display its clone boots with, where the image's (1024x768 points) is too small: a tree
+    /// row's instance opens about 2,300 points wide (`reveal_tab::WINDOW`), so that the grid's
+    /// password column is on its first screen, and the window stays whole on this display.
+    #[must_use]
+    pub const fn display(self) -> Option<&'static str> {
+        if self.reads_tree() {
+            Some("2560x1600")
+        } else {
+            None
+        }
+    }
+
+    /// Whether it reads a window's accessibility tree through the guest helper, so its base is
+    /// the person base whatever the flags ([`TREE`]).
+    #[must_use]
+    pub const fn reads_tree(self) -> bool {
+        matches!(self, Scenario::RevealTab | Scenario::RevealTabControl)
     }
 }
 
-/// The rows `--scenario` names (comma-separated, `all` for [`ALL`], `faults` for [`FAULTS`]), in
-/// run order, each once.
+/// The rows `--scenario` names (comma-separated, `all` for [`ALL`], `faults` for [`FAULTS`], `tree`
+/// for [`TREE`]), in run order, each once.
 ///
 /// # Errors
 /// An empty list or a name no row has.
@@ -573,9 +659,10 @@ pub fn parse_scenarios(list: &str) -> Result<Vec<Scenario>, String> {
         match word {
             "all" => picked.extend(ALL),
             "faults" => picked.extend(FAULTS),
+            "tree" => picked.extend(TREE),
             _ => picked.push(every().find(|s| s.name() == word).ok_or_else(|| {
                 format!(
-                    "no row '{word}' (rows: all, faults, {})",
+                    "no row '{word}' (rows: all, faults, tree, {})",
                     every().map(Scenario::name).collect::<Vec<_>>().join(", ")
                 )
             })?),
@@ -797,19 +884,34 @@ impl Row {
     /// [`NOT_RUN`] refusal), else failed.
     #[must_use]
     pub fn refused(scenario: Scenario, fail: &Fail) -> Row {
+        let mut row = Row::new(scenario);
+        row.refuse(fail);
+        row
+    }
+
+    /// Fold a lane step's refusal into this row, keeping every cell it already holds: a failed
+    /// step fails it (the first cause stays, a later one becomes a cell); a [`NOT_RUN`] refusal
+    /// leaves a failed row failed, so a guard that failed is never hidden by a body the guest
+    /// could not run.
+    pub fn refuse(&mut self, fail: &Fail) {
         let why = fail
             .msg
             .clone()
             .unwrap_or_else(|| format!("exit {}", fail.code));
         let why = squeeze(why.strip_prefix("NOT RUN: ").unwrap_or(&why), 400);
-        Row {
-            scenario,
-            outcome: if fail.code == NOT_RUN {
-                Outcome::NotRun(why)
-            } else {
-                Outcome::Failed(why)
-            },
-            cells: Vec::new(),
+        match (&self.outcome, fail.code == NOT_RUN) {
+            (Outcome::Measured, true) => self.outcome = Outcome::NotRun(why),
+            (Outcome::Measured | Outcome::NotRun(_), false) => {
+                self.outcome = Outcome::Failed(why);
+            }
+            (_, not_run) => self.cell(
+                if not_run {
+                    "also not run"
+                } else {
+                    "also failed"
+                },
+                Value::Text(why),
+            ),
         }
     }
 }
@@ -2227,6 +2329,7 @@ impl Watchers {
     /// consent dialogs of its own) tccd's prompts.
     fn finish(mut self, g: &Guest, row: &mut Row) -> Result<(), Fail> {
         g.agent_stop(CENSUS_AGENT);
+        let mut gatekeeper_since = None;
         let dialogs_cell = match &self.census {
             Err(why) => Value::Missing(why.clone()),
             Ok(()) => {
@@ -2243,6 +2346,9 @@ impl Watchers {
                             .unwrap_or(0);
                         let seen = dialogs(&census, since);
                         devtools_verdict(row, &seen);
+                        if seen.iter().any(|d| d.kind == GATEKEEPER_DIALOG) {
+                            gatekeeper_since = Some(since);
+                        }
                         Value::Text(dialog_text(&seen))
                     }
                 }
@@ -2256,6 +2362,9 @@ impl Watchers {
             );
         }
         row.cell("dialogs", dialogs_cell);
+        if let Some(since) = gatekeeper_since {
+            gatekeeper_cells(g, row, since)?;
+        }
         let _ =
             g.vm.exec(&g.as_root("pkill -INT -f '^/usr/bin/log stream'"), STEP);
         crate::mac::reap_within(&mut self.tccd, STEP);
@@ -2280,6 +2389,63 @@ impl Watchers {
         }
         Ok(())
     }
+}
+
+/// The kind [`crate::mac_nux_guest::dialog_kind`] gives a CoreServicesUIAgent window.
+const GATEKEEPER_DIALOG: &str = "Gatekeeper";
+
+/// The unified log's lines that can name a Gatekeeper window's subject: CoreServicesUIAgent's
+/// own, and syspolicyd's about a prompt, a quarantine mark or a Gatekeeper (`GK`) assessment.
+const GATEKEEPER_PREDICATE: &str = "process == \"CoreServicesUIAgent\" OR (process == \"syspolicyd\" \
+     AND (eventMessage CONTAINS[c] \"prompt\" OR eventMessage CONTAINS[c] \"quarantine\" \
+     OR eventMessage BEGINSWITH \"GK \"))";
+
+/// How many quarantined paths [`gatekeeper_cells`] names.
+const QUARANTINED_SHOWN: usize = 5;
+
+/// What macOS said of a Gatekeeper window the row's census saw since `since_ms` (the record of
+/// 2026-11-02 left it as finding 19, its subject unread): [`GATEKEEPER_PREDICATE`]'s lines, and
+/// which files under aterm's folders on this account, and in the app, carry macOS's quarantine
+/// mark, which is what makes Gatekeeper ask before a first open. Read only once a window was seen.
+fn gatekeeper_cells(g: &Guest, row: &mut Row, since_ms: u64) -> Result<(), Fail> {
+    let since_s = g.clock_ms()?.saturating_sub(since_ms) / 1000 + 5;
+    let log = g.sh(
+        &format!(
+            "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate \
+             '{GATEKEEPER_PREDICATE}' 2>/dev/null || true"
+        ),
+        STEP,
+    )?;
+    let said = distinct_messages(&log, UNC_SHOWN);
+    row.cell(
+        "Gatekeeper said",
+        Value::Text(if said.is_empty() {
+            "nothing".into()
+        } else {
+            said.join(" | ")
+        }),
+    );
+    let marked = g.sh(
+        &format!(
+            "/usr/bin/find \"$HOME/Library/Application Support/aterm\" \"$HOME/.local\" \
+             /Applications/aterm.app -xattrname com.apple.quarantine 2>/dev/null \
+             > {GUEST_NUX}/quarantined.txt; wc -l < {GUEST_NUX}/quarantined.txt; \
+             head -{QUARANTINED_SHOWN} {GUEST_NUX}/quarantined.txt"
+        ),
+        STEP,
+    )?;
+    let mut lines = marked.lines().map(str::trim).filter(|l| !l.is_empty());
+    let count = lines.next().unwrap_or("0").to_owned();
+    let shown: Vec<String> = lines.map(|l| squeeze(l, 120)).collect();
+    row.cell(
+        "quarantined files of aterm's",
+        Value::Text(if shown.is_empty() {
+            format!("{count} (none under aterm's folders or in the app)")
+        } else {
+            format!("{count}: {}", shown.join(", "))
+        }),
+    );
+    Ok(())
 }
 
 /// The row's verdict on Apple's developer-tools install dialog among the dialogs its census saw
@@ -2613,6 +2779,69 @@ fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
     })
 }
 
+/// What the guest is in the lab once setup's wait ended: the first tab's `fleet=` (its fleet
+/// listener), `aterm members status`'s first line, and a no-URL `aterm members join --no-wait`
+/// (install.sh's ask). A guest is a virtual machine, so its identity is a lab identity (A12),
+/// which never asks the live ALab: it founds or joins a lab of its own by URL (`vault-local`,
+/// `vault-phrase`), and a join with no URL refuses before it dials ([`lab_join_verdict`]); one
+/// that does not fails the row.
+fn fleet_member_cells(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
+    let at = first_session(&sessions).map_or_else(String::new, |sid| format!("@{sid} "));
+    let status = g.run(
+        &format!("{} ctl {at}status 2>/dev/null | head -1", g.aterm),
+        STEP,
+    )?;
+    row.cell(
+        "fleet listener",
+        or_missing(
+            status_field(&status, "fleet"),
+            |f| Value::Text(f.to_owned()),
+            "no fleet= in the first tab's status",
+        ),
+    );
+    let members = g.run(&format!("{} members status 2>&1 | head -1", g.aterm), STEP)?;
+    row.cell("members status", Value::Text(squeeze(members.trim(), 160)));
+    let joined = g.run(
+        &format!("{} members join --no-wait 2>&1; echo \"exit=$?\"", g.aterm),
+        STEP,
+    )?;
+    match lab_join_verdict(&joined) {
+        Ok(text) => row.cell("a no-URL join from the guest", Value::Text(text)),
+        Err(why) => row.fail(why),
+    }
+    Ok(())
+}
+
+/// `key`'s value among a status line's `key=value` words.
+#[must_use]
+pub fn status_field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+    status
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// The verdict on a guest's no-URL `aterm members join --no-wait` (what it printed): it must
+/// refuse as a lab identity before it dials ([`aterm_secrets::client::LAB_IDENTITY_REFUSAL`]).
+///
+/// # Errors
+/// It printed no such refusal: the guest would have asked the live ALab's members.
+pub fn lab_join_verdict(said: &str) -> Result<String, String> {
+    match said
+        .lines()
+        .find(|l| l.contains(aterm_secrets::client::LAB_IDENTITY_REFUSAL))
+    {
+        Some(line) => Ok(format!(
+            "refused before it dialed: {}",
+            squeeze(line.trim(), 200)
+        )),
+        None => Err(format!(
+            "the guest's no-URL join did not refuse as a lab identity (A12): {}",
+            squeeze(said.trim(), 200)
+        )),
+    }
+}
+
 /// Wait for setup: until `setup=done` (the record's completion on a build without the field),
 /// until it stood still for [`STALL_MS`] with nothing new from the person or in the app's
 /// processes either (the one-minute no-progress hang detector, [`setup_reading`]), or until
@@ -2882,21 +3111,45 @@ pub fn bridge_heard(browse: &str, name_of: &dyn Fn(u32) -> Option<String>) -> Ve
         .collect()
 }
 
-/// The ALab guard every row ends with: the guest's look at the ALab vault ([`alab_probe_verdict`])
-/// and at ALab's members ([`member_probe_verdict`]), and this Mac's for a guest's production
-/// advert of either ([`host_guests`]); any one failing fails the row.
-fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
+/// What the guest reaches of the ALab vault: the address its name resolves to (`none` when it
+/// does not) and the HTTP code of the vault's URL (`000`: no answer). The name is resolved by
+/// macOS's own perl, which a Mac without the Command Line Tools has (its `/usr/bin/python3` is
+/// the tools' stub, which prints nothing and offers their install).
+fn alab_reach(g: &Guest) -> Result<(String, String), Fail> {
     let seen = g.run(
         &format!(
-            "/usr/bin/python3 -c \"import socket\ntry: print(socket.getaddrinfo('{ALAB_HOST}', 7484)[0][4][0])\nexcept Exception: print('none')\"; \
+            "/usr/bin/perl -MSocket -e '$a = gethostbyname(shift); print $a ? inet_ntoa($a) : \"none\", \"\\n\"' '{ALAB_HOST}'; \
              curl -s -o /dev/null -m 3 -w '%{{http_code}}\\n' '{url}'",
             url = aterm_types::macos_setup::DEFAULT_VAULT_URL
         ),
         STEP,
     )?;
+    Ok(reach_of(&seen))
+}
+
+/// [`alab_reach`]'s two lines: an address that is no IPv4 one reads `none`, a missing or
+/// malformed code `000`, so a probe that printed nothing never reads as a reached vault's.
+#[must_use]
+pub fn reach_of(seen: &str) -> (String, String) {
     let mut lines = seen.lines().map(str::trim);
-    let address = lines.next().unwrap_or("none").to_owned();
-    let http = lines.next().unwrap_or("000").to_owned();
+    let address = lines
+        .next()
+        .filter(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
+        .unwrap_or("none")
+        .to_owned();
+    let http = lines
+        .next()
+        .filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("000")
+        .to_owned();
+    (address, http)
+}
+
+/// The ALab guard every row ends with: the guest's look at the ALab vault ([`alab_probe_verdict`])
+/// and at ALab's members ([`member_probe_verdict`]), and this Mac's for a guest's production
+/// advert of either ([`host_guests`]); any one failing fails the row.
+fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
+    let (address, http) = alab_reach(g)?;
     let adverts = guest_heard(g, ALAB_SERVICE)?;
     match alab_probe_verdict(&address, &http, &adverts) {
         Ok(text) => row.cell("ALab probe", Value::Text(text)),
@@ -3020,7 +3273,12 @@ fn host_guests(run: &Path, service: &str) -> Result<Result<advert::Split, String
     Ok(Ok(split))
 }
 
-/// One `dns-sd ARGS...` on this Mac for `secs`, under `script -q -t 0` into `file`, then its
+/// The lane's one-minute hang detector on a wait for something that must happen: a resolve's
+/// answer past its window ([`dns_sd_text::answered`]), a joined vault's entry on disk.
+const HANG: Duration = Duration::from_secs(60);
+
+/// One `dns-sd ARGS...` on this Mac for `secs`, under `script -q -t 0` into `file`, then on
+/// until a resolve has answered ([`dns_sd_text::answered`], within [`HANG`]), then its
 /// group killed: its transcript ("" when it left none). `script -t 0` writes the transcript at
 /// each line: with its default 30 s flush, the group's kill left it empty, which read as
 /// "nothing heard" (measured 2026-10-28).
@@ -3037,9 +3295,21 @@ fn host_dns_sd(file: &Path, args: &[String], secs: u64) -> Result<String, Fail> 
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| Fail::die(format!("dns-sd on this Mac: {e}")))?;
-    stop::sleep(Duration::from_secs(secs))?;
+    let listened = stop::sleep(Duration::from_secs(secs)).and_then(|()| {
+        let hang = Instant::now() + HANG;
+        while Instant::now() < hang
+            && !dns_sd_text::answered(
+                args,
+                &crate::util::read_regular_text(file).unwrap_or_default(),
+            )
+        {
+            stop::sleep(POLL)?;
+        }
+        Ok(())
+    });
     let _ = crate::sys::kill_group(i32::try_from(child.id()).unwrap_or(0), libc::SIGTERM);
     crate::mac::reap_within(&mut child, STEP);
+    listened?;
     Ok(crate::util::read_regular_text(file).unwrap_or_default())
 }
 
@@ -3224,6 +3494,17 @@ fn guest(
         if !status.success() {
             return Err(not_run(format!("tart set --disk-size: {status}")));
         }
+    }
+    if let Some(display) = scenario.display() {
+        let status = aterm_uds::spawnfd::command(tart)
+            .args(["set", &vm.name, "--display", display])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| not_run(format!("tart set: {e}")))?;
+        if !status.success() {
+            return Err(not_run(format!("tart set --display {display}: {status}")));
+        }
+        row.cell("guest display", Value::Text(format!("{display} points")));
     }
     crate::mac::boot_sip_on(&mut vm, base)?;
     let zip = format!("{}/aterm.zip", crate::mac::GUEST_SHARE);
@@ -3976,6 +4257,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     }
     presses_cells(row, &g.presses.borrow(), ask.person);
     tab_git(g, row, "git", "once setup's wait ended")?;
+    fleet_member_cells(g, row)?;
     elevation_cells(g, ask, row, open_ms)?;
     // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
     captures.stop(g);
@@ -5257,22 +5539,17 @@ fn timeline(lines: &[(u64, String)], max: usize) -> String {
 }
 
 fn vault(g: &Guest, row: &mut Row) -> Result<(), Fail> {
-    let seen = g.run(
-        &format!(
-            "/usr/bin/python3 -c \"import socket\ntry: print(socket.getaddrinfo('{ALAB_HOST}', 7484)[0][4][0])\nexcept Exception: print('none')\"; \
-             script -q {GUEST_NUX}/browse.txt dns-sd -B {ALAB_SERVICE} >/dev/null 2>&1 & sleep 4; pkill -x dns-sd; sleep 0.5; \
-             grep -c ' Add ' {GUEST_NUX}/browse.txt || true"
-        ),
-        STEP,
-    )?;
-    let mut lines = seen.lines().map(str::trim);
-    let address = lines.next().unwrap_or("none");
-    let adverts: u32 = lines.next_back().and_then(|n| n.parse().ok()).unwrap_or(0);
-    if address != "none" || adverts > 0 {
-        return Err(not_run(format!(
-            "an ALab vault answers on the guest's network ({ALAB_HOST} {address}, {adverts} {ALAB_SERVICE} advert(s)): the lane never asks a real vault to admit a guest"
-        )));
-    }
+    // Off the ALab network as the guard judges it: no answer from the vault (the guard's packet
+    // filter refuses its port whatever its name resolves to) and no advert but this Mac's own,
+    // which the guest hears over tart's bridge while this Mac serves the vault.
+    let (address, http) = alab_reach(g)?;
+    let off =
+        alab_probe_verdict(&address, &http, &guest_heard(g, ALAB_SERVICE)?).map_err(|why| {
+            not_run(format!(
+                "{why}: the lane never asks a real vault to admit a guest"
+            ))
+        })?;
+    row.cell("off the ALab network", Value::Text(off));
     start_mdns(g)?;
     let (d, out) = g.drive(
         "vault",
@@ -5280,29 +5557,13 @@ fn vault(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         &format!("{} init --only workstation", g.aterm),
     )?;
     let mdns = stop_mdns(g)?;
-    let asked = d.prompts.iter().find(|(_, _, text)| text.contains("vault"));
+    let asked = vault_questions(&d);
     row.cell(
-        "to the vault prompt",
-        or_missing(asked.map(|p| p.0), Value::Ms, "init asked for no vault"),
-    );
-    row.cell(
-        "silent before it",
-        or_missing(asked.map(|p| p.1), Value::Ms, "init asked for no vault"),
+        "vault questions (target 0)",
+        Value::Count(asked.len() as u64),
     );
     drive_cells(row, "", &d);
     open_rows_cell(row, "", &d, &out);
-    let join = d
-        .prompts
-        .iter()
-        .find(|(_, _, text)| text.contains("join password"));
-    row.cell(
-        "join password to the end",
-        or_missing(
-            join.zip(d.end_ms).map(|(p, end)| end.saturating_sub(p.0)),
-            Value::Ms,
-            "init asked for no join password",
-        ),
-    );
     row.cell(
         "mDNS questions for the ALab vault",
         Value::Count(alab_questions(&mdns) as u64),
@@ -5324,11 +5585,29 @@ fn vault(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     row.cell(
         "ALab join",
         Value::NotRun(
-            "it needs the ALab vault's join password and its signer, which the guest has not (vault-local joins a vault of the guest's own)"
+            "a guest's identity is a lab identity, which never asks the live ALab vault (A12): vault-local and vault-phrase join labs of the guest's own"
                 .into(),
         ),
     );
+    if !asked.is_empty() {
+        row.fail(format!(
+            "init asked {} vault question(s) off the ALab network: {}",
+            asked.len(),
+            asked.join(" | ")
+        ));
+    }
     Ok(())
+}
+
+/// The prompts a run of `aterm init` asked about a vault (a prompt's words naming one), each as
+/// the driver recorded it: since `f83256665c` init asks none off the ALab network.
+#[must_use]
+pub fn vault_questions(d: &Drive) -> Vec<String> {
+    d.prompts
+        .iter()
+        .filter(|(_, _, text)| text.to_ascii_lowercase().contains("vault"))
+        .map(|(_, _, text)| text.clone())
+        .collect()
 }
 
 /// The port and name of the vault `vault-local` serves in the guest, on 127.0.0.1 only.
@@ -5364,8 +5643,10 @@ fn local_vault_setup(aterm: &str, admin: &str) -> String {
     )
 }
 
-/// `vault-local`: the vault [`local_vault_setup`] makes, joined by `aterm init --only workstation
-/// --vault <it>#<signer>` on a terminal with its join password typed.
+/// `vault-local`: the vault [`local_vault_setup`] makes, named by `aterm init --only workstation
+/// --vault <it>#<signer>` on a terminal (which asks nothing since `f83256665c`), then joined with
+/// its join password as a person who has it does, piped to `aterm secrets join <it>
+/// --password-stdin`: the vault's entry on disk with the admin's bytes ([`local_join_verdict`]).
 fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let admin = format!("{GUEST_NUX}/vault-admin");
     let signer = g.sh(&local_vault_setup(&g.aterm, &admin), STEP)?;
@@ -5379,57 +5660,13 @@ fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let url = format!("http://127.0.0.1:{LOCAL_VAULT_PORT}/v1/{LOCAL_VAULT}#{signer}");
     let (d, out) = g.drive(
         "vault-local",
-        &format!(
-            "NUX_JOIN=\"$(cat {admin}/password)\" NUX_SUDO={}",
-            g.sudo_password()
-        ),
+        &format!("NUX_SUDO={}", g.sudo_password()),
         &format!("{} init --only workstation --vault '{url}'", g.aterm),
     )?;
-    let typed = d
-        .prompts
-        .iter()
-        .find(|(_, _, text)| text.contains("join password"));
+    drive_cells(row, "init: ", &d);
+    open_rows_cell(row, "init: ", &d, &out);
     row.cell(
-        "to the join password prompt",
-        or_missing(
-            typed.map(|p| p.0),
-            Value::Ms,
-            "init asked for no join password",
-        ),
-    );
-    let written = g.run(
-        &format!(
-            "perl -MTime::HiRes=stat -e 'my @s = stat shift; print $s[9] if @s' ~/.secrets/{LOCAL_VAULT_ENTRY}"
-        ),
-        STEP,
-    )?;
-    let on_disk = written
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .zip(d.start_epoch_ms)
-        .zip(typed)
-        .map(|((at, start), typed)| secs_to_ms(at).saturating_sub(start.saturating_add(typed.0)));
-    row.cell(
-        "typed to the secret on disk",
-        or_missing(
-            on_disk,
-            Value::Ms,
-            &format!("no ~/.secrets/{LOCAL_VAULT_ENTRY} after init"),
-        ),
-    );
-    row.cell(
-        "typed to the end",
-        or_missing(
-            typed.zip(d.end_ms).map(|(p, end)| end.saturating_sub(p.0)),
-            Value::Ms,
-            "init asked for no join password",
-        ),
-    );
-    drive_cells(row, "", &d);
-    open_rows_cell(row, "", &d, &out);
-    row.cell(
-        "vault step",
+        "init: vault step",
         or_missing(
             out.lines()
                 .rev()
@@ -5437,6 +5674,69 @@ fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
                 .map(|l| squeeze(l.trim(), 100)),
             Value::Text,
             "no `Secrets vault` row in init's output",
+        ),
+    );
+    phase_cells(row, "", &g.log()?, "aterm init:");
+
+    // The join password, piped from the admin's file (never on a command line or in a log).
+    let piped = format!(
+        "{} secrets join '{url}' --password-stdin < {admin}/password",
+        g.aterm
+    );
+    let (join, join_out) = g.notty_within(
+        "vault-local-join",
+        &format!("/bin/sh -c {}", crate::util::shell_quote(&piped)),
+        HANG,
+    )?;
+    drive_cells_within(row, "join: ", &join, HANG);
+    row.cell(
+        "join: said",
+        or_missing(
+            join_out
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| squeeze(l.trim(), 120)),
+            Value::Text,
+            "the join printed nothing",
+        ),
+    );
+    let probe = format!(
+        "perl -MTime::HiRes=stat -e 'my @s = stat shift; print $s[9] if @s' ~/.secrets/{LOCAL_VAULT_ENTRY}"
+    );
+    let hang = Instant::now() + HANG;
+    let landed = loop {
+        let at = g.run(&probe, STEP)?.trim().parse::<f64>().ok();
+        if at.is_some() || Instant::now() >= hang {
+            break at;
+        }
+        stop::sleep(POLL)?;
+    };
+    let same = match landed {
+        Some(_) => Some(
+            g.run(
+                &format!(
+                    "cmp -s ~/.secrets/{LOCAL_VAULT_ENTRY} {admin}/seed/{LOCAL_VAULT_ENTRY} && echo same || echo differs"
+                ),
+                STEP,
+            )?
+            .trim()
+                == "same",
+        ),
+        None => None,
+    };
+    let why = format!(
+        "no ~/.secrets/{LOCAL_VAULT_ENTRY} within {} s",
+        HANG.as_secs()
+    );
+    row.cell(
+        "join password piped to the secret on disk",
+        or_missing(
+            landed
+                .zip(join.start_epoch_ms)
+                .map(|(at, start)| secs_to_ms(at).saturating_sub(start)),
+            Value::Ms,
+            &why,
         ),
     );
     row.cell(
@@ -5453,8 +5753,29 @@ fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             Value::Text(squeeze(last.trim(), 100)),
         );
     }
-    phase_cells(row, "", &g.log()?, "aterm init:");
+    if let Err(why) = local_join_verdict(landed.is_some(), same) {
+        row.fail(why);
+    }
     Ok(())
+}
+
+/// Whether `vault-local` let the guest into its own vault: the vault's entry `landed` in
+/// `~/.secrets` within the hang detector, and is the admin's bytes (`same`, compared in the guest,
+/// never printed).
+///
+/// # Errors
+/// Why the guest is not in: the entry never landed, or it is not the vault's.
+pub fn local_join_verdict(landed: bool, same: Option<bool>) -> Result<(), String> {
+    match (landed, same) {
+        (true, Some(true)) => Ok(()),
+        (true, _) => Err(format!(
+            "~/.secrets/{LOCAL_VAULT_ENTRY} is not the guest's own vault's entry"
+        )),
+        (false, _) => Err(format!(
+            "the guest's own vault never wrote ~/.secrets/{LOCAL_VAULT_ENTRY} within {} s of its join password",
+            HANG.as_secs()
+        )),
+    }
 }
 
 /// The latest public release, read in the guest from the pointer install.sh reads.
@@ -5764,11 +6085,23 @@ fn run_row(
     });
     let watched = watchers.finish(&g, &mut row);
     let guarded = alab_guard(&g, run, &mut row);
+    // A kept clone keeps the guard for its later boots, put in place once the row read its census:
+    // the daemon that loads it is a background item macOS may say it added.
+    let kept = if ask.keep {
+        g.sh(&g.as_root(&pf_guard_at_boot()), STEP).map(drop)
+    } else {
+        Ok(())
+    };
     drop(g);
-    body?;
-    read?;
-    watched?;
-    guarded?;
+    // Each step's refusal is folded into the row, which keeps its cells and any guard failure.
+    for step in [body, read, watched, guarded, kept] {
+        if let Err(fail) = step {
+            if fail.stopped.is_some() {
+                return Err(fail);
+            }
+            row.refuse(&fail);
+        }
+    }
     Ok(row)
 }
 
@@ -5810,6 +6143,8 @@ fn row_body(
         Scenario::Dmg => fault::dmg(g, row),
         Scenario::AgentSsh => fault::agent_ssh(g, row),
         Scenario::ClockBack => fault::clock_back(g, row),
+        Scenario::RevealTab => reveal::row(g, row, false),
+        Scenario::RevealTabControl => reveal::row(g, row, true),
     }
 }
 
@@ -5960,6 +6295,10 @@ pub fn cmd_nux(args: &[String]) -> Res {
     crate::util::copy_regular_file(&install, share.join("install.sh"))
         .map_err(|e| format!("{}: {e}", install.display()))?;
     build_helper(&share)?;
+    let reads_tree = ask.scenarios.iter().any(|s| s.reads_tree());
+    if reads_tree {
+        reveal::stage(&share)?;
+    }
     let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
         Some(stage_app(ask.app.as_deref(), run, &share)?)
     } else {
@@ -5968,8 +6307,9 @@ pub fn cmd_nux(args: &[String]) -> Res {
     let prep = crate::mac::Prep {
         fda: false,
         no_clt: ask.no_clt,
-        // The reader reads dialogs through the person base's Accessibility grant.
-        person: (ask.person || ask.reader).then(|| GUEST_HELPER.to_owned()),
+        // The reader reads dialogs, and the tree rows' helper a window's tree, through the person
+        // base's Accessibility grant.
+        person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
     };
     pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
     let base =
@@ -6022,7 +6362,11 @@ pub fn cmd_nux(args: &[String]) -> Res {
             String::new()
         },
         app.as_ref().map_or_else(
-            || "a public release (install.sh)".to_owned(),
+            || if ask.scenarios.iter().all(|s| s.reads_tree()) {
+                "none: the tree rows run this checkout's debug aterm and lab".to_owned()
+            } else {
+                "a public release (install.sh)".to_owned()
+            },
             |a| format!("{} {} ({})", a.id, a.version, a.how)
         ),
     );
@@ -6038,6 +6382,9 @@ pub fn cmd_nux(args: &[String]) -> Res {
 #[path = "mac_nux_advert.rs"]
 mod advert;
 
+#[path = "guest/dns_sd_text.rs"]
+mod dns_sd_text;
+
 #[path = "mac_nux_capture.rs"]
 mod capture;
 
@@ -6046,6 +6393,30 @@ mod fault;
 
 #[path = "mac_nux_phrase.rs"]
 mod phrase;
+
+#[cfg(debug_assertions)]
+#[path = "mac_nux_reveal.rs"]
+mod reveal;
+
+/// A release lab image has no `lab reveal-tab` (its scratch registry is a debug build's seam), so
+/// its tree rows are NOT RUN.
+#[cfg(not(debug_assertions))]
+mod reveal {
+    use std::path::Path;
+
+    use super::{Guest, Row};
+    use crate::Fail;
+
+    const WHY: &str = "the tree rows run lab reveal-tab, which needs a debug lab image for its scratch-registry seams";
+
+    pub(super) fn stage(_: &Path) -> Result<(), Fail> {
+        Err(crate::mac::not_run(WHY))
+    }
+
+    pub(super) fn row(_: &Guest, _: &mut Row, _: bool) -> Result<(), Fail> {
+        Err(crate::mac::not_run(WHY))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -6093,6 +6464,26 @@ mod tests {
             [Scenario::KillPublish]
         );
         assert!(FAULTS.iter().all(|s| s.needs_app()));
+        // The tree rows come by name or as `tree`, never with `all` or `faults`, last; they alone
+        // read a tree (so the person base), and run no app.
+        assert_eq!(parse_scenarios("tree").unwrap(), TREE);
+        assert_eq!(
+            parse_scenarios("reveal-tab-control,doctor,kill-stage").unwrap(),
+            [
+                Scenario::Doctor,
+                Scenario::KillStage,
+                Scenario::RevealTabControl
+            ]
+        );
+        assert!(
+            parse_scenarios("all,faults")
+                .unwrap()
+                .iter()
+                .all(|s| !s.reads_tree())
+        );
+        assert_eq!(every().filter(|s| s.reads_tree()).collect::<Vec<_>>(), TREE);
+        assert!(TREE.iter().all(|s| !s.needs_app() && !s.grows_disk()));
+        assert!(every().all(|s| s.display().is_some() == s.reads_tree()));
     }
 
     #[test]
@@ -6386,6 +6777,47 @@ mod tests {
             member_probe_verdict(&Err("its transcript is empty".into())).unwrap_err(),
             "the guest's browse of _alab._tcp did not run (its transcript is empty), so no advert \
              is unproven"
+        );
+    }
+
+    /// A kept clone's boot guard: the file it writes holds the guard every row loads, whole, and
+    /// the boot daemon enables the packet filter on that file at load, so a clone booted again is
+    /// guarded before its aterm reopens. NEGATIVE CONTROL: a daemon loading any other file, or no
+    /// `RunAtLoad`, fails it.
+    #[test]
+    fn a_kept_clone_loads_the_guard_again_at_boot() {
+        let script = pf_guard_at_boot();
+        let body = |path: &str| {
+            let start = script
+                .find(&format!("cat > {path} <<'EOF'\n"))
+                .map(|at| at + format!("cat > {path} <<'EOF'\n").len())
+                .expect("a heredoc for the file");
+            let len = script[start..].find("EOF\n").expect("the heredoc's end");
+            script[start..start + len].to_owned()
+        };
+        assert_eq!(
+            body(PF_GUARD_BOOT),
+            PF_GUARD,
+            "the boot file is the guard, whole"
+        );
+        let daemon = body(PF_GUARD_DAEMON);
+        assert!(
+            daemon.contains(&format!(
+                "<array><string>/sbin/pfctl</string><string>-E</string><string>-f</string>\
+                 <string>{PF_GUARD_BOOT}</string></array>"
+            )),
+            "{daemon}"
+        );
+        assert!(daemon.contains("<key>RunAtLoad</key><true/>"), "{daemon}");
+        assert!(
+            script.contains(&format!(
+                "chown root:wheel {PF_GUARD_BOOT} {PF_GUARD_DAEMON}"
+            )),
+            "launchd loads only root's daemons: {script}"
+        );
+        assert!(
+            script.ends_with("; /bin/sync"),
+            "the files reach the disk before the clone stops: {script}"
         );
     }
 
@@ -7518,6 +7950,110 @@ mod tests {
             shown.contains("| doctor | FAILED: guest `x`: exit 1 |"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn a_guard_failure_outlives_a_body_the_guest_could_not_run() {
+        // E3 (2026-11-05): the guard fails the row, then the body's refusal is folded in.
+        let mut row = Row::new(Scenario::Vault);
+        row.cell("dialogs", Value::Text("none".into()));
+        row.fail("the guest heard an ALab member answer".into());
+        row.refuse(&not_run("an ALab vault answers on the guest's network"));
+        assert_eq!(
+            row.outcome,
+            Outcome::Failed("the guest heard an ALab member answer".into())
+        );
+        assert_eq!(exit_code(std::slice::from_ref(&row)), 1);
+        assert_eq!(row.cells[0].0, "dialogs", "the row keeps what it measured");
+        assert_eq!(row.cells[1].0, "also not run");
+        // NEGATIVE CONTROL: the row the old flow returned for the same run, the body's refusal
+        // alone with every cell dropped, exits NOT RUN and hides the guard's failure.
+        let old = Row::refused(
+            Scenario::Vault,
+            &not_run("an ALab vault answers on the guest's network"),
+        );
+        assert_eq!(exit_code(std::slice::from_ref(&old)), NOT_RUN);
+        assert!(old.cells.is_empty());
+        // A failed step after a NOT RUN one fails the row; a second failure is a cell.
+        let mut row = Row::new(Scenario::Doctor);
+        row.refuse(&not_run("no tart"));
+        row.refuse(&Fail::die("guest `x`: exit 1"));
+        row.refuse(&Fail::die("guest `y`: exit 2"));
+        assert_eq!(row.outcome, Outcome::Failed("guest `x`: exit 1".into()));
+        assert_eq!(
+            row.cells,
+            vec![(
+                "also failed".into(),
+                Value::Text("guest `y`: exit 2".into())
+            )]
+        );
+    }
+
+    /// A vault question is a prompt whose words name a vault, whatever its case; a sudo password
+    /// prompt is none. NEGATIVE CONTROL: the same drive with its vault prompt, which init asked
+    /// before `f83256665c`, names it, and the row fails on it.
+    #[test]
+    fn a_vault_question_is_a_prompt_naming_a_vault() {
+        let asked = read_drive(
+            "start_epoch_ms 1\nfirst_byte_ms 5\nprompt 120 50 Vault join password (Enter keeps none):\n\
+             prompt 300 20 Password:\nend_ms 900\nprompts 2\n",
+        );
+        assert_eq!(vault_questions(&asked).len(), 1, "{asked:?}");
+        let none = read_drive("start_epoch_ms 1\nprompt 300 20 Password:\nend_ms 900\nprompts 1\n");
+        assert!(vault_questions(&none).is_empty(), "{none:?}");
+    }
+
+    /// The guest is in its own vault only when the vault's entry landed with the admin's bytes:
+    /// an entry that never came (0.155.0's init asked for no join password, so nothing was
+    /// typed) or that differs fails the row. NEGATIVE CONTROL: the row as it was, with no verdict,
+    /// measured such a run (E3's second batch, 2026-11-05).
+    #[test]
+    fn a_guests_own_vault_lets_it_in_only_with_the_vaults_entry_on_disk() {
+        assert!(local_join_verdict(true, Some(true)).is_ok());
+        let never = local_join_verdict(false, None).unwrap_err();
+        assert!(
+            never.contains("never wrote ~/.secrets/NUX_PROBE"),
+            "{never}"
+        );
+        assert!(local_join_verdict(true, Some(false)).is_err());
+        assert!(local_join_verdict(true, None).is_err());
+    }
+
+    #[test]
+    fn a_guests_join_with_no_url_must_refuse_as_a_lab_identity() {
+        let refused = "aterm members join: this Mac runs in a virtual machine, so its vault \
+                       identity is a lab identity (vm): a lab identity founds its own lab; pass \
+                       its URL\nexit=1\n";
+        let said = lab_join_verdict(refused).unwrap();
+        assert!(said.starts_with("refused before it dialed: "), "{said}");
+        // NEGATIVE CONTROL: a join that asked (no lab refusal) fails, whatever it printed.
+        let asked = "Asked m22 to let this Mac in; waiting for a person's Allow\nexit=0\n";
+        assert!(
+            lab_join_verdict(asked)
+                .unwrap_err()
+                .contains("did not refuse")
+        );
+        assert!(lab_join_verdict("").is_err());
+        assert_eq!(
+            status_field("OK schema=1 fleet=listening setup=done", "fleet"),
+            Some("listening")
+        );
+        assert_eq!(status_field("OK fleetx=1 fleet= ", "fleet"), Some(""));
+        assert_eq!(status_field("OK setup=done", "fleet"), None);
+    }
+
+    #[test]
+    fn a_reach_probe_that_printed_nothing_never_reads_as_a_reached_vault() {
+        assert_eq!(
+            reach_of("192.168.1.242\n000\n"),
+            ("192.168.1.242".into(), "000".into())
+        );
+        assert_eq!(reach_of("none\n200\n"), ("none".into(), "200".into()));
+        // A resolver that printed nothing (the Command Line Tools' python stub): curl's code is
+        // the first line, which is no address, and no second line is no answer.
+        assert_eq!(reach_of("000\n"), ("none".into(), "000".into()));
+        assert_eq!(reach_of(""), ("none".into(), "000".into()));
+        assert_eq!(reach_of("none\nxyz\n"), ("none".into(), "000".into()));
     }
 
     #[test]

@@ -422,9 +422,10 @@ fn kimi_pattern_phrases(pattern: &str) -> Vec<String> {
 }
 
 /// KIMI CODE'S LIMIT WORDS ARE ITS OWN QUOTA CLASSIFIER'S: every phrase each `kimi.wall.*`
-/// pattern or code matches (aterm-phase's `vendor_drift` bench holds them to the installed
-/// binary) is a limit to a review, and every limit word is one of them; the measured 429 line is
-/// a limit. CONTROL: a 429 that names no quota is not.
+/// pattern or code matches, in any build that carries it (aterm-phase's `vendor_drift` bench
+/// holds each to the installed binary where that build carries it), is a limit to a review, and
+/// every limit word is one of them; the measured 429 line and 2.5's form of it are limits.
+/// CONTROL: a 429 that names no quota is not.
 #[test]
 fn kimis_limit_words_are_its_own_quota_classifiers() {
     let phrases: Vec<String> = aterm_phase::anchors::KIMI_ANCHORS
@@ -455,6 +456,14 @@ fn kimis_limit_words_are_its_own_quota_classifiers() {
         "error: failed to run prompt: provider.rate_limit: 429 You exceeded your current quota, \
          please check your plan and billing details."
     ));
+    assert!(
+        says(
+            KIMI.limit_words,
+            "Error: [provider.api_error] You exceeded your current quota, please check your plan \
+             and billing details."
+        ),
+        "2.5's quota error, which shows the server's message after its code"
+    );
     assert!(
         !says(
             KIMI.limit_words,

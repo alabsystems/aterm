@@ -33,7 +33,7 @@ struct Capture {
 }
 
 fn corpus_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS)
+    aterm_tempfile::manifest_dir().join(CORPUS)
 }
 
 fn captures() -> Vec<Capture> {

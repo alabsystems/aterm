@@ -224,64 +224,73 @@ pub fn summary(place: &Place, words: &Words<'_>) -> String {
 #[must_use]
 pub fn line(place: &Place, words: &Words<'_>) -> String {
     use std::fmt::Write as _;
-    let mut parts = vec![format!(
-        "{}{}",
-        where_words(place),
-        since_words(place, words)
-    )];
+    let mut out = String::with_capacity(192);
+    out.push_str(&where_words(place));
+    if let Some(ms) = place.since_ms {
+        let _ = write!(
+            out,
+            " since {}{}",
+            if place.since_before { "before " } else { "" },
+            words.clock(ms)
+        );
+    }
     if place.at == Where::AlabLan {
-        parts[0].push_str(" (recognised: ");
+        out.push_str(" (recognised: ");
         match place.recognised {
-            Some(Recognised::Members) => parts[0].push_str("members answered here"),
+            Some(Recognised::Members) => out.push_str("members answered here"),
             Some(Recognised::Remembered) => {
-                parts[0].push_str("network ");
-                parts[0].push_str(place.network.as_ref().map_or("?", |id| id.short()));
+                out.push_str("network ");
+                out.push_str(place.network.as_ref().map_or("?", |id| id.short()));
             }
             Some(Recognised::Seeded) => {
-                parts[0].push_str("the fleet book's members answered on this subnet");
+                out.push_str("the fleet book's members answered on this subnet");
             }
             None => {}
         }
-        parts[0].push(')');
+        out.push(')');
     }
     if let Some(route) = &place.route {
         let link = place.path.map_or("", |path| path.link.word());
-        let gateway = route
-            .gateway
-            .map_or_else(|| "no gateway".to_owned(), |gw| format!("via {gw}"));
-        parts.push(format!(
-            "{}{}{} {}/{} {gateway}",
+        let _ = write!(
+            out,
+            " · {}{}{} {}/{} ",
             route.interface,
             if link.is_empty() { "" } else { " " },
             link,
             route.address,
             route.prefix
-        ));
+        );
+        match route.gateway {
+            Some(gw) => {
+                let _ = write!(out, "via {gw}");
+            }
+            None => out.push_str("no gateway"),
+        }
     }
     if let Some(tunnel) = &place.tunnel {
-        parts.push(format!("{tunnel} holds the default route"));
+        let _ = write!(out, " · {tunnel} holds the default route");
     }
     if place.path.is_some_and(|path| path.expensive) {
-        parts.push("expensive".to_owned());
+        out.push_str(" · expensive");
     }
     if place.path.is_some_and(|path| path.constrained) {
-        parts.push("Low Data Mode".to_owned());
+        out.push_str(" · Low Data Mode");
     }
-    parts.push(internet_long(place, words));
-    let mut alab = match place.alab {
-        Alab::Here => format!("ALab LAN: {}", alab_short(place, words)),
-        _ => alab_short(place, words),
-    };
-    if !matches!(place.alab, Alab::Here)
-        && let Some(last) = last_answer_words(place, words)
-    {
-        let _ = write!(alab, " ({last})");
+    out.push_str(" · ");
+    out.push_str(&internet_long(place, words));
+    out.push_str(" · ");
+    if matches!(place.alab, Alab::Here) {
+        out.push_str("ALab LAN: ");
     }
-    parts.push(alab);
+    out.push_str(&alab_short(place, words));
     if !matches!(place.alab, Alab::Here) {
-        parts.push(members_words(place));
+        if let Some(last) = last_answer_words(place, words) {
+            let _ = write!(out, " ({last})");
+        }
+        out.push_str(" · ");
+        out.push_str(&members_words(place));
     }
-    parts.join(" · ")
+    out
 }
 
 /// THE `status` FIELDS: `net=<alab-lan|remote|offline|checking> net_kind=<hotspot|lan|cellular|

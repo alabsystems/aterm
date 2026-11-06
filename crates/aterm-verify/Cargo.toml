@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-verify"
-version.workspace = true
+version = "0.0.0"
 edition = "2024"
 # src/wasm_glue/templates.rs and src/wasm_glue/js.rs are derived from
 # wasm-bindgen-cli-support 0.2.108 (MIT OR Apache-2.0); see LICENSE-MIT. The
@@ -51,6 +51,8 @@ aterm-png = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-digest = { workspace = true }
 aterm-toml = { workspace = true }
+# The identity record's input names, which the perf lanes keep out of a bench build.
+aterm-stamp = { workspace = true }
 aterm-uds = { workspace = true }
 # The instance the run rides in, reached through aterm ctl's own client path
 # (`hosting_sock`, `connect_then_read_token`, `exchange_lines`): `window_list`

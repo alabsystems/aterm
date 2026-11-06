@@ -1474,6 +1474,8 @@ fn finish(
                 #[cfg(unix)]
                 &mut live,
                 Some(cmd.term_grace.unwrap_or(STUCK_GRACE)),
+                #[cfg(unix)]
+                REAP_AFTER_KILL,
             );
             return (
                 used(
@@ -1496,6 +1498,8 @@ fn finish(
                 #[cfg(unix)]
                 &mut live,
                 cmd.term_grace,
+                #[cfg(unix)]
+                REAP_AFTER_KILL,
             );
             return (
                 used(over_ceiling(cmd, &clock, limit, &killed), &clock),
@@ -1507,10 +1511,15 @@ fn finish(
     }
 }
 
+/// End `child`'s group: with a `grace`, `SIGTERM` first and up to `grace` for its leader to exit;
+/// then `SIGKILL` and the leader's reap, which, for a leader still there after the grace, gives
+/// up on Unix at `reap_bound` ([`reap_killed`]). What it adds to the child's block: nothing, the
+/// grace its leader exited within, what failed, or a leader left as it is.
 fn kill_and_reap(
     child: &mut Child,
     #[cfg(unix)] live: &mut group::Live,
     grace: Option<Duration>,
+    #[cfg(unix)] reap_bound: Duration,
 ) -> String {
     #[cfg(unix)]
     if let Some(grace) = grace
@@ -1551,10 +1560,44 @@ fn kill_and_reap(
         Err(e) => format!("  (SIGKILL itself failed: {e})\n"),
     };
     #[cfg(unix)]
-    let _ = live.reap_stage(child, true);
+    let note = match reap_killed(child, live, reap_bound) {
+        Some(left) => format!("{note}  ({left})\n"),
+        None => note,
+    };
     #[cfg(not(unix))]
     let _ = child.wait();
     note
+}
+
+/// How long a child sent `SIGKILL` may take to end before verify gives up its reap: whether a
+/// program held at its first exec dies of it is unmeasured (leftover U11), and a wait on one that
+/// does not would hang the run. The one-minute hang detector.
+#[cfg(unix)]
+const REAP_AFTER_KILL: Duration = Duration::from_secs(60);
+
+/// Reap `child`, just sent `SIGKILL`, looking every 25 ms for at most `bound`: `None` once it is
+/// reaped or its custody reads lost, else the clause that says it did not end and was left as it
+/// is, never signalled again here (its handle, once dropped, hands it to `aterm_uds`' reaper).
+#[cfg(unix)]
+fn reap_killed(child: &mut Child, live: &mut group::Live, bound: Duration) -> Option<String> {
+    let begun = Instant::now();
+    loop {
+        match live.exited(child, false) {
+            Ok(true) => {
+                let _ = live.reap_stage(child, true);
+                return None;
+            }
+            Ok(false) if begun.elapsed() < bound => std::thread::sleep(Duration::from_millis(25)),
+            Ok(false) => {
+                return Some(format!(
+                    "it did not end within {} of SIGKILL: pid {}, left as it is",
+                    aterm_capacity::span(bound),
+                    child.id()
+                ));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 fn over_ceiling(cmd: &Cmd, clock: &Clock<'_>, limit: Duration, kill: &str) -> Run {
@@ -2004,6 +2047,10 @@ pub mod group {
     fn signal_group(pgid: u32, sig: i32) -> std::io::Result<()> {
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         custody_audit::before_signal(pgid, sig)?;
+        #[cfg(test)]
+        if sig == SIGKILL && spared::armed() {
+            return Ok(());
+        }
         let g = i32::try_from(pgid).map_err(|_| std::io::Error::other("pid out of range"))?;
         // SAFETY: callers retain the unreaped group leader; two integer arguments.
         if unsafe { killpg(g, sig) } == 0 {
@@ -2269,6 +2316,40 @@ pub mod group {
         LIVE.iter()
             .filter(|slot| slot.load(Ordering::SeqCst) != 0)
             .count()
+    }
+
+    /// A unit test's stand-in for a leader `SIGKILL` does not end, as a program macOS holds at
+    /// its first exec may not (leftover U11, unmeasured): while a `Scope` is armed on a thread, a
+    /// `SIGKILL` that thread sends a group is sent nowhere and answers `Ok`, so the group's leader
+    /// runs on.
+    #[cfg(test)]
+    pub(super) mod spared {
+        use std::cell::Cell;
+        use std::marker::PhantomData;
+        use std::rc::Rc;
+
+        thread_local! { static ARMED: Cell<bool> = const { Cell::new(false) }; }
+
+        pub(crate) struct Scope {
+            previous: bool,
+            _same_thread: PhantomData<Rc<()>>,
+        }
+        impl Scope {
+            pub(crate) fn arm() -> Self {
+                Self {
+                    previous: ARMED.with(|armed| armed.replace(true)),
+                    _same_thread: PhantomData,
+                }
+            }
+        }
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                ARMED.with(|armed| armed.set(self.previous));
+            }
+        }
+        pub(super) fn armed() -> bool {
+            ARMED.with(Cell::get)
+        }
     }
 }
 
@@ -2807,6 +2888,99 @@ mod tests {
             gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the ceiling kill"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A child of `/bin/sleep 600` leading its own group, under a run in `tmp`.
+    #[cfg(unix)]
+    fn a_sleeping_leader(tmp: &Path) -> Child {
+        spawn_command(
+            &Cmd::new("/bin/sleep").arg("600"),
+            env_in(tmp),
+            Path::new(TASKPOLICY),
+        )
+        .spawn()
+        .expect("spawn sleep")
+    }
+
+    /// `pid`'s group, `SIGKILL`ed by `/bin/kill` once a test's wait on it ran past its hang
+    /// detector, so the thread blocked on its reap returns.
+    #[cfg(unix)]
+    fn kill_stray_group(pid: u32) {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+    }
+
+    /// The reap after `SIGKILL` is bounded: a child still there at the bound is left as it is,
+    /// named, and the wait returns; once it is killed, the same reap takes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reap_after_sigkill_gives_up_at_its_bound_and_leaves_the_child_as_it_is() {
+        let tmp = crate::mktemp_dir("atv-bounded-reap").expect("mktemp");
+        let mut child = a_sleeping_leader(&tmp);
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            let mut live = group::Live::enter(child.id());
+            let left = reap_killed(&mut child, &mut live, Duration::from_millis(200));
+            let _ = tx.send(left);
+            let _ = live.kill();
+            reap_killed(&mut child, &mut live, HANG_DETECTOR)
+        });
+        let Ok(left) = rx.recv_timeout(HANG_DETECTOR) else {
+            kill_stray_group(pid);
+            let _ = reaper.join();
+            panic!("the reap waited past its bound");
+        };
+        let left = left.expect("a child still there at the bound");
+        assert!(left.contains(&format!("pid {pid},")), "{left}");
+        assert_eq!(
+            reaper.join().expect("the reaper"),
+            None,
+            "the killed child reaped"
+        );
+        assert!(gone_within(&pid.to_string(), HANG_DETECTOR));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A ceiling's kill whose `SIGKILL` does not end the leader (a stand-in: the `SIGKILL` a
+    /// [`group::spared::Scope`] sends nowhere, as macOS's held first exec may not die of it) gives
+    /// up its reap at its bound and returns, its block naming the leader it left as it is; that
+    /// leader is still verify's to kill and reap. Negative control: the unbounded reap the kill
+    /// had (`reap_stage(child, true)`) never returns, which the hang detector fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_ceiling_kill_whose_sigkill_does_not_end_the_leader_names_it_and_returns() {
+        let tmp = crate::mktemp_dir("atv-spared-kill").expect("mktemp");
+        let mut child = a_sleeping_leader(&tmp);
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let killer = std::thread::spawn(move || {
+            let mut live = group::Live::enter(child.id());
+            let note = {
+                let _spared = group::spared::Scope::arm();
+                kill_and_reap(&mut child, &mut live, None, Duration::from_secs(1))
+            };
+            let _ = tx.send(note);
+            let _ = live.kill();
+            reap_killed(&mut child, &mut live, HANG_DETECTOR)
+        });
+        let Ok(note) = rx.recv_timeout(HANG_DETECTOR) else {
+            kill_stray_group(pid);
+            let _ = killer.join();
+            panic!("the kill's reap waited past its bound");
+        };
+        assert_eq!(
+            note,
+            format!("  (it did not end within 1s of SIGKILL: pid {pid}, left as it is)\n")
+        );
+        assert_eq!(
+            killer.join().expect("the killer"),
+            None,
+            "the leader, killed, reaped"
+        );
+        assert!(gone_within(&pid.to_string(), HANG_DETECTOR));
         std::fs::remove_dir_all(&tmp).ok();
     }
 

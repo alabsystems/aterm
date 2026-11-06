@@ -334,15 +334,28 @@ impl MarkdownHistory {
     }
 }
 
+/// Read `source` into its blocks, outline, links and images, with its HTML comments hidden.
+///
+/// The comment scan runs before any block exists and judges code spans line by line
+/// ([`mask_html_comments`]); the readers then judge them per block. Where the scan kept a comment
+/// opener that the readers show outside code, the source is read again with every comment hidden,
+/// so no comment shows or lends a link (`md-comments-hidden-code-preserved`).
 pub fn parse(source: &str) -> MarkdownDocument {
-    let presentation_source = mask_html_comments(source);
-    let display_source = presentation_source.as_ref();
+    let kept = mask_html_comments(source, CommentScan::KeepCode);
+    let (document, shows_a_comment) = read_document(source, &kept);
+    if !shows_a_comment {
+        return document;
+    }
+    read_document(source, &mask_html_comments(source, CommentScan::HideAll)).0
+}
+
+/// [`parse`] of `source` read from `display_source`, its comment-masked copy, and whether an
+/// HTML comment opener still shows there outside the code the readers found.
+fn read_document(source: &str, display_source: &str) -> (MarkdownDocument, bool) {
     let lines = source_lines(display_source);
     let mut blocks = Vec::new();
     let mut outline = Vec::new();
-    let mut links = Vec::new();
-    let mut images = Vec::new();
-    let mut inline_runs = Vec::new();
+    let mut found = Found::default();
     let mut block_styles = std::collections::BTreeMap::new();
     let mut anchors = std::collections::BTreeMap::new();
     let mut heading_ids = std::collections::BTreeMap::<String, usize>::new();
@@ -385,7 +398,9 @@ pub fn parse(source: &str) -> MarkdownDocument {
         }
 
         if let Some((level, text)) = heading(trimmed) {
-            let (text, styles) = lower_inline_text_styled(text);
+            let at = line.start + (line.text.len() - line.text.trim_start().len()) + text.start;
+            let (text, styles) =
+                read_inline_text(&display_source[at..at + text.len()], at, Some(&mut found));
             if !styles.is_empty() {
                 block_styles.insert(blocks.len(), styles);
             }
@@ -397,27 +412,19 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 format!("{base}-{}", *count + 1)
             };
             *count += 1;
-            let block = MarkdownBlock::Heading {
-                level,
-                id: id.clone(),
-                text: text.clone(),
-                source: line.start..line.end,
-            };
             outline.push(HeadingRef {
                 level,
                 id: id.clone(),
-                text,
+                text: text.clone(),
                 source_start: line.start,
             });
-            anchors.insert(id, line.start);
-            scan_inlines(
-                display_source,
-                line.start..line.end,
-                &mut links,
-                &mut images,
-                &mut inline_runs,
-            );
-            blocks.push(block);
+            anchors.insert(id.clone(), line.start);
+            blocks.push(MarkdownBlock::Heading {
+                level,
+                id,
+                text,
+                source: line.start..line.end,
+            });
             i += 1;
             continue;
         }
@@ -432,27 +439,13 @@ pub fn parse(source: &str) -> MarkdownDocument {
 
         if i + 1 < lines.len() && is_table_separator(lines[i + 1].text.trim()) {
             let start = line.start;
-            scan_inlines(
-                display_source,
-                line.start..line.end,
-                &mut links,
-                &mut images,
-                &mut inline_runs,
-            );
-            let header = table_cells(line.text);
+            let header = read_table_row(display_source, line, &mut found);
             i += 2;
             let mut rows = Vec::new();
             let mut end = lines[i - 1].end;
             while i < lines.len() && lines[i].text.contains('|') && !lines[i].text.trim().is_empty()
             {
-                scan_inlines(
-                    display_source,
-                    lines[i].start..lines[i].end,
-                    &mut links,
-                    &mut images,
-                    &mut inline_runs,
-                );
-                rows.push(table_cells(lines[i].text));
+                rows.push(read_table_row(display_source, &lines[i], &mut found));
                 end = lines[i].end;
                 i += 1;
             }
@@ -465,14 +458,8 @@ pub fn parse(source: &str) -> MarkdownDocument {
         }
 
         if let Some((depth, ordinal, text)) = list_item(line.text) {
-            scan_inlines(
-                display_source,
-                line.start..line.end,
-                &mut links,
-                &mut images,
-                &mut inline_runs,
-            );
-            let (text, styles) = lower_inline_text_styled(text);
+            let at = line.start + line.text.len() - text.len();
+            let (text, styles) = read_inline_text(text, at, Some(&mut found));
             if !styles.is_empty() {
                 block_styles.insert(blocks.len(), styles);
             }
@@ -489,28 +476,25 @@ pub fn parse(source: &str) -> MarkdownDocument {
         if trimmed.starts_with('>') {
             let start = line.start;
             let mut end = line.end;
-            let mut quote = String::new();
+            let mut markers = Vec::new();
             while i < lines.len() {
                 let candidate = &lines[i];
-                let candidate_trimmed = candidate.text.trim();
-                let Some(text) = candidate_trimmed.strip_prefix('>') else {
+                let marker = candidate.text.len() - candidate.text.trim_start().len();
+                if !candidate.text[marker..].starts_with('>') {
                     break;
-                };
-                if !quote.is_empty() {
-                    quote.push(' ');
                 }
-                quote.push_str(text.trim_start());
-                scan_inlines(
-                    display_source,
-                    candidate.start..candidate.end,
-                    &mut links,
-                    &mut images,
-                    &mut inline_runs,
-                );
+                markers.push(candidate.start - start + marker);
                 end = candidate.end;
                 i += 1;
             }
-            let (text, styles) = lower_inline_text_styled(&quote);
+            // The quote reads as one text: its lines with their `>` markers read as spaces,
+            // byte for byte in place, so every range found in it is canonical.
+            let mut quote = display_source.as_bytes()[start..end].to_vec();
+            for marker in markers {
+                quote[marker] = b' ';
+            }
+            let quote = String::from_utf8(quote).expect("an ASCII marker replaced by a space");
+            let (text, styles) = read_inline_text(&quote, start, Some(&mut found));
             if !styles.is_empty() {
                 block_styles.insert(blocks.len(), styles);
             }
@@ -523,14 +507,6 @@ pub fn parse(source: &str) -> MarkdownDocument {
 
         let start = line.start;
         let mut end = line.end;
-        let mut paragraph = line.text.trim().to_string();
-        scan_inlines(
-            display_source,
-            line.start..line.end,
-            &mut links,
-            &mut images,
-            &mut inline_runs,
-        );
         i += 1;
         while i < lines.len() {
             let candidate = &lines[i];
@@ -545,19 +521,10 @@ pub fn parse(source: &str) -> MarkdownDocument {
             {
                 break;
             }
-            paragraph.push(' ');
-            paragraph.push_str(candidate_trimmed);
             end = candidate.end;
-            scan_inlines(
-                display_source,
-                candidate.start..candidate.end,
-                &mut links,
-                &mut images,
-                &mut inline_runs,
-            );
             i += 1;
         }
-        let (text, styles) = lower_inline_text_styled(&paragraph);
+        let (text, styles) = read_inline_text(&display_source[start..end], start, Some(&mut found));
         if !styles.is_empty() {
             block_styles.insert(blocks.len(), styles);
         }
@@ -567,12 +534,13 @@ pub fn parse(source: &str) -> MarkdownDocument {
         });
     }
 
-    MarkdownDocument {
+    let shows_a_comment = shows_a_comment(display_source, &blocks, &found.runs);
+    let document = MarkdownDocument {
         blocks,
         outline,
-        links,
-        images,
-        inline_runs,
+        links: found.links,
+        images: found.images,
+        inline_runs: found.runs,
         block_styles,
         anchors,
         source_len: source.len(),
@@ -581,7 +549,48 @@ pub fn parse(source: &str) -> MarkdownDocument {
                 (byte == b'\n' && index + 1 < source.len()).then_some(index + 1)
             }))
             .collect(),
-    }
+    };
+    (document, shows_a_comment)
+}
+
+/// The lowered cells of the table row `line` of `source`, each read on its own.
+fn read_table_row(source: &str, line: &SourceLine<'_>, found: &mut Found) -> Vec<String> {
+    table_cell_ranges(line.text)
+        .map(|cell| {
+            let at = line.start + cell.start;
+            read_inline_text(&source[at..line.start + cell.end], at, Some(found)).0
+        })
+        .collect()
+}
+
+/// Whether an HTML comment opener shows in `display_source` outside the code the readers found:
+/// a fenced block, or the content of an inline code run.
+fn shows_a_comment(
+    display_source: &str,
+    blocks: &[MarkdownBlock],
+    runs: &[MarkdownInlineRun],
+) -> bool {
+    let mut code = blocks
+        .iter()
+        .filter_map(|block| match block {
+            MarkdownBlock::CodeBlock { source, .. } => Some(source.clone()),
+            _ => None,
+        })
+        .chain(
+            runs.iter()
+                .filter(|run| run.kind == MarkdownInlineKind::Code)
+                .map(|run| run.content_source.clone()),
+        )
+        .collect::<Vec<_>>();
+    // Code blocks and code runs never overlap, so the one starting last at or before an opener
+    // is the only one that can hold it.
+    code.sort_unstable_by_key(|range| range.start);
+    display_source.match_indices("<!--").any(|(at, opener)| {
+        let holder = code.partition_point(|range| range.start <= at);
+        !holder
+            .checked_sub(1)
+            .is_some_and(|holder| at + opener.len() <= code[holder].end)
+    })
 }
 
 /// How one span of a block's display text is styled.
@@ -1700,16 +1709,28 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
     lines
 }
 
+/// Which comments [`mask_html_comments`] leaves in place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommentScan {
+    /// Those inside fenced code and inside code spans, which are code text.
+    KeepCode,
+    /// None: every comment is hidden, in code too.
+    HideAll,
+}
+
 /// Hide HTML comments without moving a single canonical source byte.
 ///
-/// A comment inside a code span is code text and stays. A backtick run opens a span only when
-/// its inline block closes it ([`has_closing_code_ticks`]), and the span closes at the first
-/// equal run that is not backslash-escaped, the pairing the inline readers use
-/// ([`find_exact_run`]); an unmatched run is literal and keeps no comment visible. Nothing is
-/// masked inside a span, so its closer stays where the readers find it, and a span is closed again
-/// before any line that starts another block.
-fn mask_html_comments(source: &str) -> Cow<'_, str> {
+/// With [`CommentScan::KeepCode`] a comment inside fenced code or a code span is code text and
+/// stays. A backtick run opens a span only when its inline block closes it
+/// ([`CodeTicks::close`]), and the span closes at the first equal run that is not
+/// backslash-escaped, the pairing the inline readers use ([`find_exact_run`]); an unmatched run
+/// is literal and keeps no comment visible. Nothing is masked inside a span, so its closer stays
+/// where the readers find it, and a span is closed again before any line that starts another
+/// block. With [`CommentScan::HideAll`] no fence or span keeps a comment.
+fn mask_html_comments(source: &str, scan: CommentScan) -> Cow<'_, str> {
+    let keep_code = scan == CommentScan::KeepCode;
     let lines = source_lines(source);
+    let mut code_ticks = CodeTicks::new(&lines);
     let mut masked = None::<Vec<u8>>;
     let mut in_comment = false;
     let mut inline_code_ticks = None::<usize>;
@@ -1725,7 +1746,8 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
             }
             continue;
         }
-        if !in_comment
+        if keep_code
+            && !in_comment
             && inline_code_ticks.is_none()
             && let Some(fence) = fence_start(trimmed)
         {
@@ -1744,13 +1766,13 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
                 continue;
             }
 
-            if bytes[index] == b'`' {
+            if keep_code && bytes[index] == b'`' {
                 let run = ascii_run(bytes, index, b'`');
                 if !is_backslash_escaped(bytes, index) {
                     inline_code_ticks = match inline_code_ticks {
                         Some(open) if open == run => None,
                         Some(open) => Some(open),
-                        None => has_closing_code_ticks(&lines, at, index + run, run).then_some(run),
+                        None => code_ticks.close(at, index + run, run).then_some(run),
                     };
                 }
                 index += run;
@@ -1770,19 +1792,46 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
     })
 }
 
-/// Whether a code span of `ticks` backticks opened just before byte `from` of line `at` closes
-/// in its inline block: at an equal run that is not backslash-escaped ([`find_exact_run`]) later
-/// on that line or on a later line `parse` reads into the same block ([`joins_next_line`]).
-fn has_closing_code_ticks(lines: &[SourceLine<'_>], at: usize, from: usize, ticks: usize) -> bool {
-    let (mut at, mut from) = (at, from);
-    loop {
-        if find_exact_run(lines[at].text.as_bytes(), from, b'`', ticks).is_some() {
-            return true;
+/// The look ahead of [`mask_html_comments`] for the closer of a code span, over lines it reads
+/// in order. Each line's [`joins_next_line`] is judged once, and a run length found unclosed
+/// stays unclosed for every later opener in the same block, so a block of many unmatched runs
+/// is not read again for each of them.
+struct CodeTicks<'s, 'l> {
+    lines: &'l [SourceLine<'s>],
+    joins: Vec<Option<bool>>,
+    /// For each run length found unclosed, the last line of the block it was looked for in.
+    unclosed: std::collections::HashMap<usize, usize>,
+}
+
+impl<'s, 'l> CodeTicks<'s, 'l> {
+    fn new(lines: &'l [SourceLine<'s>]) -> Self {
+        Self {
+            lines,
+            joins: vec![None; lines.len()],
+            unclosed: std::collections::HashMap::new(),
         }
-        if !joins_next_line(lines, at) {
+    }
+
+    /// Whether a code span of `ticks` backticks opened just before byte `from` of line `at`
+    /// closes in its inline block: at an equal run that is not backslash-escaped
+    /// ([`find_exact_run`]) later on that line or on a later line `parse` reads into the same
+    /// block ([`joins_next_line`]). Openers are asked about in source order.
+    fn close(&mut self, at: usize, from: usize, ticks: usize) -> bool {
+        if self.unclosed.get(&ticks).is_some_and(|&last| at <= last) {
             return false;
         }
-        (at, from) = (at + 1, 0);
+        let (mut line, mut from) = (at, from);
+        loop {
+            if find_exact_run(self.lines[line].text.as_bytes(), from, b'`', ticks).is_some() {
+                return true;
+            }
+            let joins = *self.joins[line].get_or_insert_with(|| joins_next_line(self.lines, line));
+            if !joins {
+                self.unclosed.insert(ticks, line);
+                return false;
+            }
+            (line, from) = (line + 1, 0);
+        }
     }
 }
 
@@ -1859,9 +1908,90 @@ fn lower_inline_text(source: &str) -> String {
 
 /// [`lower_inline_text`] plus the styled spans of the text it returns.
 pub fn lower_inline_text_styled(source: &str) -> (String, Vec<(Range<usize>, InlineStyle)>) {
+    read_inline_text(source, 0, None)
+}
+
+/// What reading a block's inline text finds besides the text: its links, images and semantic
+/// runs, each at its canonical source range.
+#[derive(Default)]
+struct Found {
+    links: Vec<MarkdownLink>,
+    images: Vec<MarkdownImage>,
+    runs: Vec<MarkdownInlineRun>,
+}
+
+impl Found {
+    /// Record a link or image whose label is still to be read, and return the slot of its run
+    /// for [`Found::label`]. It is recorded before its label, so it precedes what the label holds.
+    fn open(
+        &mut self,
+        image: bool,
+        destination: &str,
+        source: Range<usize>,
+        content_source: Range<usize>,
+    ) -> usize {
+        let kind = if image {
+            let index = self.images.len();
+            self.images.push(MarkdownImage {
+                alt: None,
+                source_uri: destination.to_string(),
+                source: source.clone(),
+                remote: matches!(link_policy(destination), LinkPolicy::ExplicitExternal),
+            });
+            MarkdownInlineKind::Image { index }
+        } else {
+            let index = self.links.len();
+            self.links.push(MarkdownLink {
+                label: String::new(),
+                destination: destination.to_string(),
+                source: source.clone(),
+                policy: link_policy(destination),
+            });
+            MarkdownInlineKind::Link { index }
+        };
+        self.runs.push(MarkdownInlineRun {
+            kind,
+            text: String::new(),
+            source,
+            content_source,
+        });
+        self.runs.len() - 1
+    }
+
+    /// Give the run at `slot`, and the link or image it names, the lowered `label` read for it;
+    /// an image's alt text is `None` where its authored label is empty.
+    fn label(&mut self, slot: usize, label: String, authored: bool) {
+        let run = &mut self.runs[slot];
+        match run.kind {
+            MarkdownInlineKind::Image { index } => {
+                self.images[index].alt = authored.then(|| label.clone());
+            }
+            MarkdownInlineKind::Link { index } => self.links[index].label.clone_from(&label),
+            _ => {}
+        }
+        run.text = label;
+    }
+}
+
+/// The display text and styled spans of the inline text `source`, whose first byte is canonical
+/// byte `at`, and with `found` its links, images and runs. A block's text is read here once, so
+/// what it shows and the links it lends are one reading of one text.
+fn read_inline_text(
+    source: &str,
+    at: usize,
+    found: Option<&mut Found>,
+) -> (String, Vec<(Range<usize>, InlineStyle)>) {
     let mut raw = String::with_capacity(source.len());
     let mut spans = Vec::new();
-    lower_segment_into(source, 0, InlineStyle::default(), &mut raw, &mut spans);
+    lower_segment_into(
+        source,
+        at,
+        0,
+        InlineStyle::default(),
+        &mut raw,
+        &mut spans,
+        found,
+    );
     let mut text = String::with_capacity(raw.len());
     let mut map = Vec::with_capacity(raw.len() + 1);
     let mut pending_space = false;
@@ -1915,24 +2045,30 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
     let mut out = String::with_capacity(source.len());
     lower_segment_into(
         source,
+        0,
         depth,
         InlineStyle::default(),
         &mut out,
         &mut Vec::new(),
+        None,
     );
     out
 }
 
-/// The lowering pass, appending to `out`. Each recognized construct records the
-/// range of `out` it emitted with its style merged over the enclosing `style`
-/// (nested constructs record their own, stronger spans); `lower_inline_text`
-/// discards them, `lower_inline_text_styled` keeps them.
+/// The lowering pass over `source`, whose first byte is canonical byte `at`, appending to `out`.
+/// Each recognized construct records the range of `out` it emitted with its style merged over
+/// the enclosing `style` (nested constructs record their own, stronger spans);
+/// `lower_inline_text` discards them, `lower_inline_text_styled` keeps them. With `found`, each
+/// link, image, code span and emphasis is recorded there too, at its canonical range, in the
+/// order it starts.
 fn lower_segment_into(
     source: &str,
+    at: usize,
     depth: usize,
     style: InlineStyle,
     out: &mut String,
     spans: &mut Vec<(Range<usize>, InlineStyle)>,
+    mut found: Option<&mut Found>,
 ) {
     if depth >= MAX_INLINE_NESTING {
         out.push_str(source);
@@ -1980,6 +2116,14 @@ fn lower_segment_into(
                         ..InlineStyle::default()
                     }),
                 ));
+                if let Some(found) = found.as_deref_mut() {
+                    found.runs.push(MarkdownInlineRun {
+                        kind: MarkdownInlineKind::Code,
+                        text: code,
+                        source: at + index..at + close + ticks,
+                        content_source: at + index + ticks..at + close,
+                    });
+                }
                 index = close + ticks;
                 continue;
             }
@@ -2004,16 +2148,34 @@ fn lower_segment_into(
                     ..InlineStyle::default()
                 })
             };
+            let label = label_open + 1..label_close;
+            let slot = found.as_deref_mut().map(|found| {
+                found.open(
+                    image,
+                    source[label_close + 2..destination_close].trim(),
+                    at + index..at + destination_close + 1,
+                    at + label.start..at + label.end,
+                )
+            });
             let start = out.len();
             lower_segment_into(
-                &source[label_open + 1..label_close],
+                &source[label.clone()],
+                at + label.start,
                 depth + 1,
                 inner,
                 out,
                 spans,
+                found.as_deref_mut(),
             );
             if !image {
                 spans.push((start..out.len(), inner));
+            }
+            if let (Some(found), Some(slot)) = (found.as_deref_mut(), slot) {
+                found.label(
+                    slot,
+                    normalize_display_whitespace(&out[start..]),
+                    !label.is_empty(),
+                );
             }
             index = destination_close + 1;
             continue;
@@ -2031,27 +2193,57 @@ fn lower_segment_into(
                 && delimiter_can_open(bytes, index, marker, run)
                 && let Some(close) = find_emphasis_close(bytes, index + run, marker, run)
             {
-                let own = if marker == b'~' {
-                    InlineStyle {
-                        strike: true,
-                        ..InlineStyle::default()
-                    }
+                let (own, kind) = if marker == b'~' {
+                    (
+                        InlineStyle {
+                            strike: true,
+                            ..InlineStyle::default()
+                        },
+                        MarkdownInlineKind::Strikethrough,
+                    )
                 } else if run >= 2 {
-                    InlineStyle {
-                        strong: true,
-                        emphasis: run == 3,
-                        ..InlineStyle::default()
-                    }
+                    (
+                        InlineStyle {
+                            strong: true,
+                            emphasis: run == 3,
+                            ..InlineStyle::default()
+                        },
+                        MarkdownInlineKind::Strong,
+                    )
                 } else {
-                    InlineStyle {
-                        emphasis: true,
-                        ..InlineStyle::default()
-                    }
+                    (
+                        InlineStyle {
+                            emphasis: true,
+                            ..InlineStyle::default()
+                        },
+                        MarkdownInlineKind::Emphasis,
+                    )
                 };
                 let inner = style.merged(own);
+                let content = index + run..close;
+                let slot = found.as_deref_mut().map(|found| {
+                    found.runs.push(MarkdownInlineRun {
+                        kind,
+                        text: String::new(),
+                        source: at + index..at + close + run,
+                        content_source: at + content.start..at + content.end,
+                    });
+                    found.runs.len() - 1
+                });
                 let start = out.len();
-                lower_segment_into(&source[index + run..close], depth + 1, inner, out, spans);
+                lower_segment_into(
+                    &source[content.clone()],
+                    at + content.start,
+                    depth + 1,
+                    inner,
+                    out,
+                    spans,
+                    found.as_deref_mut(),
+                );
                 spans.push((start..out.len(), inner));
+                if let (Some(found), Some(slot)) = (found.as_deref_mut(), slot) {
+                    found.runs[slot].text = normalize_display_whitespace(&out[start..]);
+                }
                 index = close + run;
                 continue;
             }
@@ -2075,6 +2267,21 @@ fn lower_segment_into(
                         ..InlineStyle::default()
                     }),
                 ));
+                if let Some(found) = found.as_deref_mut() {
+                    let link = found.links.len();
+                    found.links.push(MarkdownLink {
+                        label: inside.to_string(),
+                        destination: inside.to_string(),
+                        source: at + index..at + close + 1,
+                        policy: link_policy(inside),
+                    });
+                    found.runs.push(MarkdownInlineRun {
+                        kind: MarkdownInlineKind::Link { index: link },
+                        text: inside.to_string(),
+                        source: at + index..at + close + 1,
+                        content_source: at + index + 1..at + close,
+                    });
+                }
                 index = close + 1;
                 continue;
             }
@@ -2241,12 +2448,17 @@ fn decode_entity(entity: &str) -> Option<char> {
     }
 }
 
-fn heading(line: &str) -> Option<(u8, &str)> {
+/// The level of the heading `line` and the range of `line` its text is: past the `#` run and
+/// its space, trimmed, without a closing `#` run.
+fn heading(line: &str) -> Option<(u8, Range<usize>)> {
     let count = line.bytes().take_while(|byte| *byte == b'#').count();
     if !(1..=6).contains(&count) || line.as_bytes().get(count) != Some(&b' ') {
         return None;
     }
-    Some((count as u8, line[count + 1..].trim_end_matches('#').trim()))
+    let rest = &line[count + 1..];
+    let text = rest.trim_end_matches('#').trim();
+    let start = count + 1 + (rest.len() - rest.trim_start().len());
+    Some((count as u8, start..start + text.len()))
 }
 
 fn fence_start(line: &str) -> Option<&str> {
@@ -2307,11 +2519,23 @@ fn list_item(line: &str) -> Option<(usize, Option<u64>, &str)> {
 }
 
 fn table_cells(line: &str) -> Vec<String> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
-        .map(|cell| lower_inline_text(cell.trim()))
+    table_cell_ranges(line)
+        .map(|cell| lower_inline_text(&line[cell]))
         .collect()
+}
+
+/// The range of `line` each cell of the table row is: split at `|` once the row is trimmed and
+/// its outer `|`s dropped, each cell trimmed.
+fn table_cell_ranges(line: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let trimmed = line.trim();
+    let inner = trimmed.trim_matches('|');
+    let mut at = (line.len() - line.trim_start().len())
+        + (trimmed.len() - trimmed.trim_start_matches('|').len());
+    inner.split('|').map(move |cell| {
+        let start = at + (cell.len() - cell.trim_start().len());
+        at += cell.len() + 1;
+        start..start + cell.trim().len()
+    })
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -2341,183 +2565,6 @@ fn slug(text: &str) -> String {
         "section".into()
     } else {
         out
-    }
-}
-
-fn scan_inlines(
-    source: &str,
-    range: Range<usize>,
-    links: &mut Vec<MarkdownLink>,
-    images: &mut Vec<MarkdownImage>,
-    runs: &mut Vec<MarkdownInlineRun>,
-) {
-    scan_inline_segment(source, range, links, images, runs, 0);
-}
-
-fn scan_inline_segment(
-    source: &str,
-    range: Range<usize>,
-    links: &mut Vec<MarkdownLink>,
-    images: &mut Vec<MarkdownImage>,
-    runs: &mut Vec<MarkdownInlineRun>,
-    depth: usize,
-) {
-    if depth >= MAX_INLINE_NESTING || range.start >= range.end {
-        return;
-    }
-    let text = &source[range.clone()];
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|byte| byte.is_ascii_punctuation())
-        {
-            i += 2;
-            continue;
-        }
-
-        if bytes[i] == b'`' {
-            let ticks = ascii_run(bytes, i, b'`');
-            if let Some(close) = find_exact_run(bytes, i + ticks, b'`', ticks) {
-                let content = i + ticks..close;
-                let authored = range.start + i..range.start + close + ticks;
-                let mut code = text[content.clone()]
-                    .chars()
-                    .map(|character| {
-                        if matches!(character, '\r' | '\n') {
-                            ' '
-                        } else {
-                            character
-                        }
-                    })
-                    .collect::<String>();
-                if code.starts_with(' ')
-                    && code.ends_with(' ')
-                    && code.chars().any(|character| character != ' ')
-                {
-                    code.remove(0);
-                    code.pop();
-                }
-                runs.push(MarkdownInlineRun {
-                    kind: MarkdownInlineKind::Code,
-                    text: code,
-                    source: authored,
-                    content_source: range.start + content.start..range.start + content.end,
-                });
-                i = close + ticks;
-                continue;
-            }
-            i += ticks;
-            continue;
-        }
-
-        let image = bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[');
-        let open = if image { i + 1 } else { i };
-        if bytes.get(open) == Some(&b'[')
-            && let Some(close) = find_balanced_close(text, open, b'[', b']')
-            && bytes.get(close + 1) == Some(&b'(')
-            && let Some(end) = find_balanced_close(text, close + 1, b'(', b')')
-        {
-            let label_range = open + 1..close;
-            let label = &text[label_range.clone()];
-            let destination = text[close + 2..end].trim();
-            let absolute = range.start + i..range.start + end + 1;
-            let content_source = range.start + label_range.start..range.start + label_range.end;
-            let lowered = lower_inline_text(label);
-            let kind = if image {
-                let index = images.len();
-                images.push(MarkdownImage {
-                    alt: (!label.is_empty()).then(|| lowered.clone()),
-                    source_uri: destination.to_string(),
-                    source: absolute.clone(),
-                    remote: matches!(link_policy(destination), LinkPolicy::ExplicitExternal),
-                });
-                MarkdownInlineKind::Image { index }
-            } else {
-                let index = links.len();
-                links.push(MarkdownLink {
-                    label: lowered.clone(),
-                    destination: destination.to_string(),
-                    source: absolute.clone(),
-                    policy: link_policy(destination),
-                });
-                MarkdownInlineKind::Link { index }
-            };
-            runs.push(MarkdownInlineRun {
-                kind,
-                text: lowered,
-                source: absolute,
-                content_source: content_source.clone(),
-            });
-            scan_inline_segment(source, content_source, links, images, runs, depth + 1);
-            i = end + 1;
-            continue;
-        }
-
-        if matches!(bytes[i], b'*' | b'_' | b'~') {
-            let marker = bytes[i];
-            let run = ascii_run(bytes, i, marker);
-            let supported = if marker == b'~' {
-                run == 2
-            } else {
-                (1..=3).contains(&run)
-            };
-            if supported
-                && delimiter_can_open(bytes, i, marker, run)
-                && let Some(close) = find_emphasis_close(bytes, i + run, marker, run)
-            {
-                let content = i + run..close;
-                let kind = if marker == b'~' {
-                    MarkdownInlineKind::Strikethrough
-                } else if run >= 2 {
-                    MarkdownInlineKind::Strong
-                } else {
-                    MarkdownInlineKind::Emphasis
-                };
-                let content_source = range.start + content.start..range.start + content.end;
-                runs.push(MarkdownInlineRun {
-                    kind,
-                    text: lower_inline_text(&text[content]),
-                    source: range.start + i..range.start + close + run,
-                    content_source: content_source.clone(),
-                });
-                scan_inline_segment(source, content_source, links, images, runs, depth + 1);
-                i = close + run;
-                continue;
-            }
-            i += run;
-            continue;
-        }
-
-        if bytes[i] == b'<'
-            && let Some(relative) = text[i + 1..].find('>')
-        {
-            let close = i + 1 + relative;
-            let destination = &text[i + 1..close];
-            if is_autolink(destination) {
-                let index = links.len();
-                let authored = range.start + i..range.start + close + 1;
-                let content = range.start + i + 1..range.start + close;
-                links.push(MarkdownLink {
-                    label: destination.to_string(),
-                    destination: destination.to_string(),
-                    source: authored.clone(),
-                    policy: link_policy(destination),
-                });
-                runs.push(MarkdownInlineRun {
-                    kind: MarkdownInlineKind::Link { index },
-                    text: destination.to_string(),
-                    source: authored,
-                    content_source: content,
-                });
-                i = close + 1;
-                continue;
-            }
-        }
-
-        i += text[i..].chars().next().map_or(1, char::len_utf8);
     }
 }
 
@@ -2589,7 +2636,9 @@ mod tests {
 
     /// A backtick run its block never closes is literal, so a comment after it stays hidden; a
     /// span closes at its first unescaped equal run and never past its block, as `parse` reads
-    /// the blocks; a comment inside a real span is code text.
+    /// the blocks; a comment inside a real span is code text, and so is any link in it, on every
+    /// line the span covers. Where the line scan keeps a comment the readers do not show as code,
+    /// every comment is hidden.
     #[test]
     fn only_a_closed_code_span_keeps_a_comment_visible() {
         for source in [
@@ -2599,6 +2648,11 @@ mod tests {
             "Price is `5 <!-- [bad](https://bad.example) -->\n- item ` tick",
             "# Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
             "> Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
+            // The line scan takes these for code that the readers do not show as code.
+            "*x `a* <!-- [bad](https://bad.example) --> b`",
+            "| h |\n|---|\n| `x <!-- [bad](https://bad.example) --> |\n| z` |",
+            "Price `a <!-- [bad](https://bad.example) -->\nb` |\n|---|<!-- -->",
+            "| h |\n|---|\n```|\n<!-- [bad](https://bad.example) -->",
         ] {
             let document = parse(source);
             assert!(
@@ -2621,6 +2675,23 @@ mod tests {
             ),
             ("Price `a\n<!-- c --> b` end", "Price a <!-- c --> b end"),
             ("> `a\n> <!-- c --> b`", "a <!-- c --> b"),
+            // A span across lines is code on every line it covers, for the links as well.
+            (
+                "Price `a <!-- [bad](https://bad.example) -->\nb`",
+                "Price a <!-- [bad](https://bad.example) --> b",
+            ),
+            (
+                "Price `a\n<!-- [bad](https://bad.example) --> b`",
+                "Price a <!-- [bad](https://bad.example) --> b",
+            ),
+            (
+                "Price `a\n[bad](https://bad.example) b`",
+                "Price a [bad](https://bad.example) b",
+            ),
+            (
+                "> Price `a\n> [bad](https://bad.example) b`",
+                "Price a [bad](https://bad.example) b",
+            ),
         ] {
             let document = parse(source);
             let shown = document
@@ -2630,6 +2701,60 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(shown, [painted], "{source:?}");
             assert!(document.links.is_empty(), "{source:?}");
+        }
+
+        // The link the readers find first stays a link; the comment the line scan took for code
+        // after it is hidden.
+        let document = parse("[x `a](https://x.example) <!-- [bad](https://bad.example) --> b`");
+        let destinations = document
+            .links
+            .iter()
+            .map(|link| link.destination.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(destinations, ["https://x.example"]);
+        assert_eq!(block_paint_text(&document.blocks[0]), "x `a b`");
+    }
+
+    /// A block lends exactly the links its text shows, both read from one text: a link across a
+    /// paragraph's or a quote's lines is one, a tag the text hides lends none, and a table cell
+    /// lends only a link that is whole in it.
+    #[test]
+    fn a_block_lends_exactly_the_links_its_text_shows() {
+        for (source, painted, labels) in [
+            ("[a\nb](https://x.example)", "a b", &["a b"][..]),
+            ("> see [a\n> b](https://x.example)", "see a b", &["a b"][..]),
+            ("<span [x](https://x.example)> y", "y", &[][..]),
+            (
+                "| [a | b](https://x.example) |\n|---|---|",
+                "[a  │  b](https://x.example)\n",
+                &[][..],
+            ),
+            (
+                "| [a](https://x.example) | b |\n|---|---|",
+                "a  │  b\n",
+                &["a"][..],
+            ),
+        ] {
+            let document = parse(source);
+            assert_eq!(block_paint_text(&document.blocks[0]), painted, "{source:?}");
+            let lent = document
+                .links
+                .iter()
+                .map(|link| link.label.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(lent, labels, "{source:?}");
+            for link in &document.links {
+                assert!(
+                    document.blocks[0].source().start <= link.source.start
+                        && link.source.end <= document.blocks[0].source().end,
+                    "{source:?}: {link:?}"
+                );
+                let authored = &source[link.source.clone()];
+                assert!(
+                    authored.starts_with('[') && authored.ends_with("(https://x.example)"),
+                    "{source:?}: {authored:?}"
+                );
+            }
         }
     }
 

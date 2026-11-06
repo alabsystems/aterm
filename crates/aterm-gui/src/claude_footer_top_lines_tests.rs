@@ -774,7 +774,7 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         )
     );
     let label = harness_label(aterm_phase::CliHarness::Agy);
-    assert_eq!(lit[0].label, format!("{label} on"));
+    assert_eq!(lit[0].label, format!("{label} on: harness"));
     let carried = app.session_autopilot(session).1;
     assert!(
         matches!(carried, AutopilotView::Cruise | AutopilotView::Land),
@@ -809,7 +809,7 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         [(
             HarnessChip::Switch,
             Some(Toggled::False),
-            format!("{label} off").as_str()
+            format!("{label} off: harness").as_str()
         )],
         "NEGATIVE CONTROL: the off face is one switch, toggled off"
     );
@@ -910,7 +910,7 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
 
 /// EVERY CLI HARNESS SHARES THE SWITCH AND ITS LABEL: Claude Code, Antigravity, Muse Code and
 /// all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
-/// followed by its own label (`alab <cli> harness v0.5`), every cell on the line's ground, the
+/// followed by its own label (`alab v0.5 (v<cli build>)`), every cell on the line's ground, the
 /// switch never bold; when off no cell wears the theme's active green accent.
 #[test]
 fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {

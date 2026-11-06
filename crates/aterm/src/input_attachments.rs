@@ -46,6 +46,7 @@ impl Keeper {
         }
         if self.attempted.as_ref() != Some(&current) {
             self.retry = RunnerRetry::default();
+            self.attempted = Some(current.clone());
         } else if self
             .retry
             .remaining(now_ms)
@@ -53,7 +54,6 @@ impl Keeper {
         {
             return Ok(false);
         }
-        self.attempted = Some(current.clone());
         self.retry.started();
         let result = activate(revision, &new);
         self.retry.reaped(

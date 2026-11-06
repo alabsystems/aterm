@@ -145,12 +145,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// This build, as [`judge`] compares it.
+/// The release this crate's test binary runs as: it installs no identity (`aterm_stamp`), so
+/// [`own`] takes this fixed release, the one current when the product version left the library
+/// graph, and no bump is an input of the tests.
+#[cfg(test)]
+pub(super) const TEST_RELEASE: Version = (0, 156, 0);
+
+/// This build, as [`judge`] compares it: the release its installed identity names.
+///
+/// # Errors
+/// A process that installed no identity, or whose version does not read as a release: what it
+/// may publish depends on which release it is, so it publishes nothing.
 pub(super) fn own() -> crate::Result<Own> {
+    #[cfg(test)]
+    let unstamped = Some(TEST_RELEASE);
+    #[cfg(not(test))]
+    let unstamped = None;
+    let release = aterm_stamp::installed().map_or(unstamped, |stamp| version(stamp.app_version));
     Ok(Own {
-        version: version(env!("CARGO_PKG_VERSION"))
-            .ok_or_else(|| Error::new("this aterm's release number is unreadable"))?,
-        release: aterm_types::version::installed().is_some_and(|stamp| stamp.release_build),
+        version: release.ok_or_else(|| Error::new("this aterm's release number is unreadable"))?,
+        release: aterm_stamp::installed().is_some_and(|stamp| stamp.release_build),
         program: std::env::current_exe().ok().map(canonical),
     })
 }

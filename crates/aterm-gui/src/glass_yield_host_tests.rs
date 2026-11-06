@@ -17,10 +17,9 @@ use aterm_render::{GlowQuad, GlowRamps};
 use std::time::{Duration, Instant};
 
 /// The font the rig draws, as the dump draws it.
-const FIXTURE_FONT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-);
+fn fixture_font() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-render/tests/fixtures/jetbrains-mono.ttf")
+}
 
 /// The config every run admits.
 const CONFIG: &str = "trail_sounds = false\ncursor_trail_style = \"rainbow kitty\"\nmotion = \
@@ -33,7 +32,7 @@ const RED_W: &[u8] = b"\x1b[38;2;196;38;46mw\x1b[39m";
 /// A rig on Default Light on a scale-2 display, whose face the glass draws under (§15.8
 /// amendment 53, `light_fork_pin_tests::at_scale_two`), gridded, before its first frame.
 fn rig() -> TrailRig {
-    let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
+    let mut rig = TrailRig::new(&fixture_font()).expect("the rig");
     let t0 = rig.t0();
     rig.configure(CONFIG, t0).expect("the config admits");
     crate::light_fork_pin_tests::at_scale_two(&mut rig, t0);

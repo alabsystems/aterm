@@ -633,7 +633,7 @@ pub(crate) fn locate_identity(
     #[cfg(unix)]
     {
         if let Some(home) = home {
-            let kc = crate::release_keychain::Keychains::new(home, run);
+            let kc = crate::release_keychain::Keychains::waiting(home, run);
             if let Ok(mut identity) =
                 select_devid_identity(&kc.release_listing(true)?, team_id, preferred)
             {
@@ -1179,7 +1179,8 @@ pub fn apple_selfcheck_verdict(e: &AppleSelfcheck<'_>) -> Result<(), String> {
     }
     if !e
         .app_codesign_dv
-        .contains(&format!("TeamIdentifier={}", e.team_id))
+        .match_indices("TeamIdentifier=")
+        .any(|(i, _)| e.app_codesign_dv[i + "TeamIdentifier=".len()..].starts_with(e.team_id))
     {
         return Err(format!(
             "self-check failed: bundle TeamIdentifier does not match manifest team_id {}",

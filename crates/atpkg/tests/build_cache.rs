@@ -135,7 +135,7 @@ fn nested_build(hop: bool, verb: &str) {
     let forwarding = if hop {
         let quoted = format!("'{}'", targo.to_string_lossy().replace('\'', "'\\''"));
         atpkg::build_cache::registered::shim_hop(
-            Path::new(env!("CARGO_BIN_EXE_atpkg")),
+            &aterm_tempfile::bin_exe("atpkg"),
             "targo",
             &quoted,
             None,
@@ -312,7 +312,7 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
     let command = |release: &str, args: &[&str], env: &[(&str, &str)]| {
         let bin = root.join(format!("bin-{release}"));
         fake_cargo(&bin, release);
-        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
         cmd.arg("__reroute")
             .arg("cargo")
             .args(args)

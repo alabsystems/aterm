@@ -287,7 +287,7 @@ fn a_pwsh_writes_a_commands_d_before_the_users_prompt_runs() {
     let pwsh = need_pwsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let mut cmd = shell_command(pwsh);
     cmd.args([

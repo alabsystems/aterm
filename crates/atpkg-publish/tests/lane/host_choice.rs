@@ -213,42 +213,22 @@ fn the_default_host_is_gh_everywhere() {
 }
 
 #[test]
-fn a_missing_agh_toml_is_named_and_raises_its_need() {
+fn missing_config_builds_without_manufacturing_writers_or_needs() {
     for choice in [HostChoice::AghStaging, HostChoice::Agh] {
         let fx = Fx::new("host-missing");
         let dirs = unit_dirs(&fx.ctx);
-        let e = built(&fx, choice).err().expect("no agh.toml refuses");
-        assert_eq!(e.exit_code(), 3, "{e}");
-        let shown = e.to_string();
-        assert!(shown.contains("agh.toml is missing"), "{shown}");
-        assert!(
-            shown.contains(&format!("--host {}", choice.as_str())),
-            "{shown}"
-        );
-        assert!(
-            shown.contains(&fx.ctx.shown(&dirs.config_file())),
-            "{shown}"
-        );
-        let raised = needs::list(&dirs).expect("the needs");
-        assert_eq!(raised.len(), 1, "{raised:?}");
-        assert_eq!(raised[0].key, "agh.config.missing");
-        assert!(raised[0].then.contains(RUNBOOK), "{raised:?}");
-        // The lanes read agh.toml alone, so the step names the writers and their grants, never
-        // the vault (`aterm secrets sync`), which no lane reads.
-        assert!(
-            raised[0].then.contains("agh policy grant atpkg-publish"),
-            "{raised:?}"
-        );
-        assert!(!raised[0].then.contains("secrets sync"), "{raised:?}");
+        assert_eq!(built(&fx, choice).unwrap().host_choice(), choice);
+        let checks =
+            hosts_check::check(&fx.ctx, &dirs, choice, false, &hosts_check::program_repos());
+        assert!(named(&checks, "config").ok);
+        assert!(!named(&checks, "staging_writer").ok);
+        assert!(needs::list(&dirs).expect("the needs").is_empty());
     }
 }
 
-/// A file that says `vault = true` beside a profile of its own: the lanes refuse it, so
-/// `hosts check`'s `config` fails naming the line, and `from_home_hosts` raises
-/// `agh.config.invalid` (the file is there), its `why` the refusal, its `then` the line's
-/// removal, the missing need cleared.
+/// Explicit profiles still route when their file also opts into vault adoption.
 #[test]
-fn a_vault_agh_toml_is_named_and_raises_the_invalid_need() {
+fn a_vault_join_keeps_its_explicit_profile_and_clears_obsolete_config_needs() {
     let mut fx = Fx::new("host-vault");
     fixture_accounts(&mut fx.ctx);
     let dirs = unit_dirs(&fx.ctx);
@@ -272,49 +252,11 @@ fn a_vault_agh_toml_is_named_and_raises_the_invalid_need() {
         false,
         &hosts_check::program_repos(),
     );
-    let config = named(&checks, "config");
-    assert!(!config.ok, "{config:?}");
-    assert!(config.detail.contains("says vault = true"), "{config:?}");
-    assert!(
-        config
-            .detail
-            .contains("remove agh.toml's vault = true line"),
-        "{config:?}"
-    );
-    for name in ["staging_writer", "public_writer", "grants", "drafts"] {
-        let c = named(&checks, name);
-        assert!(!c.ok, "{c:?}");
-        assert_eq!(c.detail, "needs a valid agh.toml");
-    }
+    all_hold(&checks);
 
     needs::raise(&dirs, &Need::config_missing(0)).expect("the missing need");
-    let e = built(&fx, HostChoice::Agh)
-        .err()
-        .expect("a vault agh.toml refuses");
-    assert_eq!(e.exit_code(), 3, "{e}");
-    let shown = e.to_string();
-    assert!(shown.contains("vault = true"), "{shown}");
-    // The refusal names the step that clears it; naming writers beside the line never does.
-    assert!(
-        shown.contains("remove agh.toml's vault = true line"),
-        "{shown}"
-    );
-    assert!(!shown.contains("name its writers"), "{shown}");
-    let raised = needs::list(&dirs).expect("the needs");
-    assert_eq!(raised.len(), 1, "{raised:?}");
-    assert_eq!(raised[0].key, "agh.config.invalid");
-    assert!(raised[0].what.contains("vault = true"), "{raised:?}");
-    assert!(
-        raised[0].why.contains("whatever profiles agh.toml names"),
-        "{raised:?}"
-    );
-    assert!(!raised[0].why.contains("name its writers"), "{raised:?}");
-    assert!(
-        raised[0]
-            .then
-            .contains("remove agh.toml's vault = true line"),
-        "{raised:?}"
-    );
+    assert!(built(&fx, HostChoice::Agh).is_ok());
+    assert!(needs::list(&dirs).unwrap().is_empty());
 }
 
 #[test]
@@ -328,7 +270,7 @@ fn an_invalid_agh_toml_is_named_and_raises_its_need() {
         .expect("an invalid agh.toml refuses");
     assert_eq!(e.exit_code(), 3, "{e}");
     let shown = e.to_string();
-    assert!(shown.contains("agh.toml is invalid:"), "{shown}");
+    assert!(shown.contains("agh.toml"), "{shown}");
     assert!(shown.contains("bogus"), "{shown}");
     let raised = needs::list(&dirs).expect("the needs");
     assert_eq!(raised.len(), 1, "{raised:?}");
@@ -433,15 +375,13 @@ fn install_flags_parse_the_host() {
     }
 }
 
-/// A mistyped verb after a global `--host` is Usage before any context: the built binary, run
-/// over a scratch home with no agh.toml, raises no need. NEGATIVE CONTROL: a known verb under
-/// the same choice builds the context, which refuses the missing file and raises its need.
+/// A mistyped verb and a local command both avoid identity-state writes.
 #[test]
 fn a_mistyped_verb_after_a_global_host_raises_nothing() {
     let fx = Fx::new("host-typo");
     let (config, state) = unit_env(&fx.ctx);
     let dirs = unit_dirs(&fx.ctx);
-    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_atpkg-publish")).expect("the binary");
+    let exe = std::fs::canonicalize(aterm_tempfile::bin_exe("atpkg-publish")).expect("the binary");
     let run = |args: &[&str]| {
         let mut cmd = aterm_uds::spawnfd::command(&exe);
         cmd.args(args)
@@ -463,11 +403,9 @@ fn a_mistyped_verb_after_a_global_host_raises_nothing() {
     assert!(stderr.contains("unknown verb `statsu`"), "{stderr}");
     assert!(!dirs.needs().exists(), "a typo raised a need");
 
-    let (code, stderr) = run(&["--host", "agh", "status"]);
-    assert_eq!(code, Some(3), "{stderr}");
-    let raised = needs::list(&dirs).expect("the needs");
-    assert_eq!(raised.len(), 1, "{raised:?}");
-    assert_eq!(raised[0].key, "agh.config.missing");
+    let (code, stderr) = run(&["--host", "agh", "sign"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(needs::list(&dirs).expect("the needs").is_empty());
 }
 
 #[test]
@@ -485,8 +423,7 @@ fn an_install_whose_hosts_check_fails_arms_nothing() {
     assert_eq!(e.exit_code(), 1, "{e}");
     let shown = e.to_string();
     assert!(
-        shown
-            .contains("hosts check failed (config, staging_writer, public_writer, grants, drafts)"),
+        shown.contains("hosts check failed (staging_writer, public_writer, grants)"),
         "{shown}"
     );
     assert!(
@@ -511,14 +448,12 @@ fn hosts_check_reports_each_check() {
     // 1. No agh.toml.
     let checks = check(HostChoice::Agh, false);
     let config = named(&checks, "config");
-    assert!(!config.ok);
-    assert!(config.detail.contains("is missing"), "{config:?}");
-    assert!(config.detail.contains(RUNBOOK), "{config:?}");
-    for name in ["staging_writer", "public_writer", "grants", "drafts"] {
+    assert!(config.ok, "{config:?}");
+    for name in ["staging_writer", "public_writer", "grants"] {
         let c = named(&checks, name);
         assert!(!c.ok, "{c:?}");
-        assert_eq!(c.detail, "needs a valid agh.toml");
     }
+    assert!(named(&checks, "drafts").ok);
 
     // 2. The dev profile alone, under agh-staging.
     let tokens = tokens(&fx);
@@ -672,7 +607,7 @@ fn the_forwarding_verb_answers_git_as_the_credential_helper() {
     let start = agh::fx::Fx::live()
         .wall_secs()
         .unwrap_or_else(|e| panic!("the host's clock: {}", e.why));
-    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_atpkg-publish")).expect("the binary");
+    let exe = std::fs::canonicalize(aterm_tempfile::bin_exe("atpkg-publish")).expect("the binary");
     let slug = agh::Slug::parse("fixture-dev/app").expect("a slug");
     let read = |args: Vec<String>| {
         agh::GithubBuilder::new(router.clone())

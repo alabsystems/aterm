@@ -250,7 +250,7 @@ pub fn run(
         ["screen-watch", rest @ ..] => watch::main(sys, layout, exe, rest, out),
         ["tcc", clients @ ..] => crate::items::person::agent_tcc(sys, clients, out),
         ["version"] => {
-            let _ = writeln!(out, "{}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(out, "{}", aterm_stamp::app_version());
             ExitCode::SUCCESS
         }
         _ => refuse(

@@ -259,6 +259,9 @@ impl Rooms {
             open.mode(0o600)
                 .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
+        #[cfg(unix)]
+        let mut file = aterm_uds::kept_out(|| open.open(&staged))?;
+        #[cfg(not(unix))]
         let mut file = open.open(&staged)?;
         #[cfg(unix)]
         {

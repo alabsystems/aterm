@@ -4,7 +4,6 @@
 //! The corpus of generator v1 (design §10.3): it is deterministic under a pinned digest, no item leaves the denominator, and every scenario is admitted inside its tables.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use super::MomentumTrace;
 use super::corpus::{
@@ -135,8 +134,8 @@ fn no_item_leaves_the_denominator() {
     let ItemBody::Trace(golden) = train[0].body() else {
         panic!("the golden item is a trace");
     };
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/aos-momentum/aarch64-macos.trace");
+    let path =
+        aterm_tempfile::manifest_dir().join("tests/fixtures/aos-momentum/aarch64-macos.trace");
     let on_disk = std::fs::read(&path).expect("the golden trace is checked in");
     assert_eq!(
         *golden,

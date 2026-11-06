@@ -1671,12 +1671,25 @@ fn network_details(snap: &Snapshot) -> Vec<Clause> {
     }
     if let Some(tcp) = snap.net.as_ref().and_then(|n| n.tcp) {
         let est = grouped(u64::from(tcp.established));
-        let lis = grouped(u64::from(tcp.listen));
         let conn = plural(
             u64::from(tcp.established),
             "TCP connection established",
             "TCP connections established",
         );
+        let Some(listen) = tcp.other(tcp.listen) else {
+            out.push(
+                Clause::new(
+                    2,
+                    vec![
+                        format!("{est} TCP established or close-wait"),
+                        format!("{est} TCP"),
+                    ],
+                )
+                .said(format!("{est} {conn} or waiting to close.")),
+            );
+            return out;
+        };
+        let lis = grouped(u64::from(listen));
         out.push(
             Clause::new(
                 2,
@@ -2147,7 +2160,9 @@ fn trend_sentences(view: &ResourceView, now_ms: i64, loc: &Locale) -> Vec<String
             loc.clock(at, now_ms)
         ));
     }
-    let over = heat.iter().filter(|c| c.over).count();
+    // Each 10 s column counts the share of it that was over, so a short spell is said in
+    // proportion, as its cap draws it (A1 §3).
+    let over = heat.iter().map(|c| f64::from(c.over)).sum::<f64>().round() as usize;
     if over > 0 {
         out.push(format!(
             "Over capacity {} of the last 10 minutes.",
@@ -2951,7 +2966,8 @@ mod tests {
             .map(|i| Cell {
                 mean: v,
                 max: v,
-                over: i >= 60 - over,
+                n: 1.0,
+                over_n: if i >= 60 - over { 1.0 } else { 0.0 },
             })
             .collect::<Vec<_>>()
             .into();
@@ -4443,7 +4459,8 @@ mod tests {
                 .map(|i| Cell {
                     mean: (i >= unread).then_some(9.0),
                     max: (i >= unread).then_some(9.0),
-                    over: false,
+                    n: if i >= unread { 1.0 } else { 0.0 },
+                    over_n: 0.0,
                 })
                 .collect::<Vec<_>>()
                 .into();

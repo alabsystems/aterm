@@ -97,7 +97,8 @@ fn tricks(doc: &str) -> Result<String, String> {
 
 #[test]
 fn lexicon_documents_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "lexicon");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(dir.to_str().expect("a UTF-8 package directory"), "lexicon");
     corpus.record("bundled/lexicon", lexicon(&lf(LEXICON), &lf(EXCEPTIONS)));
     corpus.record("bundled/tricks", tricks(&lf(TRICKS)));
     corpus.record("entry/base", lexicon(ENTRY, EXCEPTION));

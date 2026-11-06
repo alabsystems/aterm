@@ -66,6 +66,13 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
         .is_some_and(|proxy| proxy.send_event(wake).is_ok())
 }
 
+/// The window's wake once no macOS dialog of this process is up
+/// ([`aterm_types::macos_setup::on_no_macos_dialog_for_window`]): it runs in the last dialog's
+/// drop, on whichever thread let it go, so it only posts [`Wake::NoMacosDialog`].
+fn wake_for_no_dialog() {
+    let _ = send_setup_wake(Wake::NoMacosDialog);
+}
+
 /// Wait on a worker thread for System State's answer to the offer of `initial`.
 /// A delivered Begin calls `on_begin` before the window can handle another input,
 /// so a Stop and quit know its admission is under way even before this wait returns.
@@ -389,6 +396,12 @@ pub(crate) struct Host {
     /// launch where the window reads this Mac, outside a scratch world, and this build's tab
     /// never opened for the account.
     root_steps_unread: bool,
+    /// The launch reads the elevation's other steps and their answer has not landed
+    /// ([`crate::App::root_steps_owed`]): set where [`Self::root_steps_unread`] is, cleared by
+    /// that answer or a reading that could not start. Until then the Mac Setup tab may still be
+    /// the window's next macOS ask on a Mac that has the tools
+    /// ([`crate::App::mac_setup_tab_comes_next`]).
+    pub(crate) root_steps_awaited: bool,
     /// The last reason the automatic tab was held that the window logged
     /// ([`crate::App::developer_tools_install_held`]), so each new one is said once.
     pub(crate) developer_tools_held_said: std::cell::Cell<Option<&'static str>>,
@@ -494,6 +507,7 @@ impl Host {
             developer_tools_root_owed: false,
             developer_tools_scratch_world: scratch_world,
             root_steps_unread,
+            root_steps_awaited: root_steps_unread,
             developer_tools_held_said: std::cell::Cell::new(None),
         }
     }
@@ -822,12 +836,15 @@ impl App {
                 *proxy = self.proxy.clone();
             }
             self.workstation_setup.proxy_registered = self.proxy.is_some();
+            aterm_types::macos_setup::on_no_macos_dialog_for_window(wake_for_no_dialog);
         }
         // The elevation's other steps read off the loop, answered by a wake: a Mac that has the
         // tools gets the automatic tab only for what that reading says is owed.
         let registered = self.workstation_setup.proxy_registered;
-        if self.workstation_setup.take_root_steps_read(registered) {
-            crate::clt_install::read_root_steps();
+        if self.workstation_setup.take_root_steps_read(registered)
+            && !crate::clt_install::read_root_steps()
+        {
+            self.workstation_setup.root_steps_awaited = false;
         }
         self.workstation_setup.start(now);
         self.tick_system_state(now);

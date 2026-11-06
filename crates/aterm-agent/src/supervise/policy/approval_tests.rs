@@ -3616,15 +3616,12 @@ fn the_advisory_word_refuses_a_secret_and_a_proof_gap() {
         ("awk 'NR<3' .env", "a read of a secret"),
         ("FOO=1 awk 'NR<3' README.md", "assigns a variable"),
         ("env cat README.md", "runs env"),
+        ("grep -rn credentials src/", "cannot list"),
     ] {
         let r = word(line).expect_err(line);
         assert!(r.contains(why), "{line}: {r}");
     }
-    for line in [
-        "cat README.md",
-        "grep -rn credentials src/",
-        "grep -m 1 id_rsa docs/",
-    ] {
+    for line in ["cat README.md", "grep -m 1 id_rsa docs/"] {
         assert_eq!(word(line), Ok(()), "{line}");
     }
 }
@@ -3966,6 +3963,7 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         Start::Unplaced,
         &|_| false,
         LeadingDot::Any,
+        &unlisted,
     )
     .expect_err("a secret");
     assert!(r.contains("a read of a secret"), "{r}");
@@ -4126,32 +4124,74 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         }
     }
     // NEGATIVE CONTROL
+    let descending = [
+        "grep -rn token src",
+        "rg token src",
+        "diff a.txt b.txt",
+        "diff -u README.md /etc/hosts",
+    ];
+    // A plain diff reads one level below each folder, above the home's rules, so no rule is
+    // reached by its words; a walk that meets nothing there proves it (this machine's own
+    // `/Users` is never listed here).
     let diff_users = format!("diff {users_root} /tmp/x");
-    for line in [
+    let met_nothing = |_: &[String], _: usize, _: &[SecretRule]| -> Result<_, String> {
+        Ok(crate::supervise::policy::Below::Clear)
+    };
+    let work = [PathBuf::from("/private/tmp/claude-502/scratch/work1")];
+    assert_eq!(
+        secrets_unreached(
+            std::slice::from_ref(&diff_users),
+            &default_secrets(Some(home)),
+            Some(home),
+            Start::Known(&work),
+            &|_| false,
+            LeadingDot::Any,
+            &met_nothing,
+        ),
+        Ok(())
+    );
+    assert!(
+        word(&diff_users).is_err_and(|r| r.contains("list")),
+        "the word"
+    );
+    let flat = [
         "cd src && cat README.md",
         "cd ~/proj && cat README.md",
         "cd /etc && cat hosts",
         "cat ~/notes/*.md",
         "cat ~/.sshrc",
-        "grep -rn token src",
-        "rg token src",
         "ls ~/.ssh",
         "sed -n '$p' README.md",
         "git -C ~/proj show HEAD:README.md",
-        "diff a.txt b.txt",
-        "diff -u README.md /etc/hosts",
-        diff_users.as_str(),
-    ] {
+    ];
+    for line in flat {
         for rows in boxes(line) {
             let d = on_screen(&rows, &host);
             assert!(approved(&d).is_some(), "{line}: {d:?}");
         }
+    }
+    for line in descending {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &host);
+            assert!(
+                approved(&d).is_some() || unlisted_on_windows(&d),
+                "{line}: {d:?}"
+            );
+        }
+    }
+    for line in flat {
         assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+    // The word looks at no disk, so a tree a reader descends (a diff's folder one level down)
+    // is unproven there.
+    for line in descending {
+        let r = word(line).expect_err(line);
+        assert!(r.contains("list"), "the word: {line}: {r}");
     }
     // A scratch cwd holds no secret; the word, which cannot place `.`, refuses it.
     for rows in boxes("grep -r token .") {
         let d = on_screen(&rows, &host);
-        assert!(approved(&d).is_some(), "{d:?}");
+        assert!(approved(&d).is_some() || unlisted_on_windows(&d), "{d:?}");
     }
     assert!(word("grep -r token .").is_err());
 }
@@ -4325,7 +4365,7 @@ fn an_extended_glob_operator_under_zsh_proves_no_box_only_where_the_startup_may_
         "cat ~/.config/^x/hosts.yml",
         "cat ~/.config/g#h/hosts.yml",
         "cat ~/.s#h/config",
-        "git show HEAD^",
+        "git log --oneline HEAD^",
         "grep -n ^fn src",
     ] {
         for rows in boxes(line) {
@@ -4342,7 +4382,7 @@ fn an_extended_glob_operator_under_zsh_proves_no_box_only_where_the_startup_may_
     for line in [
         "setopt extendedglob; cat ~/.config/^x/hosts.yml",
         "set -o extendedglob; cat ~/.s#h/config",
-        "emulate -L zsh -o extendedglob; git show HEAD^",
+        "emulate -L zsh -o extendedglob; git log --oneline HEAD^",
         "unsetopt noextendedglob; cat ~/.s#h/config",
         "options[extendedglob]=on; cat ~/.s#h/config",
         "print -v 'options[extendedglob]' on; cat ~/.s#h/config",
@@ -4526,14 +4566,26 @@ fn escalates_in(rows: &[(&str, &str)], why: &str) {
     }
 }
 
-/// Each line, in its directory, under each free startup, is approved as a read.
+/// Each line, in its directory, under each free startup, is approved as a read (or, on a
+/// Windows host, refused for a tree it descends alone, [`unlisted_on_windows`]).
 fn reads_in(rows: &[(&str, &str)]) {
     for (cwd, line) in rows {
         for shell in &free_startups() {
             let d = on_screen(&folder_box_with(line), &owner_at(cwd, shell));
-            assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line} in {cwd}: {d:?}");
+            assert!(
+                approved(&d) == Some(RULE_READ_ONLY) || unlisted_on_windows(&d),
+                "{line} in {cwd}: {d:?}"
+            );
         }
     }
+}
+
+/// Whether `d` refuses a line, on a Windows host, for a tree its reader descends alone: the walk
+/// of a tree spells no Windows path ([`PolicyProbe::below_tree`]), so every descent is unproven
+/// there.
+fn unlisted_on_windows(d: &Decision) -> bool {
+    cfg!(windows)
+        && matches!(d, Decision::Escalate { reason } if reason.contains("a tree on Windows"))
 }
 
 /// git matches a pathspec by wildmatch, where `*`, `?` and a bracket expression cross `/`
@@ -4647,8 +4699,9 @@ fn a_git_pathspec_from_the_repository_top_is_unplaced() {
 }
 
 /// [`pathspec_tree`] reads a pathspec as git does: a glob below the directory its components
-/// before it name, past its magic; an exclusion as `.`; the repository's top, a `..` after a
-/// glob and a long magic that never closes as no directory this check can place.
+/// before it name, past its magic; an exclusion, and a name `icase` matches in any case, as `.`;
+/// the repository's top, a `..` after a glob and a long magic that never closes as no directory
+/// this check can place.
 #[test]
 fn a_pathspec_is_read_below_its_literal_directory_past_its_magic() {
     for (word, tree) in [
@@ -4658,7 +4711,10 @@ fn a_pathspec_is_read_below_its_literal_directory_past_its_magic() {
         ("/x*", Some("/")),
         ("../../*.json", Some("../..")),
         ("a\\*", Some(".")),
-        (":(icase)src/*.rs", Some("src")),
+        (":(icase)src/*.rs", Some(".")),
+        (":(icase)SRC", Some(".")),
+        (":(glob)src/**", Some("src")),
+        (":(literal)src", Some("src")),
         (":(glob,icase)*", Some(".")),
         (":src", Some("src")),
         ("::src", Some("src")),
@@ -4854,12 +4910,21 @@ fn a_relative_read_starts_where_the_session_stands() {
         (unknown.clone(), "cat /etc/hosts"),
     ] {
         let d = on_screen(&folder_box_with(line), &c);
-        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line}: {d:?}");
-        assert_eq!(
-            readings_read_only_at(&[line.to_string()], &[], Some(home)),
-            Ok(()),
-            "the word: {line}"
+        let descends = !line.starts_with("cat ");
+        assert!(
+            approved(&d) == Some(RULE_READ_ONLY) || descends && unlisted_on_windows(&d),
+            "{line}: {d:?}"
         );
+        // The word reads a file it places; a tree a reader descends it cannot list.
+        let word = readings_read_only_at(&[line.to_string()], &[], Some(home));
+        if !descends {
+            assert_eq!(word, Ok(()), "the word: {line}");
+        } else {
+            assert!(
+                word.as_ref().is_err_and(|why| why.contains("cannot list")),
+                "the word: {line}: {word:?}"
+            );
+        }
     }
 }
 
@@ -4869,8 +4934,9 @@ fn a_relative_read_starts_where_the_session_stands() {
 /// move after it, so a read below it is refused when a trailing part of a home rule's path leads
 /// the target and the read together, or when that directory is the root and an alias of the root
 /// leads them (`cd Volumes`, which a `CDPATH` of `/` places in `/Volumes`). A git read after such
-/// a move is refused, as git's settings there cannot be read. A line whose commands may stand in
-/// more than 64 directories reads no relative path.
+/// a move is refused, as git's settings there cannot be read, and so is a tree a reader descends
+/// there, whose files no walk can list. A line whose commands may stand in more than 64
+/// directories reads no relative path.
 #[test]
 fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
     let in_project = ApprovalCtx {
@@ -4899,6 +4965,10 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         ),
         ("cd proc && cat self/cwd/x", "through /proc's cwd"),
         ("cd sub && git status", "CDPATH"),
+        (
+            "cd crates && grep -rn token .",
+            "whose files it cannot list",
+        ),
         ("cd sub; git log -1", "CDPATH"),
         ("cd .config && cat gh/hosts.yml", floated),
         ("cd src && cd .config && cat gh/hosts.yml", floated),
@@ -4922,7 +4992,6 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         "cd sub && cat README.md",
         "cd sub && cat .claude.json",
         "cd crates/aterm-agent && cat SPECS.md",
-        "cd crates && grep -rn token .",
         "cd .. && cat notes.txt",
         "cd -P .. && cat notes.txt",
         "cd a; cd a; cd a; cd a; cd a; cd a; cd a; cd a; cat README.md",
@@ -4952,7 +5021,10 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         &bash_box(&["cd ./crates && rg token .."], Some("Read it")),
         &deep,
     );
-    assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+    assert!(
+        approved(&d) == Some(RULE_READ_ONLY) || unlisted_on_windows(&d),
+        "{d:?}"
+    );
 }
 
 /// The loop reads where the Bash tool stands for a box whose command reads a path from where it
@@ -4988,14 +5060,18 @@ fn a_box_is_placed_where_the_bash_tool_stands_only_when_it_reads_from_there() {
 
 /// The advisory word, which knows no cwd, reads a relative operand from a directory it cannot
 /// place, so it refuses one that may reach a secret from there, as the rules would from some cwd
-/// (`../.claude.json`, a recursive read of `.`); `aterm drive classify` reads one from the
-/// directory it is asked from, where the asking agent's line runs.
+/// (`../.claude.json`, a recursive read of `.`), and a tree a reader descends there, whose files
+/// it cannot list; `aterm drive classify` reads one from the directory it is asked from, where
+/// the asking agent's line runs, and walks the tree there.
 #[test]
 fn the_advisory_word_and_the_classify_verb_place_a_relative_read() {
     let home = Path::new("/Users/_owner");
     let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
     let proj = Path::new("/Users/_owner/proj");
-    let verb = |line: &str, cwd| command_read_only_at(line, &[], Some(home), cwd);
+    let walk = |root: &[String], below: usize, secrets: &[SecretRule]| {
+        crate::supervise::policy::LiveProbe.below_tree(root, below, secrets, Some(home))
+    };
+    let verb = |line: &str, cwd| command_read_only_at(line, &[], Some(home), cwd, &walk);
     for line in [
         "cat ../.claude.json",
         "cat ../../.secrets/t",
@@ -5029,17 +5105,23 @@ fn the_advisory_word_and_the_classify_verb_place_a_relative_read() {
     assert!(r.contains("a read of a secret"), "{r}");
     let r = verb("rg token ..", Some(proj)).expect_err("the home's tree");
     assert!(r.contains("a read of a secret"), "{r}");
+    let r = word("grep -rn TODO src").expect_err("a tree it cannot list");
+    assert!(r.contains("cannot list"), "{r}");
     // NEGATIVE CONTROL
     for line in [
         "cat ../README.md",
         "cat src/main.rs",
-        "grep -rn TODO src",
         "cd src && cat lib.rs",
         "cat System/Volumes/Data/Users/_owner/notes.txt",
     ] {
         assert_eq!(word(line), Ok(()), "the word: {line}");
     }
-    for line in ["cat .claude.json", "cat gh/hosts.yml", "rg token"] {
+    for line in [
+        "cat .claude.json",
+        "cat gh/hosts.yml",
+        "rg token",
+        "grep -rn TODO src",
+    ] {
         assert_eq!(verb(line, Some(proj)), Ok(()), "the verb in proj: {line}");
     }
 }
@@ -5254,8 +5336,8 @@ fn windows_own_spellings_of_a_secret_are_not_read_only() {
     for (cwd, cmd) in [
         (scratch, "cat C:/Users/_owner/notes.txt."),
         (scratch, "cat C:/Users/_owner/HEAD~1"),
-        (scratch, "git diff HEAD~1"),
-        (scratch, "git show HEAD~2:src/main.rs"),
+        (scratch, "git diff --stat HEAD~1"),
+        (scratch, "git cat-file -s HEAD~2:src/main.rs"),
         (scratch, "cat 'C:/Users/_owner/proj/notes.txt::$DATA'"),
         (scratch, "sed -n 's:a:b:p' README.md"),
         (scratch, "cat C:notes.txt"),
@@ -11667,3 +11749,7 @@ fn a_conversation_resume_warning_keeps_the_selected_conversation() {
         }
     }
 }
+
+/// What a read reaches past its words: below a tree, through a link, and into git's objects.
+#[path = "approval_reach_tests.rs"]
+mod reach;

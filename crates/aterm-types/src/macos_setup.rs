@@ -1089,32 +1089,72 @@ impl Access {
 /// stacks a second one (`docs/DESIGN-system-state-2026-10-21.md` §6).
 static MACOS_DIALOGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-static MACOS_DIALOG_WAITER: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static MACOS_DIALOG_WAITER_READY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+/// A wake that runs once no macOS dialog of this process is up, for a waiter that found one up
+/// and looks again only when told: armed by it ([`DialogEndWake::arm`]), run and spent by the
+/// last [`MacosDialog`]'s drop.
+struct DialogEndWake {
+    armed: std::sync::atomic::AtomicBool,
+    ready: std::sync::OnceLock<fn()>,
+}
+
+impl DialogEndWake {
+    const fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            ready: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Run the wake once no dialog is up: at the last drop, or now where none is up already
+    /// (the last may have ended between the waiter's look and this arm).
+    fn arm(&self) {
+        // This arm/check and the last drop's count transition/consume share one
+        // SeqCst order: neither side can miss the other across the two atomics.
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify();
+    }
+
+    /// Run the wake, spending it, if it is armed and no dialog is up.
+    fn notify(&self) {
+        if MACOS_DIALOGS.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            && let Some(ready) = self.ready.get()
+        {
+            ready();
+        }
+    }
+}
+
+/// The setup worker's wake: a caller that timed out waiting behind another dialog
+/// (`MacosDialog::when_none_up` with a bound) tries again once the last one ends.
+static WORKER_WAKE: DialogEndWake = DialogEndWake::new();
+
+/// The window's wake: a gesture of the window's that probes the slot without waiting and found
+/// another dialog up ([`wake_window_when_no_macos_dialog`]) looks again once none is.
+static WINDOW_WAKE: DialogEndWake = DialogEndWake::new();
 
 /// Register what wakes a caller that timed out waiting for another macOS
 /// dialog, once the last dialog ends. Immediate slot probes do not wait and
-/// never subscribe. The first registration wins.
+/// do not subscribe here: a window's subscribes through
+/// [`wake_window_when_no_macos_dialog`]. The first registration wins.
 pub fn on_macos_dialog_waiter_ready(ready: fn()) {
-    let _ = MACOS_DIALOG_WAITER_READY.set(ready);
+    let _ = WORKER_WAKE.ready.set(ready);
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn arm_macos_dialog_waiter() {
-    // This arm/check and the last drop's count transition/consume share one
-    // SeqCst order: neither side can miss the other across the two atomics.
-    MACOS_DIALOG_WAITER.store(true, std::sync::atomic::Ordering::SeqCst);
-    notify_macos_dialog_waiter();
+/// Register what wakes the window once no macOS dialog of this process is up, after one of its
+/// gestures found another up ([`wake_window_when_no_macos_dialog`]). The first registration wins.
+pub fn on_no_macos_dialog_for_window(ready: fn()) {
+    let _ = WINDOW_WAKE.ready.set(ready);
 }
 
-fn notify_macos_dialog_waiter() {
-    if MACOS_DIALOGS.load(std::sync::atomic::Ordering::SeqCst) == 0
-        && MACOS_DIALOG_WAITER.swap(false, std::sync::atomic::Ordering::SeqCst)
-        && let Some(ready) = MACOS_DIALOG_WAITER_READY.get()
-    {
-        ready();
-    }
+/// Wake the window ([`on_no_macos_dialog_for_window`]) once no macOS dialog of this process is
+/// up, or now where none is: a gesture of the window's that probes the slot without waiting
+/// (`MacosDialog::when_none_up(ZERO)`, [`macos_dialog_up`]) and found another up arms it, since
+/// nothing else need look again then. The Mac Setup tab deferred behind the Commons runtime's
+/// Local Network question waited out a whole first launch for want of it (E3, 2026-11-05): that
+/// question's hold ended 30 s on with the setup run parked on the tab, so no status read came.
+pub fn wake_window_when_no_macos_dialog() {
+    WINDOW_WAKE.arm();
 }
 
 /// Whether a macOS dialog or page this process started is still up.
@@ -1161,7 +1201,7 @@ impl MacosDialog {
             }
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 if !limit.is_zero() {
-                    arm_macos_dialog_waiter();
+                    WORKER_WAKE.arm();
                 }
                 return None;
             }
@@ -1382,8 +1422,9 @@ pub mod lan_first_use {
     /// A use of this process asked macOS through the door ([`note_asked`]).
     static ASKED: AtomicBool = AtomicBool::new(false);
 
-    /// This process's reader of whether another process of this app on this Mac (the vault
-    /// subscriber, a background job) already put macOS's Local Network question to aterm
+    /// This process's reader of whether macOS's Local Network question was put to this app on
+    /// this Mac outside this process: by another process of it (the vault subscriber, a
+    /// background job) or in an earlier launch whose window lived through it
     /// ([`install_asked_elsewhere`]).
     static ASKED_ELSEWHERE: OnceLock<Reader> = OnceLock::new();
 
@@ -1631,19 +1672,33 @@ pub mod lan_first_use {
         SHARING.get().is_none_or(|on| on())
     }
 
-    /// Install this process's reader of whether another process of this app on this Mac (the
-    /// vault subscriber, a background job with no window) already put macOS's Local Network
-    /// question to aterm: [`asked`] reads it, at most every [`ELSEWHERE_LOOK`], and once it says
-    /// so this process counts the question asked. A window that runs first-run setup installs
-    /// it. The first reader installed wins.
+    /// Install this process's reader of whether macOS's Local Network question was already put
+    /// to this app on this Mac outside this process: by another process of it (the vault
+    /// subscriber, a background job with no window) or in an earlier launch whose window lived
+    /// through the question's hold. [`asked`] reads it, at most every [`ELSEWHERE_LOOK`], and
+    /// once it says so this process counts the question asked; [`asked_elsewhere`] reads it at
+    /// each call. A window that runs first-run setup installs it. The first reader installed
+    /// wins.
     pub fn install_asked_elsewhere(reader: impl Fn() -> bool + Send + Sync + 'static) {
         let _ = ASKED_ELSEWHERE.set(Box::new(reader));
     }
 
+    /// Whether macOS's Local Network question was put to this app on this Mac outside this
+    /// process, as the installed reader says now ([`install_asked_elsewhere`]); `false` where
+    /// none is installed. Unlike [`asked`], a question a use of this process raised through the
+    /// door does not count: that question's hold is this process's, under its dialog slot. A use
+    /// that holds the slot while its LAN use may raise the question (the Secrets stage's vault
+    /// join) needs none once this says so: its use raises no question of this process's, so it
+    /// waits behind no other dialog of this process's (a Full Disk Access panel nobody answers).
+    #[must_use]
+    pub fn asked_elsewhere() -> bool {
+        ASKED_ELSEWHERE.get().is_some_and(|elsewhere| elsewhere())
+    }
+
     /// Whether a LAN use of this process went through the door and raised macOS's Local Network
-    /// question by itself ([`note_asked`]), or another process of this app on this Mac did
-    /// ([`install_asked_elsewhere`]): every later use follows its answer, raising no question of
-    /// its own (macOS asks each app once).
+    /// question by itself ([`note_asked`]), or the question was put to this app on this Mac
+    /// outside this process ([`install_asked_elsewhere`]): every later use follows its answer,
+    /// raising no question of its own (macOS asks each app once).
     #[must_use]
     pub fn asked() -> bool {
         if ASKED.load(Ordering::Acquire) {
@@ -2748,7 +2803,8 @@ pub mod lan_first_use {
 impl Drop for MacosDialog {
     fn drop(&mut self) {
         if MACOS_DIALOGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            notify_macos_dialog_waiter();
+            WORKER_WAKE.notify();
+            WINDOW_WAKE.notify();
         }
     }
 }
@@ -4106,10 +4162,42 @@ mod tests {
 
         // The last dialog can end after the timed-out caller saw contention
         // but before it arms the wake. Its post-arm check still notifies once.
-        arm_macos_dialog_waiter();
+        WORKER_WAKE.arm();
         assert_eq!(READY.load(Ordering::SeqCst), 2);
-        notify_macos_dialog_waiter();
+        WORKER_WAKE.notify();
         assert_eq!(READY.load(Ordering::SeqCst), 2);
+
+        // The window's wake is its own: a window gesture that probed the slot without waiting
+        // and found another dialog up (the Mac Setup tab behind the Commons runtime's Local
+        // Network question) is woken by the last one's end, and the worker, which did not wait,
+        // is not. NEGATIVE CONTROL: a drop that wakes only the worker leaves `WINDOW` at 0 here,
+        // which is how E3's first launch lost its one Mac password (2026-11-05).
+        static WINDOW: AtomicUsize = AtomicUsize::new(0);
+        fn window() {
+            WINDOW.fetch_add(1, Ordering::SeqCst);
+        }
+        on_no_macos_dialog_for_window(window);
+        let commons = MacosDialog::up();
+        wake_window_when_no_macos_dialog();
+        assert_eq!(WINDOW.load(Ordering::SeqCst), 0, "not while it is up");
+        drop(commons);
+        assert_eq!(WINDOW.load(Ordering::SeqCst), 1, "its end wakes the window");
+        assert_eq!(READY.load(Ordering::SeqCst), 2, "and not the worker");
+        drop(MacosDialog::up());
+        assert_eq!(WINDOW.load(Ordering::SeqCst), 1, "the wake was spent");
+        wake_window_when_no_macos_dialog();
+        assert_eq!(
+            WINDOW.load(Ordering::SeqCst),
+            2,
+            "armed with none up, at once"
+        );
+        // A worker's timed-out wait wakes the worker alone.
+        let up = MacosDialog::up();
+        assert!(MacosDialog::when_none_up(std::time::Duration::from_nanos(1)).is_none());
+        drop(up);
+        assert_eq!(READY.load(Ordering::SeqCst), 3);
+        assert_eq!(WINDOW.load(Ordering::SeqCst), 2);
+        assert!(!macos_dialog_up());
     }
 
     #[test]

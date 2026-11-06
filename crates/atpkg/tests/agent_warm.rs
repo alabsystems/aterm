@@ -148,7 +148,7 @@ impl Fixture {
     }
 
     fn command(&self, operands: &[&str], extra: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
         cmd.arg(atpkg::warm::HIDDEN_VERB)
             .args(operands)
             .env("HOME", &self.home)

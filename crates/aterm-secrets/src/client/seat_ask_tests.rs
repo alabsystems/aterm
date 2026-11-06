@@ -93,6 +93,17 @@ fn asking<'a>(
     asks: &'a AtomicUsize,
     now_ms: u64,
 ) -> impl Fn(&Paths) -> crate::Result<usize> + 'a {
+    asking_authorized(world, pair, asks, now_ms, &|| Ok(()), &|| {})
+}
+
+fn asking_authorized<'a>(
+    world: &'a Seatless,
+    pair: &'a Ed25519KeyPair,
+    asks: &'a AtomicUsize,
+    now_ms: u64,
+    current: &'a (dyn Fn() -> crate::Result<()> + Sync),
+    handed: &'a (dyn Fn() + Sync),
+) -> impl Fn(&Paths) -> crate::Result<usize> + 'a {
     move |paths: &Paths| {
         asks.fetch_add(1, Ordering::SeqCst);
         let m22 = &world.macs.m22;
@@ -123,8 +134,12 @@ fn asking<'a>(
         let alab = world.alab.clone();
         let decide = |proving: &desk::Proving<'_>| {
             crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-            prove_at_ms(m22, proving, CURRENT, now_ms)
+            let bundle = prove_at_ms(m22, proving, CURRENT, now_ms)?;
+            handed();
+            Ok(bundle)
         };
+        let proving = join::ProofLock::take(paths, None)?.expect("no other proof");
+        let expected = config(paths)?;
         let proved = std::thread::scope(|scope| {
             let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
                 let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
@@ -141,13 +156,26 @@ fn asking<'a>(
                         Some(desk::Proof {
                             decide,
                             refuses: &|_| None,
+                            authority: None,
                             fleet: None,
                         }),
                     ));
                 });
                 Ok(Box::new(theirs))
             };
-            join::prove_first(paths, &dial, &joining, &sign_node, &["m22:7100".to_owned()])
+            join::prove_first_admitted(
+                paths,
+                &dial,
+                &joining,
+                &sign_node,
+                &["m22:7100".to_owned()],
+                &join::ProofAdmission {
+                    proving: &proving,
+                    expected: expected.as_ref(),
+                    default_alab: false,
+                    current,
+                },
+            )
         });
         proved
             .map(|_| 1)
@@ -215,6 +243,13 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
         "the envelope let s in with no seat"
     );
     let recipient = read_identity(s).unwrap().unwrap().recipient();
+    let held = [
+        s.source_file(),
+        s.state_file(),
+        s.identity_file(),
+        s.home.join(".secrets/shared"),
+    ];
+    let before_files = held.each_ref().map(|path| std::fs::read(path).unwrap());
     let before = log_of(m22);
     assert!(before.wraps_maximal_audience_to(&EpochAudience::Everyone, &recipient));
     assert!(seat_ask::asks_for_seat(s));
@@ -232,6 +267,10 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
     assert_eq!(asks.load(Ordering::SeqCst), 1, "one ask on the first round");
 
     assert_eq!(seat(s), Seat::Seated, "s is seated");
+    assert_eq!(
+        held.each_ref().map(|path| std::fs::read(path).unwrap()),
+        before_files
+    );
     assert_eq!(
         read_identity(s).unwrap().unwrap().recipient(),
         recipient,
@@ -268,6 +307,59 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
     assert!(
         rotated.wraps_maximal_audience_to(&EpochAudience::Everyone, &recipient),
         "the rotation carries s"
+    );
+    drop(ask);
+    world.macs.server.stop();
+}
+
+#[test]
+fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vault() {
+    use std::sync::atomic::AtomicBool;
+    let _answering = ServersAnswering::set();
+    let world = seatless(false);
+    let s = &world.s;
+    let held = [
+        s.records_file(),
+        s.source_file(),
+        s.state_file(),
+        s.identity_file(),
+        s.home.join(".secrets/shared"),
+    ];
+    let before = held.each_ref().map(|path| std::fs::read(path).unwrap());
+    let stopped = AtomicBool::new(false);
+    let current = || {
+        if stopped.load(Ordering::SeqCst) {
+            Err(crate::Error::new("setup stopped before taking the seat"))
+        } else {
+            assert!(
+                StateLock::observe(s).unwrap().is_some(),
+                "pre-dial guard holds no state lock"
+            );
+            Ok(())
+        }
+    };
+    let handed = || {
+        stopped.store(true, Ordering::SeqCst);
+    };
+    let asks = AtomicUsize::new(0);
+    let pair = node_pair(0x5e);
+    let ask = asking_authorized(
+        &world,
+        &pair,
+        &asks,
+        aterm_time::unix_millis().unwrap(),
+        &current,
+        &handed,
+    );
+    let why = ask(s).unwrap_err().to_string();
+    assert!(
+        why.contains("setup stopped before taking the seat"),
+        "{why}"
+    );
+    assert_eq!(seat(s), Seat::Seatless);
+    assert_eq!(
+        held.each_ref().map(|path| std::fs::read(path).unwrap()),
+        before
     );
     drop(ask);
     world.macs.server.stop();

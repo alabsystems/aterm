@@ -8,12 +8,9 @@ use std::collections::BTreeMap;
 use aterm_xkb::keysym::NAMES;
 
 fn recorded() -> BTreeMap<String, u32> {
-    let path = format!(
-        "{}/tests/recorded/xkeysym-0.2.1-keysyms.tsv",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = aterm_tempfile::manifest_dir().join("tests/recorded/xkeysym-0.2.1-keysyms.tsv");
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| {

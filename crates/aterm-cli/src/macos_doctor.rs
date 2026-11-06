@@ -25,22 +25,22 @@ pub use initial::{
     LocalNetworkHeard, ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
     SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, activate_input_attachments, alab_mac,
     apply_initial_setup, apply_initial_setup_observed, automatic_plan,
-    bring_forward_restored_setup, bring_forward_restored_setup_observing,
-    check_background_workstation, check_initial_setup, check_initial_setup_observed,
-    forget_set_aside_setup, initial_setup_access_revision, initial_setup_access_step,
-    initial_setup_admission, initial_setup_finished, initial_setup_holds,
-    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
-    initial_setup_park_mark, initial_setup_permission_steps, initial_setup_review_revision,
-    initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_read_only,
-    input_activation_revision, local_network_first_use, local_network_heard,
-    local_network_question_is_own, look_for_the_alab_vault, note_person_asked_for_access,
-    note_setup_interrupted, observe_initial_setup, probe_local_network_again,
-    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
-    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
-    retry_parked_setup_stages, run_initial_setup_pass, set_aside_unreadable_setup,
-    set_aside_unreadable_setup_observing, setup_is_newer, setup_ledger_environment,
-    setup_records_held, take_back_setup_interrupted, validate_initial_setup_plan,
-    vault_config_unread, with_initial_setup_vault_sync,
+    automatic_vault_bootstrap_allowed, bring_forward_restored_setup,
+    bring_forward_restored_setup_observing, check_background_workstation, check_initial_setup,
+    check_initial_setup_observed, forget_set_aside_setup, initial_setup_access_revision,
+    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
+    initial_setup_holds, initial_setup_keeps_vault_sync, initial_setup_observation,
+    initial_setup_owes_secrets_stage, initial_setup_park_mark, initial_setup_permission_steps,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_snapshot_read_only, input_activation_revision, local_network_first_use,
+    local_network_heard, local_network_question_is_own, look_for_the_alab_vault,
+    note_person_asked_for_access, note_setup_interrupted, observe_initial_setup,
+    probe_local_network_again, provisional_setup_widened, provisional_setup_widens,
+    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
+    restart_initial_setup_observed, retry_parked_setup_stages, run_initial_setup_pass,
+    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
+    setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
+    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -1057,7 +1057,7 @@ fn apply_accounts_at(root: &Path, on_screen: fn() -> bool) -> Result<Option<Repo
         root,
         &sys,
         &mut NativeHost::present(on_screen),
-        &aterm_types::version::build_id(),
+        &aterm_stamp::build_id(),
         std::time::SystemTime::now(),
         Part::Accounts {
             on_screen: on_screen(),
@@ -1086,7 +1086,7 @@ fn apply_part_at(root: &Path, part: Part) -> Result<Option<Report>, String> {
         root,
         &sys,
         &mut NativeHost::new(),
-        &aterm_types::version::build_id(),
+        &aterm_stamp::build_id(),
         std::time::SystemTime::now(),
         part,
     )
@@ -2849,7 +2849,7 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
         host,
         root,
         action,
-        &aterm_types::version::build_id(),
+        &aterm_stamp::build_id(),
         epoch_secs(std::time::SystemTime::now()),
     )
     .map(|pass| pass.report)
@@ -3551,7 +3551,7 @@ pub fn finish_withheld_preferences_observed_unless_stopped<S>(
             ensure_person_scope()?;
             Ok(NativeHost::new())
         },
-        &aterm_types::version::build_id(),
+        &aterm_stamp::build_id(),
         std::time::SystemTime::now(),
         follow_up_lock_wait(),
         stopped,
@@ -3691,7 +3691,7 @@ fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
     follow_up_at(
         root,
         &mut NativeHost::new(),
-        &aterm_types::version::build_id(),
+        &aterm_stamp::build_id(),
         std::time::SystemTime::now(),
     )
 }
@@ -4488,12 +4488,7 @@ mod tests {
         ) -> Result<Report, String> {
             self.now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
             self.host.select(selected);
-            automatic_pass(
-                &mut self.host,
-                root,
-                &aterm_types::version::build_id(),
-                self.now,
-            )
+            automatic_pass(&mut self.host, root, &aterm_stamp::build_id(), self.now)
         }
 
         /// Preference writes and relaunches so far.

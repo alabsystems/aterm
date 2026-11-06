@@ -229,6 +229,58 @@ fn ordinary_local_builds_keep_their_existing_compiler_metadata_contract() {
 }
 
 #[test]
+fn ordinary_builds_keep_metadata_selections_without_duplicate_owned_flags() {
+    let w = world("local-metadata-selections");
+    let build_args = [
+        "--locked",
+        "-p",
+        "astream-broker",
+        "-p",
+        "astream-pump",
+        "--bin",
+        "asb",
+        "--bin",
+        "aspump",
+        "--features",
+        "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/aead",
+    ];
+    for (policy, selectors) in [
+        (Policy::Repository, build_args.to_vec()),
+        (Policy::Unverified, build_args.to_vec()),
+        // An equals-form selector counts too; the missing bundled bin is still built.
+        (Policy::Unverified, vec!["--locked", "--bin=asb"]),
+    ] {
+        let meta = aterm_json::json!({
+            "packages": [{
+                "name": "astream", "version": "0.3.0", "manifest_path": "/x/Cargo.toml"
+            }],
+            "metadata": {"atpkg": {
+                "expose": ["asb"], "bundle": ["aspump"], "build-args": selectors
+            }}
+        });
+        let t = tools(&w, aterm_json::to_string(&meta).unwrap(), vec![], &[]);
+        let mut req = w.request();
+        req.program = "astream".into();
+        req.policy = policy;
+        let plan = build_local::plan(&w.ctx, &req, &t).unwrap();
+        let args = plan.command.argv();
+        let mut expected = if policy == Policy::Unverified {
+            vec!["--unverified"]
+        } else {
+            vec![]
+        };
+        expected.extend(["build", "--locked", "--profile", "release", "-j", "4"]);
+        expected.extend(selectors.iter().copied().filter(|arg| *arg != "--locked"));
+        if selectors.contains(&"--bin=asb") {
+            expected.extend(["--bin", "aspump"]);
+        }
+        assert_eq!(args, expected);
+        assert_eq!(plan.bins, ["asb", "aspump"]);
+        assert!(t.runs_of("build").is_empty(), "planning builds nothing");
+    }
+}
+
+#[test]
 fn a_build_that_could_not_be_trusted_is_refused_before_it_starts() {
     let w = world("local-refusals");
     let t = tools(&w, metadata(&["trust-ir"], &[], false), vec![], &[]);

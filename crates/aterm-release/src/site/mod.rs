@@ -1758,8 +1758,9 @@ fn steps(
             nothing = false;
         }
         let tail = |e: &str, out: &mut dyn Write| {
-            let lines: Vec<&str> = e.lines().collect();
-            for l in &lines[lines.len().saturating_sub(5)..] {
+            let mut lines: Vec<&str> = e.lines().rev().take(5).collect();
+            lines.reverse();
+            for l in lines {
                 let _ = writeln!(out, "  {l}");
             }
         };

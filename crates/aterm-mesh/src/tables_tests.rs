@@ -95,6 +95,11 @@ impl Fake {
         *lock(&self.egress) = Some(Arc::downgrade(egress));
     }
 
+    /// Feed no egress: an append after this is one whose feed the egress never reads.
+    fn unserve(&self) {
+        *lock(&self.egress) = None;
+    }
+
     fn egress(&self) -> Option<Arc<Egress>> {
         lock(&self.egress).as_ref().and_then(Weak::upgrade)
     }
@@ -205,6 +210,23 @@ impl Fake {
             format!("{writer}|{text}").as_bytes(),
             false,
         );
+    }
+
+    /// Forget the operation whose text is `text`: a store that lost the last records its log
+    /// had answered, as one whose Mac stopped before it ingested them does.
+    fn forget(&self, text: &str) {
+        let file = self.table_file(&TABLE);
+        let tail = format!("|{text}");
+        let kept: String = lines(&file)
+            .into_iter()
+            .filter(|line| {
+                line.split_once(' ')
+                    .is_none_or(|(_, wire)| !unhex(wire).ends_with(tail.as_bytes()))
+            })
+            .map(|line| line + "\n")
+            .collect();
+        std::fs::write(&file, kept).expect("the stand-in store file");
+        self.bump();
     }
 
     /// Seat `writer` in this store's membership log, with no egress fed: history before the mesh.
@@ -784,6 +806,115 @@ fn a_record_cut_below_a_sleeping_macs_cursor_reaches_it_by_one_inventory() {
     }
 }
 
+/// The offset of the table operation on `mac`'s `tables.log` whose text is `text`.
+fn offset_of(mac: &Mac, text: &str) -> u64 {
+    let tail = format!("|{text}");
+    let mut client = mac
+        .mesh()
+        .read_client(MeshLog::Tables, "/t/>", Some(HANG))
+        .expect("a reader");
+    let mut from = 0;
+    loop {
+        let (page, (next, head)) = client.fetch(from, "/t/>", 1024).expect("a page");
+        if let Some((offset, _, _)) = page
+            .iter()
+            .find(|(_, _, body)| body.windows(tail.len()).any(|w| w == tail.as_bytes()))
+        {
+            return *offset;
+        }
+        assert!(next < head, "{}'s log holds no {text:?}", mac.principal);
+        from = next;
+    }
+}
+
+/// The `Inventory` exchanges a Mac started for `reason` from event `since` on.
+fn started_for(events: &[Event], since: usize, reason: Reason) -> usize {
+    events
+        .iter()
+        .skip(since)
+        .filter(|event| matches!(event, Event::Inventory { reason: Some(r), .. } if *r == reason))
+        .count()
+}
+
+/// The lineage event (`relay_live_island.rs`'s `lineage_repaired`): a neighbour whose log answered
+/// a record and whose stores lost it before they held it for good comes back in another boot, at a
+/// later generation of its log with lineage. The relay to it reads the cursor moved and asks the
+/// lineage exchange, which brings the record back. With `KEPT_ON_A_MOVED_LOG` (the island's
+/// `keptOnMove`), the relay resumes as if the log were the same, asks nothing, and the record
+/// never returns.
+#[test]
+fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange() {
+    for lineage_rule in [true, false] {
+        crate::relay::KEPT_ON_A_MOVED_LOG.with(|on| on.set(!lineage_rule));
+        let lab = Lab::new();
+        let mut macs: Vec<(Mac, Arc<Fake>)> =
+            (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+        start_all(&lab, &mut macs);
+        crate::relay::KEPT_ON_A_MOVED_LOG.with(|on| on.set(false));
+        macs[0].1.write("w", "before");
+        macs[1].1.until_holds("before");
+        macs[0].1.write("w", "answered");
+        macs[1].1.until_holds("answered");
+        // B's ingest group steps past the record, so B's own log never hands it to its stores
+        // again; then B stops uncleanly and its stores lose it.
+        let at = offset_of(&macs[1].0, "answered");
+        let ingest = macs[1].0.mesh().ingest().expect("an ingest consumer");
+        assert!(ingest.wait_committed_for_test(at, Instant::now() + HANG));
+        let was = macs[1].0.mesh().broker(MeshLog::Tables).log_identity();
+        for log in MeshLog::ALL {
+            macs[1].0.mesh().broker(log).arm_unclean_stop();
+        }
+        let since = macs[0].0.seen.mark();
+        macs[1].0.stop();
+        let gone = macs[1].0.principal.clone();
+        macs[0].0.seen.until("A's relay to B ended", |events| {
+            events.iter().skip(since).any(
+                |e| matches!(e, Event::Ended { peer, log: MeshLog::Tables, .. } if *peer == gone),
+            )
+        });
+        macs[1].1.forget("answered");
+        assert!(!macs[1].1.holds("answered"));
+        let mark = macs[0].0.seen.mark();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::logs::BOOT.with(|boot| boot.set(Some([7; 16])));
+                    macs[1].0.start(&lab);
+                })
+                .join()
+        })
+        .expect("B starts again, in another boot");
+        let now = macs[1].0.mesh().broker(MeshLog::Tables).log_identity();
+        assert!(
+            now.id == was.id && now.generation > was.generation,
+            "the reboot moved {was} to {now}"
+        );
+        macs[1]
+            .1
+            .serve(&macs[1].0.mesh().egress().expect("an egress"));
+        lab.tick();
+        if lineage_rule {
+            macs[1].1.until_holds("answered");
+            macs[0].0.seen.until("A's lineage exchange ends", |events| {
+                started_for(events, mark, Reason::Lineage) > 0
+            });
+        } else {
+            // A barrier: a later record reaches B over the resumed relay, and A's Inventory worker
+            // then has nothing asked or running.
+            macs[0].1.write("w", "after");
+            macs[1].1.until_holds("after");
+            let inventory = macs[0].0.mesh().inventory().expect("an Inventory");
+            assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+            let events = lock(&macs[0].0.seen.events).clone();
+            assert_eq!(started_for(&events, mark, Reason::Lineage), 0);
+            assert!(
+                !macs[1].1.holds("answered"),
+                "the lost record came back with no lineage exchange"
+            );
+        }
+    }
+}
+
 /// An `Inventory` that moved nothing is not run again with the same neighbour while this Mac's
 /// digest is unchanged; with that rule off (the negative control), it is.
 #[test]
@@ -932,4 +1063,66 @@ fn one_append_yields_exactly_one_egress_record_in_process_and_from_a_second_proc
         ])
     );
     assert_eq!(egress.published(), 4);
+}
+
+/// A record the mesh delivered whose feed the egress never read (dropped from a full queue, or
+/// the node stopped first) is not published as this Mac's when the catch-up reads it from its
+/// store: its id was noted on disk before the append ([`crate::egress::ARRIVED_FILE`]). With the
+/// note gone (the negative control), the catch-up publishes it as this Mac's.
+#[test]
+fn a_delivered_record_a_catch_up_reads_is_not_published_again() {
+    for noted in [true, false] {
+        let lab = Lab::new();
+        let mut macs: Vec<(Mac, Arc<Fake>)> =
+            (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+        start_all(&lab, &mut macs);
+        // B's store feeds its egress nothing: the record's feed is lost.
+        macs[1].1.unserve();
+        macs[0].1.write("w", "feed-lost");
+        macs[1].1.until_holds("feed-lost");
+        let dir = macs[1].0.mesh().log_dir(MeshLog::Tables);
+        macs[1].0.stop();
+        if !noted {
+            std::fs::remove_file(dir.join(crate::egress::ARRIVED_FILE)).expect("the note");
+        }
+        // The next start catches the store up from its cursor, below the record.
+        macs[1].0.start(&lab);
+        let egress = macs[1].0.mesh().egress().expect("an egress");
+        macs[1].1.serve(&egress);
+        let key = TableKey {
+            table: TABLE,
+            recovery: false,
+        };
+        assert!(egress.wait_published(key, 1, Instant::now() + HANG));
+        assert_eq!(
+            own(&macs[1].0).len(),
+            usize::from(!noted),
+            "noted: {noted}: what the catch-up published as B's"
+        );
+    }
+}
+
+/// A push another process of the Mac asks of the node service ([`crate::push::push_by_node`]) is
+/// answered once a neighbour acked the table on the relay. Where no node serves the state dir,
+/// nothing answers, and the asker's old path pushes.
+#[test]
+fn a_push_another_process_asks_is_answered_by_the_nodes_relay() {
+    let lab = Lab::new();
+    let mut macs: Vec<(Mac, Arc<Fake>)> =
+        (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+    start_all(&lab, &mut macs);
+    macs[0].1.write("w", "pushed");
+    let state = macs[0].0.mesh().state_dir().to_path_buf();
+    assert_eq!(
+        crate::push::push_by_node(&state, &TABLE, Instant::now() + HANG),
+        Some(crate::Pushed::Reached)
+    );
+    macs[1].1.until_holds("pushed");
+    let unserved = aterm_tempfile::TempDir::new().expect("a scratch folder");
+    std::fs::create_dir_all(unserved.path().join(crate::logs::MESH_DIR)).expect("its mesh folder");
+    assert_eq!(
+        crate::push::push_by_node(unserved.path(), &TABLE, Instant::now() + HANG),
+        None,
+        "no node answers"
+    );
 }

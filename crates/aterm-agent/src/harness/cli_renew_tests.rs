@@ -2148,6 +2148,9 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
     );
 }
 
+/// A hosted OAuth code published beside the opener's outcome reaches the provider's stdin. The
+/// stand-in publishes it as `open_url::write_oauth_code` does, renamed into place whole: a code
+/// file seen created but not yet written is an invalid code, which ends the capture.
 #[cfg(unix)]
 #[test]
 fn an_unattended_renewal_injects_a_hosted_code_into_the_provider_stdin() {
@@ -2155,14 +2158,38 @@ fn an_unattended_renewal_injects_a_hosted_code_into_the_provider_stdin() {
     let program = tmp.path().join("provider");
     aterm_tempfile::stand_in(
         &program,
-        "#!/bin/sh\nprintf secret > \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n",
+        "#!/bin/sh\nprintf secret > \"$ATERM_OPEN_URL_OUTCOME.code.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.code.part\" \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n",
     )
     .unwrap();
     let mut cmd = aterm_uds::spawnfd::command(program);
     cmd.env("PATH", "/usr/bin:/bin");
-    let (ran, _) = capture_unattended_renewal(cmd, std::time::Duration::from_secs(60)).unwrap();
+    let (ran, _) = capture_unattended_renewal(cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
     assert_eq!(ran.code, Some(0));
     assert_eq!(ran.stdout, b"secret");
+}
+
+/// A hosted code file that holds no valid code ends the capture, as the opener's recorded
+/// failure ends it: the provider waiting at its paste prompt is stopped, and no code reaches
+/// it. A code file seen created but not yet written is such a file, which is why the code is
+/// published whole.
+#[cfg(unix)]
+#[test]
+fn a_hosted_code_file_with_no_valid_code_ends_the_capture() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let program = tmp.path().join("provider");
+    aterm_tempfile::stand_in(
+        &program,
+        "#!/bin/sh\n: > \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n",
+    )
+    .unwrap();
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.env("PATH", "/usr/bin:/bin");
+    let failure = capture_unattended_renewal(cmd, aterm_spec::wait::MUST_HAPPEN).unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        "its browser opener stopped before authorization completed"
+    );
+    assert_eq!(failure.met, None);
 }
 
 #[cfg(unix)]
@@ -2361,14 +2388,18 @@ fn an_unattended_renewal_that_runs_out_leaves_no_provider_running() {
 
 #[cfg(unix)]
 #[test]
-fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries() {
-    for (code, expected) in [(1, Renewal::AuthFailed), (130, Renewal::Failed)] {
+fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
+    for (code, met, expected) in [
+        (1, "bot-check claude.ai", Renewal::BotCheck),
+        (130, "bot-check claude.ai", Renewal::Failed),
+        (1, "browser-control", Renewal::AuthFailed),
+    ] {
         let (tmp, env) = renew_env("renew-browser-exit");
         let program = tmp.path().join("provider");
         aterm_tempfile::stand_in(
             &program,
             &format!(
-                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet=bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
+                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
             ),
         )
         .unwrap();
@@ -2408,11 +2439,42 @@ fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries
         );
         let err = String::from_utf8(err).unwrap();
         assert_eq!(result, expected, "{err}");
-        assert_eq!(result.can_retry_authentication(), code == 1, "{err}");
+        assert_eq!(
+            result.can_retry_authentication(),
+            expected == Renewal::AuthFailed,
+            "{err}"
+        );
         assert!(err.contains(&format!("exited {code}")), "{err}");
-        assert!(err.contains("Cloudflare"), "{err}");
-        assert!(err.contains("claude.ai"), "{err}");
-        assert_eq!(logins_of(&env).get("work-2").cloned(), before);
+        let after = logins_of(&env).get("work-2").cloned();
+        if expected == Renewal::BotCheck {
+            assert!(
+                err.contains("Cloudflare") && err.contains("claude.ai"),
+                "{err}"
+            );
+            let records = store
+                .read_account_records(Some(&roster_path), env.now)
+                .unwrap();
+            assert_eq!(
+                accounts::sign_in_tasks(&records.raw_roster, &records.logins),
+                [("work-2".into(), accounts::SignInAction::Login)]
+            );
+            let mut after = after.unwrap();
+            assert_eq!(
+                after.sign_in_task.take().unwrap().action,
+                accounts::SignInAction::Login
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("human browser challenge recorded"), "{out}");
+            assert!(!out.contains("NEEDS YOU"), "{out}");
+            let prior_generation = before
+                .as_ref()
+                .map_or(0, |binding| binding.renewal_generation);
+            assert!(after.renewal_generation > prior_generation);
+            after.renewal_generation = prior_generation;
+            assert_eq!(after, before.unwrap_or_default());
+        } else {
+            assert_eq!(after, before);
+        }
     }
 }
 

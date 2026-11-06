@@ -1338,7 +1338,9 @@ fn every_build_is_partial_until_one_is_measured() {
 }
 
 /// Where a measured build's reduction is committed.
-const MEASURED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
+fn measured_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("src/harness/testdata/steps")
+}
 
 /// How a Codex rollout's reduction is named beside them.
 const CODEX_REDUCTION: &str = "codex-";
@@ -1403,7 +1405,7 @@ fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), St
 /// A build is exact iff its reduction is committed.
 #[test]
 fn a_build_is_exact_iff_its_reduction_is_committed() {
-    measured_builds_hold(std::path::Path::new(MEASURED_DIR), MEASURED_BUILDS)
+    measured_builds_hold(&measured_dir(), MEASURED_BUILDS)
         .expect("the measured builds and their reductions agree");
 }
 
@@ -1421,7 +1423,7 @@ fn claude_build_of(header: &str) -> Option<&str> {
 #[test]
 fn the_measured_builds_are_what_the_committed_reductions_name() {
     let mut named = Vec::new();
-    for e in std::fs::read_dir(MEASURED_DIR)
+    for e in std::fs::read_dir(measured_dir())
         .expect("the step testdata")
         .filter_map(Result::ok)
     {
@@ -1449,7 +1451,7 @@ fn the_measured_builds_are_what_the_committed_reductions_name() {
 /// A listed build with no reduction fails the guard, and so does a reduction no listed build names.
 #[test]
 fn a_listed_build_with_no_reduction_fails_the_guard() {
-    let dir = std::path::Path::new(MEASURED_DIR);
+    let dir = &measured_dir();
     let e = measured_builds_hold(dir, &["9.9.999"]).expect_err("no file");
     assert!(e.starts_with("9.9.999 is named"), "{e}");
     let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
@@ -1549,7 +1551,7 @@ fn a_transcripts_text_never_reaches_a_step() {
 
 /// Every transcript under `supervise/fixtures`, by name.
 fn fixtures() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/supervise/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("src/supervise/fixtures");
     let mut all: Vec<(String, String)> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .map(|e| e.expect("an entry").path())

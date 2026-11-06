@@ -296,9 +296,8 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Every lock the census names is a `compile_fail` block of its file under its error code, and no Aos source holds a lock the census does not name.
 #[test]
 fn aos_locks_are_present() {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crate sits under crates/");
+    let manifest = aterm_tempfile::manifest_dir();
+    let crates = manifest.parent().expect("the crate sits under crates/");
     let mut found = BTreeSet::new();
     for &(root, prefix) in ROOTS {
         let dir = crates.join(root);

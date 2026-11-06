@@ -20,10 +20,10 @@ use crate::measure::{
 use crate::reduce;
 use crate::stop::Stopped;
 
-const COMMITTED: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-agent/src/harness/testdata/steps"
-);
+/// The step testdata, in the agent crate beside this package.
+fn committed_dir() -> PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-agent/src/harness/testdata/steps")
+}
 
 const B: &str = "0.165.0-dev.13586+g133286d36";
 
@@ -213,7 +213,7 @@ fn a_reduction_that_is_no_fixed_point_refuses_fixed_point() {
         fixed_point("first", "a\n", &once).expect("a fixed point"),
         "# reduced\na\n"
     );
-    let path = format!("{COMMITTED}/codex-alab-0.165.0-dev.13594-first.jsonl");
+    let path = committed_dir().join("codex-alab-0.165.0-dev.13594-first.jsonl");
     let committed = std::fs::read_to_string(&path).expect("a committed reduction");
     assert_eq!(
         fixed_point("first", &committed, &reduce_checked(Program::Codex))
@@ -373,7 +373,7 @@ fn a_rollout_key_the_previous_build_showed_refuses_gone() {
 #[test]
 fn gone_holds_a_build_to_every_rollout_key_the_fold_reads() {
     assert_eq!(
-        read_but_not_held(&CODEX, Path::new(COMMITTED)),
+        read_but_not_held(&CODEX, &committed_dir()),
         Vec::<String>::new(),
         "keys the fold reads of a committed reduction that ROLLOUT_KEYS does not name"
     );
@@ -389,7 +389,7 @@ const BEFORE_13594: [&str; 4] = [
 
 #[test]
 fn every_codex_alab_build_in_the_step_testdata_is_its_six_legs() {
-    let all = committed(&CODEX, Path::new(COMMITTED)).expect("the step testdata");
+    let all = committed(&CODEX, &committed_dir()).expect("the step testdata");
     let builds: BTreeSet<&str> = all
         .iter()
         .filter_map(|r| r.build.as_deref())
@@ -409,7 +409,7 @@ fn every_codex_alab_build_in_the_step_testdata_is_its_six_legs() {
 
 #[test]
 fn the_committed_builds_read_as_measured_with_nothing_the_verb_would_refuse() {
-    let all = committed(&CODEX, Path::new(COMMITTED)).expect("the step testdata");
+    let all = committed(&CODEX, &committed_dir()).expect("the step testdata");
     let build = "0.165.0-dev.13594+g870dabaa6";
     assert_eq!(admit(build, &all).expect("listed"), None);
     // 13594 as the verb would have judged it: against the builds measured before it, whatever
@@ -773,9 +773,9 @@ fn the_build_and_test_output_are_read_as_cargo_and_libtest_write_them() {
 #[test]
 fn a_gated_word_a_build_drops_is_noted() {
     let leg = |name: &str| {
-        std::fs::read_to_string(format!(
-            "{COMMITTED}/codex-alab-0.166.0-dev.13766-{name}.jsonl"
-        ))
+        std::fs::read_to_string(
+            committed_dir().join(format!("codex-alab-0.166.0-dev.13766-{name}.jsonl")),
+        )
         .expect("a 13766 leg")
     };
     let plant = |text: &str| {

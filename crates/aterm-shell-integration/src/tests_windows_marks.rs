@@ -181,7 +181,7 @@ fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
         let dir = &world.root;
         let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
         let profile = dir.path().join("profile.ps1");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = aterm_tempfile::manifest_dir()
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");
@@ -326,7 +326,7 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
     let world = PowerShellWorld::new();
     let dir = world.root.path();
     let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let script = aterm_tempfile::manifest_dir()
         .join("src")
         .join("scripts")
         .join("aterm_shell_integration.bash");
@@ -417,7 +417,7 @@ fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
             "git bash without /tmp: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
         );
     };
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let script = aterm_tempfile::manifest_dir()
         .join("src")
         .join("scripts")
         .join("aterm_shell_integration.bash");
@@ -533,7 +533,7 @@ fn test_ctrl_j_accepts_the_line_in_powershell_and_git_bash() {
         let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
         let result = dir.path().join("result.txt");
         let profile = dir.path().join("profile.ps1");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = aterm_tempfile::manifest_dir()
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");
@@ -791,7 +791,7 @@ fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
     let world = PowerShellWorld::new();
     let dir = world.root.path();
     let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let script = aterm_tempfile::manifest_dir()
         .join("src")
         .join("scripts")
         .join("aterm_shell_integration.bash");
@@ -886,7 +886,7 @@ fn test_a_command_title_is_the_whole_line_or_marks_its_cut() {
         let dir = &world.root;
         let quoted = |path: &Path| path.display().to_string().replace('\'', "''");
         let profile = dir.path().join("profile.ps1");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = aterm_tempfile::manifest_dir()
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");
@@ -957,7 +957,7 @@ fn test_a_command_title_is_the_whole_line_or_marks_its_cut() {
     let world = PowerShellWorld::new();
     let dir = world.root.path();
     let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let script = aterm_tempfile::manifest_dir()
         .join("src")
         .join("scripts")
         .join("aterm_shell_integration.bash");

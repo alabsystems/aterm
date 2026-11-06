@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::agy_signin::{Authorization, Code};
 use super::google_browser::{self, MemoryBrowser};
@@ -13,6 +13,7 @@ use super::google_credentials::{self, Credentials};
 use super::google_federation::{self, Authenticator};
 use super::google_identity::Identity;
 use super::headless_oauth::{self as oauth, MailboxConfig};
+use super::wake_deadline::WakeDeadline;
 use aterm_secrets::SecretBytes;
 
 /// Bounded, redacted approval failures; no request, account address or code is included.
@@ -61,7 +62,7 @@ pub(super) struct Context<'a> {
 pub(super) fn approve(
     request: &Authorization,
     ctx: &Context<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Result<Code, Error> {
     if !(ctx.current)() {
         return Err(Error::Configuration);
@@ -88,7 +89,7 @@ pub(super) fn approve(
     let mut seen = BTreeSet::new();
     let started = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok());
     loop {
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err(Error::Deadline);
         }
         if !(ctx.current)() {

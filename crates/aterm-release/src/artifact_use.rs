@@ -51,9 +51,10 @@ fn remove_observed(
                 left.as_secs()
             ));
         }
+        let mut canonical_dir = None;
         for reference in read()? {
             remaining(deadline)?;
-            if points_into(&reference.program, dir)? {
+            if points_into_cached(&reference.program, dir, &mut canonical_dir)? {
                 return Err(format!(
                     "{} still references this artifact",
                     reference.source
@@ -86,7 +87,16 @@ fn same_directory(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg(test)]
 fn points_into(program: &Path, dir: &Path) -> Result<bool, String> {
+    points_into_cached(program, dir, &mut None)
+}
+
+fn points_into_cached(
+    program: &Path,
+    dir: &Path,
+    canonical_dir: &mut Option<PathBuf>,
+) -> Result<bool, String> {
     if !program.is_absolute() {
         return Err("a service or process executable path is relative".into());
     }
@@ -95,21 +105,30 @@ fn points_into(program: &Path, dir: &Path) -> Result<bool, String> {
     if descendant(program, dir) {
         return Ok(true);
     }
-    let canonical_dir = dir.canonicalize().map_err(|error| error.to_string())?;
-    if descendant(program, &canonical_dir) {
+    let canonical_dir = match canonical_dir {
+        Some(cached) => cached.as_path(),
+        None => {
+            let resolved = dir.canonicalize().map_err(|error| error.to_string())?;
+            canonical_dir.insert(resolved).as_path()
+        }
+    };
+    if descendant(program, canonical_dir) {
         return Ok(true);
     }
-    Ok(descendant(&resolve_missing(program)?, &canonical_dir))
+    Ok(descendant(&resolve_missing(program)?, canonical_dir))
 }
 
 fn descendant(path: &Path, directory: &Path) -> bool {
-    let form = |path: &Path| {
-        path.strip_prefix("/System/Volumes/Data")
-            .map_or_else(|_| path.to_path_buf(), |tail| Path::new("/").join(tail))
-    };
+    fn form(p: &Path) -> &Path {
+        p.strip_prefix("/System/Volumes/Data")
+            .or_else(|_| p.strip_prefix("/"))
+            .unwrap_or(p)
+    }
     // macOS exposes a data-volume vnode under either spelling. This is the same
     // conservative alias used by the shared path-holder reader.
-    path.starts_with(directory) || form(path).starts_with(form(directory))
+    path.starts_with(directory)
+        || (path.is_absolute() == directory.is_absolute()
+            && form(path).starts_with(form(directory)))
 }
 
 fn resolve_missing(program: &Path) -> Result<PathBuf, String> {
@@ -214,6 +233,13 @@ fn service_references(_: Instant) -> Result<Vec<Reference>, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(
+    all(test, not(target_os = "macos")),
+    expect(
+        dead_code,
+        reason = "the tests that read service directories run on macOS alone"
+    )
+)]
 fn configured(directories: &[PathBuf]) -> Result<Vec<Reference>, String> {
     let mut references = Vec::new();
     for directory in directories {
@@ -295,11 +321,13 @@ fn labels(text: &str) -> Result<Vec<String>, String> {
         if count >= MAX_UNITS {
             return Err("loaded service list exceeds the observation bound".into());
         }
-        let words: Vec<_> = line.split_whitespace().collect();
-        if words.len() != 3 {
+        let mut words = line.split_whitespace();
+        let (Some(_), Some(_), Some(raw_label), None) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
             return Err("the loaded service list has an unfamiliar row".into());
-        }
-        let label = words[2].trim_matches(['"', ';']);
+        };
+        let label = raw_label.trim_matches(['"', ';']);
         if managed(label) {
             if !label_shape(label) {
                 return Err("loaded service label is ambiguous".into());

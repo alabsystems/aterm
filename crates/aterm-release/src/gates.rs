@@ -148,16 +148,31 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
             Ok(())
         }
     };
+    // The lock in the clone's working tree (its HEAD until the cut moves it to the candidate)
+    // names the build, so an index that flips `current` mid-run changes nothing here. Binding the
+    // candidate's own lock is `trust_lock::locked_prover` over `lock_at(R)`, which `prover()`
+    // takes once it runs after `choose_candidate()`.
+    let lock = env::current_dir().ok().and_then(|cwd| {
+        let xdg = env::var_os("XDG_CONFIG_HOME")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        let prefix = atpkg::toolchain::atpkg_prefix(&home, xdg.as_deref());
+        atpkg::trust_lock::found_for(&cwd, Some(&prefix))
+    });
     let found = atpkg::toolchain::Toolchain::discover_guarded(
         explicit.as_deref(),
         &home,
         &path,
         Some(atpkg::seam::DEFAULT_SEAM),
+        lock.as_ref(),
         &mut before_probe,
     )
     .map_err(Error::new)?;
     if found.have_targo() && found.stage2_dir.join("trustc").is_file() {
         return canonical_toolchain(&found.stage2_dir);
+    }
+    if let Some(why) = &found.lock_refusal {
+        return Err(Error::new(why.clone()));
     }
     let looked = found
         .refused
@@ -1076,56 +1091,13 @@ pub fn toolchain_at(stage2: &Path) -> Result<String> {
     Ok(format!("{} trustc {commit}", stage2.display()))
 }
 
-/// Where `ship release` keeps its [`VerifiedRecord`]s.
-pub const VERIFIED_DIR: &str = "verified";
-
-/// The record that a release's checks passed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VerifiedRecord {
-    /// The commit `verify release` ran in.
-    pub commit: String,
-    /// SHA-256 of the executable it judged (`aterm.app/Contents/MacOS/aterm`).
-    pub executable: String,
-    /// Compiler, standard-library and SDK content identity during the checks.
-    pub inputs: String,
-}
-
-fn verified_path(git: &dyn GitRunner, commit: &str) -> Result<(PathBuf, String)> {
-    let tree = rev_parse(git, &format!("{commit}^{{tree}}"))?;
-    let path = crate::release::release_dir(git)
-        .map_err(Error::new)?
-        .join(VERIFIED_DIR)
-        .join(&tree);
-    Ok((path, tree))
-}
-
-/// Record that `verify release` passed for `commit`'s tree on the executable `macho_sha256`.
+/// Did these bytes, from this tree, pass every check a release requires, each by its own record
+/// under the current build-inputs seal ([`crate::check_record::checks`])? Its words name the
+/// missing and the failed checks.
 ///
 /// # Errors
-/// git cannot name the tree or the common dir; any write.
-pub fn record_verified(
-    git: &dyn GitRunner,
-    commit: &str,
-    macho_sha256: &str,
-    inputs: &str,
-) -> Result<PathBuf> {
-    let (path, _) = verified_path(git, commit)?;
-    let record = VerifiedRecord {
-        commit: commit.to_string(),
-        executable: macho_sha256.to_string(),
-        inputs: inputs.to_string(),
-    };
-    let text = aterm_toml::to_string(&record)
-        .map_err(|e| Error::new(format!("serialize the verified record: {e}")))?;
-    crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
-        .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
-    Ok(path)
-}
-
-/// Did these bytes, from this tree, pass every check a release requires?
-///
-/// # Errors
-/// git cannot name the tree, or the record cannot be read at all: no answer either way.
+/// git cannot name the tree, a record cannot be read at all, or the seal cannot be taken: no
+/// answer either way.
 pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<(bool, String)> {
     verified_with_inputs(git, commit, macho_sha256, crate::build_inputs::current)
 }
@@ -1136,59 +1108,9 @@ pub(crate) fn verified_with_inputs(
     macho_sha256: &str,
     inputs: impl FnOnce() -> std::result::Result<String, String>,
 ) -> Result<(bool, String)> {
-    if let Some(accepted) =
-        crate::accepted_measure::accepted(git, commit, macho_sha256).map_err(Error::new)?
-    {
-        return Ok((true, accepted));
-    }
-    let (path, tree) = verified_path(git, commit)?;
-    let text = match crate::durable::read_regular_text(&path, 1024 * 1024) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((
-                false,
-                format!(
-                    "no record that `verify release` passed for {}'s tree {}",
-                    short(commit),
-                    short(&tree)
-                ),
-            ));
-        }
-        Err(e) => return Err(Error::new(format!("read {}: {e}", path.display()))),
-    };
-    let Ok(record) = aterm_toml::from_str::<VerifiedRecord>(&text) else {
-        return Ok((
-            false,
-            format!("{} is not a record this cutter reads", path.display()),
-        ));
-    };
-    if record.executable != macho_sha256 {
-        return Ok((
-            false,
-            format!(
-                "`verify release` passed for {}'s tree on the executable {}, not {}",
-                short(commit),
-                short(&record.executable),
-                short(macho_sha256)
-            ),
-        ));
-    }
-    if record.inputs != inputs().map_err(Error::new)? {
-        return Ok((
-            false,
-            "compiler or SDK bytes changed since release verification".into(),
-        ));
-    }
-    Ok((
-        true,
-        format!(
-            "verify release: PASSED for {}'s tree {} on the executable {} (run in {})",
-            short(commit),
-            short(&tree),
-            short(macho_sha256),
-            short(&record.commit)
-        ),
-    ))
+    let checks =
+        crate::check_record::checks(git, commit, Some(macho_sha256), inputs).map_err(Error::new)?;
+    Ok((checks.complete(), checks.line().to_owned()))
 }
 
 /// `ship check`'s `verify release` line for `commit`.
@@ -1407,6 +1329,18 @@ pub fn precheck(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
     precheck_with(git, rev, crate::cutter::running())
 }
 
+/// Source-only main sampling asks every commit gate and makes no claim about bundle bytes.
+/// # Errors
+/// The revision cannot be read or names no release version.
+pub fn precheck_source(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
+    precheck_parts(
+        git,
+        rev,
+        crate::cutter::running(),
+        None::<fn(&str) -> Result<String>>,
+    )
+}
+
 fn precheck_with(
     git: &dyn GitRunner,
     rev: &str,
@@ -1420,6 +1354,15 @@ fn precheck_with_judge(
     rev: &str,
     stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
     verify: impl FnOnce(&str) -> Result<String>,
+) -> Result<Precheck> {
+    precheck_parts(git, rev, stamp, Some(verify))
+}
+
+fn precheck_parts(
+    git: &dyn GitRunner,
+    rev: &str,
+    stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
+    verify: Option<impl FnOnce(&str) -> Result<String>>,
 ) -> Result<Precheck> {
     let mut found = Precheck::of(git, rev)?;
     let (commit, version) = (found.commit.clone(), found.version.clone());
@@ -1486,11 +1429,13 @@ fn precheck_with_judge(
                     .map(|found| format!("handoff policy a cut seals into the bundle: {found}")),
             ),
         },
-        PrecheckGate {
+    ];
+    if let Some(verify) = verify {
+        found.gates.push(PrecheckGate {
             name: "verify release",
             outcome: answer(verify(&commit)),
-        },
-    ];
+        });
+    }
     Ok(found)
 }
 
@@ -2625,16 +2570,8 @@ pub(crate) fn release_at_least(release: &str, floor: &str) -> Result<bool> {
     }
 }
 
-/// The release's retained fixture-generator target, outside filesystem indexing.
-pub const HANDOFF_FIXTURE_GUARD_TARGET: &str = "target/.ubd/fixture-guard.noindex";
-
-/// `targo --unverified test -p aterm-gui --lib --target-dir <target> -- <args>` in `tree`, with the build's steering variables (`RUSTFLAGS`, `RUSTC`, …) removed, as for the release build.
-pub(crate) fn aterm_gui_lib_test(
-    targo: &Path,
-    tree: &Path,
-    target: &Path,
-    args: &[&str],
-) -> Command {
+/// Compile only the missing fixture target, recording Cargo artifacts for direct execution.
+pub(crate) fn aterm_gui_lib_compile(targo: &Path, tree: &Path, target: &Path) -> Command {
     let mut command = command(targo);
     command
         .args([
@@ -2646,8 +2583,7 @@ pub(crate) fn aterm_gui_lib_test(
             "--target-dir",
         ])
         .arg(target)
-        .arg("--")
-        .args(args)
+        .args(["--no-run", "--message-format=json-render-diagnostics"])
         .current_dir(tree)
         .env_remove("RUSTFLAGS")
         .env_remove("RUSTDOCFLAGS")
@@ -4039,7 +3975,8 @@ mod handoff_policy_gate_tests {
 
     #[test]
     fn the_checked_in_policy_passes_the_gate() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let package = aterm_tempfile::manifest_dir();
+        let root = package
             .parent()
             .and_then(Path::parent)
             .expect("crates/aterm-release sits two levels under the root");
@@ -4658,6 +4595,20 @@ mod published_commit_tests {
             (candidate.as_str(), "0.2.0")
         );
         assert_eq!(found.refused(), ["verify release"]);
+        let source = precheck_parts(
+            &git,
+            &candidate,
+            Ok(&candidate),
+            None::<fn(&str) -> Result<String>>,
+        )
+        .unwrap();
+        assert_eq!(
+            source.exit_code(),
+            0,
+            "source-only sampling needs no bundle"
+        );
+        assert_eq!(source.gates.len() + 1, found.gates.len());
+        assert!(!source.gates.iter().any(|g| g.name == "verify release"));
 
         let macho = "ab".repeat(32);
         crate::release::Journal {
@@ -4679,18 +4630,34 @@ mod published_commit_tests {
                 .join(crate::release::JOURNAL_FILE),
         )
         .unwrap();
-        record_verified(&git, &candidate, &macho, "inputs").unwrap();
+        let ok = |_: &str| Some("ok");
+        crate::check_record::record_run(&git, &candidate, &"ef".repeat(32), "inputs", 0, ok);
+        let found = check(&candidate);
+        assert_eq!(
+            found.refused(),
+            ["verify release"],
+            "another executable's measure record: {}",
+            found.transcript()
+        );
+        crate::check_record::record_run(&git, &candidate, &macho, "inputs", 0, ok);
         let found = check(&candidate);
         assert!(found.refused().is_empty(), "{}", found.transcript());
 
         let head = check("HEAD");
         assert_eq!(head.commit, later);
         assert_eq!(head.refused(), ["handoff fixtures", "verify release"]);
-        record_verified(&git, &candidate, &"ef".repeat(32), "inputs").unwrap();
+        crate::check_record::record_run(&git, &candidate, &macho, "inputs", 1, |c| {
+            Some(if c == "lint" { "FAIL" } else { "ok" })
+        });
         let found = check(&candidate);
         assert_eq!(
             found.refused(),
             ["verify release"],
+            "a FAIL record: {}",
+            found.transcript()
+        );
+        assert!(
+            found.transcript().contains("FAILED lint"),
             "{}",
             found.transcript()
         );

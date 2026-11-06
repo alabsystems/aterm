@@ -122,7 +122,7 @@ const _: () =
     assert!(astream_wire::HEADER_SIZE + astream_wire::MAX_PAYLOAD_LEN <= BYTES_MASK as usize);
 
 /// log2 of the records a page holds.
-const PAGE_SHIFT: u32 = 8;
+pub(crate) const PAGE_SHIFT: u32 = 8;
 /// The records a page holds.
 const PAGE: usize = 1 << PAGE_SHIFT;
 /// A column entry that names no value: the record's value is in the tier's map of wide
@@ -334,6 +334,27 @@ impl Columns {
         self.subject.reserve_exact(n);
     }
 
+    /// The entries each column holds.
+    fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// The entries every column has room for: past it the next push moves a column.
+    fn capacity(&self) -> usize {
+        self.at
+            .capacity()
+            .min(self.bt.capacity())
+            .min(self.meta.capacity())
+            .min(self.subject.capacity())
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.at.shrink_to_fit();
+        self.bt.shrink_to_fit();
+        self.meta.shrink_to_fit();
+        self.subject.shrink_to_fit();
+    }
+
     #[cfg(test)]
     fn truncate(&mut self, n: usize) {
         self.at.truncate(n);
@@ -417,6 +438,9 @@ pub(crate) enum PageMutant {
     /// A walk keeps the subject name its last record read across a page boundary, so a
     /// page's records read the last page's name for their index.
     StaleName,
+    /// A filtered read's pass ([`Tier::passing`]) passes whole the first page it wants a
+    /// record of, as it passes a page it wants none of.
+    DropWanted,
 }
 
 /// The retained records of one log: every one's summary in pages, and the decoded records
@@ -453,6 +477,9 @@ pub(crate) struct Tier {
     /// [`PageMutant::StaleName`] applied.
     #[cfg(test)]
     stale_names: bool,
+    /// [`PageMutant::DropWanted`] applied.
+    #[cfg(test)]
+    drops_wanted: bool,
     /// What its readers and writers did ([`TierTally`]).
     #[cfg(any(test, debug_assertions))]
     counted: tally::Counters,
@@ -632,6 +659,256 @@ impl<'a> Iterator for Walk<'a> {
     }
 }
 
+/// The words of a set of up to [`PAGE`] small numbers, a bit each: a page's subject indices a
+/// filtered read wants, or the slots of its [`Verdicts`].
+const WORDS: usize = PAGE / 64;
+const _: () = assert!(PAGE % 64 == 0);
+
+/// A set of up to [`PAGE`] small numbers.
+type Bits = [u64; WORDS];
+
+/// Whether `k` is in `bits`.
+fn has(bits: &Bits, k: usize) -> bool {
+    match bits.get(k >> 6) {
+        Some(w) => (w >> (k & 63)) & 1 == 1,
+        None => false,
+    }
+}
+
+/// Put `k` in `bits`, or take it out.
+fn set(bits: &mut Bits, k: usize, on: bool) {
+    if let Some(w) = bits.get_mut(k >> 6) {
+        let b = 1u64 << (k & 63);
+        if on {
+            *w |= b;
+        } else {
+            *w &= !b;
+        }
+    }
+}
+
+/// What a filtered read's pass ([`Tier::passing`]) meets in its range, in offset order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Met {
+    /// Record `i`, not hidden, of a subject the read wants.
+    Wanted(usize),
+    /// Record `i`, whose summary the tier cannot read ([`Tier::summary`] answers none).
+    Unread(usize),
+}
+
+impl Met {
+    /// The record's index.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Met::Wanted(i) | Met::Unread(i) => i,
+        }
+    }
+}
+
+/// A filtered read's verdicts by subject id: slot `id % PAGE` holds the last id asked there and
+/// whether the read wants it. Each id is asked once a read unless another took its slot since.
+struct Verdicts {
+    ids: [u32; PAGE],
+    known: Bits,
+    wanted: Bits,
+}
+
+impl Verdicts {
+    fn new() -> Verdicts {
+        Verdicts {
+            ids: [0; PAGE],
+            known: [0; WORDS],
+            wanted: [0; WORDS],
+        }
+    }
+
+    /// Whether the read wants subject `id`, if it was asked.
+    fn get(&self, id: u32) -> Option<bool> {
+        let k = (id as usize) % PAGE;
+        if has(&self.known, k) && self.ids.get(k) == Some(&id) {
+            return Some(has(&self.wanted, k));
+        }
+        None
+    }
+
+    /// Keep the read's verdict on subject `id`.
+    fn put(&mut self, id: u32, wanted: bool) {
+        let k = (id as usize) % PAGE;
+        if let Some(slot) = self.ids.get_mut(k) {
+            *slot = id;
+            set(&mut self.known, k, true);
+            set(&mut self.wanted, k, wanted);
+        }
+    }
+}
+
+/// A filtered read's pass over retained records in offset order ([`Tier::passing`]): a page is
+/// found once and its subjects are asked of the read's filter, each at most once a page and,
+/// across pages, once a pass while its slot of the pass's [`Verdicts`] (`id % PAGE`) keeps its
+/// verdict, so a pass whose pages name more than [`PAGE`] subjects asks again of one whose
+/// slot another took. Where the pass reads at least as many of a page's records as the page
+/// names subjects, it asks of them all first and passes the page whole when it wants none; it
+/// reads any other page's records one by one, asking of a subject when a record not hidden
+/// first names it, so a short read asks no more than it has records. In a page it reads, a
+/// record costs its two column entries (`meta` and `subject`), its subject's id among the
+/// page's ids and, when it is not hidden, the page's bits for that subject (asked, then
+/// wanted).
+pub(crate) struct Passing<'a, W> {
+    tier: &'a Tier,
+    /// The next record's index, and the index the pass stops at.
+    i: usize,
+    hi: usize,
+    /// Whether the read wants a subject.
+    wants: W,
+    verdicts: Verdicts,
+    /// The page the pass is in: its `meta` and subject entries from the pass's next record to
+    /// the pass's end in it, the ids it names, the indices of those asked and of those the
+    /// read wants.
+    metas: std::slice::Iter<'a, u32>,
+    locals: std::slice::Iter<'a, u8>,
+    ids: &'a [u32],
+    known: Bits,
+    wanted: Bits,
+    /// The records of a page whose entries cannot be read, each met as unread.
+    unread: std::ops::Range<usize>,
+    /// Whether the pass has passed a page it wants under [`PageMutant::DropWanted`].
+    #[cfg(test)]
+    dropped: bool,
+    /// The rows it read, the pages it passed whole and the verdicts it asked, added to the
+    /// tier's tally when it ends.
+    #[cfg(any(test, debug_assertions))]
+    counts: [u64; 3],
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<W> Drop for Passing<'_, W> {
+    fn drop(&mut self) {
+        let [rows, passed, asked] = self.counts;
+        count!(self.tier, Rows, rows);
+        count!(self.tier, PassedPage, passed);
+        count!(self.tier, Verdict, asked);
+    }
+}
+
+impl<W: FnMut(&str) -> bool> Passing<'_, W> {
+    /// Count `n` more of the pass's `k`th count (rows, pages passed, verdicts asked).
+    #[cfg(any(test, debug_assertions))]
+    fn add(&mut self, k: usize, n: u64) {
+        if let Some(c) = self.counts.get_mut(k) {
+            *c = c.saturating_add(n);
+        }
+    }
+
+    /// Whether the read wants the page's subject `l`, asked once.
+    fn local(&mut self, l: usize, id: u32) -> bool {
+        if has(&self.known, l) {
+            return has(&self.wanted, l);
+        }
+        let hit = match self.verdicts.get(id) {
+            Some(hit) => hit,
+            None => {
+                #[cfg(any(test, debug_assertions))]
+                self.add(2, 1);
+                let hit = (self.wants)(self.tier.subjects.name(id));
+                self.verdicts.put(id, hit);
+                hit
+            }
+        };
+        set(&mut self.known, l, true);
+        set(&mut self.wanted, l, hit);
+        hit
+    }
+
+    /// Whether to pass a page the read wants records of: once a pass, under
+    /// [`PageMutant::DropWanted`].
+    #[cfg(test)]
+    fn drops(&mut self) -> bool {
+        if self.tier.drops_wanted && !self.dropped {
+            self.dropped = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether to pass a page the read wants records of: never.
+    #[cfg(not(test))]
+    fn drops(&mut self) -> bool {
+        false
+    }
+
+    /// Move to the next page that may hold a record the read wants, its entries up to the
+    /// pass's end in it, or that cannot be read, passing whole every page the pass reads at
+    /// least as many records of as it names subjects and wants none of; `false` once the pass
+    /// has reached its end.
+    fn enter(&mut self) -> bool {
+        let tier = self.tier;
+        while self.i < self.hi {
+            let j = tier.head.saturating_add(self.i);
+            let p = j >> tier.shift;
+            let end = (p.saturating_add(1) << tier.shift).min(tier.head.saturating_add(self.hi));
+            let n = end.saturating_sub(j).max(1);
+            let page = tier.pages.get(p);
+            let metas = tier.cols.meta.get(j..end);
+            let locals = tier.cols.subject.get(j..end);
+            let (Some(page), Some(metas), Some(locals)) = (page, metas, locals) else {
+                // No record of this page can be read: each one is met as unread.
+                self.unread = self.i..self.i.saturating_add(n);
+                self.i = self.unread.end;
+                return true;
+            };
+            self.ids = &page.subjects;
+            self.known = [0; WORDS];
+            self.wanted = [0; WORDS];
+            if n >= page.subjects.len() {
+                for (l, &id) in page.subjects.iter().enumerate() {
+                    self.local(l, id);
+                }
+                if self.wanted == [0; WORDS] || self.drops() {
+                    // Every record of a page names one of its ids (`append` writes it so), so
+                    // none of these is one the read wants: past them, their entries unread.
+                    #[cfg(any(test, debug_assertions))]
+                    self.add(1, 1);
+                    self.i = self.i.saturating_add(n);
+                    continue;
+                }
+            }
+            self.metas = metas.iter();
+            self.locals = locals.iter();
+            return true;
+        }
+        false
+    }
+}
+
+impl<W: FnMut(&str) -> bool> Iterator for Passing<'_, W> {
+    type Item = Met;
+
+    fn next(&mut self) -> Option<Met> {
+        loop {
+            if let Some(i) = self.unread.next() {
+                return Some(Met::Unread(i));
+            }
+            let (Some(&meta), Some(&l)) = (self.metas.next(), self.locals.next()) else {
+                if self.enter() {
+                    continue;
+                }
+                return None;
+            };
+            let i = self.i;
+            self.i = i.saturating_add(1);
+            #[cfg(any(test, debug_assertions))]
+            self.add(0, 1);
+            let l = usize::from(l);
+            let Some(&id) = self.ids.get(l) else {
+                return Some(Met::Unread(i));
+            };
+            if meta & HIDDEN == 0 && self.local(l, id) {
+                return Some(Met::Wanted(i));
+            }
+        }
+    }
+}
+
 impl Tier {
     /// The budget under which every retained record stays resident (the behaviour
     /// before the tier existed).
@@ -663,6 +940,8 @@ impl Tier {
             shadow: reference::Slots::with_budget(budget),
             #[cfg(test)]
             stale_names: false,
+            #[cfg(test)]
+            drops_wanted: false,
             #[cfg(any(test, debug_assertions))]
             counted: tally::Counters::default(),
         }
@@ -794,23 +1073,41 @@ impl Tier {
         }
     }
 
-    /// Records `lo..hi`'s summaries (clamped to the records held) one item an index, in offset
-    /// order: what [`summary`](Self::summary) answers for each, `None` for a record it cannot
-    /// read, but read page by page as a [`Walk`] reads them. A filtered read's scan passes
-    /// every record of its range by its summary, so the scan finds each page once rather than
-    /// once a record (aterm D10f: a bridge's refill scans a session's lane over the whole
-    /// backlog behind its watermark).
-    pub(crate) fn scan(&self, lo: usize, hi: usize) -> impl Iterator<Item = Option<Summary<'_>>> {
-        let rows = self.summaries(lo, hi);
-        let mut walk = rows.iter().peekable();
-        let base = self.base;
-        (rows.lo..rows.hi).map(move |i| {
-            let off = base.checked_add(i as u64);
-            match walk.peek() {
-                Some(s) if Some(s.offset()) == off => walk.next(),
-                _ => None,
-            }
-        })
+    /// What a filtered read meets in records `lo..hi` (clamped to the records held), in offset
+    /// order: each record that is not hidden and whose subject `wants`, and each whose summary
+    /// cannot be read (`summary` answers none for it). `wants` is asked of a subject the pages
+    /// name at most once a page and, while the pass's [`Verdicts`] keep it, once a pass, not
+    /// once a record ([`Passing`] says when it asks again), and a page the pass reads at
+    /// least as many records of as it names subjects, and none of whose subjects it wants, is
+    /// passed whole, its records' entries unread ([`Passing`]): a bridge's refill pages a
+    /// session's lane over the backlog behind its watermark (aterm D10f), and a backlog of
+    /// subjects the lane does not name costs the refill its pages' ids, not its records (aterm
+    /// F11c).
+    pub(crate) fn passing<W: FnMut(&str) -> bool>(
+        &self,
+        lo: usize,
+        hi: usize,
+        wants: W,
+    ) -> Passing<'_, W> {
+        let hi = hi.min(self.len);
+        count!(self, Walk, 1);
+        Passing {
+            tier: self,
+            i: lo.min(hi),
+            hi,
+            wants,
+            verdicts: Verdicts::new(),
+            metas: [].iter(),
+            locals: [].iter(),
+            ids: &[],
+            known: [0; WORDS],
+            wanted: [0; WORDS],
+            unread: 0..0,
+            #[cfg(test)]
+            dropped: false,
+            #[cfg(any(test, debug_assertions))]
+            counts: [0; 3],
+        }
     }
 
     /// The indices of the records in `lo..hi` (clamped to the records held) whose subject is
@@ -1109,6 +1406,7 @@ impl Tier {
             }
             PageMutant::Index => self.head = self.head.saturating_add(1),
             PageMutant::StaleName => self.stale_names = true,
+            PageMutant::DropWanted => self.drops_wanted = true,
         }
     }
 
@@ -1225,7 +1523,9 @@ impl Tier {
     /// The page-by-page walks against [`summary`](Self::summary) and [`bt`](Self::bt) an index
     /// (test helper): over every record, and from a third of the way in (mid-page, in pages of
     /// more than one record) to past the end; and [`naming`](Self::naming) each of up to eight
-    /// subjects the tier holds and one it does not, from there to two thirds of the way in.
+    /// subjects the tier holds and one it does not, from there to two thirds of the way in, and
+    /// a filtered read's [`passing`](Self::passing) over both ranges wanting each of them,
+    /// all but one, all and none, against the slot vector ([`check_pass`](Self::check_pass)).
     #[cfg(test)]
     fn check_walks(&self) -> Result<(), String> {
         let mut names: Vec<&str> = self.subjects.ids.keys().map(|s| &**s).collect();
@@ -1256,14 +1556,18 @@ impl Tier {
                     "the walk from {lo} answers {walked:?}, each record {each:?}"
                 ));
             }
-            let scanned: Vec<Option<Summary<'_>>> = self.scan(lo, hi).collect();
-            let each: Vec<Option<Summary<'_>>> = (lo.min(self.len)..hi.min(self.len))
-                .map(|i| self.summary(i))
-                .collect();
-            if scanned != each {
-                return Err(format!(
-                    "the scan from {lo} answers {scanned:?}, each record {each:?}"
-                ));
+            // A filtered read's pass, from here past the end and to two thirds of the way in,
+            // wanting each of those subjects alone, every subject but the first, every subject
+            // and none.
+            let to = if lo == 0 { hi } else { self.len - self.len / 3 };
+            for (a, b) in [(lo, hi), (lo, to)] {
+                for name in &names {
+                    self.check_pass(a, b, &format!("only {name:?}"), |s| s == *name)?;
+                }
+                let first = names.first().copied().unwrap_or("");
+                self.check_pass(a, b, &format!("all but {first:?}"), |s| s != first)?;
+                self.check_pass(a, b, "every subject", |_| true)?;
+                self.check_pass(a, b, "no subject", |_| false)?;
             }
             #[cfg(feature = "retention")]
             {
@@ -1282,16 +1586,48 @@ impl Tier {
         Ok(())
     }
 
+    /// A filtered read's pass over `lo..hi` wanting `wants` ([`passing`](Self::passing))
+    /// against the slot vector's summaries an index (test helper): the records it meets are
+    /// those the slot vector holds unhidden of a subject `wants`, and those it cannot read.
+    #[cfg(test)]
+    fn check_pass(
+        &self,
+        lo: usize,
+        hi: usize,
+        what: &str,
+        wants: impl Fn(&str) -> bool,
+    ) -> Result<(), String> {
+        let passed: Vec<Met> = self.passing(lo, hi, &wants).collect();
+        let s = &self.shadow;
+        let each: Vec<Met> = (lo.min(self.len)..hi.min(self.len))
+            .filter_map(|i| match s.summary(i) {
+                None => Some(Met::Unread(i)),
+                Some(r) if !r.is_hidden() && wants(r.subject()) => Some(Met::Wanted(i)),
+                Some(_) => None,
+            })
+            .collect();
+        if passed != each {
+            return Err(format!(
+                "the pass over {lo}..{hi} wanting {what} meets {passed:?}, the slot vector's \
+                 records {each:?}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Allocated slot capacity of the hot `VecDeque` (test helper).
     #[cfg(test)]
     pub(crate) fn hot_capacity(&self) -> usize {
         self.hot.capacity()
     }
 
-    /// A tier over records an open recovered, with their broker times and frame starts;
-    /// cold prefix records outside `budget` are summarized and dropped in place without
-    /// allocating `Arc`s or growing the hot `VecDeque` past the hot suffix. The pages and
-    /// columns are allocated once, at the count recovered.
+    /// A tier over records recovered whole, with their broker times and frame starts; cold
+    /// prefix records outside `budget` are summarized and dropped in place without allocating
+    /// `Arc`s or growing the hot `VecDeque` past the hot suffix. The pages and columns are
+    /// allocated once, at the count recovered. How the open built its tier before its scan
+    /// streamed (aterm F16), kept as the reference [`Opening`] is held to
+    /// (`open_scan_tests.rs`).
+    #[cfg(test)]
     pub(crate) fn from_parts(
         records: Vec<BrokerRecord>,
         bts: Vec<Option<u64>>,
@@ -1351,6 +1687,44 @@ impl Tier {
         if let Err(e) = self.check_shadow() {
             panic!("the pages and the slot vector differ after an open's build: {e}");
         }
+    }
+
+    /// A tier an open builds as its scan passes each record ([`Opening`]), charging the
+    /// decoded ones against `budget`, its pages and columns allocated for the records
+    /// `expect` says the scan passes: at once for a count known exact, and otherwise once
+    /// they hold [`SAMPLE`] records, for the count the file's length predicts
+    /// ([`Opening::push`]), as [`Tier::from_parts`] allocates them once at the count
+    /// recovered. Grown a record at a time instead, they pass through every smaller size, and
+    /// an allocator may keep what it freed: aterm's caches freed blocks of up to 512 KiB, and
+    /// its broker served 1.5 MiB more at `Hello` after such an open of 510,000 records, and
+    /// 2.0 to 2.2 MiB more from `Hello` on after one of 1,020,000, than after the whole-buffer
+    /// open. Allocated at once at a clean close's count, it served as much as that open at
+    /// `Hello` at both counts and, at 1,020,000, within 0.1 MiB of it after the world but 0.5
+    /// to 0.6 MiB more with the world ready (aterm F16).
+    pub(crate) fn opening(budget: usize, expect: Expect) -> Opening {
+        let mut tier = Tier::paged(budget, PAGE_SHIFT);
+        if expect.exact && expect.records > 0 {
+            tier.reserve_for(expect.records);
+        }
+        Opening {
+            tier,
+            ring: VecDeque::new(),
+            held: Some(Vec::new()),
+            ring_bytes: 0,
+            newest_at: None,
+            expect,
+            #[cfg(test)]
+            from_head: false,
+        }
+    }
+
+    /// Room in the pages and columns for `records` records in all.
+    fn reserve_for(&mut self, records: usize) {
+        let pages = (records >> self.shift).saturating_add(1);
+        self.pages
+            .reserve_exact(pages.saturating_sub(self.pages.len()));
+        self.cols
+            .reserve_exact(records.saturating_sub(self.cols.len()));
     }
 
     /// Drop the oldest `n` records (a retention cut) and move every kept frame start
@@ -1446,6 +1820,287 @@ impl Tier {
     }
 }
 
+/// A tier an open builds AS ITS SCAN PASSES each record, oldest first ([`Tier::opening`]):
+/// each record's summary written to the pages when it is pushed, and the hot window the
+/// records after it leave kept as where each of its records starts and what it charges — a
+/// ring the newest record joins and the oldest leaves while the ring is over its budget (the
+/// newest always stays). The window a scan decides so is the one [`Tier::from_parts`] decides
+/// from the tail over every record recovered, the longest suffix whose charge fits the
+/// budget, the newest always in it: a record leaves the ring only when it and the records
+/// after it charge more than the budget, and they go on doing so as records join.
+///
+/// WHAT STAYS DECODED. Until a record first leaves the window, every record pushed is in it,
+/// and the ring keeps them decoded as well (`held`); the first to leave lets every decoded
+/// one go, and from then on a record is let go as soon as it is folded. The window's records
+/// are then decoded again once the scan has decided it, from where its oldest starts
+/// ([`finish`](Self::finish)), straight into the hot window's `Arc`s. So an open holds decoded
+/// at most the budget's worth of records, never the log, and a log the budget holds whole is
+/// decoded once (aterm F16). A ring of the decoded records themselves, evicted as the scan
+/// went (this change's first form), held as many, but moved each into its `Arc` at the end
+/// beside the ring that held it: a 1,006,000-record open under 16 MiB peaked at 50,541,505 B
+/// so (`broker_index_bench`, whose open under 16 MiB reopens the log its open at a budget of
+/// 0 dropped without a clean close, the sidecar's count current), the ring of positions over
+/// columns grown a record at a time (its second form) at 43,201,552, and this form, the
+/// columns allocated once for that count, at 43,731,740.
+pub(crate) struct Opening {
+    tier: Tier,
+    /// The window so far, oldest first: where each of its records' frames starts and what it
+    /// charges ([`resident_cost`]).
+    ring: VecDeque<(u64, usize)>,
+    /// Every record pushed, decoded, while none has left the window.
+    held: Option<Vec<BrokerRecord>>,
+    /// Sum of the charges in `ring`.
+    ring_bytes: usize,
+    /// Where the newest record pushed starts.
+    newest_at: Option<u64>,
+    /// What the open knew of the records its scan passes, which the pages and columns are
+    /// allocated for.
+    expect: Expect,
+    /// The negative control: the window kept from the HEAD (the oldest records that fit the
+    /// budget) rather than the tail.
+    #[cfg(test)]
+    from_head: bool,
+}
+
+/// What an open knows, before its scan, of the records the scan passes ([`Tier::opening`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Expect {
+    /// Records the scan passes at least: the count the last open saw (the newest place its
+    /// identity sidecar recorded, plus one), or a refold's kept count; 0 when none is known.
+    pub(crate) records: usize,
+    /// Whether `records` is the count itself rather than a floor: a head a clean close
+    /// recorded, or a refold's count. A sidecar's head is written at an open, a clean close, a
+    /// lossy record and a replica's truncation, never while the log serves, so after any other
+    /// stop (a kill, a crash, a power loss) the log may hold any number of records past it.
+    pub(crate) exact: bool,
+    /// The byte the scan's frames end by: the file's length.
+    pub(crate) end: u64,
+}
+
+/// The records an open's columns hold before they are reserved for the count the file
+/// predicts ([`Opening::push`]), when no exact count was known: up to it they grow as a
+/// vector does, through blocks of at most 4 KiB (the most aterm's allocator serves from its
+/// slabs rather than the cache of freed larger blocks it never gives back), and from it on
+/// the bytes per record the scan has passed predict the rest.
+pub(crate) const SAMPLE: usize = 1024;
+
+/// The records in all an open's scan passes, predicted when it has passed `n` (`n` at least
+/// one), the first starting at byte `first` and the next at byte `at`, of a file whose frames
+/// end by byte `end`: the bytes left at the bytes per record so far, or the last open's count
+/// `floor` when that is more, and an eighth over of what `floor` does not vouch for (so an
+/// estimate a little short needs no second move, and a count the last open saw is not
+/// reserved over); at least twice `n` (so a log whose later records are smaller than its
+/// first is never moved more often than a vector grows); never more than the bytes left
+/// could hold, a frame being at least a header, nor fewer than `n + 1`.
+fn predicted(n: usize, (first, at, end): (u64, u64, u64), floor: usize) -> usize {
+    let n_wide = n as u128;
+    let floor = floor as u128;
+    let left = u128::from(end.saturating_sub(at));
+    let passed = u128::from(at.saturating_sub(first));
+    let est = match passed {
+        0 => 0,
+        p => n_wide.saturating_add(left.saturating_mul(n_wide).div_ceil(p)),
+    };
+    let most = n_wide.saturating_add(left / astream_wire::HEADER_SIZE as u128);
+    let want = est
+        .max(floor)
+        .saturating_add(est.saturating_sub(floor) / 8)
+        .max(n_wide.saturating_mul(2))
+        .min(most)
+        .max(n_wide.saturating_add(1));
+    usize::try_from(want).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many opens on this thread built their window from the records they held decoded,
+    /// and how many read it again from the file (a test's count, `open_scan_tests.rs`).
+    pub(crate) static WINDOWS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    /// The capacities this thread's opens moved their columns off as records joined, oldest
+    /// first (a test's record, `open_scan_tests.rs`): each a block freed.
+    pub(crate) static MOVED: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Where an open reads the records of its window again, once its scan has decided it
+/// ([`Opening::finish`]): the `count` records stored from byte `at` on, the first of them
+/// record `first`, each handed to `each` as it is decoded.
+pub(crate) type Reread<'a> = &'a mut dyn FnMut(
+    u64,
+    u64,
+    usize,
+    &mut dyn FnMut(BrokerRecord) -> std::io::Result<()>,
+) -> std::io::Result<()>;
+
+impl Opening {
+    /// The negative control's opening when `yes`: the window kept from the head, read again
+    /// from the file however much of the log the budget holds.
+    #[cfg(test)]
+    pub(crate) fn windowed_from_head(mut self, yes: bool) -> Opening {
+        self.from_head = yes;
+        if yes {
+            self.held = None;
+        }
+        self
+    }
+
+    /// Record `base + len` (the first push names the base), its broker time `bt` and the
+    /// byte `at` its frame starts.
+    ///
+    /// When the columns are full and hold at least [`SAMPLE`] records, they and the pages are
+    /// first reserved for the records the file predicts ([`predicted`]): the bytes it has left
+    /// at the bytes per record so far, at least the count the last open saw. A log whose
+    /// identity sidecar has a clean close's count was reserved for it at once and moves
+    /// nothing; after any other stop the sidecar's count can be any number short, and a
+    /// reservation at it would be moved, and freed, as soon as the scan passed it.
+    pub(crate) fn push(&mut self, rec: BrokerRecord, bt: Option<u64>, at: u64) {
+        #[cfg(test)]
+        let had = self.tier.cols.capacity();
+        self.make_room(at);
+        let t = &mut self.tier;
+        if t.len == 0 {
+            t.base = rec.seq.0;
+        }
+        let meta = meta_of(&rec, bt);
+        t.append(&rec.subject, meta, bt, at);
+        #[cfg(test)]
+        if had > 0 && t.cols.capacity() != had {
+            MOVED.with(|m| m.borrow_mut().push(had));
+        }
+        self.newest_at = Some(at);
+        let cost = resident_cost(&rec);
+        #[cfg(test)]
+        if self.from_head {
+            if self.ring.is_empty() || self.ring_bytes.saturating_add(cost) <= t.budget {
+                t.shadow
+                    .push_warm(rec.seq.0, &rec.subject, meta, bt, at, cost);
+                self.ring_bytes = self.ring_bytes.saturating_add(cost);
+                self.ring.push_back((at, cost));
+            } else {
+                t.shadow.push_cold(rec.seq.0, &rec.subject, meta, bt, at);
+            }
+            return;
+        }
+        #[cfg(test)]
+        t.shadow.push(rec.seq.0, &rec.subject, meta, bt, at, cost);
+        self.ring_bytes = self.ring_bytes.saturating_add(cost);
+        self.ring.push_back((at, cost));
+        if let Some(held) = self.held.as_mut() {
+            held.push(rec);
+        }
+        while self.ring_bytes > t.budget && self.ring.len() > 1 {
+            let Some((_, old)) = self.ring.pop_front() else {
+                break;
+            };
+            self.ring_bytes = self.ring_bytes.saturating_sub(old);
+            self.held = None;
+        }
+    }
+
+    /// Before the record whose frame starts at byte `at` joins, the reservation [`push`]
+    /// describes, when it is due.
+    ///
+    /// [`push`]: Self::push
+    fn make_room(&mut self, at: u64) {
+        let t = &mut self.tier;
+        let n = t.cols.len();
+        if n < SAMPLE || n < t.cols.capacity() {
+            return;
+        }
+        let first = t.pages.first().map_or(at, |p| p.at0);
+        t.reserve_for(predicted(
+            n,
+            (first, at, self.expect.end),
+            self.expect.records,
+        ));
+    }
+
+    /// How many records were pushed.
+    pub(crate) fn len(&self) -> usize {
+        self.tier.len
+    }
+
+    /// Where the newest record pushed starts, read without a lookup the tally counts.
+    pub(crate) const fn newest_at(&self) -> Option<u64> {
+        self.newest_at
+    }
+
+    /// The budget the window is charged against.
+    #[cfg(test)]
+    pub(crate) const fn budget(&self) -> usize {
+        self.tier.budget
+    }
+
+    /// The tier: the pages as pushed, their vectors cut to what they hold (as
+    /// [`Tier::from_parts`] leaves them, which allocates them at the count recovered), and the
+    /// ring its hot window — the records it held decoded, or, once it let them go, the
+    /// window's records as `reread` decodes them from where the oldest starts.
+    ///
+    /// # Errors
+    ///
+    /// `reread`'s, and `InvalidData` when what it hands back is not the window the scan
+    /// decided: a record missing, one more, or one at another offset or of another charge.
+    pub(crate) fn finish(self, reread: Reread<'_>) -> std::io::Result<Tier> {
+        let mut t = self.tier;
+        let count = self.ring.len();
+        let mut hot = VecDeque::with_capacity(count);
+        if let Some(held) = self.held {
+            #[cfg(test)]
+            WINDOWS.with(|n| n.set((n.get().0.saturating_add(1), n.get().1)));
+            hot.extend(held.into_iter().map(Arc::new));
+        } else if let Some(&(at, _)) = self.ring.front() {
+            #[cfg(test)]
+            WINDOWS.with(|n| n.set((n.get().0, n.get().1.saturating_add(1))));
+            let skipped = t.len.saturating_sub(count);
+            #[cfg(test)]
+            let skipped = if self.from_head { 0 } else { skipped };
+            let first = t.base.saturating_add(skipped as u64);
+            let mut costs = self.ring.iter();
+            let mut next = first;
+            reread(at, first, count, &mut |rec: BrokerRecord| {
+                let due = costs.next().map(|&(_, cost)| cost);
+                if rec.seq.0 != next || due != Some(resident_cost(&rec)) {
+                    return Err(not_the_window(next, rec.seq.0));
+                }
+                next = next.saturating_add(1);
+                hot.push_back(Arc::new(rec));
+                Ok(())
+            })?;
+        }
+        if hot.len() != count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the open's resident window, read again, holds {} records where its scan \
+                     decided {count}",
+                    hot.len()
+                ),
+            ));
+        }
+        t.hot = hot;
+        t.hot_bytes = self.ring_bytes;
+        t.pages.shrink_to_fit();
+        t.cols.shrink_to_fit();
+        #[cfg(test)]
+        if let Err(e) = t.check_shadow() {
+            panic!("the pages and the slot vector differ after an open's streamed build: {e}");
+        }
+        Ok(t)
+    }
+}
+
+/// The refusal of a window read again that is not the one the open's scan decided.
+fn not_the_window(due: u64, got: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "the open's resident window, read again, is not the one its scan decided (record \
+             {due} due, {got} read)"
+        ),
+    )
+}
+
 /// The retention planning's walk of the tier: a [`Walk`]'s rows as entries, each with its
 /// broker time read from the page the walk is in.
 #[cfg(feature = "retention")]
@@ -1510,6 +2165,32 @@ mod tests {
             body: vec![7u8; body],
             commit: None,
         })
+    }
+
+    /// The count an open reserves its columns for once they are full past its sample: the
+    /// bytes left at the bytes per record so far or the floor if more, an eighth over of what
+    /// the floor does not vouch for, at least twice what it passed, at most what the bytes
+    /// left could hold in frames, and always one more.
+    #[test]
+    fn an_open_predicts_its_records_from_the_bytes_per_record_it_has_passed() {
+        // 1,024 records of 100 bytes passed, 897,600 bytes left: 10,000 records, an eighth over.
+        assert_eq!(predicted(1024, (0, 102_400, 1_000_000), 0), 11_250);
+        // A frame starts past byte 0 as well: the bytes per record are counted from it.
+        assert_eq!(predicted(1024, (64, 102_464, 1_000_064), 0), 11_250);
+        // The last open's count, when more, and nothing over it.
+        assert_eq!(predicted(1024, (0, 102_400, 1_000_000), 20_000), 20_000);
+        assert_eq!(predicted(1024, (0, 102_400, 1_000_000), 10_000), 10_000);
+        // When less, an eighth over of the 2,000 records past it the file predicts.
+        assert_eq!(predicted(1024, (0, 102_400, 1_000_000), 8_000), 10_250);
+        // Twice what it passed, when a log's later records are smaller than its first...
+        assert_eq!(predicted(4096, (0, 4_096_000, 4_200_000), 0), 8192);
+        // ...but never more than the bytes left hold in frames of a header each.
+        let left = 100u64;
+        let most = 1024 + left as usize / astream_wire::HEADER_SIZE;
+        assert_eq!(predicted(1024, (0, 102_400, 102_400 + left), 0), most);
+        assert_eq!(predicted(1024, (0, 102_400, 102_400 + left), 20_000), most);
+        // Nothing passed to count by, or no byte left: one more.
+        assert_eq!(predicted(1, (8, 8, 8), 0), 2);
     }
 
     #[test]
@@ -1807,6 +2488,89 @@ mod tally_tests {
             (2, 3, 0),
             "a subject walk counts the pages naming it, and a subject no record names reads none"
         );
+    }
+
+    /// A filtered read's pass over records of subjects it does not want passes every page whole
+    /// and asks its filter once a subject; over pages naming one it wants, it reads their rows
+    /// (aterm F11c).
+    #[test]
+    fn a_pass_counts_the_pages_it_passed_and_the_subjects_it_asked() {
+        let mut t = tier();
+        // A fourth page of `w` alone, after three of `s` and now and then `w`.
+        for i in 600..1024u64 {
+            let subject = if i < 768 { "s" } else { "w" };
+            t.push(named(i, subject), Some(i), 1_000 + i * 64);
+        }
+        let len = t.len();
+        let before = t.tally();
+        assert_eq!(t.passing(0, len, |_| false).count(), 0);
+        let d = t.tally().since(before);
+        assert_eq!(
+            (d.walks, d.rows, d.passed_pages, d.verdicts, d.lookups),
+            (1, 0, 4, 2, 0),
+            "a pass wanting nothing reads no row and asks each subject once"
+        );
+
+        let before = t.tally();
+        let asked = std::cell::Cell::new(0);
+        let met: Vec<usize> = t
+            .passing(0, len, |s| {
+                asked.set(asked.get() + 1);
+                s == "w"
+            })
+            .map(Met::index)
+            .collect();
+        let d = t.tally().since(before);
+        let expect: Vec<usize> = [50, 150, 250, 350, 450, 550]
+            .into_iter()
+            .chain(768..1024)
+            .collect();
+        assert_eq!(met, expect);
+        assert_eq!(asked.get(), 2, "each subject asked once");
+        assert_eq!(
+            (d.rows, d.passed_pages, d.verdicts),
+            (1024, 0, 2),
+            "every page names `w`, so the pass reads every row"
+        );
+
+        // From the third page on, wanting `s`: the fourth page names only `w` and is passed.
+        let before = t.tally();
+        let met = t.passing(512, len, |s| s == "s").count();
+        let d = t.tally().since(before);
+        assert_eq!(met, 600 - 512 - 1 + (768 - 600));
+        assert_eq!((d.rows, d.passed_pages, d.verdicts), (256, 1, 2));
+    }
+
+    /// A pass asks its filter at most once a page a subject, and in a later page again unless
+    /// the subject's verdict slot (`id % PAGE`) still keeps it: a page naming two ids of one
+    /// slot asks of both. A page it reads record by record asks only of the records it reads.
+    #[test]
+    fn a_pass_asks_again_of_a_subject_whose_verdict_slot_another_took() {
+        let mut t = Tier::with_budget(0);
+        let page = PAGE as u64;
+        // Page 0 names `s0` to `s255`, ids 0 to 255, a record each; page 1 names `s256`, id
+        // 256, which takes id 0's slot, then `s0` again.
+        let subjects = (0..page).map(|i| (i, format!("s{i}")));
+        let then = [(page, format!("s{page}")), (page + 1, "s0".to_string())];
+        for (i, subject) in subjects.chain(then) {
+            t.push(named(i, &subject), Some(i), 1_000 + i * 64);
+        }
+        let len = t.len();
+        let before = t.tally();
+        assert_eq!(t.passing(0, len, |_| false).count(), 0);
+        let d = t.tally().since(before);
+        assert_eq!(
+            (d.rows, d.passed_pages, d.verdicts),
+            (0, 2, page + 2),
+            "257 subjects, `s0` asked again once `s256` took its slot"
+        );
+
+        // Three records of page 0: read one by one, a verdict each, not one a subject the page
+        // names.
+        let before = t.tally();
+        assert_eq!(t.passing(0, 3, |_| false).count(), 0);
+        let d = t.tally().since(before);
+        assert_eq!((d.rows, d.passed_pages, d.verdicts), (3, 0, 3));
     }
 
     /// A test build checks every rebuilt tier against its slot vector, reading the pages

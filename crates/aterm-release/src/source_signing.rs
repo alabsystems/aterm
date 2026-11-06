@@ -296,6 +296,15 @@ fn built_helper(repo: &Path, output: &[u8]) -> Result<PathBuf, String> {
     let manifest = repo.join("crates/atpkg-keys/Cargo.toml");
     let mut found = std::collections::BTreeSet::new();
     for line in output.split(|byte| *byte == b'\n') {
+        if !line
+            .windows(b"compiler-artifact".len())
+            .any(|w| w == b"compiler-artifact")
+            || !line
+                .windows(b"atpkg-keys".len())
+                .any(|w| w == b"atpkg-keys")
+        {
+            continue;
+        }
         let Ok(row) = aterm_json::from_slice::<aterm_json::Value>(line) else {
             continue;
         };

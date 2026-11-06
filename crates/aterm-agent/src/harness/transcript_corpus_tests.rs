@@ -167,7 +167,9 @@ pub(crate) const TURN_ROWS: &[(&str, &str)] = &[
 
 #[test]
 fn transcript_projections_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "transcript");
+    let package = aterm_tempfile::manifest_dir();
+    let package = package.to_str().expect("a UTF-8 package directory");
+    let mut corpus = Corpus::new(package, "transcript");
     let written = |read: aterm_json::Result<aterm_json::Value>| {
         read.map(|value| aterm_json::to_string(&value).expect("a kept value writes"))
     };
@@ -190,7 +192,9 @@ fn transcript_projections_answer_as_recorded() {
 
 #[test]
 fn steps_projections_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "steps");
+    let package = aterm_tempfile::manifest_dir();
+    let package = package.to_str().expect("a UTF-8 package directory");
+    let mut corpus = Corpus::new(package, "steps");
     let written = |read: aterm_json::Result<aterm_json::Value>| {
         read.map(|value| aterm_json::to_string(&value).expect("a kept value writes"))
     };

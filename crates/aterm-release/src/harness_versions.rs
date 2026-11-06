@@ -34,14 +34,14 @@ pub fn declared(text: &str) -> Option<(u16, u16)> {
     let at = text.find(VER_LINE)?;
     let args = text[at + VER_LINE.len()..].split(");").next()?;
     let text_arg = args.split('"').nth(1);
-    let numbers: Vec<u16> = args
-        .split(',')
-        .take(2)
-        .filter_map(|a| uint(a.trim()))
-        .collect();
-    if let ([major, minor], Some(spelled)) = (numbers.as_slice(), text_arg) {
-        return (aterm_phase::HarnessVersion::parse_major_minor(spelled) == Some((*major, *minor)))
-            .then_some((*major, *minor));
+    let mut parts = args.split(',');
+    if let (Some(major), Some(minor), Some(spelled)) = (
+        parts.next().and_then(|a| uint(a.trim())),
+        parts.next().and_then(|a| uint(a.trim())),
+        text_arg,
+    ) {
+        return (aterm_phase::HarnessVersion::parse_major_minor(spelled) == Some((major, minor)))
+            .then_some((major, minor));
     }
     let constant = |name: &str| -> Option<&str> {
         let key = format!("pub const {name}: ");
@@ -589,7 +589,7 @@ fn read() {}
         );
         for harness in CliHarness::ALL {
             let real = std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                aterm_tempfile::manifest_dir()
                     .join("../..")
                     .join(harness.version_file()),
             )

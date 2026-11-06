@@ -34,7 +34,7 @@ pub struct SignedGenesis {
 pub fn admin_sign_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGenesis> {
     let lineage = decode_key32(crate::ALAB_SIGNER)
         .ok_or_else(|| Error::new("this build's ALab vault key is unreadable"))?;
-    let released = aterm_types::version::installed().is_some_and(|stamp| stamp.release_build);
+    let released = aterm_stamp::installed().is_some_and(|stamp| stamp.release_build);
     sign_genesis(paths, out, &lineage, released)
 }
 

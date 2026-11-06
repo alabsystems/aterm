@@ -536,10 +536,17 @@ pub fn pairing_floor(root: &Path) -> Result<Option<AtermVersion>, String> {
     parse_aterm_min(&text)
 }
 
-/// THIS ATERM's version.
+/// THIS ATERM's version: the running binary's installed identity's ([`aterm_of`]).
 #[must_use]
 pub fn this_aterm() -> AtermVersion {
-    parse_aterm_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0))
+    aterm_of(aterm_stamp::current())
+}
+
+/// The aterm version `stamp` names; `0.0.0` where its version does not read as one (a process
+/// that installed no identity reads `0.0.0` either way).
+#[must_use]
+pub(crate) fn aterm_of(stamp: &aterm_stamp::Stamp) -> AtermVersion {
+    parse_aterm_version(stamp.app_version).unwrap_or((0, 0, 0))
 }
 
 /// THE MINIMUM-ATERM PAIRING.

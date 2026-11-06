@@ -62,7 +62,7 @@ impl Fixture {
             &reroute.join("cargo"),
             &atpkg::reroute::stub_body_sh(
                 "cargo",
-                Path::new(env!("CARGO_BIN_EXE_atpkg")),
+                &aterm_tempfile::bin_exe("atpkg"),
                 &reroute,
                 false,
             ),
@@ -516,7 +516,7 @@ fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
             &fx.reroute.join(name),
             &atpkg::reroute::stub_body_sh(
                 name,
-                Path::new(env!("CARGO_BIN_EXE_atpkg")),
+                &aterm_tempfile::bin_exe("atpkg"),
                 &fx.reroute,
                 false,
             ),

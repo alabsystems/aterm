@@ -30,6 +30,14 @@ fn each_answer_reads_back_as_it_was_written() {
     for real in [None, Some(vec!["private".to_string(), "tmp".to_string()])] {
         assert_eq!(reread(&real), real);
     }
+    for walked in [
+        Ok(Below::Missing),
+        Ok(Below::Clear),
+        Ok(Below::Secret("/w/.env (Basename(\".env\"))".to_string())),
+        Err("a tree too big to prove (over 20000 entries): /w".to_string()),
+    ] {
+        assert_eq!(reread(&walked), walked);
+    }
     for disk in [
         Ok(OnDisk {
             comps: vec!["private".to_string(), "tmp".to_string(), "x".to_string()],
@@ -58,6 +66,8 @@ fn each_answer_reads_back_as_it_was_written() {
             },
         )],
         external_diff: None,
+        assume_unchanged: true,
+        pathspec_env: Some("GIT_ICASE_PATHSPECS".to_string()),
     };
     for v in [
         Ok(view),

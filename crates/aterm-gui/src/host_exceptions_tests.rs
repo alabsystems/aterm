@@ -4544,6 +4544,20 @@ fn a_background_sign_in_task_steps_to_its_pool_and_clears_when_resolved() {
             "{:?}",
             entry.detail
         );
+        assert_eq!(
+            digest
+                .entries
+                .iter()
+                .filter(|entry| entry.key == key)
+                .count(),
+            1
+        );
+        assert!(
+            app.messages
+                .live_rows()
+                .all(|row| { !matches!(row.msg.need(), aterm_messages::need::Need::Now(_)) }),
+            "the account task must not prompt an unrelated working session"
+        );
     }
     app.note_harness_host(HostNote::Pools(Vec::new()));
     assert!(

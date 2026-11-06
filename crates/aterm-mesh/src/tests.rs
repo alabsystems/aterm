@@ -1390,6 +1390,44 @@ fn the_verdict_judges_keys_by_class_current_winning() {
     assert!(unread.keys.is_empty() && unread.principals.is_empty());
 }
 
+/// A rotated seat's ring takes its mail under each node it held before, and `bus.log` is told its
+/// new node continues each of those producers (§11 C3b); this Mac's own rotation is no lineage on
+/// its own log, whose bridge numbers its records afresh.
+#[test]
+fn a_rotated_seat_is_ringed_and_continued_under_each_node_it_held() {
+    let key = |tag: u8| [tag; 32];
+    let (me, me_old, b, b_old, b_older) = (key(1), key(2), key(3), key(4), key(5));
+    let read = Standings {
+        current: [me, b].into(),
+        retired: [me_old, b_old, b_older].into(),
+        rotated: [(me_old, me), (b_old, b), (b_older, b)].into(),
+        ..Standings::default()
+    };
+    let p = astream_broker::identity_principal;
+    let id = |k: &[u8; 32]| astream_cap::producer_id_of(&p(k));
+    assert_eq!(
+        crate::logs::retired_of(&read, &b),
+        [p(&b_old), p(&b_older)].into()
+    );
+    assert!(crate::logs::retired_of(&read, &key(9)).is_empty());
+    let mut olds = vec![id(&b_old), id(&b_older)];
+    olds.sort_unstable();
+    let mut lineage = crate::logs::lineage(&read, &me);
+    for (_, preds) in &mut lineage {
+        preds.sort_unstable();
+    }
+    assert_eq!(
+        lineage,
+        [(id(&b), olds)],
+        "none for this Mac's own rotation"
+    );
+    let ring = crate::logs::ring("alab", &p(&me), &p(&b), &crate::logs::retired_of(&read, &b));
+    for old in [&b_old, &b_older] {
+        let grant = format!("rw,p={}:/f/alab/in/{}/*/{}/*", p(&b), p(&me), p(old));
+        assert!(ring.contains(&grant), "{grant} in {ring:?}");
+    }
+}
+
 /// A key whose first eight bytes are `prefix`'s: its astream principal (`n-` and those bytes in
 /// hex) is `prefix`'s, whatever the rest. Two such keys are one principal to a broker.
 fn sharing_principal(prefix: &[u8; 32], tail: u8) -> [u8; 32] {

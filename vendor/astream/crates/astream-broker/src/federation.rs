@@ -375,6 +375,15 @@ pub struct FederationConfig {
     pub group: String,
     /// Subscription [`Filter`] selecting records on `source` (e.g. `"/f/fleet/pub/host-a/>"`).
     pub filter: String,
+    /// The filters within `filter` this bridge carries, when one group follows several: a record
+    /// of `filter` is carried only where one of these matches it too, and is otherwise skipped
+    /// (counted in [`FederationReport::skipped`]) exactly as a rewrite that drops it; empty carries
+    /// every record of `filter`. Each must be a [`Filter`] that `filter` contains. The group still
+    /// tails `filter` and commits past every record it scans, carried or not, so a union of lanes
+    /// under one group is one edge whose cursor never passes a record of any of them it has not
+    /// carried; two bridges on one group, one per lane, are not: either one's commit would pass the
+    /// other's unsent records.
+    pub carry: Vec<String>,
     /// Stable `producer_id` used on `dest` (on a guarded destination broker with a bound
     /// `rw,p=<principal>:` grant, set to `astream_cap::producer_id_of(principal)`).
     pub producer_id: u64,
@@ -431,8 +440,9 @@ pub struct FederationReport {
     pub mirrored: usize,
     /// Subset of `mirrored` that deduplicated against an existing record on `dest`.
     pub deduped: usize,
-    /// Records skipped by loop-exclusion / hop-limit / prefix policy, and, on a relay, those whose
-    /// producer is not their subject's owner: no destination would take them.
+    /// Records skipped by loop-exclusion / hop-limit / prefix policy or outside
+    /// [`FederationConfig::carry`], and, on a relay, those whose producer is not their subject's
+    /// owner: no destination would take them.
     pub skipped: usize,
     /// Relayed records the destination refused for good: a bad signature, a revoked origin, a
     /// record that is not its origin's, or an origin over its subject budget there; and a record
@@ -548,6 +558,8 @@ pub struct FederationBridge {
     closer: FederationBridgeCloser,
     liveness: Duration,
     seated: Option<Seated>,
+    /// [`FederationConfig::carry`], parsed.
+    carry: Vec<Filter>,
 }
 
 /// Whether the source still seats a relayed record's owner ([`FederationBridge::hold_while`]).
@@ -563,12 +575,13 @@ impl FederationBridge {
                 cfg.group
             )));
         }
-        if Filter::new(&cfg.filter).is_err() {
+        let Ok(filter) = Filter::new(&cfg.filter) else {
             return Err(FederationError::Config(format!(
                 "filter {:?} is not a valid Filter",
                 cfg.filter
             )));
-        }
+        };
+        let carry = carried_within(&filter, &cfg.carry)?;
         if let Err(msg) = cfg.rewrite.validate() {
             return Err(FederationError::Config(msg));
         }
@@ -617,6 +630,7 @@ impl FederationBridge {
             closer: FederationBridgeCloser::default(),
             liveness: IDLE_MARK_DEADLINE,
             seated: None,
+            carry,
         })
     }
 
@@ -694,6 +708,11 @@ impl FederationBridge {
         })
     }
 
+    /// Whether this bridge carries a record of `subject` ([`FederationConfig::carry`]).
+    fn carries(&self, subject: &str) -> bool {
+        self.carry.is_empty() || self.carry.iter().any(|f| f.matches_str(subject))
+    }
+
     /// Fetch up to `max_records` (`1..=256`) matching records from `source`, pipeline
     /// eligible rewritten publishes onto `dest` under deterministic `(producer_id, src_offset)`
     /// dedup keys, and durably commit `cfg.group` on `source` only after `dest` acknowledges
@@ -728,7 +747,7 @@ impl FederationBridge {
                 Some(prev) => federation_cursor_advance(prev, src_off),
                 None => src_off,
             });
-            if is_hidden_subject(&src_subj) {
+            if is_hidden_subject(&src_subj) || !self.carries(&src_subj) {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
@@ -1270,7 +1289,7 @@ impl Burst {
         }
         self.fetched = self.fetched.saturating_add(1);
         self.next = src_off.saturating_add(1);
-        if is_hidden_subject(&src_subj) {
+        if is_hidden_subject(&src_subj) || !bridge.carries(&src_subj) {
             self.skipped = self.skipped.saturating_add(1);
             return Ok(());
         }
@@ -1449,6 +1468,24 @@ fn read_client_identity(
         Ok(None) => Err(FederationError::MissingLogIdentity { role }),
         Err(e) => Err(FederationError::Io(e)),
     }
+}
+
+/// [`FederationConfig::carry`] parsed, each filter one that `filter` contains: a carried filter
+/// `filter` did not contain would name records the group never scans.
+fn carried_within(filter: &Filter, carry: &[String]) -> Result<Vec<Filter>, FederationError> {
+    carry
+        .iter()
+        .map(|raw| match Filter::new(raw) {
+            Ok(f) if filter.contains(&f) => Ok(f),
+            Ok(_) => Err(FederationError::Config(format!(
+                "carry filter {raw:?} is not within filter {:?}",
+                filter.as_str()
+            ))),
+            Err(_) => Err(FederationError::Config(format!(
+                "carry filter {raw:?} is not a valid Filter"
+            ))),
+        })
+        .collect()
 }
 
 fn bootstrap_group_cursor(
@@ -1948,6 +1985,7 @@ impl FederationRunner {
                 dest: dest.clone(),
                 group: rule.group.clone(),
                 filter: rule.filter.clone(),
+                carry: Vec::new(),
                 producer_id: rule.producer_id.unwrap_or(default_producer_id),
                 rewrite: rule.rewrite.clone(),
                 relay: false,
@@ -3431,6 +3469,7 @@ impl FederationMesh {
             dest: self.cfg.local_endpoint.clone(),
             group,
             filter,
+            carry: Vec::new(),
             producer_id,
             rewrite: rw,
             relay: false,

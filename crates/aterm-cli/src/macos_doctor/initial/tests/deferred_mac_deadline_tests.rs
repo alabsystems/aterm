@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 fn build() -> &'static str {
     static BUILD: OnceLock<String> = OnceLock::new();
-    BUILD.get_or_init(aterm_types::version::build_id).as_str()
+    BUILD.get_or_init(aterm_stamp::build_id).as_str()
 }
 
 fn pass(stages: &mut WithholdingStages, root: &Path, revision: u64) -> (Report, SetupNext) {

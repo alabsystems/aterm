@@ -5,7 +5,7 @@
 
 use core::fmt;
 
-use astream_wire::frame::{Frame, MAX_PAYLOAD_LEN, decode_frame_slice};
+use astream_wire::frame::{HEADER_SIZE, MAX_PAYLOAD_LEN, decode_frame_slice, encode_frame_header};
 
 use crate::ident::{BranchId, Digest, Revision, TaskIdentity};
 use crate::log::IdentityMismatch;
@@ -198,20 +198,26 @@ impl Checkpoint {
 
     /// The checkpoint's bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CheckpointFault> {
-        let mut e = Enc::with_capacity(self.state.len().saturating_add(256));
+        let mut e = Enc::with_capacity(
+            HEADER_SIZE
+                .saturating_add(self.state.len())
+                .saturating_add(256),
+        );
+        e.raw(&[0u8; HEADER_SIZE]);
         e.raw(&CHECKPOINT_MAGIC);
         e.u8(CHECKPOINT_VERSION);
         encode_provenance(&mut e, &self.provenance);
         e.digest(&self.state_digest);
         e.bytes(&self.state);
-        let body = e.finish();
-        let len = body.len();
-        Frame::new(body)
-            .encode()
-            .map_err(|_| CheckpointFault::TooLarge {
+        let mut framed = e.finish();
+        let len = framed.len() - HEADER_SIZE;
+        let hdr =
+            encode_frame_header(&framed[HEADER_SIZE..]).map_err(|_| CheckpointFault::TooLarge {
                 len,
                 limit: MAX_PAYLOAD_LEN,
-            })
+            })?;
+        framed[..HEADER_SIZE].copy_from_slice(&hdr);
+        Ok(framed)
     }
 
     /// Reads a checkpoint.

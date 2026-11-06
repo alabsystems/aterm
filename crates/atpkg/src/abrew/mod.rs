@@ -2472,7 +2472,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     // -v, after its shift trick) as the version command and
     // ignores everything after it.
     if matches!(args[0].as_str(), "--version" | "-v") {
-        println!("abrew {} (aterm)", env!("CARGO_PKG_VERSION"));
+        println!("abrew {} (aterm)", aterm_stamp::app_version());
         return ExitCode::SUCCESS;
     }
     // Only global flags and no command is the no-arguments
@@ -2579,7 +2579,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     };
     match cmd {
         "--version" | "-v" if rest.is_empty() => {
-            println!("abrew {} (aterm)", env!("CARGO_PKG_VERSION"));
+            println!("abrew {} (aterm)", aterm_stamp::app_version());
             return ExitCode::SUCCESS;
         }
         "--help" | "-h" | "help" => {

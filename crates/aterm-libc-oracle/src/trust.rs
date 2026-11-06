@@ -78,6 +78,7 @@ pub fn discover(root: &Path) -> Result<Trust, CouldNotRun> {
         &home,
         &path,
         discovery::pinned_channel(root).as_deref(),
+        aterm_toolchain::trust_lock::find(root).as_ref(),
     );
     if !toolchain.have_targo() {
         return Err(CouldNotRun::bare(toolchain.missing_targo_label()));

@@ -80,9 +80,9 @@ fn main() {
         );
     }
     println!("load         {:?}", aterm_sysprobe::load_average());
-    println!("limits       {:?}", aterm_sysprobe::process_limits());
     let uid = self_uid();
-    println!("pid_counts   {:?}", aterm_sysprobe::pid_counts(uid));
+    println!("task_room    {:?}", aterm_sysprobe::task_room(uid));
+    println!("forks        {:?} (at the core_ticks read)", probe.forks());
     links_check();
     disk_check();
 
@@ -115,13 +115,12 @@ fn main() {
         "net_links_into",
         cost(calls, || aterm_sysprobe::net_links_into(&mut scratch)),
     );
+    report("task_room", cost(calls, || aterm_sysprobe::task_room(uid)));
     report(
-        "pid_counts",
-        cost(calls, || aterm_sysprobe::pid_counts(uid)),
-    );
-    report(
-        "process_limits",
-        cost(calls, aterm_sysprobe::process_limits),
+        "coalitions",
+        cost(calls, || {
+            aterm_sysprobe::coalitions::coalitions().map(|r| r.rows.len())
+        }),
     );
     report("load_average", cost(calls, aterm_sysprobe::load_average));
     report(
@@ -210,7 +209,7 @@ fn disk_check() {
     }
 }
 
-/// This process's real user id, whose processes `pid_counts` counts; 0
+/// This process's real user id, whose processes `task_room` counts; 0
 /// where the platform has none.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn self_uid() -> u32 {

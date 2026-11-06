@@ -199,8 +199,10 @@ fn classify_verb(args: &[String]) -> Result<Reply, String> {
 
 /// [`classify_verb`] under `home`, asked from `cwd`: the classifier's verdict, then the advisory
 /// word's on the line (`approval::command_read_only_at`: the proof gaps, the blanks and the
-/// default secret list, a relative path read from `cwd`, where the asking agent's line runs), so
-/// the verb calls read-only no line the harness's rules refuse there on its words.
+/// default secret list, a relative path read from `cwd`, where the asking agent's line runs, and
+/// a tree a reader descends walked on this machine's disk as the harness walks it,
+/// `PolicyProbe::below_tree`), so the verb calls read-only no line the harness's rules refuse
+/// there.
 fn classify_verb_at(
     args: &[String],
     home: Option<&std::path::Path>,
@@ -217,7 +219,16 @@ fn classify_verb_at(
     let allow = python_allow(&sub);
     let v = classify_command_with(&cmd, &allow);
     let verdict = if v.read_only {
-        supervise::policy::approval::command_read_only_at(&cmd, &allow, home, cwd)
+        supervise::policy::approval::command_read_only_at(
+            &cmd,
+            &allow,
+            home,
+            cwd,
+            &|root, below, secrets| {
+                use supervise::policy::PolicyProbe as _;
+                supervise::policy::LiveProbe.below_tree(root, below, secrets, home)
+            },
+        )
     } else {
         Err(v.reason)
     };
@@ -1006,9 +1017,12 @@ mod tests {
                 "{line}: {r:?}"
             );
         }
+        // Asked from no directory, the verb cannot place the tree a reader descends.
+        let r = classify_verb_at(&args(&["grep -rn credentials src/"]), home, None).expect("ok");
+        assert_eq!(r.code, 1, "{r:?}");
+        assert!(r.text.contains("cannot list"), "{r:?}");
         // NEGATIVE CONTROLS
         for line in [
-            "grep -rn credentials src/",
             "grep -m 1 credentials src/",
             "wc -l src/credentials.rs",
             "ls -la ~/.ssh",

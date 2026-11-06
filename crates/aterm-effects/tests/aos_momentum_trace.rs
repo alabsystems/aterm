@@ -99,7 +99,7 @@ fn story(t0: Instant) -> MomentumHost {
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("tests/fixtures/aos-momentum")
         .join(format!("{}.trace", target_name()))
 }

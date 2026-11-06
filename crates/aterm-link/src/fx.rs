@@ -82,6 +82,26 @@ pub(crate) enum RefillTap<'a> {
     BelowTheOldest { sid: &'a str, oldest: u64 },
 }
 
+/// WHAT A RESERVATION'S PUBLISH AT ITS PIN CAME TO where its words or astream's dedup answer
+/// asked for a verdict (`Bridge::publish_reserved`, critic item F23): the simulated world counts
+/// the answers its worlds meet, so a law of `Bridge::unverified_publication`'s is judged in
+/// worlds that reach it (`sim::Core::reservations`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReservationTap {
+    /// The read back found a record of one of the pin's identities at the answered offset: the
+    /// attempt's own, or, for a keyed re-post, its key's winner's (`PublishPin::original`),
+    /// which is every verified answer the keyed world counts.
+    Verified,
+    /// Another writer's record of the pin's face at the answered offset.
+    Collision,
+    /// `Bridge::unverified_publication`'s case `n` (1 to 5).
+    Unverifiable(u8),
+    /// The attach's replay settled a keyed re-post's entry at its key's winner, read back
+    /// (`Bridge::keyed_winner_at`), not published again.
+    ReplayedAtTheWinner,
+}
+
 /// Which world answers the doors.
 #[derive(Clone, Debug)]
 enum World {
@@ -183,6 +203,14 @@ impl Fx {
     pub(crate) fn refill_tap(&self, tap: RefillTap<'_>) {
         if let World::Sim(p) = &self.world {
             p.refill_tap(tap);
+        }
+    }
+
+    /// What a reservation's publish at its pin came to, for the simulated world's count (F23).
+    #[cfg(test)]
+    pub(crate) fn reservation_tap(&self, tap: ReservationTap) {
+        if let World::Sim(p) = &self.world {
+            p.reservation_tap(tap);
         }
     }
 

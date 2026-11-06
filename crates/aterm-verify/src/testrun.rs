@@ -3,10 +3,12 @@
 
 //! Running test binaries concurrently.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::exec::{self, Cmd, Run};
@@ -338,6 +340,10 @@ pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
 pub struct TestExe {
     pub exe: PathBuf,
     pub flag: String,
+    /// `CARGO_BIN_EXE_<name>` for each binary of its package the compile reported. Cargo names
+    /// them only while it compiles a test, so the run hands them over (`aterm_tempfile::bin_exe`
+    /// reads them).
+    pub bin_env: Vec<(OsString, OsString)>,
 }
 
 /// cargo's re-run flag for a target of these kinds and this name.
@@ -357,11 +363,13 @@ fn target_flag(kinds: &[&str], name: &str) -> Option<String> {
 }
 
 /// Take cargo's JSON messages out of a `--message-format=json-render-diagnostics` log, in place.
+/// Each test executable carries its package's binaries ([`TestExe::bin_env`]).
 ///
 /// # Errors
 /// A message that does not parse.
 pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     let mut exes = Vec::new();
+    let mut bins: Vec<(String, OsString, OsString)> = Vec::new();
     let mut bad = None;
     let mut kept = String::with_capacity(log.len());
     for line in log.split_inclusive('\n') {
@@ -398,10 +406,24 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
         let Some(exe) = v.get("executable").and_then(aterm_json::Value::as_str) else {
             continue;
         };
+        let package = v.get("package_id").and_then(aterm_json::Value::as_str);
+        let name = v
+            .get("target")
+            .and_then(|t| t.get("name"))
+            .and_then(aterm_json::Value::as_str)
+            .unwrap_or_default();
         if !test {
+            let bin = crate::compiler_message::artifact_target_kinds(&v)
+                .is_ok_and(|kinds| kinds == ["bin"]);
+            if let (true, Some(package), false) = (bin, package, name.is_empty()) {
+                bins.push((
+                    package.to_owned(),
+                    format!("CARGO_BIN_EXE_{name}").into(),
+                    exe.into(),
+                ));
+            }
             continue;
         }
-        let target = v.get("target");
         let kinds = match crate::compiler_message::artifact_target_kinds(&v) {
             Ok(kinds) => kinds,
             Err(reason) => {
@@ -409,25 +431,35 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
                 continue;
             }
         };
-        let name = target
-            .and_then(|t| t.get("name"))
-            .and_then(aterm_json::Value::as_str)
-            .unwrap_or_default();
         match target_flag(&kinds, name) {
-            Some(flag) => exes.push(TestExe {
-                exe: PathBuf::from(exe),
-                flag,
-            }),
+            Some(flag) => exes.push((
+                TestExe {
+                    exe: PathBuf::from(exe),
+                    flag,
+                    bin_env: Vec::new(),
+                },
+                package.map(str::to_owned),
+            )),
             None => {
                 bad.get_or_insert_with(|| format!("a test executable of kind {kinds:?}: {exe}"));
             }
         }
     }
     *log = kept;
-    match bad {
-        Some(what) => Err(format!("cargo reported what this gate cannot read: {what}")),
-        None => Ok(exes),
+    if let Some(what) = bad {
+        return Err(format!("cargo reported what this gate cannot read: {what}"));
     }
+    Ok(exes
+        .into_iter()
+        .map(|(mut exe, package)| {
+            exe.bin_env = bins
+                .iter()
+                .filter(|(of, _, _)| Some(of) == package.as_ref())
+                .map(|(_, key, path)| (key.clone(), path.clone()))
+                .collect();
+            exe
+        })
+        .collect())
 }
 
 /// The bytes of a recording pass's log before cargo's first `Running` header: its compile's
@@ -478,7 +510,8 @@ fn announced(log: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Pair each record with the header cargo printed for it and the compile's flag for its executable.
+/// Pair each record with the header cargo printed for it and the compile's flag for its
+/// executable, and add its package's binaries to its environment ([`TestExe::bin_env`]).
 ///
 /// # Errors
 /// Whatever does not add up, in a few words.
@@ -494,7 +527,7 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
     records
         .into_iter()
         .zip(headers)
-        .map(|(record, (header, path))| {
+        .map(|(mut record, (header, path))| {
             let exe = record.exe().to_path_buf();
             if !exe.ends_with(&path) {
                 return Err(format!(
@@ -502,7 +535,7 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
                     exe.display()
                 ));
             }
-            let flag = exes
+            let found = exes
                 .iter()
                 .find(|e| e.exe == exe)
                 .or_else(|| {
@@ -510,8 +543,12 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
                         e.exe.file_name().is_some() && e.exe.file_name() == exe.file_name()
                     })
                 })
-                .map(|e| e.flag.clone())
                 .ok_or_else(|| format!("the compile did not report {}", exe.display()))?;
+            let flag = &found.flag;
+            record
+                .env
+                .retain(|(k, _)| !found.bin_env.iter().any(|(bin, _)| bin == k));
+            record.env.extend(found.bin_env.iter().cloned());
             let package = record
                 .var("CARGO_PKG_NAME")
                 .and_then(OsStr::to_str)
@@ -567,6 +604,137 @@ where
     .collect()
 }
 
+/// The most bytes a `test-binary-finished` event spends on each failed case's output: with at
+/// most [`crate::report::FINDINGS_SHOWN`] cases the line stays far under the 64 KiB the release's
+/// reader holds a line to, so a FAIL is never lost to its own length.
+pub const FAILURE_OUTPUT_BYTES: usize = 2048;
+
+/// The test binaries a release's resume may carry (A19): each binary that passed before in this
+/// tree, by its spec, with the SHA-256 its executable had then.
+pub type Passed = BTreeMap<String, String>;
+
+/// A `--passed-binaries` file: `<sha256> <spec>` on each line (the spec is the rest of the line),
+/// blank lines ignored.
+///
+/// # Errors
+/// A line with no spec, a digest that is not 64 lowercase hex digits, or one spec twice.
+pub fn read_passed(text: &str) -> Result<Passed, String> {
+    let mut passed = Passed::new();
+    for (n, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let (sha, spec) = line
+            .split_once(' ')
+            .filter(|(sha, spec)| aterm_codec::hex::is_lower(sha, 64) && !spec.trim().is_empty())
+            .ok_or_else(|| format!("line {} is not `<sha256> <spec>`: {line}", n + 1))?;
+        if passed
+            .insert(spec.trim().to_owned(), sha.to_owned())
+            .is_some()
+        {
+            return Err(format!("line {} names {} twice", n + 1, spec.trim()));
+        }
+    }
+    Ok(passed)
+}
+
+/// The SHA-256 of `exe`, lowercase hex, and what reading it took, added to `spent` (nanoseconds).
+fn exe_sha256(exe: &Path, spent: &AtomicU64) -> Option<String> {
+    use std::io::Read as _;
+    let began = Instant::now();
+    let mut file = std::fs::File::open(exe).ok()?;
+    let mut hasher = aterm_digest::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let sha = loop {
+        match file.read(&mut buf) {
+            Ok(0) => break Some(aterm_codec::hex::encode_lower(&hasher.finalize())),
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break None,
+        }
+    };
+    let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    spent.fetch_add(nanos, Ordering::Relaxed);
+    sha
+}
+
+/// What a release's resume does with its binaries ([`carry`]).
+pub struct Carried {
+    /// The binaries that run, in their order.
+    pub run: Vec<Binary>,
+    /// The binaries carried, each with its executable's SHA-256.
+    pub carried: Vec<(Binary, String)>,
+    /// The SHA-256 of each binary hashed to decide, by spec.
+    pub known: BTreeMap<String, String>,
+}
+
+/// Which of `bins` a release's resume carries, and the SHA-256 of each binary it hashed (`hash`,
+/// for each binary `passed` names): a binary is carried only when `passed` names its spec with
+/// the digest its executable has now and its package is not [`crate::checks::GOLDEN`]'s, whose
+/// test a release's run must show every time ([`decide`]). The rest run, in their order.
+pub fn carry(
+    passed: &Passed,
+    bins: Vec<Binary>,
+    hash: impl Fn(&Binary) -> Option<String> + Sync,
+    jobs: usize,
+) -> Carried {
+    let golden = |b: &Binary| {
+        b.record.var("CARGO_PKG_NAME").and_then(OsStr::to_str) == Some(crate::checks::GOLDEN.0)
+    };
+    let asked: Vec<usize> = (0..bins.len())
+        .filter(|&i| passed.contains_key(&bins[i].spec) && !golden(&bins[i]))
+        .collect();
+    let hashes = pool(bins.len(), &asked, jobs, |i| hash(&bins[i]));
+    let mut known = BTreeMap::new();
+    let (mut run, mut carried) = (Vec::new(), Vec::new());
+    for (b, sha) in bins.into_iter().zip(hashes) {
+        let sha = sha.flatten();
+        if let Some(sha) = &sha {
+            known.insert(b.spec.clone(), sha.clone());
+        }
+        match sha {
+            Some(sha) if passed.get(&b.spec) == Some(&sha) => carried.push((b, sha)),
+            _ => run.push(b),
+        }
+    }
+    Carried {
+        run,
+        carried,
+        known,
+    }
+}
+
+/// The `test-binary-finished` event of a binary a resume carried: it passed before in this tree
+/// with these bytes, and runs no time now.
+fn carried_event(binary: &Binary, sha256: &str) -> String {
+    format!(
+        "verify-event: {}",
+        aterm_json::json!({
+            "schema": 1, "event": "test-binary-finished", "test": binary.spec,
+            "outcome": "ok", "exit_code": aterm_json::Value::Null,
+            "waiting_s": 0.0, "execution_s": 0.0,
+            "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
+            "peak_bytes": aterm_json::Value::Null,
+            "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
+            "failures": [], "detail": "carried: it passed before in this tree with these bytes",
+            "exe_sha256": sha256, "carried": true,
+        })
+    )
+}
+
+/// Write one structured line to stderr in one `write_all` of the line and its newline
+/// (`eprintln!` writes the newline apart), and to a release's events file, where it lands whole
+/// whatever else writes ([`Ctx::record_event`]): stderr is shared with every child, and a line
+/// longer than a pipe writes at once can be split there.
+fn emit(ctx: &crate::Ctx, event: &str) {
+    let mut line = String::with_capacity(event.len() + 1);
+    line.push_str(event);
+    line.push('\n');
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    ctx.record_event(&line);
+}
+
 /// A finished binary's outcome (ok, NOT RUN when its machine or the run's end kept it from
 /// running, else FAIL, the proven red that ends a halted run), its `test-binary-finished` event,
 /// and the sample of it its history keeps ([`crate::test_history`]) when its run measured what it
@@ -580,6 +748,7 @@ fn binary_event(
     waiting: Duration,
     execution: Duration,
     width: u32,
+    exe_sha256: Option<&str>,
 ) -> (Outcome, String, Option<crate::test_history::Sample>) {
     // The child has no cargo rerun footer. Classify it with the same known-binary
     // context as the final report, so passing fixture output cannot own a failure.
@@ -590,9 +759,12 @@ fn binary_event(
         .and_then(|all| crate::libtest::failed_tests(&all.output))
         .unwrap_or_default()
         .into_iter()
+        .take(crate::report::FINDINGS_SHOWN)
         .map(|failed| {
             aterm_json::json!({
-                "case": failed.name, "output": failed.block, "refused": failed.refused,
+                "case": crate::report::clip_json(&failed.name, crate::report::EVENT_ROW_BYTES),
+                "output": crate::report::clip_json(&failed.block, FAILURE_OUTPUT_BYTES),
+                "refused": failed.refused,
             })
         })
         .collect::<Vec<_>>();
@@ -622,6 +794,7 @@ fn binary_event(
             "width": width, "tests": tests,
             "failures": failures,
             "detail": if run.ok { String::new() } else { unavailable.unwrap_or_else(|| first_error(&run.output)) },
+            "exe_sha256": exe_sha256, "carried": false,
         })
     );
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
@@ -728,7 +901,10 @@ pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
     command
 }
 
-/// The one log cargo would have written for these runs, in declared order.
+/// The one log cargo would have written for these runs, in declared order, except that a run with
+/// a `spawn_error` (something outside the binary ended it: [`split_unrun`]) adds its own output
+/// alone: it is no failed target, and the returned `ok` says nothing of it. Its own row says why
+/// ([`decide_runs`]).
 #[must_use]
 pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     let mut output = String::new();
@@ -738,7 +914,7 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
         if !output.ends_with('\n') {
             output.push('\n');
         }
-        if r.ok {
+        if r.ok || r.spawn_error.is_some() {
             continue;
         }
         output.push_str(&format!("error: test failed, to rerun pass `{}`\n", b.spec));
@@ -749,11 +925,10 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
-            let why = match (&r.spawn_error, r.code) {
-                (Some(e), _) => format!("could not execute: {e}"),
-                (None, Some(c)) => format!("exit status: {c}"),
-                (None, None) => "killed by a signal".to_string(),
-            };
+            let why = r.code.map_or_else(
+                || "killed by a signal".to_string(),
+                |c| format!("exit status: {c}"),
+            );
             output.push_str(&format!(
                 "\nCaused by:\n  process didn't exit successfully: `{}` ({why})\n",
                 argv.join(" ")
@@ -839,6 +1014,49 @@ fn decide(ctx: &crate::Ctx, r: &mut Report, run: &Run, label: &str, env: &[(OsSt
     r.decide_test_child(run, label, env);
 }
 
+/// The binaries whose runs carry a `spawn_error`, each with it, apart from the rest with their
+/// runs: something outside the binary ended it (a spawn refused, an interrupt, a stuck holder it
+/// waited behind, a wait for it that failed), so its run decided nothing about the tree.
+fn split_unrun<'a>(
+    bins: &'a [Binary],
+    runs: &'a [Run],
+) -> (Vec<(&'a Binary, &'a str)>, Vec<Binary>, Vec<Run>) {
+    let mut unrun = Vec::new();
+    let (mut ran_bins, mut ran) = (Vec::new(), Vec::new());
+    for (b, run) in bins.iter().zip(runs) {
+        match &run.spawn_error {
+            Some(why) => unrun.push((b, why.as_str())),
+            None => {
+                ran_bins.push(b.clone());
+                ran.push(run.clone());
+            }
+        }
+    }
+    (unrun, ran_bins, ran)
+}
+
+/// Decide the test run's rows from each binary's run: one COULD NOT RUN row per binary
+/// [`split_unrun`] takes out, `label — spec: why`, in declared order, then `decide` over the
+/// [`combined`] log of the rest, unless it took out every binary (so a run of unrun binaries
+/// alone has no [`crate::libtest::RAN_NO_TEST`] row). No binary at all, a resume that carried
+/// every one ([`carry`]), is decided as before.
+fn decide_runs(
+    r: &mut Report,
+    bins: &[Binary],
+    runs: &[Run],
+    label: &str,
+    decide: impl FnOnce(&mut Report, &Run),
+) {
+    let (unrun, bins, runs) = split_unrun(bins, runs);
+    let none_ran = runs.is_empty() && !unrun.is_empty();
+    for (b, why) in unrun {
+        r.cannot_run(format!("{label} — {}: {why}", b.spec));
+    }
+    if !none_ran {
+        decide(r, &combined(&bins, &runs));
+    }
+}
+
 /// What a rerun of one binary of `command` adds to that binary's `-p <crate> <target>` spec: the
 /// command's feature flags, and `-p` for each package a `<package>/<feature>` among them names,
 /// because cargo refuses that feature beside a selection with no direct dependency on the package.
@@ -922,8 +1140,10 @@ fn binary_features(bins: &mut [Binary], features: &str) {
 /// Record Cargo's current test invocations and run them with the admitted parallelism. The first
 /// binary that fails ends the run when its halt is armed ([`crate::Ctx::halt`], named for `check`):
 /// no binary starts after it, and those it stopped are one NOT RUN row with the halt's words. A
-/// binary's `test … FAILED` line sets nothing while it runs: that case may yet read as its
-/// machine's refusal or a full disk, which libtest's report of it says only at the binary's end.
+/// binary verify could not start or ended unrun otherwise is a NOT RUN row of its own, and the
+/// binaries that ran decide the run's row ([`decide_runs`]). A binary's `test … FAILED` line
+/// sets nothing while it runs: that case may yet read as its machine's refusal or a full disk,
+/// which libtest's report of it says only at the binary's end.
 pub fn run_tests(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -1099,6 +1319,36 @@ pub fn run_tests(
         }
     };
     binary_features(&mut bins, &features);
+    // A release hashes each binary's executable (its record's key for a resume, A19); a dev run
+    // keeps none, so it pays nothing for it.
+    let hashed = AtomicU64::new(0);
+    let hash = |b: &Binary| {
+        ctx.release
+            .then(|| exe_sha256(b.record.exe(), &hashed))
+            .flatten()
+    };
+    let listed = bins.len();
+    let Carried {
+        run: bins,
+        carried,
+        known,
+    } = match &ctx.passed_binaries {
+        Some(passed) => carry(
+            passed,
+            bins,
+            hash,
+            usize::try_from(granted_cores).unwrap_or(1),
+        ),
+        None => Carried {
+            run: bins,
+            carried: Vec::new(),
+            known: BTreeMap::new(),
+        },
+    };
+    for (binary, sha) in &carried {
+        emit(ctx, &carried_event(binary, sha));
+    }
+    let shas = Mutex::new(known);
     let ceiling = ctx.exec_env().child_ceiling;
     let started = Instant::now();
     let samples = Mutex::new(Vec::with_capacity(bins.len()));
@@ -1117,6 +1367,15 @@ pub fn run_tests(
                     spawn_error: Some(words.to_owned()),
                     usage: None,
                 };
+            }
+            let known = shas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&b.spec);
+            if !known && let Some(sha) = hash(b) {
+                shas.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(b.spec.clone(), sha);
             }
             let mut env = ctx.exec_env();
             if let Some(limit) = ceiling {
@@ -1137,9 +1396,21 @@ pub fn run_tests(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&binary.spec);
-            let (outcome, event, sample) =
-                binary_event(binary, run, !never_started, waiting, execution, threads);
-            eprintln!("{event}");
+            let sha = shas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&binary.spec)
+                .cloned();
+            let (outcome, event, sample) = binary_event(
+                binary,
+                run,
+                !never_started,
+                waiting,
+                execution,
+                threads,
+                sha.as_deref(),
+            );
+            emit(ctx, &event);
             if outcome == Outcome::Fail(Severity::GateFailed) {
                 ctx.halt.red(check.name());
             }
@@ -1160,6 +1431,30 @@ pub fn run_tests(
         .as_deref()
         .map(|path| crate::test_history::keep(path, samples));
     let (runs, walls): (Vec<Run>, Vec<Duration>) = timed.into_iter().unzip();
+    // What a release's resume carried and what hashing the executables cost, in a halted run's
+    // report as in a whole one's.
+    let accounted = |r: &mut Report| {
+        if ctx.passed_binaries.is_some() {
+            r.raw(format!(
+                "  test binaries: {} of {listed} carried (each passed before in this tree, its \
+                 executable unchanged); {} run",
+                carried.len(),
+                bins.len()
+            ));
+        }
+        if ctx.release {
+            r.raw(format!(
+                "  test binaries hashed (SHA-256 of each executable, a resume's key): {} in {} \
+                 summed over workers",
+                shas.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                crate::report::duration(
+                    Duration::from_nanos(hashed.load(Ordering::Relaxed)).as_secs_f64()
+                )
+            ));
+        }
+    };
     if let Some(words) = ctx.halted()
         && runs
             .iter()
@@ -1170,6 +1465,7 @@ pub fn run_tests(
             .zip(&runs)
             .partition(|(_, run)| run.spawn_error.as_deref() == Some(words));
         r.raw(summary(&bins, jobs, threads));
+        accounted(r);
         r.raw(poles(&bins, &walls, total));
         if let Some(Err(why)) = &kept {
             r.raw(format!(
@@ -1181,10 +1477,11 @@ pub fn run_tests(
                 .into_iter()
                 .map(|(b, run)| (b.clone(), run.clone()))
                 .unzip();
-            let all = combined(&bins, &runs);
-            r.raw(all.output.as_str());
+            r.raw(combined(&bins, &runs).output);
             // The golden test may be among those stopped, and the run is red already.
-            r.decide_test_child(&all, label, &env);
+            decide_runs(r, &bins, &runs, label, |r, rest| {
+                r.decide_test_child(rest, label, &env);
+            });
         }
         r.cannot_run(format!(
             "{label} — {} of {} test binaries not run: {words}",
@@ -1201,15 +1498,17 @@ pub fn run_tests(
         .collect();
     r.raw(preface);
     r.raw(summary(&bins, jobs, threads));
-    let all = combined(&bins, &runs);
-    r.raw(all.output.as_str());
+    accounted(r);
+    r.raw(combined(&bins, &runs).output);
     r.raw(poles(&bins, &walls, total));
     if let Some(Err(why)) = kept {
         r.raw(format!(
             "  test binaries' history not kept (planning data only): {why}"
         ));
     }
-    decide(ctx, r, &all, label, &env);
+    decide_runs(r, &bins, &runs, label, |r, rest| {
+        decide(ctx, r, rest, label, &env);
+    });
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
@@ -1435,7 +1734,8 @@ mod tests {
             usage: None,
         };
         let parse = |run: &Run| -> aterm_json::Value {
-            let (_, line, _) = binary_event(&binary, run, true, Duration::ZERO, Duration::ZERO, 1);
+            let (_, line, _) =
+                binary_event(&binary, run, true, Duration::ZERO, Duration::ZERO, 1, None);
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
         };
         assert_eq!(parse(&run)["outcome"].as_str(), Some("ok"));
@@ -1465,6 +1765,125 @@ mod tests {
              \"profile\":{{\"opt_level\":\"0\",\"debuginfo\":2,\"test\":{test}}},\
              \"features\":[],\"filenames\":[\"{exe}\"],\"executable\":\"{exe}\",\"fresh\":true}}\n"
         )
+    }
+
+    /// A resume carries a binary only when the spec that passed before names the digest its
+    /// executable has now, and never GOLDEN's package, whose test a release must show every run;
+    /// the rest run in their order, and each binary hashed is known by its digest. Negative
+    /// control: dropping the GOLDEN filter carries `aterm-gpu --lib`.
+    #[test]
+    fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_package() {
+        let bin = |exe: &str, pkg: &str| Binary {
+            header: format!("     Running unittests src/lib.rs ({exe})"),
+            spec: format!("-p {pkg} --lib"),
+            record: rec(exe, pkg),
+        };
+        let bins = vec![
+            bin("/t/deps/aterm_db-1", "aterm-db"),
+            bin("/t/deps/aterm_grid-2", "aterm-grid"),
+            bin("/t/deps/aterm_gpu-3", crate::checks::GOLDEN.0),
+            bin("/t/deps/aterm_core-4", "aterm-core"),
+        ];
+        let digest = |exe: &Path| match exe.to_str() {
+            Some("/t/deps/aterm_db-1") => "aa".repeat(32),
+            Some("/t/deps/aterm_grid-2") => "bb".repeat(32),
+            Some("/t/deps/aterm_gpu-3") => "cc".repeat(32),
+            _ => "dd".repeat(32),
+        };
+        let passed = read_passed(&format!(
+            "{} -p aterm-db --lib\n\n{} -p aterm-grid --lib\n{} -p {} --lib\n",
+            "aa".repeat(32),
+            "ee".repeat(32),
+            "cc".repeat(32),
+            crate::checks::GOLDEN.0
+        ))
+        .unwrap();
+        let hashed = Mutex::new(Vec::new());
+        let Carried {
+            run,
+            carried,
+            known,
+        } = carry(
+            &passed,
+            bins,
+            |b| {
+                hashed.lock().unwrap().push(b.spec.clone());
+                Some(digest(b.record.exe()))
+            },
+            2,
+        );
+        let specs = |v: &[Binary]| v.iter().map(|b| b.spec.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            carried
+                .iter()
+                .map(|(b, sha)| (b.spec.as_str(), sha.as_str()))
+                .collect::<Vec<_>>(),
+            [("-p aterm-db --lib", "aa".repeat(32).as_str())],
+            "only the unchanged binary that passed"
+        );
+        assert_eq!(
+            specs(&run),
+            [
+                "-p aterm-grid --lib",
+                "-p aterm-gpu --lib",
+                "-p aterm-core --lib"
+            ],
+            "a changed executable runs, GOLDEN's package always runs, an unnamed one runs"
+        );
+        let mut hashed = hashed.into_inner().unwrap();
+        hashed.sort();
+        assert_eq!(
+            hashed,
+            ["-p aterm-db --lib", "-p aterm-grid --lib"],
+            "only what passed is hashed to decide"
+        );
+        assert_eq!(known.get("-p aterm-grid --lib"), Some(&"bb".repeat(32)));
+        let event: aterm_json::Value = aterm_json::from_str(
+            carried_event(&carried[0].0, &carried[0].1)
+                .strip_prefix("verify-event: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event["outcome"].as_str(), Some("ok"));
+        assert_eq!(event["carried"].as_bool(), Some(true));
+        assert_eq!(event["execution_s"].as_f64(), Some(0.0));
+        assert_eq!(event["exe_sha256"].as_str(), Some("aa".repeat(32).as_str()));
+
+        for bad in [
+            "aa -p x --lib".to_owned(),
+            format!("{} ", "aa".repeat(32)),
+            format!("{} -p x --lib", "AA".repeat(32)),
+            format!("{0} -p x --lib\n{0} -p x --lib", "aa".repeat(32)),
+        ] {
+            assert!(read_passed(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A test binary's event lands in a release's events file whole, as its cutter reads it, beside
+    /// stderr. Negative control: an `emit` that writes stderr alone leaves the file empty.
+    #[test]
+    fn a_binarys_event_reaches_the_release_events_file_whole() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let at = dir.path().join("06-verify.events");
+        let ctx = crate::Ctx::new(
+            dir.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            dir.path().to_path_buf(),
+        )
+        .with_events(Some(crate::event_log::EventLog::open(&at).unwrap()));
+        let binary = Binary {
+            header: String::new(),
+            spec: "-p aterm-db --lib".into(),
+            record: Record {
+                cwd: dir.path().to_path_buf(),
+                argv: vec!["/t/deps/aterm_db-1".into()],
+                env: Vec::new(),
+            },
+        };
+        let event = carried_event(&binary, &"aa".repeat(32));
+        emit(&ctx, &event);
+        assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{event}\n"));
     }
 
     /// A RECORD IS THE PROCESS, BYTE FOR BYTE: every argument and variable
@@ -1691,10 +2110,12 @@ mod tests {
             TestExe {
                 exe: "/r/target/debug/deps/aterm_link-1".into(),
                 flag: "--lib".into(),
+                bin_env: Vec::new(),
             },
             TestExe {
                 exe: "/r/target/debug/deps/bridge_e2e-2".into(),
                 flag: "--test bridge_e2e".into(),
+                bin_env: Vec::new(),
             },
         ];
         let recs = || {
@@ -1714,6 +2135,7 @@ mod tests {
                 exe: Path::new("/cache/r/.cargo-build/debug/deps")
                     .join(e.exe.file_name().expect("a file name")),
                 flag: e.flag.clone(),
+                bin_env: Vec::new(),
             })
             .collect();
         assert_eq!(plan(recs(), log, &in_build_dir).expect("a plan"), bins);
@@ -1902,8 +2324,15 @@ mod tests {
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].spec, "-p x --test b");
         assert_eq!(tests[0].name, "t::broke");
-        let (outcome, event, _) =
-            binary_event(&bins[1], &runs[1], true, Duration::ZERO, Duration::ZERO, 1);
+        let (outcome, event, _) = binary_event(
+            &bins[1],
+            &runs[1],
+            true,
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            None,
+        );
         assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "a proven red");
         let event: aterm_json::Value =
             aterm_json::from_str(event.strip_prefix("verify-event: ").unwrap()).unwrap();
@@ -1991,6 +2420,155 @@ mod tests {
         assert!(combined(&bins, &[pass(&bins[0]), pass(&bins[1]), pass(&bins[2])]).ok);
     }
 
+    /// A test executable runs with its own package's binaries, named as Cargo names them while
+    /// it compiles the test (`CARGO_BIN_EXE_<name>`), which a test reads at run time
+    /// (`aterm_tempfile::bin_exe`); a value its record already holds gives way. NEGATIVE CONTROL:
+    /// package y's binary reaches no test of package x, and x's none of y's.
+    #[test]
+    fn a_test_executable_runs_with_its_packages_binaries() {
+        let of = |pkg: &str, exe: &str, kind: &str, name: &str, test: bool| {
+            artifact(exe, kind, name, test).replace("/r/crates/x#", &format!("/r/crates/{pkg}#"))
+        };
+        let mut log = [
+            of("x", "/r/target/debug/deps/it-1", "test", "it", true),
+            of("x", "/r/target/debug/x-tool", "bin", "x-tool", false),
+            of("y", "/r/target/debug/y-tool", "bin", "y-tool", false),
+            of("y", "/r/target/debug/deps/yt-2", "test", "yt", true),
+        ]
+        .concat();
+        let exes = take_test_executables(&mut log).expect("readable");
+        let named = |env: &[(OsString, OsString)]| {
+            env.iter()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
+                .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(&exes[0].bin_env),
+            ["CARGO_BIN_EXE_x-tool=/r/target/debug/x-tool"]
+        );
+        assert_eq!(
+            named(&exes[1].bin_env),
+            ["CARGO_BIN_EXE_y-tool=/r/target/debug/y-tool"]
+        );
+        let mut record = rec("/r/target/debug/deps/it-1", "x");
+        record
+            .env
+            .push(("CARGO_BIN_EXE_x-tool".into(), "/stale/x-tool".into()));
+        let header = "     Running tests/it.rs (target/debug/deps/it-1)\n";
+        let bins = plan(vec![record], header, &exes).expect("a plan");
+        assert_eq!(
+            named(&binary_cmd(&bins[0], 1).envs),
+            ["CARGO_BIN_EXE_x-tool=/r/target/debug/x-tool"],
+            "the compile's binary, once, in place of the stale one"
+        );
+    }
+
+    /// A binary verify ended unrun (or could not start) is its own COULD NOT RUN row, naming its
+    /// spec, and the rest decide the run's row as before: a pass beside it and a failed test
+    /// itemized under cargo's rerun spec. The combined log keeps its output and names it no
+    /// failed target. Negative control: a binary killed by a signal with no `spawn_error` is
+    /// still part of the one finding. With every binary unrun, only their rows; with no binary at
+    /// all (a resume carried every one), the run's one row as before.
+    #[test]
+    fn a_binary_verify_ended_unrun_is_its_own_could_not_run_row() {
+        let bins: Vec<Binary> = ["a", "b", "c"]
+            .iter()
+            .map(|n| Binary {
+                header: format!("     Running tests/{n}.rs (target/debug/deps/{n}-1)"),
+                spec: format!("-p x --test {n}"),
+                record: rec(&format!("/r/target/debug/deps/{n}-1"), "x"),
+            })
+            .collect();
+        let pass = |b: &Binary| Run {
+            ok: true,
+            output: format!(
+                "{}\n\nrunning 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 \
+                 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n",
+                b.header
+            ),
+            code: Some(0),
+            spawn_error: None,
+            usage: None,
+        };
+        let fail = |b: &Binary| Run {
+            ok: false,
+            output: format!(
+                "{}\n\nrunning 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n\
+                 ---- t::broke stdout ----\n\nthread 't::broke' panicked at src/x.rs:3:5:\n\
+                 assertion failed: false\n\nfailures:\n    t::broke\n\ntest result: FAILED. 0 \
+                 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n",
+                b.header
+            ),
+            code: Some(101),
+            spawn_error: None,
+            usage: None,
+        };
+        let why = "the run was interrupted before this child started";
+        let unrun = |b: &Binary| Run {
+            ok: false,
+            output: format!("{}\naterm-verify: cannot run {}: {why}", b.header, b.spec),
+            code: None,
+            spawn_error: Some(why.to_string()),
+            usage: None,
+        };
+        let label = "targo test --tests";
+        let decided = |runs: &[Run]| {
+            let mut r = Report::new("test");
+            r.raw(combined(&bins, runs).output);
+            decide_runs(&mut r, &bins, runs, label, |r, rest| {
+                r.decide_test_child(rest, label, &[]);
+            });
+            r
+        };
+        let cnr = Outcome::Fail(Severity::CouldNotRun);
+        let gf = Outcome::Fail(Severity::GateFailed);
+
+        let r = decided(&[pass(&bins[0]), unrun(&bins[1]), fail(&bins[2])]);
+        let rows: Vec<_> = r.outcomes().collect();
+        let b_row = format!("{label} — -p x --test b: {why}");
+        assert_eq!(rows, [(cnr, b_row.as_str()), (gf, label)], "{}", r.render());
+        let ids: Vec<String> = r.findings().into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["-p x --test c -- t::broke"], "{}", r.render());
+        let block = r.render();
+        assert!(
+            block.contains("error: 1 target failed:\n    `-p x --test c`\n")
+                && !block.contains("rerun pass `-p x --test b`")
+                && !block.contains("could not execute"),
+            "the log names no unrun binary a failed target:\n{block}"
+        );
+
+        let crashed = Run {
+            ok: false,
+            output: format!("{}\n\nrunning 1 test\n", bins[1].header),
+            code: None,
+            spawn_error: None,
+            usage: None,
+        };
+        let r = decided(&[pass(&bins[0]), crashed, fail(&bins[2])]);
+        assert_eq!(
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [gf],
+            "{}",
+            r.render()
+        );
+
+        let r = decided(&[unrun(&bins[0]), unrun(&bins[1]), unrun(&bins[2])]);
+        assert!(
+            r.outcomes()
+                .all(|(o, l)| o == cnr && !l.contains(crate::libtest::RAN_NO_TEST)),
+            "{}",
+            r.render()
+        );
+        assert_eq!(r.outcomes().count(), 3, "{}", r.render());
+
+        let mut r = Report::new("test");
+        decide_runs(&mut r, &[], &[], label, |r, rest| {
+            r.decide_test_child(rest, label, &[]);
+        });
+        assert_eq!(r.outcomes().count(), 1, "{}", r.render());
+    }
+
     #[test]
     fn the_replayed_command_is_the_record_with_its_thread_count() {
         let b = Binary {
@@ -2030,10 +2608,12 @@ mod tests {
             TestExe {
                 exe: PathBuf::from("/other/target/debug/deps/a-1"),
                 flag: "--lib".to_string(),
+                bin_env: Vec::new(),
             },
             TestExe {
                 exe: PathBuf::from("/r/target/debug/deps/a-1"),
                 flag: "--test a".to_string(),
+                bin_env: Vec::new(),
             },
         ];
         let bins = plan(records, log, &exes).expect("plan");

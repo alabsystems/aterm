@@ -4,6 +4,10 @@
 
 //! GitHub repository metadata, permissions, and owner repository listings.
 
+mod create;
+pub(crate) use create::RepoCreateWrite;
+pub use create::{CREATE_KEY, RepoCreatePermit, RepoVisibility};
+
 use crate::client::Github;
 use crate::error::{Error, Forbid, Kind, Result, Sub};
 use crate::github::{How, limit_after_sort, repo_root};

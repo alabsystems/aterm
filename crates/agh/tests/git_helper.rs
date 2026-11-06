@@ -613,6 +613,65 @@ fn repo_clone_clones_through_the_runner() {
 }
 
 #[test]
+fn repo_fetch_accepts_exact_anonymous_reads_and_refuses_unsafe_names() {
+    let world = World::canonical("helper-exact-fetch");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    let sha = crate::git_runner::host_git(&bare, &["rev-parse", "main"]);
+    let checkout = world.root.path().join("receiver.git");
+    std::fs::create_dir(&checkout).unwrap();
+    crate::git_runner::host_git(&checkout, &["init", "--quiet", "--bare"]);
+    let head = std::fs::read(checkout.join("HEAD")).unwrap();
+    let config = std::fs::read(checkout.join("config")).unwrap();
+    std::fs::write(checkout.join("FETCH_HEAD"), b"retained\n").unwrap();
+    let invoke = |source: &str, into: &str, extra: &[&str]| {
+        let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("alabsystems/aterm", &bare);
+        let path = checkout.display().to_string();
+        let mut args = vec![
+            "repo",
+            "fetch",
+            "alabsystems/aterm",
+            path.as_str(),
+            "--ref",
+            source,
+            "--into",
+            into,
+        ];
+        args.extend_from_slice(extra);
+        let exit = common::run_cli(&mut ctx, &args);
+        (exit, captured)
+    };
+    let (exit, captured) = invoke(&sha, "refs/agh/release-tree", &["--anonymous", "--meta"]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert!(captured.stderr_text().contains("as=anonymous"));
+    assert_eq!(
+        crate::git_runner::host_git(&checkout, &["rev-parse", "refs/agh/release-tree"]),
+        sha
+    );
+    assert_eq!(std::fs::read(checkout.join("HEAD")).unwrap(), head);
+    assert_eq!(std::fs::read(checkout.join("config")).unwrap(), config);
+    assert_eq!(
+        std::fs::read(checkout.join("FETCH_HEAD")).unwrap(),
+        b"retained\n"
+    );
+    for (source, into, extra) in [
+        ("main", "refs/agh/read", &[][..]),
+        ("refs/heads/*", "refs/agh/read", &[][..]),
+        (sha.as_str(), "refs/heads/main", &[][..]),
+        (sha.as_str(), "refs/agh/read", &["--as", "release"][..]),
+    ] {
+        let (exit, captured) = invoke(source, into, extra);
+        assert_eq!(exit, 2, "{}", captured.stderr_text());
+    }
+    assert!(
+        world.fake.seen().is_empty(),
+        "the local fixture needs no HTTP or credential probe"
+    );
+}
+
+#[test]
 fn repo_fetch_main_keeps_work_and_refs_and_records_rewinds() {
     let world = World::with_reader("helper-fetch-main");
     let bare = crate::git_runner::bare_repo(world.root.path(), "app");

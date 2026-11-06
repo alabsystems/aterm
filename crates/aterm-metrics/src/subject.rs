@@ -298,7 +298,11 @@ impl fmt::Display for HomeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HomeKey::Home => f.write_str("home"),
-            HomeKey::Hashed(h) => write!(f, "h{h:016x}"),
+            HomeKey::Hashed(h) => {
+                let bytes = h.to_be_bytes();
+                let buf = format_hex_lower::<8, 17>(b"h", &bytes);
+                f.write_str(std::str::from_utf8(&buf).unwrap_or_default())
+            }
         }
     }
 }
@@ -637,6 +641,10 @@ impl Metric {
 
 impl fmt::Display for Metric {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.as_str();
+        if !s.is_empty() {
+            return f.write_str(s);
+        }
         match *self {
             Metric::Tokens(cli) => write!(f, "{cli}.tokens"),
             Metric::Class(cli, family, class) => {

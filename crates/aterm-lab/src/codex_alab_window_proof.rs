@@ -827,7 +827,8 @@ fn shut_page(proof: &Proof, desk: &Desk) -> Result<String, String> {
 }
 
 /// END: once every leg's journal stood still [`QUIET`], one idle window (`what`: the page open,
-/// or shut): `metrics reset`, its settle, the opening counts, [`surfaces::IDLE_MS`] with no read,
+/// or shut): its opening counts once the settle after its `metrics reset` has passed
+/// ([`surfaces::open_idle_count`]), [`surfaces::IDLE_MS`] with no read,
 /// the closing counts, judged by [`surfaces::idle_counts_beside`] with the owners `also` that may
 /// arm there, never fire ([`PAGE_TURN`] while the page is open).
 fn idle(
@@ -855,12 +856,7 @@ fn idle(
         }
     };
     let read = |args: &[&str]| proof.inst.ctl(args);
-    let _ = read(&["metrics", "reset"]);
-    sleep(Duration::from_secs(2))?;
-    let (m0, p0) = (
-        read(&["metrics"]).stdout,
-        read(&["metrics", "percentiles"]).stdout,
-    );
+    let (m0, p0) = surfaces::open_idle_count(|args| read(args).stdout, sleep)?;
     sleep(Duration::from_millis(
         u64::try_from(surfaces::IDLE_MS).unwrap_or(20_000),
     ))?;

@@ -209,24 +209,25 @@ impl Estimate {
 impl fmt::Display for Estimate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(c) = self.machine {
-            let read = if c.exact {
-                "the most a run of it".to_owned()
+            write!(f, "{}, ", size(self.bytes))?;
+            if c.exact {
+                f.write_str("the most a run of it")?;
             } else if c.selections == 1 {
-                "the most a run of the same checks over crates holding its".to_owned()
+                f.write_str("the most a run of the same checks over crates holding its")?;
             } else {
-                format!(
+                write!(
+                    f,
                     "summed over {} selections of the same checks whose crates together hold its, \
                      the most a run of each",
                     c.selections
-                )
-            };
+                )?;
+            }
             return write!(
                 f,
-                "{}, {read} in this machine's checkouts wrote, or held at its peak beyond {} (the \
+                " in this machine's checkouts wrote, or held at its peak beyond {} (the \
                  least any run the record keeps began from, or these directories hold now, {}), \
                  of {} run(s) the machine's record keeps: no run of it measured on these \
                  directories",
-                size(self.bytes),
                 size(c.floor),
                 size(self.holds),
                 c.runs

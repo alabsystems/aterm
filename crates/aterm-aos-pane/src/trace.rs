@@ -502,18 +502,24 @@ impl PaneTrace {
     /// # Errors
     /// [`PaneTraceFault::Identity`], [`PaneTraceFault::Checkpoint`], [`PaneTraceFault::Restore`], [`PaneTraceFault::Log`], [`PaneTraceFault::Tail`], [`PaneTraceFault::State`] or [`PaneTraceFault::Chain`], in that order.
     pub fn check(&self, origin: ClockReading, build: &str) -> Result<PaneCheck, PaneTraceFault> {
-        let ours = |c: PaneCode| pane_identity(&PrebuiltPane::new(c, build));
-        let prebuilt = PaneCode::ALL
-            .iter()
-            .copied()
-            .map(|c| PrebuiltPane::new(c, build))
-            .find(|p| pane_identity(p) == self.identity)
-            .ok_or_else(|| {
-                PaneTraceFault::Identity(
-                    IdentityMismatch::first(&self.identity, &ours(PaneCode::ThisBuild))
-                        .unwrap_or(IdentityMismatch::Code),
-                )
-            })?;
+        let this_prebuilt = PrebuiltPane::new(PaneCode::ThisBuild, build);
+        let this_identity = pane_identity(&this_prebuilt);
+        let prebuilt = if self.identity == this_identity {
+            this_prebuilt
+        } else {
+            if let Some(m) = IdentityMismatch::first(&self.identity, &this_identity)
+                && m != IdentityMismatch::Code
+            {
+                return Err(PaneTraceFault::Identity(m));
+            }
+            PaneCode::ALL
+                .iter()
+                .copied()
+                .skip(1)
+                .map(|c| PrebuiltPane::new(c, build))
+                .find(|p| p.id == self.identity.code)
+                .ok_or(PaneTraceFault::Identity(IdentityMismatch::Code))?
+        };
         let schema = PaneSchema::new(origin);
         let checkpoint =
             Checkpoint::decode(&self.checkpoint).map_err(PaneTraceFault::Checkpoint)?;

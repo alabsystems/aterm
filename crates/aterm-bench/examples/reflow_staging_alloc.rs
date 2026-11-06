@@ -1,0 +1,194 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! Manual allocation-traffic comparison for grid row and frame preparation.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use aterm_core::scrollback::Scrollback;
+use aterm_core::terminal::Terminal;
+
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct Counting;
+
+fn note(bytes: usize) {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+// SAFETY: every operation forwards the caller's pointer and layout to System unchanged;
+// the counters use only nonallocating atomic arithmetic.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        note(layout.size());
+        // SAFETY: forwarding the caller's layout unchanged.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        note(size);
+        // SAFETY: ptr and layout came from System through this allocator.
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: ptr and layout came from System through this allocator.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+#[cfg(target_os = "macos")]
+fn instructions() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let pid = libc::c_int::try_from(std::process::id()).ok()?;
+    // SAFETY: info is writable for the requested rusage_info_v4 flavor.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    // SAFETY: zeroed at creation, so initialized whatever the call did.
+    (rc == 0).then(|| unsafe { info.assume_init() }.ri_instructions)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn instructions() -> Option<u64> {
+    None
+}
+
+fn main() {
+    floating_frames();
+    restore_rows();
+    for (rows, cols, next_cols) in [
+        (24, 256, 16),
+        (128, 256, 8),
+        (256, 256, 1),
+        (256, 256, 2),
+        (256, 256, 3),
+    ] {
+        let mut history = Scrollback::new(64, 512, 64_000_000);
+        history.set_line_limit(None);
+        let mut term = Terminal::with_scrollback(rows, cols, 0, history);
+        let line = "x".repeat(usize::from(cols) - 1);
+        for row in 0..rows {
+            term.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            term.process(line.as_bytes());
+        }
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        black_box(&mut term).resize(rows, next_cols);
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        let found = term
+            .indexed_search()
+            .search_results_opts("x", true, false)
+            .unwrap();
+        let expected = usize::from(rows) * (usize::from(cols) - 1);
+        assert_eq!(
+            found.matches.len(),
+            expected,
+            "reflow must preserve every written glyph"
+        );
+        assert_eq!(found.cut_short_lines, 0);
+        println!(
+            "reflow_staging rows={rows} cols={cols} next_cols={next_cols} allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} glyphs={expected} history_lines={}",
+            term.grid().scrollback_lines()
+        );
+    }
+}
+
+fn floating_frames() {
+    for (rows, cols) in [(4_u16, 16_u16), (24, 80)] {
+        let mut term = Terminal::new(rows, cols);
+        term.set_cell_pixel_size(1, 1);
+        term.process(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2,q=2;/wAA/w==\x1b\\");
+        term.process("\x1b_Ga=p,U=1,i=1,p=7,c=1,r=1,q=2\x1b\\\x1b[1;1H\x1b[38;5;1m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m".as_bytes());
+        term.process(
+            format!("\x1b_Ga=p,i=2,p=5,P=1,Q=7,c={cols},r={rows},z=1,q=2\x1b\\").as_bytes(),
+        );
+        let mut frame = aterm_core::render::RenderInput::empty();
+        term.cell_frame_into(&mut frame, usize::from(rows), usize::from(cols));
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..64 {
+            black_box(&mut term).cell_frame_into(&mut frame, usize::from(rows), usize::from(cols));
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        let mut found = 0;
+        for (row, images) in frame.images.iter().enumerate() {
+            for (col, image) in images {
+                if image.kitty.is_some_and(|tag| tag.image_id == 2) {
+                    assert_eq!(usize::from(image.cell_row), row);
+                    assert_eq!(usize::from(image.cell_col), *col);
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, usize::from(rows) * usize::from(cols));
+        println!(
+            "floating_frame rows={rows} cols={cols} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} tiles={found}"
+        );
+    }
+}
+
+fn restore_rows() {
+    for (rows, cols) in [(1_u16, 4_u16), (1, 80), (1, 256), (24, 80), (128, 80)] {
+        let mut source = Terminal::new(rows, cols);
+        source.process(b"\x1b[38;2;12;34;56m\x1b[48;2;65;43;21m");
+        for row in 0..rows {
+            source.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            source.process("x".repeat(usize::from(cols)).as_bytes());
+        }
+        let lines = source.grid().checkpoint_visible_lines();
+        let mut grid = aterm_grid::Grid::new(rows, cols);
+        grid.restore_visible_from_lines(&lines);
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..64 {
+            black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        let restored = grid.checkpoint_visible_lines();
+        for (actual_line, expected_line) in restored.iter().zip(&lines) {
+            assert_eq!(actual_line.as_str(), expected_line.as_str());
+            let mut actual = actual_line.attr_cursor();
+            let mut expected = expected_line.attr_cursor();
+            for col in 0..usize::from(cols) {
+                assert_eq!(actual.attr_at(col), expected.attr_at(col));
+            }
+        }
+        println!(
+            "restore_rows rows={rows} cols={cols} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+        );
+    }
+}

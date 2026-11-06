@@ -1311,6 +1311,11 @@ impl Proof {
         self.inst.ctl(args)
     }
 
+    /// The rig's aterm process ([`Instance::aterm_pid`]).
+    pub(crate) fn instance_aterm_pid(&self) -> Option<i32> {
+        self.inst.aterm_pid()
+    }
+
     /// The directory `ctl image <name>` writes into.
     pub(crate) fn images_dir(&self) -> PathBuf {
         self.inst
@@ -4078,6 +4083,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     proof.end_all();
     // The last leg, where the lane runs it ([`Lane::runs_capacity`]) and once the instance is
     // gone: codex exec, alone in a jail of its own.
+    if lane.runs_capacity(&outcome) {
+        for want in capacity_proof::unobservable(&pkg_a) {
+            proof.unobserved(&want);
+        }
+    }
     let s = proof.s.clone();
     let jail = |port: u16| policy(port, crate::paths::paths(), &s);
     settle(
@@ -4338,9 +4348,13 @@ fn capacity_alone(pkg: &Path) -> Res {
     let s = world.dir.clone();
     let jail = |port: u16| policy(port, crate::paths::paths(), &s);
     let (mut oks, mut fails) = (0, Vec::new());
-    settle(Lane::Capacity, Ok(()), (&mut oks, &mut fails, &[]), || {
-        capacity_proof::lane(pkg, &s.join("capacity"), &jail)
-    })
+    let unobserved = capacity_proof::unobservable(pkg);
+    settle(
+        Lane::Capacity,
+        Ok(()),
+        (&mut oks, &mut fails, &unobserved),
+        || capacity_proof::lane(pkg, &s.join("capacity"), &jail),
+    )
 }
 
 fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {

@@ -15,7 +15,10 @@ const ID: Option<(u64, u64)> = Some((16_777_220, 78));
 const MAIN: &str = include_str!("testdata/steps/codex-0.163.0.jsonl");
 const SUBAGENT: &str = include_str!("testdata/steps/codex-0.163.0-subagent.jsonl");
 
-const STEPS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
+/// The committed step reductions.
+fn steps_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("src/harness/testdata/steps")
+}
 
 const PARENT: &str = "01900000-0000-7000-8000-000000000001";
 const FORK: &str = "01900000-0000-7000-8000-000000000002";
@@ -509,7 +512,7 @@ fn build_of<'a>(name: &str, header: &'a str) -> Option<&'a str> {
 }
 
 fn committed_of(build: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = std::fs::read_dir(STEPS_DIR)
+    let mut out: Vec<(String, String)> = std::fs::read_dir(steps_dir())
         .expect("the testdata")
         .filter_map(Result::ok)
         .filter_map(|e| {
@@ -526,7 +529,7 @@ fn committed_of(build: &str) -> Vec<(String, String)> {
 #[test]
 fn every_committed_codex_reduction_folds_whole() {
     let mut read = 0;
-    for e in std::fs::read_dir(STEPS_DIR)
+    for e in std::fs::read_dir(steps_dir())
         .expect("the testdata")
         .filter_map(Result::ok)
     {
@@ -1000,8 +1003,8 @@ fn alab_leg(leg: &str) -> String {
 }
 
 fn alab_leg_of(build: &str, leg: &str) -> String {
-    let path = format!("{STEPS_DIR}/{}-{leg}.jsonl", rollout_reduction_stem(build));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    let path = steps_dir().join(format!("{}-{leg}.jsonl", rollout_reduction_stem(build)));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 fn shape(said: &str) -> String {
@@ -1747,7 +1750,7 @@ fn harnessed(batch: &StepBatch) -> usize {
 #[test]
 fn a_turn_naming_no_trigger_is_nobodys() {
     let mut read = 0;
-    for e in std::fs::read_dir(STEPS_DIR)
+    for e in std::fs::read_dir(steps_dir())
         .expect("the testdata")
         .filter_map(Result::ok)
     {
@@ -1919,7 +1922,7 @@ fn codex_shown_is_what_each_measured_builds_reductions_hold() {
             "{build}: an id is no closed word"
         );
         assert_eq!(
-            super::super::codex_shown::shown_in(std::path::Path::new(STEPS_DIR), build),
+            super::super::codex_shown::shown_in(&steps_dir(), build),
             *words,
             "{build}"
         );
@@ -1928,7 +1931,7 @@ fn codex_shown_is_what_each_measured_builds_reductions_hold() {
     }
     assert_eq!(Gate::of(Some("0.163.0")), Gate::NONE);
     assert_eq!(Gate::of(None), Gate::NONE);
-    let upstream = super::super::codex_shown::shown_in(std::path::Path::new(STEPS_DIR), "0.163.0");
+    let upstream = super::super::codex_shown::shown_in(&steps_dir(), "0.163.0");
     assert_eq!(
         upstream, "\n",
         "codex_shown reads codex-alab reductions only"

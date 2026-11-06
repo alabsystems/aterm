@@ -488,12 +488,16 @@ impl<M: Machine> Core<M> {
 
     /// The agent the running VM has or will have: the guest's, once it said hello, else the
     /// plan's.
-    fn agent_now(&self) -> Option<String> {
+    fn agent_now(&self) -> Option<std::borrow::Cow<'_, str>> {
         if let Some(h) = &self.hello {
-            return Some(crate::hex(&h.agent_sha256));
+            return Some(std::borrow::Cow::Owned(crate::hex(&h.agent_sha256)));
         }
         self.running()
-            .then(|| self.plan.as_ref().map(|p| p.agent_sha256.clone()))
+            .then(|| {
+                self.plan
+                    .as_ref()
+                    .map(|p| std::borrow::Cow::Borrowed(p.agent_sha256.as_str()))
+            })
             .flatten()
     }
 
@@ -1162,11 +1166,7 @@ impl<M: Machine> Core<M> {
     )]
     fn hello(&mut self, h: Hello, now: Duration) -> Flow {
         let got = crate::hex(&h.agent_sha256);
-        let want = self
-            .plan
-            .as_ref()
-            .map(|p| p.agent_sha256.clone())
-            .unwrap_or_default();
+        let want = self.plan.as_ref().map_or("", |p| p.agent_sha256.as_str());
         if got != want || h.proto != wire::PROTO {
             let why = format!(
                 "NOT RUN — the guest runs agent {got} (protocol {}); this checkout built {want} \

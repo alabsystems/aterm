@@ -332,6 +332,14 @@ pub fn automatic() -> bool {
     enabled() && aterm_update_core::settings::update_enabled()
 }
 
+/// [`automatic`] as the user config says now, read again at each call: a process whose own
+/// [`automatic`] differs runs under a setting changed since it started, which its next launch
+/// reads.
+#[must_use]
+pub fn automatic_as_saved() -> bool {
+    enabled() && aterm_update_core::settings::update_enabled_saved()
+}
+
 /// Applies a staged update if one is ready and strictly newer than `current_build`.
 #[cfg(target_os = "macos")]
 #[must_use]
@@ -360,21 +368,68 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
 /// another process already installed in this image's place. `None` where neither stands, and
 /// for a copy outside an installed bundle (a dev build), whose start applies nothing. The node
 /// service asks it to decide whether to end its run so launchd starts it again
-/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13). It reads the stage's marker and the
-/// installed bundle's `Info.plist`, and never the network.
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13). An installed build the operator floor
+/// yanks, or one whose floor cannot be read, is none: a window refuses to activate it
+/// ([`preverify_installed_for_handoff`]), and a start would run it. It reads the stage's marker,
+/// the floor and the installed bundle's `Info.plist`, and never the network.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn newer_build_for_a_start(current_build: u64) -> Option<u64> {
     let installed = bundle::resolve()?;
-    let staged = paths::Staging::resolve()
-        .and_then(|staging| manifest::Ready::read_publishable(&staging))
+    let staging = paths::Staging::resolve();
+    let staged = staging
+        .as_ref()
+        .and_then(manifest::Ready::read_publishable)
         .map(|ready| ready.build_number);
     let replaced = installed_build_observed(&installed.app_root).ok();
+    newer_for_a_start(current_build, staged, replaced, |build| {
+        installed_build_yanked(staging.as_ref(), build)
+    })
+}
+
+/// [`newer_build_for_a_start`]'s choice: the newest of `staged` and `installed` above
+/// `current_build`, the installed build only once `yanked` reads that the floor leaves it.
+#[cfg(target_os = "macos")]
+fn newer_for_a_start(
+    current_build: u64,
+    staged: Option<u64>,
+    installed: Option<u64>,
+    yanked: impl Fn(u64) -> Result<bool, String>,
+) -> Option<u64> {
+    let installed = installed.filter(|build| *build > current_build && yanked(*build) == Ok(false));
     staged
-        .into_iter()
-        .chain(replaced)
         .filter(|build| *build > current_build)
+        .into_iter()
+        .chain(installed)
         .max()
+}
+
+/// The build installed in this copy's place, where it is older than `current_build`: a boot's
+/// crash-loop revert put it back (whose re-exec of it failed, so this process still runs the
+/// build it reverted), or a person installed an older release over this one. A fresh start
+/// runs it. `None` where the installed build is this one or newer or cannot be read, and for a
+/// copy outside an installed bundle. It reads the installed bundle's `Info.plist` alone.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn older_build_installed(current_build: u64) -> Option<u64> {
+    let installed = bundle::resolve()?;
+    older_than(
+        current_build,
+        installed_build_observed(&installed.app_root).ok(),
+    )
+}
+
+/// [`older_build_installed`]'s choice: `installed` where it is below `current_build`.
+#[cfg(target_os = "macos")]
+fn older_than(current_build: u64, installed: Option<u64>) -> Option<u64> {
+    installed.filter(|build| *build < current_build)
+}
+
+/// Off macOS no installed bundle stands in this process's place.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn older_build_installed(_current_build: u64) -> Option<u64> {
+    None
 }
 
 /// Off macOS no start of this process applies a stage this way.
@@ -5420,5 +5475,63 @@ mod handoff_candidate_facts_tests {
         assert_eq!(grants(chunks_only), Ok((true, false, false)));
         assert_eq!(grants(both), Ok((true, true, false)));
         assert_eq!(grants(all), Ok((true, true, true)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod node_start_tests {
+    use super::{newer_for_a_start, older_than};
+
+    /// AN OLDER INSTALLED BUILD IS ONLY ONE BELOW THIS ONE: the build a revert put back, never
+    /// this build or a newer one, which [`newer_for_a_start`] judges.
+    #[test]
+    fn only_a_build_below_this_one_is_an_older_installed_build() {
+        assert_eq!(older_than(100, Some(99)), Some(99), "a revert put 99 back");
+        assert_eq!(older_than(100, Some(100)), None, "this build stands here");
+        assert_eq!(
+            older_than(100, Some(101)),
+            None,
+            "a newer build stands here"
+        );
+        assert_eq!(
+            older_than(100, None),
+            None,
+            "the installed build cannot be read"
+        );
+    }
+
+    /// A NODE START RUNS NO YANKED INSTALLED BUILD: the installed arm counts only once the floor
+    /// reads that it leaves the build, while a staged build above this one counts as it did. The
+    /// control is the same installed build with a floor that leaves it.
+    #[test]
+    fn a_yanked_or_unjudged_installed_build_is_no_newer_build_for_a_start() {
+        let leaves = |_: u64| Ok(false);
+        let yanks = |build: u64| Ok(build < 102);
+        let unread = |_: u64| Err("the floor is unreadable".to_owned());
+        assert_eq!(
+            newer_for_a_start(100, None, Some(101), leaves),
+            Some(101),
+            "CONTROL: a window installed 101 over this image and the floor leaves it"
+        );
+        assert_eq!(
+            newer_for_a_start(100, None, Some(101), yanks),
+            None,
+            "the floor yanks 101: a start would run a build a window refuses to activate"
+        );
+        assert_eq!(
+            newer_for_a_start(100, None, Some(101), unread),
+            None,
+            "a floor that cannot be read does not clear the installed build"
+        );
+        assert_eq!(
+            newer_for_a_start(100, Some(102), Some(101), yanks),
+            Some(102),
+            "a staged build above this one still counts beside a yanked installed one"
+        );
+        assert_eq!(
+            newer_for_a_start(100, Some(100), Some(99), leaves),
+            None,
+            "nothing above this build"
+        );
     }
 }

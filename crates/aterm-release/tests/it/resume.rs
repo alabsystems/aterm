@@ -13,7 +13,7 @@ use verify::{CutMode, RemoteState};
 
 /// A fresh directory under `<target tmp>/resume`, removed on drop.
 fn tmpdir(name: &str) -> aterm_tempfile::TempDir {
-    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("resume");
+    let parent = aterm_tempfile::target_tmpdir().join("resume");
     std::fs::create_dir_all(&parent).expect("create tmpdir");
     aterm_tempfile::Builder::new()
         .prefix(&format!("{name}-"))

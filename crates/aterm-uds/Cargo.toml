@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-uds"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -44,11 +44,13 @@ aterm-vitals = { workspace = true }
 # dev-only.
 aterm-sysprobe = { workspace = true }
 
-# aterm-durable: how an `atomic_file` write is finished. The file takes the durable flush
-# (`durable`), and its directory the best-effort one after the rename
-# (`Flush::dir_best_effort`, astream-sys's `dir_flush_unavailable`): a directory that
-# cannot be flushed here is accepted, and `EIO` is returned. Std plus astream-sys, so no
-# third-party code is added; it depends on nothing of this crate's, so no cycle.
+# aterm-durable: how an `atomic_file` write is finished. A write takes one `Flush`, durable
+# unless its caller names another through `write_flushed` (or none, which flushes nothing):
+# the temporary takes it before the rename (`Flush::file`) and the directory after it
+# (`Flush::dir`, classified as `Flush::dir_best_effort` does by astream-sys's
+# `dir_flush_unavailable`): a directory that cannot be flushed here is accepted, and `EIO` is
+# returned. Std plus astream-sys, so no third-party code is added; it depends on nothing of
+# this crate's, so no cycle.
 aterm-durable = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -57,6 +57,18 @@ pub enum GitOp {
         /// The ref main is fetched into.
         into: String,
     },
+    /// Fetch one full ref or object id into agh's private local namespace, without
+    /// changing FETCH_HEAD, branches, tags or remote-tracking refs.
+    FetchRef {
+        /// The existing checkout or bare repository.
+        dir: PathBuf,
+        /// A full ref or forty-digit object id.
+        reference: String,
+        /// A ref beneath `refs/agh/`.
+        into: String,
+        /// Read without any credential, including for a release-tier owner.
+        anonymous: bool,
+    },
     /// `git ls-remote --refs <url> [<ref>]`.
     LsRemote {
         /// One ref, or every one.
@@ -144,6 +156,27 @@ impl GitRun {
             GitOp::FetchMain {
                 dir: dir.to_path_buf(),
                 into: into.to_string(),
+            },
+        )
+    }
+
+    /// Fetch exactly `reference` into `refs/agh/…`. Anonymous reads never get a
+    /// credential helper or a release-writer grant.
+    #[must_use]
+    pub fn fetch_ref(
+        slug: &Slug,
+        dir: &Path,
+        reference: &str,
+        into: &str,
+        anonymous: bool,
+    ) -> GitRun {
+        GitRun::of(
+            slug,
+            GitOp::FetchRef {
+                dir: dir.to_path_buf(),
+                reference: reference.to_string(),
+                into: into.to_string(),
+                anonymous,
             },
         )
     }
@@ -314,6 +347,7 @@ mod unix {
     //! The runner's steps, on unix.
 
     use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
     use super::{GitOp, GitOut, GitRun};
@@ -389,6 +423,21 @@ mod unix {
                      remote-tracking ref, by a name git accepts",
                     Redactor::shapes(into)
                 )))
+            }
+            GitOp::FetchRef {
+                reference, into, ..
+            } => {
+                if !(crate::path::is_sha(reference)
+                    || (reference.starts_with("refs/") && crate::path::ref_name_ok(reference)))
+                {
+                    return Err(Error::usage(
+                        "REF must be a full ref or forty lowercase hex digits",
+                    ));
+                }
+                if !into.starts_with("refs/agh/") || !crate::path::ref_name_ok(into) {
+                    return Err(Error::usage("--into must be a valid ref beneath refs/agh/"));
+                }
+                Ok(())
             }
             GitOp::Fetch { .. } | GitOp::LsRemote { .. } => Ok(()),
         }
@@ -619,7 +668,9 @@ mod unix {
     /// empty folder in a checkout, a home that is a dotfiles repository) would have the config
     /// screen read, and the fetch force-write the refs and tags of, the enclosing repository.
     fn ceiling(root: &Path, op: &GitOp) -> Result<OsString> {
-        let (GitOp::Fetch { dir } | GitOp::FetchMain { dir, .. }) = op else {
+        let (GitOp::Fetch { dir } | GitOp::FetchMain { dir, .. } | GitOp::FetchRef { dir, .. }) =
+            op
+        else {
             return Ok(root.as_os_str().to_os_string());
         };
         let dir = std::fs::canonicalize(dir)
@@ -719,7 +770,7 @@ mod unix {
     fn op_word(op: &GitOp) -> &'static str {
         match op {
             GitOp::Clone { .. } | GitOp::Mirror { .. } => "clone",
-            GitOp::Fetch { .. } | GitOp::FetchMain { .. } => "fetch",
+            GitOp::Fetch { .. } | GitOp::FetchMain { .. } | GitOp::FetchRef { .. } => "fetch",
             GitOp::LsRemote { .. } => "ls-remote",
             GitOp::PushDelete { .. } => "push",
         }
@@ -969,12 +1020,21 @@ mod unix {
         let slug = &run.slug;
         let router = gh.router();
         let push = matches!(run.op, GitOp::PushDelete { .. });
+        let anonymous = matches!(
+            run.op,
+            GitOp::FetchRef {
+                anonymous: true,
+                ..
+            }
+        );
         let release = router.tier_of(slug.owner()) == Tier::Release;
         if release && !push && !literal_for(&run.named, slug) {
             return Err(release_needs_literal(slug));
         }
         let target = RouteTarget::Repo(slug.clone());
-        let req = if push {
+        let req = if anonymous {
+            RouteRequest::read(target).with_anonymous(true)
+        } else if push {
             RouteRequest::write(target)
         } else if release {
             RouteRequest::writer_read(target)
@@ -983,8 +1043,14 @@ mod unix {
         }
         .with_named(run.named.clone());
         let profile = match gh.fx().route(&req, &mut || gh.decide(&req))? {
+            Decision::Send { .. } if anonymous => {
+                return Err(
+                    Error::refused("anonymous git fetch cannot receive credentials")
+                        .with_repo(slug.to_string()),
+                );
+            }
             Decision::Send { profile, .. } => Some(profile),
-            Decision::Anonymous { .. } if !(push || release) => None,
+            Decision::Anonymous { .. } if anonymous || !(push || release) => None,
             Decision::Anonymous { .. } => {
                 return Err(Error::refused(format!(
                     "a git run on {slug} speaks as {}'s writer, and the decision was anonymous",
@@ -999,7 +1065,7 @@ mod unix {
         {
             return Err(error);
         }
-        let needs_grant = push || release;
+        let needs_grant = push || (release && !anonymous);
         let now = if needs_grant {
             Some(gh.fx().wall_secs()?)
         } else {
@@ -1077,7 +1143,8 @@ mod unix {
             git,
             env,
             work: Some(root.join("work")),
-            scratch_git: push.then(|| root.join("scratch.git")),
+            scratch_git: (push || matches!(run.op, GitOp::FetchRef { .. }))
+                .then(|| root.join("scratch.git")),
             budget: run.budget,
             reads: !push,
         };
@@ -1120,6 +1187,170 @@ mod unix {
         }
         screen(&listed.stdout, slug)?;
         Ok(dir)
+    }
+
+    /// Cache refs must not traverse a symlink in either the ref or reflog's parent
+    /// chain. Git's `--no-deref` protects a symbolic ref, not a filesystem symlink.
+    /// As with the config screen, the caller owns the repository during this run.
+    fn cache_parents(common: &Path, into: &str) -> Result<()> {
+        for relative in [into.to_string(), format!("logs/{into}")] {
+            let mut current = common.to_path_buf();
+            let components: Vec<_> = Path::new(&relative).components().collect();
+            for (index, component) in components.iter().enumerate() {
+                current.push(component.as_os_str());
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(Error::refused(
+                            "cache ref or reflog traverses a filesystem symlink",
+                        ));
+                    }
+                    Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
+                        return Err(Error::refused(
+                            "cache ref or reflog parent is not a directory",
+                        ));
+                    }
+                    Ok(metadata) if index + 1 == components.len() && !metadata.is_file() => {
+                        return Err(Error::refused("cache ref or reflog is not a regular file"));
+                    }
+                    Ok(metadata)
+                        if index + 1 == components.len()
+                            && relative.starts_with("logs/")
+                            && metadata.nlink() != 1 =>
+                    {
+                        return Err(Error::refused("cache reflog has another hard link"));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(Error::local(format!("cache ref parent: {error}"))),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch into private scratch first, then import objects with no destination
+    /// ref. Only the final no-deref update can change the caller's cache ref.
+    fn fetch_exact(
+        children: &Children<'_>,
+        run: &GitRun,
+        remote: &Remote,
+        dir: &Path,
+        reference: &str,
+        into: &str,
+    ) -> Result<ChildOut> {
+        let dir = screened(children, run, dir)?;
+        let canonical = crate::fx::canon::git_request(run);
+        let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
+            let key = [canonical.as_slice(), b"\nstep ", name.as_bytes()].concat();
+            let out = children.git(&args, cwd, &key).map_err(unsent)?;
+            if out.code != Some(0) {
+                return Err(failed(
+                    &run.op,
+                    &out,
+                    children.gh.redactor(),
+                    &run.slug,
+                    false,
+                ));
+            }
+            Ok(out)
+        };
+        let common = step(
+            "common-dir",
+            vec![
+                os("-C"),
+                dir.as_os_str().to_os_string(),
+                os("rev-parse"),
+                os("--path-format=absolute"),
+                os("--git-common-dir"),
+            ],
+            None,
+        )?;
+        let common = std::str::from_utf8(&common.stdout)
+            .ok()
+            .and_then(|text| text.strip_suffix('\n'))
+            .filter(|text| !text.contains(['\n', '\r']) && Path::new(text).is_absolute())
+            .ok_or_else(|| Error::local("git returned an invalid common directory"))?;
+        let check_parents =
+            || -> Result<()> {
+                let answer =
+                    children.gh.fx().fact(
+                        "cache-ref-parents",
+                        into,
+                        &mut || match cache_parents(Path::new(common), into) {
+                            Ok(()) => String::new(),
+                            Err(error) => error.why.clone(),
+                        },
+                    )?;
+                if answer.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Error::refused(answer))
+                }
+            };
+        check_parents()?;
+        let scratch = children.scratch_git.as_deref();
+        let mut init = vec![os("init"), os("--quiet"), os("--bare")];
+        if let Some(path) = scratch {
+            init.push(path.as_os_str().to_os_string());
+        }
+        step("init", init, None)?;
+        step(
+            "fetch",
+            vec![
+                os("fetch"),
+                os("--quiet"),
+                os("--no-tags"),
+                os("--no-write-fetch-head"),
+                os("--recurse-submodules=no"),
+                os(remote.url()),
+                os(format!("+{reference}:refs/agh/source")),
+            ],
+            scratch,
+        )?;
+        let oid = step(
+            "oid",
+            vec![os("rev-parse"), os("--verify"), os("refs/agh/source")],
+            scratch,
+        )?;
+        let oid = std::str::from_utf8(&oid.stdout)
+            .ok()
+            .and_then(|text| text.strip_suffix('\n'))
+            .filter(|text| crate::path::is_sha(text))
+            .ok_or_else(|| Error::local("git returned an invalid fetched object id"))?;
+        // Only this generated private directory gets file transport. No user URL
+        // or repository remote participates in the local object transfer.
+        let source = scratch.map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf);
+        step(
+            "objects",
+            vec![
+                os("-C"),
+                dir.as_os_str().to_os_string(),
+                os("-c"),
+                os("protocol.file.allow=always"),
+                os("fetch"),
+                os("--quiet"),
+                os("--no-tags"),
+                os("--no-write-fetch-head"),
+                os("--recurse-submodules=no"),
+                source.into_os_string(),
+                os("refs/agh/source"),
+            ],
+            None,
+        )?;
+        check_parents()?;
+        step(
+            "update",
+            vec![
+                os("-C"),
+                dir.into_os_string(),
+                os("update-ref"),
+                os("--no-deref"),
+                os("--create-reflog"),
+                os(into),
+                os(oid),
+            ],
+            None,
+        )
     }
 
     /// Steps 3, 7 and 9: the config screen of a fetch, the children, and the exit's mapping.
@@ -1190,6 +1421,20 @@ mod unix {
                     os(format!("+refs/heads/main:{into}")),
                 ];
                 (args, None)
+            }
+            GitOp::FetchRef {
+                dir,
+                reference,
+                into,
+                ..
+            } => {
+                let out = fetch_exact(children, run, remote, dir, reference, into)?;
+                return Ok(GitOut {
+                    stdout: kept(&out.stdout, redactor),
+                    stderr: kept(&out.stderr, redactor),
+                    as_: profile,
+                    grant,
+                });
             }
             GitOp::LsRemote { reference } => {
                 let mut args = vec![os("ls-remote"), os("--refs"), url];

@@ -7,7 +7,7 @@ name = "aterm-buffer"
 # of the one `buffer_suite` binary, which mounts `tests/support/` once. With
 # autotests off a `tests/*.rs` file listed nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

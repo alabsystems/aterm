@@ -9,7 +9,7 @@ use aterm_models_release::{release_durable_post_intent_model, release_historical
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use publish::{CutCtx, CutKind, DurablePostDecision, Journal};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn journal() -> Journal {
     Journal {
@@ -85,8 +85,8 @@ fn step(model: &Model, state: &mut aterm_spec::interp::State, action: &str, labe
 
 #[test]
 fn real_guard_and_fsynced_journal_refine_one_shot_model() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("durable-post-intent-{}", std::process::id()));
+    let root =
+        aterm_tempfile::target_tmpdir().join(format!("durable-post-intent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
@@ -211,7 +211,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
     use publish::PostOutcome::{NeverSent, Refused, Unknown};
     const NAME: &str = "aterm-0.55.0.dmg";
     const OTHER: &str = "aterm-0.55.0-mac.zip";
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let root = aterm_tempfile::target_tmpdir()
         .join(format!("upload-intent-settle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();

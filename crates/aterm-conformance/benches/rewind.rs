@@ -136,7 +136,7 @@ mod measuring {
     pub fn run() -> std::process::ExitCode {
         let rig = Rig::release(
             &["ATERM_REWIND_BIN", "ATERM_PAINT_BIN"],
-            env!("CARGO_BIN_EXE_fake-tui"),
+            aterm_tempfile::bin_exe("fake-tui"),
         );
         support::run("rewind", ROWS, |row| take(&rig, row))
     }

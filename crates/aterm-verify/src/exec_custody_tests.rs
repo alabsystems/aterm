@@ -196,6 +196,7 @@ fn exercise(alias: &str, graceful: bool) {
         owned.child.as_mut().expect("owned child"),
         owned.live.as_mut().expect("owned Live"),
         grace,
+        REAP_AFTER_KILL,
     );
     let status = owned
         .child

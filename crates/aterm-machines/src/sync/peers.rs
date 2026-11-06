@@ -314,6 +314,7 @@ mod tests {
     #[test]
     fn an_open_vault_joins_with_nothing_typed() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
         let looks = Cell::new(0);
         let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
         assert!(matches!(read, PeersRead::Joinable(_)), "{read:?}");
@@ -341,6 +342,7 @@ mod tests {
     #[test]
     fn a_vault_that_asks_a_password_is_deferred_and_never_joined_again() {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
         ops.joins_as(Some(configured(Membership::Pending)), Ok(pending()));
         let done = joined(&ops);
         assert!(matches!(done, Ok(PeersDone::Waiting(_))), "{done:?}");
@@ -379,6 +381,7 @@ mod tests {
         let other = configured(Membership::Pending);
         for (status, waits) in [(alab, Waits::Approver), (other, Waits::PasswordOrApproval)] {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.alab_answers();
             ops.joins_as(Some(status.clone()), Ok(pending()));
             assert_eq!(
                 joined(&ops),

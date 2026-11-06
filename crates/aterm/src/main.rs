@@ -341,6 +341,23 @@ fn relay_tables(runtime: &aterm_db::runtime::Runtime) {
     ));
 }
 
+/// Hand a window's or a session lane's Commons `runtime` the node service's relay ack: its push
+/// asks the node whose state dir is `state_dir` ([`aterm_mesh::push::push_by_node`]), and where
+/// no node answers, the push takes the old path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn relay_by_node(runtime: &aterm_db::runtime::Runtime, state_dir: std::path::PathBuf) {
+    runtime
+        .pusher()
+        .relay(std::sync::Arc::new(
+            move |table, deadline| match aterm_mesh::push::push_by_node(
+                &state_dir, &table, deadline,
+            )? {
+                aterm_mesh::Pushed::Reached => Some(aterm_db::runtime::Pushed::Reached),
+                aterm_mesh::Pushed::TimedOut => Some(aterm_db::runtime::Pushed::TimedOut),
+            },
+        ));
+}
+
 /// Background Commons runtime and steward enroller held by `aterm node serve` (C22). Before the
 /// one-mesh transport it yields local observation and transport whenever an interactive window
 /// runs; with `aterm_types::mesh_switch::MESH` on it yields to none (the runtime reads the
@@ -415,24 +432,25 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         // at its queue's class. First, as a thread started earlier keeps the default class.
         aterm_gui::hold_process_as_background_work();
         aterm_gui::install_session_log();
-        // First, before the job's Commons runtime, listener or update checker starts: a build
-        // this job staged and ended its last run for goes in now, with no window here to apply
-        // it. That boot execs the build it installed and does not return
-        // (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.13).
-        let boot = aterm_gui::apply_node_update_at_boot();
-        // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
-        if let Some(home) = aterm_types::dirs::home_dir() {
-            commons_lan::install_sharing(&home);
-        }
-        // The job's first LAN uses (its Commons runtime's, its `_alab._tcp` browse and advert,
-        // its listener, heartbeat and facts push) wait while a window's System State Local
-        // Network step is still to come, as its Commons gate does.
-        #[cfg(target_os = "macos")]
-        if let Some(config) = aterm_types::dirs::aterm_config_path() {
-            commons_lan::hold_first_uses_for_the_step(&config, commons_lan::Host::NodeServe);
-        }
-        spawn_node_commons_runtime();
-        return aterm_gui::run_node_serve(boot);
+        // The job's lock first, then its boot: a build this job staged and ended its last run
+        // for goes in now, with no window here to apply it, and that boot execs the build it
+        // installed and does not return (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.13). Only
+        // then this closure, before the job's listener or update checker starts. A start that
+        // finds the lock held runs neither.
+        return aterm_gui::run_node_serve_owning(|| {
+            // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
+            if let Some(home) = aterm_types::dirs::home_dir() {
+                commons_lan::install_sharing(&home);
+            }
+            // The job's first LAN uses (its Commons runtime's, its `_alab._tcp` browse and
+            // advert, its listener, heartbeat and facts push) wait while a window's System State
+            // Local Network step is still to come, as its Commons gate does.
+            #[cfg(target_os = "macos")]
+            if let Some(config) = aterm_types::dirs::aterm_config_path() {
+                commons_lan::hold_first_uses_for_the_step(&config, commons_lan::Host::NodeServe);
+            }
+            spawn_node_commons_runtime();
+        });
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -522,14 +540,22 @@ fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     Ok(report.render(ms, Some("client")))
 }
 
-const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::BuildStamp {
-    app_version: env!("CARGO_PKG_VERSION"),
-    git_commit: env!("ATERM_GIT_COMMIT"),
-    git_commit_full: env!("ATERM_GIT_COMMIT_FULL"),
-    git_dirty: env!("ATERM_GIT_DIRTY"),
-    build_time: env!("ATERM_BUILD_TIME"),
-    build_number: env!("ATERM_BUILD_NUMBER"),
-    dev_commits: env!("ATERM_DEV_COMMITS"),
+/// This binary's identity record (`aterm_stamp`): the version, commit, build number, build time,
+/// dev-commit count, index hint and release mark `build.rs` wrote, in a section of its own so a
+/// writer that patches the image after the link can rewrite it. No library compiles any of it in:
+/// each reads [`aterm_stamp::current`] after [`main`] installs this.
+#[used]
+#[cfg_attr(target_vendor = "apple", unsafe(link_section = "__DATA,__aterm_stamp"))]
+#[cfg_attr(
+    all(not(target_vendor = "apple"), not(windows)),
+    unsafe(link_section = ".aterm_stamp")
+)]
+#[cfg_attr(windows, unsafe(link_section = ".astamp"))]
+static STAMP: [u8; aterm_stamp::LEN] = *include_bytes!(concat!(env!("OUT_DIR"), "/stamp.bin"));
+
+/// The facts of this binary's own compile, constant per toolchain and profile: the record's
+/// fields are decoded over them.
+const COMPILED: aterm_stamp::Stamp = aterm_stamp::Stamp {
     compiler_version_line: env!("ATERM_COMPILER_VERSION_LINE"),
     compiler_commit: env!("ATERM_COMPILER_COMMIT"),
     compiler_host: env!("ATERM_COMPILER_HOST"),
@@ -537,7 +563,7 @@ const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::Buil
     compiler_flavor: env!("ATERM_COMPILER_FLAVOR"),
     build_profile: env!("ATERM_BUILD_PROFILE"),
     trust_verify: env!("ATERM_TRUST_VERIFY"),
-    release_build: option_env!("ATERM_RELEASE_BUILD").is_some(),
+    ..aterm_stamp::Stamp::UNSTAMPED
 };
 
 /// The executable's inherited-lane ownership admission. The Link library parses first and invokes
@@ -622,6 +648,8 @@ fn cpu_policy_hang() -> Option<std::time::Duration> {
 }
 
 pub(crate) fn main() -> ExitCode {
+    // First: every entry below, the early helper verbs included, reads the installed identity.
+    aterm_stamp::install(&STAMP, COMPILED);
     let mut argv: Vec<OsString> = std::env::args_os().collect();
     // Before even the build-holder/tether helper entries may fork or spawn.
     // This original opaque description remains live through the whole GUI run.
@@ -663,7 +691,6 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     if let Some(code) = aterm_pty::serve_console_client() {
         return code;
     }
-    aterm_types::version::install(BUILD_STAMP);
     #[cfg(target_os = "macos")]
     aterm_types::macos_setup::access_record::code_subject_from(local_network_code_subject);
     // Before any vault path runs: the vault refuses every AI CLI's login file as an entry, as the
@@ -691,6 +718,23 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     #[cfg(unix)]
     aterm_secrets::client::on_ask_members(|paths| {
         aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
+    });
+    #[cfg(unix)]
+    aterm_secrets::client::on_native_bootstrap(|paths, current| {
+        let admitted = aterm_agent::members_cli::bootstrap_from_members(paths, current)?;
+        #[cfg(target_os = "macos")]
+        if admitted == aterm_secrets::client::NativeAdmission::Admitted {
+            let keeper = aterm_cli::macos_doctor::LAN_KEEPER;
+            if (keeper.keeps)() {
+                (keeper.keep)(aterm_machines::init_secrets::LanHeard::Reached);
+            }
+        }
+        Ok(admitted)
+    });
+    #[cfg(target_os = "macos")]
+    aterm_secrets::client::on_bootstrap_allowed(|_| {
+        aterm_cli::macos_doctor::automatic_vault_bootstrap_allowed()
+            .map_err(aterm_secrets::Error::new)
     });
     #[cfg(unix)]
     aterm_agent::service_repair_rpc::install_dispatcher(service_repair::rpc)
@@ -1005,11 +1049,11 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
                 ExitCode::from(2)
             }
             aterm_cli::Verb::Keeper => {
-                aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
+                aterm_keeper::cli::main_entry(forwarded, aterm_stamp::app_version())
             }
             aterm_cli::Verb::Acaffeine => {
                 aterm_gui::install_session_log();
-                aterm_acaffeine::cli::main_entry(forwarded, aterm_types::version::app_version())
+                aterm_acaffeine::cli::main_entry(forwarded, aterm_stamp::app_version())
             }
             aterm_cli::Verb::Agents => {
                 let _ = aterm_cli::parse_args(rest);
@@ -1086,8 +1130,7 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     }
 
     let scan = rest.get(..payload_boundary(&rest)).unwrap_or(&rest);
-    let force_session =
-        argv0 == "aterm-cli" || scan.iter().any(|a| a.to_string_lossy() == "--session");
+    let force_session = argv0 == "aterm-cli" || scan.iter().any(|a| a == "--session");
     let windowish = is_windowish(scan, force_session, stdin_is_terminal());
     let mode_args = take_no_reroute(&strip_mode_flags(&rest));
     if windowish {
@@ -1142,12 +1185,16 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     ) && let Some(layout) = layout.clone()
     {
         let dir = layout.reroute_dir();
-        if let Err(error) = layout.ensure_dir(&dir) {
-            aterm_log::warn!(
-                "aterm: reroute dir not created ({error}); this session does not reroute the upstream toolchain names (cargo, rustc, z3, …) — `aterm pkg doctor` explains (aterm help reroute)"
-            );
-        }
-        if dir.is_dir() {
+        let ensured = match layout.ensure_dir(&dir) {
+            Ok(()) => true,
+            Err(error) => {
+                aterm_log::warn!(
+                    "aterm: reroute dir not created ({error}); this session does not reroute the upstream toolchain names (cargo, rustc, z3, …) — `aterm pkg doctor` explains (aterm help reroute)"
+                );
+                dir.is_dir()
+            }
+        };
+        if ensured {
             aterm_log::env::set(atpkg::reroute::REROUTE_DIR_ENV, &dir);
         }
         let _ = std::thread::Builder::new()
@@ -1510,7 +1557,7 @@ fn window_host_for(scan: &[OsString]) -> WindowHost {
     }
     let in_process = scan
         .iter()
-        .any(|a| matches!(a.to_string_lossy().as_ref(), "--headless" | "--diagnose"));
+        .any(|a| matches!(a.to_str(), Some("--headless" | "--diagnose")));
     if in_process {
         WindowHost::ThisProcess
     } else {
@@ -1597,15 +1644,17 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ordinary_window(args: &[OsString]) -> bool {
     use aterm_types::control_socket::{SocketDirective, socket_directive};
-    let mut words = args.iter().map(|a| a.to_string_lossy());
+    let mut words = args.iter();
     while let Some(word) = words.next() {
-        let private = match word.as_ref() {
-            "--headless" | "--diagnose" => true,
-            "--control-sock" => words.next().is_none_or(|value| {
-                matches!(
-                    socket_directive(Some(value.as_ref()), None),
-                    SocketDirective::Explicit(_)
-                )
+        let private = match word.to_str() {
+            Some("--headless" | "--diagnose") => true,
+            Some("--control-sock") => words.next().is_none_or(|value| {
+                value.to_str().is_none_or(|s| {
+                    matches!(
+                        socket_directive(Some(s), None),
+                        SocketDirective::Explicit(_)
+                    )
+                })
             }),
             _ => false,
         };
@@ -1817,6 +1866,13 @@ fn start_commons_runtime(
         rounds,
     ) {
         Ok(runtime) => {
+            // With the one mesh on, this process's push asks the node service, whose mesh relays
+            // the tables, to wait for a neighbour's ack (§11 B7b).
+            if aterm_types::mesh_switch::MESH
+                && let Some(state_dir) = aterm_types::dirs::state_dir()
+            {
+                relay_by_node(&runtime, state_dir);
+            }
             let _ = COMMONS_RUNTIME.set(runtime);
             alab_journal::start_backfill();
         }
@@ -1975,7 +2031,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
     #[cfg(target_os = "macos")]
     if !args
         .iter()
-        .any(|a| matches!(a.to_string_lossy().as_ref(), "--headless" | "--diagnose"))
+        .any(|a| matches!(a.to_str(), Some("--headless" | "--diagnose")))
     {
         let _ = std::thread::Builder::new()
             .name("aterm-machines-retire".into())
@@ -4632,7 +4688,7 @@ impl SetupRetryHost for LiveSetupRetry {
     }
     fn park(&mut self) -> bool {
         // Local vault facts, interfaces for pending Secrets or Repositories, the
-        // Command Line Tools and existing retry deadlines can change without the
+        // selected Git build and existing retry deadlines can change without the
         // window. Each is watched (`ParkWatch`), so the park reads its mark again
         // only when one may have moved, a retry falls due or a wake comes: a run
         // left waiting on a person alone has no timer. A window gaining focus ends
@@ -7262,14 +7318,16 @@ fn ends_secrets_stage(event: &aterm_cli::macos_doctor::StageEvent<'_>) -> bool {
             .contains(&aterm_types::macos_setup::Setting::Secrets)
 }
 
-/// No stage runs now (a pass ended, possibly through an error inside a stage).
+/// No stage runs now (a pass ended, possibly through a panic inside a stage).
 #[cfg(target_os = "macos")]
 fn end_setup_activity() {
     if let Ok(mut activity) = SETUP_ACTIVITY.lock()
         && (!activity.settings.is_empty() || !activity.subjects.is_empty())
     {
-        // An early error missed the normal end hook. Retire readings taken
-        // during those stages just as the hook would, before clearing their rows.
+        // A panic missed the normal end hook: a stage that ends early with an
+        // error still ends through it, but its fence calls no hook while its thread
+        // unwinds. Retire readings taken during those stages just as the hook would,
+        // before clearing their rows.
         let settings = std::mem::take(&mut activity.settings);
         let subjects = std::mem::take(&mut activity.subjects);
         activity.mark(&settings, &subjects, false);
@@ -7281,7 +7339,7 @@ fn with_setup_activity<T>(pass: impl FnOnce() -> T) -> T {
     struct Activity;
     impl Drop for Activity {
         fn drop(&mut self) {
-            // An error or panic may have missed the stage's normal end hook.
+            // A panic may have missed the stage's normal end hook.
             end_setup_activity();
             // Every row is read again after a pass (System State design §3.5).
             request_observation(None, aterm_types::macos_setup::Subject::all(), false);
@@ -13692,7 +13750,7 @@ fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
 fn update_verb(rest: &[OsString]) -> ExitCode {
     aterm_gui::install_session_log();
     let build = aterm_gui::running_build_number();
-    let first = rest.first().map(|a| a.to_string_lossy().into_owned());
+    let first = rest.first().map(|a| a.to_string_lossy());
     let words = rest
         .iter()
         .filter(|a| !matches!(a.to_str(), Some("-v" | "--verbose")))
@@ -13760,10 +13818,10 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     }
     let mut verbose = false;
     let mut sub = None;
-    for arg in rest.iter().map(|a| a.to_string_lossy().into_owned()) {
-        match arg.as_str() {
+    for arg in rest.iter().map(|a| a.to_string_lossy()) {
+        match arg.as_ref() {
             "-v" | "--verbose" => verbose = true,
-            _ if sub.is_none() && !arg.starts_with('-') => sub = Some(arg),
+            _ if sub.is_none() && !arg.starts_with('-') => sub = Some(arg.into_owned()),
             _ => {
                 // A word that is not ours (`claude --wait-lock 60`, `apply` on a Mac)
                 // says what it is, and one of ours out of place says so, whatever follows it.
@@ -13803,10 +13861,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         }
     };
     let Some(st) = st else {
-        println!(
-            "{}",
-            update_unreadable_line(aterm_types::version::app_version())
-        );
+        println!("{}", update_unreadable_line(aterm_stamp::app_version()));
         return if no_ledger_fails(checking) {
             ExitCode::FAILURE
         } else {
@@ -13816,7 +13871,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     let lane = aterm_update::apply_lane_report(build);
     let (line, trouble) = update_summary(
-        aterm_types::version::app_version(),
+        aterm_stamp::app_version(),
         build,
         &st,
         lane.as_ref(),
@@ -13935,7 +13990,7 @@ impl DevCopy {
             return Self::No;
         }
         let lag = if asked_check || aterm_update::automatic() {
-            aterm_update::dev_channel::standing(aterm_types::version::app_version())
+            aterm_update::dev_channel::standing(aterm_stamp::app_version())
         } else {
             None
         };
@@ -14354,7 +14409,9 @@ fn stdin_is_terminal() -> bool {
 }
 
 fn front_door_verbs() -> Vec<&'static str> {
-    let mut verbs = vec!["help"];
+    let mut verbs =
+        Vec::with_capacity(1 + aterm_cli::Verb::ALL.len() + aterm_cli::DIAG_COMMANDS.len());
+    verbs.push("help");
     for verb in aterm_cli::Verb::ALL {
         verbs.push(verb.name());
     }
@@ -14469,7 +14526,7 @@ mod commons_lan;
 #[path = "doctor.rs"]
 mod doctor;
 
-/// Compiler-provenance probe: `build.rs` `include!`s it to stamp [`BUILD_STAMP`]'s values; this
+/// Compiler-provenance probe: `build.rs` `include!`s it to stamp [`COMPILED`]'s values; this
 /// test-only mount runs the same code against real `-vV` fixtures.
 #[cfg(test)]
 mod compiler_probe;

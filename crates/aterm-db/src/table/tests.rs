@@ -1164,18 +1164,22 @@ fn a_log_admitted_mac_reads_an_older_log_epochs_row_through_a_history_handoff() 
     );
 }
 
-/// A Mac that holds another Mac's `Remove` but not yet the removal's rotation seals no table row:
-/// the Commons epoch it would seal under is still wrapped to the removed Mac, whose key would open
-/// the row. Once the rotation lands, its session is a writer's again, under the rotation's epoch.
-///
-/// NEGATIVE CONTROL: the oracle reads the log itself: before the rotation the session's basis
-/// carries a `Wrap` to the removed Mac, and after it none.
-#[test]
-fn a_mac_holding_a_removal_without_its_rotation_seals_no_row() {
+/// A lab of three log members in which m1 (`paths[1]`) holds a table written before m0 removes
+/// m4, and m0's whole removal batch: its `Remove` first, then the rotation. The removed Mac's
+/// recipient and the table's folder.
+fn removal_lab(
+    fold: bool,
+) -> (
+    Lab,
+    Vec<aterm_secrets::membership_log::Record>,
+    aterm_secrets::age::Recipient,
+    std::path::PathBuf,
+    Scope,
+) {
     use aterm_secrets::{
         client::{Paths, admit_member_in_log, load_records, remove_member_in_log, save_records},
         commons::bootstrap::Device,
-        membership_log::{Body, Entrant, Evidence, encode_records},
+        membership_log::{Body, Entrant, Evidence},
     };
     let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
     client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
@@ -1206,54 +1210,330 @@ fn a_mac_holding_a_removal_without_its_rotation_seals_no_row() {
         &load_records(&lab.paths[0]).unwrap().encode(),
     )
     .unwrap();
-    let b1 = lab.bootstrap(1);
     let dir = lab._home.path().join("table-m1");
-    // Each session reopens the replica: a session's custody is its own.
-    let write = |session: &Session<'_>, payload: &[u8]| {
-        store::Store::create(session, &dir)?.commit_catalog(session, payload)
+    let scope = {
+        let b1 = lab.bootstrap(1);
+        let session = Session::open(&b1).unwrap();
+        let mut store = store::Store::create(&session, &dir).unwrap();
+        store
+            .commit_catalog(&session, b"before")
+            .expect("m1 writes before the removal");
+        store.scope()
     };
-    let session = Session::open(&b1).unwrap();
-    write(&session, b"before").expect("m1 writes before the removal");
-    drop(session);
-
+    if fold {
+        for paths in &lab.paths {
+            turn_fold_on(paths);
+        }
+    }
     let removal = remove_member_in_log(&lab.paths[0], actor4).unwrap();
     assert!(
         matches!(removal[0].body(), Body::Remove { .. }),
         "CONTROL: the batch opens with the Remove"
     );
+    (lab, removal, recipient4, dir, scope)
+}
+
+/// Turn the fold's adoption gate on for the vault at `paths` the way the node service does,
+/// through `commons::fold::note`, here by the 60-day bound.
+fn turn_fold_on(paths: &aterm_secrets::client::Paths) {
+    use aterm_secrets::commons::fold;
+    let gate = fold::Gate {
+        reads: None,
+        r2_shipped_ms: Some(0),
+    };
+    assert!(fold::note(paths, &gate, &[], fold::BOUND_MS).unwrap());
+    assert!(fold::on(paths));
+}
+
+/// The audiences of the `Epoch` records in `batch`.
+fn minted_audiences(
+    batch: &[aterm_secrets::membership_log::Record],
+) -> Vec<aterm_secrets::membership_log::EpochAudience> {
+    batch
+        .iter()
+        .filter_map(|record| match record.body() {
+            aterm_secrets::membership_log::Body::Epoch { audience, .. } => Some(audience.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One-mesh M6 (§11 B11): once the fold's adoption gate holds, a removal mints one audience,
+/// `[everyone]`; before it, Commons keeps its own epochs (the control: the same lab with the gate
+/// shut mints both).
+#[test]
+fn a_removal_mints_one_audience_once_the_gate_holds() {
+    use aterm_secrets::membership_log::EpochAudience;
+    let (_lab, folded, ..) = removal_lab(true);
+    assert_eq!(minted_audiences(&folded), vec![EpochAudience::Everyone]);
+    let (_lab, unfolded, ..) = removal_lab(false);
+    let mut audiences = minted_audiences(&unfolded);
+    audiences.sort_by_key(|audience| format!("{audience:?}"));
+    assert_eq!(
+        audiences,
+        vec![EpochAudience::Commons, EpochAudience::Everyone],
+        "CONTROL: with the gate shut the removal rotates Commons too"
+    );
+}
+
+/// The fold end to end: a write m1 makes while it holds m0's `Remove` of m4 stays pending, named
+/// for the `[everyone]` epoch that still wraps m4, and applies under the `[everyone]` epoch the
+/// removal minted; m0, which sealed nothing under the fold yet, reads it, and the row written
+/// before the fold, under Commons, stays readable beside it. A member admitted after a later
+/// rotation reads the fold row through a history handoff of the derived key: a member admitted
+/// after the fold reads rows written before it.
+///
+/// NEGATIVE CONTROL: before the handoff the late member cannot authenticate the row, and repair
+/// names the fold epoch among the history it needs.
+#[test]
+fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads_everywhere() {
+    use aterm_secrets::{
+        client::{
+            Paths, admit_member_in_log, load_records, remove_member_in_log, save_records,
+            trusted_commons_log,
+        },
+        commons::bootstrap::{Bootstrap, Device},
+        membership_log::{Entrant, Evidence, encode_records},
+    };
+    let (lab, removal, recipient4, dir, scope) = removal_lab(true);
     save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
-    let wraps_removed = |session: &Session<'_>| {
-        load_records(&lab.paths[1])
+    let b1 = lab.bootstrap(1);
+    let fold_epoch = |paths: &Paths, id: &Digest| {
+        trusted_commons_log(paths, lab.bootstrap(1).trust())
             .unwrap()
-            .log()
             .unwrap()
-            .records()
-            .any(|record| {
-                matches!(record.body(), Body::Wrap { epoch, recipient, .. }
-                    if epoch == session.access.basis() && *recipient == recipient4)
-            })
+            .0
+            .is_fold_epoch(id)
     };
     let session = Session::open(&b1).unwrap();
+    let old = *session.access.basis();
     assert!(
-        wraps_removed(&session),
-        "CONTROL: the basis is still wrapped to the removed m4"
+        fold_epoch(&lab.paths[1], &old),
+        "the fold seals under an [everyone] epoch"
     );
-    let refused = write(&session, b"during").unwrap_err();
-    assert!(
-        refused.to_string().contains("removed Mac"),
-        "the write waits for the rotation: {refused}"
-    );
+    assert!(basis_wraps(&lab, &old, recipient4));
+    let kept = store::Store::open(&session, &dir, scope)
+        .unwrap()
+        .commit_catalog(&session, b"during")
+        .unwrap_err();
+    assert!(kept.is_write_pending(), "{kept}");
     drop(session);
 
     save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
     let session = Session::open(&b1).unwrap();
+    let new = *session.access.basis();
+    assert_ne!(new, old);
+    assert!(fold_epoch(&lab.paths[1], &new));
+    let mut store = store::Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(store.seal_pending(&session).unwrap(), 1);
+    let rows = store.catalog(&session).unwrap();
+    let during = rows.iter().find(|r| r.payload() == b"during").unwrap();
+    assert_eq!(*during.roster(), new);
+    let during_id = during.header().id;
+    let before = rows.iter().find(|r| r.payload() == b"before").unwrap();
     assert!(
-        !wraps_removed(&session),
-        "CONTROL: the rotation's epoch reaches m4 no more"
+        !fold_epoch(&lab.paths[1], before.roster()),
+        "the row written before the fold stays under its Commons epoch"
     );
-    session
-        .writer()
-        .expect("a writer's session opens once the rotation lands");
+    let wire = store.wire(&session, &during_id).unwrap().unwrap().to_vec();
+    drop((store, session));
+
+    // m0 reads the fold row (its own observation is the same `[everyone]` epoch).
+    let b0 = lab.bootstrap(0);
+    assert_eq!(
+        Session::open(&b0)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .unwrap()
+            .payload(),
+        b"during"
+    );
+
+    // A later rotation, then a late member: it holds no `Wrap` of the row's epoch.
+    let trust = b0.trust();
+    let pinned = format!(
+        "{}#{}",
+        lab._home.path().join("test.vault").display(),
+        lab.signer
+    );
+    let entrant = |name: &str, byte: u8| -> (Paths, Entrant) {
+        let paths = Paths::for_home(&lab._home.path().join(name));
+        client::configure_log_member(&paths, &pinned, name).unwrap();
+        let _ = client::machine_identity(&paths).unwrap();
+        let request = Device::open(&paths)
+            .unwrap()
+            .unwrap()
+            .request(trust.network, trust.authority)
+            .unwrap();
+        (
+            paths,
+            Entrant {
+                request,
+                node_key: [byte; 32],
+                name: name.to_owned(),
+                label: name.to_owned(),
+            },
+        )
+    };
+    let (_m6, e6) = entrant("m6", 0x66);
+    let actor6 = e6.request.binding().actor();
+    admit_member_in_log(&lab.paths[0], e6, Evidence::Phrase).unwrap();
+    let again = remove_member_in_log(&lab.paths[0], actor6).unwrap();
+    assert_eq!(
+        minted_audiences(&again),
+        vec![aterm_secrets::membership_log::EpochAudience::Everyone]
+    );
+    let (m5, e5) = entrant("m5", 0x55);
+    let actor5 = e5.request.binding().actor();
+    admit_member_in_log(&lab.paths[0], e5, Evidence::Phrase).unwrap();
+    turn_fold_on(&m5);
+    let records = load_records(&lab.paths[0]).unwrap().encode();
+    save_records(&lab.paths[1], &records).unwrap();
+    save_records(&m5, &records).unwrap();
+    let b5 = Bootstrap::required(&m5).unwrap();
+    assert!(
+        Session::open(&b5)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .is_err(),
+        "CONTROL: m5 holds no key of the fold epoch the row names"
+    );
+    let (needs, _) = Session::open(&b5).unwrap().history_needs(None, 64).unwrap();
+    assert!(needs.contains(&new), "repair asks for the fold epoch");
+    let handoff = Session::open(&b1)
+        .unwrap()
+        .handoffs(actor5, &[new])
+        .unwrap()
+        .remove(0)
+        .expect("m1 issues the handoff of a fold epoch's table key");
+    Session::open(&b5)
+        .unwrap()
+        .import_handoff(new, &handoff)
+        .unwrap();
+    let (needs, _) = Session::open(&b5).unwrap().history_needs(None, 64).unwrap();
+    assert!(!needs.contains(&new), "the handoff answers the need");
+    assert_eq!(
+        Session::open(&b5)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .unwrap()
+            .payload(),
+        b"during",
+        "a member admitted after the fold reads the row written before it"
+    );
+}
+
+/// Whether the log m1 holds wraps `basis` to `recipient`.
+fn basis_wraps(lab: &Lab, basis: &Digest, recipient: aterm_secrets::age::Recipient) -> bool {
+    aterm_secrets::client::load_records(&lab.paths[1])
+        .unwrap()
+        .log()
+        .unwrap()
+        .records()
+        .any(|record| {
+            matches!(record.body(), aterm_secrets::membership_log::Body::Wrap { epoch, recipient: to, .. }
+                if epoch == basis && *to == recipient)
+        })
+}
+
+/// The roster (the epoch) the catalog row `payload` of the table at `dir` was sealed under.
+fn sealed_under(
+    session: &Session<'_>,
+    dir: &std::path::Path,
+    scope: Scope,
+    payload: &[u8],
+) -> Option<Digest> {
+    store::Store::open(session, dir, scope)
+        .unwrap()
+        .catalog(session)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.payload() == payload)
+        .map(|record| *record.roster())
+}
+
+/// One-mesh M4 (§11 B11): a Mac that holds another Mac's `Remove` but not yet the removal's
+/// rotation keeps its table write pending, named for the epoch it waited on, because that epoch
+/// is still wrapped to the removed Mac, whose key would open the row; nothing is sealed or
+/// published meanwhile. Once the rotation arrives the store seals it under the new epoch, never
+/// under the old one.
+///
+/// NEGATIVE CONTROL: `a_table_write_lands_under_the_old_epoch_when_the_wait_is_off`, the same lab
+/// with `TABLES_DONT_WAIT` on, seals the write at once under the epoch that wraps the removed Mac.
+#[test]
+fn a_table_write_on_a_mac_holding_a_remove_stays_pending_until_the_new_epoch_arrives() {
+    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    let (lab, removal, recipient4, dir, scope) = removal_lab(false);
+    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    let b1 = lab.bootstrap(1);
+    let session = Session::open(&b1).unwrap();
+    let old = *session.access.basis();
+    assert!(
+        basis_wraps(&lab, &old, recipient4),
+        "CONTROL: the basis is still wrapped to the removed m4"
+    );
+    let kept = store::Store::open(&session, &dir, scope)
+        .unwrap()
+        .commit_catalog(&session, b"during")
+        .unwrap_err();
+    assert!(
+        kept.is_write_pending(),
+        "the write waits for the rotation: {kept}"
+    );
+    let held = store::Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(held.pending_epochs(&session).unwrap(), vec![old]);
+    drop(held);
+    assert_eq!(
+        sealed_under(&session, &dir, scope, b"during"),
+        None,
+        "nothing is sealed yet"
+    );
+    // A second pass while the rotation is still due seals nothing and keeps one write.
+    let mut held = store::Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(held.seal_pending(&session).unwrap(), 0);
+    assert_eq!(held.pending_epochs(&session).unwrap().len(), 1);
+    drop((held, session));
+
+    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    let session = Session::open(&b1).unwrap();
+    let new = *session.access.basis();
+    assert_ne!(new, old, "the rotation moved the epoch");
+    assert!(
+        !basis_wraps(&lab, &new, recipient4),
+        "CONTROL: the new epoch reaches m4 no more"
+    );
+    let mut store = store::Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(store.seal_pending(&session).unwrap(), 1);
+    assert!(store.pending_epochs(&session).unwrap().is_empty());
+    drop(store);
+    assert_eq!(
+        sealed_under(&session, &dir, scope, b"during"),
+        Some(new),
+        "the pending write applies under the new epoch, never the old"
+    );
+}
+
+/// The negative control of the writer's wait: with `TABLES_DONT_WAIT` on, the write a held
+/// `Remove` would keep pending lands at once, under the epoch still wrapped to the removed Mac.
+#[test]
+fn a_table_write_lands_under_the_old_epoch_when_the_wait_is_off() {
+    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    let (lab, removal, recipient4, dir, scope) = removal_lab(false);
+    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    let b1 = lab.bootstrap(1);
+    let session = Session::open(&b1).unwrap();
+    let old = *session.access.basis();
+    super::TABLES_DONT_WAIT.with(|off| off.set(true));
+    let landed = store::Store::open(&session, &dir, scope)
+        .unwrap()
+        .commit_catalog(&session, b"during");
+    super::TABLES_DONT_WAIT.with(|off| off.set(false));
+    landed.expect("with the wait off the write is sealed at once");
+    assert_eq!(sealed_under(&session, &dir, scope, b"during"), Some(old));
+    assert!(
+        basis_wraps(&lab, &old, recipient4),
+        "the row is sealed under the epoch the removed Mac holds"
+    );
 }
 
 /// Table repair refuses a peer while this device has never read its roster (it could name that

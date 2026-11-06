@@ -53,13 +53,20 @@ struct UpdateOnly {
 /// Parse `[update] enabled` from `aterm.toml` text (`false` only when explicitly set to `false`).
 #[must_use]
 pub fn parse_update_enabled(text: &str) -> bool {
-    match aterm_toml::from_str::<UpdateOnly>(text) {
-        Ok(root) => root.update.and_then(|u| u.enabled).unwrap_or(true),
-        Err(e) => {
-            crate::warn(&update_parse_notice(text, &e));
-            true
-        }
-    }
+    update_enabled_in(text).unwrap_or_else(|e| {
+        crate::warn(&update_parse_notice(text, &e));
+        true
+    })
+}
+
+/// [`parse_update_enabled`] without its warning: what `text` says of `[update] enabled`, or why
+/// it says nothing.
+fn update_enabled_in(text: &str) -> Result<bool, aterm_toml::Error> {
+    aterm_toml::from_str::<UpdateOnly>(text).map(|root| {
+        root.update
+            .and_then(|update| update.enabled)
+            .unwrap_or(true)
+    })
 }
 
 fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
@@ -131,11 +138,28 @@ pub fn update_auto_apply() -> bool {
         .is_none_or(|text| parse_update_auto_apply(&text))
 }
 
-/// Cached `[update] enabled` setting for this process.
+/// Cached `[update] enabled` setting for this process, read at its first call (which warns of a
+/// config that does not parse) and kept until the next launch, whatever the file says later.
 #[must_use]
 pub fn update_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| config_path().is_none_or(|path| update_enabled_at(&path)))
+}
+
+/// `[update] enabled` as the user config holds it now, read again at each call
+/// ([`update_enabled_saved_at`] of [`config_path`]): a long-lived process compares it with
+/// [`update_enabled`] to learn that the setting changed since it started.
+#[must_use]
+pub fn update_enabled_saved() -> bool {
+    update_enabled_saved_at(config_path().as_deref())
+}
+
+/// [`update_enabled_at`] of `path` (`true` with none), but quiet: a config that does not parse
+/// reads as on without a warning, since a caller that reads it again and again would repeat
+/// the one warning [`update_enabled`]'s first read gave.
+fn update_enabled_saved_at(path: Option<&Path>) -> bool {
+    path.and_then(read_config_file)
+        .is_none_or(|text| update_enabled_in(&text).unwrap_or(true))
 }
 
 #[cfg(test)]
@@ -185,5 +209,38 @@ mod tests {
         let off = dir.path().join("aterm.toml");
         std::fs::write(&off, "[update]\nenabled = false\n").unwrap();
         assert!(!update_enabled_at(&off));
+    }
+
+    /// THE SAVED SETTING IS READ AGAIN AT EACH CALL, AS THE PARSER READS IT: it follows the file
+    /// as the file changes, and reads every text, one that does not parse included, as
+    /// `parse_update_enabled` does (which alone warns).
+    #[test]
+    fn the_saved_setting_follows_the_file_and_reads_as_the_parser_does() {
+        for text in [
+            "",
+            "[update]\nenabled = false\n",
+            "[update]\nenabled = true\n",
+            "[update]\nenabled = \"no\"\n",
+            "[update\nbroken",
+        ] {
+            assert_eq!(
+                update_enabled_in(text).unwrap_or(true),
+                parse_update_enabled(text),
+                "{text:?}"
+            );
+        }
+        let dir = crate::test_scratch_dir("upd-settings-saved");
+        let path = dir.path().join("aterm.toml");
+        assert!(update_enabled_saved_at(None), "no config path reads as on");
+        assert!(update_enabled_saved_at(Some(&path)), "no file reads as on");
+        std::fs::write(&path, "[update]\nenabled = false\n").unwrap();
+        assert!(!update_enabled_saved_at(Some(&path)), "turned off");
+        std::fs::write(&path, "[update]\nenabled = true\n").unwrap();
+        assert!(update_enabled_saved_at(Some(&path)), "turned on again");
+        std::fs::write(&path, "[update\nbroken").unwrap();
+        assert!(
+            update_enabled_saved_at(Some(&path)),
+            "a broken file reads as on"
+        );
     }
 }

@@ -4,8 +4,6 @@
 
 //! Recorded differential tests for the jq corpus against `jq -r -c -S` 1.7.1.
 
-use std::path::Path;
-
 use agh::Kind;
 use agh::cli::jq::{compile, render_results};
 use aterm_json::Value;
@@ -31,7 +29,7 @@ fn text<'a>(row: &'a Value, key: &str) -> &'a str {
 }
 
 fn input(name: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("tests/fixtures/jq/inputs")
         .join(name);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

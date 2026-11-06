@@ -9,23 +9,34 @@ mod account_worker_env;
 
 #[test]
 fn a_task_frame_is_at_most_64_kib() {
-    assert_eq!(frame_len("0", "claude"), Ok(0));
-    assert_eq!(frame_len("65536", "claude"), Ok(TASK_MAX));
+    let claude = spawn_form_word(None, None);
     assert_eq!(
-        frame_len("65537", "claude"),
+        claude, "agent=claude",
+        "a spawn naming no agent is Claude Code's"
+    );
+    assert_eq!(frame_len("0", &claude), Ok(0));
+    assert_eq!(frame_len("65536", &claude), Ok(TASK_MAX));
+    assert_eq!(
+        frame_len("65537", &claude),
         Err("ERR spawn agent=claude: the task is 65537 bytes (max 65536)\n".to_string())
     );
     assert_eq!(
-        frame_len("65537", worker_word(Some("muse"))),
+        frame_len("65537", &spawn_form_word(Some("muse"), None)),
         Err("ERR spawn agent=muse: the task is 65537 bytes (max 65536)\n".to_string())
     );
+    assert_eq!(
+        frame_len("65537", &spawn_form_word(None, Some("/opt/my%20run"))),
+        Err("ERR spawn program=/opt/my%20run: the task is 65537 bytes (max 65536)\n".to_string()),
+        "a program worker's names its program as the wire spells it"
+    );
+    assert_eq!(program_form("/opt/my run"), "program=/opt/my%20run");
     assert!(
-        frame_len("99999999999999999999999", "claude")
+        frame_len("99999999999999999999999", &claude)
             .is_err_and(|e| e.contains("bytes (max 65536)"))
     );
     for bad in ["", "-1", "1k", "0x10"] {
         assert!(
-            frame_len(bad, "claude").is_err_and(
+            frame_len(bad, &claude).is_err_and(
                 |e| e.starts_with("ERR usage: spawn") && e.contains(&format!("`len={bad}`"))
             ),
             "{bad:?}"
@@ -74,6 +85,28 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
         "ERR spawn agent=claude: the task is empty\n"
     );
     assert!(refused(Some(b"a\0b")).contains("NUL byte"));
+    let run = crate::program_worker::ProgramRun {
+        program: "/bin/sh".to_string(),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        TaskOrder::of_program_frame(Some(Vec::new()), run.clone(), None, None).unwrap_err(),
+        "ERR spawn program=/bin/sh: the task is empty\n",
+        "a program worker's refusal names its program"
+    );
+    let program =
+        TaskOrder::of_program_frame(Some(b"echo hi\n\nexit 3".to_vec()), run.clone(), None, None)
+            .expect("an order");
+    assert_eq!(
+        (program.agent, program.program, program.fact_line),
+        (aterm_phase::Program::Generic, Some(run), false),
+        "no fact line: the task is the program's input"
+    );
+    assert_eq!(
+        task_text(&program.task, None, program.autopilot, program.agent),
+        b"echo hi\n\nexit 3\n",
+        "its task as given, blank lines and all, its last line ended"
+    );
     assert_eq!(
         TaskOrder::of_frame(
             Some(Vec::new()),

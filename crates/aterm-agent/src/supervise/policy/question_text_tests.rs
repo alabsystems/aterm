@@ -1946,7 +1946,7 @@ fn a_dialog_under_land_writes_the_land_text() {
 /// The question captures the holdouts read, each as its own program reads it, one per file of
 /// `aterm-phase`'s fixtures named for a question: (name, rows, prompt).
 fn question_captures() -> Vec<(String, Vec<String>, aterm_phase::PromptV2)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("the phase fixtures")
         .filter_map(|e| e.ok()?.file_name().into_string().ok())

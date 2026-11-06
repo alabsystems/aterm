@@ -5165,13 +5165,10 @@ mod tests {
         let back = RestoreManifest::from_toml(&later).expect("a later show key is skipped");
         assert_eq!(back.windows[0].show, shown.windows[0].show);
 
-        let fixtures = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/handoff"
-        ));
+        let fixtures = aterm_tempfile::manifest_dir().join("tests/fixtures/handoff");
         let mut layouts = 0;
         let (mut without_show, mut with_show) = (0, 0);
-        for release in fs::read_dir(fixtures).expect("the handoff fixtures") {
+        for release in fs::read_dir(&fixtures).expect("the handoff fixtures") {
             let release = release.expect("a release directory").path();
             if !release.is_dir() {
                 continue;

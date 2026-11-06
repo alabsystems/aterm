@@ -244,6 +244,7 @@ fn serve_deciding(
     paths: &Paths,
     (decide, refuses): (desk::Prove<'_>, desk::Refuses<'_>),
 ) -> aterm_secrets::Result<()> {
+    let authority = |proving: &desk::Proving<'_>| client::member_authority(paths, proving);
     let own;
     let desk = match shared {
         Some(desk) => desk,
@@ -265,6 +266,7 @@ fn serve_deciding(
         Some(desk::Proof {
             decide,
             refuses,
+            authority: Some(&authority),
             fleet: Some(desk::Fleet {
                 node: judged.node,
                 current: judged.fleet,
@@ -333,6 +335,25 @@ pub fn prove_over_fleet(
     peers: &[(String, Option<IpAddr>, u16)],
     until: Option<std::time::Instant>,
 ) -> Result<join::Joined, join::Missed> {
+    prove_over_fleet_admitted(paths, joining, (secret, me), peers, until, None)
+}
+
+/// [`prove_over_fleet`] with the default automatic join's exact source and
+/// authority admission policy. A restored Mac can keep its fleet identity while
+/// lacking a vault source; it uses the same guarded proof over that recovery
+/// channel as it does over a fresh numeric LAN endpoint.
+///
+/// # Errors
+/// As [`prove_over_fleet`], or `admission` refuses the responder, current source
+/// or setup authority before possession or publication.
+pub fn prove_over_fleet_admitted(
+    paths: &Paths,
+    joining: &Joining<'_>,
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    peers: &[(String, Option<IpAddr>, u16)],
+    until: Option<std::time::Instant>,
+    admission: Option<&join::ProofAdmission<'_>>,
+) -> Result<join::Joined, join::Missed> {
     if let Err(error) = client::refuse_lab_identity_for_fleet(paths) {
         return Err(join::Missed {
             refused: vec![("this Mac".to_owned(), error.to_string())],
@@ -344,6 +365,7 @@ pub fn prove_over_fleet(
         .map(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port))
         .collect();
     let reach = |at: &str, within: Duration| -> aterm_secrets::Result<Box<dyn Stream>> {
+        let by = std::time::Instant::now() + within;
         let (host, addr, port) = peers
             .iter()
             .find(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port) == at)
@@ -357,15 +379,18 @@ pub fn prove_over_fleet(
             within,
         )
         .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
-        let stream = reached.transport.into_stream();
-        stream.sock.set_read_timeout(Some(VAULT_JOIN_WITHIN))?;
-        stream.sock.set_write_timeout(Some(VAULT_JOIN_WITHIN))?;
+        let stream = reached.transport.into_bounded_stream(by)?;
         Ok(Box::new(stream))
     };
     let dial = dial_until(until, VAULT_JOIN_WITHIN, &reach);
     let dial: &Dial<'_> = &dial;
     let sign_node = |message: &[u8]| -> [u8; 64] { me.sign_record(desk::PROVE_RECORD, message) };
-    join::prove_first(paths, dial, joining, &sign_node, &ats)
+    match admission {
+        Some(admission) => {
+            join::prove_first_admitted(paths, dial, joining, &sign_node, &ats, admission)
+        }
+        None => join::prove_first(paths, dial, joining, &sign_node, &ats),
+    }
 }
 
 #[cfg(test)]

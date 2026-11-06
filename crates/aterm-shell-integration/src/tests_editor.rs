@@ -163,7 +163,7 @@ fn pwsh_sets_amacs_only_where_the_person_set_no_editor() {
     let pwsh = need_pwsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     for case in EDITOR_CASES {
         let bin = aterm_tempfile::tempdir().expect("a bin dir");

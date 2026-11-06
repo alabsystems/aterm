@@ -368,6 +368,16 @@ const PROVING_LOCK: &str = "proving.lock";
 pub struct ProofLock(std::fs::File);
 
 impl ProofLock {
+    pub(crate) fn guards(&self, paths: &Paths) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = self.0.metadata()?;
+        let named = std::fs::symlink_metadata(paths.dir.join(PROVING_LOCK))?;
+        if !named.file_type().is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(Error::new("the proof lock no longer guards this vault"));
+        }
+        Ok(())
+    }
+
     /// Take the proof lock under `paths`, waiting while another process holds it until `until`
     /// (`None`: one try). `Ok(None)` while another proof still holds it: that proof goes on, and
     /// this one sends nothing, as after a member that may have signed.
@@ -393,6 +403,55 @@ impl Drop for ProofLock {
     }
 }
 
+/// Whether a retained default proof must keep using its authenticated signing member.
+/// This bounded local observation grants no authority to send a proof.
+///
+/// # Errors
+/// The private retry record cannot be read or is malformed.
+pub fn pending_proof(paths: &Paths) -> Result<bool> {
+    super::proof_retry::pending(paths)
+}
+
+/// Authority for an automatic proof whose local vault choice must remain unchanged.
+pub struct ProofAdmission<'a> {
+    /// The held proof lock for these vault paths, shared by native and fleet attempts.
+    pub proving: &'a ProofLock,
+    /// The exact source configuration read before discovery, or none for a cold bootstrap.
+    pub expected: Option<&'a client::Config>,
+    /// Only ALab's compiled authority may initialize this default automatic join.
+    pub default_alab: bool,
+    /// Read the caller's current authorization. This runs before each dial and under the
+    /// vault's state lock before publication; it must not take that same lock itself.
+    pub current: &'a (dyn Fn() -> Result<()> + Sync),
+}
+
+impl ProofAdmission<'_> {
+    pub(crate) fn check(&self, paths: &Paths) -> Result<()> {
+        self.proving.guards(paths)?;
+        (self.current)()?;
+        if client::config(paths)?.as_ref() != self.expected {
+            return Err(Error::new(
+                "the vault choice changed during the automatic proof; nothing was changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn accepts(&self, bundle: &super::Bundle) -> Result<()> {
+        if self.default_alab
+            && (bundle.vault != crate::ALAB_VAULT
+                || !crate::envelope::Retired::compiled().names(&bundle.signer, &bundle.followed))
+        {
+            return Err(Error::new(
+                "the member's records are not the compiled default ALab vault",
+            ));
+        }
+        // checked_log_bundle then verifies the complete log against Store::for_vault's
+        // compiled ALab genesis, never a genesis trusted from this member's greeting.
+        Ok(())
+    }
+}
+
 /// Prove this Mac to the members at `ats` with nobody's Allow (`desk::serve_with`'s `prove`):
 /// its request's writer key and its fleet node key (`sign_node`) sign each member's fresh
 /// challenge, and it answers the possession challenge. The first member that lets it in hands the
@@ -414,16 +473,114 @@ pub fn prove_first(
     sign_node: joiner::SignNode<'_>,
     ats: &[String],
 ) -> std::result::Result<Joined, Missed> {
+    prove_first_with(paths, dial, joining, sign_node, ats, None)
+}
+
+/// [`prove_first`] bound to the automatic caller's exact vault choice and current authority.
+/// An already-configured seatless Mac merges only its seat's records under the same guard;
+/// other Macs initialize or readmit a vault after the guarded local publication checks.
+///
+/// # Errors
+/// As [`prove_first`], or the authority or exact configured source changed.
+pub fn prove_first_admitted(
+    paths: &Paths,
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+    admission: &ProofAdmission<'_>,
+) -> std::result::Result<Joined, Missed> {
+    prove_first_with(paths, dial, joining, sign_node, ats, Some(admission))
+}
+
+fn prove_first_with(
+    paths: &Paths,
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+    admission: Option<&ProofAdmission<'_>>,
+) -> std::result::Result<Joined, Missed> {
+    let missed = |why: String, signed_maybe| Missed {
+        refused: vec![("automatic admission".into(), why)],
+        signed_maybe,
+    };
+    let pinned = if let Some(admission) = admission.filter(|a| a.default_alab) {
+        admission
+            .check(paths)
+            .map_err(|why| missed(why.to_string(), false))?;
+        match super::proof_retry::before(
+            paths,
+            admission.proving,
+            joining,
+            super::proof_retry::now_secs(),
+        )
+        .map_err(|why| missed(why.to_string(), true))?
+        {
+            super::proof_retry::Round::Fresh => None,
+            super::proof_retry::Round::Cooling => {
+                return Err(missed(
+                    "a native proof waits for its propagation pause".into(),
+                    true,
+                ));
+            }
+            super::proof_retry::Round::Pinned(peer) => Some(peer),
+        }
+    } else {
+        None
+    };
+    let retained = std::cell::Cell::new(pinned.is_some());
     let mut ats = ats.to_vec();
     ats.sort();
     ats.dedup();
+    if let Some(peer) = &pinned {
+        ats.retain(|at| at != &peer.at);
+        ats.insert(0, peer.at.clone());
+    }
     let mut missed = Vec::new();
     for at in &ats {
         let mut sent = false;
         let tried = (|| {
+            if let Some(admission) = admission {
+                admission.check(paths)?;
+            }
             let mut stream = dial(at)?;
             let greeting = joiner::greeting(&mut stream)?;
-            let bundle = joiner::prove(&mut stream, &greeting, joining, sign_node, &mut sent)?;
+            let ready = |request: &crate::commons::binding::Request| {
+                if let Some(admission) = admission {
+                    admission.check(paths)?;
+                    if admission.default_alab {
+                        if pinned.as_ref().is_some_and(|peer| {
+                            peer.key != greeting.key || &peer.binding != request.binding()
+                        }) {
+                            return Err(Error::new("another authenticated member may have signed"));
+                        }
+                        client::with_proof_admission(paths, admission, || {
+                            retained.set(true);
+                            super::proof_retry::sending(
+                                paths,
+                                admission.proving,
+                                joining,
+                                at,
+                                greeting.key,
+                                request.binding(),
+                                super::proof_retry::now_secs(),
+                            )?;
+                            admission.check(paths)
+                        })?;
+                    }
+                }
+                Ok(())
+            };
+            let bundle = joiner::prove_guarded(
+                &mut stream,
+                &greeting,
+                joining,
+                sign_node,
+                &mut sent,
+                admission.is_some_and(|a| a.default_alab),
+                &ready,
+            )?;
             drop(stream);
             if !matches!(bundle.handed, Handed::Log { .. }) {
                 return Err(Error::new(
@@ -433,14 +590,20 @@ pub fn prove_first(
             // A seatless recipient holds the vault already and only takes its seat's records
             // (one-mesh S1); a new Mac writes the vault from the bundle, which a proof never
             // moves to another vault than the one it is configured for.
-            let report = if client::seat(paths) == client::Seat::Seatless {
+            let report = if let Some(admission) = admission {
+                client::readmit_from_log_bundle_admitted(paths, &bundle, admission)?
+            } else if client::seat(paths) == client::Seat::Seatless {
                 client::take_seat(paths, &bundle)?
             } else {
                 client::readmit_from_log_bundle(paths, &bundle)?
             };
-            // Best effort, as after a phrase: the servers and this Mac's subscriber follow on.
-            drop(client::sync(paths, None));
-            drop(client::ask_allowed(paths));
+            if let Some(admission) = admission.filter(|a| a.default_alab) {
+                super::proof_retry::clear(paths, admission.proving)?;
+            }
+            // The verified log and its keys already admit this Mac. The
+            // subscriber follows the saved Allowed and pending materialization;
+            // reaching an HTTP source here would hold admission behind a
+            // different server, even after the native handshake finished.
             Ok(Joined {
                 member: greeting.name,
                 name: bundle.allowed.name().to_owned(),
@@ -463,7 +626,7 @@ pub fn prove_first(
     }
     Err(Missed {
         refused: missed,
-        signed_maybe: false,
+        signed_maybe: retained.get(),
     })
 }
 
@@ -494,10 +657,9 @@ fn written(
             } else {
                 client::write_from_log_bundle(paths, &bundle)?
             };
-            // Best effort: the vault's servers follow from here, and an admin's approver names
-            // this Mac in `[machines]` from its `Allowed`; this Mac's subscriber keeps trying.
-            drop(client::sync(paths, None));
-            drop(client::ask_allowed(paths));
+            // As after a proof, the subscriber posts the saved Allowed and
+            // follows the source. No HTTP round trip belongs to this completed
+            // local admission.
             (report, Admission::Logged)
         }
         Handed::Files(_) => {

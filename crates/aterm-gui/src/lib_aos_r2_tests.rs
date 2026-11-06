@@ -325,7 +325,7 @@ fn sparkles_paper_gold_is_recorded_in_tick_config_and_stays_attached_across_styl
     );
     let exported = gold.aos_export_now(None).expect("exports trace");
     let trace = MomentumTrace::decode(&exported.bytes).expect("decodes");
-    let build = aterm_types::version::build_id();
+    let build = aterm_stamp::build_id();
     assert!(
         trace.check(t0, &build).is_ok(),
         "the exported paper-gold trace checks cleanly"

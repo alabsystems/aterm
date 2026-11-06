@@ -44,6 +44,7 @@ pub mod budgets;
 pub mod entries;
 mod epochs;
 mod eval;
+mod fold;
 pub mod genesis;
 #[cfg(unix)]
 pub(crate) mod history;
@@ -64,6 +65,7 @@ pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
 };
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, RevokingRow, Undo};
+pub use fold::{NETWORK_KEY_INFO, fold_network_key};
 pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};

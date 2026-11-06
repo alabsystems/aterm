@@ -2533,11 +2533,9 @@ mod tests {
 
     #[test]
     fn the_pins_file_is_discovered_from_inside_the_checkout() {
-        let found = discover_pins_path_from(env!("CARGO_MANIFEST_DIR").into()).unwrap();
-        let shipped = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-update-core/src/pins.rs"
-        );
+        let package = aterm_tempfile::manifest_dir();
+        let found = discover_pins_path_from(package.clone()).unwrap();
+        let shipped = package.join("../aterm-update-core/src/pins.rs");
         assert_eq!(
             std::fs::canonicalize(found).unwrap(),
             std::fs::canonicalize(shipped).unwrap()

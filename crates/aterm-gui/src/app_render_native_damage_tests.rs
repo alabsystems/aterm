@@ -263,6 +263,221 @@ fn a_tree_read_from_the_model_leaves_the_owed_paint_owed() {
     assert_eq!(owed(&app), before);
 }
 
+/// An Editor page a client reads, presented once, on a file that says "before".
+#[cfg(a11y_tree)]
+struct ReloadedPage {
+    app: App,
+    wid: WindowId,
+    view: crate::tab_model::ViewId,
+    path: std::path::PathBuf,
+    document: u64,
+    _scratch: aterm_tempfile::TempDir,
+}
+
+#[cfg(a11y_tree)]
+impl ReloadedPage {
+    fn presented() -> Self {
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("reloaded.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.first_present_done = true;
+        app.open_document_tab_in_window(
+            wid,
+            crate::native_app::AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        )
+        .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap().get();
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.a11y_active = true;
+        window.bootstrap_present_retry_available = false;
+        present_page(&mut app, wid, view);
+        Self {
+            app,
+            wid,
+            view,
+            path,
+            document,
+            _scratch: scratch,
+        }
+    }
+
+    fn reload(&mut self) {
+        std::fs::write(&self.path, "after\n").unwrap();
+        self.app.native_document_file_changed(self.document);
+    }
+
+    /// What a frame does before its present: compile the page and stage the tree it would show.
+    fn stage_a_frame(&mut self) {
+        self.app.invalidate_native_view_cache(
+            self.wid,
+            self.view,
+            crate::native_app::DamageRegion::All,
+        );
+        assert!(self.app.prepare_native_input_scratch(self.wid));
+        assert!(self.app.windows[&self.wid].native_a11y_staged.is_some());
+        self.app
+            .windows
+            .get_mut(&self.wid)
+            .unwrap()
+            .a11y_sent
+            .clear();
+    }
+
+    fn sent(&self) -> usize {
+        self.app.windows[&self.wid].a11y_sent.len()
+    }
+
+    fn read(&self) -> String {
+        let line = self.app.windows[&self.wid]
+            .native_a11y_published
+            .as_ref()
+            .and_then(|published| published.first_text_line())
+            .expect("the tree carries the document's text");
+        line.text.trim_end().to_string()
+    }
+}
+
+/// A reload compiles a frame and the frame's present fails, so the window parks with the tree it
+/// staged. No later frame is coming to publish it, and until one does the client's next selection
+/// is an offset into text the reload replaced.
+#[cfg(a11y_tree)]
+#[test]
+fn a_page_whose_present_fails_reaches_its_client_as_the_window_parks() {
+    let mut page = ReloadedPage::presented();
+    page.reload();
+    page.stage_a_frame();
+
+    page.app
+        .rearm_dropped_present(page.wid, crate::metrics::PresentDropReason::GpuOccluded);
+
+    assert!(page.app.windows[&page.wid].present_retry.parked);
+    assert_eq!(page.read(), "after");
+    assert_eq!(page.sent(), 1);
+}
+
+/// A surface that answers its wait unpresentable parks the window with no failed present, and a
+/// frame that compiled before the wait is all that frame will ever do. One that answers
+/// presentable has a frame coming, and that frame publishes.
+#[cfg(a11y_tree)]
+#[test]
+fn a_surface_that_answers_unpresentable_sends_the_tree_its_frame_staged() {
+    let mut page = ReloadedPage::presented();
+    page.reload();
+    page.stage_a_frame();
+    let wid = page.wid;
+    page.app
+        .windows
+        .get_mut(&wid)
+        .unwrap()
+        .on_gpu_acquire_pending(17);
+
+    assert!(
+        page.app
+            .finish_gpu_acquire_wait_in(wid, Some(17), 17, true, || {})
+    );
+
+    assert_eq!(page.sent(), 0);
+
+    page.app
+        .windows
+        .get_mut(&wid)
+        .unwrap()
+        .on_gpu_acquire_pending(18);
+
+    assert!(
+        page.app
+            .finish_gpu_acquire_wait_in(wid, Some(18), 18, false, || {})
+    );
+
+    assert!(page.app.windows[&wid].present_retry.parked);
+    assert_eq!(page.read(), "after");
+    assert_eq!(page.sent(), 1);
+}
+
+/// A parked window presents nothing, so the frame that would publish a file reloaded beneath its
+/// page never comes. The client's tree must follow the page all the same: its next selection is an
+/// offset into what it holds, and the reload moved the bytes under it.
+#[cfg(a11y_tree)]
+#[test]
+fn a_page_that_moves_in_a_parked_window_reaches_its_client() {
+    let mut page = ReloadedPage::presented();
+    page.stage_a_frame();
+    page.app
+        .rearm_dropped_present(page.wid, crate::metrics::PresentDropReason::GpuOccluded);
+    assert_eq!(page.read(), "before");
+    page.app
+        .windows
+        .get_mut(&page.wid)
+        .unwrap()
+        .a11y_sent
+        .clear();
+
+    page.reload();
+    page.app.redraw_window(page.wid);
+
+    assert_eq!(page.read(), "after");
+    assert_eq!(page.sent(), 1);
+}
+
+/// A window waiting on a retry has a frame coming, so neither the drop nor a redraw it gates sends
+/// anything. Its stage stays behind until that frame, and a client that asks first reads the page
+/// and not what the failed frame compiled.
+#[cfg(a11y_tree)]
+#[test]
+fn a_window_waiting_on_a_retry_leaves_the_tree_to_its_frame() {
+    let mut page = ReloadedPage::presented();
+    page.stage_a_frame();
+
+    page.app
+        .rearm_dropped_present(page.wid, crate::metrics::PresentDropReason::GpuTimeout);
+    assert!(page.app.windows[&page.wid].present_retry.deadline.is_some());
+    assert_eq!(page.sent(), 0);
+
+    page.reload();
+    page.app.redraw_window(page.wid);
+    assert_eq!(page.sent(), 0);
+
+    page.app.push_a11y_tree(page.wid);
+    assert_eq!(page.read(), "after");
+}
+
+/// A redraw with nothing new for the client, in a window that cannot present, sends it nothing:
+/// neither a page whose frame failed but whose tree it already read, nor an overlay that covers
+/// one that moved.
+#[cfg(a11y_tree)]
+#[test]
+fn a_parked_redraw_with_nothing_to_tell_sends_nothing() {
+    let (mut app, wid, view) = about_page_with_a_client();
+    app.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+    assert!(app.prepare_native_input_scratch(wid));
+    let window = app.windows.get_mut(&wid).unwrap();
+    window.bootstrap_present_retry_available = false;
+    window.a11y_sent.clear();
+    app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
+    assert_eq!(app.windows[&wid].a11y_sent.len(), 1);
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+    let compiles = crate::app_native::native_ui_compile_count();
+
+    app.redraw_window(wid);
+    app.redraw_window(wid);
+
+    assert!(app.windows[&wid].a11y_sent.is_empty());
+    assert_eq!(crate::app_native::native_ui_compile_count(), compiles);
+
+    app.invalidate_native_ui_cache(wid);
+    app.open_theme_palette_in(wid);
+    assert!(app.windows[&wid].overlay.is_some());
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.redraw_window(wid);
+
+    assert!(app.windows[&wid].a11y_sent.is_empty());
+}
+
 /// A press can bring in a page no frame has shown: it goes on the plan's slot, so the client reads
 /// it at once and keeps a place, where a root-only tree would drop it to the window.
 #[cfg(a11y_tree)]

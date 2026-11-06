@@ -55,19 +55,24 @@ impl AghHost {
         }
     }
 
-    /// The production host serving `home` (design §10.3): `Router::from_validated` of
-    /// agh.toml as `load_config` reads it (`config::load_for_host_faults`), the journal, the caller `atpkg-publish`, and
-    /// `RetryPolicy::STANDARD`.
+    /// The production host serving `home`, using agh's shared configured identity snapshot.
     ///
     /// # Errors
     ///
-    /// `Err(why)` when agh.toml is missing (`None`) or invalid, for `Ctx::from_env_hosts`,
-    /// and when it says `vault = true`: vault adoption's rows are not composed here, so such a
-    /// file would build a host whose every write is refused as a missing writer.
+    /// Refusal of explicit configuration or adopted identity. Missing configuration adopts
+    /// the vault's identities but grants no release-tier publication permission.
     pub fn production(dirs: &agh::config::Dirs, home: agh::Slug) -> Result<AghHost, String> {
-        let validated = load_config(dirs).map_err(|refusal| refusal.detail("agh.toml"))?;
+        Self::configured_client(dirs, true).map(|client| AghHost::new(client, home))
+    }
+
+    /// One client snapshot shared by a run's staging and public hosts. `learn = false`
+    /// reads only recorded identities, with no request or state change.
+    pub(crate) fn configured_client(
+        dirs: &agh::config::Dirs,
+        learn: bool,
+    ) -> Result<agh::Github, String> {
         let env = Arc::new(agh::identity::ProcessEnv);
-        let github = agh::GithubBuilder::new(agh::policy::Router::from_validated(validated))
+        let base = agh::GithubBuilder::new(agh::policy::Router::empty())
             .transport(Arc::new(agh::wire::http::HttpTransport::new(env.clone())))
             .endpoints(agh::wire::Endpoints::github_com())
             .env(env)
@@ -77,7 +82,17 @@ impl AghHost {
             .journal(dirs.clone())
             .rate_book(agh::rate::RateBook::at(dirs.rate()))
             .build();
-        Ok(AghHost::new(github, home))
+        let resolved = if learn {
+            agh::routing::adopt_for_host(&base, dirs)
+        } else {
+            agh::routing::view_for_host(dirs, base.env())
+        };
+        resolved
+            .and_then(|resolved| resolved.bind(&base))
+            .map_err(|error| {
+                base.redactor()
+                    .apply(&format!("agh identity routing refused: {}", error.why))
+            })
     }
 
     /// Tests: another pause (the contract uses zero).
@@ -402,56 +417,6 @@ impl AghHost {
             Ok(_) => Probe::Present,
             Err(e) if e.kind == Kind::NotFound => Probe::Absent,
             Err(e) => Probe::Unknown(self.redacted(&e.why)),
-        }
-    }
-}
-
-/// Why agh.toml builds no host for the lanes (design §10.3): what `AghHost::production` and
-/// `hosts check` both read it as.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConfigRefusal {
-    /// There is no agh.toml.
-    Missing,
-    /// agh.toml is refused: its first fault, `{rule} {what}` whole, or the refusal of the
-    /// file itself (its mode, its owner, its bytes), which names no rule; shaped.
-    Invalid(String),
-    /// agh.toml says `vault = true`: vault adoption's rows are not composed here, so such a
-    /// file would build a host whose every write is refused as a missing writer.
-    Vault,
-}
-
-impl ConfigRefusal {
-    /// The refusal of the agh.toml written `file` (`agh.toml`, or its shown path).
-    pub(crate) fn detail(&self, file: &str) -> String {
-        match self {
-            ConfigRefusal::Missing => format!("{file} is missing"),
-            ConfigRefusal::Invalid(fault) => format!("{file} is invalid: {fault}"),
-            ConfigRefusal::Vault => format!(
-                "{file} says vault = true, and vault adoption is not composed for atpkg-publish: \
-                 {}",
-                crate::hosts_check::UNVAULT
-            ),
-        }
-    }
-}
-
-/// agh.toml under `dirs` as the lanes read it: `config::load_for_host_faults`, its first
-/// fault taken as data, and a file that says `vault = true` refused.
-pub(crate) fn load_config(
-    dirs: &agh::config::Dirs,
-) -> Result<agh::config::Validated, ConfigRefusal> {
-    match agh::config::load_for_host_faults(dirs) {
-        Ok(Some(validated)) if validated.joins_vault() => Err(ConfigRefusal::Vault),
-        Ok(Some(validated)) => Ok(validated),
-        Ok(None) => Err(ConfigRefusal::Missing),
-        Err(refusal) => {
-            let fault = match refusal.first {
-                Some(first) => format!("{} {}", first.rule, first.what),
-                None => refusal.error.why.clone(),
-            };
-            Err(ConfigRefusal::Invalid(agh::redact::Redactor::shapes(
-                &fault,
-            )))
         }
     }
 }
@@ -859,18 +824,12 @@ mod tests {
     }
 
     #[test]
-    fn production_refuses_a_missing_an_invalid_and_a_vault_agh_toml_apart() {
-        let missing = refusal(None);
-        assert!(missing.contains("agh.toml"), "{missing}");
+    fn production_allows_missing_or_vault_config_but_refuses_invalid_config() {
+        assert!(production(None).is_ok());
+        assert!(production(Some("vault = true\n")).is_ok());
         let invalid = refusal(Some("[profiles.x]\ntier = \"dev\"\nbogus = true\n"));
-        assert!(invalid.contains("L1 "), "{invalid}");
+        assert!(invalid.contains("L1:"), "{invalid}");
         assert!(invalid.contains("bogus"), "{invalid}");
-        assert!(!invalid.contains("rule(s)"), "{invalid}");
-        let vault = refusal(Some("vault = true\n"));
-        assert!(vault.contains("vault = true"), "{vault}");
-        assert_ne!(missing, vault);
-        assert_ne!(missing, invalid);
-        assert!(!invalid.contains("vault"), "{invalid}");
     }
 
     #[test]

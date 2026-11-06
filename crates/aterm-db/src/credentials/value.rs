@@ -96,11 +96,12 @@ pub(super) fn validate(want: &Want, values: &Values) -> Result<Option<String>> {
                         .strip_suffix(concat!("-----END ", "PRIVATE KEY-----"))
                 })
                 .ok_or_else(refused)?;
-            let joined = Zeroizing::new(
-                body.chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect::<String>(),
-            );
+            let mut joined = Zeroizing::new(String::with_capacity(body.len()));
+            for ch in body.chars() {
+                if !ch.is_ascii_whitespace() {
+                    joined.push(ch);
+                }
+            }
             let der = Zeroizing::new(aterm_codec::base64::decode(&joined).map_err(|_| refused())?);
             ring::signature::RsaKeyPair::from_pkcs8(&der).map_err(|_| refused())?;
             return Ok(Some(email.to_owned()));

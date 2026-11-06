@@ -853,7 +853,7 @@ mod tests {
 
     /// The toolchain this host's own drivers find, as `verify` would.
     fn real_tools() -> crate::Toolchain {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = aterm_tempfile::manifest_dir().join("../..");
         let env = crate::EnvSnapshot::capture();
         // The host's own drivers must answer the discovery's probes, so they wait on the hang
         // detector, not the product's 5 s, which a loaded machine outlasts.

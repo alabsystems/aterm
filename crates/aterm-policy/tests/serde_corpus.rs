@@ -51,7 +51,8 @@ fn read(doc: &str) -> Result<String, String> {
 
 #[test]
 fn policy_documents_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "policy");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(dir.to_str().expect("a UTF-8 package directory"), "policy");
     for (name, policy) in [
         ("permissive", profiles::permissive()),
         ("standard", profiles::standard()),

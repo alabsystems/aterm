@@ -717,17 +717,26 @@ fn manifests(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for e in entries {
-        let path = e.path();
-        let Ok(kind) = e.file_type() else { continue };
-        if kind.is_dir() {
-            if !matches!(e.file_name().to_str(), Some(".git" | "target")) {
-                manifests(&path, out);
+    let mut entries: Vec<_> = entries
+        .flatten()
+        .filter_map(|e| {
+            let kind = e.file_type().ok()?;
+            let name = e.file_name();
+            if kind.is_dir() {
+                (!matches!(name.to_str(), Some(".git" | "target"))).then_some((name, true, e))
+            } else if kind.is_file() && name == "Cargo.toml" {
+                Some((name, false, e))
+            } else {
+                None
             }
-        } else if kind.is_file() && e.file_name() == "Cargo.toml" {
-            out.push(path);
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, is_dir, e) in entries {
+        if is_dir {
+            manifests(&e.path(), out);
+        } else {
+            out.push(e.path());
         }
     }
 }
@@ -808,24 +817,32 @@ fn strip_manifest(text: &str, dir: &Path) -> Option<(String, Vec<(String, String
             .find(|l| l.starts_with('['))
             .copied()
             .unwrap_or("");
-        let kind = ["test", "bench", "example", "bin"]
-            .into_iter()
-            .find(|k| head.trim_end() == format!("[[{k}]]"));
+        let kind = head
+            .trim_end()
+            .strip_prefix("[[")
+            .and_then(|s| s.strip_suffix("]]"))
+            .filter(|k| matches!(*k, "test" | "bench" | "example" | "bin"));
         if let Some(kind) = kind {
             let (mut path, mut name) = (None, None);
             for l in seg {
                 path = string_key(l, "path").or(path);
                 name = string_key(l, "name").or(name);
             }
-            let candidates = match (path, name) {
-                (Some(p), _) => vec![p.to_string()],
-                (None, Some(n)) => default_paths(kind, n, package_name.as_deref()),
-                (None, None) => Vec::new(),
+            let missing_regular_file = match (path, name) {
+                (Some(p), _) => {
+                    !std::fs::symlink_metadata(dir.join(p)).is_ok_and(|m| m.file_type().is_file())
+                }
+                (None, Some(n)) => {
+                    let candidates = default_paths(kind, n, package_name.as_deref());
+                    !candidates.is_empty()
+                        && !candidates.iter().any(|c| {
+                            std::fs::symlink_metadata(dir.join(c))
+                                .is_ok_and(|m| m.file_type().is_file())
+                        })
+                }
+                (None, None) => false,
             };
-            let has_regular_file = candidates.iter().any(|c| {
-                std::fs::symlink_metadata(dir.join(c)).is_ok_and(|m| m.file_type().is_file())
-            });
-            if !candidates.is_empty() && !has_regular_file {
+            if missing_regular_file {
                 dropped.push((kind.to_string(), name.unwrap_or("").to_string()));
                 continue;
             }

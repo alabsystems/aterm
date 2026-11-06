@@ -31,7 +31,7 @@
 //!   capture has pegged ten-second cells, and a light Mac must read calm.
 
 use crate::model::{CPU_OVER_BUSY, Pressure, Resource, ResourceView, SWAP_OVER_BPS, Snapshot};
-use crate::ring::{BUCKET_S, RING_BUCKETS};
+use crate::ring::{BUCKET_S, Cell, RING_BUCKETS};
 
 /// The level memory pressure `warn` lifts [`Strain::level`] to: the middle of heat step 5
 /// (`0.80..0.95` in [`crate::ink::HEAT_EDGES`]), as the chip and flame sketches lift it, so an
@@ -134,7 +134,7 @@ fn share(row: &ResourceView) -> Option<f64> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
     /// The CPU bucket was over: the load average past the cores with at least
-    /// [`CPU_OVER_BUSY`] of them busy, for at least half its readings (the strip's over cap).
+    /// [`CPU_OVER_BUSY`] of them busy, for at least half its readings.
     pub cpu_over: bool,
     /// The Memory bucket was over: swapping at [`SWAP_OVER_BPS`] (4 MiB/s) or more, for at least
     /// half its readings.
@@ -174,11 +174,18 @@ pub fn hour_of(snap: &Snapshot) -> impl Iterator<Item = Flags> + '_ {
     (first..=last).map(move |k| {
         let mem_i = index(mem, k);
         Flags {
-            cpu_over: index(cpu, k).is_some_and(|i| cpu.ring[i].over),
-            mem_over: mem_i.is_some_and(|i| mem.ring[i].over),
+            cpu_over: index(cpu, k).is_some_and(|i| over_half(&cpu.ring[i])),
+            mem_over: mem_i.is_some_and(|i| over_half(&mem.ring[i])),
             pressure: mem_i.and_then(|i| mem.pressure.get(i).copied().flatten()),
         }
     })
+}
+
+/// Whether at least half of a bucket's readings were over: the soak scores a bucket whole, so
+/// it counts one over when it mostly was. The strip draws the share itself
+/// (`Cell::over_share`, A1 §3).
+fn over_half(c: &Cell) -> bool {
+    c.n > 0.0 && c.over_share() * 2.0 >= 1.0
 }
 
 /// The bucket key of a row's oldest cell.
@@ -612,7 +619,8 @@ mod tests {
                 .map(|k| Cell {
                     mean: Some(1.0),
                     max: Some(1.0),
-                    over: over(k),
+                    n: 1.0,
+                    over_n: if over(k) { 1.0 } else { 0.0 },
                 })
                 .collect(),
             ring_k: last,

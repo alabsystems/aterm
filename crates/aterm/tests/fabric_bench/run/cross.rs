@@ -522,7 +522,7 @@ fn report(
     let mut burst_json = aterm_json::Map::new();
     for (v, form) in Form::ALL.iter().enumerate() {
         let (deliver, messages, span_ms) = bursts_of(&by.bursts[v]);
-        let rate = (span_ms > 0.0).then(|| messages as f64 / (span_ms / 1000.0));
+        let rate = (span_ms > 0.0).then_some(messages as f64 / (span_ms / 1000.0));
         let s = stats::summarize(&deliver);
         let q = |f: fn(&stats::Summary) -> f64| {
             s.as_ref()

@@ -20,6 +20,9 @@ pub(crate) struct GitReads {
     pub signatures: bool,
     /// A `log`/`show`/`whatchanged`/`reflog`.
     pub log_like: bool,
+    /// A `grep` that reads the files the index tracks (no `--no-index`), an assume-unchanged
+    /// one from the index ([`GitView::assume_unchanged`]).
+    pub grep_index: bool,
     /// The first read that contacts a remote, as a reason.
     pub remote: Option<String>,
 }
@@ -160,6 +163,9 @@ pub(crate) fn git_reads(
         if matches!(sub, "log" | "show" | "whatchanged" | "reflog") {
             out.log_like = true;
         }
+        if sub == "grep" && !has("--no-index") {
+            out.grep_index = true;
+        }
         let contacts_remote = sub == "ls-remote"
             || (sub == "remote" && crate::supervise::classify::git_remote_show_contacts(args));
         if contacts_remote && out.remote.is_none() {
@@ -257,6 +263,15 @@ pub struct GitView {
     pub submodules: Vec<(PathBuf, GitView)>,
     /// The worker's `GIT_EXTERNAL_DIFF` environment value.
     pub external_diff: Option<String>,
+    /// Whether the index marks an entry assume-unchanged, whose copy in the index `git grep`
+    /// reads in place of the file (MEASURED 2026-11-05 with git 2.56.0: after `git update-index
+    /// --assume-unchanged a/.ssh/id_rsa` and the file's removal, `git grep token` printed
+    /// `a/.ssh/id_rsa:token rsa`).
+    pub assume_unchanged: bool,
+    /// The first of `GIT_LITERAL_PATHSPECS` and `GIT_ICASE_PATHSPECS` the worker's environment
+    /// sets, under which git reads every pathspec literally or in any case, otherwise than the
+    /// secret check reads it.
+    pub pathspec_env: Option<String>,
 }
 
 const MAX_SUBMODULE_DEPTH: usize = 8;
@@ -594,6 +609,10 @@ impl Probe<'_> {
                 .var("GIT_EXTERNAL_DIFF")
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            pathspec_env: ["GIT_LITERAL_PATHSPECS", "GIT_ICASE_PATHSPECS"]
+                .into_iter()
+                .find(|key| self.env.var(key).is_some_and(|v| !v.is_empty()))
+                .map(str::to_string),
             ..GitView::default()
         };
         if let Ok(hook) = run(&["rev-parse", "--git-path", "hooks/post-index-change"])
@@ -623,7 +642,9 @@ impl Probe<'_> {
         {
             view.filters_selected = self.filters_selected(&top);
         }
-        for path in self.gitlinks(&top)? {
+        let (gitlinks, assume_unchanged) = self.index_entries(&top)?;
+        view.assume_unchanged = assume_unchanged;
+        for path in gitlinks {
             let sub = normalise(&top.join(&path));
             if !sub.starts_with(&top) || !sub.join(".git").exists() {
                 continue; // not populated: a read does not recurse into it
@@ -642,9 +663,13 @@ impl Probe<'_> {
         Ok(view)
     }
 
-    fn gitlinks(&self, top: &Path) -> Result<Vec<String>, String> {
+    /// The index's gitlinks (the paths of its submodules), and whether it marks any entry
+    /// assume-unchanged: `git ls-files -v` tags such an entry with a lowercase letter, beside the
+    /// stage line `--stage` writes (MEASURED 2026-11-05 with git 2.56.0: `h 100644 <oid> 0\tx.rs`
+    /// after `git update-index --assume-unchanged x.rs`).
+    fn index_entries(&self, top: &Path) -> Result<(Vec<String>, bool), String> {
         let mut cmd = self.git(top);
-        cmd.args(["ls-files", "-z", "--stage"]);
+        cmd.args(["ls-files", "-z", "--stage", "-v"]);
         let out = aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
             .map_err(|e| format!("cannot list the index in {}: {e}", top.display()))?;
         if !out.status.success() {
@@ -652,7 +677,7 @@ impl Probe<'_> {
                 "cannot list the index in",
                 top,
                 out.status,
-                "git ls-files --stage",
+                "git ls-files --stage -v",
             ));
         }
         if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
@@ -662,13 +687,20 @@ impl Probe<'_> {
                 aterm_uds::deadline::OUTPUT_KEEP
             ));
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter_map(|entry| {
-                let (meta, path) = entry.split_once('\t')?;
-                meta.starts_with("160000 ").then(|| path.to_string())
-            })
-            .collect())
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let mut gitlinks = Vec::new();
+        let mut assume_unchanged = false;
+        for entry in listed.split('\0') {
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let (tag, stage) = meta.split_once(' ').unwrap_or(("", meta));
+            assume_unchanged |= tag.chars().any(|c| c.is_ascii_lowercase());
+            if stage.starts_with("160000 ") {
+                gitlinks.push(path.to_string());
+            }
+        }
+        Ok((gitlinks, assume_unchanged))
     }
 
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
@@ -872,7 +904,7 @@ pub(crate) fn consulted(key: &str) -> bool {
 }
 
 /// The version of [`GitView::project`]'s rule.
-pub const PROJECTION: u32 = 1;
+pub const PROJECTION: u32 = 2;
 
 /// The one value a projected entry keeps in place of anything but a boolean ([`GitView::project`]).
 pub const VALUE_SET: &str = "<set>";
@@ -912,6 +944,8 @@ impl GitView {
                 .map(|(path, sub)| (path.clone(), sub.project()))
                 .collect(),
             external_diff: self.external_diff.as_ref().map(|_| VALUE_SET.to_string()),
+            assume_unchanged: self.assume_unchanged,
+            pathspec_env: self.pathspec_env.clone(),
         }
     }
 }
@@ -965,6 +999,19 @@ pub(crate) fn hazard(view: &GitView, reads: &GitReads) -> Option<String> {
              refreshes the index (status, diff) runs",
             h.display()
         ));
+    }
+    if let Some(key) = &view.pathspec_env {
+        return Some(format!(
+            "git read: `{key}` is set in the worker's environment: git reads every pathspec \
+             otherwise than this check reads it"
+        ));
+    }
+    if reads.grep_index && view.assume_unchanged {
+        return Some(
+            "git read: the index marks a file assume-unchanged, whose copy in the index git grep \
+             reads in place of the file, which this check cannot list"
+                .to_string(),
+        );
     }
     view.submodules.iter().find_map(|(path, sub)| {
         hazard(sub, reads).map(|why| format!("in submodule {}: {why}", path.display()))

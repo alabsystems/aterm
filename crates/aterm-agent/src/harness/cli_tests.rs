@@ -699,6 +699,7 @@ fn the_accounts_page_says_what_the_limit_reset_reads_and_takes() {
         text: "a later build's text",
         kind: aterm_phase::anchors::AnchorKind::Literal,
         since: "9.9.9",
+        gone_in: None,
     };
     let widened: Vec<Anchor> = anchors.iter().copied().chain([later]).collect();
     assert!(!lines.contains("9.9.9's"));
@@ -4355,6 +4356,434 @@ fn the_ledger_verb_lists_a_self_claims_act_as_its_holders() {
         lines[1].ends_with(" self-claim codex-alab@4242 continue continue@v1"),
         "{out}"
     );
+}
+
+#[test]
+fn ledger_zero_rows_selects_no_output_without_claiming_empty_history() {
+    let row = b"{\"t\":1,\"ts\":1000,\"id\":1,\"step\":\"present\",\"command\":\"present\"}\n";
+    for (file, json) in ledger_output_modes() {
+        let tmp = tmp_dir("ledger-zero-rows");
+        let env = env_at(&tmp);
+        let path = ledger_path(&env, &file).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, row).unwrap();
+        let (ok, out, err) = go(
+            &Cmd::Ledger {
+                file: file.clone(),
+                count: 1,
+                json,
+            },
+            &env,
+        );
+        assert!(ok && err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "populated control: {out}");
+        assert!(out.contains("present"), "populated control: {out}");
+        std::fs::remove_file(&path).unwrap();
+        for body in [
+            Some(row.as_slice()),
+            None,
+            Some(b"".as_slice()),
+            Some(b"\xff\n"),
+        ] {
+            if let Some(bytes) = body {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let (ok, out, err) = go(
+                &Cmd::Ledger {
+                    file: file.clone(),
+                    count: 0,
+                    json,
+                },
+                &env,
+            );
+            assert!(ok && err.is_empty(), "{file:?} json={json}: {err}");
+            assert!(out.is_empty(), "zero rows selected: {out}");
+            let mut sink = ResultSink {
+                bytes: Vec::new(),
+                remaining: Some(0),
+                fail_flush: true,
+                flushed: false,
+            };
+            let mut err = Vec::new();
+            assert_eq!(
+                run_ledger(&env, &file, 0, json, &mut sink, &mut err),
+                ExitCode::from(1)
+            );
+            assert!(sink.bytes.is_empty() && sink.flushed);
+            assert!(String::from_utf8_lossy(&err).contains(OUTPUT_FAILURE));
+            match body {
+                Some(bytes) => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+                None => assert!(!path.exists()),
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut err = Vec::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            run_ledger(&env, &file, 0, json, &mut out, &mut err),
+            ExitCode::from(1)
+        );
+        assert!(out.is_empty() && !err.is_empty());
+    }
+}
+
+#[test]
+fn ledger_output_write_failures_are_nonzero_and_read_only() {
+    let rows = b"{\"t\":1,\"ts\":1000,\"id\":1,\"step\":\"first\"}\n{\"t\":2,\"ts\":2000,\"id\":2,\"step\":\"last\"}\n";
+    for (file, json) in ledger_output_modes() {
+        for body in [rows.as_slice(), b""] {
+            let tmp = tmp_dir("ledger-output-write");
+            let env = env_at(&tmp);
+            let path = ledger_path(&env, &file).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            let (mut complete, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run_ledger(&env, &file, 8, json, &mut complete, &mut err),
+                ExitCode::SUCCESS
+            );
+            assert!(err.is_empty());
+            let mut limits = vec![1];
+            if let Some(newline) = complete.iter().position(|byte| *byte == b'\n') {
+                limits.push(newline + 2);
+            }
+            for limit in limits.into_iter().filter(|limit| *limit < complete.len()) {
+                let mut sink = ResultSink {
+                    bytes: Vec::new(),
+                    remaining: Some(limit),
+                    fail_flush: false,
+                    flushed: false,
+                };
+                err.clear();
+                let code = run_ledger(&env, &file, 8, json, &mut sink, &mut err);
+                assert_eq!(
+                    code,
+                    ExitCode::from(1),
+                    "{file:?} json={json} limit={limit}"
+                );
+                assert!(String::from_utf8_lossy(&err).contains(OUTPUT_FAILURE));
+                assert_eq!(sink.bytes, complete[..limit]);
+                assert_eq!(std::fs::read(&path).unwrap(), body);
+            }
+        }
+    }
+}
+
+#[test]
+fn ledger_output_flush_failures_are_nonzero_even_for_empty_or_damaged_input() {
+    let rows = b"{\"t\":1,\"ts\":1000,\"id\":1,\"step\":\"first\"}\n";
+    let damaged = [b"\xff\n".as_slice(), rows.as_slice()].concat();
+    for (file, json) in ledger_output_modes() {
+        for (body, damaged_input) in [
+            (rows.as_slice(), false),
+            (b"", false),
+            (damaged.as_slice(), true),
+        ] {
+            let tmp = tmp_dir("ledger-output-flush");
+            let env = env_at(&tmp);
+            let path = ledger_path(&env, &file).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            let (mut complete, mut baseline_err) = (Vec::new(), Vec::new());
+            let expected = if damaged_input {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            };
+            assert_eq!(
+                run_ledger(&env, &file, 8, json, &mut complete, &mut baseline_err),
+                expected
+            );
+            assert_eq!(baseline_err.is_empty(), !damaged_input);
+            let mut sink = ResultSink {
+                bytes: Vec::new(),
+                remaining: None,
+                fail_flush: true,
+                flushed: false,
+            };
+            let mut err = Vec::new();
+            assert_eq!(
+                run_ledger(&env, &file, 8, json, &mut sink, &mut err),
+                ExitCode::from(1),
+                "{file:?} json={json} damaged={damaged_input}"
+            );
+            assert!(sink.flushed, "the report must flush its supplied writer");
+            assert_eq!(sink.bytes, complete);
+            assert!(err.starts_with(&baseline_err));
+            assert!(String::from_utf8_lossy(&err).contains(OUTPUT_FAILURE));
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+}
+
+fn ledger_output_modes() -> [(LedgerFile, bool); 5] {
+    [
+        (LedgerFile::Disk, false),
+        (LedgerFile::Upgrade, false),
+        (LedgerFile::Accounts(Cli::Claude), false),
+        (LedgerFile::Approvals(Some("s-output".into())), false),
+        (LedgerFile::Upgrade, true),
+    ]
+}
+
+#[test]
+fn ledger_utf8_damage_does_not_hide_readable_json_rows() {
+    let tmp = tmp_dir("ledger-utf8-display");
+    let env = env_at(&tmp);
+    let path = env.state.join("upgrade/ledger.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let first = b"{\"id\":1,\"t\":1,\"step\":\"first\"}\n";
+    let last = b"{\"id\":3,\"t\":3,\"step\":\"last\"}\n";
+    let broken = b"{\"id\":2,\"t\":2,\"step\":\"forged\",\"detail\":\"\xff\"}\n";
+    let damaged = [first.as_slice(), broken.as_slice(), last.as_slice()].concat();
+    std::fs::write(&path, &damaged).unwrap();
+    for (count, expected) in [(1, &[3][..]), (2, &[3][..]), (3, &[1, 3][..])] {
+        let (ok, out, err) = go(
+            &Cmd::Ledger {
+                file: LedgerFile::Upgrade,
+                count,
+                json: true,
+            },
+            &env,
+        );
+        assert!(!ok, "corruption must remain an error");
+        assert!(!err.is_empty());
+        let ids: Vec<u64> = out
+            .lines()
+            .map(|row| {
+                aterm_json::from_str::<Value>(row).unwrap()["id"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, expected, "count={count}: {out}{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+    }
+    let healthy = [
+        first.as_slice(),
+        b"{\"id\":2,\"t\":2,\"step\":\"middle\"}\n",
+        last.as_slice(),
+    ]
+    .concat();
+    std::fs::write(&path, healthy).unwrap();
+    let (ok, out, err) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Upgrade,
+            count: 3,
+            json: true,
+        },
+        &env,
+    );
+    assert!(ok && err.is_empty(), "{err}");
+    let ids: Vec<u64> = out
+        .lines()
+        .map(|row| {
+            aterm_json::from_str::<Value>(row).unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+#[test]
+fn ledger_utf8_damage_is_reported_in_human_output_without_an_empty_history_claim() {
+    let tmp = tmp_dir("ledger-utf8-human");
+    let env = env_at(&tmp);
+    let path = env.state.join("upgrade/ledger.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        b"{\"t\":1,\"step\":\"first\"}\n\xff\n{\"t\":3,\"step\":\"last\"}\n",
+    )
+    .unwrap();
+    let command = Cmd::Ledger {
+        file: LedgerFile::Upgrade,
+        count: 3,
+        json: false,
+    };
+    let (ok, out, err) = go(&command, &env);
+    assert!(!ok && !err.is_empty());
+    assert_eq!(out.lines().count(), 2, "{out}{err}");
+    assert!(out.contains(" first ") && out.contains(" last "), "{out}");
+    std::fs::write(&path, b"\xff\n").unwrap();
+    let (ok, out, err) = go(&command, &env);
+    assert!(!ok && !err.is_empty());
+    assert!(
+        out.is_empty(),
+        "unreadable rows are not an empty history: {out}"
+    );
+}
+
+#[test]
+fn ledger_utf8_damage_still_refuses_strict_reads_and_compaction() {
+    let tmp = tmp_dir("ledger-utf8-strict");
+    let path = tmp.path().join("ledger.jsonl");
+    let body = b"\xff\n{\"id\":3}\n";
+    std::fs::write(&path, body).unwrap();
+    assert_eq!(
+        tail_lines(&path, 1).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(bound_ledger(&path, 1, 1).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), body);
+}
+
+#[test]
+fn ledger_utf8_display_keeps_oversized_rows_fatal() {
+    let tmp = tmp_dir("ledger-utf8-size");
+    let env = env_at(&tmp);
+    let path = env.state.join("upgrade/ledger.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut body = b"{\"id\":1}\n".to_vec();
+    body.extend(std::iter::repeat_n(0xff, (16 << 20) + 1));
+    body.extend_from_slice(b"\n{\"id\":3}\n");
+    std::fs::write(&path, body).unwrap();
+    let (ok, out, err) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Upgrade,
+            count: 3,
+            json: true,
+        },
+        &env,
+    );
+    assert!(!ok && !err.is_empty());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn ledger_tail_budget_matches_a_batch_final_window() {
+    fn explore(sequence: &mut Vec<Option<&'static str>>) {
+        for keep in 0..=4 {
+            let selected = &sequence[sequence.len().saturating_sub(keep)..];
+            let expected: Vec<String> = selected
+                .iter()
+                .filter_map(|row| *row)
+                .map(str::to_owned)
+                .collect();
+            let bytes: usize = expected.iter().map(String::len).sum();
+            for cap in 0..=8 {
+                let mut tail = LedgerTail::new(keep, cap);
+                for &row in sequence.iter() {
+                    tail.push(row.map(Into::into));
+                }
+                let got = tail.into_rows();
+                if bytes <= cap {
+                    assert_eq!(got.as_ref(), Some(&expected), "{sequence:?} {keep} {cap}");
+                } else {
+                    assert!(got.is_none(), "{sequence:?} {keep} {cap}");
+                }
+            }
+        }
+        if sequence.len() < 7 {
+            for row in [None, Some("x"), Some("éé")] {
+                sequence.push(row);
+                explore(sequence);
+                sequence.pop();
+            }
+        }
+    }
+    explore(&mut Vec::new());
+}
+
+#[test]
+fn ledger_tail_budget_refuses_a_large_final_selection_without_rewriting_history() {
+    let tmp = tmp_dir("ledger-tail-budget");
+    let env = env_at(&tmp);
+    let path = ledger_path(&env, &LedgerFile::Upgrade).unwrap();
+    let digest = write_large_ledger_tail(&path);
+    let refused = match tail_lines(&path, 9) {
+        Err(error) => error.kind() == io::ErrorKind::InvalidData,
+        Ok(rows) => {
+            drop(rows);
+            false
+        }
+    };
+    assert!(
+        refused,
+        "a 72 MiB selected tail must exceed the byte budget"
+    );
+    assert!(bound_ledger(&path, 1, 9).is_err());
+    let (ok, out, err) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Upgrade,
+            count: 9,
+            json: true,
+        },
+        &env,
+    );
+    assert!(!ok && out.is_empty() && !err.is_empty());
+    let mut file = std::fs::File::open(&path).unwrap();
+    let mut hash = aterm_digest::Sha256::new();
+    let mut bytes = [0; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut bytes).unwrap();
+        if n == 0 {
+            break;
+        }
+        hash.update(&bytes[..n]);
+    }
+    assert_eq!(hash.finalize(), digest);
+}
+
+#[test]
+fn ledger_tail_budget_accepts_a_small_final_tail_after_large_history() {
+    let tmp = tmp_dir("ledger-tail-budget-aging");
+    let env = env_at(&tmp);
+    let path = ledger_path(&env, &LedgerFile::Upgrade).unwrap();
+    write_large_ledger_tail(&path);
+    let rows: Vec<String> = (0..9).map(|n| format!("{{\"last\":{n}}}")).collect();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    for row in &rows {
+        writeln!(file, "{row}").unwrap();
+    }
+    let got = tail_lines(&path, 9).unwrap();
+    assert!(got == rows, "the small final tail must remain readable");
+    file.write_all(b"\xff\n").unwrap();
+    for row in &rows {
+        writeln!(file, "{row}").unwrap();
+    }
+    let error = match tail_lines(&path, 9) {
+        Err(error) => error,
+        Ok(_) => panic!("strict reads must reject corruption outside the final tail"),
+    };
+    assert!(
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<std::str::Utf8Error>()),
+        "a large earlier window must not hide later corruption"
+    );
+    let (ok, out, err) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Upgrade,
+            count: 9,
+            json: true,
+        },
+        &env,
+    );
+    assert!(!ok && !err.is_empty());
+    assert!(out.lines().eq(rows.iter().map(String::as_str)));
+}
+
+fn write_large_ledger_tail(path: &Path) -> [u8; 32] {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = std::fs::File::create(path).unwrap();
+    let mut row = vec![b'x'; 8 << 20];
+    row[0] = b'"';
+    *row.last_mut().unwrap() = b'"';
+    row.push(b'\n');
+    let mut hash = aterm_digest::Sha256::new();
+    for _ in 0..9 {
+        file.write_all(&row).unwrap();
+        hash.update(&row);
+    }
+    hash.finalize()
 }
 
 #[test]
@@ -11256,47 +11685,47 @@ fn disk_free_removes_a_scratch_cache_journals_it_and_exits_nonzero_on_a_refusal(
     assert_eq!(actions, ["removing", "removed", "refused"], "{ledger}");
 }
 
+const OUTPUT_FAILURE: &str = "fixture output failure";
+
+struct ResultSink {
+    bytes: Vec<u8>,
+    remaining: Option<usize>,
+    fail_flush: bool,
+    flushed: bool,
+}
+
+impl Write for ResultSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self
+            .remaining
+            .map_or(bytes.len(), |left| left.min(bytes.len()));
+        if count == 0 && !bytes.is_empty() {
+            return Err(io::Error::other(OUTPUT_FAILURE));
+        }
+        self.bytes.extend_from_slice(&bytes[..count]);
+        if let Some(left) = &mut self.remaining {
+            *left -= count;
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushed = true;
+        if self.fail_flush {
+            Err(io::Error::other(OUTPUT_FAILURE))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[test]
 fn disk_free_result_write_and_flush_failures_are_nonzero_without_undoing_cleanup() {
-    const OUTPUT_FAILURE: &str = "fixture output failure";
-
     #[derive(Clone, Copy, Debug)]
     enum Failure {
         Row,
         Summary,
         Flush,
-    }
-
-    struct ResultSink {
-        bytes: Vec<u8>,
-        remaining: Option<usize>,
-        fail_flush: bool,
-        flushed: bool,
-    }
-
-    impl Write for ResultSink {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let count = self
-                .remaining
-                .map_or(bytes.len(), |left| left.min(bytes.len()));
-            if count == 0 && !bytes.is_empty() {
-                return Err(io::Error::other(OUTPUT_FAILURE));
-            }
-            self.bytes.extend_from_slice(&bytes[..count]);
-            if let Some(left) = &mut self.remaining {
-                *left -= count;
-            }
-            Ok(count)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flushed = true;
-            if self.fail_flush {
-                Err(io::Error::other(OUTPUT_FAILURE))
-            } else {
-                Ok(())
-            }
-        }
     }
 
     for dry_run in [false, true] {

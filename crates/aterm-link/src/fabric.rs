@@ -1160,10 +1160,10 @@ impl BrokerView {
     }
 
     /// The build the node service serving the socket runs, where it is this process's own
-    /// ([`Self::own_build`]): `<version>+g<commit>` ([`aterm_types::version::build_id`]).
+    /// ([`Self::own_build`]): `<version>+g<commit>` ([`aterm_stamp::build_id`]).
     #[must_use]
     pub fn build(&self) -> Option<String> {
-        self.own_build.then(aterm_types::version::build_id)
+        self.own_build.then(aterm_stamp::build_id)
     }
 
     /// astream's health snapshot ([`Self::snapshot`]) only when it is the serving broker's own
@@ -8777,7 +8777,7 @@ mod tests {
             poisoned: None,
             flushes: FlushCounts::default(),
         });
-        let id = aterm_types::version::build_id();
+        let id = aterm_stamp::build_id();
         assert_eq!(
             row(&r, "host")
                 .as_deref()
@@ -11075,7 +11075,7 @@ mod running_argv_tests {
             "its build is asked of it once"
         );
         assert!(node.own_build);
-        assert_eq!(node.build(), Some(aterm_types::version::build_id()));
+        assert_eq!(node.build(), Some(aterm_stamp::build_id()));
         assert_eq!(node.keeper(), crate::enable::Keeper::Node);
         let (other, _) = locate(true, "/r/bus.sock", &serve, false, false);
         assert_eq!((other.host, other.build()), (Some(Host::NodeService), None));

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::check_record::{Checks, Failed, State, VerifyRun};
 use crate::line::{Admitted, Fix, Hop, Line};
 use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
@@ -35,6 +36,11 @@ fn hop_of(fix: &str) -> String {
 }
 
 struct World {
+    fleet_refusal: Option<String>,
+    fleet_selected: Option<Line>,
+    existing_fleet_line: Option<Line>,
+    fleet_audit_refusal: bool,
+    fleet_audits: usize,
     dir: aterm_tempfile::TempDir,
     now: u64,
     out: Vec<String>,
@@ -62,8 +68,16 @@ struct World {
     newest: Option<String>,
     cut: Option<CutState>,
     attested: Option<String>,
-    /// The executable digests a verified record names.
-    verified: BTreeSet<String>,
+    /// Each check's record, by R's commit (its tree here), the executable for the bundle's
+    /// `measure` (`None` for a tree check), and the check: its outcome word.
+    records: BTreeMap<(String, Option<String>, String), &'static str>,
+    /// The test binaries a test record that did not pass lists as passed.
+    resume: Vec<(String, String)>,
+    /// What the fake `verify release` records for a check it is asked to run, over
+    /// `verify_passes` (every asked check ok, else nothing).
+    verify_outcomes: BTreeMap<&'static str, &'static str>,
+    /// What each `verify release` was asked to run.
+    verify_runs: Vec<VerifyRun>,
     /// origin's ledger tail.
     tail: u64,
     /// The release cache: key → (its build number, its executable digest, its app).
@@ -186,6 +200,11 @@ impl World {
         let mut origin_tags = BTreeMap::new();
         origin_tags.insert("v0.5.0".into(), OLD.into());
         Self {
+            fleet_refusal: None,
+            fleet_selected: None,
+            existing_fleet_line: None,
+            fleet_audit_refusal: false,
+            fleet_audits: 0,
             dir: aterm_tempfile::tempdir().unwrap(),
             now: 1_000_000,
             out: Vec::new(),
@@ -209,7 +228,10 @@ impl World {
             newest: Some(OLD.into()),
             cut: None,
             attested: None,
-            verified: BTreeSet::new(),
+            records: BTreeMap::new(),
+            resume: Vec::new(),
+            verify_outcomes: BTreeMap::new(),
+            verify_runs: Vec::new(),
             tail: 1_791_500_000,
             artifacts: BTreeMap::new(),
             overtaken_at_cut: false,
@@ -318,6 +340,62 @@ impl World {
     fn macho(&self) -> Option<String> {
         self.journal()?.artifact.map(|a| a.macho_sha256)
     }
+
+    /// The records of `commit`'s tree on `executable`, as the real judge folds them.
+    fn checks_of(&self, commit: &str, executable: Option<&str>) -> Checks {
+        let record = |check: &str, u: Option<&str>| {
+            self.records
+                .get(&(commit.to_owned(), u.map(str::to_owned), check.to_owned()))
+                .copied()
+        };
+        let log = "/l/06-verify.log".to_owned();
+        let mut also = Vec::new();
+        if record(crate::check_record::RUN_LEVEL, None) == Some("FAIL") {
+            also.push(Failed {
+                check: crate::check_record::RUN_LEVEL.into(),
+                log: log.clone(),
+                unrecorded: false,
+            });
+        }
+        for ((c, u, check), outcome) in &self.records {
+            if c == commit && check == "measure" && u.as_deref() != executable && *outcome == "FAIL"
+            {
+                also.push(Failed {
+                    check: "measure".into(),
+                    log: log.clone(),
+                    unrecorded: false,
+                });
+            }
+        }
+        Checks::of(
+            commit,
+            commit,
+            executable,
+            |check| {
+                let measure = check == aterm_verify::checks::Check::Measure;
+                if measure && executable.is_none() {
+                    return State::Missing { resume: Vec::new() };
+                }
+                match record(check.name(), executable.filter(|_| measure)) {
+                    Some("ok") => State::Passed,
+                    Some("FAIL") => State::Failed { log: log.clone() },
+                    _ => State::Missing {
+                        resume: self.resume.clone(),
+                    },
+                }
+            },
+            also,
+        )
+    }
+
+    /// Every check of the journal's R passed on the journal's bundle.
+    fn complete(&self) -> bool {
+        let Some(j) = self.journal() else {
+            return false;
+        };
+        self.checks_of(&j.commit, self.macho().as_deref())
+            .complete()
+    }
 }
 
 fn mac() -> ReleaseOptions {
@@ -349,6 +427,30 @@ fn ran(code: i32) -> Ran {
 }
 
 impl Backend for World {
+    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, String> {
+        Ok(self
+            .existing_fleet_line
+            .clone()
+            .filter(|line| line.version == version))
+    }
+    fn fleet_line(
+        &mut self,
+        line: &crate::line::Line,
+        _handed: bool,
+    ) -> Result<crate::line::Line, String> {
+        self.fleet_refusal.clone().map_or_else(
+            || Ok(self.fleet_selected.clone().unwrap_or_else(|| line.clone())),
+            Err,
+        )
+    }
+    fn fleet_audit(&mut self) -> Result<(), String> {
+        self.fleet_audits += 1;
+        if self.fleet_audit_refusal {
+            Err("fleet line was adopted".into())
+        } else {
+            Ok(())
+        }
+    }
     fn observe_operational(&mut self) {
         self.observations.push("observe-operational");
     }
@@ -641,15 +743,6 @@ impl Backend for World {
     }
     fn facts(&mut self, c: &Candidate, _prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let down = self.judge_down;
-        let yes = |set: &BTreeSet<String>, what: &str, key: &str| {
-            if down {
-                Answer::unanswered(format!("the {what} judge did not answer: store unreadable"))
-            } else if set.contains(key) {
-                Answer::yes(format!("{what} {}", &key[..4]))
-            } else {
-                Answer::no(format!("no {what} receipt"))
-            }
-        };
         let built = match artifact {
             None => Answer::no("no bundle is built for it yet"),
             Some(a)
@@ -662,9 +755,13 @@ impl Backend for World {
             }
             Some(_) => Answer::no("the release cache holds no COMPLETE bundle for it"),
         };
-        let verified = match artifact.filter(|_| built.yes) {
-            None => Answer::no("its bundle is not built yet (step 5)"),
-            Some(a) => yes(&self.verified, "PASSED", &a.macho_sha256),
+        let checks = if down {
+            Checks::unanswered("the check records' judge did not answer: store unreadable")
+        } else {
+            let executable = artifact
+                .filter(|_| built.yes)
+                .map(|a| a.macho_sha256.as_str());
+            self.checks_of(&c.commit, executable)
         };
         let attested =
             self.attested.as_deref() == Some(c.commit.as_str()) && self.staged_by.is_some();
@@ -674,7 +771,7 @@ impl Backend for World {
             attested,
             staged_by: self.staged_by.clone().filter(|_| attested),
             built,
-            verified,
+            checks,
             fixtures: if self.fixtures_on_main {
                 Answer::yes(format!("v{}'s handoff fixtures are on main", c.version))
             } else {
@@ -837,8 +934,15 @@ impl Backend for World {
             fixtures: fixtures.then(|| self.stage_fixtures(c, reserved, p)),
         }
     }
-    fn verify(&mut self, _c: &Candidate, _p: &Prover, artifact: &Artifact) -> Result<Ran, Refusal> {
+    fn verify(
+        &mut self,
+        c: &Candidate,
+        _p: &Prover,
+        artifact: &Artifact,
+        run: &VerifyRun,
+    ) -> Result<Ran, Refusal> {
         self.calls.push("verify".into());
+        self.verify_runs.push(run.clone());
         assert!(
             self.artifacts
                 .values()
@@ -853,8 +957,30 @@ impl Backend for World {
             cmd.args(["-c", script.as_str(), "sh"]).arg(dir.as_path());
             return Ok(real.logged(Step::Verify, &mut cmd));
         }
-        if self.verify_passes {
-            self.verified.insert(artifact.macho_sha256.clone());
+        let mut failed = false;
+        for check in &run.checks {
+            let outcome = self
+                .verify_outcomes
+                .get(check.as_str())
+                .copied()
+                .or(self.verify_passes.then_some("ok"));
+            if let Some(outcome) = outcome {
+                failed |= outcome == "FAIL";
+                let u = (check == "measure").then(|| artifact.macho_sha256.clone());
+                self.records
+                    .insert((c.commit.clone(), u, check.clone()), outcome);
+            }
+        }
+        // As the real cutter does, an exit 1 that named no FAIL is a run-level FAIL.
+        if self.verify_code == 1 && !failed {
+            self.records.insert(
+                (
+                    c.commit.clone(),
+                    None,
+                    crate::check_record::RUN_LEVEL.into(),
+                ),
+                "FAIL",
+            );
         }
         if let Some(then) = self.after_verify {
             then(self);
@@ -1011,6 +1137,122 @@ fn lease_held() -> Refusal {
         "release lease — the release lock is held by claim abcdef; nothing was claimed",
         "on the machine that cut it: targo --unverified ship release",
     )
+}
+
+#[test]
+fn fleet_line_excludes_a_second_cut_and_rechecks_before_publication() {
+    let mut live = World::new();
+    live.fleet_refusal = Some("CUTTING ELSEWHERE: live progressing peer".into());
+    let (code, _) = live.run(bump());
+    assert_eq!(code, 4);
+    assert_eq!(live.count("stage"), 0);
+    assert_eq!(live.count("build"), 0);
+
+    let mut adopted = World::new();
+    adopted.fleet_audit_refusal = true;
+    let (code, _) = adopted.run(bump());
+    assert_ne!(code, 0);
+    assert!(adopted.fleet_audits > 0);
+    assert_eq!(adopted.count("publish"), 0);
+    assert_eq!(adopted.count("cut"), 0);
+
+    // Negative control: the same candidate publishes when it still owns the line.
+    let mut owner = World::new();
+    let (code, last) = owner.run(bump());
+    assert_eq!(code, 0, "{last}");
+    assert!(owner.fleet_audits >= 2);
+}
+
+#[test]
+fn fleet_line_adoption_keeps_the_candidates_head_and_drops_other_trees_records() {
+    let mut world = World::new();
+    let line = Line::start("0.6.0", NEXT, 123);
+    world.fleet_selected = Some(line.clone());
+    let mut candidate = Candidate {
+        version: "0.6.0".into(),
+        commit: BUMP.into(),
+        why: "moving main".into(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let previous = Journal {
+        version: "0.6.0".into(),
+        commit: BUMP.into(),
+        done: vec!["commit-gates".into()],
+        ..Journal::default()
+    };
+    let mut journal = Some(previous.clone());
+    crate::line_claim::select(&mut world, false, &mut candidate, &mut journal, 1000).unwrap();
+    assert_eq!(candidate.commit, NEXT);
+    let adopted = journal.unwrap();
+    assert_eq!(adopted.line(), line);
+    assert!(adopted.done.is_empty());
+    assert!(adopted.reserved.is_none());
+    assert!(adopted.artifact.is_none());
+
+    // Negative control: selecting the existing line preserves its same-tree records.
+    world.fleet_selected = None;
+    let mut same = Some(previous);
+    candidate.commit = BUMP.into();
+    crate::line_claim::select(&mut world, false, &mut candidate, &mut same, 1000).unwrap();
+    assert_eq!(same.unwrap().done, ["commit-gates"]);
+}
+
+#[test]
+fn fleet_line_is_read_before_refusing_a_newer_main_tip_than_the_published_source() {
+    let setup = || {
+        let mut world = World::new();
+        world.history.insert(1, NEXT.into());
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.versions.insert(NEXT.into(), "0.6.0".into());
+        world.published.insert(NEXT.into(), "e1e1e1e1e1e1".into());
+        world.source_attested.insert(NEXT.into());
+        world.newest = Some(NEXT.into());
+        world
+    };
+    let mut negative = setup();
+    let (code, _) = negative.run(mac());
+    assert_ne!(code, 0);
+    assert_eq!(negative.count("build"), 0);
+    let mut adopter = setup();
+    adopter.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 123));
+    let (code, last) = adopter.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", adopter.out);
+    assert_eq!(adopter.journal().unwrap().commit, NEXT);
+    assert_eq!(adopter.count("bump"), 0);
+}
+
+#[test]
+fn fleet_line_read_does_not_erase_a_carried_hop_a_failed_write_did_not_publish() {
+    let mut world = World::new();
+    let base = Line::start("0.6.0", BUMP, 123);
+    world.existing_fleet_line = Some(base.clone());
+    let mut advanced = base;
+    advanced.hops.push(Hop {
+        commit: NEXT.into(),
+        carries: FIX.into(),
+        why: "landed fix".into(),
+        paths: vec!["src/lib.rs".into()],
+    });
+    let mut candidate = Candidate {
+        commit: NEXT.into(),
+        version: "0.6.0".into(),
+        why: "carried fix".into(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let mut journal = Some(Journal {
+        commit: NEXT.into(),
+        version: "0.6.0".into(),
+        line: Some(advanced.clone()),
+        done: vec!["commit-gates".into()],
+        ..Journal::default()
+    });
+    crate::line_claim::follow(&mut world, &mut candidate, &mut journal).unwrap();
+    assert_eq!(candidate.commit, NEXT);
+    let journal = journal.unwrap();
+    assert_eq!(journal.line(), advanced);
+    assert_eq!(journal.done, ["commit-gates"]);
 }
 
 #[test]
@@ -1620,7 +1862,7 @@ fn a_bare_rerun_keeps_the_ready_candidate() {
     assert_eq!(code, 1);
     let j = w.journal().unwrap();
     assert_eq!(j.commit, BUMP);
-    assert!(w.macho().is_some_and(|m| w.verified.contains(&m)), "READY");
+    assert!(w.complete(), "READY");
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
     w.audits = VecDeque::from([passes()]);
@@ -1758,8 +2000,9 @@ fn a_fix_after_a_red_carries_a_landed_commit_and_never_reselects_main() {
 }
 
 /// `--fix` naming a commit a hop carries already carries nothing and resumes the line as it
-/// is, journal and all. NEGATIVE CONTROL: refuse a carried commit instead of dropping it, and
-/// the run stops at step 1.
+/// is, journal and all. The hop's verify could not run (exit 3), which leaves it resumable; a
+/// FAIL would refuse its tree (rf-fail-never-rerolled). NEGATIVE CONTROL: refuse a carried
+/// commit instead of dropping it, and the run stops at step 1.
 #[test]
 fn a_fix_the_line_carries_resumes_it_as_it_is() {
     let mut w = World::new();
@@ -1772,10 +2015,11 @@ fn a_fix_the_line_carries_resumes_it_as_it_is() {
         fix: vec![FIX.into()],
         ..mac()
     };
+    w.verify_code = 3;
     let (code, last) = w.run(fix.clone());
     assert!(
-        code == 1 && last.starts_with("REFUSED at 6/11 verify"),
-        "red at the hop too: {last}"
+        code == 3 && last.starts_with("REFUSED at 6/11 verify"),
+        "the hop's verify could not run: {last}"
     );
     let before = w.journal().unwrap();
     assert_eq!(before.commit, hop_of(FIX));
@@ -1802,12 +2046,13 @@ fn a_fix_the_line_carries_resumes_it_as_it_is() {
 
 /// With an unpublished line in the clone, `--commit` naming another commit (main's tip, the
 /// remedy before lines) refuses and names `--fix` and `--forget`; the journal is untouched.
-/// `--commit` naming the line's head resumes it. NEGATIVE CONTROL: remove the refusal, and
-/// `--commit origin/main` takes main's tip as the candidate again (a re-selection).
+/// `--commit` naming the line's head resumes it (its verify could not run, exit 3, so its tree
+/// holds no FAIL). NEGATIVE CONTROL: remove the refusal, and `--commit origin/main` takes main's
+/// tip as the candidate again (a re-selection).
 #[test]
 fn commit_on_an_unpublished_line_refuses_naming_fix_and_forget() {
     let mut w = World::new();
-    w.verify_code = 1;
+    w.verify_code = 3;
     w.verify_passes = false;
     let _ = w.run(bump());
     let before = w.journal().unwrap();
@@ -2827,10 +3072,11 @@ fn every_child_a_killed_step_left_running_holds_the_clone() {
 fn a_check_that_could_not_run_keeps_the_ask_open() {
     let mut w = World::new();
     w.audits = VecDeque::from([owner_gap()]);
+    // A check that could not run (exit 3) is resumed; a FAIL never would be (A19).
     w.verify_passes = false;
-    w.verify_code = 1;
+    w.verify_code = 3;
     let (code, last) = w.run(bump());
-    assert_eq!(code, 1, "{last}");
+    assert_eq!(code, 3, "{last}");
     assert_eq!(w.journal().unwrap().asks, ["release.notary"], "journaled");
 
     let unanswered = vec![Finding {
@@ -3644,13 +3890,172 @@ fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
     }
 }
 
+/// PLANTED RED (f), design §8: a test that fails once and would pass if run again. Its FAIL
+/// record refuses R's tree at minute one of the next run's stage, exit 1, naming the check and
+/// the log, before the disk is asked for room for work the tree can never pass, and nothing is
+/// staged, built or verified again: only a new hop changes the tree, so the remedy is `--fix`.
+/// Negative controls: without the stage's FAIL rule the next run gets past its stage; the FAIL
+/// rule after the disk check refuses for room instead; reading a FAIL as missing, with no FAIL
+/// rule (what the single pass record did), verifies the flaky test once more and releases; a
+/// FAIL remedy that re-selects main (`--commit origin/main`) fails the remedy assertion.
+#[test]
+fn a_fail_is_never_rerolled_into_a_pass() {
+    let mut w = World::new();
+    w.verify_outcomes.insert("test", "FAIL");
+    w.verify_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 6/11 verify"), "{last}");
+    assert!(last.contains("FAILED test"), "{last}");
+    assert_eq!(w.count("verify"), 1);
+
+    // The flaky test would pass now, and the release's disk claim would be refused: the FAIL is
+    // what refuses, before any room is sought.
+    w.verify_outcomes.clear();
+    w.verify_code = 0;
+    w.claim_refusal = Some(Refusal::new(
+        "the release's 30 GiB can never fit on /c",
+        "free space, then re-run",
+    ));
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 4/11 stage"), "{last}");
+    assert!(
+        last.contains("FAILED test") && last.contains("/l/06-verify.log"),
+        "names the check and its log: {last}"
+    );
+    assert!(last.contains("a new hop changes the tree"), "{last}");
+    assert!(
+        last.contains("--fix") && !last.contains("--commit origin/main"),
+        "the FAIL's remedy carries a landed fix onto the line: {last}"
+    );
+    for step in ["verify", "build", "stage", "publish"] {
+        assert_eq!(w.count(step), 0, "{step}: {:?}", w.calls);
+    }
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("disk-claim")),
+        "no room is claimed for a FAILed tree: {:?}",
+        w.calls
+    );
+}
+
+/// A FAIL refuses only its own tree (A19 with A18's line): after a test FAILs on the line's base,
+/// `--fix` carries a landed fix as a hop, the FAIL rule judges the hop's tree, which has no
+/// record, and the release verifies the new head once and ships it from there. Negative control:
+/// a step 3 that carries the hop but leaves the run's candidate at the old head refuses with the
+/// base's FAIL.
+#[test]
+fn a_fail_refuses_its_own_tree_and_a_fix_hop_is_verified_anew() {
+    let mut w = World::new();
+    w.verify_outcomes.insert("test", "FAIL");
+    w.verify_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 6/11 verify"), "{last}");
+
+    for moved in [NEXT, FIX] {
+        w.history.push(moved.into());
+        w.versions.insert(moved.into(), "0.6.0".into());
+    }
+    w.verify_outcomes.clear();
+    w.verify_code = 0;
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let hop = hop_of(FIX);
+    assert_eq!(w.journal().unwrap().commit, hop);
+    assert_eq!(w.count("verify"), 1, "the hop's tree is verified once");
+    assert_eq!(
+        w.checks_of(BUMP, w.macho().as_deref())
+            .failed
+            .iter()
+            .map(|f| f.check.as_str())
+            .collect::<Vec<_>>(),
+        ["test"],
+        "the base's FAIL stays its own"
+    );
+}
+
+/// A run that could not run every check (exit 3) keeps the records of those that finished, and
+/// the resume runs exactly the missing checks, carrying exactly the test binaries the test
+/// record lists as passed; once they pass the release goes on. Negative control: a resume that
+/// asks every check again fails the asserted set.
+#[test]
+fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() {
+    let mut w = World::new();
+    w.verify_outcomes.insert("test", "NOT RUN");
+    w.verify_outcomes.insert("appkit", "NOT RUN");
+    w.verify_code = 3;
+    let carried = vec![("-p aterm-db --lib".to_owned(), "aa".repeat(32))];
+    w.resume.clone_from(&carried);
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert!(last.starts_with("REFUSED at 6/11 verify"), "{last}");
+    let r = w.journal().unwrap().commit;
+    assert_eq!(
+        w.checks_of(&r, w.macho().as_deref()).missing,
+        ["test", "appkit"]
+    );
+    assert_eq!(w.verify_runs.len(), 1);
+    assert!(
+        !w.verify_runs[0].strict_subset(),
+        "the first run asks every check"
+    );
+
+    w.verify_outcomes.clear();
+    w.verify_code = 0;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("verify"), 1);
+    let resumed = w.verify_runs.last().unwrap();
+    assert_eq!(resumed.checks, ["test", "appkit"]);
+    assert_eq!(resumed.passed_binaries, carried);
+}
+
+/// A run killed after a test binary failed (no exit code of verify's own) leaves its test FAIL
+/// record, and the verify step refuses at once, exit 1, as the FAIL rule does: never a COULD NOT
+/// RUN whose resume the next stage would refuse. Negative control: without Run::verify's own
+/// FAIL refusal the run ends COULD NOT RUN (exit 3) and claims a resume.
+#[test]
+fn a_killed_run_that_failed_a_test_is_refused_never_resumed() {
+    for killed in [-1, 137] {
+        let mut w = World::new();
+        w.verify_outcomes.insert("test", "FAIL");
+        w.verify_code = killed;
+        let (code, last) = w.run(bump());
+        assert_eq!(code, 1, "{killed}: {last}");
+        assert!(last.starts_with("REFUSED at 6/11 verify"), "{last}");
+        assert!(last.contains("a new hop changes the tree"), "{last}");
+        let r = w.journal().unwrap().commit;
+        let judged = w.checks_of(&r, w.macho().as_deref());
+        assert_eq!(
+            judged
+                .failed
+                .iter()
+                .map(|f| f.check.as_str())
+                .collect::<Vec<_>>(),
+            ["test"]
+        );
+        assert_eq!(w.count("publish"), 0, "nothing public: {:?}", w.calls);
+    }
+}
+
 /// STEP 6 AS AN AGENT RUNS IT: the real backend runs the release's own `targo` —
-/// `<prover>/targo --unverified run -q -p aterm-verify -- release --app <app>` — in the
-/// clone, and only its exit 0 from a clone at R's tree and clean, before and after,
-/// writes the verified record of R's tree on the bundle's executable.
+/// `<prover>/targo --unverified run -q -p aterm-verify -- release --events <file> --app <app>`
+/// — in the clone (a resume names its missing `--checks` and its `--passed-binaries`, and
+/// `--app` only when it runs measure), and only a run from a clone at R's tree and clean, before
+/// and after, under one seal, keeps one record per check its events file says finished, a FAIL
+/// included, never what its output says; a moved clone or a changed seal keeps nothing, its
+/// `began` record withdrawn, and could not run. Negative control: records read from the log
+/// take its decoy FAIL.
 #[cfg(unix)]
 #[test]
-fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass() {
+fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().unwrap();
     let repo = dir.path().join("clone");
@@ -3680,15 +4085,20 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     std::fs::create_dir_all(&bin).unwrap();
     let said = dir.path().join("said");
     let mode = dir.path().join("mode");
+    let events = dir.path().join("events");
     std::fs::write(
         bin.join("targo"),
         format!(
-            "#!/bin/sh\necho \"$PWD $*\" > '{said}'\ncase \"$(cat '{mode}')\" in\n  \
+            "#!/bin/sh\necho \"$PWD $*\" > '{said}'\nout=; prev=\nfor a in \"$@\"; do \
+             [ \"$prev\" = --events ] && out=$a; prev=$a; done\ncase \"$(cat '{mode}')\" in\n  \
              dirty) echo stray > stray.txt ;;\n  move) git checkout -q --detach {other} ;;\nesac\n\
-             exit \"$(cat '{code}')\"\n",
+             cat '{events}' >> \"$out\"\necho '{decoy}'\nexit \"$(cat '{code}')\"\n",
             said = said.display(),
             mode = mode.display(),
+            events = events.display(),
             code = dir.path().join("code").display(),
+            decoy = "verify-event: {\"schema\":1,\"event\":\"check-finished\",\"check\":\"fmt\",\
+                     \"outcome\":\"FAIL\",\"seconds\":1,\"detail\":\"\",\"rows\":[]}",
         ),
     )
     .unwrap();
@@ -3709,39 +4119,46 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     };
     let mut real = Real::new(&repo, None, true, false).expect("a backend");
     real.build_inputs = || Ok("fixture inputs".into());
-    let record =
-        |r: &str| {
-            crate::gates::verified_with_inputs(&git, r, &"ab".repeat(32), || {
-                Ok("fixture inputs".into())
+    let judge = |r: &str| {
+        crate::check_record::checks(&git, r, Some(&"ab".repeat(32)), || {
+            Ok("fixture inputs".into())
+        })
+        .unwrap()
+    };
+    let nothing = |r: &str| {
+        let judged = judge(r);
+        judged.failed.is_empty() && judged.missing == crate::check_record::release_names()
+    };
+    let finished = |outcomes: &[(&str, &str)]| -> String {
+        outcomes
+            .iter()
+            .map(|(check, outcome)| {
+                format!(
+                    "verify-event: {}\n",
+                    aterm_json::json!({"schema":1,"event":"check-finished","check":check,
+                        "outcome":outcome,"seconds":1.5,"detail":"","rows":[]})
+                )
             })
-            .unwrap()
-            .0
-        };
-    let set = |code: &str, how: &str| {
+            .collect()
+    };
+    let all_ok: Vec<(&str, &str)> = aterm_verify::checks::RELEASE
+        .iter()
+        .map(|c| (c.name(), "ok"))
+        .collect();
+    let set = |code: &str, how: &str, said_events: &str| {
         std::fs::write(dir.path().join("code"), code).unwrap();
         std::fs::write(&mode, how).unwrap();
+        std::fs::write(&events, said_events).unwrap();
     };
-
-    set("1", "");
-    let ran = Backend::verify(&mut real, &cand, &prover, &artifact).expect("it ran");
-    assert_eq!(ran.code, 1);
-    assert!(!record(&r), "a failure records nothing");
+    let every = crate::check_record::Checks::no("none").run();
     let repo_seen = std::fs::canonicalize(&repo).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&said).unwrap().trim(),
-        format!(
-            "{} --unverified run -q -p aterm-verify -- release --app {}",
-            repo_seen.display(),
-            artifact.app.display()
-        )
-    );
 
     for how in ["dirty", "move"] {
-        set("0", how);
-        let refused =
-            Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("the clone moved");
+        set("0", how, &finished(&all_ok));
+        let refused = Backend::verify(&mut real, &cand, &prover, &artifact, &every)
+            .expect_err("the clone moved");
         assert!(refused.could_not_run, "{refused:?}");
-        assert!(!record(&r), "{how}: nothing is recorded");
+        assert!(nothing(&r), "{how}: nothing is recorded");
         let _ = std::fs::remove_file(repo.join("stray.txt"));
         assert!(
             git.git(&["checkout", "-q", "--detach", &r])
@@ -3752,11 +4169,12 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
 
     std::fs::write(repo.join("stray.txt"), "before").unwrap();
     std::fs::remove_file(&said).unwrap();
-    set("0", "");
-    let refused = Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("a dirty clone");
+    set("0", "", &finished(&all_ok));
+    let refused =
+        Backend::verify(&mut real, &cand, &prover, &artifact, &every).expect_err("a dirty clone");
     assert!(refused.could_not_run, "{refused:?}");
     assert!(!said.exists(), "nothing ran");
-    assert!(!record(&r));
+    assert!(nothing(&r));
     std::fs::remove_file(repo.join("stray.txt")).unwrap();
 
     fn changing_inputs() -> Result<String, String> {
@@ -3767,17 +4185,129 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     }
     real.build_inputs = changing_inputs;
     let refused =
-        Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("inputs changed");
-    assert!(refused.why.contains("compiler or SDK bytes changed"));
+        Backend::verify(&mut real, &cand, &prover, &artifact, &every).expect_err("inputs changed");
     assert!(
-        !record(&r),
-        "changed inputs cannot produce a verification receipt"
+        refused.why.contains("compiler or SDK bytes changed"),
+        "{refused:?}"
+    );
+    assert!(
+        refused.could_not_run,
+        "a changed seal decides nothing: {refused:?}"
+    );
+    assert!(nothing(&r), "changed inputs keep no record");
+    let began =
+        crate::check_record::checks(&git, &r, Some(&"ab".repeat(32)), || Ok("0".into())).unwrap();
+    assert!(
+        began.failed.is_empty(),
+        "the run's began record is withdrawn: {}",
+        began.line()
     );
     real.build_inputs = || Ok("fixture inputs".into());
 
-    let ran = Backend::verify(&mut real, &cand, &prover, &artifact).expect("it ran");
+    // A resume names exactly its missing checks and the binaries that passed.
+    let resume = VerifyRun {
+        checks: vec!["lint".into(), "test".into()],
+        passed_binaries: vec![("-p a --lib".into(), "aa".repeat(32))],
+    };
+    let binary = |spec: &str, sha: &str, outcome: &str| {
+        format!(
+            "verify-event: {}\n",
+            aterm_json::json!({"schema":1,"event":"test-binary-finished","test":spec,
+                "outcome":outcome,"exe_sha256":sha,"carried":false})
+        )
+    };
+    set(
+        "3",
+        "",
+        &format!(
+            "{}{}{}",
+            finished(&[("lint", "ok")]),
+            binary("-p a --lib", &"aa".repeat(32), "ok"),
+            binary("-p b --lib", &"bb".repeat(32), "NOT RUN")
+        ),
+    );
+    let ran = Backend::verify(&mut real, &cand, &prover, &artifact, &resume).expect("it ran");
+    assert_eq!(ran.code, 3);
+    let said_now = std::fs::read_to_string(&said).unwrap();
+    let after = |flag: &str| {
+        said_now
+            .split_whitespace()
+            .skip_while(|w| *w != flag)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{flag} <path>: {said_now}"))
+            .to_owned()
+    };
+    let (passed, events_file) = (after("--passed-binaries"), after("--events"));
+    assert_eq!(
+        said_now.trim(),
+        format!(
+            "{} --unverified run -q -p aterm-verify -- release --checks lint,test \
+             --passed-binaries {passed} --events {events_file}",
+            repo_seen.display(),
+        ),
+        "no measure, so no --app"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&passed).unwrap(),
+        format!("{} -p a --lib\n", "aa".repeat(32))
+    );
+    let judged = judge(&r);
+    assert!(
+        !judged.missing.iter().any(|m| m == "lint"),
+        "{}",
+        judged.line()
+    );
+    assert_eq!(
+        judged.run().passed_binaries,
+        [("-p a --lib".to_owned(), "aa".repeat(32))],
+        "the test record of the killed run lists what passed"
+    );
+
+    set("0", "", &finished(&all_ok));
+    let ran = Backend::verify(&mut real, &cand, &prover, &artifact, &every).expect("it ran");
     assert_eq!(ran.code, 0);
-    assert!(record(&r), "a pass is recorded for R's tree on these bytes");
+    assert_eq!(
+        std::fs::read_to_string(&said).unwrap().trim(),
+        format!(
+            "{} --unverified run -q -p aterm-verify -- release --events {events_file} --app {}",
+            repo_seen.display(),
+            artifact.app.display()
+        ),
+        "a run of every check names none"
+    );
+    assert!(
+        judge(&r).complete(),
+        "every check recorded ok for R's tree on these bytes"
+    );
+    assert!(!judge(&other).complete(), "another tree has no records");
+
+    set("1", "", &finished(&[("fmt", "ok"), ("lint", "FAIL")]));
+    let ran = Backend::verify(&mut real, &cand, &prover, &artifact, &every).expect("it ran");
+    assert_eq!(ran.code, 1);
+    let judged = judge(&r);
+    assert_eq!(
+        judged
+            .failed
+            .iter()
+            .map(|f| f.check.as_str())
+            .collect::<Vec<_>>(),
+        ["lint"],
+        "a FAIL is recorded: {}",
+        judged.line()
+    );
+    let verified = repo.join(".git/aterm-release/verified");
+    std::fs::remove_dir_all(&verified).unwrap();
+    set("1", "", "");
+    Backend::verify(&mut real, &cand, &prover, &artifact, &every).expect("it ran");
+    assert_eq!(
+        judge(&r)
+            .failed
+            .iter()
+            .map(|f| f.check.as_str())
+            .collect::<Vec<_>>(),
+        [crate::check_record::RUN_LEVEL],
+        "an exit 1 that names no FAIL still refuses the tree"
+    );
 }
 
 #[test]
@@ -3821,6 +4351,11 @@ fn a_spent_reservation_is_built_again_never_renumbered() {
             (2, 2),
             "{case}: {:?}",
             w.calls
+        );
+        assert_eq!(
+            w.verify_runs.last().unwrap().checks,
+            ["measure"],
+            "{case}: the tree's records stand; only the new bundle is judged again"
         );
         assert_eq!(w.cut.as_ref().unwrap().build, fresh.build, "{case}");
     }

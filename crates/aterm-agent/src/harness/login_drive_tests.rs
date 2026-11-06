@@ -337,8 +337,9 @@ fn kimis_child_runs_with_telemetry_and_updates_off_in_its_staging_home_and_no_op
 /// hands it) holds a `.stand-in` script (`<transcript> <exit>`), it checks it was run as `kimi
 /// login --region global` (after `--`), prints that transcript to its standard error, writes the
 /// login file into that home when it exits 0, and exits; `hold` writes its pid to `pid` there,
-/// prints Kimi's transcript and waits a minute before it exits 0. Anywhere else it is an empty
-/// test.
+/// prints Kimi's transcript and waits a minute before it exits 0; `hold-unfinished` writes its pid
+/// there, prints that transcript without the line that says it is done, and waits an hour, so only
+/// its driver ends it. Anywhere else it is an empty test.
 #[test]
 fn signin_stand_in() {
     let Some(which) = std::env::var_os("KIMI_CODE_HOME")
@@ -352,7 +353,7 @@ fn signin_stand_in() {
     let first = words.next();
     let transcript = match first {
         Some("kimi" | "hold") => KIMI.to_owned(),
-        Some("kimi-unfinished") => KIMI
+        Some("kimi-unfinished" | "hold-unfinished") => KIMI
             .lines()
             .filter(|line| !line.contains("Logged in"))
             .collect::<Vec<_>>()
@@ -370,6 +371,12 @@ fn signin_stand_in() {
         std::fs::write(home.join("pid"), std::process::id().to_string()).expect("pid");
         eprint!("{transcript}");
         std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+    if first == Some("hold-unfinished") {
+        std::fs::write(home.join("pid"), format!("{}\n", std::process::id())).expect("pid");
+        eprintln!("{transcript}");
+        std::thread::sleep(Duration::from_secs(3600));
         std::process::exit(0);
     }
     if code == 0 {
@@ -407,6 +414,16 @@ fn stand_in_drive(script: &str) -> (Drove, Handed) {
 
 /// The Kimi stand-in driven in `root/sol+1`, its page handed to `approver`.
 fn stand_in_drive_in(root: &Path, script: &str, approver: &mut dyn Approver) -> Drove {
+    stand_in_drive_within(root, script, approver, Duration::from_secs(60))
+}
+
+/// [`stand_in_drive_in`] within `hang`.
+fn stand_in_drive_within(
+    root: &Path,
+    script: &str,
+    approver: &mut dyn Approver,
+    hang: Duration,
+) -> Drove {
     let tmp = root;
     let staging = tmp.join("sol+1");
     std::fs::create_dir_all(&staging).expect("staging");
@@ -444,7 +461,7 @@ fn stand_in_drive_in(root: &Path, script: &str, approver: &mut dyn Approver) -> 
             completion,
             hosts: hosts.of(Some(Region::Global)).expect("global"),
             email: Some("kimi-one@example.com"),
-            hang: Duration::from_secs(60),
+            hang,
         },
         approver,
     )
@@ -1301,10 +1318,10 @@ fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication()
             &mut self,
             request: &Request<'_>,
             outcome: &Outcome,
-            deadline: Instant,
+            deadline: WakeDeadline,
         ) -> Result<(), String> {
             self.seen.push("complete");
-            assert!(deadline > Instant::now());
+            assert!(!deadline.passed());
             if matches!(outcome, Outcome::SignedIn { .. }) {
                 assert!(request.staging.join("credentials/kimi-code.json").is_file());
             }
@@ -1394,7 +1411,7 @@ fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication()
 fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     struct ResumeOnly(u8);
     impl Approver for ResumeOnly {
-        fn resume(&mut self, _: &Request<'_>, _: Instant) -> Result<Resume, String> {
+        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
             match self.0 {
                 0 => Ok(Resume::Fresh),
                 1 => Ok(Resume::NativeSeed),
@@ -1448,7 +1465,7 @@ fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
     }
     struct NoHooks;
     impl Approver for NoHooks {
-        fn resume(&mut self, _: &Request<'_>, _: Instant) -> Result<Resume, String> {
+        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
             panic!("revoked root admission reached a recovery hook")
         }
         fn approve(&mut self, _: &Handoff<'_>) -> Approval {
@@ -1537,7 +1554,7 @@ fn native_kimi_cancellation_runs_completion_without_opening_a_window() {
             &mut self,
             _: &Request<'_>,
             outcome: &Outcome,
-            _: Instant,
+            _: WakeDeadline,
         ) -> Result<(), String> {
             self.0.push("complete");
             assert!(matches!(outcome, Outcome::Unverified(_)));
@@ -1594,5 +1611,132 @@ fn native_kimi_cancellation_runs_completion_without_opening_a_window() {
     println!(
         "native Kimi handoff and cancellation observed; config_present={}",
         staging.join("config.toml").is_file()
+    );
+}
+
+#[cfg(unix)]
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// A DRIVEN SIGN-IN ITS HOST SLEPT PAST ENDS AT ITS FIRST LOOK AFTER THE HOST WAKES
+/// (KI-1105-14): a child that named its page and code and never says it is done, driven with an
+/// hour's budget, whose host then slept two hours while the approver had the page, ends `Hung`
+/// as soon as the approver returns, its child and the child's process group gone. NEGATIVE
+/// CONTROL: the budget measured on the clock that stops in sleep alone waited the hour out, which
+/// the one-minute hang detector reports.
+#[cfg(unix)]
+#[test]
+fn a_driven_sign_in_its_host_slept_past_ends_hung_at_its_first_look() {
+    struct Sleeps(bool);
+    impl Approver for Sleeps {
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            super::super::wake_deadline::host_slept(2 * HOUR);
+            self.0 = true;
+            Approval::Approved { page: false }
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let root = tmp.path().to_owned();
+    let (tx, rx) = mpsc::channel();
+    // The drive and its approver run on this thread, which alone reads the sleep the approver
+    // says its host slept.
+    std::thread::spawn(move || {
+        let _seam = super::super::wake_deadline::SleepSeam::hold();
+        let mut approver = Sleeps(false);
+        let drove = stand_in_drive_within(&root, "hold-unfinished", &mut approver, HOUR);
+        let _ = tx.send((drove, approver.0));
+    });
+    let (drove, slept) = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the driven sign-in waited on the clock that stops in sleep, past the budget its host slept through");
+    assert!(slept, "the approver had the page");
+    assert_eq!(drove.outcome, Outcome::Hung);
+    let pid = std::fs::read_to_string(tmp.path().join("sol+1/pid"))
+        .ok()
+        .and_then(|said| said.trim().parse::<libc::pid_t>().ok())
+        .expect("the child's pid");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the child and its process group are gone",
+        || {
+            let gone = |target: libc::pid_t| {
+                // SAFETY: signal 0 only checks whether the process, or the group it led, exists.
+                let checked = unsafe { libc::kill(target, 0) };
+                checked != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            (gone(pid) && gone(-pid)).then_some(())
+        },
+    );
+}
+
+/// A SIGN-IN WHOSE RESUME ITS HOST SLEPT THROUGH STARTS NO CHILD: an hour's sign-in whose host
+/// slept two hours while its approver resumed (nothing retained) is not begun and runs nothing,
+/// with the words for a sign-in its deadline ended. NEGATIVE CONTROL: on the clock that stops in
+/// sleep alone the hour was left, and the child was begun (the approver's `begin` panics).
+#[cfg(unix)]
+#[test]
+fn a_sign_in_whose_resume_its_host_slept_through_starts_no_child() {
+    struct SleepsInResume;
+    impl Approver for SleepsInResume {
+        fn resume(&mut self, _: &Request<'_>, _: WakeDeadline) -> Result<Resume, String> {
+            super::super::wake_deadline::host_slept(2 * HOUR);
+            Ok(Resume::Fresh)
+        }
+        fn begin(&mut self, _: &Request<'_>) -> Result<(), String> {
+            panic!("a sign-in its host slept past began a child")
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("a sign-in its host slept past handed a page over")
+        }
+    }
+    let _seam = super::super::wake_deadline::SleepSeam::hold();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(staging.join(".stand-in"), "kimi 0").unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+    let row = super::super::accounts::Row {
+        label: "one".into(),
+        email: Some("kimi-one@example.com".into()),
+        vendor: super::super::accounts::Vendor {
+            region: Some(Region::Global),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let route = KIMI_SIGNIN.route(None).unwrap();
+    let request = Request {
+        recovery: None,
+        admission: None,
+        cli: Cli::Kimi,
+        row: &row,
+        staging: &staging,
+        store: &store,
+        route,
+        hosts: route.hosts.of(Some(Region::Global)).unwrap(),
+    };
+    let exe = std::env::current_exe().unwrap();
+    let lead = [
+        "harness::login_drive::tests::signin_stand_in",
+        "--exact",
+        "--nocapture",
+        "--",
+    ]
+    .map(OsString::from);
+    let result = sign_in_with(
+        &request,
+        (&exe, &lead),
+        None,
+        Some(Path::new(SANDBOX_EXEC)),
+        &vars(&[]),
+        &mut SleepsInResume,
+        HOUR,
+    );
+    assert_eq!(
+        result.outcome,
+        Outcome::NotRun("native sign-in deadline expired".into())
+    );
+    assert!(
+        !staging.join("credentials").exists(),
+        "no child ran to sign in"
     );
 }

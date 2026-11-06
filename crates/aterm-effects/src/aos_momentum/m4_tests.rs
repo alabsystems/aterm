@@ -1496,10 +1496,7 @@ fn crate_sources() -> Vec<(std::path::PathBuf, String)> {
         }
     }
     let mut out = Vec::new();
-    walk(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut out,
-    );
+    walk(&aterm_tempfile::manifest_dir().join("src"), &mut out);
     out
 }
 

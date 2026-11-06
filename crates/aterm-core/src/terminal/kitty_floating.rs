@@ -7,6 +7,7 @@
 use std::num::NonZeroU32;
 use std::ops::Range;
 
+use aterm_alloc::SmallVec;
 use aterm_grid::{Grid, MAX_IMAGE_LAYERS};
 
 use super::kitty_placeholder;
@@ -103,46 +104,82 @@ pub(super) fn visible_cell_range(origin: i32, span: u16, limit: u16) -> Range<u1
     start..clamp(i64::from(limit) - origin).max(start)
 }
 
-/// Every on-screen cell of the floating placements, placement by placement
-/// in `kitty_floating` order. Empty — and free — while there are none.
-pub(super) fn floating_tiles(grid: &Grid, transient: &TransientState) -> Vec<FloatingTile> {
-    let mut tiles = Vec::new();
-    let origins = floating_origins(grid, transient);
-    for (index, (floating, origin)) in transient.kitty_floating.iter().zip(origins).enumerate() {
-        let Some((top, left)) = origin else {
-            continue;
-        };
-        let cols = visible_cell_range(left, floating.image.cols, grid.cols());
-        for cell_row in visible_cell_range(top, floating.image.rows, grid.rows()) {
-            let Ok(row) = u16::try_from(top.saturating_add(i32::from(cell_row))) else {
-                continue;
-            };
-            for cell_col in cols.clone() {
-                let Ok(col) = u16::try_from(left.saturating_add(i32::from(cell_col))) else {
-                    continue;
-                };
-                tiles.push(FloatingTile {
-                    row,
-                    col,
-                    index,
-                    cell_row,
-                    cell_col,
-                });
-            }
-        }
-    }
-    tiles
+/// On-screen cells within `rows`, in placement/row/column order. Geometry is
+/// captured up front; iteration borrows placements but does not borrow the grid.
+pub(super) fn floating_tiles<'a>(
+    grid: &Grid,
+    transient: &'a TransientState,
+    rows: Range<u16>,
+) -> impl Iterator<Item = FloatingTile> + 'a + use<'a> {
+    let (first, end, cols) = (
+        rows.start.min(grid.rows()),
+        rows.end.min(grid.rows()),
+        grid.cols(),
+    );
+    let origins = if first >= end {
+        SmallVec::new()
+    } else {
+        floating_origins(grid, transient)
+    };
+    transient
+        .kitty_floating
+        .iter()
+        .zip(origins)
+        .enumerate()
+        .flat_map(move |(index, (floating, origin))| {
+            origin.into_iter().flat_map(move |(top, left)| {
+                let columns = visible_cell_range(left, floating.image.cols, cols);
+                let visible = visible_cell_range(top, floating.image.rows, end);
+                let first_cell = visible
+                    .start
+                    .max(visible_cell_range(top, floating.image.rows, first).end);
+                (first_cell..visible.end)
+                    .filter_map(move |cell_row| {
+                        u16::try_from(top.saturating_add(i32::from(cell_row)))
+                            .ok()
+                            .map(|row| (cell_row, row))
+                    })
+                    .flat_map(move |(cell_row, row)| {
+                        columns.clone().filter_map(move |cell_col| {
+                            let col =
+                                u16::try_from(left.saturating_add(i32::from(cell_col))).ok()?;
+                            Some(FloatingTile {
+                                row,
+                                col,
+                                index,
+                                cell_row,
+                                cell_col,
+                            })
+                        })
+                    })
+            })
+        })
 }
 
 /// Where each floating placement's top-left cell is on the live screen now,
 /// `(row, col)` — off screen when negative or past the edge — indexed like
 /// `kitty_floating`; `None` while its virtual ancestor's placeholders show
 /// nowhere on screen, or its chain of parents is broken or too deep.
-pub(super) fn floating_origins(grid: &Grid, transient: &TransientState) -> Vec<Option<(i32, i32)>> {
+pub(super) fn floating_origins(
+    grid: &Grid,
+    transient: &TransientState,
+) -> SmallVec<Option<(i32, i32)>, MAX_KITTY_FLOATING> {
     if transient.kitty_floating.is_empty() {
-        return Vec::new();
+        return SmallVec::new();
     }
-    let mut shown: Vec<(NonZeroU32, i32, i32)> = Vec::new();
+    // Every resolvable chain reaches a virtual parent through a placement in this
+    // list, so only these serials can contribute an origin. Unrelated virtual
+    // placements need no metadata entry, however many are visible.
+    let mut needed: SmallVec<NonZeroU32, MAX_KITTY_FLOATING> = SmallVec::new();
+    for floating in &transient.kitty_floating {
+        if let KittyFloatParent::Virtual(parent) = floating.parent
+            && let Some(v) = named_virtual(transient, parent)
+            && !needed.contains(&v.tag.serial)
+        {
+            needed.push(v.tag.serial);
+        }
+    }
+    let mut shown: SmallVec<(NonZeroU32, i32, i32), MAX_KITTY_FLOATING> = SmallVec::new();
     let (rows, cols) = (grid.rows(), grid.cols());
     for (at, extra) in grid.extras().iter() {
         if at.row >= rows || at.col >= cols {
@@ -154,6 +191,9 @@ pub(super) fn floating_origins(grid: &Grid, transient: &TransientState) -> Vec<O
         let Some(v) = placeholder_virtual(transient, cell.image_id, cell.placement_id) else {
             continue;
         };
+        if !needed.contains(&v.tag.serial) {
+            continue;
+        }
         let (row, col) = (i32::from(at.row), i32::from(at.col));
         match shown
             .iter_mut()

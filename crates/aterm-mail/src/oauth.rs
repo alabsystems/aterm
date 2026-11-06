@@ -96,12 +96,14 @@ fn encoded_len(value: &str) -> usize {
 }
 
 fn encode_into(result: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
             result.push(char::from(b));
         } else {
-            use std::fmt::Write;
-            let _ = write!(result, "%{b:02X}");
+            result.push('%');
+            result.push(char::from(HEX[usize::from(b >> 4)]));
+            result.push(char::from(HEX[usize::from(b & 0x0f)]));
         }
     }
 }
@@ -116,18 +118,30 @@ pub fn begin(client_id: &str, port: u16, login_hint: Option<&str>) -> Result<Pen
     if client_id.is_empty() || port == 0 {
         return Err("Google desktop OAuth client is not configured".into());
     }
-    let verifier = random()?;
+    let mut verifier = zeroize::Zeroizing::new(random()?);
     let digest = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
     let challenge = url_safe_base64(digest.as_ref())?;
     let state = random()?;
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
-    let mut authorize_url = format!(
-        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&code_challenge={}&code_challenge_method=S256&access_type=offline&prompt=consent%20select_account",
-        encode(client_id),
-        encode(&redirect_uri),
-        encode("https://mail.google.com/"),
-        encode(&state),
-        encode(&challenge)
+    let mut authorize_url = String::with_capacity(
+        192 + encoded_len(client_id)
+            + encoded_len(&redirect_uri)
+            + state.len()
+            + challenge.len()
+            + login_hint.map_or(0, |h| 12 + encoded_len(h)),
+    );
+    authorize_url.push_str("https://accounts.google.com/o/oauth2/v2/auth?client_id=");
+    encode_into(&mut authorize_url, client_id);
+    authorize_url.push_str("&redirect_uri=");
+    encode_into(&mut authorize_url, &redirect_uri);
+    authorize_url.push_str("&response_type=code&scope=");
+    encode_into(&mut authorize_url, "https://mail.google.com/");
+    authorize_url.push_str("&state=");
+    encode_into(&mut authorize_url, &state);
+    authorize_url.push_str("&code_challenge=");
+    encode_into(&mut authorize_url, &challenge);
+    authorize_url.push_str(
+        "&code_challenge_method=S256&access_type=offline&prompt=consent%20select_account",
     );
     if let Some(hint) = login_hint {
         authorize_url.push_str("&login_hint=");
@@ -135,7 +149,7 @@ pub fn begin(client_id: &str, port: u16, login_hint: Option<&str>) -> Result<Pen
     }
     Ok(Pending {
         state,
-        verifier: Secret::new(verifier),
+        verifier: Secret::new(std::mem::take(&mut *verifier)),
         redirect_uri,
         authorize_url,
     })
@@ -171,16 +185,19 @@ pub fn exchange_until(
             kind: ErrorKind::Rejected,
         });
     }
-    let mut fields = vec![
+    let fields = [
         ("client_id", client_id),
         ("code", code),
         ("code_verifier", pending.verifier.expose()),
         ("redirect_uri", &pending.redirect_uri),
         ("grant_type", "authorization_code"),
+        ("client_secret", client_secret.unwrap_or("")),
     ];
-    if let Some(secret) = client_secret {
-        fields.push(("client_secret", secret));
-    }
+    let fields = if client_secret.is_some() {
+        &fields[..]
+    } else {
+        &fields[..5]
+    };
     request_until(fields, end)
 }
 
@@ -208,18 +225,21 @@ pub fn refresh_until(
             kind: ErrorKind::Rejected,
         });
     }
-    let mut fields = vec![
+    let fields = [
         ("client_id", client_id),
         ("refresh_token", refresh_token.expose()),
         ("grant_type", "refresh_token"),
+        ("client_secret", client_secret.unwrap_or("")),
     ];
-    if let Some(secret) = client_secret {
-        fields.push(("client_secret", secret));
-    }
+    let fields = if client_secret.is_some() {
+        &fields[..]
+    } else {
+        &fields[..3]
+    };
     request_until(fields, end)
 }
 
-fn request_until(fields: Vec<(&str, &str)>, end: std::time::Instant) -> Result<Tokens, Error> {
+fn request_until(fields: &[(&str, &str)], end: std::time::Instant) -> Result<Tokens, Error> {
     let within = end
         .saturating_duration_since(std::time::Instant::now())
         .min(std::time::Duration::from_secs(30));
@@ -234,7 +254,7 @@ fn request_until(fields: Vec<(&str, &str)>, end: std::time::Instant) -> Result<T
         .map(|(i, (k, v))| usize::from(i > 0) + encoded_len(k) + 1 + encoded_len(v))
         .sum();
     let mut body = zeroize::Zeroizing::new(String::with_capacity(cap));
-    for (i, (k, v)) in fields.into_iter().enumerate() {
+    for (i, &(k, v)) in fields.iter().enumerate() {
         if i > 0 {
             body.push('&');
         }

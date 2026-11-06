@@ -5,15 +5,17 @@
 //! truncations, budget changes, rebuilds and repagings, over every page size from one record
 //! to [`PAGE`], with frame starts and broker times that sometimes leave their page's column
 //! range, and after every step each answer the pages give (every record's summary, frame
-//! start, broker time and residency, the page-by-page walks, the counts, the subjects named,
-//! and with `retention` the retention planning over them) is the slot vector's. The negative
-//! controls: a page entry off by one record, its base or its index, is caught.
+//! start, broker time and residency, the page-by-page walks, a filtered read's passes, the
+//! counts, the subjects named, and with `retention` the retention planning over them) is the
+//! slot vector's. The negative controls: a page entry off by one record, its base or its
+//! index, a walk that keeps a name across a page, and a pass that drops a page it wants, are
+//! caught.
 
 use std::sync::Arc;
 
 use astream_wire::Offset;
 
-use super::{PageMutant, Tier, PAGE, PAGE_SHIFT};
+use super::{Met, PageMutant, Tier, PAGE, PAGE_SHIFT};
 use crate::brecord::BrokerRecord;
 
 /// xorshift64*: the streams' deterministic PRNG.
@@ -337,47 +339,83 @@ fn a_page_entry_off_by_one_record_is_caught() {
     }
 }
 
-/// The negative control of the page-by-page walk and of the filtered reads' scan built on it: a
-/// walk that keeps the subject name its last record read across a page boundary reads the next
-/// page's records under the last page's name, and is caught, at every page size.
+/// Two pages of `1 << shift` records, the first naming `SUBJECTS[0]` alone and the second
+/// `SUBJECTS[1]`.
+fn two_pages(shift: u32) -> Tier {
+    let page = 1u64 << shift;
+    let mut t = Tier::paged(0, shift);
+    for i in 0..2 * page {
+        let rec = BrokerRecord {
+            seq: Offset(i),
+            producer_id: 1,
+            producer_seq: i,
+            subject: SUBJECTS[(i / page) as usize].to_string(),
+            body: vec![3; 8],
+            commit: None,
+        };
+        t.push(Arc::new(rec), Some(i), i * 64);
+    }
+    t
+}
+
+/// The negative control of the page-by-page walk: a walk that keeps the subject name its last
+/// record read across a page boundary reads the next page's records under the last page's
+/// name, and is caught, at every page size. A filtered read's pass names a page's records by
+/// the page's own ids, so it meets what it met before.
 #[test]
 fn a_walk_that_keeps_a_name_across_a_page_is_caught() {
     for shift in 0..=PAGE_SHIFT {
-        let page = 1u64 << shift;
-        let mut t = Tier::paged(0, shift);
-        for i in 0..2 * page {
-            let rec = BrokerRecord {
-                seq: Offset(i),
-                producer_id: 1,
-                producer_seq: i,
-                subject: SUBJECTS[(i / page) as usize].to_string(),
-                body: vec![3; 8],
-                commit: None,
-            };
-            t.push(Arc::new(rec), Some(i), i * 64);
-        }
+        let page = 1usize << shift;
+        let mut t = two_pages(shift);
         assert_eq!(t.check_shadow(), Ok(()), "shift {shift}");
         // Each page names one subject: the walk for it reads that page's records alone.
         let len = t.len();
         let second: Vec<usize> = t.naming(SUBJECTS[1], 0, len).collect();
-        assert_eq!(
-            second,
-            (page as usize..len).collect::<Vec<_>>(),
-            "shift {shift}"
-        );
-        assert_eq!(t.naming(SUBJECTS[0], 1, len).count(), page as usize - 1);
+        assert_eq!(second, (page..len).collect::<Vec<_>>(), "shift {shift}");
+        assert_eq!(t.naming(SUBJECTS[0], 1, len).count(), page - 1);
         assert_eq!(t.naming(SUBJECTS[2], 0, len).count(), 0, "shift {shift}");
         t.mutate(PageMutant::StaleName);
         assert!(
             t.check_shadow().is_err(),
             "shift {shift}: a walk keeping the last page's name answers the same"
         );
-        // A filtered read's scan reads as the walk does, so it reads the stale name too.
-        let scanned: Vec<_> = t.scan(0, len).collect();
-        let each: Vec<_> = (0..len).map(|i| t.summary(i)).collect();
-        assert_ne!(
-            scanned, each,
-            "shift {shift}: a scan keeping the last page's name answers the same"
+        let met: Vec<usize> = t
+            .passing(0, len, |s| s == SUBJECTS[1])
+            .map(Met::index)
+            .collect();
+        assert_eq!(met, (page..len).collect::<Vec<_>>(), "shift {shift}");
+    }
+}
+
+/// The negative control of a filtered read's page skip (aterm F11c): a pass that passes whole a
+/// page it wants a record of answers differently from the slot vector and is caught, at every
+/// page size, on two pages of one subject each and on the streams' tiers.
+#[test]
+fn a_pass_that_drops_a_wanted_page_is_caught() {
+    for shift in 0..=PAGE_SHIFT {
+        let page = 1usize << shift;
+        let mut t = two_pages(shift);
+        let len = t.len();
+        // The pass wanting the second page's subject passes the first page whole.
+        let met: Vec<Met> = t.passing(0, len, |s| s == SUBJECTS[1]).collect();
+        assert_eq!(
+            met,
+            (page..len).map(Met::Wanted).collect::<Vec<_>>(),
+            "shift {shift}"
         );
+        t.mutate(PageMutant::DropWanted);
+        assert!(
+            t.check_shadow().is_err(),
+            "shift {shift}: a pass dropping a page it wants answers the same"
+        );
+        for seed in 0..3 {
+            let mut t = mutable_tier(900 + u64::from(shift) * 10 + seed, shift);
+            assert_eq!(t.check_shadow(), Ok(()), "shift {shift} seed {seed}");
+            t.mutate(PageMutant::DropWanted);
+            assert!(
+                t.check_shadow().is_err(),
+                "shift {shift} seed {seed}: a pass dropping a page it wants answers the same"
+            );
+        }
     }
 }

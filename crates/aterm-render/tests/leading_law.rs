@@ -40,11 +40,9 @@ fn half_leading_splits_within_one_px() {
 
 #[test]
 fn renderer_geometry_follows_the_law_live() {
-    let bytes = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/jetbrains-mono.ttf"
-    ))
-    .expect("committed JetBrains Mono fixture");
+    let bytes =
+        std::fs::read(aterm_tempfile::manifest_dir().join("tests/fixtures/jetbrains-mono.ttf"))
+            .expect("committed JetBrains Mono fixture");
     let mut r = Renderer::from_bytes(&bytes, 16.0, Theme::default()).expect("fixture parses");
 
     let (asc, desc, gap) = r

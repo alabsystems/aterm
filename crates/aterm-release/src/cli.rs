@@ -22,7 +22,7 @@ USAGE
   targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
       Recheck a retained take's dSYM and a stripped private copy, without rebuilding.
 
-  targo --unverified ship release status [--json]
+  targo --unverified ship release status [--json | --fleet]
       Read this clone's current or latest release, unfinished verification stages,
       first reported failure, log paths and validation timing without starting,
       resuming or building it. Older logs leave stage activity unobserved.
@@ -212,9 +212,12 @@ USAGE
                            ledger tail · journaled cut · newest published build ·
                            dangling claims
   targo --unverified ship check [--commit REV] [--engine DIRECTORY]
-                 [--cut] [--export] [--wasm32]
+                 [--cut [--source]] [--export] [--wasm32] [--compat]
                            would a release of REV (default HEAD) pass? Read-only;
                            naming sections narrows it to them, none is all three:
+        --compat           the stage's stable x86_64 compile check, without a cut
+        --source           with --cut: only commit gates, for source sampling;
+                           no bundle-verification outcome is recorded
         --cut              the cut's pre-claim gates that read only the commit
                            and this clone's records (cutter identity, release
                            notes, harness versions, the predecessor's handoff
@@ -450,6 +453,7 @@ pub enum Cmd {
     Status,
     ReleaseStatus {
         json: bool,
+        fleet: bool,
     },
     /// `check`: would a release of one commit pass ([`crate::release_steps::check`]).
     Check(crate::release_steps::CheckOptions),
@@ -559,9 +563,15 @@ const OWN_VERDICT: [&str; 5] = [
 
 /// Format the final line printed by a failed verb.
 pub fn failure_line(msg: &str) -> String {
-    let own = OWN_VERDICT.iter().any(|w| match *w {
+    let own = OWN_VERDICT.iter().any(|&w| match w {
         "NOT DONE" | "CHECK ONLY" => msg.starts_with(w),
-        _ => msg.contains(&format!(" {w} —")) || msg.contains(&format!(" {w}:")),
+        _ => msg.match_indices(w).any(|(i, _)| {
+            i > 0
+                && msg.as_bytes()[i - 1] == b' '
+                && msg
+                    .get(i + w.len()..)
+                    .is_some_and(|after| after.starts_with(" —") || after.starts_with(':'))
+        }),
     });
     if own {
         format!("aterm-release: {msg}")
@@ -588,12 +598,13 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         },
         "release" if it.clone().next() == Some("status") => {
             it.next();
-            let json = match (it.next(), it.next()) {
-                (None, None) => false,
-                (Some("--json"), None) => true,
-                _ => return Err("release status accepts only --json".into()),
+            let (json, fleet) = match (it.next(), it.next()) {
+                (None, None) => (false, false),
+                (Some("--json"), None) => (true, false),
+                (Some("--fleet"), None) => (false, true),
+                _ => return Err("release status accepts --json or --fleet".into()),
             };
-            Ok(Cmd::ReleaseStatus { json })
+            Ok(Cmd::ReleaseStatus { json, fleet })
         }
         "release" => parse_release(&mut it).map(Cmd::Release),
         "accept-measure-failure" => {
@@ -773,6 +784,8 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         opts.engine = Some(std::path::PathBuf::from(dir));
                     }
                     "--cut" => opts.cut = true,
+                    "--compat" => opts.compat = true,
+                    "--source" => opts.source = true,
                     "--export" => opts.export = true,
                     "--wasm32" => opts.wasm32 = true,
                     other => {
@@ -782,6 +795,9 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         ));
                     }
                 }
+            }
+            if opts.source && !opts.cut {
+                return Err("--source requires --cut".into());
             }
             Ok(Cmd::Check(opts))
         }
@@ -1253,7 +1269,13 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             },
         },
         Cmd::Status => verify::run_status(&repo_root()?),
-        Cmd::ReleaseStatus { json } => crate::release_status::run(&repo_root()?, json),
+        Cmd::ReleaseStatus { json, fleet } => {
+            if fleet {
+                crate::line_claim::status(&repo_root()?).map_err(Error::new)
+            } else {
+                crate::release_status::run(&repo_root()?, json)
+            }
+        }
         Cmd::Check(opts) => match crate::release_steps::check(&repo_root()?, &opts) {
             0 => Ok(()),
             code => Err(Error::new(format!("check exited {code}"))),
@@ -1334,6 +1356,26 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compat_checks_only_the_stage_compile_without_exporting_or_cutting() {
+        let args = ["check", "--compat"].map(str::to_owned);
+        let Cmd::Check(opts) = parse(&args).unwrap() else {
+            panic!("check verb");
+        };
+        assert!(opts.compat);
+        assert_eq!(opts.sections(), (false, false, false));
+        assert_eq!(
+            crate::release_steps::CheckOptions::default().sections(),
+            (true, true, true)
+        );
+        assert!(parse(&["check", "--source"].map(str::to_owned)).is_err());
+        let Cmd::Check(source) = parse(&["check", "--cut", "--source"].map(str::to_owned)).unwrap()
+        else {
+            panic!("source check");
+        };
+        assert!(source.cut && source.source);
+    }
 
     /// `inputs` takes a new seal, `inputs --recheck` rechecks the kept one, and any other
     /// argument is refused by its own spelling, after `--recheck` too. CONTROL: the two forms.

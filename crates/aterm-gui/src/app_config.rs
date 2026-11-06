@@ -8237,11 +8237,9 @@ mod reload_render_transaction_tests {
     fn a_rollback_writes_the_scheme_back_and_raises_scheme_changed() {
         use crate::trail_rig::TrailRig;
         use std::time::{Duration, Instant};
-        let font = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-        );
-        let mut rig = TrailRig::new(std::path::Path::new(font)).expect("the rig");
+        let font = aterm_tempfile::manifest_dir()
+            .join("../aterm-render/tests/fixtures/jetbrains-mono.ttf");
+        let mut rig = TrailRig::new(&font).expect("the rig");
         let t0 = rig.t0();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         rig.configure(
@@ -9193,10 +9191,9 @@ mod cfg_engine_tests {
 
     #[test]
     fn w6_font_config_warns_and_skips_unresolvable() {
-        let fixture = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aterm-render/assets/DejaVuSansMono.ttf"
-        );
+        let fixture =
+            aterm_tempfile::manifest_dir().join("../aterm-render/assets/DejaVuSansMono.ttf");
+        let fixture = fixture.to_str().expect("a UTF-8 font path");
         let toml = format!(
             "font_family_bold = \"definitely-not-a-real-font-xyzzy\"\n\
              font_synthetic_style = false\n\

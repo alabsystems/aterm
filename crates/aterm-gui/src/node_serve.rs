@@ -791,7 +791,8 @@ pub(crate) fn query_window_survey_facts(
     aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(&wire).ok()
 }
 
-/// Configuration for [`run_node_serve_with`] so integration and negative-control tests run
+/// Configuration for the node job's supervision loop ([`serve_node_job`]), which production
+/// builds in [`run_node_serve_owning`] and integration and negative-control tests build to run
 /// hermetically against scratch directories and ephemeral loopback listeners.
 pub struct NodeServeConfig {
     /// `<state_dir>` holding `node-job.lock`, `fleet.key`, `fleet-node`, `fleet-peers.toml`, etc.
@@ -803,9 +804,9 @@ pub struct NodeServeConfig {
     /// Path to `aterm.toml`, if known.
     pub config_path: Option<PathBuf>,
     /// Vault paths for the `_alab._tcp` advert, the deny list and headless automatic admission
-    /// (`None`: an isolated run, which reads no vault, so its deny list names no one and `dns-sd`
-    /// ticks and automatic admission are off; a live run that finds no vault does not start,
-    /// [`node_vault_paths`]).
+    /// (`None`: a job that reads no vault, under a private state root, so its deny list names no
+    /// one and `dns-sd` ticks and automatic admission are off; a job on the account's own state
+    /// that finds no vault does not start, [`super::vault_under`]).
     pub vault_paths: Option<aterm_secrets::client::Paths>,
     /// This Mac's membership log, whose verdict admits a handshake, a join and a drive (`None`:
     /// the book's keyring alone).
@@ -984,6 +985,17 @@ pub trait NodeUpdater: Send + Sync {
     fn apply_at_boot(&self) -> String;
     /// Confirm this build's boot trial; `false` asks again.
     fn confirm_trial(&self) -> bool;
+    /// The build installed in this copy's place where it is older than the one this job runs
+    /// and this job's image is no longer the installed file: a boot's crash-loop revert put it
+    /// back and its re-exec failed, or a person installed an older release over this one.
+    fn older_build_installed(&self) -> Option<u64>;
+    /// Whether automatic checks (`[update] enabled`) as saved now differ from those this run's
+    /// checker started under, which reads the setting once, at its start.
+    fn checks_setting_moved(&self) -> bool;
+    /// Look at the checker [`Self::start_checker`] started, and replace one that stopped
+    /// stamping its heartbeat, as a window's watchdog replaces its own: with no window here,
+    /// nothing else would.
+    fn mind_checker(&self);
     /// End this run so it is started again, saying `why`.
     fn restart(&self, why: &str);
     /// The clock [`RETRY_LEFT_AFTER`] is read on.
@@ -1123,9 +1135,39 @@ fn restart_for(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> O
     (updater.auto_apply() && !a_window_relay_answers(relay_dir)).then_some(build)
 }
 
+/// Why a node run ends now, so that its next start runs as it should (§4.13), or `None`. An
+/// older build put back in this copy's place goes first, window or not: this job serves a build
+/// that was reverted, or that no longer stands here. Then a changed `[update] enabled`, which
+/// this run's checker read once: Settings tells the person a change takes effect at the next
+/// launch, and only a restart is this job's next launch. Then [`restart_for`]'s newer build.
+fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> Option<String> {
+    if let Some(build) = updater.older_build_installed() {
+        return Some(format!(
+            "build {build}, older than this one, stands in this copy's place (a crash-loop revert \
+             put it back, or it was installed over this one): this run ends so launchd starts the \
+             job again, and that start runs build {build}"
+        ));
+    }
+    if updater.checks_setting_moved() {
+        return Some(
+            "automatic update checks ([update] enabled) changed since this run started, which \
+             reads them once: this run ends so launchd starts the job again under the saved \
+             setting"
+                .to_owned(),
+        );
+    }
+    restart_for(updater, boot, relay_dir).map(|build| {
+        format!(
+            "build {build} waits here (staged, or installed over this image) and no window runs: \
+             this run ends so launchd starts the job again, and that start runs build {build}"
+        )
+    })
+}
+
 /// Start `updates`' checker and its look (§4.13): at each notice from the checker, and every
-/// [`NodeUpdater::look_every`], [`restart_for`] decides. Once it names a build the run ends
-/// through [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set.
+/// [`NodeUpdater::look_every`], the look minds the checker ([`NodeUpdater::mind_checker`]) and
+/// [`why_the_run_ends`] decides. Once it names a reason the run ends through
+/// [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set.
 fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<AtomicBool>) {
     let (noticed, notices) = std::sync::mpsc::sync_channel::<()>(1);
     let updater = Arc::clone(&updates.updater);
@@ -1138,12 +1180,9 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Atomi
         .spawn(move || {
             let every = updater.look_every();
             while !stop.load(Ordering::Acquire) {
-                if let Some(build) = restart_for(&*updater, boot, &relay_dir) {
-                    updater.restart(&format!(
-                        "build {build} waits here (staged, or installed over this image) and no \
-                         window runs: this run ends so launchd starts the job again, and that \
-                         start runs build {build}"
-                    ));
+                updater.mind_checker();
+                if let Some(why) = why_the_run_ends(&*updater, boot, &relay_dir) {
+                    updater.restart(&why);
                     return;
                 }
                 if notices.recv_timeout(every)
@@ -1169,6 +1208,50 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Atomi
 #[cfg(target_os = "macos")]
 struct LiveNodeUpdater {
     stop: Arc<AtomicBool>,
+    /// What the job's checker watchdog remembers between looks ([`mind_node_checker`]).
+    checker_watch: Mutex<crate::update_checker_watch::CheckerWatchState>,
+}
+
+/// The older installed build a node run ends for ([`NodeUpdater::older_build_installed`]):
+/// `older`, only once `image_replaced` reads that this job's image is no longer the installed
+/// file. A bundle whose `Info.plist` names an older build than the executable it holds would
+/// otherwise end every run at its first look, and launchd would start the job again into the
+/// same image, again and again.
+#[cfg(any(target_os = "macos", test))]
+fn older_build_to_run(older: Option<u64>, image_replaced: impl FnOnce() -> bool) -> Option<u64> {
+    older.filter(|_| image_replaced())
+}
+
+/// One look of the node job's checker watchdog at `beat`, at `now_secs` (§4.13): a stall the
+/// window's watchdog would act on ([`crate::update_checker_watch::judge`], which suspects at one
+/// look and acts at a later one) is replaced through `respawn`, as the window replaces its own,
+/// and logged. The stall it acted on, and the generation `respawn` started in its place.
+#[cfg(any(target_os = "macos", test))]
+fn mind_node_checker(
+    watch: &mut crate::update_checker_watch::CheckerWatchState,
+    beat: Option<aterm_update::checker_watch::CheckerBeat>,
+    now_secs: u64,
+    respawn: impl FnOnce(u64) -> Option<u64>,
+) -> Option<(crate::update_checker_watch::CheckerStall, Option<u64>)> {
+    let stall = crate::update_checker_watch::judge(watch, beat, now_secs)?;
+    let replacement = respawn(stall.generation);
+    match replacement {
+        Some(next) => aterm_log::warn!(
+            "aterm node serve: the update checker stalled (generation {} has not stamped its \
+             heartbeat for {} s, last in {}); started generation {next} in its place",
+            stall.generation,
+            stall.for_secs,
+            stall.phase.as_str()
+        ),
+        None => aterm_log::warn!(
+            "aterm node serve: the update checker stalled (generation {} has not stamped its \
+             heartbeat for {} s, last in {}) and no replacement started",
+            stall.generation,
+            stall.for_secs,
+            stall.phase.as_str()
+        ),
+    }
+    Some((stall, replacement))
 }
 
 #[cfg(target_os = "macos")]
@@ -1212,6 +1295,34 @@ impl NodeUpdater for LiveNodeUpdater {
         )
     }
 
+    fn older_build_installed(&self) -> Option<u64> {
+        older_build_to_run(
+            aterm_update::older_build_installed(crate::running_build_number()),
+            || {
+                std::env::current_exe().is_ok_and(|exe| {
+                    aterm_agent::node_service::image_replaced(std::process::id(), &exe)
+                })
+            },
+        )
+    }
+
+    fn checks_setting_moved(&self) -> bool {
+        aterm_update::automatic() != aterm_update::automatic_as_saved()
+    }
+
+    fn mind_checker(&self) {
+        let mut watch = self
+            .checker_watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        mind_node_checker(
+            &mut watch,
+            aterm_update::checker_watch::checker_snapshot(),
+            aterm_update::checker_watch::now_secs(),
+            aterm_update::respawn_stalled_checker,
+        );
+    }
+
     fn restart(&self, why: &str) {
         aterm_log::info!("aterm node serve: {why}");
         self.stop.store(true, Ordering::Release);
@@ -1222,9 +1333,12 @@ impl NodeUpdater for LiveNodeUpdater {
     }
 }
 
-/// Whether this `aterm node serve` runs on scratch state (a lab instance, a test, CI), which
-/// reads no vault and updates nothing.
-fn node_run_isolated() -> bool {
+/// Whether this `aterm node serve` stages and applies no update ([`live_node_updater`]) and keeps
+/// no account claims ([`run_node_serve`]): a run told it is on scratch state or a CI runner
+/// (`ATERM_STATE_HOME` or `CI` set, read raw, so a release build, which does not move its state
+/// for `ATERM_STATE_HOME`, honours both), so no CI runner ever updates. It decides no vault read:
+/// which vault the job reads follows where its state root resolved ([`super::vault_here`]).
+fn node_run_updates_and_claims_nothing() -> bool {
     std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some()
 }
 
@@ -1234,15 +1348,17 @@ fn node_relay_dir(state_dir: &Path) -> PathBuf {
 }
 
 /// This Mac's updater for a run that `stop` ends: production's on macOS, and none on scratch
-/// state (a lab instance, a test, CI) or on another platform.
+/// state (a lab instance, a test) or a CI runner ([`node_run_updates_and_claims_nothing`]) or on
+/// another platform.
 fn live_node_updater(stop: &Arc<AtomicBool>) -> Option<Arc<dyn NodeUpdater>> {
-    if node_run_isolated() {
+    if node_run_updates_and_claims_nothing() {
         return None;
     }
     #[cfg(target_os = "macos")]
     {
         Some(Arc::new(LiveNodeUpdater {
             stop: Arc::clone(stop),
+            checker_watch: Mutex::new(crate::update_checker_watch::CheckerWatchState::default()),
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -1253,9 +1369,9 @@ fn live_node_updater(stop: &Arc<AtomicBool>) -> Option<Arc<dyn NodeUpdater>> {
 }
 
 /// [`apply_at_node_boot`] for `aterm node serve` (launchd's `systems.alab.aterm-node`), first
-/// thing, with this Mac's updater ([`live_node_updater`]).
-#[must_use]
-pub fn apply_node_update_at_boot() -> NodeBoot {
+/// thing once the job's lock is held ([`run_node_serve_owning`]), with this Mac's updater
+/// ([`live_node_updater`]).
+fn apply_node_update_at_boot() -> NodeBoot {
     // A boot asks no restart: no run has started for one to end.
     let no_run = Arc::new(AtomicBool::new(false));
     match (live_node_updater(&no_run), aterm_types::dirs::state_dir()) {
@@ -1266,42 +1382,99 @@ pub fn apply_node_update_at_boot() -> NodeBoot {
     }
 }
 
-/// The vault a node job reads its deny list and membership log from: none in an isolated run (a
-/// test, a lab's scratch state, CI), which reads no vault and so has a deny list that names no
-/// one; otherwise this user's (`live`).
-///
-/// # Errors
-/// A live run whose vault cannot be found (no home directory): a job that cannot read its deny
-/// list must not serve as though the list named no one.
-fn node_vault_paths(
-    isolated: bool,
-    live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
-) -> Result<Option<aterm_secrets::client::Paths>, String> {
-    if isolated {
-        return Ok(None);
-    }
-    live().map(Some).map_err(|error| {
-        format!("no vault to read the deny list from ({error}), so this job does not serve")
-    })
-}
-
-/// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23), after
-/// its boot ([`apply_node_update_at_boot`]) found `boot`.
+/// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23,
+/// §4.13): the job's lock first ([`own_node_job`]), then its boot apply
+/// ([`apply_node_update_at_boot`]), then `startup` (the job's Commons runtime and the LAN gates
+/// it starts under), then the run. A start that finds the lock held is a second instance and
+/// does none of it, so it neither swaps a stage in nor counts a start against the boot trial of
+/// a build another instance runs, and starts no service beside the one that serves.
 #[must_use = "return or inspect the node service's exit status"]
-pub fn run_node_serve(boot: NodeBoot) -> ExitCode {
-    crate::descriptor_limit::raise_descriptor_limit_for_node();
+pub fn run_node_serve_owning(startup: impl FnOnce()) -> ExitCode {
     let Some(state_dir) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm node serve: state directory is unavailable");
         return ExitCode::FAILURE;
     };
+    own_node_job(
+        &state_dir,
+        apply_node_update_at_boot,
+        startup,
+        |boot, job_lock| run_node_serve(state_dir.clone(), boot, job_lock),
+    )
+}
+
+/// Take `<state_dir>/node-job.lock`, then run `boot`, `startup` and `serve` under it, in that
+/// order. A lock another instance holds ends the start at once, with none of them run, as a
+/// second instance. A lock that cannot be opened orders no start, so `boot` still runs, as it
+/// did before the lock came first: each start of a new build that fails there is counted against
+/// its boot trial, and the crash-loop revert still reaches it. That start then fails, with no
+/// service started. The lock is close-on-exec, so a boot that execs the build it installed lets
+/// it go, and that build's start takes it again before it counts or confirms its trial.
+fn own_node_job(
+    state_dir: &Path,
+    boot: impl FnOnce() -> NodeBoot,
+    startup: impl FnOnce(),
+    serve: impl FnOnce(NodeBoot, NodeJobLock) -> ExitCode,
+) -> ExitCode {
+    match take_node_job_lock(state_dir) {
+        JobLock::Taken(job_lock) => {
+            let boot = boot();
+            startup();
+            serve(boot, job_lock)
+        }
+        JobLock::HeldElsewhere => ExitCode::SUCCESS,
+        JobLock::Unopenable => {
+            let _ = boot();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// What a start found of `<state_dir>/node-job.lock` ([`take_node_job_lock`]).
+enum JobLock {
+    /// This start took it.
+    Taken(NodeJobLock),
+    /// Another instance holds it.
+    HeldElsewhere,
+    /// It could not be opened or taken (said on stderr).
+    Unopenable,
+}
+
+/// Take `<state_dir>/node-job.lock`, saying why where another instance holds it or it cannot be
+/// opened.
+fn take_node_job_lock(state_dir: &Path) -> JobLock {
+    match NodeJobLock::try_acquire(state_dir) {
+        Ok(Some(job_lock)) => JobLock::Taken(job_lock),
+        Ok(None) => {
+            aterm_log::info!(
+                "aterm node serve: another instance already holds {}/{}",
+                state_dir.display(),
+                aterm_agent::node_service::NODE_JOB_LOCK
+            );
+            JobLock::HeldElsewhere
+        }
+        Err(err) => {
+            eprintln!(
+                "aterm node serve: cannot acquire {}/{}: {err}",
+                state_dir.display(),
+                aterm_agent::node_service::NODE_JOB_LOCK
+            );
+            JobLock::Unopenable
+        }
+    }
+}
+
+/// The run of `aterm node serve` on `state_dir` that holds `job_lock`, after its boot found
+/// `boot`.
+fn run_node_serve(state_dir: PathBuf, boot: NodeBoot, job_lock: NodeJobLock) -> ExitCode {
+    crate::descriptor_limit::raise_descriptor_limit_for_node();
     let relay_dir = node_relay_dir(&state_dir);
     let home_dir = aterm_types::dirs::home_dir();
     let config_path = crate::app_config::config_path();
-    let isolated = node_run_isolated();
-    let vault_paths = match node_vault_paths(isolated, aterm_secrets::client::Paths::live) {
+    // A job that cannot read its deny list must not serve as though the list named no one.
+    let vault_paths = match super::vault_here() {
         Ok(paths) => paths,
         Err(why) => {
-            eprintln!("aterm node serve: {why}");
+            eprintln!("aterm node serve: {why}, so this job does not serve");
             return ExitCode::FAILURE;
         }
     };
@@ -1328,14 +1501,14 @@ pub fn run_node_serve(boot: NodeBoot) -> ExitCode {
         mesh: NodeMesh::live(),
     };
     crate::board_keeper::start(cfg.state_dir.clone());
-    if !isolated {
+    if !node_run_updates_and_claims_nothing() {
         spawn_claims_upkeep(cfg.relay_dir.clone(), Arc::clone(&cfg.stop));
         arm_claims_off_on_quit(
             cfg.relay_dir.clone(),
             crate::harness_host::claims_off_as_the_node_job_stops,
         );
     }
-    run_node_serve_with(cfg)
+    serve_node_job(cfg, job_lock)
 }
 
 /// The account claims' look while no window runs on this Mac (docs/DESIGN-fluid-swarm-2026-10-28.md
@@ -1405,32 +1578,25 @@ fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<AtomicBool>) {
     }
 }
 
-/// Run the node job supervision loop with explicit paths and seams.
+/// Run the node job supervision loop with explicit paths and seams, once it takes the job's
+/// lock ([`take_node_job_lock`]); production starts through [`run_node_serve_owning`].
+#[cfg(test)]
 #[must_use = "return or inspect the configured node service's exit status"]
-pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
+pub(crate) fn run_node_serve_with(cfg: NodeServeConfig) -> ExitCode {
+    match take_node_job_lock(&cfg.state_dir) {
+        JobLock::Taken(job_lock) => serve_node_job(cfg, job_lock),
+        JobLock::HeldElsewhere => ExitCode::SUCCESS,
+        JobLock::Unopenable => ExitCode::FAILURE,
+    }
+}
+
+/// The node job supervision loop of the instance that holds `job_lock`, which it keeps until it
+/// returns.
+fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
     if !cfg!(test) {
         crate::qos::set_self(crate::qos::Role::Background);
     }
-    let lock = match NodeJobLock::try_acquire(&cfg.state_dir) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            aterm_log::info!(
-                "aterm node serve: another instance already holds {}/{}",
-                cfg.state_dir.display(),
-                aterm_agent::node_service::NODE_JOB_LOCK
-            );
-            return ExitCode::SUCCESS;
-        }
-        Err(err) => {
-            eprintln!(
-                "aterm node serve: cannot acquire {}/{}: {err}",
-                cfg.state_dir.display(),
-                aterm_agent::node_service::NODE_JOB_LOCK
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let _held_lock = lock;
+    let _held_lock = job_lock;
     if !cfg.stop.load(Ordering::Acquire) {
         aterm_agent::service_repair_rpc::start_recovery_in_context(
             cfg.vault_paths.as_ref(),
@@ -2041,8 +2207,8 @@ fn wanted_for_node(cfg: &NodeServeConfig) -> Option<Wanted> {
 /// dialer and its hand-over, and the watch every tick, so an unchanged vault is never decrypted
 /// again. `cache` keeps the last authoritative list through a mid-apply or failed read, and
 /// `None` until one was read, under which every proved dialer is refused
-/// ([`super::update_denied_nodes_cache`]). A job that reads no vault (`vault_paths` `None`: an
-/// isolated run, [`node_vault_paths`]) has a deny list that names no one.
+/// ([`super::update_denied_nodes_cache`]). A job that reads no vault (`vault_paths` `None`: one
+/// under a private state root, [`super::vault_under`]) has a deny list that names no one.
 fn denied_nodes_for(
     vault_paths: Option<&aterm_secrets::client::Paths>,
     cache: &Mutex<DeniedCache>,
@@ -2717,20 +2883,15 @@ fn serve_one_node_generation(
                     log.as_deref(),
                     vault_paths.as_ref(),
                 );
-                let vault = vault_paths.clone();
+                let on = super::vault_join_on(judged, vault_paths.clone());
                 return served.answer(|stream| {
                     stream.set_read_timeout(Some(HANDSHAKE))?;
                     stream.set_write_timeout(Some(HANDSHAKE))?;
-                    let ended = match (judged, vault) {
-                        (Ok(judged), Some(paths)) => {
-                            let from =
-                                peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
-                            aterm_agent::vault_join::serve(stream, from, &judged, None, &paths)
-                                .map_err(|error| error.to_string())
-                        }
-                        (Err(why), _) => Err(why),
-                        (Ok(_), None) => Err("this node job follows no vault".to_owned()),
-                    };
+                    let from = peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
+                    let ended = on.and_then(|(judged, paths)| {
+                        aterm_agent::vault_join::serve(stream, from, &judged, None, &paths)
+                            .map_err(|error| error.to_string())
+                    });
                     if let Err(why) = ended {
                         let _ = aterm_secrets::members::refuse(stream, &why);
                         aterm_log::info!("members: a vault-join from {peer:?} ended: {why}");

@@ -189,23 +189,22 @@ impl Activations {
     /// Current unambiguous preparations addressed to this installation. This
     /// supplies discovery, not reusable permission: consumers must call
     /// `prepare` again before each effect and retain their consumption floor.
+    /// An observation first asks whether any current decision names this
+    /// device; where none does, including where no Mac declared the table,
+    /// discovery is empty without the control writer each permit requires.
     pub fn local_preparations(&self) -> Result<Vec<(Digest, Digest)>> {
+        let named = self.observe_store_if_declared(|session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            Ok(!addressed(&history, session.actor()).is_empty())
+        })?;
+        if named != Some(true) {
+            return Ok(Vec::new());
+        }
         self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
-            let statuses = history.statuses();
-            Ok(statuses
-                .iter()
-                .filter_map(|(&account, state)| {
-                    let &State::Ready(decision) = state else {
-                        return None;
-                    };
-                    let record = &history.records[&decision];
-                    intents::current_with_statuses(&history, &statuses, record).ok()?;
-                    session
-                        .permit_account(record)
-                        .ok()
-                        .map(|()| (account, decision))
-                })
+            Ok(addressed(&history, session.actor())
+                .into_iter()
+                .filter(|(_, decision)| session.permit_account(&history.records[decision]).is_ok())
                 .collect())
         })
     }
@@ -520,10 +519,53 @@ impl Activations {
             None => crate::documents::application::observe_store(&self.paths, descriptor, action),
         }
     }
+
+    /// [`Self::observe_store`], `None` where no Mac declared the table.
+    fn observe_store_if_declared<T>(
+        &self,
+        action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+    ) -> Result<Option<T>> {
+        match self.deadline {
+            Some(deadline) => crate::documents::application::observe_store_if_declared_until(
+                &self.paths,
+                descriptor,
+                deadline,
+                action,
+            ),
+            None => crate::documents::application::observe_store_if_declared(
+                &self.paths,
+                descriptor,
+                action,
+            ),
+        }
+    }
 }
 
 fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
     Descriptor::application(bootstrap.trust(), "accounts", "activations", 1)
+}
+
+/// Each account whose unique current decision prepares the device `actor`, with
+/// that decision: the most a permit can admit, since it requires the same device.
+fn addressed(history: &History, actor: Actor) -> Vec<(Digest, Digest)> {
+    let statuses = history.statuses();
+    statuses
+        .iter()
+        .filter_map(|(&account, state)| {
+            let &State::Ready(decision) = state else {
+                return None;
+            };
+            let record = &history.records[&decision];
+            let Action::Prepare(terms) = &record.request().action else {
+                return None;
+            };
+            if terms.device.actor() != actor {
+                return None;
+            }
+            intents::current_with_statuses(history, &statuses, record).ok()?;
+            Some((account, decision))
+        })
+        .collect()
 }
 
 fn next_generation(history: &History, parents: &[Digest]) -> Result<u64> {

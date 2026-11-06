@@ -69,10 +69,7 @@ impl CratesIo {
         let response = self
             .client
             .get(url)
-            .header(
-                "User-Agent",
-                concat!("aterm-forge/", env!("CARGO_PKG_VERSION")),
-            )
+            .header("User-Agent", "aterm-forge")
             .limit(limit)
             .connect_within(Duration::from_secs(30))
             .idle(Duration::from_secs(60))

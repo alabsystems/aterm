@@ -7,16 +7,16 @@
 //! fixture paths, so a change to the template fails HERE, naming the fixture to
 //! regenerate, instead of letting the other crate test a hook atpkg no longer writes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const FIXTURE_AGENTS: &str = "/opt/aterm-si fixture/pkg/agents";
 const FIXTURE_BIN: &str = "/opt/aterm-si fixture/pkg/bin";
 const FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 
-const SI: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../aterm-shell-integration/src/"
-);
+/// The shell integration's source folder, which holds the goldens to regenerate.
+fn si() -> PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-shell-integration/src")
+}
 
 macro_rules! si_file {
     ($rel:literal) => {
@@ -47,7 +47,8 @@ fn the_shell_integration_hook_goldens_are_what_hook_files_writes() {
     assert_eq!(
         body(&format!("{}.zsh", atpkg::hooks::HOOK_BASENAME)),
         posix,
-        "regenerate {SI}fixtures/atpkg-hook-posix.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})"
+        "regenerate {} from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})",
+        si().join("fixtures/atpkg-hook-posix.golden").display()
     );
     assert_eq!(
         body(&format!("{}.bash", atpkg::hooks::HOOK_BASENAME)),
@@ -57,6 +58,7 @@ fn the_shell_integration_hook_goldens_are_what_hook_files_writes() {
     assert_eq!(
         body(&format!("{}.fish", atpkg::hooks::HOOK_BASENAME)),
         fish,
-        "regenerate {SI}fixtures/atpkg-hook-fish.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})"
+        "regenerate {} from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})",
+        si().join("fixtures/atpkg-hook-fish.golden").display()
     );
 }

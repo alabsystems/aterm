@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-lab"
-version.workspace = true
+version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -40,6 +40,7 @@ path = "src/standin/main.rs"
 aterm-agent = { workspace = true }
 # The control protocol's reply bound, shared by inline trail image validation.
 # Already in the build graph through aterm-agent.
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # The one spawn seam (`spawnfd::command`: posix_spawn, `setsid` as a spawn
 # attribute) and the lifeline a throwaway instance watches.

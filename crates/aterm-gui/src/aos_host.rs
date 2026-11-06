@@ -534,7 +534,7 @@ impl App {
         if self.config.secure_keyboard_entry_or_default() {
             return Err(AosRefusal::SecureEntry);
         }
-        let build = aterm_types::version::build_id();
+        let build = aterm_stamp::build_id();
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
         refute_hold(ws, now);
         // A run proven under the last recording corroborates nothing in this one, and its grant

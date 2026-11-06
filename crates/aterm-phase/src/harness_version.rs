@@ -459,7 +459,7 @@ mod tests {
                 "{harness:?}: owns its reader and its harness files"
             );
         }
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = aterm_tempfile::manifest_dir().join("../..");
         for (i, a) in CliHarness::ALL.iter().enumerate() {
             for &src in a.sources() {
                 assert!(
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn each_version_file_holds_its_one_line() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = aterm_tempfile::manifest_dir().join("../..");
         for harness in CliHarness::ALL {
             let text = std::fs::read_to_string(dir.join(harness.version_file()))
                 .unwrap_or_else(|e| panic!("{harness:?}: {e}"));

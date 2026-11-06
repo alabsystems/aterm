@@ -1,6 +1,6 @@
 [package]
 name = "aterm-wasm"
-version.workspace = true
+version = "0.0.0"
 edition = "2021"
 description = "The aterm engine + CPU rasterizer (aterm-render) -> RGBA frames as a wasm module, for rendering a terminal on a <canvas> in the Electron renderer. The in-page replacement substrate for @xterm/xterm's rendering."
 license = "MIT"

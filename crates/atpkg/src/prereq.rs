@@ -30,6 +30,8 @@ pub enum CcVerdict {
     Unanswered {
         /// The compiler that was asked.
         driver: PathBuf,
+        /// How long the probe waited for it ([`CcHost::bound`]).
+        bound: Duration,
     },
     /// The compiler answered, but the build probe could not run — unknown, not broken.
     Unproven {
@@ -89,11 +91,11 @@ impl CcVerdict {
                     |act| format!("fix: {act}")
                 )
             ),
-            Self::Unanswered { driver } => format!(
+            Self::Unanswered { driver, bound } => format!(
                 "the C compiler at {} did not answer within {} s — whether Rust builds can \
                  compile C here is unknown",
                 driver.display(),
-                PROBE_TIMEOUT.as_secs()
+                bound.as_secs()
             ),
             Self::Unproven { driver, why } => format!(
                 "the C compiler at {} answers, but the build probe could not run ({why}) — \
@@ -123,6 +125,14 @@ pub const fn act() -> &'static str {
 /// How long one compiler probe may take.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the probe of a run a person waits on once waits for the compiler (the elevation
+/// System State's Mac Setup tab and `aterm init` run, [`CcHost::waited_on`]): a hang
+/// detector, never a latency budget. A new Mac's first compile waits on macOS's first check of
+/// the compiler, which a slow network stretches past [`PROBE_TIMEOUT`] (E3, 2026-11-05, a
+/// fresh macOS 27 guest: 3.6 s idle, 8.0 s at 1 Mbit/s with 150 ms delay and 1% loss), and a
+/// probe that gives up then reads tools that are there as unknown.
+pub const FIRST_COMPILE_BOUND: Duration = Duration::from_secs(60);
+
 /// Where the probe looks beyond `PATH`.
 #[derive(Clone, Debug)]
 pub struct CcHost {
@@ -148,6 +158,16 @@ impl CcHost {
             default_developer_dir: PathBuf::from("/Library/Developer/CommandLineTools"),
             bound: PROBE_TIMEOUT,
             tmp_root: std::env::temp_dir(),
+        }
+    }
+
+    /// [`Self::this_machine`] for a run a person waits on once, which gives up only on a
+    /// compiler that hangs ([`FIRST_COMPILE_BOUND`]).
+    #[must_use]
+    pub fn waited_on() -> Self {
+        Self {
+            bound: FIRST_COMPILE_BOUND,
+            ..Self::this_machine()
         }
     }
 }
@@ -418,6 +438,7 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     match result {
         None => CcVerdict::Unanswered {
             driver: cc.to_path_buf(),
+            bound: host.bound,
         },
         Some(out) if out.status.success() => {
             let wrote =
@@ -484,6 +505,7 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], bound: Duration) -> CcVerdict {
     match crate::doctor::output_bounded_capturing(&mut cmd, bound) {
         None => CcVerdict::Unanswered {
             driver: driver.to_path_buf(),
+            bound,
         },
         Some(out) if out.status.success() => {
             let printed = String::from_utf8_lossy(&out.stdout);
@@ -809,6 +831,7 @@ mod tests {
         for unknown in [
             CcVerdict::Unanswered {
                 driver: PathBuf::from("/usr/bin/cc"),
+                bound: PROBE_TIMEOUT,
             },
             CcVerdict::NotProbed,
         ] {
@@ -897,7 +920,8 @@ mod tests {
         assert_eq!(
             verdict,
             CcVerdict::Unanswered {
-                driver: dir.join("cc")
+                driver: dir.join("cc"),
+                bound,
             }
         );
         assert!(!verdict.blocks_builds());

@@ -537,6 +537,230 @@ fn a_fetch_of_main_writes_only_its_record_ref() {
 }
 
 #[test]
+fn an_exact_fetch_keeps_tag_objects_and_leaves_checkout_state_alone() {
+    let world = World::canonical("git-exact-fetch");
+    let bare = bare_repo(world.path(), "app");
+    let checkout = world.path().join("checkout");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &bare.to_string_lossy(),
+            &checkout.to_string_lossy(),
+        ],
+    );
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    let tree = host_git(&bare, &["rev-parse", "main^{tree}"]);
+    let second = host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
+    host_git(&bare, &["tag", "-a", "v2", &second, "-m", "two"]);
+    let tag = host_git(&bare, &["rev-parse", "refs/tags/v2"]);
+    let before = host_git(&checkout, &["for-each-ref"]);
+    let config = std::fs::read(checkout.join(".git/config")).unwrap();
+    std::fs::write(checkout.join(".git/FETCH_HEAD"), b"keep fetch head\n").unwrap();
+    std::fs::write(checkout.join("local-work"), b"keep local work\n").unwrap();
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    for (reference, expected) in [
+        ("refs/tags/v2", tag.as_str()),
+        (second.as_str(), second.as_str()),
+    ] {
+        let result = gh
+            .run_git(&GitRun::fetch_ref(
+                &slug,
+                &checkout,
+                reference,
+                "refs/agh/exact",
+                true,
+            ))
+            .unwrap_or_else(|error| panic!("{}", error.why));
+        assert_eq!(result.as_, None);
+        assert_eq!(result.grant, None);
+        assert_eq!(
+            host_git(&checkout, &["rev-parse", "refs/agh/exact"]),
+            expected
+        );
+    }
+    // A syntactically private cache ref may already be a symbolic reference to
+    // a branch. Replacing the cache must not follow it into that branch.
+    host_git(&checkout, &["update-ref", "-d", "refs/agh/exact"]);
+    host_git(
+        &checkout,
+        &["symbolic-ref", "refs/agh/exact", "refs/heads/main"],
+    );
+    gh.run_git(&GitRun::fetch_ref(
+        &slug,
+        &checkout,
+        &second,
+        "refs/agh/exact",
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        host_git(&checkout, &["rev-parse", "refs/heads/main"]),
+        first
+    );
+    assert_eq!(
+        host_git(&checkout, &["rev-parse", "refs/agh/exact"]),
+        second
+    );
+    host_git(&checkout, &["update-ref", "-d", "refs/agh/exact"]);
+    assert_eq!(host_git(&checkout, &["for-each-ref"]), before);
+    assert_eq!(host_git(&checkout, &["rev-parse", "HEAD"]), first);
+    assert_eq!(
+        std::fs::read(checkout.join(".git/FETCH_HEAD")).unwrap(),
+        b"keep fetch head\n"
+    );
+    assert_eq!(
+        std::fs::read(checkout.join("local-work")).unwrap(),
+        b"keep local work\n"
+    );
+    assert_eq!(std::fs::read(checkout.join(".git/config")).unwrap(), config);
+    assert!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .all(|spec| !runs_agh_s_helper(spec))
+    );
+    assert!(files(&world.dirs.grants()).is_empty());
+}
+
+#[test]
+fn exact_fetch_refuses_filesystem_symlinks_in_refs_and_reflogs() {
+    use std::os::unix::fs::symlink;
+    let world = World::canonical("git-exact-fetch-symlink");
+    let bare = bare_repo(world.path(), "app");
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    for root in ["refs", "logs/refs"] {
+        let checkout = world.path().join(root.replace('/', "-"));
+        std::fs::create_dir(&checkout).unwrap();
+        host_git(&checkout, &["init", "--quiet", "--bare"]);
+        host_git(
+            &checkout,
+            &[
+                "fetch",
+                "--quiet",
+                &bare.to_string_lossy(),
+                "main:refs/heads/victim",
+            ],
+        );
+        let parent = checkout.join(root);
+        std::fs::create_dir_all(&parent).unwrap();
+        symlink(checkout.join("refs/heads"), parent.join("agh")).unwrap();
+        let before = gh.fx().children_run().len();
+        let error = gh
+            .run_git(&GitRun::fetch_ref(
+                &common::slug("fixture-dev/app"),
+                &checkout,
+                &first,
+                "refs/agh/victim",
+                true,
+            ))
+            .unwrap_err();
+        assert!(error.why.contains("filesystem symlink"), "{}", error.why);
+        assert_eq!(
+            host_git(&checkout, &["rev-parse", "refs/heads/victim"]),
+            first
+        );
+        assert!(
+            gh.fx().children_run()[before..]
+                .iter()
+                .all(|spec| !spec.args.iter().any(|arg| arg == "fetch"))
+        );
+    }
+    let checkout = world.path().join("hardlink.git");
+    std::fs::create_dir(&checkout).unwrap();
+    host_git(&checkout, &["init", "--quiet", "--bare"]);
+    let logs = checkout.join("logs/refs/agh");
+    std::fs::create_dir_all(&logs).unwrap();
+    let unrelated = world.path().join("unrelated-file");
+    std::fs::write(&unrelated, b"keep unchanged\n").unwrap();
+    std::fs::hard_link(&unrelated, logs.join("exact")).unwrap();
+    let error = gh
+        .run_git(&GitRun::fetch_ref(
+            &common::slug("fixture-dev/app"),
+            &checkout,
+            &first,
+            "refs/agh/exact",
+            true,
+        ))
+        .unwrap_err();
+    assert!(error.why.contains("hard link"), "{}", error.why);
+    assert_eq!(std::fs::read(unrelated).unwrap(), b"keep unchanged\n");
+}
+
+#[test]
+fn exact_fetch_rejects_ambiguous_sources_and_non_owned_destinations_before_running() {
+    let world = World::canonical("git-exact-fetch-refusals");
+    let gh = world.client(git_env()).build();
+    let slug = common::slug("fixture-dev/app");
+    for (source, into) in [
+        ("main", "refs/agh/exact"),
+        ("--upload-pack=other", "refs/agh/exact"),
+        ("refs/heads/*", "refs/agh/exact"),
+        ("refs/heads/main:refs/heads/main", "refs/agh/exact"),
+        ("refs/heads/main", "refs/heads/main"),
+        ("refs/heads/main", "refs/tags/v1"),
+        ("refs/heads/main", "refs/remotes/origin/main"),
+        ("refs/heads/main", "refs/record/main"),
+        ("refs/heads/main", "refs/agh/../main"),
+    ] {
+        let error = gh
+            .run_git(&GitRun::fetch_ref(&slug, world.path(), source, into, true))
+            .unwrap_err();
+        assert_eq!(error.kind, Kind::Usage, "{source} {into}: {}", error.why);
+    }
+    assert!(gh.fx().children_run().is_empty());
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
+fn anonymous_release_fetch_cannot_use_available_writer_credentials() {
+    let world = World::release("git-anonymous-release-fetch");
+    world.fake.add_repo(
+        "alabsystems/secret",
+        RepoSpec::private().pull("fixture-release-bot"),
+    );
+    world
+        .fake
+        .set_branch("alabsystems/secret", "main", common::MAIN_SHA);
+    let checkout = world.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    host_git(&checkout, &["init", "--quiet"]);
+    let gh = world.client(git_env()).build();
+    let named = common::granted(&gh, "alabsystems/secret");
+    gh.run_git(
+        &GitRun::fetch_ref(
+            &common::slug("alabsystems/secret"),
+            &checkout,
+            "refs/heads/main",
+            "refs/agh/anonymous",
+            true,
+        )
+        .with_named(named),
+    )
+    .expect_err("a private repository cannot be fetched anonymously");
+    let seen = git_seen(&world.fake, "alabsystems/secret");
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|request| !request.had_authorization));
+    assert!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .all(|spec| !runs_agh_s_helper(spec))
+    );
+    assert!(files(&world.dirs.grants()).is_empty());
+    assert!(host_git(&checkout, &["for-each-ref"]).is_empty());
+}
+
+#[test]
 fn a_release_tier_run_needs_a_literal_or_a_grant() {
     let world = World::canonical("git-release-named");
     let gh = world.client(git_env()).build();

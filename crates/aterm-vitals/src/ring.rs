@@ -46,21 +46,16 @@ impl Bucket {
         (self.n > 0).then(|| self.sum / f64::from(self.n))
     }
 
-    /// Over for at least half its readings.
-    #[inline]
-    #[must_use]
-    pub const fn is_over(&self) -> bool {
-        self.n > 0 && (self.over_n as u32) * 2 >= (self.n as u32)
-    }
-
-    /// The bucket as a strip cell.
+    /// The bucket as a strip cell: its mean, its largest reading, and its readings counted with
+    /// how many of them were over.
     #[inline]
     #[must_use]
     pub fn cell(&self) -> Cell {
         Cell {
             mean: self.value(),
             max: (self.n > 0).then_some(self.max),
-            over: self.is_over(),
+            n: f64::from(self.n),
+            over_n: f64::from(self.over_n.min(self.n)),
         }
     }
 
@@ -80,58 +75,73 @@ impl Bucket {
     }
 }
 
-/// One strip cell: a bucket, or a column of consecutive buckets.
+/// One strip cell: a bucket, or a box of consecutive buckets or readings.
+///
+/// Its mean and its over share are count-weighted: each reading counts once, whichever bucket
+/// holds it (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3, until F4′ weights them by time).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cell {
-    /// The mean of its read buckets, raw; `None` when none was read (hollow).
+    /// The mean of its readings, raw; `None` when none was read (hollow).
     pub mean: Option<f64>,
-    /// The largest single reading, for the lens and the accessibility text.
+    /// The largest single reading: the strip box's peak tick, the lens and the accessibility text.
     pub max: Option<f64>,
-    /// Whether any of its buckets was over for at least half its readings.
-    pub over: bool,
+    /// How many readings it holds, the weight its mean and its over share carry in a merge; a
+    /// box that spans part of a bucket holds that part of the bucket's readings. 0 when none was
+    /// read.
+    pub n: f64,
+    /// How many of those readings were over the resource's maximum.
+    pub over_n: f64,
 }
 
 impl Cell {
-    /// Merge consecutive cells into one column.
+    /// The share of its readings that were over the resource's maximum, `0..=1`: the strip box's
+    /// over cap is this long (A1 §3, ruling 8). 0 when none was read.
+    #[inline]
     #[must_use]
-    pub fn merge(cells: impl IntoIterator<Item = Cell>) -> Cell {
-        let mut sum = 0.0;
-        let mut n = 0u32;
-        let mut out = Cell::default();
-        for c in cells {
-            if let Some(m) = c.mean.filter(|m| m.is_finite()) {
-                sum += m;
-                n += 1;
-            }
-            if let Some(x) = c.max.filter(|x| x.is_finite()) {
-                out.max = Some(out.max.map_or(x, |o| o.max(x)));
-            }
-            out.over |= c.over;
+    pub fn over_share(&self) -> f64 {
+        if self.n > 0.0 && self.over_n.is_finite() {
+            (self.over_n / self.n).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
-        out.mean = (n > 0).then(|| sum / f64::from(n));
-        out
     }
 
-    /// Merge cells each spanning `w` ms of one box: the read ones' mean weighted by `w`, the
-    /// largest max, over when any is; a cell spanning no time counts for nothing.
+    /// Merge consecutive cells into one box: its read readings' mean, the largest max, and the
+    /// readings and over readings summed.
     #[must_use]
-    pub fn merge_weighted(cells: impl IntoIterator<Item = (Cell, i64)>) -> Cell {
-        let (mut sum, mut weight) = (0.0, 0.0);
+    pub fn merge(cells: impl IntoIterator<Item = Cell>) -> Cell {
+        Self::merge_parts(cells.into_iter().map(|c| (c, 1.0)))
+    }
+
+    /// Merge cells of which a box takes `part` (`0..=1`) each: a ten-minute bucket an hour box
+    /// spans only some of brings that part of its readings, and so that part of its weight in the
+    /// box's mean and its over share. A cell the box takes none of counts for nothing; one whose
+    /// mean is not finite brings no readings, only its max where that is finite.
+    #[must_use]
+    pub fn merge_parts(cells: impl IntoIterator<Item = (Cell, f64)>) -> Cell {
+        let (mut sum, mut n, mut over_n) = (0.0, 0.0, 0.0);
         let mut out = Cell::default();
-        for (c, w) in cells {
-            if w <= 0 {
+        for (c, part) in cells {
+            if part.is_nan() || part <= 0.0 {
                 continue;
             }
-            if let Some(m) = c.mean.filter(|m| m.is_finite()) {
-                sum += m * w as f64;
-                weight += w as f64;
+            let w = c.n * part.min(1.0);
+            if let Some(m) = c.mean.filter(|m| m.is_finite())
+                && w > 0.0
+            {
+                sum += m * w;
+                n += w;
+                over_n += c.over_n.clamp(0.0, c.n) * part.min(1.0);
             }
             if let Some(x) = c.max.filter(|x| x.is_finite()) {
                 out.max = Some(out.max.map_or(x, |o| o.max(x)));
             }
-            out.over |= c.over;
         }
-        out.mean = (weight > 0.0).then_some(sum / weight);
+        if n > 0.0 {
+            out.mean = Some(sum / n);
+            out.n = n;
+            out.over_n = over_n;
+        }
         out
     }
 }
@@ -155,7 +165,8 @@ impl Reading {
         Cell {
             mean: Some(self.v),
             max: Some(self.v),
-            over: self.over,
+            n: 1.0,
+            over_n: if self.over { 1.0 } else { 0.0 },
         }
     }
 }
@@ -589,10 +600,11 @@ impl BucketRing {
         self.recent.max(now_unix_ms, window_ms)
     }
 
-    /// Whether the open bucket is over.
+    /// Whether the open bucket holds a reading over the resource's maximum: its box draws an
+    /// over cap (A1 §3).
     #[must_use]
     pub fn open_over(&self) -> bool {
-        self.b.back().is_some_and(Bucket::is_over)
+        self.b.back().is_some_and(|b| b.over_n > 0)
     }
 
     /// The sustained-30 s value ending at bucket `k`.
@@ -817,13 +829,10 @@ pub struct ScaleBand {
     pub live_now: bool,
 }
 
-/// Normalized geometry and age window of one box in a [`MultiScaleSpec`].
+/// The age window, weight and band of one box in a [`MultiScaleSpec`]: the deck lays its edges
+/// from the weights and bands (`crates/aterm-gui/src/stats_plan.rs`, `Strip::box_edges`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ProgSlot {
-    /// Normalized left edge in `0.0..=1.0` across the strip.
-    pub x0: f32,
-    /// Normalized right edge in `0.0..=1.0` across the strip.
-    pub x1: f32,
     /// Older edge of the slot's window relative to `now_unix_ms` (ms ago, `>= age_lo_ms`).
     pub age_hi_ms: i64,
     /// Newer edge of the slot's window relative to `now_unix_ms` (ms ago, `0` on `live_now`).
@@ -832,6 +841,9 @@ pub struct ProgSlot {
     pub weight: u16,
     /// True when this slot is the far-left real-time `now` box.
     pub is_live_now: bool,
+    /// The index of its band in [`MultiScaleSpec::bands`]: a gate stands between two boxes of
+    /// different bands.
+    pub band: u8,
 }
 
 /// One resampled cell in a [`MultiScaleSpec`] strip, carrying its slot geometry and gap marker.
@@ -878,7 +890,7 @@ const BANDS_FULL_6H: [ScaleBand; 6] = [
     ScaleBand {
         slots: 9,
         period_ms: 60_000,
-        weight: 5,
+        weight: 6,
         live_now: false,
     },
     ScaleBand {
@@ -890,7 +902,7 @@ const BANDS_FULL_6H: [ScaleBand; 6] = [
     ScaleBand {
         slots: 5,
         period_ms: 3_600_000,
-        weight: 10,
+        weight: 9,
         live_now: false,
     },
 ];
@@ -908,7 +920,7 @@ const BANDS_FOLD_4H: [ScaleBand; 6] = [
     ScaleBand {
         slots: 1,
         period_ms: 1_000,
-        weight: 2,
+        weight: 4,
         live_now: true,
     },
     ScaleBand {
@@ -920,25 +932,25 @@ const BANDS_FOLD_4H: [ScaleBand; 6] = [
     ScaleBand {
         slots: 5,
         period_ms: 10_000,
-        weight: 1,
+        weight: 2,
         live_now: false,
     },
     ScaleBand {
         slots: 9,
         period_ms: 60_000,
-        weight: 1,
+        weight: 3,
         live_now: false,
     },
     ScaleBand {
         slots: 5,
         period_ms: 600_000,
-        weight: 2,
+        weight: 4,
         live_now: false,
     },
     ScaleBand {
         slots: 3,
         period_ms: 3_600_000,
-        weight: 2,
+        weight: 5,
         live_now: false,
     },
 ];
@@ -956,25 +968,25 @@ const BANDS_COMPACT_6M: [ScaleBand; 4] = [
     ScaleBand {
         slots: 1,
         period_ms: 1_000,
-        weight: 2,
+        weight: 7,
         live_now: true,
     },
     ScaleBand {
         slots: 9,
         period_ms: 1_000,
-        weight: 1,
+        weight: 4,
         live_now: false,
     },
     ScaleBand {
         slots: 5,
         period_ms: 10_000,
-        weight: 1,
+        weight: 6,
         live_now: false,
     },
     ScaleBand {
         slots: 5,
         period_ms: 60_000,
-        weight: 2,
+        weight: 8,
         live_now: false,
     },
 ];
@@ -990,19 +1002,19 @@ const BANDS_MINI_1M: [ScaleBand; 3] = [
     ScaleBand {
         slots: 1,
         period_ms: 1_000,
-        weight: 1,
+        weight: 5,
         live_now: true,
     },
     ScaleBand {
         slots: 9,
         period_ms: 1_000,
-        weight: 1,
+        weight: 2,
         live_now: false,
     },
     ScaleBand {
         slots: 5,
         period_ms: 10_000,
-        weight: 2,
+        weight: 7,
         live_now: false,
     },
 ];
@@ -1013,31 +1025,35 @@ const TICKS_MINI_1M: [(i64, &str); 3] =
 impl MultiScaleSpec {
     /// Full's six hours: the live second, nine more 1 s boxes, five of 10 s, nine of 1 min,
     /// five of 10 min and five of 1 h, each size starting where its age is its own block's
-    /// (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4), 34 slots.
+    /// (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4), 34 slots. Weighed 10; 4, 5, 6, 7, 9:
+    /// from the 1 s band to the 1 h band each band's boxes are wider than the finer band's, and
+    /// the live box is wider than every 1 s box (`docs/DESIGN-stats-deck-units-2026-11-04.md`
+    /// §3), 205 in all.
     pub const FULL_6H: Self = Self {
         bands: &BANDS_FULL_6H,
         ticks: &TICKS_FULL_6H,
     };
 
-    /// Four hours: [`Self::FULL_6H`]'s blocks with three of 1 h, 32 slots. The 1 s, 10 s and
-    /// 1 min blocks are one width and the live, 10 min and 1 h ones twice it, so on Folded's
-    /// 129 pt strip a 1 s block is 3 pt or more and "–1m" and "–10m" stand clear of "4h ago".
+    /// Four hours: [`Self::FULL_6H`]'s blocks with three of 1 h, 32 slots. Weighed 4; 1, 2, 3,
+    /// 4, 5, rising from the 1 s band to the 1 h band (A1 §3), so its 1 s boxes are the narrowest
+    /// it lays: about 1 pt each on a 129 pt strip, 1 device px at 1× below 208 pt.
     pub const FOLD_4H: Self = Self {
         bands: &BANDS_FOLD_4H,
         ticks: &TICKS_FOLD_4H,
     };
 
     /// Six minutes: the 1 s, 10 s and five 1 min blocks; too narrow for the 10 min and 1 h
-    /// ones, 20 slots. The live and 1 min blocks are twice the 1 s and 10 s ones, so on a 79 pt
-    /// strip a 1 s block is 3 pt or more and "–10s" stands clear of "6m ago".
+    /// ones, 20 slots. Weighed 7; 4, 6, 8, rising from the 1 s band (A1 §3): on a 79 pt strip a
+    /// 1 s box is about 1.9 pt.
     pub const COMPACT_6M: Self = Self {
         bands: &BANDS_COMPACT_6M,
         ticks: &TICKS_COMPACT_6M,
     };
 
-    /// One minute: the 1 s and 10 s blocks alone, 15 slots, the 10 s ones twice as wide, so on a
-    /// 59 pt strip a 1 s block is 2.95 pt (3 device px at 1×) and "–10s", at the strip's
-    /// middle, stands clear of "–1m".
+    /// One minute: the 1 s and 10 s blocks alone, 15 slots, weighed 5; 2, 7, rising from the 1 s
+    /// band (A1 §3). The 10 s band weighs enough to hold the `–10s` tick left of the strip's
+    /// middle, clear of its `–1m` label at every width it lays (59–78 pt); A1's 4; 2, 3 put the
+    /// tick under the label below 77 pt. On a 59 pt strip a 1 s box is about 1.4 pt.
     pub const MINI_1M: Self = Self {
         bands: &BANDS_MINI_1M,
         ticks: &TICKS_MINI_1M,
@@ -1068,54 +1084,26 @@ impl MultiScaleSpec {
             .max(1)
     }
 
-    /// Compute normalized `[x0, x1]` and `[age_lo_ms, age_hi_ms]` layout for every slot, newest
-    /// first: the live `now` box at `x0 = 0`, then each older box to the right of the last.
+    /// Every slot's age window `[age_lo_ms, age_hi_ms]`, weight and band, newest first: the live
+    /// `now` box, then each older box after the last.
     #[must_use]
     pub fn slots(&self) -> Vec<ProgSlot> {
-        let total_w = self.total_weight() as f32;
         let mut age = 0_i64;
-        let mut acc_w = 0u32;
         let mut out = Vec::with_capacity(self.slot_count());
-        for band in self.bands {
+        for (bi, band) in self.bands.iter().enumerate() {
             for _ in 0..band.slots {
-                let next_w = acc_w + u32::from(band.weight);
                 let next_age = age + band.period_ms;
                 out.push(ProgSlot {
-                    x0: acc_w as f32 / total_w,
-                    x1: next_w as f32 / total_w,
                     age_hi_ms: next_age,
                     age_lo_ms: age,
                     weight: band.weight,
                     is_live_now: band.live_now,
+                    band: u8::try_from(bi).unwrap_or(u8::MAX),
                 });
-                acc_w = next_w;
                 age = next_age;
             }
         }
         out
-    }
-
-    /// Map an event age `age_ms` (`now_unix_ms - event_unix_ms`) to its exact continuous
-    /// normalized X coordinate in `0.0..=1.0`, growing with age (now is `0`, the horizon `1`), or
-    /// `None` when older than [`Self::horizon_ms`].
-    #[must_use]
-    pub fn x_frac_of_age_ms(&self, age_ms: i64) -> Option<f32> {
-        if age_ms < -2_000 {
-            return None;
-        }
-        let age = age_ms.max(0);
-        let horizon = self.horizon_ms();
-        if age > horizon {
-            return None;
-        }
-        for slot in self.slots() {
-            if age <= slot.age_hi_ms && age >= slot.age_lo_ms {
-                let span = (slot.age_hi_ms - slot.age_lo_ms).max(1) as f32;
-                let into = (age - slot.age_lo_ms) as f32 / span;
-                return Some((slot.x0 + (slot.x1 - slot.x0) * into).clamp(0.0, 1.0));
-            }
-        }
-        Some(1.0)
     }
 }
 
@@ -1200,7 +1188,9 @@ pub fn multi_scale_cells(
                 .max(lo_ms)
                 .div_euclid(LONG_BUCKET_MS),
         );
-        Cell::merge_weighted(
+        // Each bucket brings the part of its ten minutes the box spans, so that part of its
+        // readings.
+        Cell::merge_parts(
             (k_lo.max(long_first)..=k_hi.min(tiers.long_k)).filter_map(|k| {
                 let back = usize::try_from(i128::from(tiers.long_k) - i128::from(k)).ok()?;
                 let idx = tiers.long.len().checked_sub(1 + back)?;
@@ -1208,7 +1198,7 @@ pub fn multi_scale_cells(
                 let b_lo = i128::from(k) * i128::from(LONG_BUCKET_MS);
                 let b_hi = (i128::from(k) + 1) * i128::from(LONG_BUCKET_MS);
                 let ov = i128::from(hi_ms).min(b_hi) - i128::from(lo_ms).max(b_lo);
-                Some((cell, i64::try_from(ov).unwrap_or(i64::MAX)))
+                Some((cell, ov as f64 / LONG_BUCKET_MS as f64))
             }),
         )
     };
@@ -1367,7 +1357,11 @@ mod tests {
         let twenty = r.columns(20, 3, now);
         assert_eq!(twenty[2].mean, Some(8.5));
         assert_eq!(twenty[1].mean, Some(6.5));
-        assert!(twenty[1].over, "a column is over when one bucket is");
+        assert_eq!(
+            twenty[1].over_share(),
+            0.5,
+            "a column's over share counts its readings: one of two was over"
+        );
         assert_eq!(twenty[1].max, Some(7.0));
         assert_eq!(twenty[0].mean, Some(5.0), "the unread bucket is skipped");
         let thirty = r.columns(30, 5, now);
@@ -1407,7 +1401,7 @@ mod tests {
         );
         assert_eq!(r.now_mean(T0 + 55_000, NOW_WINDOW_MS), None);
         assert_eq!(Bucket::default().value(), None);
-        assert!(!Bucket::default().is_over());
+        assert_eq!(Bucket::default().cell().over_share(), 0.0);
         let _ = r.push(T0 + 60_000, Some(0.0), false);
         assert_eq!(r.now_mean(T0 + 60_000, NOW_WINDOW_MS), Some(0.0));
         assert_eq!(r.cells().last().and_then(|c| c.mean), Some(0.0));
@@ -1580,34 +1574,27 @@ mod tests {
             assert_eq!(slots.len(), spec.slot_count());
             // Newest first: the live box at the left end, holding now.
             let live = slots[0];
-            assert!(live.is_live_now && live.x0.abs() < 1e-6 && live.age_lo_ms == 0);
+            assert!(live.is_live_now && live.age_lo_ms == 0);
             assert!(slots[1..].iter().all(|s| !s.is_live_now));
-            assert!((slots.last().unwrap().x1 - 1.0).abs() < 1e-6);
             assert_eq!(slots.last().unwrap().age_hi_ms, spec.horizon_ms());
             for pair in slots.windows(2) {
-                assert_eq!(pair[0].x1, pair[1].x0, "the boxes tile the strip");
-                assert_eq!(pair[0].age_hi_ms, pair[1].age_lo_ms, "and the age");
-            }
-            for pair in slots[1..].windows(2) {
-                assert!(
-                    pair[0].weight <= pair[1].weight,
-                    "historical boxes grow wider toward older right bands: {pair:?}"
+                assert_eq!(
+                    pair[0].age_hi_ms, pair[1].age_lo_ms,
+                    "the boxes tile the age"
                 );
             }
-            // x grows with age: now at 0, the horizon at 1, every box edge on its own x.
-            assert_eq!(spec.x_frac_of_age_ms(0), Some(0.0));
-            assert_eq!(spec.x_frac_of_age_ms(spec.horizon_ms()), Some(1.0));
-            assert_eq!(spec.x_frac_of_age_ms(spec.horizon_ms() + 1), None);
-            for slot in &slots {
-                let at = |age| spec.x_frac_of_age_ms(age).expect("inside the horizon");
-                assert!((at(slot.age_lo_ms) - slot.x0).abs() < 1e-6, "{slot:?}");
-                assert!((at(slot.age_hi_ms) - slot.x1).abs() < 1e-6, "{slot:?}");
+            for pair in slots.windows(2) {
+                assert!(
+                    pair[0].band == pair[1].band || pair[0].band + 1 == pair[1].band,
+                    "each slot names its band, in order: {pair:?}"
+                );
+                assert_eq!(
+                    pair[0].band == pair[1].band,
+                    pair[0].age_hi_ms - pair[0].age_lo_ms == pair[1].age_hi_ms - pair[1].age_lo_ms
+                        && pair[0].is_live_now == pair[1].is_live_now,
+                    "a band is its boxes' period: {pair:?}"
+                );
             }
-            let xs: Vec<f32> = (0..=spec.horizon_ms())
-                .step_by(500)
-                .filter_map(|age| spec.x_frac_of_age_ms(age))
-                .collect();
-            assert!(xs.windows(2).all(|w| w[0] <= w[1]), "x grows with age");
             assert!(
                 spec.ticks.windows(2).all(|w| w[0].0 < w[1].0),
                 "ticks read outward from now: tick_ages takes them coarsest first by reversing \
@@ -1818,16 +1805,6 @@ mod tests {
                 .iter()
                 .any(|s| s.gap == Some(GapKind::Crash) && s.cell.mean.is_none())
         );
-        let x_crash = MultiScaleSpec::COMPACT_6M
-            .x_frac_of_age_ms(6_000)
-            .expect("6s inside 5m horizon");
-        let x_10s = MultiScaleSpec::COMPACT_6M
-            .x_frac_of_age_ms(10_000)
-            .expect("10s boundary");
-        assert!(
-            x_crash > 0.0 && x_crash < x_10s,
-            "now at the left, x grows with age"
-        );
     }
 
     /// A 10 s box older than a run's first reading draws nothing from that reading's bucket,
@@ -1918,7 +1895,7 @@ mod tests {
     }
 
     /// NEGATIVE CONTROL: `Bucket::add` saturating `n` at `u16::MAX` must not keep adding into
-    /// `sum` or `over_n`, and `Cell::merge` / `Cell::merge_weighted` ignore non-finite values.
+    /// `sum` or `over_n`, and `Cell::merge` / `Cell::merge_parts` ignore non-finite values.
     #[test]
     fn bucket_saturation_and_cell_merge_preserve_bounded_finite_means() {
         let mut bucket = Bucket {
@@ -1937,17 +1914,228 @@ mod tests {
         let nan_cell = Cell {
             mean: Some(f64::NAN),
             max: Some(f64::INFINITY),
-            over: false,
+            n: 3.0,
+            over_n: 3.0,
         };
         let finite_cell = Cell {
             mean: Some(0.25),
             max: Some(0.75),
-            over: true,
+            n: 4.0,
+            over_n: 4.0,
         };
         assert_eq!(Cell::merge([nan_cell, finite_cell]), finite_cell);
         assert_eq!(
-            Cell::merge_weighted([(nan_cell, 10), (finite_cell, 10)]),
+            Cell::merge_parts([(nan_cell, 0.5), (finite_cell, 1.0)]),
             finite_cell
+        );
+    }
+
+    /// A box's mean and over share count each reading once (A1 §3, count-weighted until F4′):
+    /// a bucket of ten readings at 0.2 and one of two at 0.8 merge to 0.3, not the buckets' 0.5;
+    /// and an hour box that spans half of a ten-minute bucket takes half of that bucket's
+    /// readings and half of its over readings. FULL_6H's newest hour box, at a now halfway
+    /// through a ten-minute bucket, spans half of its oldest bucket (120 readings at 0.9, all
+    /// over), five whole ones (60 at 0.3 each) and half of its newest (60 at 0.3): 390 readings,
+    /// 60 over, mean 153 / 390. CONTROL: weighing each bucket by its part alone reads 0.35, and
+    /// counting the half bucket's over readings whole reads 120 / 390.
+    #[test]
+    fn a_merge_counts_each_reading_once_and_a_part_brings_its_share_of_the_over() {
+        let cell = |mean: f64, n: f64, over_n: f64| Cell {
+            mean: Some(mean),
+            max: Some(mean),
+            n,
+            over_n,
+        };
+        let two = Cell::merge([cell(0.2, 10.0, 0.0), cell(0.8, 2.0, 0.0)]);
+        assert!((two.mean.unwrap() - 0.3).abs() < 1e-12, "{two:?}");
+        assert_eq!((two.n, two.max), (12.0, Some(0.8)));
+        assert!(
+            (two.mean.unwrap() - 0.5).abs() > 0.1,
+            "CONTROL: not the buckets' mean"
+        );
+
+        let k0 = T0.div_euclid(LONG_BUCKET_MS);
+        assert_eq!(
+            T0.rem_euclid(LONG_BUCKET_MS),
+            0,
+            "CONTROL: T0 opens a bucket"
+        );
+        let now = T0 + 7 * LONG_BUCKET_MS + LONG_BUCKET_MS / 2;
+        let long_k = now.div_euclid(LONG_BUCKET_MS);
+        let long: Vec<Cell> = (long_k + 1 - LONG_BUCKETS as i64..=long_k)
+            .map(|k| {
+                if k == k0 - 5 {
+                    cell(0.9, 120.0, 120.0)
+                } else {
+                    cell(0.3, 60.0, 0.0)
+                }
+            })
+            .collect();
+        let tiers = Tiers {
+            long: &long,
+            long_k,
+            ..Tiers::default()
+        };
+        let cells = multi_scale_cells(tiers, now, MultiScaleSpec::FULL_6H, 2_500, &[]);
+        let hour = cells
+            .iter()
+            .find(|c| c.slot.age_lo_ms == RING_REACH_MS)
+            .expect("the newest hour box");
+        assert_eq!(
+            (now - hour.slot.age_hi_ms, now - hour.slot.age_lo_ms),
+            (
+                (k0 - 5) * LONG_BUCKET_MS + LONG_BUCKET_MS / 2,
+                (k0 + 1) * LONG_BUCKET_MS + LONG_BUCKET_MS / 2
+            ),
+            "CONTROL: the box spans half of its edge buckets"
+        );
+        let got = hour.cell;
+        assert!((got.n - 390.0).abs() < 1e-9, "{got:?}");
+        assert!((got.over_n - 60.0).abs() < 1e-9, "{got:?}");
+        assert!((got.over_share() - 60.0 / 390.0).abs() < 1e-12, "{got:?}");
+        assert!((got.mean.unwrap() - 153.0 / 390.0).abs() < 1e-12, "{got:?}");
+        assert_eq!(got.max, Some(0.9));
+        assert!(
+            (got.mean.unwrap() - 0.35).abs() > 0.02
+                && (got.over_share() - 120.0 / 390.0).abs() > 0.1,
+            "CONTROL: the count and the part each move the box"
+        );
+    }
+
+    /// A1 §3's weights: from the 1 s band to the 1 h band each band's boxes weigh strictly more
+    /// than the finer band's, in every preset, so with gates and cumulative rounding no box of a
+    /// coarser band lays narrower than one of a finer band; the live box weighs more than a 1 s
+    /// box. FULL_6H weighs 10; 4, 5, 6, 7, 9 (205 in all). CONTROL: the presets main laid before
+    /// A1 (FOLD_4H's 2; 1, 1, 1, 2, 2) do not rise.
+    #[test]
+    fn band_weights_rise_strictly_from_the_one_second_band_to_the_oldest_in_every_preset() {
+        let rises = |bands: &[ScaleBand]| {
+            let history: Vec<&ScaleBand> = bands.iter().filter(|b| !b.live_now).collect();
+            let live = bands.iter().find(|b| b.live_now);
+            history.windows(2).all(|w| w[0].weight < w[1].weight)
+                && live
+                    .zip(history.first())
+                    .is_some_and(|(l, f)| l.weight > f.weight)
+        };
+        for spec in [
+            MultiScaleSpec::FULL_6H,
+            MultiScaleSpec::FOLD_4H,
+            MultiScaleSpec::COMPACT_6M,
+            MultiScaleSpec::MINI_1M,
+        ] {
+            assert!(rises(spec.bands), "{:?}", spec.bands);
+            assert!(
+                spec.bands
+                    .windows(2)
+                    .all(|w| w[0].period_ms <= w[1].period_ms),
+                "bands run from now outward"
+            );
+        }
+        assert_eq!(MultiScaleSpec::FULL_6H.total_weight(), 205);
+        let weights =
+            |spec: MultiScaleSpec| spec.bands.iter().map(|b| b.weight).collect::<Vec<_>>();
+        assert_eq!(weights(MultiScaleSpec::FULL_6H), [10, 4, 5, 6, 7, 9]);
+        assert_eq!(weights(MultiScaleSpec::FOLD_4H), [4, 1, 2, 3, 4, 5]);
+        assert_eq!(weights(MultiScaleSpec::COMPACT_6M), [7, 4, 6, 8]);
+        assert_eq!(weights(MultiScaleSpec::MINI_1M), [5, 2, 7]);
+        let before = [
+            (1, 2, true),
+            (9, 1, false),
+            (5, 1, false),
+            (9, 1, false),
+            (5, 2, false),
+        ]
+        .map(|(slots, weight, live_now)| ScaleBand {
+            slots,
+            period_ms: 1_000,
+            weight,
+            live_now,
+        });
+        assert!(!rises(&before), "CONTROL: equal weights do not rise");
+    }
+
+    /// Ruling 8 (A1 §3): over is a proportional share at every horizon. A four-minute over spell,
+    /// read once a second, shows in every box that holds any of it while it ages from the 1 min
+    /// band through the 10 min band into the hour band, each box's share its over readings over
+    /// its readings, so in an hour box it is about 4/60 and never rounds away. CONTROL: under the
+    /// half-the-readings flag a bucket or box is over only where half its readings were, so the
+    /// hour box holding the spell would read not over.
+    #[test]
+    fn an_over_spell_shows_in_every_box_that_holds_it_at_every_horizon() {
+        let t0 = T0 - T0.rem_euclid(LONG_BUCKET_MS);
+        let (spell_lo, spell_hi) = (t0 + 2 * 3_600_000, t0 + 2 * 3_600_000 + 240_000);
+        let mut horizons = Vec::new();
+        for age in [120_000_i64, 1_800_000, 3 * 3_600_000 - 240_000] {
+            let now = spell_hi + age;
+            let mut r = BucketRing::default();
+            for at in (t0..=now).step_by(1_000) {
+                let over = (spell_lo..spell_hi).contains(&at);
+                let _ = r.push(at, Some(if over { 0.99 } else { 0.3 }), over);
+            }
+            let (ring, long, recent) = (r.cells(), r.long_cells(), r.readings());
+            let tiers = Tiers {
+                ring: &ring,
+                ring_k: r.open_k().unwrap_or(0),
+                long: &long,
+                long_k: r.long_k().unwrap_or(0),
+                recent: &recent,
+            };
+            let cells = multi_scale_cells(tiers, now, MultiScaleSpec::FULL_6H, 2_500, &[]);
+            let holding: Vec<&ScaleCell> = cells
+                .iter()
+                .filter(|c| {
+                    let (lo, hi) = (now - c.slot.age_hi_ms, now - c.slot.age_lo_ms);
+                    lo < spell_hi && hi > spell_lo
+                })
+                .collect();
+            assert!(!holding.is_empty(), "{age} ms on: a box holds the spell");
+            for c in &holding {
+                let (lo, hi) = (now - c.slot.age_hi_ms, now - c.slot.age_lo_ms);
+                // A box past the last minute and inside the hour reads the whole 10 s buckets
+                // it touches; an hour box the part of each ten-minute bucket it spans.
+                let (lo_r, hi_r) = if c.slot.age_lo_ms >= RING_REACH_MS {
+                    (lo, hi)
+                } else {
+                    (
+                        lo.div_euclid(BUCKET_MS) * BUCKET_MS,
+                        ((hi - 1).div_euclid(BUCKET_MS) + 1) * BUCKET_MS,
+                    )
+                };
+                let inside = (hi_r.min(spell_hi) - lo_r.max(spell_lo)).max(0) as f64;
+                let want = inside / (hi_r - lo_r) as f64;
+                let got = c.cell.over_share();
+                assert!(got > 0.0, "{age} ms on: {c:?} shows the spell");
+                let period = c.slot.age_hi_ms - c.slot.age_lo_ms;
+                assert!(
+                    (got - want).abs() <= 1e-3,
+                    "{age} ms on: {got} against {want}: {c:?}"
+                );
+                if period >= 3_600_000 {
+                    // CONTROL: what main drew before A1. An hour box was over where one of its
+                    // ten-minute buckets was over for half its readings, and the spell is 4 of
+                    // its bucket's 10 minutes.
+                    let first = r.long_k().unwrap_or(0) + 1 - long.len() as i64;
+                    let half_rule = (lo.div_euclid(LONG_BUCKET_MS)
+                        ..=(hi - 1).div_euclid(LONG_BUCKET_MS))
+                        .filter_map(|k| long.get(usize::try_from(k - first).ok()?))
+                        .any(|b| b.n > 0.0 && b.over_n * 2.0 >= b.n);
+                    assert!(
+                        !half_rule,
+                        "CONTROL: the half rule erases the spell from {c:?}"
+                    );
+                }
+            }
+            horizons.push(
+                holding
+                    .iter()
+                    .map(|c| c.slot.age_hi_ms - c.slot.age_lo_ms)
+                    .max(),
+            );
+        }
+        assert_eq!(
+            horizons,
+            [Some(60_000), Some(600_000), Some(3_600_000)],
+            "CONTROL: the spell was seen in the 1 min, 10 min and 1 h bands"
         );
     }
 }

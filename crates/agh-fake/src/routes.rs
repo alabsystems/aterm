@@ -611,11 +611,7 @@ fn over_limit(state: &State, req: &Request, ctx: &Ctx, status: Option<u16>) -> b
     }
     let resource = resource_of(req);
     let limit = limit_for(ctx.token.is_some(), resource);
-    let used = state
-        .used
-        .get(&(ctx.token.clone(), resource))
-        .copied()
-        .unwrap_or(0);
+    let used = state.used_count(ctx.token.as_deref(), resource);
     used >= limit
 }
 
@@ -627,8 +623,8 @@ fn etag(req: &Request, mut a: Answer) -> Answer {
     if a.status != 200 || !json {
         return a;
     }
-    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&a.body));
-    let tag = format!("W/\"{}\"", &digest[..16]);
+    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&a.body)[..8]);
+    let tag = format!("W/\"{digest}\"");
     let hit = req.header("if-none-match").is_some_and(|v| {
         v.split(',')
             .map(str::trim)
@@ -717,15 +713,23 @@ fn charge(state: &mut State, req: &Request, ctx: &Ctx, status: Option<u16>) -> O
     let resource = resource_of(req);
     let limit = limit_for(ctx.token.is_some(), resource);
     let free = is_free(req, ctx, status);
-    let count = state.used.entry((ctx.token.clone(), resource)).or_insert(0);
-    if !free {
-        *count = (*count + 1).min(limit);
+    if let Some((_, count)) = state
+        .used
+        .iter_mut()
+        .find(|((t, r), _)| t.as_deref() == ctx.token.as_deref() && *r == resource)
+    {
+        if !free {
+            *count = (*count + 1).min(limit);
+        }
+        return Some(*count);
     }
-    Some(*count)
+    let initial = u64::from(!free).min(limit);
+    state.used.insert((ctx.token.clone(), resource), initial);
+    Some(initial)
 }
 
 /// A resource's limit: 5000 per token and 60 anonymous (graphql: none anonymous).
-fn limit_for(authenticated: bool, resource: &str) -> u64 {
+pub(crate) fn limit_for(authenticated: bool, resource: &str) -> u64 {
     match (authenticated, resource) {
         (true, _) => 5000,
         (false, "graphql") => 0,
@@ -844,17 +848,19 @@ fn moved(state: &State, req: &Request, ctx: &Ctx, slug: &str, rest: &[&str]) -> 
     if !state.repos[i].visible_to(ctx.login()) {
         return Answer::not_found();
     }
-    let mut tail: String = rest.iter().map(|s| format!("/{s}")).collect();
-    if let Some((_, query)) = req.target.split_once('?') {
-        tail.push('?');
-        tail.push_str(query);
-    }
     let api = state.ports.api;
-    let location = format!("http://127.0.0.1:{api}/repositories/{id}{tail}");
-    let url = location.clone();
+    let mut location = format!("http://127.0.0.1:{api}/repositories/{id}");
+    for s in rest {
+        location.push('/');
+        location.push_str(s);
+    }
+    if let Some((_, query)) = req.target.split_once('?') {
+        location.push('?');
+        location.push_str(query);
+    }
     let mut a = Answer::json(
         301,
-        &json!({"message": "Moved Permanently", "url": url, "documentation_url": DOCS}),
+        &json!({"message": "Moved Permanently", "url": &location, "documentation_url": DOCS}),
     );
     a.headers.push(("Location".into(), location));
     a
@@ -965,15 +971,23 @@ impl Paging {
     /// Formats the pagination `Link` header for `base`, or `None` for a single page.
     fn link(&self, req: &Request, base: &str) -> Option<String> {
         let (per_page, number, last) = (self.per_page, self.number, self.last);
-        let kept: String = req
+        if number <= 1 && number >= last {
+            return None;
+        }
+        let mut kept = String::new();
+        for (k, v) in req
             .raw_query()
             .filter(|(k, _)| *k != "per_page" && *k != "page")
-            .map(|(k, v)| format!("{k}={v}&"))
-            .collect();
+        {
+            kept.push_str(k);
+            kept.push('=');
+            kept.push_str(v);
+            kept.push('&');
+        }
         let link = |n: usize, rel: &str| {
             format!("<{base}?{kept}per_page={per_page}&page={n}>; rel=\"{rel}\"")
         };
-        let mut links = Vec::new();
+        let mut links = Vec::with_capacity(4);
         if number > 1 {
             links.push(link(number - 1, "prev"));
         }
@@ -984,7 +998,7 @@ impl Paging {
         if number > 1 {
             links.push(link(1, "first"));
         }
-        (!links.is_empty()).then(|| links.join(", "))
+        Some(links.join(", "))
     }
 }
 
@@ -1002,11 +1016,7 @@ fn page(req: &Request, items: Vec<Value>, base: &str) -> Answer {
 fn rate_limit(state: &State, ctx: &Ctx) -> Answer {
     let entry = |resource: &'static str| {
         let limit = limit_for(ctx.token.is_some(), resource);
-        let used = state
-            .used
-            .get(&(ctx.token.clone(), resource))
-            .copied()
-            .unwrap_or(0);
+        let used = state.used_count(ctx.token.as_deref(), resource);
         json!({"limit": limit, "used": used, "remaining": limit - used, "reset": RESET})
     };
     let core = entry("core");
@@ -1312,9 +1322,7 @@ fn signature(id: u64) -> String {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(b"agh-fake/sig\0");
     hasher.update(id.to_string().as_bytes());
-    let mut hex = aterm_codec::hex::encode_lower(&hasher.finalize());
-    hex.truncate(8);
-    hex
+    aterm_codec::hex::encode_lower(&hasher.finalize()[..4])
 }
 
 /// What an asset's `digest` field says.
@@ -1417,9 +1425,7 @@ fn blob_sha(bytes: &[u8]) -> String {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(b"blob\0");
     hasher.update(bytes);
-    let mut hex = aterm_codec::hex::encode_lower(&hasher.finalize());
-    hex.truncate(40);
-    hex
+    aterm_codec::hex::encode_lower(&hasher.finalize()[..20])
 }
 
 /// A directory's sha: forty hex digits bound to its path and reference.
@@ -1429,9 +1435,7 @@ fn dir_sha(reference: &str, path: &str) -> String {
     hasher.update(reference.as_bytes());
     hasher.update(b"\0");
     hasher.update(path.as_bytes());
-    let mut hex = aterm_codec::hex::encode_lower(&hasher.finalize());
-    hex.truncate(40);
-    hex
+    aterm_codec::hex::encode_lower(&hasher.finalize()[..20])
 }
 
 /// Encodes `bytes` as base64 wrapped every 60 characters with newlines.
@@ -1886,12 +1890,16 @@ fn text_field(body: &Value, name: &str) -> Result<Option<String>, ()> {
 /// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset; create a
 /// ref (`POST …/git/refs`) and delete one (`DELETE …/git/refs/{name}`: 204, or 422
 /// `{"message":"Reference does not exist"}`); and add (`POST /user/keys`) and delete (`DELETE
-/// /user/keys/{id}`) an SSH key.
+/// /user/keys/{id}`) an SSH key; and create (`POST /user/repos`) an empty repository
+/// owned by the authenticated user.
 fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     if req.path() == "/graphql" && req.method == "POST" {
         return atomic_refs::update(state, req, ctx);
     }
     let segs = segments(req.path());
+    if segs.as_slice() == ["user", "repos"] && req.method == "POST" {
+        return create_repo(state, req, ctx);
+    }
     if let ["user", "keys", rest @ ..] = segs.as_slice() {
         return key_write(state, req, ctx, rest);
     }
@@ -1937,6 +1945,50 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
         },
         _ => Answer::not_found(),
     }
+}
+
+/// `POST /user/repos`: an empty repository under the authenticated User's login.
+fn create_repo(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
+    let Some(login) = ctx.login().filter(|login| state.is_user(login)) else {
+        return Answer::error(401, "Requires authentication");
+    };
+    let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(name), Ok(private), Ok(auto_init)) = (
+        text_field(&body, "name"),
+        flag(&body, "private"),
+        flag(&body, "auto_init"),
+    ) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let Some(name) = name.filter(|name| {
+        (1..=100).contains(&name.len())
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    }) else {
+        return invalid("Repository", "name", "invalid");
+    };
+    let Some(private) = private else {
+        return invalid("Repository", "private", "missing_field");
+    };
+    if auto_init != Some(false) {
+        return invalid("Repository", "auto_init", "invalid");
+    }
+    let slug = format!("{login}/{name}");
+    if state.repo_index(&slug).is_some() {
+        return invalid("Repository", "name", "already_exists");
+    }
+    let spec = crate::RepoSpec {
+        private,
+        ..crate::RepoSpec::public().push(login)
+    };
+    let id = state.add_repo(&slug, spec);
+    let index = state.repo_by_id(id).expect("the repository just created");
+    Answer::json(201, &repo_json(state, &state.repos[index], Some(login)))
 }
 
 /// A ref object: `{ref, url, object{sha, type, url}}`.

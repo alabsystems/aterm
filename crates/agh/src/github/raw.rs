@@ -245,7 +245,7 @@ pub(crate) fn journal_key(method: Method, path: &str) -> String {
     } else {
         for seg in &segs {
             out.push('/');
-            out.push_str(&crate::path::segment(seg));
+            crate::path::encode_into(&mut out, seg);
         }
     }
     if let Some((_, query)) = path.split_once('?') {

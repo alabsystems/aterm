@@ -152,7 +152,7 @@ impl TapeHeader {
     #[must_use]
     pub fn for_run(argv: &[String], endpoints: &Endpoints) -> TapeHeader {
         TapeHeader {
-            agh_version: crate::VERSION.to_string(),
+            agh_version: crate::version().to_string(),
             api_version: crate::API_VERSION.to_string(),
             argv: argv.to_vec(),
             mode: TapeMode::Anonymous,

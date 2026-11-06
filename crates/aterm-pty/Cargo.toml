@@ -2,7 +2,7 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-pty"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -40,6 +40,8 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 # `aterm_spec::host::could_not_run` (a host that cannot run a test, the Windows smoke
 # included) and `aterm_spec::wait::within`, the hang detector for must-happen waits.
 aterm-spec = { workspace = true }
+# The Windows tests' stand-in binaries, named when they run (`aterm_tempfile::bin_exe`).
+aterm-tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # `spawn_locale_model` conformance check (`unix_tests::spawn_locale_conformance_child_always_utf8_ctype`).

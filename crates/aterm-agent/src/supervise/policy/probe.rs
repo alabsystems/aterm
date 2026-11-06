@@ -10,7 +10,7 @@ use astream_effects::{EffectRecord, KeyedIndex};
 use aterm_types::MutexExt;
 use serde::{Deserialize, Serialize};
 
-use super::approval::ApprovalCtx;
+use super::approval::{ApprovalCtx, SecretRule};
 use super::claude_settings::{AskKind, OwnerAsk};
 use super::git_config::{GitView, PROJECTION, VALUE_SET, WorkerEnv};
 use super::rm_breaker::{ScratchRoot, abs_components};
@@ -46,6 +46,20 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// A link climbs out of a missing directory, the links do not end.
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String>;
+
+    /// What a reader that descends the absolute path `root` may open within `below` levels of it
+    /// ([`Below`]): every name the walk meets there, and where every symbolic link it meets leads,
+    /// held to `secrets`; `home` keeps the walk out of the folders macOS never lets it list.
+    /// # Errors
+    /// The walk was cut: a folder cannot be listed, holds more entries than the walk reads, lies
+    /// where it is never listed, or a link cannot be resolved.
+    fn below_tree(
+        &self,
+        root: &[String],
+        below: usize,
+        secrets: &[SecretRule],
+        home: Option<&Path>,
+    ) -> Result<Below, String>;
 
     /// The worker: the process leading the foreground group `group` of session `sid`.
     /// # Errors
@@ -92,6 +106,17 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     fn look_out(&self) -> bool {
         false
     }
+}
+
+/// What a walk below a tree found ([`PolicyProbe::below_tree`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Below {
+    /// Nothing is at the tree's path.
+    Missing,
+    /// Every name the walk met, and where every link it met leads, lies outside every rule.
+    Clear,
+    /// A path the walk met falls under a rule: that path and the rule, named.
+    Secret(String),
 }
 
 /// An absolute path as the disk resolves it for `rm` ([`PolicyProbe::rm_physical`]).
@@ -211,6 +236,16 @@ impl PolicyProbe for NoLook {
         unreachable!("{NO_LOOK}")
     }
 
+    fn below_tree(
+        &self,
+        _: &[String],
+        _: usize,
+        _: &[SecretRule],
+        _: Option<&Path>,
+    ) -> Result<Below, String> {
+        unreachable!("{NO_LOOK}")
+    }
+
     fn worker_proc(&self, _: u32, _: &str) -> Result<WorkerEnv, String> {
         unreachable!("{NO_LOOK}")
     }
@@ -274,6 +309,34 @@ impl Requests<'_> {
             ("worker", Field::Text(&self.worker(worker))),
             (key, Field::Path(at)),
         ])
+    }
+
+    /// A walk below a tree asked for: the tree, how many levels below it (`any`), the home, and
+    /// each rule, a directory rule's path as the run's roots write it.
+    fn below_tree(
+        &self,
+        root: &[String],
+        below: usize,
+        secrets: &[SecretRule],
+        home: Option<&Path>,
+    ) -> Vec<u8> {
+        let tree = PathBuf::from(format!("/{}", root.join("/")));
+        let levels = if below == usize::MAX {
+            "any".to_string()
+        } else {
+            below.to_string()
+        };
+        let mut fields = vec![
+            ("root", Field::Path(&tree)),
+            ("below", Field::Text(&levels)),
+        ];
+        fields.extend(home.map(|h| ("home", Field::Path(h))));
+        fields.extend(secrets.iter().map(|rule| match rule {
+            SecretRule::Under(dir) => ("under", Field::Path(dir)),
+            SecretRule::Component(name) => ("component", Field::Text(name)),
+            SecretRule::Basename(glob) => ("basename", Field::Text(glob)),
+        }));
+        self.lines(&fields)
     }
 
     /// The worker asked for by its foreground group and session.
@@ -351,6 +414,20 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
             doors::PROBE_RM_PHYSICAL,
             || self.request(|r| r.comps(comps)),
             || self.live.rm_physical(comps),
+        )
+    }
+
+    fn below_tree(
+        &self,
+        root: &[String],
+        below: usize,
+        secrets: &[SecretRule],
+        home: Option<&Path>,
+    ) -> Result<Below, String> {
+        self.fx.exchange(
+            doors::PROBE_BELOW_TREE,
+            || self.request(|r| r.below_tree(root, below, secrets, home)),
+            || self.live.below_tree(root, below, secrets, home),
         )
     }
 
@@ -504,6 +581,20 @@ impl PolicyProbe for KeyedProbe {
         self.answer(doors::PROBE_RM_PHYSICAL, |r| r.comps(comps), Err)
     }
 
+    fn below_tree(
+        &self,
+        root: &[String],
+        below: usize,
+        secrets: &[SecretRule],
+        home: Option<&Path>,
+    ) -> Result<Below, String> {
+        self.answer(
+            doors::PROBE_BELOW_TREE,
+            |r| r.below_tree(root, below, secrets, home),
+            Err,
+        )
+    }
+
     fn worker_proc(&self, group: u32, sid: &str) -> Result<WorkerEnv, String> {
         self.answer(doors::PROBE_WORKER_PROC, |r| r.worker_proc(group, sid), Err)
     }
@@ -609,6 +700,31 @@ impl TapeValue for Result<Option<String>, String> {
     }
 }
 
+/// A walk's answer as a tape holds it: `missing`, `clear`, or `secret` and what it met.
+impl TapeValue for Result<Below, String> {
+    fn to_tape(&self) -> Vec<u8> {
+        answer(self, |b| match b {
+            Below::Missing => ("missing".to_string(), None),
+            Below::Clear => ("clear".to_string(), None),
+            Below::Secret(met) => ("secret".to_string(), Some(met.clone())),
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        answer_of(bytes, |(kind, met): (String, Option<String>)| {
+            match (kind.as_str(), met) {
+                ("missing", None) => Ok(Below::Missing),
+                ("clear", None) => Ok(Below::Clear),
+                ("secret", Some(met)) => Ok(Below::Secret(met)),
+                _ => Err(CodecError {
+                    at: 0,
+                    why: "a walk's answer this build did not write",
+                }),
+            }
+        })
+    }
+}
+
 impl TapeValue for Option<Vec<String>> {
     fn to_tape(&self) -> Vec<u8> {
         json(self)
@@ -669,6 +785,10 @@ struct ViewWire {
     submodules: Vec<(String, ViewWire)>,
     /// Whether the worker's `GIT_EXTERNAL_DIFF` is set.
     external_diff: bool,
+    /// Whether the index marks an entry assume-unchanged.
+    assume_unchanged: bool,
+    /// The pathspec variable the worker's environment sets, by name.
+    pathspec_env: Option<String>,
 }
 
 impl ViewWire {
@@ -686,6 +806,8 @@ impl ViewWire {
                 .map(|(p, sub)| (path_text(p), Self::of(sub)))
                 .collect(),
             external_diff: v.external_diff.is_some(),
+            assume_unchanged: v.assume_unchanged,
+            pathspec_env: v.pathspec_env,
         }
     }
 
@@ -706,6 +828,8 @@ impl ViewWire {
                 .map(|(p, sub)| Ok((PathBuf::from(p), sub.view()?)))
                 .collect::<Result<_, CodecError>>()?,
             external_diff: self.external_diff.then(|| VALUE_SET.to_string()),
+            assume_unchanged: self.assume_unchanged,
+            pathspec_env: self.pathspec_env,
         })
     }
 }

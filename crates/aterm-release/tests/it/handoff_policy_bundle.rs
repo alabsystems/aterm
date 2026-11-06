@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .expect("crates/aterm-release sits two levels under the root")

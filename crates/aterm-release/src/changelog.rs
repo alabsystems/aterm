@@ -38,19 +38,28 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
         if raw.starts_with("## ") {
             break;
         }
-        let mut line = raw.to_string();
-        if in_comment {
-            match line.find("-->") {
+        let rest = if in_comment {
+            match raw.find("-->") {
                 Some(p) => {
-                    line = line[p + 3..].to_string();
                     in_comment = false;
+                    &raw[p + 3..]
                 }
                 None => continue,
             }
+        } else {
+            raw
+        };
+        if !rest.contains("<!--") {
+            if rest.trim_start().starts_with("###") || rest.trim().is_empty() {
+                continue;
+            }
+            out.push(rest.to_string());
+            continue;
         }
+        let mut line = rest.to_string();
         while let Some(start) = line.find("<!--") {
             match line.rfind("-->").filter(|&end| end >= start + 4) {
-                Some(end) => line = format!("{}{}", &line[..start], &line[end + 3..]),
+                Some(end) => line.replace_range(start..end + 3, ""),
                 None => break,
             }
         }
@@ -194,19 +203,21 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
             "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
         )));
     }
-    let mut out = Vec::new();
+    let mut rolled = String::with_capacity(text.len() + version.len() + date.len() + 16);
     let mut done = false;
-    for line in text.lines() {
-        if !done && is_section_header(line, "Unreleased") {
-            out.push(line.to_string());
-            out.push(String::new());
-            out.push(format!("## [{version}] - {date}"));
-            done = true;
-            continue;
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            rolled.push('\n');
         }
-        out.push(line.to_string());
+        rolled.push_str(line);
+        if !done && is_section_header(line, "Unreleased") {
+            let _ = std::fmt::Write::write_fmt(
+                &mut rolled,
+                format_args!("\n\n## [{version}] - {date}"),
+            );
+            done = true;
+        }
     }
-    let mut rolled = out.join("\n");
     if text.ends_with('\n') {
         rolled.push('\n');
     }
@@ -256,10 +267,12 @@ pub fn release_changelog(source: &str, version: &str, date: &str) -> Result<Stri
 /// The date of `version`'s section, `## [version] - <date>`: what the release commit's roll was dated, read back so a claim on a later day checks the roll it was made with.
 #[must_use]
 pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
-    let header = format!("## [{version}] - ");
-    text.lines()
-        .find_map(|l| l.strip_prefix(header.as_str()))
-        .map(str::trim)
+    text.lines().find_map(|l| {
+        l.strip_prefix("## [")?
+            .strip_prefix(version)?
+            .strip_prefix("] - ")
+            .map(str::trim)
+    })
 }
 
 /// Roll `main` for a release whose notes are `source`'s (the published commit's) `[Unreleased]` body rather than main's own.

@@ -4,10 +4,10 @@
 //! Tests `publish/manifest.txt` path selection and `publish/config.sh` public-clone check.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .join("../..")
         .canonicalize()
         .unwrap()

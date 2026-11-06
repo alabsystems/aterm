@@ -14,11 +14,17 @@ use super::*;
 
 fn view(name: &str, nick: &str, fleet: bool) -> MachineView {
     MachineView {
+        rev: 0,
         name: name.to_owned(),
         nick: nick.to_owned(),
         word: nick.to_owned(),
-        fleet,
+        fleet: if fleet { InFleet::In } else { InFleet::Out },
     }
+}
+
+/// The vault of a scratch home under `dir`: none, so not in a fleet, until a test writes one.
+fn vault(dir: &std::path::Path) -> Paths {
+    Paths::locate_for_home(&dir.join("home"))
 }
 
 fn state() -> aterm_tempfile::TempDir {
@@ -69,6 +75,22 @@ fn the_first_row_says_whether_this_machine_is_in_a_fleet() {
         machine_menu_info_row(&view("m0", "Otter", false)),
         "m0 \u{00B7} Otter \u{00B7} not in a fleet"
     );
+    let joining = MachineView {
+        fleet: InFleet::Joining,
+        ..view("m0", "Otter", false)
+    };
+    assert_eq!(
+        machine_menu_info_row(&joining),
+        "m0 \u{00B7} Otter \u{00B7} joining a fleet"
+    );
+    let unread = MachineView {
+        fleet: InFleet::Unread("source.toml: bad".to_owned()),
+        ..view("m0", "Otter", false)
+    };
+    assert_eq!(
+        machine_menu_info_row(&unread),
+        "m0 \u{00B7} Otter \u{00B7} fleet not read"
+    );
 }
 
 /// A nickname no draw can make (the nouns are one word each), so a rename to it always changes
@@ -115,10 +137,10 @@ fn the_reader_posts_the_name_and_each_change_it_hears() {
             _ => Heard::Ended,
         }
     };
-    read_loop(dir, || Ok(None), post, wait);
+    read_loop(dir, Some(&vault(dir)), || Ok(None), post, wait);
     let posted = posted.into_inner();
     let first = posted.first().expect("a first view").clone();
-    assert_eq!((first.name.as_str(), first.fleet), ("m0", false));
+    assert_eq!((first.name.as_str(), &first.fleet), ("m0", &InFleet::Out));
     assert_eq!(
         posted,
         [first, view("m0", RENAMED, false), view("m0", RENAMED, true)],
@@ -147,6 +169,7 @@ fn a_read_that_fails_makes_nothing_and_is_tried_again_after_a_minute() {
     let mut posted = Vec::new();
     read_loop(
         root.path(),
+        Some(&vault(root.path())),
         roster,
         |view| {
             posted.push(view);
@@ -166,15 +189,20 @@ fn a_read_that_fails_makes_nothing_and_is_tried_again_after_a_minute() {
     assert_eq!(posted[0].name, "m8", "the next read's roster");
 }
 
+/// The watch hears `machine-name.toml` replaced by rename, a vault first made after the watch
+/// started (its folder missing, so the watch listens on the nearest folder above it), each of
+/// the vault's standing files written, and a fleet key: each change is a new view.
 #[test]
-fn the_watch_hears_a_rename_by_replace_and_a_fleet_key_written() {
+fn the_watch_hears_a_rename_by_replace_a_vault_made_later_and_a_fleet_key_written() {
     let root = state();
     let dir = root.path().to_path_buf();
-    let (watch, changes) = watch(&dir).expect("a watch");
+    let secrets = vault(&dir);
+    let (watch, changes) = watch(&dir, Some(&secrets)).expect("a watch");
     let (tell, views) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         read_loop(
             &dir,
+            Some(&secrets),
             || Ok(None),
             |view| tell.send(view).is_ok(),
             |timeout| heard(&changes, timeout),
@@ -188,6 +216,23 @@ fn the_watch_hears_a_rename_by_replace_and_a_fleet_key_written() {
         views.recv_timeout(hang).expect("the rename heard"),
         view(&first.name, RENAMED, false)
     );
+    // Files the vault cannot read, each written before the one its status reads ahead of it, so
+    // each read fails at the new file: each standing file is heard, as a new reason the standing
+    // is unread, and the row says so.
+    let vault_dir = vault(root.path()).dir;
+    std::fs::create_dir_all(&vault_dir).expect("a vault folder");
+    let mut was = String::new();
+    for file in ["state.toml", "identity", "source.toml"] {
+        let at = vault_dir.join(file);
+        std::fs::write(&at, "not = [a vault file").expect("a vault file");
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600)).expect("private");
+        let unread = views.recv_timeout(hang).expect("the vault's file heard");
+        let InFleet::Unread(why) = &unread.fleet else {
+            panic!("{file}: {:?}", unread.fleet);
+        };
+        assert_ne!(why, &was, "{file}");
+        was.clone_from(why);
+    }
     join(root.path());
     assert_eq!(
         views.recv_timeout(hang).expect("the fleet key heard"),
@@ -277,13 +322,13 @@ fn an_untouched_field_changes_nothing_but_another_case_is_a_change() {
 fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
     let root = state();
     let dir = root.path();
-    read(dir, || Ok(None)).expect("a first read makes the name");
+    read(dir, Some(&vault(dir)), || Ok(None)).expect("a first read makes the name");
     file::replace(dir, |name| {
         name.nick = Nickname::parse("kestrel").map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
     })
     .expect("renames");
-    let shown = read(dir, || Ok(None)).expect("a read");
+    let shown = read(dir, Some(&vault(dir)), || Ok(None)).expect("a read");
     assert_eq!(
         (shown.nick.as_str(), shown.word.as_str()),
         ("Kestrel", "kestrel")
@@ -326,19 +371,217 @@ fn a_nickname_change_is_refused_to_a_gesture_the_person_did_not_make_and_before_
 #[test]
 fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() {
     let mut app = crate::App::headless_for_test();
-    let unset = |generation| NickUnset {
+    let unset = |generation| NameUnset {
         generation,
+        kind: EditKind::Nickname,
         word: Some("Kestrel".to_owned()),
         why: "The nickname was not changed: the lock is busy.".to_owned(),
     };
-    app.nickname_sets = 2;
-    app.nickname_not_set(unset(1));
+    app.machine_sets = 2;
+    app.machine_name_not_set(unset(1));
     assert_eq!(
-        app.nickname_unset, None,
+        app.machine_unset, None,
         "press 2 started after press 1's set"
     );
-    app.nickname_not_set(unset(2));
-    assert_eq!(app.nickname_unset, Some(unset(2)));
+    app.machine_name_not_set(unset(2));
+    assert_eq!(app.machine_unset, Some(unset(2)));
+}
+
+#[test]
+fn the_rename_field_keeps_nickname_case_and_accepts_a_number_alone() {
+    let held = view("m184", "Linnet", true);
+    let to = name_to("  m86 MissBunny  ", &held)
+        .expect("valid")
+        .expect("changed");
+    assert_eq!(to.num.get(), 86);
+    assert_eq!(to.nick.expect("a nickname").as_str(), "MissBunny");
+    let to = name_to("86", &held).expect("valid").expect("changed");
+    assert_eq!(to.num.get(), 86);
+    assert!(
+        to.nick.is_none(),
+        "a number alone preserves the held nickname"
+    );
+    let to = name_to("m86 Blue Heron", &held)
+        .expect("valid")
+        .expect("changed");
+    assert_eq!(to.nick.expect("a nickname").as_str(), "Blue Heron");
+}
+
+#[test]
+fn the_rename_field_rejects_invalid_names_and_leaves_an_untouched_name_alone() {
+    let held = view("m184", "Linnet", true);
+    for invalid in ["", "m0 MissBunny", "m086 MissBunny", "m86 m8", "m86 --bad"] {
+        assert!(name_to(invalid, &held).is_err(), "{invalid}");
+    }
+    assert!(name_to("m184 Linnet", &held).expect("valid").is_none());
+    assert!(name_to("184", &held).expect("valid").is_none());
+    assert!(
+        name_to("m0 Linnet", &view("m0", "Linnet", false))
+            .expect("untouched")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_machine_rename_refuses_a_gesture_the_person_did_not_make() {
+    let mut app = crate::App::headless_for_test();
+    app.machine_view = Some(view("m184", "Linnet", true));
+    app.agents.controller_gesture = true;
+    app.rename_machine();
+    assert_eq!(
+        app.pending_action_refusal.take().as_deref(),
+        Some(NAME_PERSON_ONLY)
+    );
+    assert_eq!(app.machine_sets, 0);
+}
+
+#[test]
+fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
+    use aterm_agent::machine_name::{set_name, set_nick};
+    use aterm_net::fleet_member::name_record::{ByKind, FLOOR_MS};
+    use aterm_secrets::client::LabLabels;
+    let root = state();
+    let now = FLOOR_MS + 300 * 86_400_000;
+    let number = |n| {
+        NameChange::Name(NameTo {
+            num: Number::new(n).expect("a number"),
+            nick: None,
+        })
+    };
+    let nickname =
+        |word| NameChange::Nickname(NickTo::Word(Nickname::parse(word).expect("a nickname")));
+    let (send, jobs) = mpsc::channel();
+    for (generation, to) in [
+        number(86),
+        nickname("MissBunny"),
+        number(87),
+        nickname("Heron"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        send.send(NameJob {
+            to,
+            generation: u64::try_from(generation).expect("a generation"),
+        })
+        .expect("queues");
+    }
+    drop(send);
+    let mut applied = Vec::new();
+    write_changes(jobs, |job| {
+        let stamp = now + job.generation;
+        let name = match job.to {
+            NameChange::Name(to) => {
+                set_name(
+                    root.path(),
+                    &to,
+                    || Ok(LabLabels::default()),
+                    ByKind::Person,
+                    || Ok(None),
+                    stamp,
+                    false,
+                )
+                .expect("sets a number")
+                .name
+            }
+            NameChange::Nickname(to) => {
+                set_nick(root.path(), &to, ByKind::Person, || Ok(None), stamp, false)
+                    .expect("sets a nickname")
+                    .name
+            }
+        };
+        applied.push((job.generation, name.title()));
+    });
+    assert_eq!(
+        applied
+            .iter()
+            .map(|(generation, _)| *generation)
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(applied[1].1, "m86 MissBunny");
+    assert_eq!(applied[2].1, "m87 MissBunny");
+    assert_eq!(
+        file::read(root.path())
+            .expect("reads")
+            .expect("a name")
+            .title(),
+        "m87 Heron"
+    );
+}
+
+#[test]
+fn reading_and_posting_a_snapshot_share_the_same_serial_order() {
+    let root = state();
+    let posted = post_read(
+        root.path(),
+        None,
+        || {
+            assert!(
+                matches!(
+                    READ_POST.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "a second reader cannot overtake this read"
+            );
+            Ok(None)
+        },
+        |_| {
+            assert!(
+                matches!(
+                    READ_POST.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "the snapshot posts before another read can publish"
+            );
+            true
+        },
+    )
+    .expect("a first read");
+    assert!(posted);
+}
+
+#[test]
+fn an_authoritative_name_file_reset_replaces_the_windows_higher_revision() {
+    use aterm_agent::machine_name::file::MachineName;
+    use aterm_types::machine_name::{Class, Number};
+
+    let root = state();
+    let mut original =
+        MachineName::unnumbered(Nickname::parse("MissBunny").expect("a nickname"), 1);
+    original.num = Some(Number::new(86).expect("a number"));
+    original.class = Class::Chosen;
+    original.rev = 9;
+    file::read_or_create(root.path(), || Ok(original)).expect("the existing name");
+    let mut app = crate::App::headless_for_test();
+    post_read(
+        root.path(),
+        None,
+        || Ok(None),
+        |view| {
+            app.machine_name_read(view);
+            true
+        },
+    )
+    .expect("the first serialized read");
+    assert_eq!(app.machine_view.as_ref().expect("the first view").rev, 9);
+    std::fs::remove_file(root.path().join(file::FILE)).expect("the local file was reset");
+    post_read(
+        root.path(),
+        None,
+        || Ok(None),
+        |view| {
+            app.machine_name_read(view);
+            true
+        },
+    )
+    .expect("the authoritative read after a reset");
+    let restored = app.machine_view.as_ref().expect("the replacement view");
+    assert_eq!((restored.name.as_str(), restored.rev), ("m0", 0));
+    let stored = file::read(root.path())
+        .expect("reads")
+        .expect("the replacement file");
+    assert_eq!(restored.word, stored.nick.as_str());
 }
 
 /// A read name reaches the status item: the glance the item is built from carries the title, and

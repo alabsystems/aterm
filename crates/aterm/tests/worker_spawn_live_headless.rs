@@ -678,6 +678,98 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
     });
 }
 
+/// A PROGRAM WORKER CONCLUDES ON ITS EXIT STATUS, ITS OUTPUT TAIL ITS RESULT: `spawn
+/// program=/bin/sh -` hands the task file to the shell as its script, verbatim (no fact line,
+/// which would be input to it), in a background tab under its manager; exit 0 is `done
+/// why=exit-status exit=0` and exit 3 `failed why=exit-status exit=3`, each on `task` and on an
+/// `await task` row, and `result` answers `source=output` with what it printed. NEGATIVE
+/// CONTROLS: a spawn naming no program, or one a harness here concludes, is refused and spawns
+/// nothing.
+#[test]
+fn a_program_worker_concludes_on_its_exit_status_with_its_output_as_its_result() {
+    let inst = boot("p", "/bin/bash", Some(SUPERVISED), None);
+    let (_, manager) = boot_session(&inst);
+    let work = inst.tmp.join("work");
+    for (task, state, conclusion, exit, said) in [
+        ("echo built it\nexit 0\n", "done", "finished", 0, "built it"),
+        ("echo it broke\nexit 3\n", "failed", "failed", 3, "it broke"),
+    ] {
+        let (ok, stdout, stderr) = spawn_as(
+            &inst,
+            &manager,
+            &work,
+            &["@self", "spawn", "program=/bin/sh", "raise=false", "-"],
+            task.as_bytes(),
+        );
+        assert!(ok, "spawn program=/bin/sh: {stdout} {stderr}");
+        let worker = sid_of(&stdout);
+        let file = inst.tmp.join(format!("state/tasks/{worker}-1.txt"));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("the task file"),
+            task,
+            "the task as given"
+        );
+        let meta = ctl_ok(&inst, &[&format!("@{worker}"), "meta"]);
+        assert_eq!(field(&meta, "worker"), Some("generic"), "{meta}");
+        until(&inst, &worker, "its program's end", || {
+            ctl_ok(&inst, &[&format!("@{worker}"), "task"]).contains(&format!(" state={state} "))
+        });
+        let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
+        assert!(
+            record.contains(&format!(" conclusion={conclusion} why=exit-status "))
+                && record.contains(&format!(" exit={exit} ")),
+            "{record}"
+        );
+        let row = ctl_ok(
+            &inst,
+            &[
+                "await",
+                "task",
+                &format!("@{worker}"),
+                "since=0",
+                "timeout=1000",
+            ],
+        );
+        assert!(
+            row.contains(&format!(
+                " conclusion={conclusion} why=exit-status exit={exit}"
+            )),
+            "{row}"
+        );
+        // `result` prints the reply's status line on stderr and its body on stdout.
+        let result = ctl(&inst, &[&format!("@{worker}"), "result"]);
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(String::from_utf8_lossy(&result.stdout), format!("{said}\n"));
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains(&format!("OK 1 source=output bytes={}", said.len())),
+            "{result:?}"
+        );
+    }
+    let rows = || ctl_ok(&inst, &["sessions"]).lines().count();
+    let before = rows();
+    for (program, refused) in [
+        ("program=", "ERR usage: spawn"),
+        (
+            "program=claude",
+            "has a harness here; spawn it as `agent=claude`",
+        ),
+    ] {
+        let (ok, stdout, stderr) = spawn_as(
+            &inst,
+            &manager,
+            &work,
+            &["@self", "spawn", program, "-"],
+            b"exit 0\n",
+        );
+        assert!(
+            !ok && stderr.contains(refused),
+            "{program}: {stdout} {stderr}"
+        );
+    }
+    assert_eq!(rows(), before, "nothing was spawned");
+}
+
 /// Undo the wire's pct-encoding.
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();

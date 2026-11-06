@@ -338,15 +338,18 @@ fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged 
 
 /// `agh policy grant CALLER REPO` (design §6.2): `REPO` added to `CALLER`'s `[[writers]]`
 /// row of agh.toml, which is written again whole, atomically and 0600. It runs with or without
-/// a terminal (owner ruling 2026-10-26: an agent grants as a person does). Its answer is
+/// a terminal (owner ruling 2026-10-26: an agent grants as a person does). When the file is
+/// absent, healthy recorded vault identities seed `vault = true` and only the requested
+/// grant. Its answer is
 /// `{"caller","change","repos"}`: `added` or `unchanged`, and the row after the edit.
 ///
 /// # Errors
 ///
 /// Usage for a caller outside `[a-z][a-z0-9-]{0,31}` or a `REPO` that is no literal
 /// `OWNER/NAME` (each quoted with a token-shaped part masked). Refused when there is no
-/// agh.toml; when another edit holds the auth edit lock, or the config directory or the lock
-/// is not private; when `read_private` refuses agh.toml or it is not UTF-8; and, with nothing
+/// agh.toml and no healthy recorded vault identities can seed one; when another edit holds
+/// the auth edit lock, or the config directory or the lock is not private; when
+/// `read_private` refuses agh.toml or it is not UTF-8; and, with nothing
 /// written, when the edit would break one of its rules, would make it longer than
 /// `config::CONFIG_MAX`, or cannot be made in place (`config::edit_writers`'s Refused).
 /// Invalid when agh.toml does not parse or its `writers` cannot be edited
@@ -361,7 +364,7 @@ pub(crate) fn policy_grant(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 ///
 /// # Errors
 ///
-/// As `policy grant`.
+/// As `policy grant`; also Refused when agh.toml is absent (revoke never creates one).
 pub(crate) fn policy_revoke(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     edit_grant(ctx, inv, false)
 }
@@ -390,7 +393,7 @@ fn edit_grant(ctx: &mut Ctx, inv: &Invocation, add: bool) -> Result<Outcome> {
             "no config directory: agh cannot provision here",
         ));
     };
-    let (change, repos) = write_grant(&dirs, caller, &slug, add)?;
+    let (change, repos) = write_grant(&dirs, &*ctx.env, caller, &slug, add)?;
     let mut value = writer_row(caller, &repos, &ctx.redactor);
     if let Some(object) = value.as_object_mut() {
         object.insert("change".into(), Value::from(change));
@@ -410,11 +413,13 @@ const AUTH_EDIT_BUSY: &str = "another agh auth edit is in progress";
 
 /// The edit on unix, under the auth edit lock: agh.toml read with `read_private`, edited by
 /// `config::edit_writers`, judged by L1–L11 and held to `config::CONFIG_MAX`, and written with
-/// `write_private`. The change (`added`, `removed` or `unchanged`) and the caller's
+/// `write_private` (or `write_private_new` for the first grant). The change (`added`,
+/// `removed` or `unchanged`) and the caller's
 /// repositories after it.
 #[cfg(unix)]
 fn write_grant(
     dirs: &config::Dirs,
+    env: &dyn crate::identity::EnvSource,
     caller: &str,
     slug: &Slug,
     add: bool,
@@ -426,9 +431,16 @@ fn write_grant(
         Error::refused(format!("there is no agh.toml to {verb} in"))
             .with_next("agh auth add NAME --file PATH --tier TIER")
     };
-    if std::fs::symlink_metadata(dirs.config_file()).is_err() {
-        return Err(missing());
-    }
+    let seed = if std::fs::symlink_metadata(dirs.config_file())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        if !add {
+            return Err(missing());
+        }
+        Some(first_grant_seed(dirs, env)?)
+    } else {
+        None
+    };
     // The auth verbs' lock, whose busy refusal names the auth command: told again for this verb.
     let _edit = AuthEdit::take(dirs).map_err(|error| {
         if error.kind == Kind::Refused && error.why == AUTH_EDIT_BUSY {
@@ -439,9 +451,9 @@ fn write_grant(
             error
         }
     })?;
-    let text = match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
-        ConfigText::Text(text) => text,
-        ConfigText::Missing => return Err(missing()),
+    let (text, creating) = match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
+        ConfigText::Text(text) => (text, false),
+        ConfigText::Missing => (seed.ok_or_else(missing)?, true),
         ConfigText::Refused { error, remedy } => {
             return Err(config::invalid(
                 format!("agh.toml: {error}"),
@@ -491,22 +503,90 @@ fn write_grant(
             "make agh.toml shorter, then run agh policy {verb} again"
         )));
     }
-    aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, edited.as_bytes()).map_err(
-        |e| Error::could_not_run(format!("{}: {e}", tilde(&dirs.config_file(), &dirs.home))),
-    )?;
+    if creating {
+        create_grant_config(dirs, &edited)?;
+    } else {
+        aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, edited.as_bytes())
+            .map_err(|e| {
+                Error::could_not_run(format!("{}: {e}", tilde(&dirs.config_file(), &dirs.home)))
+            })?;
+    }
     Ok((if add { "added" } else { "removed" }, repos))
+}
+
+/// Preserve absent-file routing: only already-recorded, healthy vault identities can seed
+/// the first explicit grant. This view neither learns a login nor writes its record.
+#[cfg(unix)]
+fn first_grant_seed(dirs: &config::Dirs, env: &dyn crate::identity::EnvSource) -> Result<String> {
+    let refused = || {
+        Error::refused("a first grant needs healthy recorded vault identities")
+            .with_next(config::POLICY_CHECK)
+    };
+    let adoption = vault::view(dirs, env).ok_or_else(refused)?;
+    adoption.router()?;
+    if !adoption.adopted_any()
+        || !adoption.faults().is_empty()
+        || adoption
+            .vaulted()
+            .iter()
+            .any(|row| !matches!(row.found, Found::Absent | Found::Adopted { .. }))
+    {
+        return Err(refused());
+    }
+    crate::identity::provision::join_vault("", "")
+}
+
+#[cfg(unix)]
+fn create_grant_config(dirs: &config::Dirs, text: &str) -> Result<()> {
+    let created = aterm_uds::private_file::write_private_new(
+        &dirs.config,
+        CONFIG_FILE,
+        text.as_bytes(),
+        |_| Ok(()),
+    )
+    .map_err(|e| {
+        Error::could_not_run(format!("{}: {e}", tilde(&dirs.config_file(), &dirs.home)))
+    })?;
+    if !created {
+        return Err(Error::refused(
+            "agh.toml appeared before the first grant was saved; it was left unchanged",
+        )
+        .with_next("run agh policy grant again against that file"));
+    }
+    Ok(())
 }
 
 /// Off unix agh never reads or writes agh.toml (design §6.6), so it grants nothing there.
 #[cfg(not(unix))]
 fn write_grant(
     dirs: &config::Dirs,
+    env: &dyn crate::identity::EnvSource,
     caller: &str,
     slug: &Slug,
     add: bool,
 ) -> Result<(&'static str, Vec<String>)> {
-    let _ = (dirs, caller, slug, add);
+    let _ = (dirs, env, caller, slug, add);
     Err(Error::local(
         "agh reads and writes agh.toml only on unix, where its permissions are checked",
     ))
+}
+
+#[cfg(all(test, unix))]
+mod grant_creation_tests {
+    #[test]
+    fn first_grant_never_overwrites_a_competing_creator() {
+        let root = crate::test_fixtures::scratch_dir("grant-competing-creator");
+        let dirs = crate::config::Dirs::under(root.path());
+        let existing = "# another editor's file\nvault = true\n";
+        crate::test_fixtures::write_config(&dirs, existing);
+        let candidate = "vault = true\n[[writers]]\ncaller = 'atpkg-publish'\n\
+                         repos = ['alabsystems/aterm']\n";
+        let error =
+            super::create_grant_config(&dirs, candidate).expect_err("the competing file wins");
+        assert_eq!(error.kind, crate::Kind::Refused);
+        assert_eq!(
+            std::fs::read_to_string(dirs.config_file()).unwrap(),
+            existing
+        );
+    }
 }

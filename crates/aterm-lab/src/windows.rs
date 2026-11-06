@@ -2867,7 +2867,8 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
     Ok((send.len(), remove.len()))
 }
 
-/// The build facts `crates/aterm/build.rs` takes pinned instead of asking git.
+/// The build facts `crates/aterm/build.rs` takes pinned instead of asking git, in its `commit`
+/// mode (`aterm_stamp::input`).
 #[must_use]
 pub fn build_facts(repo: &Path) -> Vec<(String, String)> {
     let git = |args: &[&str]| {
@@ -2886,21 +2887,22 @@ pub fn build_facts(repo: &Path) -> Vec<(String, String)> {
     let dev = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
         .and_then(|tag| git(&["rev-list", "--count", &format!("{tag}..HEAD")]))
         .unwrap_or_else(|| "0".into());
-    let mut facts = Vec::new();
+    use aterm_stamp::input;
+    let mut facts = vec![(input::MODE.to_string(), "commit".to_string())];
     if let Some(epoch) = git(&["show", "-s", "--format=%ct", "HEAD"]) {
-        facts.push(("SOURCE_DATE_EPOCH".to_string(), epoch));
+        facts.push((input::EPOCH.to_string(), epoch));
     }
     facts.extend([
         (
-            "ATERM_BUILD_GIT_COMMIT".into(),
+            input::COMMIT.into(),
             if dirty {
                 format!("{short}-dirty")
             } else {
                 short
             },
         ),
-        ("ATERM_BUILD_GIT_COMMIT_FULL".into(), full),
-        ("ATERM_BUILD_DEV_COMMITS".into(), dev),
+        (input::FULL_COMMIT.into(), full),
+        (input::DEV_COMMITS.into(), dev),
     ]);
     facts
 }

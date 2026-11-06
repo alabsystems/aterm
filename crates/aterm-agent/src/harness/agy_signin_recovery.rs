@@ -133,7 +133,7 @@ pub(super) fn publication_fixture(
     let home = req.store.user_home().unwrap();
     let program = std::env::current_exe().unwrap();
     let fresh = std::cell::Cell::new(false);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = WakeDeadline::after(Duration::from_secs(60));
     let result = run_with(
         &program,
         state,
@@ -160,7 +160,7 @@ pub(super) fn publication_fixture(
     .and_then(|grant| {
         grant
             .verify_with_retry(
-                deadline,
+                || deadline.remaining(),
                 |_, expected, _| {
                     if unavailable {
                         return Err(super::super::google_profile::Error::Unavailable);
@@ -171,7 +171,6 @@ pub(super) fn publication_fixture(
                     })
                 },
                 |_| {},
-                Instant::now,
             )
             .map_err(|error| error.to_string())
     });
@@ -280,7 +279,7 @@ pub(super) fn run_scoped(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     work: Option<super::super::account_work::Scope>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     run_with_journal(
@@ -311,7 +310,7 @@ pub(super) fn direct(
     state: &Path,
     home: &Path,
     account: &str,
-    deadline: Instant,
+    deadline: WakeDeadline,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     direct_refresh::run_with(
         program,
@@ -355,14 +354,14 @@ fn direct_with(
     state: &Path,
     home: &Path,
     account: &str,
-    deadline: Instant,
+    deadline: WakeDeadline,
     fresh: impl FnOnce(
         &Path,
         &Path,
         &Path,
         &str,
         Option<StagedGoogleLogin<'_>>,
-        Instant,
+        WakeDeadline,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     remaining(deadline).map_err(GoogleLoginError::Native)?;
@@ -464,14 +463,14 @@ fn run_with(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     fresh: impl FnOnce(
         &Path,
         &Path,
         &Path,
         &str,
         Option<StagedGoogleLogin<'_>>,
-        Instant,
+        WakeDeadline,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     run_with_checked(
@@ -497,7 +496,7 @@ fn run_with_checked(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     check: impl FnOnce(&str, &str, Duration) -> Result<(), super::super::google_profile::Error>,
     fresh: impl FnOnce(
         &Path,
@@ -505,7 +504,7 @@ fn run_with_checked(
         &Path,
         &str,
         Option<StagedGoogleLogin<'_>>,
-        Instant,
+        WakeDeadline,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     run_with_journal(
@@ -531,7 +530,7 @@ fn run_with_journal(
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     check: impl FnOnce(&str, &str, Duration) -> Result<(), super::super::google_profile::Error>,
     fresh: impl FnOnce(
         &Path,
@@ -539,7 +538,7 @@ fn run_with_journal(
         &Path,
         &str,
         Option<StagedGoogleLogin<'_>>,
-        Instant,
+        WakeDeadline,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
     journal_context: (&'static str, Option<super::super::account_work::Scope>),
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
@@ -597,7 +596,7 @@ fn run_with_journal(
             binding.expected_email(),
             remaining(deadline)
                 .map_err(GoogleLoginError::Native)?
-                .min(Duration::from_secs(30)),
+                .min(GOOGLE_REQUEST),
         );
         work_current()?;
         remaining(deadline).map_err(GoogleLoginError::Native)?;

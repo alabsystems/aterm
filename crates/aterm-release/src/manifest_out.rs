@@ -19,7 +19,7 @@ pub const MANIFEST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 pub struct ManifestInputs<'a> {
     /// Canonical `MAJOR.MINOR.PATCH` release version (must match tag `v<version>` and DMG name).
     pub version: &'a str,
-    /// Verified ledger claim `n` (equals `ATERM_BUILD_NUMBER` and `CFBundleVersion`).
+    /// Verified ledger claim `n` (equals the identity record's `build` and `CFBundleVersion`).
     pub build_number: u64,
     /// Full 40-hex release commit.
     pub commit: &'a str,
@@ -125,9 +125,15 @@ pub fn write(out_dir: &Path, m: &Manifest) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn strip_xml_comments(xml: &str) -> Option<String> {
+fn strip_xml_comments(xml: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let Some(first) = xml.find("<!--") else {
+        return Some(std::borrow::Cow::Borrowed(xml));
+    };
     let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
+    out.push_str(&xml[..first]);
+    let after = &xml[first + 4..];
+    let end = after.find("-->")?;
+    let mut rest = &after[end + 3..];
     while let Some(start) = rest.find("<!--") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 4..];
@@ -135,18 +141,20 @@ fn strip_xml_comments(xml: &str) -> Option<String> {
         rest = &after[end + 3..];
     }
     out.push_str(rest);
-    Some(out)
+    Some(std::borrow::Cow::Owned(out))
 }
 
 fn decode_xml_entities(raw: &str) -> Option<String> {
     if raw.contains('<') {
         return None;
     }
+    let Some(first) = raw.find('&') else {
+        return Some(raw.to_owned());
+    };
     let mut out = String::with_capacity(raw.len());
-    let mut tail = raw;
-    while let Some(at) = tail.find('&') {
-        out.push_str(&tail[..at]);
-        tail = &tail[at..];
+    out.push_str(&raw[..first]);
+    let mut tail = &raw[first..];
+    loop {
         let (entity, ch) = [
             ("&amp;", '&'),
             ("&lt;", '<'),
@@ -158,17 +166,31 @@ fn decode_xml_entities(raw: &str) -> Option<String> {
         .find(|(entity, _)| tail.starts_with(entity))?;
         out.push(ch);
         tail = &tail[entity.len()..];
+        let Some(at) = tail.find('&') else {
+            out.push_str(tail);
+            break;
+        };
+        out.push_str(&tail[..at]);
+        tail = &tail[at..];
     }
-    out.push_str(tail);
     Some(out)
 }
 
 /// Read one `<key>K</key><string>V</string>` (or `<string/>`) value out of plist XML.
 pub fn plist_string(plist: &str, key: &str) -> Option<String> {
     let stripped = strip_xml_comments(plist)?;
-    let key_tag = format!("<key>{key}</key>");
-    let after = stripped.find(&key_tag)? + key_tag.len();
-    let rest = stripped[after..].trim_start();
+    let mut search = &*stripped;
+    let rest = loop {
+        let at = search.find("<key>")?;
+        let after_open = &search[at + 5..];
+        if let Some(after_key) = after_open
+            .strip_prefix(key)
+            .and_then(|s| s.strip_prefix("</key>"))
+        {
+            break after_key.trim_start();
+        }
+        search = after_open;
+    };
     if rest.starts_with("<string/>") {
         return Some(String::new());
     }

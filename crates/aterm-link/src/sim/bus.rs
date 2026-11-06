@@ -475,6 +475,15 @@ pub(crate) struct Retained {
     rules_next: Option<Retention>,
 }
 
+/// The other writer under a node's producer id ([`State::stray`]): its draws, and the face
+/// and body of the record it writes.
+#[derive(Debug)]
+pub(crate) struct Stray {
+    pub(crate) draw: Rng,
+    pub(crate) subject: String,
+    pub(crate) body: Vec<u8>,
+}
+
 /// The simulated broker's state.
 #[derive(Debug)]
 pub(crate) struct State {
@@ -524,6 +533,27 @@ pub(crate) struct State {
     pub(crate) fences_lifted: u64,
     /// Refuse the next this-many publishes by a NODE producer, and group commits.
     pub(crate) refuse_next: u32,
+    /// A CUT BETWEEN A DEDUP ANSWER AND THE NEXT REQUEST (critic item F23), drawn by this
+    /// stream where a world has one ([`super::world::Opts::keys`]): one dedup answer to a node
+    /// producer's publish in two is followed at once by a cut just past the answered record
+    /// ([`State::cut_to`]), a byte bound the traffic reaches while the publisher has yet to read
+    /// that record back. astream's writer cuts between any two batches, and a connection's
+    /// next request may come after either; here it comes after the cut. Counted in
+    /// `cuts_after_dedup`.
+    pub(crate) cut_after_dedup: Option<Rng>,
+    pub(crate) cuts_after_dedup: u64,
+    /// ANOTHER WRITER UNDER A NODE'S PRODUCER ID (critic item F23's case 5,
+    /// [`super::world::Opts::strays`]): where a world has one, one refused publish of a node
+    /// producer's mail in two ([`State::refuse_next`], a record on a lane, `/in/`) is followed
+    /// at once by a record of that writer's at the sequence the refusal named, on its own face
+    /// (a sibling bridge under this node's id, at this incarnation: [`super::world::Opts::alias`]'s
+    /// writer, one record of its). The node's retry of the post or receipt at its pin then meets
+    /// astream's dedup answering with a record of none of the pin's faces. Mail only: at a
+    /// mirror's or an attach's sequence the bridge reads such a dedup as its capability
+    /// compromised (`ev=cap-compromised`), the rule of another item, not F21's. Its records'
+    /// offsets are `strays`.
+    pub(crate) stray: Option<Stray>,
+    pub(crate) strays: Vec<u64>,
     /// HELD ACKS (aterm-0).
     pub(crate) holds: Option<Rng>,
     /// How many answers were held.
@@ -924,6 +954,10 @@ impl Broker {
                 gap_fenced: 0,
                 fences_lifted: 0,
                 refuse_next: 0,
+                cut_after_dedup: None,
+                cuts_after_dedup: 0,
+                stray: None,
+                strays: Vec::new(),
                 holds: None,
                 held_total: 0,
                 tries_not_yet: 0,
@@ -1030,19 +1064,18 @@ impl Broker {
     /// bound the fleet's traffic reaches does. Clamped to the head; nothing at or below the
     /// base, on a broker that is down, or on one that set no rules. Whether it cut.
     pub(crate) fn cut_to(&self, at: u64) -> bool {
-        let mut s = lock(&self.state);
-        if !s.up || !s.ret.active {
-            return false;
-        }
-        let head = s.log.len() as u64;
-        let min = astream_broker::proto::compact_floor_monotone(at.min(head), s.ret.base);
-        if min <= s.ret.base {
-            return false;
-        }
-        s.note_event(|| Event::Cut(min));
-        s.catch_up_tails();
-        let now = s.ret.stamps.last().map_or(0, |&(_, ms)| ms);
-        s.plan_and_apply(now, min, Some(min))
+        lock(&self.state).cut_to(at)
+    }
+
+    /// The cuts that landed between a dedup answer and the next request
+    /// ([`State::cut_after_dedup`]).
+    pub(crate) fn cuts_after_dedup(&self) -> u64 {
+        lock(&self.state).cuts_after_dedup
+    }
+
+    /// Where the other writer under a node's producer id wrote ([`State::stray`]).
+    pub(crate) fn strays(&self) -> Vec<u64> {
+        lock(&self.state).strays.clone()
     }
 
     /// OPEN AGAIN SETTING NO RULES, as `aterm link broker` serves when setting them fails:
@@ -1666,6 +1699,47 @@ impl State {
         Some(Arc::new(made))
     }
 
+    /// THE OTHER WRITER TAKES THE SEQUENCE A REFUSED PUBLISH NAMED ([`State::stray`]), one time
+    /// in two: its record at `producer`'s `seq`, on its own face, past every refusal still set.
+    fn stray_at(&mut self, producer: u64, seq: u64) {
+        let Some(stray) = self.stray.as_mut() else {
+            return;
+        };
+        if !stray.draw.chance(1, 2) {
+            return;
+        }
+        let (subject, body) = (stray.subject.clone(), stray.body.clone());
+        let refuse_next = std::mem::take(&mut self.refuse_next);
+        self.note_event(|| Event::Publish {
+            producer,
+            seq,
+            subject: subject.clone(),
+            body: body.clone(),
+        });
+        if let Ok((off, false)) = self.publish_bounded(producer, seq, &subject, &body, false) {
+            self.strays.push(off);
+            self.notes
+                .push(format!("stray writer seq={seq} {subject} @{off}"));
+        }
+        self.refuse_next = refuse_next;
+    }
+
+    /// [`Broker::cut_to`] on the state its lock holds.
+    fn cut_to(&mut self, at: u64) -> bool {
+        if !self.up || !self.ret.active {
+            return false;
+        }
+        let head = self.log.len() as u64;
+        let min = astream_broker::proto::compact_floor_monotone(at.min(head), self.ret.base);
+        if min <= self.ret.base {
+            return false;
+        }
+        self.note_event(|| Event::Cut(min));
+        self.catch_up_tails();
+        let now = self.ret.stamps.last().map_or(0, |&(_, ms)| ms);
+        self.plan_and_apply(now, min, Some(min))
+    }
+
     /// THE RETENTION at `now` (ms of the world's wall clock), the cut never above `ceiling`,
     /// or at `forced`: astream's planning (`BrokerLog::retention_plan`: the stamps first,
     /// then the planning over its tier's slots, `plan_over`; here `retention::plan` over a
@@ -2236,6 +2310,9 @@ impl State {
             self.notes.push(format!(
                 "refuse publish seq={seq} {subject} (batch rolled back)"
             ));
+            if subject.starts_with("/f/") && subject.contains("/in/") {
+                self.stray_at(producer, seq);
+            }
             return Err(refused(
                 astream_broker::proto::ERR_REFUSED,
                 "commit failed: the batch was rolled back (simulated)".to_string(),
@@ -2762,6 +2839,23 @@ impl State {
                             "publish c{conn} seq={producer_seq} {subject} @{offset}{}",
                             if deduped { " dup" } else { "" }
                         ));
+                        let node = self
+                            .principal(producer_id)
+                            .is_some_and(|p| p.starts_with("n-"));
+                        if deduped
+                            && node
+                            && self
+                                .cut_after_dedup
+                                .as_mut()
+                                .is_some_and(|draw| draw.chance(1, 2))
+                            && self.cut_to(offset + 1)
+                        {
+                            self.cuts_after_dedup += 1;
+                            self.notes.push(format!(
+                                "cut at {} after the dedup answer @{offset}",
+                                offset + 1
+                            ));
+                        }
                         vec![Response::PublishAck { offset, deduped }]
                     }
                     Err(e) => vec![*e],

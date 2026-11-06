@@ -1236,7 +1236,7 @@ fn a_pwsh_takes_an_older_scripts_aterm_bin_off_when_sourced_again() {
     let pwsh = need_pwsh();
     let new = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     pwsh_takes_an_older_scripts_aterm_bin_off("pwsh", |snippet, nested| {
         let mut cmd = shell_command(pwsh);
@@ -1276,7 +1276,7 @@ fn a_powershell_takes_an_older_scripts_aterm_bin_off_when_sourced_again() {
             std::fs::write(&old, PRELOADER_PWSH).expect("write the pre-loader script");
             let new = format!(
                 "{}/src/scripts/aterm_shell_integration.ps1",
-                env!("CARGO_MANIFEST_DIR")
+                aterm_tempfile::manifest_dir().display()
             );
             let old = old.to_str().expect("UTF-8 fixture path").to_owned();
             let inherited = format!(

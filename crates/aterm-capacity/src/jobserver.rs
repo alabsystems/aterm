@@ -61,7 +61,7 @@ impl Jobserver {
                     return Err(error);
                 }
             };
-            if let Err(error) = file.write_all(&vec![b'+'; slots as usize]) {
+            if let Err(error) = file.write_all(&[b'+'; 4096][..slots as usize]) {
                 let _ = std::fs::remove_file(path);
                 return Err(error);
             }

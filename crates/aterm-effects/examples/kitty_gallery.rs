@@ -187,7 +187,7 @@ fn bake_context(id: CatGlyphId, coat: u8, iris: u8, colors: CatColorKey, h: u32)
 }
 
 fn viewbox_aspect(id: &str) -> f32 {
-    let path = format!("{}/art/glyphs/{id}.toml", env!("CARGO_MANIFEST_DIR"));
+    let path = aterm_tempfile::manifest_dir().join(format!("art/glyphs/{id}.toml"));
     let Ok(text) = std::fs::read_to_string(&path) else {
         return 1.0;
     };

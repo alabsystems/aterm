@@ -500,7 +500,7 @@ fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
 }
 
 fn export_fixture(export: &Path) -> String {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = aterm_tempfile::manifest_dir().join("../..");
     for f in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
         std::fs::copy(repo.join(f), export.join(f)).unwrap();
     }
@@ -1211,7 +1211,7 @@ fn publication_stubs_run_a_handed_cutter_and_build_one_only_without() {
         }
     }
     let sourced = |name: &str, handed: Option<&Path>| {
-        let stub = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let stub = aterm_tempfile::manifest_dir()
             .join("../../publish")
             .join(name);
         let _ = std::fs::remove_file(&said);

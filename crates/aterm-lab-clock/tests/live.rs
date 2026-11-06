@@ -39,7 +39,7 @@ const UPTIME: [&str; 3] = ["uptime_raw_approx", "absolute", "instant"];
 fn library() -> &'static Path {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("aterm-lab-clock-build.noindex");
+        let target = aterm_tempfile::target_tmpdir().join("aterm-lab-clock-build.noindex");
         let out = aterm_uds::spawnfd::command(env!("CARGO"))
             .args([
                 "--unverified",
@@ -50,7 +50,7 @@ fn library() -> &'static Path {
                 "aterm-lab-clock",
                 "--manifest-path",
             ])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .arg(aterm_tempfile::manifest_dir().join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target)
             .stdin(Stdio::null())
@@ -78,7 +78,7 @@ impl Probe {
     fn start(dir: &Path, continuous: bool) -> Probe {
         std::fs::create_dir_all(dir.join("reg")).expect("record dir");
         set_offset(dir, "0");
-        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_lab-clock-probe"));
+        let mut cmd = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("lab-clock-probe"));
         cmd.env("DYLD_INSERT_LIBRARIES", library())
             .env("LABCLOCK_FILE", dir.join("offset"))
             .env("LABCLOCK_DIR", dir.join("reg"))
@@ -170,7 +170,7 @@ fn delta(a: &HashMap<String, i128>, b: &HashMap<String, i128>, k: &str) -> i128 
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let d = aterm_tempfile::target_tmpdir()
         .join(format!("aterm-lab-clock-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("scratch");

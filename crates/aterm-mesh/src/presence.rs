@@ -150,11 +150,11 @@ impl Build {
         (first && rest && b.len() <= BUILD_MAX).then(|| Self(text.into()))
     }
 
-    /// The build this process runs (`aterm_types::version::build_id`, `<version>+g<commit>`), or
+    /// The build this process runs (`aterm_stamp::build_id`, `<version>+g<commit>`), or
     /// `unstamped` where that is not a build word.
     #[must_use]
     pub fn running() -> Self {
-        Self::new(&aterm_types::version::build_id()).unwrap_or_else(|| Self("unstamped".into()))
+        Self::new(&aterm_stamp::build_id()).unwrap_or_else(|| Self("unstamped".into()))
     }
 
     /// The text.
@@ -742,9 +742,10 @@ pub fn read_seen(dir: &Path) -> BTreeMap<String, u64> {
     let Ok(bytes) = aterm_uds::private_file::read_private(dir, SEEN_FILE, SEEN_BYTES_MAX) else {
         return BTreeMap::new();
     };
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter_map(|line| {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter_map(|raw| {
+            let line = std::str::from_utf8(raw.strip_suffix(b"\r").unwrap_or(raw)).ok()?;
             let (principal, ms) = line.split_once(' ')?;
             Node::parse(principal)?;
             Some((principal.to_owned(), ms.parse().ok()?))
@@ -968,7 +969,7 @@ impl Shared {
     }
 
     /// Journal `line` once a run under `key`.
-    fn say_once(&self, key: String, line: &str) {
+    fn say_once(&self, key: String, line: fmt::Arguments<'_>) {
         let first = {
             let mut said = self.said.lock_or_recover();
             said.len() < SAID_MAX && said.insert(key)
@@ -1003,7 +1004,7 @@ impl Shared {
                 let why = e.to_string();
                 self.say_once(
                     format!("publish:{why}"),
-                    &format!("no row this tick: {why}"),
+                    format_args!("no row this tick: {why}"),
                 );
                 self.report(&Event::NotPublished { why });
             }
@@ -1056,12 +1057,14 @@ impl Shared {
             Err(why) => {
                 self.say_once(
                     format!("refused:{subject}:{why}"),
-                    &format!("refused a row on {subject}: {why}"),
+                    format_args!("refused a row on {subject}: {why}"),
                 );
-                self.report(&Event::Refused {
-                    subject: subject.to_owned(),
-                    why,
-                });
+                if let Some(observe) = &self.observe {
+                    observe(&Event::Refused {
+                        subject: subject.to_owned(),
+                        why,
+                    });
+                }
                 return;
             }
         };
@@ -1093,20 +1096,31 @@ impl Shared {
 
     /// Write the seen file where it is due at `now`.
     fn write_seen(&self, now: Duration) {
+        if self
+            .board
+            .lock_or_recover()
+            .wrote_at
+            .is_some_and(|at| now.saturating_sub(at) < SEEN_EVERY)
+        {
+            return;
+        }
         let keep = self.current_seats();
-        let Some(text) = self.board.lock_or_recover().due(now, keep.as_ref()) else {
+        let Some((text, seats)) = ({
+            let mut board = self.board.lock_or_recover();
+            board
+                .due(now, keep.as_ref())
+                .map(|text| (text, board.seen.len()))
+        }) else {
             return;
         };
         match aterm_uds::private_file::write_private(&self.dir, SEEN_FILE, text.as_bytes()) {
             Ok(()) => {
                 self.board.lock_or_recover().wrote(now);
-                self.report(&Event::Wrote {
-                    seats: text.lines().count(),
-                });
+                self.report(&Event::Wrote { seats });
             }
             Err(e) => self.say_once(
                 format!("seen:{e}"),
-                &format!("{SEEN_FILE} could not be written: {e}"),
+                format_args!("{SEEN_FILE} could not be written: {e}"),
             ),
         }
     }
@@ -1305,7 +1319,7 @@ fn tail(shared: &Shared) {
                 }
                 shared.say_once(
                     format!("tail:{e}"),
-                    &format!("the tail ended ({e}); it opens again"),
+                    format_args!("the tail ended ({e}); it opens again"),
                 );
             }
         }
@@ -1867,7 +1881,7 @@ mod tests {
         }
         assert_eq!(
             Build::running().as_str(),
-            aterm_types::version::build_id(),
+            aterm_stamp::build_id(),
             "this build's id is a build word"
         );
     }

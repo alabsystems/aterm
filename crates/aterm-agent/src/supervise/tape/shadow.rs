@@ -205,7 +205,7 @@ pub(crate) fn shadow_onto(
     }
     let header = book.header.as_ref().map_err(Clone::clone)?;
     let policy = candidate.policy(&header.opts.policy)?;
-    let shadowed_by = aterm_types::version::build_id();
+    let shadowed_by = aterm_stamp::build_id();
     let (turn_ends, turn_note) = turn_ends(bytes, &book, &header.build, &shadowed_by, &policy);
     let made = book.decisions.iter().map(|d| {
         let mark = book.ordinal_of(d.item).unwrap_or(0);

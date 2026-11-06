@@ -11,7 +11,7 @@ use crate::iokit::{self, CFTypeRef, MAIN_PORT_DEFAULT, io_object_t, io_registry_
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
     CoreTicks, CpuLayout, GpuClients, GpuDriver, GpuReading, LinkReading, MAX_GPU_CLIENTS,
-    MemoryDetail, PATH_CAP, ProcessLimits, TcpSummary, VolumeReading, pressure_of,
+    MemoryDetail, PATH_CAP, TcpSummary, VolumeReading, pressure_of,
 };
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
@@ -60,11 +60,10 @@ const _: () = assert!(std::mem::size_of::<ProcVnodePathInfo>() == VNODE_PATH_INF
 
 const SHORT_INFO_SIZE: usize = 64;
 const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == SHORT_INFO_SIZE);
-const _: () = assert!(std::mem::size_of::<libc::rusage_info_v4>() == 296);
 const _: () = assert!(PATH_CAP == libc::PROC_PIDPATHINFO_MAXSIZE as usize);
 
 /// The host port, taken once per process.
-fn host_port() -> libc::mach_port_t {
+pub(crate) fn host_port() -> libc::mach_port_t {
     static PORT: OnceLock<libc::mach_port_t> = OnceLock::new();
     // SAFETY: No arguments; returns the task's send right to the host port.
     *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
@@ -129,19 +128,10 @@ pub(crate) fn sysctl_timeval_ms(name: &CStr) -> Option<i64> {
         .checked_add(i64::from(tv.tv_usec) / 1000)
 }
 
-/// One process's physical footprint, KiB (`proc_pid_rusage(RUSAGE_INFO_V4)`'s `ri_phys_footprint`).
+/// One process's physical footprint, KiB (`proc_pid_rusage`'s `ri_phys_footprint`, read as the
+/// sweep reads it, [`crate::procs::imp::rusage`]).
 fn footprint_kib(pid: i32) -> Option<u64> {
-    // SAFETY: `rusage_info_v4` is plain integers; all-zero is a valid value.
-    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a writable `rusage_info_v4` matching the flavor layout.
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            pid,
-            libc::RUSAGE_INFO_V4,
-            (&raw mut info).cast::<libc::rusage_info_t>(),
-        )
-    };
-    (rc == 0).then_some(info.ri_phys_footprint / 1024)
+    crate::procs::imp::rusage(pid).map(|u| u.ri.ri_phys_footprint / 1024)
 }
 
 /// One process's working directory (`PROC_PIDVNODEPATHINFO`'s current directory vnode path).
@@ -263,7 +253,7 @@ pub(crate) fn group_usage(pgid: u32) -> Option<Vec<crate::MemberUsage>> {
             .take(n.min(crate::MAX_GROUP_PIDS))
             .filter(|m| **m > 0)
             .filter_map(|&m| {
-                let u = crate::procs::imp::rusage(m)?;
+                let u = crate::procs::imp::rusage(m)?.ri;
                 Some(crate::MemberUsage {
                     pid: m.unsigned_abs(),
                     start: u.ri_proc_start_abstime,
@@ -1255,6 +1245,11 @@ pub(crate) fn gpu() -> Option<GpuReading> {
     let mut reading = GpuReading {
         cores: a.cores,
         name: a.name.clone(),
+        // Apple names its own GPUs, those of its silicon, which work in the system's memory.
+        unified: a
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("Apple ")),
         ..GpuReading::default()
     };
     let Some(stats) = Cf::property(a.service.0, a.keys.stats.0) else {
@@ -1641,23 +1636,9 @@ pub(crate) fn workqueue_limits() -> crate::machine::WorkqueueLimits {
     }
 }
 
-/// [`crate::process_limits`] on macOS.
-pub(crate) fn process_limits() -> ProcessLimits {
-    let int = |name: &CStr| {
-        sysctl_int(name)
-            .and_then(|v| u64::try_from(v).ok())
-            .filter(|v| *v > 0)
-    };
-    ProcessLimits {
-        system: int(c"kern.maxproc"),
-        per_user: crate::machine::smaller(
-            int(c"kern.maxprocperuid"),
-            crate::machine::nproc_rlimit(),
-        ),
-    }
-}
-
-/// [`crate::pid_counts`] on macOS ([`crate::machine::pid_room`], [`crate::machine::owned_count`]).
+/// Every process on the machine and those real user `uid` runs, counted from the pid lists
+/// ([`crate::machine::pid_room`], [`crate::machine::owned_count`]): [`crate::room::TaskRoom`]'s
+/// `procs` and `user_procs`.
 pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     // SAFETY: A null buffer asks for the room only.
     let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };

@@ -43,6 +43,19 @@ impl InheritNothing for Command {
     }
 }
 
+/// The Unix native-image spawn, a no-op off Unix: Windows starts no shell over a file it will
+/// not execute, so the spawn already fails with the loader's error.
+pub trait NativeImage {
+    /// No-op off Unix.
+    fn native_image(&mut self, native: bool) -> &mut Self;
+}
+
+impl NativeImage for Command {
+    fn native_image(&mut self, _native: bool) -> &mut Self {
+        self
+    }
+}
+
 /// The Unix death tie, a no-op off Unix.
 pub trait Tether {
     /// No-op off Unix.

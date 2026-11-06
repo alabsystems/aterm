@@ -3,10 +3,8 @@
 
 //! JPEG decoder conformance tests against `djpeg` reference outputs across 33x21 MCU-crossing fixtures.
 
-use std::path::PathBuf;
-
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("tests/fixtures")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))

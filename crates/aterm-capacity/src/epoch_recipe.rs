@@ -120,18 +120,22 @@ fn semver(value: &str) -> bool {
     let (core, pre) = core
         .split_once('-')
         .map_or((core, None), |(a, b)| (a, Some(b)));
-    let numbers: Vec<_> = core.split('.').collect();
-    numbers.len() == 3
-        && numbers.iter().all(|s| numeric(s))
-        && pre.is_none_or(|p| identifiers(p, true))
+    let mut parts = core.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if numeric(major) && numeric(minor) && numeric(patch)
+    ) && pre.is_none_or(|p| identifiers(p, true))
 }
 
 fn driver(value: &Path, expected: &str) -> io::Result<()> {
     path(value)?;
     if value.file_name().and_then(|p| p.to_str()) != Some(expected)
         || value.components().any(|part| {
-            let s = part.as_os_str().to_string_lossy();
-            s.len() == 6 && s.starts_with("stage") && s.as_bytes()[5].is_ascii_digit()
+            matches!(
+                part.as_os_str().as_encoded_bytes(),
+                [b's', b't', b'a', b'g', b'e', b'0'..=b'9']
+            )
         })
         || value.canonicalize()? != value
     {
@@ -139,10 +143,12 @@ fn driver(value: &Path, expected: &str) -> io::Result<()> {
             "recipe compiler must name its exact immutable SDK driver",
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(value)?;
+    let file = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(value)
+    })?;
     let m = file.metadata()?;
     // SAFETY: geteuid only reads this process's account identity.
     let uid = unsafe { libc::geteuid() };

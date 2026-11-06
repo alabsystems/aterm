@@ -738,59 +738,131 @@ pub mod elf {
     /// # Errors
     /// Malformed headers, an unsupported encoding, or an invalid interpreter string.
     pub fn interpreter(bytes: &[u8]) -> Result<Option<String>, String> {
+        metadata(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+            .map(|metadata| metadata.interpreter)
+    }
+
+    struct Metadata {
+        interpreter: Option<String>,
+        #[cfg(any(target_os = "linux", test))]
+        dynamic: bool,
+    }
+
+    /// Classify only admitted runtime images: absence of dynamic tags in malformed bytes
+    /// must not turn a failed tool invocation into a successful static relocation.
+    fn metadata(
+        input: &mut (impl std::io::Read + std::io::Seek),
+        file_size: u64,
+    ) -> Result<Metadata, String> {
         let invalid = || "invalid ELF program headers or interpreter".to_string();
-        if bytes.get(..6) != Some(b"\x7fELF\x02\x01") {
+        // Read only the fixed header, at most 8192 program headers, and one bounded
+        // interpreter. Large ELF payloads never need to be loaded just to classify them.
+        let mut bytes_at = |offset: u64, size: usize| -> Result<Vec<u8>, String> {
+            if offset
+                .checked_add(size as u64)
+                .is_none_or(|end| end > file_size)
+            {
+                return Err(invalid());
+            }
+            let mut bytes = vec![0; size];
+            input
+                .seek(std::io::SeekFrom::Start(offset))
+                .and_then(|_| input.read_exact(&mut bytes))
+                .map_err(|error| format!("read ELF metadata: {error}"))?;
+            Ok(bytes)
+        };
+        let header = bytes_at(0, 64)?;
+        if header.get(..7) != Some(b"\x7fELF\x02\x01\x01") {
             return Err("the GNU package requires a little-endian ELF64 object".into());
         }
-        let word = |at: usize| {
+        let word = |bytes: &[u8], at: usize| {
             bytes
                 .get(at..at.checked_add(8)?)
                 .and_then(|part| <[u8; 8]>::try_from(part).ok())
                 .map(u64::from_le_bytes)
-                .and_then(|n| usize::try_from(n).ok())
         };
         let half = |at: usize| {
-            bytes
+            header
                 .get(at..at + 2)
                 .and_then(|part| <[u8; 2]>::try_from(part).ok())
                 .map(u16::from_le_bytes)
                 .map(usize::from)
         };
-        let offset = word(32).ok_or_else(invalid)?;
+        let offset = word(&header, 32).ok_or_else(invalid)?;
         let stride = half(54).ok_or_else(invalid)?;
         let count = half(56).ok_or_else(invalid)?;
-        if count == 0 {
-            return Ok(None);
-        }
-        if stride < 56
-            || offset
-                .checked_add(stride.checked_mul(count).ok_or_else(invalid)?)
-                .is_none_or(|end| end > bytes.len())
+        if !matches!(half(16), Some(2 | 3))
+            || header.get(20..24) != Some(&1_u32.to_le_bytes())
+            || half(52) != Some(64)
+            || count == 0
+            || count > 8192
+            || stride != 56
         {
             return Err(invalid());
         }
+        let headers = bytes_at(offset, stride * count)?;
         let mut interpreter = None;
-        for i in 0..count {
-            let at = offset + stride * i;
-            if bytes.get(at..at + 4) != Some(&3_u32.to_le_bytes()) {
+        let mut dynamic = false;
+        let mut load = false;
+        for entry in headers.chunks_exact(stride) {
+            let tag = &entry[..4];
+            if tag == 0_u32.to_le_bytes() {
                 continue;
             }
-            if interpreter.is_some() {
+            let start = word(entry, 8).ok_or_else(invalid)?;
+            let size = word(entry, 32).ok_or_else(invalid)?;
+            if start.checked_add(size).is_none_or(|end| end > file_size) {
                 return Err(invalid());
             }
-            let start = word(at + 8).ok_or_else(invalid)?;
-            let size = word(at + 32).ok_or_else(invalid)?;
-            let raw = bytes
-                .get(start..start.checked_add(size).ok_or_else(invalid)?)
-                .and_then(|part| part.strip_suffix(&[0]))
-                .ok_or_else(invalid)?;
-            let text = std::str::from_utf8(raw).map_err(|_| invalid())?;
-            if text.is_empty() || text.bytes().any(|b| b.is_ascii_control()) {
-                return Err(invalid());
+            if tag == 1_u32.to_le_bytes() {
+                load = true;
+                let memory = word(entry, 40).ok_or_else(invalid)?;
+                if memory < size
+                    || word(entry, 16)
+                        .and_then(|v| v.checked_add(memory))
+                        .is_none()
+                {
+                    return Err(invalid());
+                }
+            } else if tag == 2_u32.to_le_bytes() {
+                if dynamic {
+                    return Err(invalid());
+                }
+                dynamic = true;
+            } else if tag != 3_u32.to_le_bytes() {
+                continue;
+            } else {
+                if interpreter.is_some() {
+                    return Err(invalid());
+                }
+                let size = usize::try_from(size)
+                    .ok()
+                    .filter(|size| *size <= 4096)
+                    .ok_or_else(invalid)?;
+                let raw = bytes_at(start, size)?;
+                let raw = raw.strip_suffix(&[0]).ok_or_else(invalid)?;
+                let text = std::str::from_utf8(raw).map_err(|_| invalid())?;
+                if text.is_empty() || text.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(invalid());
+                }
+                interpreter = Some(text.to_string());
             }
-            interpreter = Some(text.to_string());
         }
-        Ok(interpreter)
+        if !load {
+            return Err(invalid());
+        }
+        Ok(Metadata {
+            interpreter,
+            #[cfg(any(target_os = "linux", test))]
+            dynamic,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn file_metadata(path: &Path) -> Result<Metadata, String> {
+        let (mut file, info) = crate::identity::open_regular_nonblock(path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        metadata(&mut file, info.len())
     }
 
     /// Split a `patchelf --print-rpath` value (`:`-separated) into entries.
@@ -859,24 +931,34 @@ pub mod elf {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    type RefReader<'a> = dyn Fn(&[&str], &Path) -> Result<String, String> + 'a;
+
+    #[cfg(any(target_os = "linux", test))]
+    fn read_refs_with(path: &Path, read: &RefReader<'_>) -> Result<ObjectRefs, String> {
+        let metadata = file_metadata(path)?;
+        if metadata.interpreter.is_none() && !metadata.dynamic {
+            return Ok(ObjectRefs::default());
+        }
+        let id = read(&["--print-soname"], path).ok().and_then(|s| {
+            let s = s.trim().to_string();
+            (!s.is_empty() && s != "no soname").then_some(s)
+        });
+        let needed = parse_needed(&read(&["--print-needed"], path)?);
+        let rpaths = parse_rpath(&read(&["--print-rpath"], path)?);
+        Ok(ObjectRefs { id, needed, rpaths })
+    }
+
     #[cfg(target_os = "linux")]
     impl Backend for ElfBackend {
         fn is_native_object(&self, path: &Path) -> bool {
             magic4(path).is_some_and(|m| is_elf_magic(&m))
         }
         fn read_refs(&self, path: &Path) -> Result<ObjectRefs, String> {
-            let id = patchelf_out(&["--print-soname"], path).ok().and_then(|s| {
-                let s = s.trim().to_string();
-                (!s.is_empty() && s != "no soname").then_some(s)
-            });
-            let needed = parse_needed(&patchelf_out(&["--print-needed"], path)?);
-            let rpaths = parse_rpath(&patchelf_out(&["--print-rpath"], path)?);
-            Ok(ObjectRefs { id, needed, rpaths })
+            read_refs_with(path, &patchelf_out)
         }
         fn interpreter(&self, path: &Path) -> Result<Option<String>, String> {
-            let bytes = crate::identity::read_regular_bytes(path, 64 * 1024 * 1024)
-                .map_err(|error| format!("read {}: {error}", path.display()))?;
-            interpreter(&bytes)
+            file_metadata(path).map(|metadata| metadata.interpreter)
         }
         fn set_interpreter(&self, path: &Path, loader: &str) -> Result<(), String> {
             patchelf(&["--set-interpreter", loader], path)
@@ -904,6 +986,125 @@ pub mod elf {
             "$ORIGIN"
         }
     }
+
+    #[cfg(test)]
+    mod static_tests {
+        use super::*;
+
+        /// A sectionless static AArch64 executable, like the pinned Linux gitleaks payload.
+        fn static_elf() -> Vec<u8> {
+            let mut bytes = vec![0; 120];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+            bytes[18..20].copy_from_slice(&183_u16.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+            bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+            bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[96..104].copy_from_slice(&120_u64.to_le_bytes());
+            bytes[104..112].copy_from_slice(&120_u64.to_le_bytes());
+            bytes
+        }
+
+        #[test]
+        fn static_elf_needs_no_dynamic_relocation_tool() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let path = dir.path().join("gitleaks");
+            std::fs::write(&path, static_elf()).unwrap();
+            // A large payload needs only its headers, with no new whole-file size limit.
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(128 * 1024 * 1024)
+                .unwrap();
+            let calls = std::cell::Cell::new(0);
+            let refs = read_refs_with(&path, &|_, _| {
+                calls.set(calls.get() + 1);
+                Err("patchelf is absent".into())
+            });
+            assert_eq!(refs, Ok(ObjectRefs::default()));
+            assert_eq!(calls.get(), 0);
+        }
+
+        fn with_segment(tag: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = static_elf();
+            bytes.resize(176, 0);
+            bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+            bytes[120..124].copy_from_slice(&tag.to_le_bytes());
+            bytes[128..136].copy_from_slice(&176_u64.to_le_bytes());
+            bytes[152..160].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            let size = bytes.len() as u64;
+            bytes[96..104].copy_from_slice(&size.to_le_bytes());
+            bytes[104..112].copy_from_slice(&size.to_le_bytes());
+            bytes
+        }
+
+        #[test]
+        fn either_dynamic_segment_or_interpreter_keeps_the_tool_path() {
+            for bytes in [
+                with_segment(2, &[0; 16]),
+                with_segment(3, b"/lib/ld-linux-aarch64.so.1\0"),
+            ] {
+                let dir = aterm_tempfile::tempdir().unwrap();
+                let path = dir.path().join("dynamic");
+                std::fs::write(&path, bytes).unwrap();
+                let calls = std::cell::RefCell::new(Vec::new());
+                let refs = read_refs_with(&path, &|args, _| {
+                    calls.borrow_mut().push(args[0].to_string());
+                    Ok(match args[0] {
+                        "--print-soname" => "libfixture.so\n",
+                        "--print-needed" => "libc.so.6\n",
+                        "--print-rpath" => "$ORIGIN/../lib\n",
+                        _ => panic!("unexpected dynamic operation"),
+                    }
+                    .into())
+                })
+                .unwrap();
+                assert_eq!(refs.id.as_deref(), Some("libfixture.so"));
+                assert_eq!(refs.needed, ["libc.so.6"]);
+                assert_eq!(refs.rpaths, ["$ORIGIN/../lib"]);
+                assert_eq!(calls.borrow().len(), 3);
+            }
+        }
+
+        #[test]
+        fn malformed_static_headers_never_bypass_validation() {
+            for fault in [
+                "truncated",
+                "table-overflow",
+                "file-range",
+                "memory-range",
+                "no-load",
+            ] {
+                let mut bytes = static_elf();
+                match fault {
+                    "truncated" => bytes.truncate(63),
+                    "table-overflow" => bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes()),
+                    "file-range" => bytes[96..104].copy_from_slice(&121_u64.to_le_bytes()),
+                    "memory-range" => bytes[80..88].copy_from_slice(&u64::MAX.to_le_bytes()),
+                    "no-load" => bytes[64..68].copy_from_slice(&4_u32.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+                let dir = aterm_tempfile::tempdir().unwrap();
+                let path = dir.path().join(fault);
+                std::fs::write(&path, bytes).unwrap();
+                let calls = std::cell::Cell::new(0);
+                assert!(
+                    read_refs_with(&path, &|_, _| {
+                        calls.set(calls.get() + 1);
+                        Ok(String::new())
+                    })
+                    .is_err(),
+                    "{fault}"
+                );
+                assert_eq!(calls.get(), 0, "{fault}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -913,14 +1114,21 @@ mod tests {
     #[test]
     fn elf_interpreter_reads_only_bounded_program_headers() {
         let loader = b"@@HOMEBREW_PREFIX@@/lib/ld.so\0";
-        let mut bytes = vec![0; 120];
-        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        let mut bytes = vec![0; 176];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
         bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
         bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[64..68].copy_from_slice(&3_u32.to_le_bytes());
-        bytes[72..80].copy_from_slice(&120_u64.to_le_bytes());
-        bytes[96..104].copy_from_slice(&(loader.len() as u64).to_le_bytes());
+        bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[96..104].copy_from_slice(&176_u64.to_le_bytes());
+        bytes[104..112].copy_from_slice(&176_u64.to_le_bytes());
+        bytes[120..124].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[128..136].copy_from_slice(&176_u64.to_le_bytes());
+        bytes[152..160].copy_from_slice(&(loader.len() as u64).to_le_bytes());
+        bytes[160..168].copy_from_slice(&(loader.len() as u64).to_le_bytes());
         bytes.extend_from_slice(loader);
         assert_eq!(
             elf::interpreter(&bytes).unwrap().as_deref(),
@@ -929,7 +1137,7 @@ mod tests {
         assert!(elf::interpreter(&bytes[..119]).is_err());
         *bytes.last_mut().unwrap() = b'x';
         assert!(elf::interpreter(&bytes).is_err());
-        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[120..124].copy_from_slice(&1_u32.to_le_bytes());
         assert_eq!(elf::interpreter(&bytes).unwrap(), None);
         bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(elf::interpreter(&bytes).is_err());

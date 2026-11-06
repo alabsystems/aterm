@@ -3,6 +3,8 @@
 
 //! Provisioned tool rows for `verify provision`.
 
+pub use aterm_uds::host::upstream::Archive;
+use aterm_uds::host::upstream::{CPYTHON, GITLEAKS, OPENSSL_SIGNING, OPENSSL_SIGNING_SOURCE};
 use aterm_uds::host::{Tool, When};
 
 /// Origin verification anchor for an unpacked archive tree.
@@ -15,27 +17,6 @@ pub enum Anchor {
         /// Apple team ID every Mach-O must carry.
         team: &'static str,
     },
-}
-
-/// One upstream archive a row fetches for one host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Archive {
-    /// `<os>-<arch>` (`macos-aarch64`), or `source` for any host.
-    pub platform: &'static str,
-    /// Upstream URL template (`{v}` is replaced by the row's version).
-    pub url: &'static str,
-    /// Lowercase-hex SHA-256.
-    pub sha256: &'static str,
-    /// Size in bytes.
-    pub bytes: u64,
-}
-
-impl Archive {
-    /// [`Archive::url`] at `version`.
-    #[must_use]
-    pub fn url_at(&self, version: &str) -> String {
-        self.url.replace("{v}", version)
-    }
 }
 
 /// Browser engine pinned by `crate::browser` and installed into the browser cache.
@@ -230,75 +211,32 @@ pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 /// Every row, in the order a run provides them.
 pub const ROWS: [Row; 14] = [
     Row {
-        name: "openssl-signing",
-        tool: Some("openssl-signing"),
+        name: OPENSSL_SIGNING.name,
+        tool: Some(OPENSSL_SIGNING.name),
         install: Install::OpenSsl {
-            source: Archive {
-                platform: "source",
-                url: "https://github.com/openssl/openssl/releases/download/openssl-{v}/openssl-{v}.tar.gz",
-                sha256: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
-                bytes: 53_279_637,
-            },
+            source: OPENSSL_SIGNING_SOURCE,
         },
     },
     Row {
-        name: "cpython",
-        tool: Some("cpython"),
+        name: CPYTHON.name,
+        tool: Some(CPYTHON.name),
         install: Install::Unpack {
-            archives: &[
-                Archive {
-                    platform: "macos-aarch64",
-                    url: "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-{v}-aarch64-apple-darwin-install_only.tar.gz",
-                    sha256: "709f419d175eb015f810b68aa54bdae1d776c9824cb362aa701c93b0a9f2a9e7",
-                    bytes: 26_814_582,
-                },
-                Archive {
-                    platform: "macos-x86_64",
-                    url: "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-{v}-x86_64-apple-darwin-install_only.tar.gz",
-                    sha256: "e09bce050cf075e777d1a802c4a11b6d43d54291b5f76911887173b28ad9c9fd",
-                    bytes: 27_005_136,
-                },
-            ],
-            strip: 1,
+            archives: CPYTHON.archives,
+            strip: CPYTHON.strip,
             anchor: Anchor::Sha256,
-            keep: &["lib/python3.14/LICENSE.txt"],
+            keep: CPYTHON.licenses,
             cap: None,
             holds: Holds::Program,
         },
     },
     Row {
-        name: "gitleaks",
-        tool: Some("gitleaks"),
+        name: GITLEAKS.name,
+        tool: Some(GITLEAKS.name),
         install: Install::Unpack {
-            archives: &[
-                Archive {
-                    platform: "macos-aarch64",
-                    url: "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_darwin_arm64.tar.gz",
-                    sha256: "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
-                    bytes: 7_897_593,
-                },
-                Archive {
-                    platform: "macos-x86_64",
-                    url: "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_darwin_x64.tar.gz",
-                    sha256: "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
-                    bytes: 8_359_235,
-                },
-                Archive {
-                    platform: "linux-aarch64",
-                    url: "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_arm64.tar.gz",
-                    sha256: "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
-                    bytes: 7_601_421,
-                },
-                Archive {
-                    platform: "linux-x86_64",
-                    url: "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_x64.tar.gz",
-                    sha256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
-                    bytes: 8_230_402,
-                },
-            ],
-            strip: 0,
+            archives: GITLEAKS.archives,
+            strip: GITLEAKS.strip,
             anchor: Anchor::Sha256,
-            keep: &["LICENSE"],
+            keep: GITLEAKS.licenses,
             cap: None,
             holds: Holds::Program,
         },

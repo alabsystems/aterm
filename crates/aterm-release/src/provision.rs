@@ -1644,7 +1644,7 @@ fn keychain_check_in(
     run: &dyn crate::dev_identity::Run,
     leave: crate::release_keychain::Leave,
 ) -> Check {
-    let kc = crate::release_keychain::Keychains::new(home, run);
+    let kc = crate::release_keychain::Keychains::waiting(home, run);
     match kc.row(id, aterm_update_core::pins::APPLE_TEAM_ID, &|sha1| {
         crate::apple::prove_can_sign(&kc, sha1, leave)
     }) {
@@ -2289,7 +2289,7 @@ fn profile_check_at(
     }
     match (creds.signing_identity_sha1(), apple_sha1) {
         (Some(pinned), Some(proved)) if !pinned.eq_ignore_ascii_case(proved) => {
-            let kc = crate::release_keychain::Keychains::new(Path::new(home), run);
+            let kc = crate::release_keychain::Keychains::waiting(Path::new(home), run);
             match crate::apple::pinned_identity_proves(&kc, pinned, leave) {
                 Ok(crate::release_keychain::Proof::Signed) => Check::Pass(format!(
                     "{} pins signing_identity_sha1 {pinned} — installed, valid and proved \

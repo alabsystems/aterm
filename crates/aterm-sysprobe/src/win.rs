@@ -283,12 +283,16 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     memory_detail_of(&status, &perf, page_file_pages(), low_memory())
 }
 
-/// [`crate::pid_counts`] on Windows: the process count of one `K32GetPerformanceInfo`.
-pub(crate) fn pid_counts() -> (Option<u64>, Option<u64>) {
-    let all = performance_info()
-        .map(|p| u64::from(p.process_count))
-        .filter(|n| *n > 0);
-    (all, None)
+/// [`crate::room::task_room`] on Windows: the process and thread counts of one
+/// `K32GetPerformanceInfo`; Windows states no limit for either, and no open-file count.
+pub(crate) fn task_room() -> crate::room::TaskRoom {
+    let perf = performance_info();
+    let count = |n: Option<u32>| n.map(u64::from).filter(|n| *n > 0);
+    crate::room::TaskRoom {
+        procs: count(perf.map(|p| p.process_count)),
+        threads: count(perf.map(|p| p.thread_count)),
+        ..crate::room::TaskRoom::default()
+    }
 }
 
 /// [`crate::processes`] on Windows.

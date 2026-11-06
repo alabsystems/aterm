@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::{BackgroundCall, BackgroundEvidence, HeldCall};
 
-use aterm_sysprobe::jobs::{self as probe, AtStart, JobsReader, ProcFacts, ReadReq, StartFacts};
+use aterm_sysprobe::jobs::{
+    self as probe, AtStart, HELD_CPU_NS, JobsReader, ProcFacts, ReadReq, StartFacts,
+};
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
@@ -27,11 +29,6 @@ use aterm_vitals::model::TabRoot;
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
 /// detailed reads.
 const FAST_MS: u64 = 2_000;
-
-/// The most CPU a process outside every job may have used for the pass to read its start. A held
-/// one has used about 2 ms, the fork child's work before its exec (leftover M4), so its counters
-/// cannot tell it from an idle one: CPU only selects rows, and the thread call decides.
-pub(crate) const HELD_CPU_NS: u64 = 20_000_000;
 
 /// The readers the pass asks of this user's processes outside every job, and the held stand-in
 /// (`KERNEL` live, `INERT` in unit tests). None reads a process's arguments or environment, which

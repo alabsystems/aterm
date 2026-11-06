@@ -10,11 +10,9 @@ use aterm_spec::wait::MUST_HAPPEN;
 
 fn gate(args: &[&OsStr]) -> (Option<i32>, String) {
     // A fresh build's first-exec check is waited out here, outside the run's hang detector.
-    aterm_spec::wait::first_exec(
-        std::path::Path::new(env!("CARGO_BIN_EXE_aterm-libc-oracle")),
-        &["--help"],
-    );
-    let mut command = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-libc-oracle"));
+    let oracle = aterm_tempfile::bin_exe("aterm-libc-oracle");
+    aterm_spec::wait::first_exec(&oracle, &["--help"]);
+    let mut command = aterm_uds::spawnfd::command(&oracle);
     command.args(args);
     let out = aterm_uds::deadline::output_until(&mut command, Instant::now() + MUST_HAPPEN)
         .unwrap_or_else(|e| panic!("the gate {e}"));

@@ -110,6 +110,7 @@ fn sample_facts(
     accounts: Vec<SurveyAccountFact>,
 ) -> SwarmSurveyFacts {
     SwarmSurveyFacts {
+        release_lines: Vec::new(),
         node: Some(node.to_owned()),
         label: Some(label.to_owned()),
         roster_unread: false,

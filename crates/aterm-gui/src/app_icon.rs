@@ -650,8 +650,7 @@ mod tests {
 
         use aterm_cg::{CGImageGetBitmapInfo, CGImageGetHeight, CGImageGetWidth};
 
-        let icns = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/aterm-mac/aterm.icns");
+        let icns = aterm_tempfile::manifest_dir().join("../../apps/aterm-mac/aterm.icns");
         // A size no icns entry has, so only a draw makes it.
         for want in [PIXELS, 100] {
             // SAFETY: a test thread; the images are live while read.

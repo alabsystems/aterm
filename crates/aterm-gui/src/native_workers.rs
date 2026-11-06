@@ -1083,6 +1083,7 @@ mod tests {
             agent: None,
             trusted_cwd: None,
             fact: None,
+            program_block: None,
             fact_rev: 0,
             carried_entered: None,
         }

@@ -192,11 +192,8 @@ mod tests {
     use aterm_core::terminal::Terminal;
 
     fn renderer() -> Renderer {
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/DejaVuSansMono.ttf"
-        ))
-        .expect("bundled DejaVu asset");
+        let bytes = std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+            .expect("bundled DejaVu asset");
         let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).expect("fixture parses");
         r.set_runtime_font_discovery(false);
         r

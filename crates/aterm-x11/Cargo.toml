@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-x11"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,7 +27,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 # tests/icccm_xrm.rs: the include tree's scratch directory; tests/xlib_layout.rs:
-# the C probe's.
+# the C probe's; tests/support: the recordings' directory, found at run time.
 aterm-tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

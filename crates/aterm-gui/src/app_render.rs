@@ -11046,21 +11046,49 @@ impl App {
         id: WindowId,
         reason: metrics::PresentDropReason,
     ) {
-        if let Some(state) = self.windows.get_mut(&id) {
-            state.on_present_dropped();
-            let now = Instant::now();
-            let bootstrap_occluded = reason == metrics::PresentDropReason::GpuOccluded
-                && state.bootstrap_present_retry_available
-                && state.present_retry.bootstrap_drop_allowed();
-            let deadline = if bootstrap_occluded {
-                state.bootstrap_present_retry_available = false;
-                state.present_retry.on_bootstrap_drop(reason, now)
-            } else {
-                state.present_retry.on_drop(reason, now)
-            };
-            let parked = deadline.is_none();
-            metrics::note_present_drop(reason, parked);
+        let Some(state) = self.windows.get_mut(&id) else {
+            return;
+        };
+        state.on_present_dropped();
+        let now = Instant::now();
+        let bootstrap_occluded = reason == metrics::PresentDropReason::GpuOccluded
+            && state.bootstrap_present_retry_available
+            && state.present_retry.bootstrap_drop_allowed();
+        let deadline = if bootstrap_occluded {
+            state.bootstrap_present_retry_available = false;
+            state.present_retry.on_bootstrap_drop(reason, now)
+        } else {
+            state.present_retry.on_drop(reason, now)
+        };
+        let parked = deadline.is_none();
+        metrics::note_present_drop(reason, parked);
+        #[cfg(a11y_tree)]
+        if parked {
+            self.publish_in_a_parked_window(id);
         }
+    }
+
+    /// The surface `window` waited on answered: `current` is the surface it holds now.
+    pub(crate) fn finish_gpu_acquire_wait_in(
+        &mut self,
+        window: WindowId,
+        current: Option<u64>,
+        surface: u64,
+        presentable: bool,
+        request_redraw: impl FnOnce(),
+    ) -> bool {
+        let Some(state) = self.windows.get_mut(&window) else {
+            return false;
+        };
+        let accepted = state.finish_gpu_acquire_wait(current, surface, presentable, request_redraw);
+        if accepted && !presentable {
+            if let Some(PresentTarget::Gpu { gpu_surface, .. }) = state.present.as_mut() {
+                gpu_surface.discard_pending_acquire();
+            }
+            #[cfg(a11y_tree)]
+            self.publish_in_a_parked_window(window);
+        }
+        accepted
     }
 
     fn recover_latched_gpu_loss(
@@ -11911,6 +11939,10 @@ impl App {
             Some(ws) if ws.gpu_acquire_pending() => return,
             Some(ws) if !ws.present_retry.present_attempt_allowed() => {
                 metrics::note_redraw_retry_gated();
+                #[cfg(a11y_tree)]
+                if ws.present_retry.parked {
+                    self.publish_in_a_parked_window(id);
+                }
                 return;
             }
             None => return,

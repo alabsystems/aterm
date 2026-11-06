@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! WHAT A TIER'S READERS AND WRITERS DID, counted: the pushes, the one-record reads by index,
-//! the walks and the rows they read, the subject walks and the pages they read, and the values
+//! the walks and the rows they read, the subject walks and the pages they read, the pages a
+//! filtered read passed whole and the times it asked its filter of a subject, and the values
 //! read from the wide maps. A measurement says by it how much of the pages' code a piece of
 //! work ran (aterm's attach bench reads it around each restart, its item D10f), so a cost is
 //! put down to the tier, or not, by a count rather than a guess. Only a test or debug build
@@ -27,9 +28,9 @@ pub struct TierTally {
     /// lookup or a walk's row; 0 in a log whose frames are contiguous and whose broker times
     /// rise within a page.
     pub wide: u64,
-    /// The walks begun over a range of summaries: a `Stats` reading, a filtered read's scan
-    /// (`Tier::scan`, whose records are rows here, not lookups) or a wake plan's, compaction's,
-    /// the retention planning's (each of its passes one).
+    /// The walks begun over a range of summaries: a `Stats` reading, a filtered read's pass
+    /// (`Tier::passing`, whose records are rows here, not lookups) or a wake plan's,
+    /// compaction's, the retention planning's (each of its passes one).
     pub walks: u64,
     /// The rows those walks read.
     pub rows: u64,
@@ -37,6 +38,16 @@ pub struct TierTally {
     pub namings: u64,
     /// The pages those walks read: the pages whose ids name the subject.
     pub named_pages: u64,
+    /// The pages a filtered read's pass (`Tier::passing`, a walk counted in `walks`) passed
+    /// whole, none of their ids a subject the read wants: their records are not in `rows`.
+    pub passed_pages: u64,
+    /// The times a filtered read's pass asked its filter of a subject: at most once a page a
+    /// subject, and not again in a later page while the pass's 256 verdict slots (slot
+    /// `id % 256`) keep its verdict. So this is not a count of distinct subjects: a pass whose
+    /// pages name more than 256 asks again of one whose slot another took, and a page the pass
+    /// reads fewer records of than it names subjects asks only of those its unhidden records
+    /// name.
+    pub verdicts: u64,
 }
 
 impl TierTally {
@@ -51,6 +62,8 @@ impl TierTally {
             rows: self.rows.saturating_sub(before.rows),
             namings: self.namings.saturating_sub(before.namings),
             named_pages: self.named_pages.saturating_sub(before.named_pages),
+            passed_pages: self.passed_pages.saturating_sub(before.passed_pages),
+            verdicts: self.verdicts.saturating_sub(before.verdicts),
         }
     }
 }
@@ -67,6 +80,8 @@ pub(crate) struct Counters {
     rows: AtomicU64,
     namings: AtomicU64,
     named_pages: AtomicU64,
+    passed_pages: AtomicU64,
+    verdicts: AtomicU64,
 }
 
 /// One kind of count.
@@ -80,6 +95,8 @@ pub(crate) enum Count {
     Rows,
     Naming,
     NamedPage,
+    PassedPage,
+    Verdict,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -93,6 +110,8 @@ impl Counters {
             Count::Rows => &self.rows,
             Count::Naming => &self.namings,
             Count::NamedPage => &self.named_pages,
+            Count::PassedPage => &self.passed_pages,
+            Count::Verdict => &self.verdicts,
         }
     }
 
@@ -112,6 +131,8 @@ impl Counters {
             rows: r(Count::Rows),
             namings: r(Count::Naming),
             named_pages: r(Count::NamedPage),
+            passed_pages: r(Count::PassedPage),
+            verdicts: r(Count::Verdict),
         }
     }
 
@@ -126,6 +147,8 @@ impl Counters {
             rows: AtomicU64::new(t.rows),
             namings: AtomicU64::new(t.namings),
             named_pages: AtomicU64::new(t.named_pages),
+            passed_pages: AtomicU64::new(t.passed_pages),
+            verdicts: AtomicU64::new(t.verdicts),
         }
     }
 }

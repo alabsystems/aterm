@@ -4,7 +4,6 @@
 //! Tests for 12-byte schedule plans, prebuilt-code equivalence, and presentation fallback.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use aterm_aos::contract::{Contract, Verdict};
@@ -500,7 +499,7 @@ fn every_decodable_plan_re_encodes_to_its_bytes() {
 #[test]
 fn the_shipped_plan_is_the_shipped_engine() {
     const RECORDED: &[&str] = &["aarch64-macos"];
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("tests/fixtures/aos-momentum")
         .join(format!("{}.trace", target_name()));
     match std::fs::read(&path) {

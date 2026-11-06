@@ -6,9 +6,9 @@
 #[cfg(target_os = "macos")]
 use crate::ledger::GitCli;
 use crate::ledger::{Error, Result};
-use aterm_update_core::service_image::{
-    ProtocolRange, Qualification, ServiceDeclaration, image_digest,
-};
+#[cfg(any(target_os = "macos", test))]
+use aterm_update_core::service_image::ProtocolRange;
+use aterm_update_core::service_image::{Qualification, ServiceDeclaration, image_digest};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -75,10 +75,7 @@ fn sha(bytes: &[u8]) -> String {
 }
 
 fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(value, 64)
 }
 
 fn validate_declaration(service: &ServiceDeclaration) -> Result<()> {

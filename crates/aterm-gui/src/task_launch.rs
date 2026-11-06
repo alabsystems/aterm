@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Worker launch (`spawn agent=<claude|codex|agy|muse|grok>`) across harnesses.
+//! Worker launch (`spawn agent=<claude|codex|agy|muse|grok>`) across harnesses, and a program
+//! worker's (`spawn program=<p>`, [`crate::program_worker`]).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use aterm_session::SessionId;
 
 use crate::SessionCtx;
 use crate::session_store::{SessionState, Store};
-use crate::task_record::{TaskMark, TaskState};
+use crate::task_record::{TaskMark, TaskRecord, TaskState};
 
 /// The longest task a worker is given: 64 KiB, raw, the client's cap too.
 pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
@@ -37,10 +38,10 @@ const VERSION_WAIT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-fn no_frame(agent: &str) -> String {
+fn no_frame(form: &str) -> String {
     format!(
-        "ERR spawn agent={agent}: the task follows the line as a frame (len=<n>, then n bytes); \
-         `aterm ctl spawn agent={agent} -` reads it from stdin\n"
+        "ERR spawn {form}: the task follows the line as a frame (len=<n>, then n bytes); \
+         `aterm ctl spawn {form} -` reads it from stdin\n"
     )
 }
 
@@ -70,8 +71,9 @@ pub(crate) fn take_frame() -> Option<Vec<u8>> {
     FRAME.with(|frame| frame.borrow_mut().take())
 }
 
-/// The bytes `len=<v>` announces, or the reply to a length the server will not read.
-pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
+/// The bytes `len=<v>` announces, or the reply to a length the server will not read, which names
+/// the spawn's `form` ([`spawn_form_word`]).
+pub(crate) fn frame_len(v: &str, form: &str) -> Result<usize, String> {
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
         return Err(crate::control::control_media::spawn_refusal(Some(
             &format!("len={v}"),
@@ -79,12 +81,12 @@ pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
     }
     match v.parse::<usize>() {
         Ok(n) if n <= TASK_MAX => Ok(n),
-        _ => Err(too_large(v, agent)),
+        _ => Err(too_large(v, form)),
     }
 }
 
-fn too_large(len: &str, agent: &str) -> String {
-    format!("ERR spawn agent={agent}: the task is {len} bytes (max {TASK_MAX})\n")
+fn too_large(len: &str, form: &str) -> String {
+    format!("ERR spawn {form}: the task is {len} bytes (max {TASK_MAX})\n")
 }
 
 /// The reply to a spawn line whose `agent=` names a retired agent
@@ -104,6 +106,20 @@ pub(crate) fn worker_word(agent: Option<&str>) -> &'static str {
         .iter()
         .find(|w| Some(w.word) == agent)
         .map_or("claude", |w| w.word)
+}
+
+/// The form a spawn line's refusals name it by: `program=<p>` where it names a program (`program`,
+/// as the wire spells it), else `agent=<word>` ([`worker_word`]).
+pub(crate) fn spawn_form_word(agent: Option<&str>, program: Option<&str>) -> String {
+    match program {
+        Some(program) => format!("program={}", aterm_codec::tty::one_line(program, 64)),
+        None => format!("agent={}", worker_word(agent)),
+    }
+}
+
+/// [`spawn_form_word`] of a program worker's decoded `program`.
+pub(crate) fn program_form(program: &str) -> String {
+    spawn_form_word(None, Some(&aterm_codec::pct::encode(program)))
 }
 
 /// What the control thread hands the main thread for a worker (`Wake::SpawnSession`'s `task`).
@@ -126,6 +142,9 @@ pub(crate) struct TaskOrder {
     /// Whether the worker drives the person's own browser (Claude Code's `--chrome`): a credit
     /// claim worker's alone ([`crate::harness_host::credit_claim`]); no `spawn` word sets it.
     pub(crate) chrome: bool,
+    /// `program=` and its `arg=` words: a program worker's ([`crate::program_worker`]), whose
+    /// [`Self::agent`] is [`aterm_phase::Program::Generic`]; `None` for an agent's.
+    pub(crate) program: Option<crate::program_worker::ProgramRun>,
 }
 
 /// A WORKER'S AUTOPILOT where its spawn names none: Land (Autopilot Land).
@@ -149,21 +168,7 @@ impl TaskOrder {
         cwd: Option<&str>,
         caller: Option<SessionId>,
     ) -> Result<Self, String> {
-        let word = agent.name();
-        let Some(task) = frame else {
-            return Err(no_frame(word));
-        };
-        if task.is_empty() {
-            return Err(format!("ERR spawn agent={word}: the task is empty\n"));
-        }
-        if task.len() > TASK_MAX {
-            return Err(too_large(&task.len().to_string(), word));
-        }
-        if task.contains(&0) {
-            return Err(format!(
-                "ERR spawn agent={word}: the task holds a NUL byte, which no argument can carry\n"
-            ));
-        }
+        let task = task_of(frame, &format!("agent={}", agent.name()))?;
         let trusted_cwd = cwd.and_then(crate::spawn_folder::canonical_folder);
         Ok(Self {
             task,
@@ -174,8 +179,53 @@ impl TaskOrder {
             fact_line: true,
             autopilot: WORKER_AUTOPILOT,
             chrome: false,
+            program: None,
         })
     }
+
+    /// The order a program worker's spawn (`program=`, [`crate::program_worker`]) makes of its
+    /// `frame`: the task its program reads on its standard input, as given (no fact line, which
+    /// would be input to it), and no Autopilot, which no harness of its reads. `Err` is the reply.
+    pub(crate) fn of_program_frame(
+        frame: Option<Vec<u8>>,
+        run: crate::program_worker::ProgramRun,
+        cwd: Option<&str>,
+        caller: Option<SessionId>,
+    ) -> Result<Self, String> {
+        let task = task_of(frame, &program_form(&run.program))?;
+        let trusted_cwd = cwd.and_then(crate::spawn_folder::canonical_folder);
+        Ok(Self {
+            task,
+            agent: aterm_phase::Program::Generic,
+            model: None,
+            caller,
+            trusted_cwd,
+            fact_line: false,
+            autopilot: WORKER_AUTOPILOT,
+            chrome: false,
+            program: Some(run),
+        })
+    }
+}
+
+/// The task a spawn's `frame` carries, or the refusal of one that is missing, empty, too large or
+/// holds a NUL byte, naming the spawn's `form` ([`spawn_form_word`]).
+fn task_of(frame: Option<Vec<u8>>, form: &str) -> Result<Vec<u8>, String> {
+    let Some(task) = frame else {
+        return Err(no_frame(form));
+    };
+    if task.is_empty() {
+        return Err(format!("ERR spawn {form}: the task is empty\n"));
+    }
+    if task.len() > TASK_MAX {
+        return Err(too_large(&task.len().to_string(), form));
+    }
+    if task.contains(&0) {
+        return Err(format!(
+            "ERR spawn {form}: the task holds a NUL byte, which no argument can carry\n"
+        ));
+    }
+    Ok(task)
 }
 
 /// The ONE LINE OF FACT a worker's task gains (design §2.1; never an order — the primer's rule).
@@ -534,6 +584,8 @@ pub(crate) struct Launch {
     /// What the supervisor may approve on a permission box (`[harness] approve`) when the worker
     /// was registered: a claim worker's mode follows it ([`worker_fresh`]).
     pub(crate) approve: aterm_agent::supervise::config::Approve,
+    /// [`TaskOrder::program`]: the program a program worker's line runs instead of an agent's.
+    pub(crate) program: Option<crate::program_worker::ProgramRun>,
     /// Account preparation retires after every other launch resource, including an unstarted box.
     pub(crate) account_scope: Option<aterm_agent::harness::account_work::Scope>,
 }
@@ -825,6 +877,10 @@ fn run_worker_launch(work: &Launch) {
         );
         return;
     }
+    if let Some(run) = &work.program {
+        run_program_launch(work, run);
+        return;
+    }
     if work.dialect == Dialect::Fish && !fish_answer(&work.shell) {
         stall_refused(
             work,
@@ -980,6 +1036,58 @@ fn run_worker_launch(work: &Launch) {
         }
         Err(why) => stall_refused(work, &format!("its launch line cannot be written: {why}")),
     }
+}
+
+/// A program worker's launch ([`crate::program_worker`]): its program typed at its first prompt
+/// with the task file as its standard input ([`aterm_agent::harness::worker::program_line`]), any
+/// fish's version alike, then the watch that concludes its task on its program's exit status
+/// ([`crate::program_worker::watch`]). No account pool, install or agent of its kind is read:
+/// none is its.
+fn run_program_launch(work: &Launch, run: &crate::program_worker::ProgramRun) {
+    let line = match aterm_agent::harness::worker::program_line(
+        work.dialect,
+        Path::new(&run.program),
+        &run.args,
+    ) {
+        Ok(line) => line,
+        Err(why) => {
+            stall_refused(work, &format!("its launch line cannot be written: {why}"));
+            return;
+        }
+    };
+    let Some(proxy) = work.proxy.as_ref() else {
+        stall_refused(work, "its main-thread launch endpoint is gone");
+        return;
+    };
+    let prompt = match await_prompt(work, Duration::ZERO) {
+        Ok(prompt) => prompt,
+        Err(why) => {
+            stall(work, &why);
+            return;
+        }
+    };
+    let typed = type_at_prompt(work, prompt, |prompt| {
+        crate::control::control_media::call_main(proxy, |reply| crate::Wake::WorkerLaunch {
+            sid: work.ctx.self_id.clone(),
+            nonce: work.ctx.nonce,
+            prompt,
+            line: line.clone(),
+            reply,
+            account_scope: work.account_scope.clone(),
+        })
+    });
+    let Some(written) = typed else {
+        return;
+    };
+    let note = format!(
+        "typed ({} B, {written}): {} with {} argument(s), its task as its input",
+        line.len() + 1,
+        run.program,
+        run.args.len()
+    );
+    aterm_log::info!("worker session {}: launch line {note}", work.local);
+    note_launch(&work.ctx, note);
+    crate::program_worker::watch(work);
 }
 
 /// What a worker's line names beside its program: `model`, its folder trusted where `here`,
@@ -1474,18 +1582,21 @@ impl Held {
 pub(crate) struct PromptFence {
     generation: crate::control::ScreenGen,
     human: u64,
+    /// The id of the shell block that prompt opened, which a line typed at it runs in.
+    block: u64,
 }
 
 /// Capture an input-ready prompt under the caller's terminal lock.
 pub(crate) fn prompt_fence(terminal: &Terminal, human: u64) -> Option<PromptFence> {
-    matches!(
-        terminal.all_blocks().last().map(|b| b.state),
-        Some(aterm_core::terminal::BlockState::EnteringCommand)
-    )
-    .then(|| PromptFence {
-        generation: crate::control::screen_gen(terminal),
-        human,
-    })
+    terminal
+        .all_blocks()
+        .last()
+        .filter(|b| b.state == aterm_core::terminal::BlockState::EnteringCommand)
+        .map(|b| PromptFence {
+            generation: crate::control::screen_gen(terminal),
+            human,
+            block: b.id,
+        })
 }
 
 /// Why [`type_launch_line`] did not type a worker's line.
@@ -1584,7 +1695,10 @@ pub(crate) fn type_scoped_launch_line(
     type_launch_line(store, sid, nonce, prompt, line)
 }
 
-/// Admit and type the worker's initial line ON THE MAIN THREAD.
+/// Admit and type the worker's initial line ON THE MAIN THREAD. A program worker's record notes the
+/// block its line was written into ([`crate::task_record::note_program_block`]) in the same turn
+/// of the main thread, before an update's park can come between, so a successor reads its end
+/// from that block alone.
 ///
 /// # Errors
 ///
@@ -1637,7 +1751,19 @@ pub(crate) fn type_launch_line(
         crate::ReadOn::EventLoop,
         None,
     );
-    launch_line_typed(result)
+    let typed = launch_line_typed(result);
+    let program = typed.is_ok() && {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.task().is_some_and(TaskRecord::runs_a_program)
+    };
+    if program && !crate::task_record::note_program_block(&ctx, prompt.block, Duration::ZERO) {
+        aterm_log::warn!(
+            "worker session {}: the block its program was typed into was not noted (its record \
+             moved on, or an update is committing), so its exit status concludes nothing",
+            sid.as_str()
+        );
+    }
+    typed
 }
 
 /// What the fenced press of a worker's line ([`type_launch_line`]) did, as its launcher reads it.
@@ -1783,7 +1909,7 @@ fn account_preparation_cancelled(work: &Launch) -> bool {
 }
 
 /// Whether `work`'s session is still there and its account preparation may continue.
-fn session_alive(work: &Launch) -> bool {
+pub(crate) fn session_alive(work: &Launch) -> bool {
     !account_preparation_cancelled(work)
         && work
             .store

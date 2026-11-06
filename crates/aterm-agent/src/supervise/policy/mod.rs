@@ -51,7 +51,7 @@ pub use git_config::{GitView, WorkerEnv};
 pub use guard::{
     KeyAct, key_args, row_guard, server_fences_gen, server_fences_send, server_takes_act,
 };
-pub use probe::{LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
+pub use probe::{Below, LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
 pub use question::{
     LONG_TERM_TEXT, MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, SHORT_TERM_TEXT,
     answer_question, is_question_rule,

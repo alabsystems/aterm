@@ -83,7 +83,7 @@ pub(crate) fn archived(spool: &Path, since: u64) -> io::Result<BTreeMap<String, 
             Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
             Err(other) => return Err(io::Error::other(other.to_string())),
         };
-        for line in bytes.split(|b| *b == b'\n') {
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
             let Ok(value) = aterm_json::from_slice::<Value>(line) else {
                 continue;
             };
@@ -136,7 +136,7 @@ pub(crate) fn batches(spool: &Path, since: u64) -> io::Result<Vec<Batch>> {
             Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
             Err(other) => return Err(io::Error::other(other.to_string())),
         };
-        for line in bytes.split(|b| *b == b'\n') {
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
             let Ok(value) = aterm_json::from_slice::<Value>(line) else {
                 continue;
             };

@@ -2816,7 +2816,7 @@ fn receive_inventory(stream: &mut impl Read) -> Result<BTreeSet<Digest>> {
 fn send_batch(stream: &mut (impl Read + Write), batch: &[Vec<u8>]) -> Result<(usize, usize)> {
     stream.write_all(&(batch.len() as u32).to_le_bytes())?;
     for wire in batch {
-        send_frame(stream, wire)?;
+        write_frame(stream, wire)?;
     }
     stream.flush()?;
     let mut retained = 0;
@@ -2866,9 +2866,13 @@ fn receive_batch<S: Store>(stream: &mut (impl Read + Write), store: &S) -> Resul
     stream.flush()?;
     Ok((retained, n - retained))
 }
-pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
     stream.write_all(bytes)?;
+    Ok(())
+}
+pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    write_frame(stream, bytes)?;
     stream.flush()?;
     Ok(())
 }

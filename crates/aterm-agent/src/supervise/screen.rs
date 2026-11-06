@@ -601,8 +601,7 @@ mod tests {
     /// 12-column match reads no search.
     #[test]
     fn of_a_live_composer_only_the_history_search_leaves_the_cursor_under_it() {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
         let mut under = Vec::new();
         let mut read = 0;
         for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {

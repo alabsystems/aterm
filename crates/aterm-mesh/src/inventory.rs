@@ -37,7 +37,8 @@
 use crate::egress::Egress;
 use crate::logs::Mesh;
 use crate::relay::{self, Event};
-use crate::stores::{self, Digest, Kind, ProofKey, Stores, Verdict};
+use crate::stores::{Digest, Kind, ProofKey, Stores, Verdict};
+use aterm_mesh_core::relay_live;
 use aterm_net::fleet::FleetOp;
 use aterm_net::fleet::link::{Bell, BusLog, Incoming, Link, LinkStream};
 use aterm_types::MutexExt;
@@ -192,9 +193,9 @@ impl Inventory {
     }
 
     /// Ask for an exchange with `peer` over `link`, for `reason`. A gap notice under
-    /// [`NO_INVENTORY_ON_GAP`] asks nothing.
+    /// [`NO_INVENTORY_ON_GAP`] asks nothing (`relay_live::requests`).
     pub fn request(&self, peer: &str, link: &Arc<Link>, reason: Reason) {
-        if reason == Reason::Gap && self.no_gap {
+        if !relay_live::requests(reason == Reason::Gap, self.no_gap) {
             return;
         }
         let mut queue = self.queue.lock_or_recover();
@@ -346,7 +347,8 @@ impl Inventory {
     }
 
     /// Exchange with `peer` over `link` as the initiator, unless the last exchange with it moved
-    /// nothing and this Mac's summary has not changed since.
+    /// nothing and this Mac's summary has not changed since (`relay_live::runs`, whose island
+    /// proves the skip safe: the neighbour holds whatever this Mac holds then).
     fn initiate(&self, mesh: &Mesh, peer: &str, link: &Link, reason: Reason) {
         let summary = match summary(self.stores.as_ref()) {
             Ok(summary) => summary,
@@ -355,7 +357,8 @@ impl Inventory {
                 return;
             }
         };
-        if self.remembers() && self.quiet.lock_or_recover().get(peer) == Some(&summary) {
+        let quiet_same = self.quiet.lock_or_recover().get(peer) == Some(&summary);
+        if !relay_live::runs(self.remembers(), quiet_same) {
             mesh.report(&Event::InventorySkipped {
                 peer: peer.to_owned(),
                 reason,
@@ -505,6 +508,12 @@ fn io_of(error: &aterm_db::Error) -> io::Error {
 fn write_frame(mut stream: &LinkStream, bytes: &[u8]) -> io::Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame past 4 GiB"))?;
+    if let Some(total) = bytes.len().checked_add(4).filter(|&n| n <= 1024) {
+        let mut buf = [0u8; 1024];
+        buf[..4].copy_from_slice(&len.to_le_bytes());
+        buf[4..total].copy_from_slice(bytes);
+        return stream.write_all(&buf[..total]);
+    }
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(bytes)
 }
@@ -513,6 +522,34 @@ fn read_u32(mut stream: &LinkStream) -> io::Result<u32> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len)?;
     Ok(u32::from_le_bytes(len))
+}
+
+fn read_greeting(mut stream: &LinkStream) -> io::Result<Digest> {
+    let max = HEAD.len() + 32;
+    let len = read_u32(stream)? as usize;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("an Inventory frame of {len} bytes, past {max}"),
+        ));
+    }
+    if len != max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the neighbour speaks another Inventory",
+        ));
+    }
+    let mut greeting = [0u8; HEAD.len() + 32];
+    stream.read_exact(&mut greeting)?;
+    if !greeting.starts_with(HEAD) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the neighbour speaks another Inventory",
+        ));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&greeting[HEAD.len()..]);
+    Ok(digest)
 }
 
 fn read_frame(stream: &LinkStream, max: usize) -> io::Result<Vec<u8>> {
@@ -555,29 +592,25 @@ fn exchange(
     summary: Digest,
     initiator: bool,
 ) -> io::Result<Moved> {
-    let mut greeting = HEAD.to_vec();
-    greeting.extend_from_slice(&summary);
+    let mut greeting = [0u8; HEAD.len() + 32];
+    greeting[..HEAD.len()].copy_from_slice(HEAD);
+    greeting[HEAD.len()..].copy_from_slice(&summary);
     let theirs = if initiator {
         write_frame(stream, &greeting)?;
-        read_frame(stream, HEAD.len() + 32)?
+        read_greeting(stream)?
     } else {
-        let theirs = read_frame(stream, HEAD.len() + 32)?;
+        let theirs = read_greeting(stream)?;
         write_frame(stream, &greeting)?;
         theirs
     };
-    if !theirs.starts_with(HEAD) || theirs.len() != HEAD.len() + 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the neighbour speaks another Inventory",
-        ));
-    }
     let mut moved = Moved::default();
-    if theirs[HEAD.len()..] == summary {
+    if theirs == summary {
         return Ok(moved);
     }
     let mine = stores.tables()?;
     let their_tables = exchange_ids(stream, initiator, &mine, TABLES_MAX)?;
-    let mut units = vec![Unit::Members];
+    let mut units = Vec::with_capacity(1 + 2 * mine.len().min(their_tables.len()));
+    units.push(Unit::Members);
     for table in mine.intersection(&their_tables) {
         units.extend([Unit::Proofs(*table), Unit::Table(*table)]);
     }
@@ -625,13 +658,49 @@ fn exchange(
 /// Send `wires` in batches, then an empty batch: how many went.
 fn send(stream: &LinkStream, wires: &[Vec<u8>]) -> io::Result<usize> {
     let mut writer = stream;
+    if wires.is_empty() {
+        writer.write_all(&0u32.to_le_bytes())?;
+        writer.flush()?;
+        return Ok(0);
+    }
+    let cap = wires
+        .iter()
+        .take(crate::ingest::BATCH)
+        .map(|w| 4 + w.len())
+        .sum::<usize>()
+        .saturating_add(8)
+        .min(aterm_net::fleet::link::FRAME_MAX);
+    let mut buf = Vec::with_capacity(cap);
     for batch in wires.chunks(crate::ingest::BATCH) {
-        writer.write_all(&(batch.len() as u32).to_le_bytes())?;
+        if buf.len() + 4 > aterm_net::fleet::link::FRAME_MAX {
+            writer.write_all(&buf)?;
+            buf.clear();
+        }
+        buf.extend_from_slice(&(batch.len() as u32).to_le_bytes());
         for wire in batch {
-            write_frame(stream, wire)?;
+            let len = u32::try_from(wire.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame past 4 GiB"))?;
+            if buf.len() + 4 + wire.len() <= aterm_net::fleet::link::FRAME_MAX {
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(wire);
+            } else {
+                if buf.len() + 4 > aterm_net::fleet::link::FRAME_MAX {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
+                buf.extend_from_slice(&len.to_le_bytes());
+                writer.write_all(&buf)?;
+                buf.clear();
+                writer.write_all(wire)?;
+            }
         }
     }
-    writer.write_all(&0u32.to_le_bytes())?;
+    if buf.len() + 4 > aterm_net::fleet::link::FRAME_MAX {
+        writer.write_all(&buf)?;
+        buf.clear();
+    }
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    writer.write_all(&buf)?;
     writer.flush()?;
     Ok(wires.len())
 }
@@ -661,12 +730,13 @@ fn receive(
             wires.push(read_frame(stream, RECORD_MAX)?);
         }
         let verdicts = match unit {
-            Unit::Members => {
-                egress.arrived(wires.iter().map(|wire| stores::digest(wire)));
-                stores.ingest_members(&wires)
-            }
-            Unit::Proofs(table) => stores.ingest_table(table, Kind::Conflict, &wires),
-            Unit::Table(table) => stores.ingest_table(table, Kind::Operation, &wires),
+            Unit::Members => egress.delivering(&wires, || stores.ingest_members(&wires)),
+            Unit::Proofs(table) => egress.delivering(&wires, || {
+                stores.ingest_table(table, Kind::Conflict, &wires)
+            }),
+            Unit::Table(table) => egress.delivering(&wires, || {
+                stores.ingest_table(table, Kind::Operation, &wires)
+            }),
         };
         for verdict in verdicts {
             match verdict {

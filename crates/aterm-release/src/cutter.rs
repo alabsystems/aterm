@@ -59,8 +59,6 @@ const MAX_LINKS: usize = 40;
 const OWN_CRATE: &str = "crates/aterm-release";
 const OWN_MAIN: &str = "crates/aterm-release/src/main.rs";
 
-const BUILT_IN: &str = env!("CARGO_MANIFEST_DIR");
-
 const RELINK: &str = "run it as `targo --unverified ship <verb>` from a clean checkout of the \
                       commit it acts for, a `targo run` that checks it against that tree (and \
                       relinks it when it is stale) first";
@@ -132,13 +130,7 @@ pub fn judge_at_start() {
                 &exe,
                 &ancestor,
             );
-            judge_process(
-                &exe,
-                Path::new(BUILT_IN),
-                launcher_start(),
-                started(std::process::id()),
-                handed,
-            )
+            judge_process(&exe, launcher_start(), started(std::process::id()), handed)
         }
         Err(e) => Judged {
             stamp: Err(NotOwn::new(
@@ -216,8 +208,10 @@ pub(crate) fn handed_since(
         let nanos: u64 = word.parse().ok()?;
         SystemTime::UNIX_EPOCH.checked_add(Duration::from_nanos(nanos))
     };
-    let words: Vec<&str> = since?.to_str()?.split(' ').collect();
-    let [at, by, started] = words.as_slice() else {
+    let mut words = since?.to_str()?.split(' ');
+    let (Some(at), Some(by), Some(started), None) =
+        (words.next(), words.next(), words.next(), words.next())
+    else {
         return None;
     };
     let handing = ancestor(by.parse().ok()?)?;
@@ -366,7 +360,6 @@ fn since(
 /// moment [`since`] picks for it.
 fn judge_process(
     exe: &Path,
-    built_in: &Path,
     launcher: Option<SystemTime>,
     own: Option<SystemTime>,
     handed: Option<SystemTime>,
@@ -397,7 +390,7 @@ fn judge_process(
     };
     let since = since(linked, placed(&meta), launcher, own, handed);
     Judged {
-        stamp: judge(exe, built_in, since),
+        stamp: judge(exe, since),
         since: Some(since),
     }
 }
@@ -422,9 +415,9 @@ fn stale_fix(exe: &Path, root: &Path, since: Since) -> String {
     }
 }
 
-/// Whether the cutter at `exe`, compiled in `built_in`, is its checkout's `HEAD` build: its
-/// inputs judged from `since`, and a stale one's remedy as [`stale_fix`] gives it for `since`.
-fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
+/// Whether the cutter at `exe` is its checkout's `HEAD` build: its inputs judged from `since`,
+/// and a stale one's remedy as [`stale_fix`] gives it for `since`.
+fn judge(exe: &Path, since: Since) -> Stamp {
     let dep_info = exe.with_extension("d");
     let text = crate::durable::read_text(&dep_info).map_err(|e| {
         NotOwn::new(
@@ -447,23 +440,6 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             RELINK,
         )
     })?;
-    if !same_dir(&root.join(OWN_CRATE), built_in) {
-        return Err(NotOwn::new(
-            format!(
-                "it was compiled in {}, not in {} whose sources its dep-info names (cargo \
-                 reused another checkout's build from a target directory the two share)",
-                built_in.display(),
-                root.display()
-            ),
-            format!(
-                "`targo clean{} -p aterm-release` in {} with the target directory that build \
-                 used (cargo reuses the other checkout's binary until it is gone), then run it \
-                 again",
-                profile_flag(exe),
-                root.display()
-            ),
-        ));
-    }
     let resolved_exe = fs::canonicalize(exe).map_err(|e| {
         NotOwn::new(
             format!("cannot resolve cutter {} ({e})", exe.display()),
@@ -591,7 +567,7 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             format!(
                 "its checkout {} has uncommitted cutter sources ({})",
                 root.display(),
-                dirty.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                dirty[..dirty.len().min(3)].join(", ")
             ),
             format!(
                 "commit or remove what `git status` lists under {}'s cutter sources ({}), then \
@@ -610,14 +586,6 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             ),
         )
     })
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (fs::canonicalize(a), fs::canonicalize(b)),
-            (Ok(a), Ok(b)) if a == b
-        )
 }
 
 fn profile_flag(exe: &Path) -> String {
@@ -645,8 +613,7 @@ fn dep_info_sources(text: &str, target: &Path) -> Option<(PathBuf, Vec<PathBuf>)
     let resolved_target = fs::canonicalize(target).ok()?;
     let same = |a: &Path| fs::canonicalize(a).is_ok_and(|a| a == resolved_target);
     text.lines().find_map(|line| {
-        let words = split_escaped(line);
-        let (first, rest) = words.split_first()?;
+        let (first, rest) = split_first_escaped(line)?;
         let out = first.strip_suffix(':')?;
         same(Path::new(out))
             .then(|| {
@@ -656,10 +623,41 @@ fn dep_info_sources(text: &str, target: &Path) -> Option<(PathBuf, Vec<PathBuf>)
                 } else {
                     std::env::current_dir().ok()?.join(output)
                 };
-                Some((output, rest.iter().map(PathBuf::from).collect()))
+                Some((
+                    output,
+                    split_escaped(rest).into_iter().map(PathBuf::from).collect(),
+                ))
             })
             .flatten()
     })
+}
+
+fn split_first_escaped(line: &str) -> Option<(std::borrow::Cow<'_, str>, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut has_escape = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b' ') {
+            has_escape = true;
+            i += 2;
+        } else if bytes[i] == b' ' {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    let raw_first = &trimmed[..i];
+    let rest = &trimmed[i..];
+    let first = if has_escape {
+        std::borrow::Cow::Owned(raw_first.replace("\\ ", " "))
+    } else {
+        std::borrow::Cow::Borrowed(raw_first)
+    };
+    Some((first, rest))
 }
 
 fn split_escaped(line: &str) -> Vec<String> {
@@ -730,9 +728,9 @@ fn checkout_sources(sources: Vec<PathBuf>, root: &Path, targets: &[&Path]) -> Ve
 /// The files a build of `sources` may read that its dep-info does not list, there or not:
 /// [`ROOT_BUILD_INPUTS`], and the `Cargo.toml` of each folder from a package root up to `root`:
 /// its package's manifest, and each place above it cargo looks for a workspace's. The package
-/// roots are the cutter's own, [`OWN_CRATE`] (where [`BUILT_IN`] says cargo found its manifest,
-/// and [`judge`] holds that to this checkout), and each source's (the nearest folder above it
-/// inside `root` that holds a `Cargo.toml`). A folder between a source and its package root is
+/// roots are the cutter's own, [`OWN_CRATE`] (its package's folder, known without reading the
+/// tree, so its manifest stays a candidate after a commit removes it), and each source's (the
+/// nearest folder above it inside `root` that holds a `Cargo.toml`). A folder between a source and its package root is
 /// none of these, so cargo reads no manifest there. Residual: a dependency package's manifest a
 /// commit removed after the moment the cutter is judged from is no candidate, as its sources'
 /// package root is then a folder above it.
@@ -838,13 +836,15 @@ fn tracked_directories(files: &BTreeSet<String>) -> BTreeSet<String> {
 /// links.
 fn from_root(path: &Path, resolved: &Path) -> Option<Vec<(PathBuf, String)>> {
     let name = |at: &Path| {
-        let parts: Vec<String> = at
-            .strip_prefix(resolved)
-            .ok()?
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        (!parts.is_empty()).then(|| parts.join("/"))
+        let rel = at.strip_prefix(resolved).ok()?;
+        let mut out = String::with_capacity(rel.as_os_str().len());
+        for part in rel.components() {
+            if !out.is_empty() {
+                out.push('/');
+            }
+            out.push_str(&part.as_os_str().to_string_lossy());
+        }
+        (!out.is_empty()).then_some(out)
     };
     let mut read = Vec::new();
     let mut at = PathBuf::new();
@@ -870,7 +870,8 @@ fn from_root(path: &Path, resolved: &Path) -> Option<Vec<(PathBuf, String)>> {
                     return None;
                 }
                 if next.starts_with(resolved) {
-                    read.push((next.clone(), name(&next)?));
+                    let link_name = name(&next)?;
+                    read.push((next.clone(), link_name));
                 }
                 queue(&mut at, &mut left, &fs::read_link(&next).ok()?);
             }
@@ -892,15 +893,13 @@ fn queue(at: &mut PathBuf, left: &mut Vec<OsString>, path: &Path) {
     if path.has_root() {
         *at = PathBuf::from("/");
     }
-    let parts: Vec<OsString> = path
-        .components()
-        .filter_map(|part| match part {
-            Component::Normal(part) => Some(part.to_os_string()),
-            Component::ParentDir => Some(OsString::from("..")),
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
-        })
-        .collect();
-    left.extend(parts.into_iter().rev());
+    let start = left.len();
+    left.extend(path.components().filter_map(|part| match part {
+        Component::Normal(part) => Some(part.to_os_string()),
+        Component::ParentDir => Some(OsString::from("..")),
+        Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+    }));
+    left[start..].reverse();
 }
 
 /// Why one of `paths` may differ from what this cutter was built with: one modified after
@@ -1058,7 +1057,7 @@ mod tests {
 
     /// The judgment of a cutter run directly, from its link.
     fn judged(b: &Built) -> Stamp {
-        judge(&b.exe, &b.work.join(OWN_CRATE), Since::Link(linked(b)))
+        judge(&b.exe, Since::Link(linked(b)))
     }
 
     /// Whether `fix` is the remedy for a stale input of a cutter not judged from a `targo`'s
@@ -1617,29 +1616,6 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_compiled_in_another_checkout_refuses_until_it_is_cleaned() {
-        let b = built();
-        let since = Since::Link(linked(&b));
-        let not =
-            judge(&b.exe, Path::new("/elsewhere/crates/aterm-release"), since).expect_err("reused");
-        assert!(not.why.contains("compiled in /elsewhere/"), "{not:?}");
-        assert!(
-            not.fix
-                .starts_with("`targo clean --profile gate -p aterm-release` in "),
-            "{not:?}"
-        );
-        #[cfg(unix)]
-        {
-            let alias = b.work.with_file_name("alias");
-            std::os::unix::fs::symlink(&b.work, &alias).unwrap();
-            assert_eq!(
-                judge(&b.exe, &alias.join(OWN_CRATE), since),
-                Ok(b.head.clone())
-            );
-        }
-    }
-
-    #[test]
     fn a_foreign_dep_info_refuses() {
         let b = built();
         fs::write(
@@ -1729,7 +1705,7 @@ mod tests {
             )
             .unwrap();
         };
-        let verdict = || judge(&output, &alias.join(OWN_CRATE), Since::Link(linked(&b)));
+        let verdict = || judge(&output, Since::Link(linked(&b)));
         write_deps(&generated);
         assert_eq!(verdict(), Ok(b.head.clone()));
         let untracked = b.work.join("crates/aterm-release/src/untracked.rs");
@@ -1779,7 +1755,7 @@ mod tests {
             )
             .unwrap();
         };
-        let verdict = || judge(&output, &b.work.join(OWN_CRATE), Since::Link(linked(&b)));
+        let verdict = || judge(&output, Since::Link(linked(&b)));
         write_deps(&generated);
         assert_eq!(verdict(), Ok(b.head.clone()));
         let source_alias = b.work.join("crates/aterm-release/src/aliased-input.rs");
@@ -1870,7 +1846,7 @@ mod tests {
         backdate(&b.work, before);
         let run = |launcher, handed| {
             let own = Some(placed_at(&b));
-            judge_process(&b.exe, &b.work.join(OWN_CRATE), launcher, own, handed)
+            judge_process(&b.exe, launcher, own, handed)
         };
         assert_eq!(run(Some(began), None).stamp, Ok(head));
 
@@ -1943,8 +1919,7 @@ mod tests {
             "the run placed it after its targo began"
         );
         let own = Some(placed_at(&b));
-        let built_in = b.work.join(OWN_CRATE);
-        let launched = judge_process(&b.exe, &built_in, Some(began), own, None);
+        let launched = judge_process(&b.exe, Some(began), own, None);
         assert_eq!(launched.stamp, Ok(head));
         assert_eq!(launched.since, Some(Since::Launch(began)));
 
@@ -2015,13 +1990,12 @@ mod tests {
             at + Duration::from_secs(1),
         );
         commit(&b.work, "a lockfile after the link");
-        let built_in = b.work.join(OWN_CRATE);
         let before = at - Duration::from_secs(60);
         for since in [Since::Link(at), Since::Handed(before)] {
-            let not = judge(&b.exe, &built_in, since).expect_err("stale");
+            let not = judge(&b.exe, since).expect_err("stale");
             assert!(cleans_first(&b, &not.fix), "{since:?}: {not:?}");
         }
-        let not = judge(&b.exe, &built_in, Since::Launch(before)).expect_err("stale");
+        let not = judge(&b.exe, Since::Launch(before)).expect_err("stale");
         assert_eq!(not.fix, RELINK, "{not:?}");
     }
 

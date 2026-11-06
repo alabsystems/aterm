@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use crate::client::{Github, Meter};
 #[cfg(unix)]
-use crate::config::{self, AghConfig, DefaultRow, OwnerRow, ProfileRow, WriteField};
-use crate::config::{ConfigFault, Dirs, Validated};
+use crate::config::{self, DefaultRow, OwnerRow, ProfileRow, WriteField};
+use crate::config::{AghConfig, ConfigFault, Dirs, Validated};
 use crate::error::{Error, IdentityRef, Kind, Result, Sub};
 use crate::identity::{Credential, EnvSource, Profile, TokenKind, tilde};
 #[cfg(unix)]
@@ -880,6 +880,29 @@ fn run(dirs: &Dirs, env: &dyn EnvSource, gh: Option<&Github>) -> Option<Adoption
 #[cfg(unix)]
 fn run(dirs: &Dirs, env: &dyn EnvSource, gh: Option<&Github>) -> Option<Adoption> {
     let base = base(dirs)?;
+    run_with_rows(dirs, env, gh, base.as_ref())
+}
+
+/// Compose a previously admitted file snapshot; the shared router owns the one file read.
+#[cfg(not(unix))]
+pub(crate) fn run_with_rows(
+    dirs: &Dirs,
+    env: &dyn EnvSource,
+    gh: Option<&Github>,
+    base: Option<&AghConfig>,
+) -> Option<Adoption> {
+    let _ = (dirs, env, gh, base);
+    None
+}
+
+/// Compose vault rows with a file snapshot already admitted by the caller.
+#[cfg(unix)]
+pub(crate) fn run_with_rows(
+    dirs: &Dirs,
+    env: &dyn EnvSource,
+    gh: Option<&Github>,
+    base: Option<&AghConfig>,
+) -> Option<Adoption> {
     let joined = base.is_some();
     let (record, damaged) = match read_record(dirs) {
         Ok(record) => (record, None),
@@ -1004,7 +1027,7 @@ fn run(dirs: &Dirs, env: &dyn EnvSource, gh: Option<&Github>) -> Option<Adoption
     {
         unrecorded = record_blocked(dirs).map(|error| (unlearned_names(&vaulted), error));
     }
-    let mut adoption = Adoption::judge(vaulted, &dirs.home, base.as_ref());
+    let mut adoption = Adoption::judge(vaulted, &dirs.home, base);
     adoption.spent = learning.spent;
     adoption.pinned = pinned
         .into_iter()

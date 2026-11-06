@@ -552,6 +552,474 @@ fn the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face() {
     );
 }
 
+/// Rounds of `bridge` until `done`.
+fn rounds_until(what: &str, bridge: &mut Bridge, mut done: impl FnMut() -> bool) {
+    until(what, || {
+        bridge.round(Duration::ZERO);
+        done()
+    });
+}
+
+/// **UNREAD MAIL FOR A MAC'S OLD NODE REACHES ITS SESSION ONCE** (§11 C3b): B's ask to `s-a`
+/// landed on A's `bus.log` for A's node after A's bridge had read and passed a note there, and
+/// before A's node key rotated. A's node service, under the new node on the same log, moves what
+/// the old node's group had not passed to the new node's lanes, under their subjects; A's bridge,
+/// attached as the new node, delivers the ask to `s-a` once, beside a note to the new node, and
+/// never the note its old bridge delivered; its receipt names the ask by its offset on B, where
+/// the asker waits on it, read where the ask came from under the node service's reader's ring
+/// ([`crate::federate::OLD_READS_FILE`]), though the bridge attached before the hand-off named
+/// the old node. An ask A's own session wrote under the old node moves too, reaches `s-a` from
+/// that session, and its receipt names it by its offset on A, where that asker waits, on the lane
+/// of the node A holds now. A person's post on A to the old node moves the same
+/// way, and A's person carry (§11 C3c) leaves it to the move, saying nothing of it. A restart of
+/// the push moves nothing again: an ask B sends to the old node later, its hand-off not yet
+/// turned, follows the first alone.
+/// NEGATIVE CONTROL: [`crate::federate::ONE_NODE`], the pushes before C3b: no such push, so the
+/// bridge's one inbox, the new node's, never reads the ask, and the old group holds it, while
+/// the note to the new node reaches `s-a`; and the carry calls the old node no member. And
+/// without the reader's ring the late ask's receipt names it by its offset on A's log.
+#[test]
+fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
+    use crate::federate::{mail_group, tests::routes_as, ONE_NODE};
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (ma, mb) = (Mac::new(53), Mac::new(54));
+        let new = ma.rotated(63);
+        let before = members(&ma, &[&ma.node, &mb.node]);
+        let after = Handoff {
+            me: new.node.clone(),
+            members: [new.node.clone(), mb.node.clone()].into(),
+            moved: [(ma.node.clone(), new.node.clone())].into(),
+        };
+        // B's mail for `s-a` at `dst`, as B's push writes it on A's log: under B's producer,
+        // numbered by its offset on B.
+        let from_b = |dst: &str, kind: &str, on_b: u64, text: &str| -> u64 {
+            let subject = format!("/f/{FLEET}/in/{dst}/s-a/{}/{kind}", mb.node);
+            let mut push = ma.client(
+                mb.key,
+                &[format!(
+                    "rw,p={}:/f/{FLEET}/in/{dst}/*/{}/*",
+                    mb.node, mb.node
+                )],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-b".to_owned());
+            body.text = text.to_owned();
+            push.publish(pid(&mb.node), on_b, &subject, &body.encode())
+                .expect("B's push lands")
+                .0
+        };
+
+        // A's bridge as the old node reads the first note and its group passes it.
+        let k_old = keys_for(53, Some(&before));
+        let (lane_old, mut old, served_old) = attached(&ma, "s-a", k_old.path());
+        let read = from_b(&ma.node, "note", 3, "read before");
+        rounds_until(
+            &format!("{case}: the old node's bridge delivers the note"),
+            &mut old,
+            || {
+                lane_old.delivery_offsets() == [read]
+                    && ma.broker.group_start(&mail_group(&ma.node)) > read
+            },
+        );
+        old.close_subscriptions();
+        // The bridge goes; the log stays served, as the node service keeps it.
+        drop((old, lane_old));
+        let ask = from_b(&ma.node, "ask", 7, "unread");
+        // And an ask of A's own session `s-x`, as A's bridge wrote it under the old node: under
+        // that node's producer, numbered in the bridge's incarnation past what it wrote above.
+        let local = {
+            let mut own = ma.client(
+                ma.key,
+                &[format!("rw,p={0}:/f/{FLEET}/in/{0}/*/{0}/*", ma.node)],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-x".to_owned());
+            body.text = "asked here".to_owned();
+            let subject = format!("/f/{FLEET}/in/{0}/s-a/{0}/ask", ma.node);
+            let (at, deduped) = own
+                .publish(pid(&ma.node), (1 << 32) | 1000, &subject, &body.encode())
+                .expect("A's own ask lands");
+            assert!(!deduped, "{case}: a sequence the old bridge never wrote");
+            at
+        };
+
+        // A's bridge, as the node A holds next, attaches under a hand-off that names no rotation
+        // yet; `s-x` is a session of A's too, so its bridge vouches for no sender by that name,
+        // and the ask reads as `s-x`'s only where the bridge knows the node it came under is A's.
+        let unturned = Handoff {
+            moved: BTreeMap::new(),
+            ..after.clone()
+        };
+        let k_new = keys_for(63, Some(&unturned));
+        let (lane, mut a, _served) = attached(&new, "s-a", k_new.path());
+        lane.sessions.lock().unwrap().push((2, "s-x".to_owned()));
+        a.refresh_sessions().expect("the sessions");
+
+        // A's node key rotates: the node service's next generation, on the same bus.log, writes
+        // its reader's ring and the hand-off that names the old node, then starts its pushes; the
+        // bridge reads the hand-off at its next inbox run.
+        crate::federate::write_old_reads(k_new.path(), &after, &|grant| {
+            Mac::mint(&ma.secret, grant)
+        })
+        .expect("the node service's reader's ring");
+        after.write(k_new.path()).expect("the hand-off");
+        ONE_NODE.with(|on| on.set(control));
+        let net = Arc::new(Net::default());
+        let olds = BTreeSet::from([ma.node.clone()]);
+        let start = || {
+            let routes = routes_as(
+                &ma,
+                (&new.node, new.key),
+                &olds,
+                vec![Peer::of(&mb)],
+                &net,
+                false,
+            );
+            routes.set(&after, &BTreeSet::new());
+            routes
+        };
+        let routes = start();
+        let moved_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", new.node, mb.node);
+        let moved = || -> Vec<u64> {
+            new.holds(&moved_lane)
+                .into_iter()
+                .map(|(off, _, _, _)| off)
+                .collect()
+        };
+        let own_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", new.node, ma.node);
+        let moved_own = || -> Vec<u64> {
+            new.holds(&own_lane)
+                .into_iter()
+                .map(|(off, _, _, _)| off)
+                .collect()
+        };
+        if !control {
+            until(&format!("{case}: the asks move to the new node"), || {
+                moved().len() == 1 && moved_own().len() == 1
+            });
+            until(&format!("{case}: the old group passes them"), || {
+                ma.broker.group_start(&mail_group(&ma.node)) > local
+            });
+        }
+        // A person's post on A to a session of A's old node is A's own mail too: the move takes
+        // it, and the person carry, which carries a person's posts to the other Macs, leaves it
+        // be, where under ONE_NODE it takes the old node for no member and says so. Each post
+        // goes in order, so the notice for a later post to no member says the first was taken.
+        let person_lane = format!("/f/{FLEET}/in/{}/s-q/h-andrew/note", new.node);
+        let post = |dst: &str, seq| {
+            person_posts(
+                &ma,
+                k_old.path(),
+                (dst, seq, "note", "a person's"),
+                Seal::Bare,
+            )
+        };
+        post(&ma.node, 1);
+        let unmet = post(&node_of(&key_of(64)), 2);
+        let notices = format!(
+            "{}/undeliverable",
+            subject::person_lane(FLEET, "h-andrew", &new.node)
+        );
+        until(
+            &format!("{case}: the carry took the post to no member"),
+            || {
+                new.holds(&notices)
+                    .iter()
+                    .any(|(_, _, body, _)| Body::decode(body).0.re == Some(unmet))
+            },
+        );
+        let status = routes.carry_status();
+        assert_eq!(
+            (status.carried, status.refused),
+            (0, if control { 2 } else { 1 }),
+            "{case}: {status:?}"
+        );
+        if !control {
+            until(&format!("{case}: the person's post moves"), || {
+                new.holds(&person_lane).len() == 1
+            });
+        }
+        let fresh = from_b(&new.node, "note", 9, "to the new node");
+        let mut want = moved();
+        want.extend(moved_own());
+        want.sort_unstable();
+        want.push(fresh);
+        rounds_until(&format!("{case}: the bridge delivers"), &mut a, || {
+            lane.delivery_offsets().contains(&fresh)
+        });
+        assert_eq!(lane.delivery_offsets(), want, "{case}: each once, in order");
+        assert!(
+            !lane.delivery_offsets().contains(&read),
+            "{case}: never the note the old bridge delivered"
+        );
+        if control {
+            assert_eq!(moved(), [], "{case}: nothing moved");
+            assert!(
+                ma.broker.group_start(&mail_group(&ma.node)) <= ask,
+                "{case}: the old group holds the ask, unread"
+            );
+            ONE_NODE.with(|on| on.set(false));
+            drop((routes, served_old));
+            continue;
+        }
+        assert!(
+            lane.deliveries()[0].contains(&format!("from=s-b@{}", mb.node)),
+            "{case}: from B's asker: {:?}",
+            lane.deliveries()
+        );
+        a.send_receipt(&OwedReceipt {
+            sid: "s-a".to_owned(),
+            rid: 1,
+            off: want[0],
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: format!("s-b@{}", mb.node),
+            earlier_log: false,
+        })
+        .expect("the receipt goes");
+        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, new.node);
+        let receipts = new.holds(&ack);
+        assert_eq!(receipts.len(), 1, "{case}: the receipt is on A's log");
+        assert_eq!(
+            Body::decode(&receipts[0].2).0.re,
+            Some(7),
+            "{case}: the receipt names the ask by its offset on B"
+        );
+        // A's own asker waits on the offset its ask has here: its receipt names that one, not
+        // the copy the move made, and goes to the asker on the node A holds now.
+        let own = moved_own()[0];
+        assert!(
+            lane.deliveries()
+                .iter()
+                .any(|line| line.contains(&format!(" off={own} "))
+                    && line.contains(&format!("from=s-x@{}", ma.node))),
+            "{case}: from A's own asker: {:?}",
+            lane.deliveries()
+        );
+        a.send_receipt(&OwedReceipt {
+            sid: "s-a".to_owned(),
+            rid: 3,
+            off: own,
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: format!("s-x@{}", ma.node),
+            earlier_log: false,
+        })
+        .expect("the receipt goes");
+        let own_ack = format!("/f/{FLEET}/in/{0}/s-x/{0}/ack", new.node);
+        assert_eq!(
+            new.holds(&own_ack)
+                .iter()
+                .map(|(_, _, body, _)| Body::decode(body).0.re)
+                .collect::<Vec<_>>(),
+            [Some(local)],
+            "{case}: the receipt names A's own ask by its offset here, not the copy's {own}"
+        );
+
+        // The push restarts; B, its hand-off not yet turned, asks the old node again.
+        drop(routes);
+        let routes = start();
+        let late = from_b(&ma.node, "ask", 11, "late");
+        until(&format!("{case}: the late ask moves"), || {
+            moved().len() == 2
+        });
+        assert!(
+            ma.broker.group_start(&mail_group(&ma.node)) > late,
+            "{case}: the old group passes the late ask"
+        );
+        let held = new.holds(&moved_lane);
+        assert_eq!(
+            held.iter()
+                .map(|(_, _, body, _)| Body::decode(body).0.text)
+                .collect::<Vec<_>>(),
+            ["unread", "late"],
+            "{case}: the restart moved the first ask no second time"
+        );
+        rounds_until(
+            &format!("{case}: the late ask is delivered"),
+            &mut a,
+            || lane.delivery_offsets().contains(&held[1].0),
+        );
+
+        // NEGATIVE CONTROL of the receipt: without the node service's reader's ring the bridge
+        // cannot read where the late ask came from, and names it by its offset here instead.
+        std::fs::remove_file(k_new.path().join(crate::federate::OLD_READS_FILE))
+            .expect("the ring goes");
+        a.send_receipt(&OwedReceipt {
+            sid: "s-a".to_owned(),
+            rid: 2,
+            off: held[1].0,
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: format!("s-b@{}", mb.node),
+            earlier_log: false,
+        })
+        .expect("the receipt goes");
+        let receipts = new.holds(&ack);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|(_, _, body, _)| Body::decode(body).0.re)
+                .collect::<Vec<_>>(),
+            [Some(7), Some(held[1].0)],
+            "{case}: the late ask's receipt names it as A's log numbers it, not 11"
+        );
+        drop((routes, served_old));
+    }
+}
+
+/// **MAIL UNREAD ACROSS TWO ROTATIONS OF A MAC'S KEY REACHES ITS SESSION ONCE** (§11 C3b): B's ask
+/// to `s-a` lands on A's `bus.log` for A's node, and A's key rotates twice before `s-a` reads it.
+/// The node service under the second new node moves the first move's copy on, and A's bridge
+/// delivers the ask once; its receipt follows the copy back through both moves, under the node
+/// service's reader's ring, to the ask as B's push wrote it, and names it by its offset on B.
+/// NEGATIVE CONTROL: [`ONE_HOP`]: the receipt follows the copy back one move alone, and names it
+/// by the first copy's offset on A.
+#[test]
+fn mail_unread_across_two_rotations_reaches_its_session_once() {
+    use crate::federate::tests::routes_as;
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (ma, mb) = (Mac::new(65), Mac::new(66));
+        let (mid, last) = (ma.rotated(67), ma.rotated(68));
+        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/s-a/{}/ask", mb.node);
+        let held = |node: &str| -> Vec<u64> {
+            ma.holds(&lane_of(node))
+                .into_iter()
+                .map(|(off, _, _, _)| off)
+                .collect()
+        };
+        {
+            let mut push = ma.client(
+                mb.key,
+                &[format!(
+                    "rw,p={0}:/f/{FLEET}/in/{1}/*/{0}/*",
+                    mb.node, ma.node
+                )],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-b".to_owned());
+            body.text = "unread twice".to_owned();
+            push.publish(pid(&mb.node), 7, &lane_of(&ma.node), &body.encode())
+                .expect("B's push lands");
+        }
+        let net = Arc::new(Net::default());
+        let handoff = |me: &Mac, olds: &[&Mac]| Handoff {
+            me: me.node.clone(),
+            members: [me.node.clone(), mb.node.clone()].into(),
+            moved: olds
+                .iter()
+                .map(|old| (old.node.clone(), me.node.clone()))
+                .collect(),
+        };
+        let generation = |me: &Mac, olds: &[&Mac]| {
+            let routes = routes_as(
+                &ma,
+                (&me.node, me.key),
+                &olds.iter().map(|old| old.node.clone()).collect(),
+                vec![Peer::of(&mb)],
+                &net,
+                false,
+            );
+            routes.set(&handoff(me, olds), &BTreeSet::new());
+            routes
+        };
+        // The first rotation, and the node service under `mid` moves the ask to it.
+        let routes = generation(&mid, &[&ma]);
+        until(&format!("{case}: the first move"), || {
+            held(&mid.node).len() == 1
+        });
+        drop(routes);
+        // The second, before any bridge of `mid` read it.
+        let routes = generation(&last, &[&ma, &mid]);
+        until(&format!("{case}: the second move"), || {
+            held(&last.node).len() == 1
+        });
+        let second = handoff(&last, &[&ma, &mid]);
+        let keys = keys_for(68, Some(&second));
+        crate::federate::write_old_reads(keys.path(), &second, &|grant| {
+            Mac::mint(&ma.secret, grant)
+        })
+        .expect("the node service's reader's ring");
+        let (lane, mut a, _served) = attached(&last, "s-a", keys.path());
+        let copy = held(&last.node)[0];
+        rounds_until(&format!("{case}: the bridge delivers"), &mut a, || {
+            lane.delivery_offsets().contains(&copy)
+        });
+        assert_eq!(lane.delivery_offsets(), [copy], "{case}: once");
+        ONE_HOP.with(|on| on.set(control));
+        let sent = a.send_receipt(&OwedReceipt {
+            sid: "s-a".to_owned(),
+            rid: 1,
+            off: copy,
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: format!("s-b@{}", mb.node),
+            earlier_log: false,
+        });
+        ONE_HOP.with(|on| on.set(false));
+        sent.expect("the receipt goes");
+        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, last.node);
+        assert_eq!(
+            ma.holds(&ack)
+                .iter()
+                .map(|(_, _, body, _)| Body::decode(body).0.re)
+                .collect::<Vec<_>>(),
+            [Some(if control { held(&mid.node)[0] } else { 7 })],
+            "{case}: the receipt names the ask where it came from"
+        );
+        drop(routes);
+    }
+}
+
+/// **A REPLY FROM WHERE A ROTATION MOVED THE ASKED NODE IS NO STRAY** (§11 C3b): an ask that went
+/// to a node a key rotation retired since, another Mac's or this Mac's own, is answered from the
+/// node its seat holds now, and the bridge takes that reply as from where the ask went; a reply
+/// from any other node is a stray all the same.
+/// NEGATIVE CONTROL: a hand-off that names no rotation: both replies are strays.
+#[test]
+fn a_reply_from_where_a_rotation_moved_the_asked_node_is_no_stray() {
+    let ma = Mac::new(55);
+    let (peer_was, peer_now) = (node_of(&key_of(56)), node_of(&key_of(57)));
+    let mine_was = node_of(&key_of(58));
+    let other = node_of(&key_of(59));
+    let keys = keys_for(55, None);
+    let (_lane, mut a, _served) = attached(&ma, "s-a", keys.path());
+    a.note_asked(5, &peer_was);
+    a.note_asked(6, &mine_was);
+    for rotated in [true, false] {
+        let case = format!("rotated={rotated}");
+        Handoff {
+            me: ma.node.clone(),
+            members: [ma.node.clone(), peer_now.clone(), other.clone()].into(),
+            moved: if rotated {
+                [
+                    (peer_was.clone(), peer_now.clone()),
+                    (mine_was.clone(), ma.node.clone()),
+                ]
+                .into()
+            } else {
+                BTreeMap::new()
+            },
+        }
+        .write(keys.path())
+        .expect("the hand-off");
+        assert_eq!(
+            a.reply_from(5, &peer_now),
+            Some(rotated),
+            "{case}: from the peer's node now"
+        );
+        let own = a.node.clone();
+        assert_eq!(
+            a.reply_from(6, &own),
+            Some(rotated),
+            "{case}: from this Mac's node now"
+        );
+        assert_eq!(a.reply_from(5, &other), Some(false), "{case}: a third node");
+    }
+}
+
 /// How a test's person seals a post (§11 C3c).
 #[derive(Clone, Copy)]
 enum Seal<'a> {

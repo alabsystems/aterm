@@ -27,11 +27,10 @@ pub(crate) const LIT_SWITCH: &str = " \u{25cf} on ";
 #[cfg(test)]
 pub(crate) const OFF_SWITCH: &str = " \u{25cb} off ";
 
-/// The harness label's words at its widest for `harness`, its CLI's version left out:
-/// `alab claude harness v0.5`.
+/// The harness label's words for `harness`, its CLI's version left out: `alab v0.5`.
 #[cfg(test)]
 pub(crate) fn harness_label(harness: aterm_phase::CliHarness) -> String {
-    format!("alab {} harness v{}", harness.cli(), harness.version_str())
+    format!("alab v{}", harness.version_str())
 }
 
 /// What a screen shows under the transcript.

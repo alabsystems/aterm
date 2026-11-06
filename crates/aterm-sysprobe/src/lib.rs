@@ -43,6 +43,8 @@ pub mod power;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate reads it through (aterm-uds re-exports it as `aterm_uds::procargs`).
 pub mod procargs;
 pub mod procs;
+pub mod room;
+pub mod rusage;
 pub mod slots;
 pub mod timeline;
 pub mod volumes;
@@ -60,13 +62,13 @@ pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
     Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuClient, GpuClients, GpuDriver, GpuReading,
     LinkCounters, LinkKind, LinkReading, MAX_GPU_CLIENTS, MAX_LINKS, MachineWords, MemoryDetail,
-    Probe, ProcessLimits, TcpCounts, TcpSummary, Throttle, ThrottleLevel, VmCounters,
-    VolumeReading, WorkqueueLimits, capacity, caps, counts_toward_machine, cpu_layout, creator_of,
-    gpu, gpu_clients, gpu_driver, layout_by_rank, level_names, load_average, machine_words,
-    memory_detail, net_links, net_links_into, open_socket_count, pid_counts, process_limits,
-    tcp_counts, tcp_counts_into, tcp_summary, tcp_summary_into, volume, withdrawn_cores,
-    workqueue_limits,
+    Probe, TcpCounts, TcpSummary, Throttle, ThrottleLevel, VmCounters, VolumeReading,
+    WorkqueueLimits, capacity, caps, counts_toward_machine, cpu_layout, creator_of, gpu,
+    gpu_clients, gpu_driver, layout_by_rank, level_names, load_average, machine_words,
+    memory_detail, net_links, net_links_into, open_socket_count, tcp_after_publish, tcp_counts,
+    tcp_counts_into, tcp_summary, tcp_summary_into, volume, withdrawn_cores, workqueue_limits,
 };
+pub use room::{TaskRoom, task_room};
 
 /// Whether this Mac's kernel offers the hypervisor Virtualization.framework runs on
 /// (`kern.hv_support` is 1), read by `sysctlbyname` with no framework loaded: the vz lane's

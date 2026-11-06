@@ -99,9 +99,9 @@ impl Flow {
             }
         }
         if let Some(socket) = &self.wake {
-            let (socket, egress) = (Arc::clone(socket), Arc::clone(&self.egress));
+            let (socket, egress, w) = (Arc::clone(socket), Arc::clone(&self.egress), weak.clone());
             self.threads
-                .push(spawn("aterm-mesh-wake", move || socket.run(&egress))?);
+                .push(spawn("aterm-mesh-wake", move || socket.run(&egress, &w))?);
         }
         let (egress, w) = (Arc::clone(&self.egress), weak.clone());
         self.threads
@@ -251,10 +251,10 @@ impl Mesh {
         let broker = &self.tables.broker;
         let mut acks = self.acks.0.lock_or_recover();
         loop {
-            // The relay commits one past what the neighbour acked, inclusively.
+            // The neighbour's group resumes one past the last record it acked.
             if peers
                 .iter()
-                .any(|peer| broker.group_start(&relay::group_of(peer)) > offset.saturating_add(1))
+                .any(|peer| broker.group_start(&relay::group_of(peer)) > offset)
             {
                 return Some(Pushed::Reached);
             }
@@ -280,7 +280,8 @@ impl Mesh {
         self.tables.broker.retain_before_carrying_state(floor)
     }
 
-    /// A tables relay's neighbour acked a burst.
+    /// A tables relay's neighbour acked a burst, or this Mac's tables log moved (a neighbour's
+    /// relay commits its group there): what a push waits on may have moved.
     pub(crate) fn acked(&self) {
         let mut acks = self.acks.0.lock_or_recover();
         *acks = acks.wrapping_add(1);

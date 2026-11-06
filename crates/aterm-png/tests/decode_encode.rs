@@ -100,7 +100,7 @@ fn encode(color: aterm_png::ColorType, w: u32, h: u32, pixels: &[u8]) -> Vec<u8>
 }
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .expect("crate lives two levels under the repository root")

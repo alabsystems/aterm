@@ -98,7 +98,9 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
         Some(word) => Some(Retirement {
             reason: Reason::parse(word)?,
             evidence: s("evidence").unwrap_or_default().to_owned(),
-            note: s("note").unwrap_or_default().to_owned(),
+            // An earlier build kept a note as typed, control characters and all, which the
+            // table refuses: read back, a note is cleaned as one entering the ledger is.
+            note: super::note_of(s("note").unwrap_or_default()),
             generation: n("generation"),
         }),
         None => None,
@@ -373,8 +375,8 @@ pub fn satisfied(paths: &Paths, want: &Want, purpose: Purpose) -> crate::Result<
     })
 }
 
-/// Withdraw this Mac's needs that `selector` names (a want key or a request id), or, with
-/// `declined`, decline as a person each one awaiting a person, with `note` (§6.2).
+/// Withdraw by hand this Mac's needs that `selector` names (a want key or a request id), or,
+/// with `declined`, decline as a person each one awaiting a person; either keeps `note` (§6.2).
 ///
 /// # Errors
 /// Nothing in the ledger matches, a decline names no need awaiting a person, or the ledger
@@ -397,15 +399,9 @@ pub fn retire(
             let step = if declined {
                 Act::Decline(note.to_owned())
             } else {
-                Act::Unneeded
+                Act::Withdraw(note.to_owned())
             };
-            if let Some(mut next) = act(need, facts, &step) {
-                if !declined
-                    && !note.is_empty()
-                    && let Some(retired) = next.retired.as_mut()
-                {
-                    retired.note = note.chars().take(160).collect();
-                }
+            if let Some(next) = act(need, facts, &step) {
                 *need = next.clone();
                 changed.push(next);
             }

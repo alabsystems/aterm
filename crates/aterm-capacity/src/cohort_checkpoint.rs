@@ -169,7 +169,9 @@ fn cover_frozen(
     expected: &str,
     before: &Stamp,
 ) -> io::Result<()> {
-    if bytes(file, MAX_ENTRY)? != (expected.to_owned(), before.clone())
+    let (text, stamp) = bytes(file, MAX_ENTRY)?;
+    if text != expected
+        || stamp != *before
         || Stamp::read(&open(parent, name, false, false)?)? != *before
     {
         return Err(bad("checkpoint metadata lost its frozen pre-flush origin"));
@@ -217,7 +219,9 @@ fn cover_frozen(
     aterm_durable::durable(file)?;
     #[cfg(test)]
     archive::after_metadata_cover(parent, name, "file")?;
-    if bytes(file, MAX_ENTRY)? != (expected.to_owned(), before.clone())
+    let (text, stamp) = bytes(file, MAX_ENTRY)?;
+    if text != expected
+        || stamp != *before
         || Stamp::read(&open(parent, name, false, false)?)? != *before
     {
         return Err(bad(
@@ -448,9 +452,8 @@ impl Anchor {
 
     fn validate(&self, backend: &File) -> io::Result<()> {
         let named = open(&self.parent, &self.name, false, true)?;
-        if identity(backend, true)? != identity(&self.directory, true)?
-            || identity(&named, true)? != identity(&self.directory, true)?
-        {
+        let dir_id = identity(&self.directory, true)?;
+        if identity(backend, true)? != dir_id || identity(&named, true)? != dir_id {
             return Err(bad("checkpoint directory was replaced"));
         }
         let (header, stamp) = immutable(&self.directory, HEADER)?;
@@ -969,6 +972,7 @@ impl Transaction {
         let metadata = &epoch.directory;
         let final_name = format!("{:016}.json", capture.ordinal);
         let pending_name = format!("{:016}.pending", capture.ordinal);
+        let encoded = capture.encode()?;
         if let Some(pending) = &self.pending {
             if pending != capture {
                 return Err(bad("another cohort generation is pending"));
@@ -992,7 +996,7 @@ impl Transaction {
                 self.tip_file
                     .as_ref()
                     .ok_or_else(|| bad("final retry lost its parsed metadata descriptor"))?,
-                &capture.encode()?,
+                &encoded,
                 &self.latest.as_ref().expect("final generation").1,
             )?;
             self.anchor.validate(backend)?;
@@ -1004,7 +1008,7 @@ impl Transaction {
                 return Err(bad("stale cohort generation writer"));
             }
             let mut file = open(metadata, &pending_name, true, false)?;
-            file.write_all(capture.encode()?.as_bytes())?;
+            file.write_all(encoded.as_bytes())?;
             fd::fchmod(&file, Mode::RUSR)?;
             let stamp = Stamp::read(&file)?;
             self.pending_file = Some((file, stamp));
@@ -1014,13 +1018,7 @@ impl Transaction {
             .pending_file
             .as_ref()
             .ok_or_else(|| bad("pending retry lost its parsed metadata descriptor"))?;
-        cover_frozen(
-            metadata,
-            &pending_name,
-            held,
-            &capture.encode()?,
-            publication_origin,
-        )?;
+        cover_frozen(metadata, &pending_name, held, &encoded, publication_origin)?;
         let publication = held.try_clone()?;
         let publication_origin = publication_origin.clone();
         aterm_durable::durable(writer)?;
@@ -1040,6 +1038,7 @@ impl Transaction {
             final_name: &final_name,
             file: &publication,
             origin: &publication_origin,
+            encoded: &encoded,
         };
         let stamp = if capture.retired {
             publish_checkpoint(pending, backend, writer, capture)?
@@ -1071,6 +1070,7 @@ struct PendingPublication<'a> {
     final_name: &'a str,
     file: &'a File,
     origin: &'a Stamp,
+    encoded: &'a str,
 }
 
 /// Ordinary generations add one physical checkpoint. A retired generation instead uses
@@ -1104,6 +1104,7 @@ fn publish_checkpoint(
         final_name,
         file: publication,
         origin: publication_origin,
+        encoded,
     } = pending;
     if Stamp::read(publication)? != *publication_origin
         || Stamp::read(&open(metadata, pending_name, false, false)?)? != *publication_origin
@@ -1134,7 +1135,7 @@ fn publish_checkpoint(
     }
     capture.check(backend, writer)?;
     let (published, stamp) = bytes(publication, MAX_ENTRY)?;
-    if published != capture.encode()?
+    if published != encoded
         || stamp != renamed
         || Stamp::read(&open(metadata, final_name, false, false)?)? != renamed
     {

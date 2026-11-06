@@ -43,8 +43,8 @@ impl Packer for Pack {
         super::bottle::upstream::pack(ctx, request)
     }
 
-    fn can_pack_bottle(&self, triple: Triple) -> std::result::Result<(), String> {
-        super::bottle::upstream::can_build(triple).map_err(|error| error.to_string())
+    fn can_pack_bottle(&self, program: &str, triple: Triple) -> std::result::Result<(), String> {
+        super::bottle::upstream::can_build(program, triple).map_err(|error| error.to_string())
     }
 }
 

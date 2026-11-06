@@ -3,7 +3,6 @@
 // Author: Andrew Yates
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use super::*;
 use crate::guards::Corpus;
@@ -309,7 +308,7 @@ fn the_credential_section_is_read_as_the_engine_reads_it() {
 
 #[test]
 fn the_checkouts_own_rows_refuse_a_planted_account_word() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = aterm_tempfile::manifest_dir().join("../..");
     let Ok(extra) = std::fs::read_to_string(root.join(EXTRA)) else {
         return; // a public snapshot withholds publish/
     };

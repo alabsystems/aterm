@@ -9,7 +9,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -84,7 +84,7 @@ impl Fixture {
     }
 
     fn atpkg(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
@@ -108,6 +108,74 @@ fn text(out: &Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+#[test]
+fn which_json_dispatch_reads_ready_and_missing_tools_without_writing_state() {
+    fn files(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut found = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let mut bytes =
+                format!("{:?}", (meta.mode(), meta.mtime(), meta.mtime_nsec())).into_bytes();
+            if kind.is_dir() {
+                found.insert(path.clone(), bytes);
+                found.extend(files(&path));
+            } else if kind.is_symlink() {
+                bytes.extend_from_slice(
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                );
+                found.insert(path, bytes);
+            } else {
+                bytes.extend_from_slice(&std::fs::read(&path).unwrap());
+                found.insert(path, bytes);
+            }
+        }
+        found
+    }
+    let f = Fixture::new("which-json");
+    f.install("targo");
+    f.record_root("targo");
+    let before = files(f.root.path());
+    for (tool, status, exit) in [("targo", "ready", 0), ("not-installed", "missing", 1)] {
+        let out = f.atpkg(&["which", "--json", tool]);
+        assert_eq!(out.status.code(), Some(exit), "{}", text(&out));
+        let record: aterm_json::Value = aterm_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(record["schema"].as_u64(), Some(1));
+        assert_eq!(record["status"].as_str(), Some(status));
+        assert!(out.stderr.is_empty(), "{}", text(&out));
+    }
+    assert_eq!(
+        before,
+        files(f.root.path()),
+        "lookup must not heal, lock, log, or initialize state"
+    );
+    let config = f.root.path().join("config/aterm/aterm.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    for (contents, status, exit) in [
+        ("[packages]\nchannel = 'retired'\n", "ready", 0),
+        ("[packages\nvalue-that-must-not-be-echoed", "refused", 1),
+    ] {
+        std::fs::write(&config, contents).unwrap();
+        let before = files(f.root.path());
+        let out = f.atpkg(&["which", "--json", "targo"]);
+        assert_eq!(out.status.code(), Some(exit), "{}", text(&out));
+        let record: aterm_json::Value = aterm_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(record["status"].as_str(), Some(status));
+        assert!(out.stderr.is_empty(), "{}", text(&out));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("value-that-must-not-be-echoed"));
+        assert_eq!(
+            before,
+            files(f.root.path()),
+            "configuration diagnostics must not write a log or repair settings"
+        );
+    }
 }
 
 #[test]

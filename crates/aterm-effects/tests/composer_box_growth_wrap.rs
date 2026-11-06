@@ -252,7 +252,7 @@ impl Host {
             num += (f32::from(q.x) + f32::from(q.w) * 0.5) * w;
             den += w;
         }
-        (den > 0.0).then(|| num / den)
+        (den > 0.0).then_some(num / den)
     }
 
     fn far_tail(&self, row: u16, from_col: u16) -> f32 {

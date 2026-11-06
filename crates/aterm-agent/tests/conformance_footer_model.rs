@@ -119,7 +119,7 @@ fn project(model: Option<&str>) -> i64 {
 }
 
 fn screen(card: Option<i64>) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures/claude-2.1.283-footer-bypass-idle.txt");
     let rows: Vec<String> = std::fs::read_to_string(path)
         .expect("the measured screen")

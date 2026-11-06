@@ -54,7 +54,7 @@ impl AtomicRefWrite {
         method == Method::Post
             && origin == Some(&self.api)
             && path_and_query == "/graphql"
-            && matches!(permit.target(), PermitTarget::Repo(slug) if slug.key() == self.slug.key())
+            && matches!(permit.target(), PermitTarget::Repo(slug) if slug == &self.slug)
             && matches!(body, WireBody::Bytes(bytes) if Sha256Digest::of(bytes) == self.body)
     }
 }
@@ -245,7 +245,7 @@ impl Refs<'_> {
         self.write_checks(permit)?;
         let reader = self.writer_view(permit);
         let repo = reader.push_repo()?;
-        if !repo.full_name.eq_ignore_ascii_case(&self.slug.to_string()) {
+        if !self.slug.eq_full_name(&repo.full_name) {
             return Err(
                 Error::protocol("repository metadata names another repository")
                     .with_repo(self.slug.to_string()),
@@ -275,9 +275,9 @@ impl Refs<'_> {
 
     fn atomic_ref(&self, reference: &str) -> Result<RefObject> {
         let name = reference.strip_prefix("refs/").expect("a validated ref");
-        let encoded: Vec<String> = name.split('/').map(path::segment).collect();
+        let encoded = path::ref_path(name);
         let call = self.how.get(
-            format!("{}/git/ref/{}", repo_root(&self.slug), encoded.join("/")),
+            format!("{}/git/ref/{encoded}", repo_root(&self.slug)),
             RouteTarget::Repo(self.slug.clone()),
         );
         let found = self.ref_of(&self.gh.call(&call)?)?;

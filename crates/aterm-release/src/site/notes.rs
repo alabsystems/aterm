@@ -569,10 +569,10 @@ pub fn render_page(slug: &str, sections: &[Section]) -> String {
 mod tests {
     use super::*;
     use crate::site::releases::parse_releases;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        aterm_tempfile::manifest_dir()
             .join("tests/fixtures/site")
             .join(name)
     }

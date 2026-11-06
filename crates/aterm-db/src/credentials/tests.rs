@@ -969,3 +969,82 @@ fn unprivate_or_symlinked_holder_files_do_not_offer_and_blank_totp_is_ignored() 
     assert_eq!(values.0[0].0, "m29_password");
     assert_eq!(super::value::validate(&want, &values).unwrap(), None);
 }
+
+/// A withdrawal by hand reaches the lab's table as the requester's `not-needed`, resting on the
+/// person's word with their note (a control character in it read as a space, since the record
+/// refuses one), and `need ls` shows the note in its text and its JSON.
+#[test]
+fn a_withdrawal_by_hand_reaches_the_table_with_its_note_and_need_ls_shows_it() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let now = 1_000_000_000;
+    need::raise(&lab.paths[1], Want::Notary, Purpose::ByHand).unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().posted, 1);
+    need::retire(&lab.paths[1], "notary", false, "no notarizing\non this Mac").unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().answered, 1);
+    repair_commons(&lab, 3);
+    let seen = pass_at(&lab.paths[0], now).unwrap();
+    let (retirement, _) = seen.threads[0].retired.clone().unwrap();
+    let line = need::list(&lab.paths[1]).unwrap()[0].line.clone();
+    assert!(
+        line.contains("withdrawn by hand on this Mac (m2)"),
+        "{line}"
+    );
+    assert_eq!(
+        (
+            retirement.reason,
+            retirement.evidence.as_str(),
+            retirement.note.as_str()
+        ),
+        (
+            Reason::NotNeeded,
+            "withdrawn by hand on m2",
+            "no notarizing on this Mac"
+        )
+    );
+    let text = cli::run(&lab.paths[1], &["ls".to_owned()]).unwrap();
+    assert!(
+        text.contains("\n    note: no notarizing on this Mac\n"),
+        "{text}"
+    );
+    let json = cli::run(&lab.paths[1], &["ls".to_owned(), "--json".to_owned()]).unwrap();
+    let row = &aterm_json::from_str::<Value>(&json).unwrap()["needs"][0];
+    assert_eq!(
+        (row["evidence"].as_str(), row["note"].as_str()),
+        (
+            Some("withdrawn by hand on m2"),
+            Some("no notarizing on this Mac")
+        )
+    );
+}
+
+/// A note an earlier build kept in the ledger as typed, a newline and all, reaches the table and
+/// `need ls` with each control character read as a space: the record refuses one, and a pass
+/// that wrote it raw would fail every pass on that Mac until the request ended.
+#[test]
+fn a_note_an_earlier_build_kept_with_a_newline_still_reaches_the_table() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let now = 1_000_000_000;
+    need::raise(&lab.paths[1], Want::Notary, Purpose::ByHand).unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().posted, 1);
+    need::retire(&lab.paths[1], "notary", false, "no notarizing on this Mac").unwrap();
+    let ledger = lab.paths[1].dir.join(need::LEDGER);
+    let kept = std::fs::read_to_string(&ledger).unwrap();
+    let typed = kept.replace(
+        "note = \"no notarizing on this Mac\"",
+        "note = \"no notarizing\\non this Mac\"",
+    );
+    assert_ne!(typed, kept, "{kept}");
+    std::fs::write(&ledger, typed).unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().answered, 1);
+    let text = cli::run(&lab.paths[1], &["ls".to_owned()]).unwrap();
+    assert!(
+        text.contains("\n    note: no notarizing on this Mac\n"),
+        "{text}"
+    );
+}

@@ -217,7 +217,7 @@ pub fn parse(result: &Value) -> Option<Reading> {
 #[must_use]
 pub fn read_usage(server: AppServer, deadline: Instant) -> Option<Reading> {
     let hello = json!({
-        "clientInfo": {"name": "aterm", "version": env!("CARGO_PKG_VERSION")},
+        "clientInfo": {"name": "aterm", "version": aterm_stamp::app_version()},
         "capabilities": {"experimentalApi": true}
     });
     let mut rpc = hello_with(server, deadline, hello)?;

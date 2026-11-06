@@ -135,7 +135,7 @@ impl Fixture {
                 &stub,
                 atpkg::reroute::stub_body_sh(
                     name,
-                    Path::new(env!("CARGO_BIN_EXE_atpkg")),
+                    &aterm_tempfile::bin_exe("atpkg"),
                     &stubs,
                     false,
                 ),
@@ -167,7 +167,7 @@ impl Fixture {
     }
 
     fn rustc_with(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(["__reroute", "rustc"])
             .args(args)
             .current_dir(cwd)
@@ -275,7 +275,7 @@ fn a_process_the_copy_leaves_behind_never_holds_the_command() {
     let fx = Fixture::new("left-behind", "left-behind-rustc", LEFT_BEHIND_RUSTC);
     let pidfile = fx.root.join("left-behind.pid");
     let (stdout, stderr) = (fx.root.join("stdout"), fx.root.join("stderr"));
-    let mut atpkg = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+    let mut atpkg = Command::new(aterm_tempfile::bin_exe("atpkg"))
         .args(["__reroute", "rustc", "main.rs"])
         .current_dir(&fx.work)
         .env_clear()
@@ -414,7 +414,7 @@ fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
         );
     }
     let storeless = |fx: &Fixture, cwd: &Path| {
-        let out = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        let out = Command::new(aterm_tempfile::bin_exe("atpkg"))
             .args(["__reroute", "rustc", "main.rs"])
             .current_dir(cwd)
             .env_clear()

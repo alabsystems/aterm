@@ -47,7 +47,10 @@ pub fn agent_of(program: &str) -> Option<Agent> {
         Some(Agent::Codex)
     } else if is("agy") {
         Some(Agent::Agy)
-    } else if is("muse") || is_muse_build(word) {
+    } else if is("muse") || is("muse-alab") || is_muse_build(word) {
+        // muse-alab, the Muse Code harness, leads the session's foreground group and runs the
+        // vendor's muse as its child on the same terminal: the screen is Muse Code's
+        // (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 5).
         Some(Agent::Muse)
     } else if is("grok") || is("grok-alab") {
         // grok-alab, the Grok Build harness, leads the session's foreground group and runs the
@@ -116,6 +119,14 @@ mod tests {
                 "/Users//x/.local/bin/muse-bin-1.4.10-R6427.1",
                 Some(Agent::Muse),
             ),
+            ("muse-alab", Some(Agent::Muse)),
+            (
+                "/opt/pkg/store/muse-alab/7/bin/muse-alab resume x",
+                Some(Agent::Muse),
+            ),
+            ("Muse-Alab", Some(Agent::Muse)),
+            ("muse-alabs", None),
+            ("xmuse-alab", None),
             ("muse-bin-", None),
             ("muse-bin-latest", None),
             ("muse-binary", None),

@@ -11,9 +11,11 @@ use aterm_wayland::protocols::ALL;
 const RECORDING: &str = "wayland-scanner-0.31.10-interfaces.tsv";
 
 fn recorded() -> Vec<String> {
-    let path = format!("{}/tests/recorded/{RECORDING}", env!("CARGO_MANIFEST_DIR"));
+    let path = aterm_tempfile::manifest_dir()
+        .join("tests/recorded")
+        .join(RECORDING);
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_owned)

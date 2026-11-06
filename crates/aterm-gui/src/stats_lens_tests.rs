@@ -48,7 +48,8 @@ fn hour_ring(s: &Snapshot, i: usize, from: f64, noise: f64, r: &mut Rng) -> Arc<
             Cell {
                 mean: (!unread).then_some(v),
                 max: (!unread).then_some(v),
-                over: false,
+                n: if unread { 0.0 } else { 1.0 },
+                over_n: 0.0,
             }
         })
         .collect();
@@ -398,7 +399,7 @@ fn the_disk_lens_keeps_what_the_mockups_keep() {
         names(&tall[0]),
         [
             "Space now",
-            "GB free, last 24 hours",
+            "GB used, last 24 hours",
             "Where the space is",
             "Writing now"
         ]
@@ -407,12 +408,12 @@ fn the_disk_lens_keeps_what_the_mockups_keep() {
     assert!(one_line(&tall[0][2]) && one_line(&tall[0][3]), "{tall:?}");
 
     let short = disk_forms(&snap, 526.0, 154.0);
-    assert_eq!(names(&short[0]), ["Space now", "GB free, last 24 hours"]);
+    assert_eq!(names(&short[0]), ["Space now", "GB used, last 24 hours"]);
     assert!(one_line(&short[0][1]), "the Filling line: {short:?}");
 
     let wide = disk_forms(&snap, 1024.0, 250.0);
     assert_eq!(wide.len(), 2);
-    assert_eq!(names(&wide[0]), ["Space now", "GB free, last 24 hours"]);
+    assert_eq!(names(&wide[0]), ["Space now", "GB used, last 24 hours"]);
     assert!(!one_line(&wide[0][1]), "{wide:?}");
     assert_eq!(names(&wide[1]), ["Writing now", "Where the space is"]);
     assert!(wide[1].iter().all(|s| !one_line(s)), "{wide:?}");
@@ -440,6 +441,8 @@ fn well<'a>(laid: &'a LensLaid, name: &str) -> &'a str {
 fn a_chart_says_one_hour_ago_in_the_singular() {
     let trace = |n: usize| Trace {
         vals: vec![Some(885.0); n],
+        peaks: Vec::new(),
+        heat: Vec::new(),
         under: DAY,
         min_span: 1.0,
         mark: None,
@@ -477,6 +480,8 @@ fn a_chart_says_one_hour_ago_in_the_singular() {
 fn a_chart_says_an_unread_span_once() {
     let trace = Trace {
         vals: vec![Some(5.0), None, None, Some(7.0)],
+        peaks: Vec::new(),
+        heat: Vec::new(),
         under: HOUR,
         min_span: 1.0,
         mark: None,
@@ -523,10 +528,10 @@ fn the_disk_lens_says_its_reading() {
         laid.explainer
     );
     assert!(well(&laid, "Wrong?").starts_with("No."));
-    let chart = well(&laid, "GB free, last 24 hours");
+    let chart = well(&laid, "GB used, last 24 hours");
     assert!(
-        chart.starts_with("GB free over the last 24 hours: ")
-            && chart.contains(" gigabytes 24 hours ago, 890 now.")
+        chart.starts_with("GB used over the last 24 hours: ")
+            && chart.contains(" gigabytes 24 hours ago, 1110 now.")
             && chart.contains(" Not read from 21:20 to 01:30. ")
             && chart.ends_with("aterm freed 41 gigabytes at 09:12."),
         "{chart}"
@@ -540,7 +545,7 @@ fn the_disk_lens_says_its_reading() {
         f.0 = 1_230_000_000_000;
     }
     let big = heard(&big, pinned(Instrument::Disk));
-    let chart = well(&big, "GB free, last 24 hours");
+    let chart = well(&big, "GB used, last 24 hours");
     assert!(
         chart.ends_with("aterm freed 1.2 terabytes at 09:12."),
         "{chart}"
@@ -967,6 +972,178 @@ fn each_lens_shows_its_sections() {
     assert!(well(&net, "Open sockets").contains("no per-app network figure"));
     let now = well(&net, "Now");
     assert!(!now.is_empty(), "{now}");
+}
+
+/// The CPU lens of `snap` on `platform`: every word of its sections.
+fn cpu_lens_words(snap: &Snapshot, platform: Platform) -> Vec<String> {
+    let m = FaceMetrics::helvetica_neue();
+    let c = Ctx {
+        loc: Locale { platform, ..LOC },
+        ..two_columns(snap, &m)
+    };
+    cpu_doc(c)
+        .sections
+        .iter()
+        .flat_map(|s| s.words.clone())
+        .collect()
+}
+
+/// A3 L2 (D2, D3): on Linux the CPU lens prints only lines whose source answered: no IOReport
+/// window, CLPC mask, power limits or frequency and residency, whose sources a platform without
+/// CPU Stats answers `NO_SOURCE` for (the reader's own sample is that one:
+/// `a_platform_without_cpu_stats_reads_no_source`), nor the pointer to them; no ⌘⇧C line, a
+/// chord that copies no report on Linux; a heuristic thermal level as an estimate; and its load as
+/// load, never less the cores as threads waiting for one. NEGATIVE CONTROL: macOS's lens over a
+/// sample whose IOReport subscription was refused, an OS thermal level and the same load prints
+/// every one of them.
+#[test]
+fn the_linux_cpu_lens_prints_no_ioreport_clpc_or_power_limit_words() {
+    use aterm_vitals::hardware::Sample;
+    use aterm_vitals::model::{Thermal, Throttle};
+    let macos_words = [
+        "IOReport",
+        "CLPC",
+        "power limits",
+        "frequency/residency",
+        "\u{2318}\u{21e7}C copies",
+        "Inspect/export",
+        "waiting for a core",
+        "OS thermal state",
+    ];
+    let mut snap = lens_scene(Scene::Calm);
+    assert_eq!(
+        (snap.facts.load1, snap.total_cores()),
+        (Some(25.7), Some(18)),
+        "PRECONDITION: a load past the cores"
+    );
+    snap.hardware = Some(Sample::unavailable(aterm_vitals::sys::hardware::NO_SOURCE));
+    snap.thermal = Some(Thermal {
+        level: Throttle::None,
+        raw: 0,
+        low_power: None,
+        exact: false,
+    });
+    let linux = cpu_lens_words(&snap, Platform::Linux).join("\n");
+    for word in macos_words {
+        assert!(!linux.contains(word), "{word}: {linux}");
+    }
+    for said in [
+        "1-minute load 25.7 (counts disk waits too)",
+        "thermal estimate: none (from thermal-zone trips; this computer reports no thermal state)",
+    ] {
+        assert!(linux.contains(said), "{said}: {linux}");
+    }
+    snap.hardware = Some(Sample::unavailable("refused:ioreport_subscription"));
+    snap.thermal = Some(Thermal {
+        low_power: Some(false),
+        exact: true,
+        ..snap.thermal.expect("set above")
+    });
+    let mac = cpu_lens_words(&snap, Platform::MacOs).join("\n");
+    for word in macos_words {
+        assert!(mac.contains(word), "CONTROL: {word}: {mac}");
+    }
+}
+
+/// A3 L2 (D2): the CPU lens says what ⌘⇧C does only on a platform where that chord copies its
+/// diagnostic report: where aterm's hardcoded ⌘ (Super) suite is live, never on Linux, whose
+/// lens's key handler takes Super+Shift+C as its ⌘C, a copy of its sentence. The handler asks
+/// the same question of this build's platform. NEGATIVE CONTROL: the macOS and
+/// Windows lenses over the same reading print the key line.
+#[test]
+fn the_cpu_lens_key_line_prints_only_where_its_key_is_bound() {
+    assert_eq!(
+        cpu_report_key(Platform::host()),
+        crate::app_input::HARDCODED_SUPER_CHORDS
+    );
+    let mut snap = lens_scene(Scene::Calm);
+    snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable(
+        "refused:ioreport_subscription",
+    ));
+    for (platform, bound) in [
+        (Platform::MacOs, true),
+        (Platform::Windows, true),
+        (Platform::Linux, false),
+    ] {
+        assert_eq!(cpu_report_key(platform), bound, "{platform:?}");
+        let said = cpu_lens_words(&snap, platform)
+            .iter()
+            .any(|w| w.starts_with("\u{2318}\u{21e7}C copies the diagnostic report"));
+        assert_eq!(said, bound, "{platform:?}");
+    }
+}
+
+/// The GPU lens of `snap` on `platform`: its sources, then every word of its sections.
+fn gpu_lens_words(snap: &Snapshot, platform: Platform) -> (Vec<String>, String) {
+    let m = FaceMetrics::helvetica_neue();
+    let c = Ctx {
+        loc: Locale { platform, ..LOC },
+        ..two_columns(snap, &m)
+    };
+    let doc = text_well(c, Instrument::Gpu);
+    let words = doc
+        .sections
+        .iter()
+        .flat_map(|s| &s.words)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (doc.sources, words)
+}
+
+/// A3 L4 (D7): the GPU lens says the GPU uses unified system memory where its reader says it
+/// works in the system's memory (`GpuSample::unified`), whatever the platform and the name: NVML's
+/// GB10 on Linux says it, under NVML's own name. NEGATIVE CONTROL: an Apple-named GPU on macOS
+/// whose reading carries no such fact says nothing of it, nor does a discrete card on Linux.
+#[test]
+fn unified_memory_words_key_on_the_readers_fact_not_the_platform() {
+    const UNIFIED: &str = "uses unified system memory";
+    let reading = |name: &str, unified: bool| {
+        let mut snap = lens_scene(Scene::Calm);
+        let gpu = snap.facts.gpu.as_mut().expect("fixture GPU");
+        gpu.name = Some(name.into());
+        gpu.unified = unified;
+        snap
+    };
+    let (sources, words) = gpu_lens_words(&reading("NVIDIA GB10", true), Platform::Linux);
+    assert!(words.contains(UNIFIED), "{words}");
+    assert!(
+        sources
+            .iter()
+            .all(|s| s.starts_with("NVIDIA GB10 \u{b7} ") || s.starts_with("as of")),
+        "{sources:?}"
+    );
+    let (_, words) = gpu_lens_words(&reading("Apple M5 Max", true), Platform::MacOs);
+    assert!(words.contains(UNIFIED), "{words}");
+    for (name, platform) in [
+        ("Apple M5 Max", Platform::MacOs),
+        ("NVIDIA RTX PRO 6000", Platform::Linux),
+    ] {
+        let (_, words) = gpu_lens_words(&reading(name, false), platform);
+        assert!(
+            words.contains("GPU memory total not reported") && !words.contains(UNIFIED),
+            "{name} on {platform:?}: {words}"
+        );
+    }
+}
+
+/// A3 L4 (D7, §3.8): only macOS has a reader of the GPU recovery counter, so the Linux GPU lens
+/// prints no line of it. NEGATIVE CONTROL: the same reading on macOS says the counter is not read,
+/// and a reset the host observed is said on Linux too.
+#[test]
+fn the_linux_gpu_lens_prints_no_recovery_counter_line() {
+    let mut snap = lens_scene(Scene::Calm);
+    snap.facts.gpu_resets = None;
+    let gpu = snap.facts.gpu.as_mut().expect("fixture GPU");
+    gpu.name = Some("NVIDIA GB10".into());
+    gpu.recoveries = None;
+    let (_, linux) = gpu_lens_words(&snap, Platform::Linux);
+    assert!(!linux.contains("recovery counter"), "{linux}");
+    let (_, mac) = gpu_lens_words(&snap, Platform::MacOs);
+    assert!(mac.contains("GPU recovery counter not read"), "{mac}");
+    snap.facts.gpu_resets = Some((2, AT - MIN_MS));
+    let (_, reset) = gpu_lens_words(&snap, Platform::Linux);
+    assert!(reset.contains("reset 2"), "{reset}");
 }
 
 /// The lens's first line says used, available and total (`docs/DESIGN-stats-deck-flow-
@@ -2182,6 +2359,35 @@ fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets()
         tcp.contains("15 established") && tcp.contains("11 listen") && tcp.contains("1 time-wait"),
         "Network lens summarizes TCP states: {tcp}"
     );
+    let mut counters_only = snap.clone();
+    if let Some(net) = counters_only.net.as_mut() {
+        net.tcp = Some(aterm_vitals::TcpCounts {
+            established: 15,
+            time_wait: 1,
+            counters_only: true,
+            ..aterm_vitals::TcpCounts::default()
+        });
+    }
+    let unread = heard(&counters_only, pinned(Instrument::Network));
+    let states = well(&unread, "TCP states");
+    assert!(
+        states.contains("15 established or close-wait") && !states.contains("listen"),
+        "with only the counters read, the lens says no listen count, not 0: {states}"
+    );
+    assert!(
+        !well(&unread, "Open sockets").contains("16 open"),
+        "nor a machine total from two states"
+    );
+    if let Some(net) = counters_only.net.as_mut() {
+        net.aterm_sockets = None;
+        net.tab_sockets.clear();
+    }
+    let unread = heard(&counters_only, pinned(Instrument::Network));
+    let sockets = well(&unread, "Open sockets");
+    assert!(
+        sockets.contains("open sockets not read") && !sockets.contains("none open"),
+        "no dump: the socket scopes are unread, not none open: {sockets}"
+    );
     let net_drawn = lay_lens(
         &shell(1024.0, 250.0, 2.0),
         &input(&snap, dark_inks()),
@@ -2362,5 +2568,176 @@ fn how_to_read_and_traces_surface_multiscale_gaps_and_events() {
                 }
             }
         }
+    }
+}
+
+/// A lens trace keeps its own axis and its uniform time (`docs/DESIGN-stats-deck-units-2026-11-04.md`
+/// §7): the axis spans every mean and peak and labels as [`axis`] lays it, each of the 60 columns
+/// stands at `x0 + j · pitch`, and `skyline_box` draws it at its axis height, its tick at its
+/// peak's, both in the heat its lens names (not the heat of its height), its cap at its over
+/// share. An unread column draws no box.
+#[test]
+fn lens_traces_keep_their_axes_and_time_base() {
+    let inks = dark_inks();
+    let m = FaceMetrics::helvetica_neue();
+    let n = 60;
+    let vals: Vec<Option<f64>> = (0..n)
+        .map(|j| (!(20..24).contains(&j)).then_some(10.0 + 0.1 * j as f64))
+        .collect();
+    let peaks: Vec<Option<f64>> = vals.iter().map(|v| v.map(|v| v + 1.5)).collect();
+    let heat: Vec<HeatCell> = (0..n)
+        .map(|j| HeatCell {
+            heat: Some(0.08),
+            max: Some(0.45),
+            over: if j == 40 { 0.5 } else { 0.0 },
+            gap: None,
+        })
+        .collect();
+    let trace = Trace {
+        vals: vals.clone(),
+        peaks: peaks.clone(),
+        heat,
+        under: HOUR,
+        min_span: 0.5,
+        mark: None,
+        gaps: Vec::new(),
+        events: Vec::new(),
+    };
+    for scale in [1.0_f32, 2.0] {
+        let mut pen = Pen {
+            p: Painter::new(&inks, scale, 14.0 * scale, false),
+            m: &m,
+            inks,
+            ic: false,
+            s: f64::from(scale),
+            ox: 0.0,
+            oy: 0.0,
+            draw: true,
+            line_tab: 0.0,
+            boxes: Vec::new(),
+        };
+        let p = Place {
+            x: 12.0,
+            y: 30.0,
+            w: 420.0,
+            h: 120.0,
+        };
+        draw_trace(&mut pen, p, &trace);
+        let s = f64::from(scale);
+        let px = |v: f64| (v * s + 0.5).floor() as f32;
+        // The axis: over the means and the peaks, as `axis` lays it.
+        let ch = p.h - 32.0;
+        let read: Vec<f64> = vals.iter().chain(&peaks).flatten().copied().collect();
+        let (mn, mx) = read
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                (a.min(v), b.max(v))
+            });
+        let k = if ch >= 60.0 { 3 } else { 2 };
+        let (lo, step) = axis(mn, mx, k, trace.min_span);
+        let hi = lo + step * k as f64;
+        assert!(
+            hi >= mx && lo <= mn,
+            "CONTROL: the axis spans the peaks ({lo}..{hi})"
+        );
+        let dec = decimals(step).max(decimals(lo));
+        let labels: Vec<String> = (0..=k)
+            .map(|i| format!("{:.*}", dec, lo + step * i as f64))
+            .collect();
+        for l in &labels {
+            assert!(
+                pen.boxes.iter().any(|b| &b.text == l),
+                "{scale}×: the axis label {l:?} in {:?}",
+                pen.boxes.iter().map(|b| &b.text).collect::<Vec<_>>()
+            );
+        }
+        let gutter = labels
+            .iter()
+            .map(|l| m.width(l, AXIS_PT, false))
+            .fold(0.0, f64::max)
+            + 4.0;
+        let (x0, x1) = (p.x + gutter, p.x + p.w);
+        let (y0, y1) = (p.y + 18.0, p.y + 18.0 + ch);
+        let pitch = (x1 - x0) / n as f64;
+        let (top, bottom) = (px(y0), px(y1));
+        let h = bottom - top;
+        let track = rgba(inks.track, 0xFF);
+        let plates: Vec<(f32, f32)> = pen
+            .p
+            .prims
+            .iter()
+            .filter_map(|q| match *q {
+                DrawPrim::Panel {
+                    x,
+                    y,
+                    w,
+                    h: ph,
+                    fill,
+                    ..
+                } if fill == track && y == top && ph == h => Some((x, w)),
+                _ => None,
+            })
+            .collect();
+        let read_cols: Vec<usize> = (0..n).filter(|&j| vals[j].is_some()).collect();
+        assert_eq!(
+            plates.len(),
+            read_cols.len(),
+            "{scale}×: one plate a read column"
+        );
+        let gap = if pitch * s >= 4.0 { 1.0 } else { 0.0 };
+        let share = |v: f64| ((v - lo) / (hi - lo)) as f32;
+        for (&j, &(x, w)) in read_cols.iter().zip(&plates) {
+            let at = format!("{scale}×, column {j}");
+            let xa = px(x0 + j as f64 * pitch);
+            assert_eq!(x, xa, "{at}: uniform time");
+            assert_eq!(w, px(x0 + (j + 1) as f64 * pitch) - gap - xa, "{at}");
+            let v = vals[j].expect("read");
+            let want_h = (share(v) * h).round().clamp(1.0, h);
+            let column = pen.p.prims.iter().find_map(|q| match *q {
+                DrawPrim::Panel {
+                    x: cx,
+                    y,
+                    w: cw,
+                    h: chh,
+                    fill,
+                    ..
+                } if cx == x && cw == w && y + chh == bottom && fill != track => Some((chh, fill)),
+                _ => None,
+            });
+            assert_eq!(
+                column,
+                Some((want_h, rgba(inks.cell_at(0.08, false), 0xFF))),
+                "{at}: the column at its axis height in its lens's heat"
+            );
+            let peak_h = (share(peaks[j].expect("read")) * h).round().clamp(1.0, h);
+            let tick = pen.p.prims.iter().any(|q| {
+                matches!(*q, DrawPrim::Panel { y, h: th, fill, .. }
+                    if y == bottom - peak_h && th == 1.0 && fill == rgba(inks.cell_at(0.45, false), 0xFF))
+            });
+            assert_eq!(tick, peak_h >= want_h + 2.0, "{at}: the peak tick");
+        }
+        let over = rgba(inks.over, 0xFF);
+        let caps: Vec<f32> = pen
+            .p
+            .prims
+            .iter()
+            .filter_map(|q| match *q {
+                DrawPrim::Panel { x, y, fill, .. } if fill == over && y < top => Some(x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(caps.len(), 1, "{scale}×: column 40's cap alone");
+        let (cx0, cx1) = (px(x0 + 40.0 * pitch), px(x0 + 41.0 * pitch));
+        assert!(
+            (cx0..cx1).contains(&caps[0]),
+            "{scale}×: the cap over its column"
+        );
+        assert!(
+            !pen.p
+                .prims
+                .iter()
+                .any(|q| matches!(q, DrawPrim::Line { .. })),
+            "{scale}×: no step line is left"
+        );
     }
 }

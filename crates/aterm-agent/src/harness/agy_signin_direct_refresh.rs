@@ -14,7 +14,7 @@ pub(super) fn run_with(
     state: &Path,
     home: &Path,
     account: &str,
-    deadline: Instant,
+    deadline: WakeDeadline,
     mut read: impl FnMut(
         &str,
         &str,
@@ -29,7 +29,7 @@ pub(super) fn run_with(
         &Path,
         &str,
         Option<StagedGoogleLogin<'_>>,
-        Instant,
+        WakeDeadline,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     let failure = || GoogleLoginError::Native(Error::Profile);
@@ -72,7 +72,7 @@ pub(super) fn run_with(
             binding.expected_email(),
             remaining(deadline)
                 .map_err(GoogleLoginError::Native)?
-                .min(Duration::from_secs(30)),
+                .min(GOOGLE_REQUEST),
         );
         remaining(deadline).map_err(GoogleLoginError::Native)?;
         journal.unchanged().map_err(GoogleLoginError::Recovery)?;
@@ -150,7 +150,7 @@ pub(super) fn run_with(
         ("pending-native-google-direct-renewal", None),
     )?;
     let mut verified = staged
-        .verify_with_retry(deadline, &mut read, std::thread::sleep, Instant::now)
+        .verify_with_retry(|| deadline.remaining(), &mut read, std::thread::sleep)
         .map_err(|_| {
             GoogleLoginError::Recovery("Renewed direct Google credential could not be verified")
         })?;

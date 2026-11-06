@@ -242,7 +242,7 @@ impl Part {
         Error::local(format!("{}: the part file is closed", path.display()))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn file(&mut self) -> Result<&mut File> {
         Ok(self.path_and_file()?.1)
     }
@@ -309,7 +309,7 @@ fn copy(
     seen: &mut dyn FnMut(&[u8]),
     wrote: &dyn Fn(&std::io::Error) -> Error,
 ) -> Result<u64> {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
         let n = match body.read(&mut buf) {
@@ -415,7 +415,18 @@ pub(crate) fn open_regular_dest_nonblocking(path: &Path) -> std::io::Result<File
 /// The sha256 of the regular file at `path` (never following a symlink); `None` when absent.
 /// Anything there other than a regular file is usage (`refuse_non_file`), judged unfollowed and on
 /// the open handle.
+#[cfg(all(test, unix))]
 fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
+    Ok(file_digest_if_size(path, None)?.flatten())
+}
+
+/// Inspects the regular file at `path` (never following a symlink): returns `Ok(None)` when
+/// absent, `Ok(Some(None))` when present as a regular file whose length differs from
+/// `expected_size`, and `Ok(Some(Some(digest)))` when hashed.
+fn file_digest_if_size(
+    path: &Path,
+    expected_size: Option<u64>,
+) -> Result<Option<Option<Sha256Digest>>> {
     #[cfg(not(unix))]
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {}
@@ -446,8 +457,11 @@ fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
             return Err(not_a_file(path));
         }
     }
+    if expected_size.is_some_and(|size| metadata.len() != size) {
+        return Ok(Some(None));
+    }
     let mut hasher = aterm_digest::Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = [0u8; 64 * 1024];
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
@@ -456,7 +470,7 @@ fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
             Err(e) => return Err(local("cannot read", path, &e)),
         }
     }
-    Ok(Some(Sha256Digest::from_bytes(hasher.finalize())))
+    Ok(Some(Some(Sha256Digest::from_bytes(hasher.finalize()))))
 }
 
 /// Conflict: `dest` holds other bytes and `clobber` is off.
@@ -523,8 +537,8 @@ fn fetch_inner(
         }));
     }
     if let (Sink::File { path, clobber }, Some(digest)) = (&sink, expect.digest) {
-        match file_digest(path)? {
-            Some(there) if there == digest => {
+        match file_digest_if_size(path, Some(expect.size))? {
+            Some(Some(there)) if there == digest => {
                 return Ok(Downloaded {
                     asset_id: asset.id,
                     bytes: expect.size,
@@ -641,9 +655,9 @@ fn fetch_inner(
             clobber,
         } => {
             part.durable()?;
-            match file_digest(&dest)? {
+            match file_digest_if_size(&dest, Some(bytes))? {
                 None => part.finish(&dest)?,
-                Some(there) if there == got => {
+                Some(Some(there)) if there == got => {
                     drop(part);
                     done.written = false;
                 }

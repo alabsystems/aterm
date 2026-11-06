@@ -1156,6 +1156,7 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
         Source::Screen {
             program: "agy".to_string(),
         },
+        Source::Output,
     ] {
         assert_eq!(Source::parse(&source.line()), Some(source.clone()));
     }
@@ -1249,6 +1250,46 @@ fn a_screens_result_is_the_landings_words() {
         "ERR result unavailable why=no-transcript\n"
     );
     assert!(snapshot_screen(&tasks, "../x", "agy", &said, DoneBy::Turn).is_err());
+}
+
+#[test]
+fn a_programs_result_is_its_output_tail() {
+    let tasks = ScratchDir::new("result", "output");
+    let output = "building\nall 12 passed\n\n";
+    let snap = snapshot_output(&tasks, "s-p1-2", output, DoneBy::Turn).expect("written");
+    assert_eq!(snap.unavailable, None);
+    assert_eq!(
+        std::fs::read_to_string(&snap.path).expect("the result"),
+        "building\nall 12 passed",
+        "trailing blank lines are no output"
+    );
+    assert_eq!(source_of(&snap.path), Some(Source::Output));
+    assert_eq!(
+        answer(&snap.path, false),
+        "OK 2 source=output bytes=22\nbuilding\nall 12 passed\n",
+        "framed as a screen's result is"
+    );
+    assert_eq!(
+        answer(&snap.path, true),
+        "ERR result unavailable why=no-transcript\n",
+        "a program keeps no transcript to read whole"
+    );
+    let failed = snapshot_output(&tasks, "s-p2-2", "boom", DoneBy::Failed).expect("written");
+    assert_eq!(
+        answer(&failed.path, false),
+        "OK 1 source=output bytes=4\nboom\n"
+    );
+    let blank = snapshot_output(&tasks, "s-p3-2", " \n\n", DoneBy::Turn).expect("written");
+    assert_eq!(
+        blank.unavailable,
+        Some("empty"),
+        "a silent program has no result"
+    );
+    assert_eq!(
+        answer(&blank.path, false),
+        "ERR result unavailable why=empty\n"
+    );
+    assert!(snapshot_output(&tasks, "../x", "boom", DoneBy::Turn).is_err());
 }
 
 #[test]

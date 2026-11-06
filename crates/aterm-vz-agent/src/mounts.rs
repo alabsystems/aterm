@@ -47,13 +47,7 @@ pub enum Op {
     ReadOnly(PathBuf),
 }
 
-/// A mountinfo field with its octal escapes (`\040` for a space) decoded.
-fn unescape(field: &str) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt as _;
-    if !field.contains('\\') {
-        return PathBuf::from(field);
-    }
-    let b = field.as_bytes();
+fn unescape_bytes(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -71,7 +65,25 @@ fn unescape(field: &str) -> PathBuf {
         out.push(b[i]);
         i += 1;
     }
-    PathBuf::from(std::ffi::OsString::from_vec(out))
+    out
+}
+
+/// A mountinfo field with its octal escapes (`\040` for a space) decoded.
+fn unescape(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt as _;
+    if !field.contains('\\') {
+        return PathBuf::from(field);
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(unescape_bytes(
+        field.as_bytes(),
+    )))
+}
+
+fn unescape_str(field: &str) -> Option<String> {
+    if !field.contains('\\') {
+        return Some(field.to_owned());
+    }
+    String::from_utf8(unescape_bytes(field.as_bytes())).ok()
 }
 
 /// Every well-formed line of `/proc/self/mountinfo`'s text.
@@ -89,8 +101,8 @@ pub fn parse(mountinfo: &str) -> Vec<Mounted> {
             Some(Mounted {
                 root: unescape(root),
                 point: unescape(point),
-                fstype: unescape(tail.next()?).into_os_string().into_string().ok()?,
-                source: unescape(tail.next()?).into_os_string().into_string().ok()?,
+                fstype: unescape_str(tail.next()?)?,
+                source: unescape_str(tail.next()?)?,
             })
         })
         .collect()
@@ -98,12 +110,14 @@ pub fn parse(mountinfo: &str) -> Vec<Mounted> {
 
 /// Whether `path` is absolute, names no `.` or `..`, and is not `/` or under [`AT`].
 fn bindable(path: &Path) -> bool {
-    path.is_absolute()
-        && path.components().count() > 1
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-        && !path.starts_with(AT)
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let Some(Component::Normal(_)) = comps.next() else {
+        return false;
+    };
+    comps.all(|c| matches!(c, Component::Normal(_))) && !path.starts_with(AT)
 }
 
 /// The steps that take `mounted` to the share at [`AT`] with exactly `shares` bound: every
@@ -266,7 +280,7 @@ pub fn ensure_plain_dir(at: &Path) -> Result<(), String> {
 pub fn check(mounted: &[Mounted], shares: &[Share]) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     for s in shares {
-        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&s.path));
+        let path = Path::new(std::ffi::OsStr::from_bytes(&s.path));
         let want = Path::new("/").join(&s.name);
         match mounted.iter().rev().find(|m| m.point == path) {
             Some(m) if m.fstype == FSTYPE && m.source == TAG && m.root == want => {}

@@ -22,13 +22,15 @@
 //! at its length, and what the other Macs lack of it reaches them by `Inventory`, which a relay
 //! with no cursor starts ([`crate::inventory`]).
 //!
-//! **Provenance.** A table record the ingest consumer applied is appended with
-//! `aterm_db::table::store::Via::Mesh`, and its feed says so: the egress steps past it. A
-//! membership record the ingest consumer applied is noted in [`Egress::arrived`] before its store
-//! is written; its id is skipped once. Only records the node service itself ingests come in by
-//! the mesh, so a record another process appended is always this Mac's to publish. A crash between
-//! a store's append and the cursor's write publishes a record a second time at the next start: a
-//! duplicate every store answers by its digest.
+//! **Provenance.** Every record the mesh delivers (by the relay or by `Inventory`) is noted in
+//! [`Egress::arrived`] before its store is written, and the note is on disk ([`ARRIVED_FILE`])
+//! before the write. The egress steps past each noted record once: by its append's feed (a table
+//! record's also says `aterm_db::table::store::Via::Mesh`), or, where that feed was dropped from a
+//! full queue or the node stopped before the egress read it, by the catch-up that reads it from its
+//! store. Only records the node service itself ingests come in by the mesh, so a record another
+//! process appended is always this Mac's to publish. A crash between a publish and its cursor's
+//! write publishes the record a second time at the next start: a duplicate every store answers by
+//! its digest.
 //!
 //! **What the tables hold.** The egress keeps the ids of the operations each primary table store
 //! holds: at its first catch-up it reads each store's records once, and after that it adds each
@@ -48,6 +50,18 @@ use std::time::{Duration, Instant};
 
 /// The file beside `tables.log` that keeps the egress's cursors.
 pub const CURSORS_FILE: &str = "egress";
+
+/// The ids of the records the mesh delivered that the egress has not yet stepped past, one lowercase
+/// hex digest a line, beside [`CURSORS_FILE`] ([`Egress::arrived`]): what tells a catch-up that a
+/// record its store holds came by the mesh, after a feed was dropped or the node stopped between a
+/// store's append and the egress reading it.
+pub const ARRIVED_FILE: &str = "arrived";
+
+/// The most ids [`ARRIVED_FILE`] keeps. An id whose record never reached its store (a duplicate a
+/// store answered without an append, or a stop before the append) is dropped past it, so the worst
+/// a full file costs is one record published a second time, which every store answers by its
+/// digest.
+const ARRIVED_MAX: usize = 65_536;
 
 /// The wake socket in `<state_dir>/mesh/`: a datagram socket another process's store write wakes
 /// the egress on.
@@ -113,12 +127,15 @@ impl Wake {
     /// Its datagram.
     #[must_use]
     pub fn encode(&self) -> String {
+        use std::fmt::Write as _;
         match self {
-            Self::Table { key, length } => format!(
-                "atm-wake 1 table {} {} {length}\n",
-                aterm_codec::hex::encode_lower(&key.table),
-                if key.recovery { 'r' } else { 'p' }
-            ),
+            Self::Table { key, length } => {
+                let mut out = String::with_capacity(96);
+                out.push_str("atm-wake 1 table ");
+                aterm_codec::hex::push_lower(&mut out, &key.table);
+                let _ = writeln!(out, " {} {length}", if key.recovery { 'r' } else { 'p' });
+                out
+            }
             Self::Members { length } => format!("atm-wake 1 members {length}\n"),
         }
     }
@@ -204,22 +221,24 @@ struct Cursors {
 
 impl Cursors {
     fn encode(&self) -> String {
-        let mut text = String::new();
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity((self.tables.len() + self.last.len()) * 88 + 24);
         for (key, published) in &self.tables {
-            text.push_str(&format!(
-                "t {} {} {published}\n",
-                aterm_codec::hex::encode_lower(&key.table),
+            text.push_str("t ");
+            aterm_codec::hex::push_lower(&mut text, &key.table);
+            let _ = writeln!(
+                text,
+                " {} {published}",
                 if key.recovery { 'r' } else { 'p' }
-            ));
+            );
         }
         if let Some(members) = self.members {
-            text.push_str(&format!("m {members}\n"));
+            let _ = writeln!(text, "m {members}");
         }
         for (table, offset) in &self.last {
-            text.push_str(&format!(
-                "l {} {offset}\n",
-                aterm_codec::hex::encode_lower(table)
-            ));
+            text.push_str("l ");
+            aterm_codec::hex::push_lower(&mut text, table);
+            let _ = writeln!(text, " {offset}");
         }
         text
     }
@@ -229,11 +248,16 @@ impl Cursors {
     fn decode(text: &str) -> Self {
         let mut cursors = Self::default();
         for line in text.lines() {
-            let words: Vec<&str> = line.split(' ').collect();
-            match words.as_slice() {
-                ["t", hex, region, published] => {
+            let mut words = line.split(' ');
+            match words.next() {
+                Some("t") => {
+                    let (Some(hex), Some(region), Some(published), None) =
+                        (words.next(), words.next(), words.next(), words.next())
+                    else {
+                        continue;
+                    };
                     let mut table = [0u8; 32];
-                    let recovery = match *region {
+                    let recovery = match region {
                         "p" => false,
                         "r" => true,
                         _ => continue,
@@ -247,8 +271,17 @@ impl Cursors {
                             .insert(TableKey { table, recovery }, published);
                     }
                 }
-                ["m", published] => cursors.members = published.parse().ok(),
-                ["l", hex, offset] => {
+                Some("m") => {
+                    if let (Some(published), None) = (words.next(), words.next()) {
+                        cursors.members = published.parse().ok();
+                    }
+                }
+                Some("l") => {
+                    let (Some(hex), Some(offset), None) =
+                        (words.next(), words.next(), words.next())
+                    else {
+                        continue;
+                    };
                     let mut table = [0u8; 32];
                     if aterm_codec::hex::is_lower(hex, 64)
                         && aterm_codec::hex::decode_into(hex.as_bytes(), &mut table)
@@ -273,7 +306,8 @@ pub struct Egress {
     state: Mutex<State>,
     /// Rung each time a cursor moves: a push waits on it.
     moved: Condvar,
-    arrived: Mutex<BTreeSet<Digest>>,
+    /// The ids in [`ARRIVED_FILE`], and whether they changed since it was last written.
+    arrived: Mutex<(BTreeSet<Digest>, bool)>,
     /// The operations each primary table store holds, as far as this egress has read them.
     table_holdings: Mutex<TableHoldings>,
     /// A feed was dropped from a full queue: the next pass catches every store up from its
@@ -355,7 +389,7 @@ impl Egress {
             bell: Arc::new(Bell::default()),
             state: Mutex::new(state),
             moved: Condvar::new(),
-            arrived: Mutex::new(BTreeSet::new()),
+            arrived: Mutex::new((read_arrived(dir), false)),
             table_holdings: Mutex::new(TableHoldings::default()),
             overflowed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -406,10 +440,78 @@ impl Egress {
         self.state.lock_or_recover().cursors.members
     }
 
-    /// Note the membership records `ids` the mesh delivered, before their store is written: each
-    /// is stepped past once.
+    /// Note the records `ids` the mesh delivered (membership records and table records alike, by
+    /// the digest of their bytes), before their store is written: each is stepped past once, by
+    /// the feed of its append or by a catch-up that reads it from its store. They are on disk
+    /// ([`ARRIVED_FILE`]) before this returns, so a catch-up after a stop steps past them too.
     pub fn arrived(&self, ids: impl IntoIterator<Item = Digest>) {
-        self.arrived.lock_or_recover().extend(ids);
+        let mut arrived = self.arrived.lock_or_recover();
+        let before = arrived.0.len();
+        arrived.0.extend(ids);
+        while arrived.0.len() > ARRIVED_MAX {
+            arrived.0.pop_first();
+        }
+        if arrived.0.len() != before {
+            arrived.1 = true;
+        }
+        self.flush_arrived(&mut arrived);
+    }
+
+    /// Hand `wires`, which the mesh delivered, to their store by `ingest`, noting each as arrived
+    /// first ([`Self::arrived`]) and forgetting each the store did not apply ([`Self::forget`]).
+    pub(crate) fn delivering(
+        &self,
+        wires: &[Vec<u8>],
+        ingest: impl FnOnce() -> Vec<crate::stores::Verdict>,
+    ) -> Vec<crate::stores::Verdict> {
+        let ids: Vec<Digest> = wires.iter().map(|wire| stores::digest(wire)).collect();
+        self.arrived(ids.iter().copied());
+        let verdicts = ingest();
+        self.forget(
+            ids.iter()
+                .zip(&verdicts)
+                .filter(|(_, verdict)| !matches!(verdict, crate::stores::Verdict::Applied))
+                .map(|(id, _)| *id),
+        );
+        verdicts
+    }
+
+    /// The noted `ids` whose records their store did not take (refused, waiting or busy): nothing
+    /// will step past them. A record a store held already answers as applied, so its id stays
+    /// until [`ARRIVED_MAX`] drops it.
+    pub fn forget(&self, ids: impl IntoIterator<Item = Digest>) {
+        let mut arrived = self.arrived.lock_or_recover();
+        for id in ids {
+            arrived.1 |= arrived.0.remove(&id);
+        }
+        self.flush_arrived(&mut arrived);
+    }
+
+    /// Whether the mesh delivered the record `id`, stepping past it. The file is written with the
+    /// next cursors, after them: a stop between the two leaves an id that steps past nothing,
+    /// never a delivered record that is published.
+    fn take_arrived(&self, id: &Digest) -> bool {
+        let mut arrived = self.arrived.lock_or_recover();
+        let took = arrived.0.remove(id);
+        arrived.1 |= took;
+        took
+    }
+
+    fn flush_arrived(&self, arrived: &mut (BTreeSet<Digest>, bool)) {
+        if !arrived.1 {
+            return;
+        }
+        let text: String = arrived
+            .0
+            .iter()
+            .map(|id| format!("{}\n", aterm_codec::hex::encode_lower(id)))
+            .collect();
+        match aterm_uds::private_file::write_private(&self.dir, ARRIVED_FILE, text.as_bytes()) {
+            Ok(()) => arrived.1 = false,
+            Err(e) => {
+                aterm_log::warn!("mesh: the egress's {ARRIVED_FILE} could not be written: {e}")
+            }
+        }
     }
 
     /// Wake the egress: a lease settled, or it should look at its queue now.
@@ -558,6 +660,8 @@ impl Egress {
         ) {
             aterm_log::warn!("mesh: the egress's {CURSORS_FILE} could not be written: {e}");
         }
+        // The ids stepped past go after the cursors that passed them ([`Self::take_arrived`]).
+        self.flush_arrived(&mut self.arrived.lock_or_recover());
     }
 
     /// The thread's body: catch up every store from its cursor, then publish what each feed
@@ -670,7 +774,10 @@ impl Egress {
                         if cursor.unwrap_or(0) > held.offset {
                             return Ok(());
                         }
-                        if !*mesh_borne || self.republishes() {
+                        // Its id steps past once either way: the feed says how it came.
+                        let delivered =
+                            self.take_arrived(&stores::digest(&held.wire)) || *mesh_borne;
+                        if !delivered || self.republishes() {
                             self.publish_one(mesh, *key, held)?;
                         }
                         self.set_cursor(*key, held.offset + 1);
@@ -724,7 +831,11 @@ impl Egress {
                 if record.offset < cursor {
                     continue;
                 }
-                self.publish_one(mesh, key, record)?;
+                // A record the mesh delivered, whose feed this egress never read.
+                let delivered = self.take_arrived(&stores::digest(&record.wire));
+                if !delivered || self.republishes() {
+                    self.publish_one(mesh, key, record)?;
+                }
                 self.set_cursor(key, record.offset + 1);
             }
         }
@@ -766,7 +877,7 @@ impl Egress {
                 continue;
             }
             let id = stores::digest(record);
-            let delivered = self.arrived.lock_or_recover().remove(&id);
+            let delivered = self.take_arrived(&id);
             if !delivered || self.republishes() {
                 mesh.publish(MeshLog::Tables, &subject, record)?;
                 self.state.lock_or_recover().published += 1;
@@ -780,6 +891,26 @@ impl Egress {
         self.moved.notify_all();
         Ok(())
     }
+}
+
+/// The ids [`ARRIVED_FILE`] in `dir` holds, each a lowercase hex digest a line; a line that is not
+/// one is skipped, and a missing or unreadable file holds none.
+fn read_arrived(dir: &Path) -> BTreeSet<Digest> {
+    let Ok(bytes) =
+        aterm_uds::private_file::read_private(dir, ARRIVED_FILE, (ARRIVED_MAX + 1) * 65)
+    else {
+        return BTreeSet::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut id = [0u8; 32];
+            (aterm_codec::hex::is_lower(line, 64)
+                && aterm_codec::hex::decode_into(line.as_bytes(), &mut id))
+            .then_some(id)
+        })
+        .take(ARRIVED_MAX)
+        .collect()
 }
 
 /// The wake socket's reader: bound in `<state_dir>/mesh/`, it hands each wake to the egress, and
@@ -805,14 +936,17 @@ impl WakeSocket {
         })
     }
 
-    /// Read wakes until `egress` stops.
-    pub(crate) fn run(&self, egress: &Egress) {
+    /// Read wakes until `egress` stops, and answer each push another process asks
+    /// ([`crate::push`]).
+    pub(crate) fn run(&self, egress: &Egress, mesh: &std::sync::Weak<Mesh>) {
         let mut buf = [0u8; WAKE_MAX];
         while !egress.stopped() {
-            match self.socket.recv(&mut buf) {
-                Ok(n) => {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
                     if let Some(wake) = Wake::decode(&buf[..n]) {
                         egress.feed(wake.feed());
+                    } else if let Some((table, within)) = crate::push::read_ask(&buf[..n]) {
+                        crate::push::answer(&self.socket, mesh, table, within, &from);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}

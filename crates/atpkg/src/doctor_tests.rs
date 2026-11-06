@@ -466,7 +466,14 @@ fn doctor_fails_when_the_c_toolchain_cannot_build() {
             true,
             false,
         ),
-        (CcVerdict::Unanswered { driver: cc.clone() }, true, false),
+        (
+            CcVerdict::Unanswered {
+                driver: cc.clone(),
+                bound: crate::prereq::PROBE_TIMEOUT,
+            },
+            true,
+            false,
+        ),
     ] {
         let label = format!("{verdict:?}");
         let probes = Probes {

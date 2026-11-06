@@ -17,6 +17,7 @@ use super::google_credentials::Credentials;
 use super::google_identity::{Identity, Registry};
 use super::headless_oauth::{self as oauth, FlowBound, Gate, Step, VendorApprover};
 use super::login_drive::{self, Approval, Handoff};
+use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::{Cli, Region};
 
 #[path = "google_federation_recovery.rs"]
@@ -229,7 +230,7 @@ impl PendingFederation {
         mut self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: Instant,
+        deadline: WakeDeadline,
         journal: Option<&recovery::Journal>,
     ) -> Result<(), String> {
         let cached = self.native.take();
@@ -244,12 +245,14 @@ impl PendingFederation {
             let now = aterm_time::unix_secs()
                 .and_then(|now| i64::try_from(now).ok())
                 .ok_or("Kimi account clock is unavailable")?;
+            // Kimi's native check is a leaf that takes an `Instant`: its requests' own timeouts
+            // bound it, and the checks around it read both clocks.
             let result = verify_native_kimi_classified(
                 request.staging,
                 scope.region,
                 &scope.expected,
                 now,
-                deadline,
+                deadline.instant(),
             );
             if let Some(journal) = journal {
                 journal.check(request)?;
@@ -279,7 +282,7 @@ impl PendingFederation {
         mut self,
         request: &login_drive::Request<'_>,
         journal: &recovery::Journal,
-        deadline: Instant,
+        deadline: WakeDeadline,
     ) -> Result<KimiProof, String> {
         let native = self
             .native
@@ -306,7 +309,7 @@ impl PendingFederation {
         self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: Instant,
+        deadline: WakeDeadline,
         verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
     ) -> Result<(), String> {
         self.complete_checked(request, outcome, deadline, None, verify)
@@ -317,7 +320,7 @@ impl PendingFederation {
         self,
         request: &login_drive::Request<'_>,
         outcome: &login_drive::Outcome,
-        deadline: Instant,
+        deadline: WakeDeadline,
         journal: Option<&recovery::Journal>,
         verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
     ) -> Result<Option<KimiProof>, String> {
@@ -325,12 +328,12 @@ impl PendingFederation {
             return Ok(None);
         }
         self.scope.check_request(request)?;
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err("Kimi federation verification deadline expired".into());
         }
         let native = verify(&self.scope)?;
         self.scope.check_request(request)?;
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err("Kimi federation verification deadline expired".into());
         }
         let proof = VerifiedKimiGoogle {
@@ -344,7 +347,7 @@ impl PendingFederation {
                 .commit_kimi(&proof)
                 .map_err(|_| "Verified Kimi Google session could not be persisted")?;
         }
-        if Instant::now() >= deadline {
+        if deadline.passed() {
             return Err("Kimi federation verification deadline expired".into());
         }
         proof.check_browser_identity(&proof.scope.identity)?;
@@ -590,7 +593,7 @@ fn run(
     pending_session: &mut Option<PendingSession>,
     configuration_current: impl Fn() -> bool,
 ) -> Approval {
-    if Instant::now() >= handoff.deadline {
+    if handoff.deadline.passed() {
         return quiet("Google federation reached its deadline");
     }
     if !configuration_current() {
@@ -658,7 +661,7 @@ fn run(
         types_email: approver.types_email,
     };
     loop {
-        if Instant::now() >= handoff.deadline {
+        if handoff.deadline.passed() {
             return quiet("Google federation reached its deadline");
         }
         if !configuration_current() {
@@ -964,7 +967,7 @@ fn verification_mail(
     identity: &Identity,
     approver: &VendorApprover,
     started: Option<i64>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     seen: &mut BTreeSet<String>,
 ) -> Result<String, &'static str> {
     verification_mail_from(
@@ -985,7 +988,7 @@ pub(super) fn verification_mail_from(
     home: Option<&Path>,
     source: Option<&oauth::MailboxConfig>,
     started: Option<i64>,
-    deadline: Instant,
+    deadline: WakeDeadline,
     seen: &mut BTreeSet<String>,
 ) -> Result<String, &'static str> {
     let target = identity
@@ -998,7 +1001,7 @@ pub(super) fn verification_mail_from(
     config.strict_since = true;
     // The code-only relay has no account-body witness. Use a full-message reader here.
     config.relay_enabled = false;
-    let left = deadline.saturating_duration_since(Instant::now());
+    let left = deadline.remaining();
     if left.is_zero() {
         return Err("Google verification mail deadline expired");
     }
@@ -1412,9 +1415,9 @@ mod tests {
                 }
             };
             let deadline = if scenario == 3 {
-                Instant::now()
+                WakeDeadline::after(Duration::ZERO)
             } else {
-                Instant::now() + Duration::from_secs(60)
+                WakeDeadline::after(Duration::from_secs(60))
             };
             let result = pending.complete_using(&request, &outcome, deadline, |_| {
                 assert!(
@@ -1634,7 +1637,7 @@ mod tests {
             hosts: HOSTS,
             email: Some("person@example.com"),
             finished: &|| false,
-            deadline: Instant::now(),
+            deadline: WakeDeadline::after(Duration::ZERO),
         };
         assert!(configured(&mut approver, &handoff).is_none());
         let text = "[[identities]]\nid='one'\nemail='person@example.com'\ncredential_ref='missing-google-entry'\n[[bindings]]\nprovider='kimi-global'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
@@ -1676,7 +1679,7 @@ mod tests {
             identity,
             root.path(),
             home.as_deref(),
-            Instant::now() + Duration::from_secs(60),
+            WakeDeadline::after(Duration::from_secs(60)),
         )
         .unwrap();
         let page = browser.open("about:blank").unwrap();
@@ -2007,8 +2010,13 @@ mod tests {
         let identity = registry.resolve("kimi-global", "probe").unwrap().0;
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut browser =
-            MemoryBrowser::start(identity, root.path(), home.as_deref(), deadline).unwrap();
+        let mut browser = MemoryBrowser::start(
+            identity,
+            root.path(),
+            home.as_deref(),
+            WakeDeadline::after(deadline.saturating_duration_since(Instant::now())),
+        )
+        .unwrap();
         let page = browser.open("https://www.kimi.ai/login").unwrap();
         let mut last_select = Instant::now() - Duration::from_secs(2);
         let mut clicks = 0;
@@ -2179,8 +2187,13 @@ mod tests {
             .unwrap_or("https://claude.ai/login");
         #[cfg(not(target_os = "macos"))]
         let start = "https://claude.ai/login";
-        let mut browser =
-            MemoryBrowser::start(identity, root.path(), home.as_deref(), deadline).unwrap();
+        let mut browser = MemoryBrowser::start(
+            identity,
+            root.path(),
+            home.as_deref(),
+            WakeDeadline::after(deadline.saturating_duration_since(Instant::now())),
+        )
+        .unwrap();
         let page = browser.open(start).unwrap();
         let mut last_select = Instant::now() - Duration::from_secs(2);
         let mut clicks = 0;
@@ -2298,7 +2311,7 @@ mod tests {
                 &identity("person@example.com"),
                 &approver,
                 Some(1000),
-                Instant::now() + Duration::from_secs(1),
+                WakeDeadline::after(Duration::from_secs(1)),
                 &mut seen
             )
             .unwrap(),
@@ -2309,7 +2322,7 @@ mod tests {
                 &identity("other@example.com"),
                 &approver,
                 Some(1000),
-                Instant::now() + Duration::from_secs(1),
+                WakeDeadline::after(Duration::from_secs(1)),
                 &mut seen
             )
             .unwrap(),
@@ -2320,7 +2333,7 @@ mod tests {
                 &identity("person@example.com"),
                 &approver,
                 Some(1000),
-                Instant::now() + Duration::from_millis(50),
+                WakeDeadline::after(Duration::from_millis(50)),
                 &mut seen
             )
             .is_err(),

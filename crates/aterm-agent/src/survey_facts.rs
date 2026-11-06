@@ -59,6 +59,8 @@ pub struct ServerHeardFact {
 /// replies (`OK <n>\ninstance …\n…`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwarmSurveyFacts {
+    /// Host-checked release process identities and their last row boundaries.
+    pub release_lines: Vec<String>,
     /// Fleet node id (`node=` on `instance`), when enrolled in a fleet.
     pub node: Option<String>,
     /// Canonical machine label (`m<N>` or configured `[ai]`/`[fleet] machine` / vault host).
@@ -157,10 +159,11 @@ impl SwarmSurveyFacts {
         match Env::from_process() {
             Ok(env) => Self::collect_in(&env, sessions, window, node, cached_system_ssh_host_key()),
             Err(_) => Self {
+                release_lines: Vec::new(),
                 node,
                 label: None,
                 roster_unread: false,
-                version: aterm_types::version::app_version().to_owned(),
+                version: aterm_stamp::app_version().to_owned(),
                 window,
                 window_last: window.then(|| u64::try_from(now.max(0)).unwrap_or(0)),
                 sessions,
@@ -236,10 +239,11 @@ impl SwarmSurveyFacts {
         let server_heard = collect_server_heard(env);
         let home = env.home.as_deref().filter(|home| home.is_absolute());
         Self {
+            release_lines: crate::release_progress::survey(&env.state),
             node,
             label,
             roster_unread,
-            version: aterm_types::version::app_version().to_owned(),
+            version: aterm_stamp::app_version().to_owned(),
             window,
             window_last,
             sessions,
@@ -330,6 +334,7 @@ impl SwarmSurveyFacts {
         };
         let mut lines =
             Vec::with_capacity(self.accounts.len() + repos.len() + self.server_heard.len());
+        lines.extend(self.release_lines.iter().cloned());
         for acc in &self.accounts {
             lines.push(format!(
                 "account pool={} id={} condition={} enrolled={} pct5={} pct7={} \
@@ -428,6 +433,7 @@ impl SwarmSurveyFacts {
         let mut accounts = Vec::new();
         let mut repos = Vec::new();
         let mut server_heard = Vec::new();
+        let mut release_lines = Vec::new();
 
         for raw in reply.lines() {
             let line = raw.trim_end_matches('\r');
@@ -442,6 +448,8 @@ impl SwarmSurveyFacts {
                 repos.push(parse_repo_line(&parse_fields(line))?);
             } else if line.starts_with("server_heard ") {
                 server_heard.push(parse_server_heard_line(&parse_fields(line))?);
+            } else if line.starts_with("release_line ") {
+                release_lines.push(line.to_owned());
             }
         }
 
@@ -497,6 +505,7 @@ impl SwarmSurveyFacts {
             .transpose()?;
 
         Ok(Self {
+            release_lines,
             node,
             label,
             version,
@@ -978,6 +987,7 @@ mod tests {
 
     fn sample_facts() -> SwarmSurveyFacts {
         SwarmSurveyFacts {
+            release_lines: Vec::new(),
             node: Some("f1e2d3c4".to_owned()),
             label: Some("m22".to_owned()),
             roster_unread: false,
@@ -1251,6 +1261,27 @@ mod tests {
         assert!(SwarmSurveyFacts::from_survey_reply(&truncated).is_err());
         let signed_accounts = wire.replacen(" accounts=3 ", " accounts=+3 ", 1);
         assert!(SwarmSurveyFacts::from_survey_reply(&signed_accounts).is_err());
+    }
+
+    #[test]
+    fn release_process_observations_cross_the_fleet_read() {
+        let mut facts = sample_facts();
+        facts.release_lines = vec!["release_line alive=1 data=%7B%7D".into()];
+        let wire = facts.to_survey_reply(1, None, 0, 1, false);
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire).unwrap();
+        assert_eq!(parsed.release_lines, facts.release_lines);
+        let removed = wire
+            .lines()
+            .filter(|line| !line.starts_with("release_line "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            SwarmSurveyFacts::from_survey_reply(&removed)
+                .unwrap()
+                .release_lines
+                .is_empty(),
+            "an older or unread peer supplies no process evidence"
+        );
     }
 
     /// A Mac's moves of the last seven days, proved and tried, and the newest proved however old.

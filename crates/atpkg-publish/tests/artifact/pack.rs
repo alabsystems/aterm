@@ -398,6 +398,68 @@ fn the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build() {
 }
 
 #[test]
+fn astream_ships_its_two_named_clis_without_workspace_tools() {
+    let w = world("pack-astream");
+    let meta = metadata_json(
+        &w.checkout,
+        &["asb", "aspump"],
+        &[],
+        &[
+            "--locked",
+            "-p",
+            "astream-broker",
+            "-p",
+            "astream-pump",
+            "--bin",
+            "asb",
+            "--bin",
+            "aspump",
+            "--features",
+            "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/aead",
+        ],
+        false,
+    );
+    let bins = ["asb", "aspump", "astream-evidence", "astream-live"]
+        .into_iter()
+        .map(|name| (name, bin_bytes(elf(EM_X86_64, 2, 1), name)))
+        .collect();
+    let t = tools(&w, "aarch64-apple-darwin", meta, bins);
+    let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
+    req.program = "astream".into();
+    req.signing = Signing::Unsigned;
+    let out = pack::pack_with(&w.ctx, &req, &t).expect("the two declared CLIs pack");
+    assert_eq!(
+        &t.runs_of("build")[0].argv()[5..],
+        [
+            "--locked",
+            "-p",
+            "astream-broker",
+            "-p",
+            "astream-pump",
+            "--bin",
+            "asb",
+            "--bin",
+            "aspump",
+            "--features",
+            "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/aead",
+            "--message-format=json",
+        ],
+        "the plain packer retains the complete checkout-owned selection"
+    );
+    assert_eq!(out.exposes, ["asb", "aspump"]);
+    let stage = w.root.join("out/astream/root/bin");
+    for name in ["asb", "aspump"] {
+        assert!(stage.join(name).is_file(), "{name}");
+    }
+    for name in ["astream-evidence", "astream-live"] {
+        assert!(
+            !stage.join(name).exists(),
+            "unshipped workspace tool {name}"
+        );
+    }
+}
+
+#[test]
 fn with_no_declaration_the_name_token_fallback_drops_internal_bins() {
     for (name, internal) in [
         ("ay", false),

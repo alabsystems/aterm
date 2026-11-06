@@ -6,10 +6,7 @@
 use crate::bundle;
 
 fn real_template() -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../apps/aterm-mac/Info.plist"
-    );
+    let path = aterm_tempfile::manifest_dir().join("../../apps/aterm-mac/Info.plist");
     std::fs::read_to_string(path).expect("read apps/aterm-mac/Info.plist")
 }
 

@@ -341,7 +341,7 @@ mod measuring {
                 return std::process::ExitCode::from(2);
             }
         };
-        let rig = Rig::release(&["ATERM_PAINT_BIN"], env!("CARGO_BIN_EXE_fake-tui"));
+        let rig = Rig::release(&["ATERM_PAINT_BIN"], aterm_tempfile::bin_exe("fake-tui"));
         support::run("paint", &rows, |row| take(&rig, row))
     }
 

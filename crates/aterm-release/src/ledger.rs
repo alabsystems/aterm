@@ -135,15 +135,17 @@ pub(crate) fn run_with_input(mut cmd: Command, args: &[&str], input: &[u8]) -> R
         .stdin
         .take()
         .ok_or_else(|| Error::new(format!("git {}: no stdin", args.join(" "))))?;
-    let input = input.to_vec();
-    let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let out = child
-        .wait_with_output()
-        .map_err(|e| Error::new(format!("wait for git {}: {e}", args.join(" "))))?;
-    writer
-        .join()
-        .map_err(|_| Error::new(format!("git {}: the input writer panicked", args.join(" "))))?
-        .map_err(|e| Error::new(format!("feed git {}: {e}", args.join(" "))))?;
+    let out = std::thread::scope(|s| -> Result<std::process::Output> {
+        let writer = s.spawn(move || stdin.write_all(input));
+        let out = child
+            .wait_with_output()
+            .map_err(|e| Error::new(format!("wait for git {}: {e}", args.join(" "))))?;
+        writer
+            .join()
+            .map_err(|_| Error::new(format!("git {}: the input writer panicked", args.join(" "))))?
+            .map_err(|e| Error::new(format!("feed git {}: {e}", args.join(" "))))?;
+        Ok(out)
+    })?;
     Ok(RunOut {
         status: out.status.code().unwrap_or(-1),
         stdout: out.stdout,
@@ -260,45 +262,59 @@ pub struct Record {
     pub version: String,
 }
 
+fn parse_line(line_no: usize, raw: &str) -> Result<Option<(u64, &str)>> {
+    if raw.starts_with('#') {
+        return Ok(None);
+    }
+    let mut fields = raw.split_whitespace();
+    let (Some(build_str), Some(version_str), None) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Err(Error::new(format!(
+            "{LEDGER_FILE} line {line_no}: malformed record {raw:?} — expected \
+             \"<build_number> <version>\" (the ledger is append-only; never edit it)"
+        )));
+    };
+    let build: u64 = (!build_str.is_empty() && build_str.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| build_str.parse().ok())
+        .flatten()
+        .ok_or_else(|| {
+            Error::new(format!(
+                "{LEDGER_FILE} line {line_no}: build number {build_str:?} is not a u64"
+            ))
+        })?;
+    Ok(Some((build, version_str)))
+}
+
 /// Parse the full ledger: `#` lines are comments; every other line, blank ones included, must be two whitespace-separated fields with a u64 first, or the parse refuses with its 1-based line number.
 pub fn parse(text: &str) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
-        let line_no = idx + 1;
-        if raw.starts_with('#') {
-            continue;
+        if let Some((build, version_str)) = parse_line(idx + 1, raw)? {
+            records.push(Record {
+                build,
+                version: version_str.to_string(),
+            });
         }
-        let mut fields = raw.split_whitespace();
-        let (Some(build_str), Some(version_str), None) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::new(format!(
-                "{LEDGER_FILE} line {line_no}: malformed record {raw:?} — expected \
-                 \"<build_number> <version>\" (the ledger is append-only; never edit it)"
-            )));
-        };
-        let build: u64 = (!build_str.is_empty() && build_str.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| build_str.parse().ok())
-            .flatten()
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "{LEDGER_FILE} line {line_no}: build number {build_str:?} is not a u64"
-                ))
-            })?;
-        records.push(Record {
-            build,
-            version: version_str.to_string(),
-        });
     }
     Ok(records)
 }
 
 /// The last record.
 pub fn tail(text: &str) -> Result<Record> {
-    parse(text)?.pop().ok_or_else(|| {
+    let mut last = None;
+    for (idx, raw) in text.lines().enumerate() {
+        if let Some(pair) = parse_line(idx + 1, raw)? {
+            last = Some(pair);
+        }
+    }
+    let (build, version_str) = last.ok_or_else(|| {
         Error::new(format!(
             "{LEDGER_FILE} has no records — it must contain at least the v0.25 seed line"
         ))
+    })?;
+    Ok(Record {
+        build,
+        version: version_str.to_string(),
     })
 }
 
@@ -645,10 +661,10 @@ pub fn commit_with(
     message: &str,
 ) -> Result<String> {
     let listed = git_ok(git, &["ls-tree", "-z", &format!("{base}^{{tree}}")])?.stdout;
-    let mut entries: Vec<Vec<u8>> = listed
+    let mut entries: Vec<std::borrow::Cow<'_, [u8]>> = listed
         .split(|b| *b == 0)
         .filter(|e| !e.is_empty())
-        .map(<[u8]>::to_vec)
+        .map(std::borrow::Cow::Borrowed)
         .collect();
     for (name, text) in files {
         let path = format!("--path={name}");
@@ -661,7 +677,8 @@ pub fn commit_with(
                 blob.stderr_utf8().trim()
             )));
         }
-        let blob = blob.stdout_utf8().trim().to_string();
+        let blob_out = blob.stdout_utf8();
+        let blob = blob_out.trim();
         let at = entries
             .iter()
             .position(|e| {
@@ -671,9 +688,9 @@ pub fn commit_with(
             .ok_or_else(|| {
                 Error::new(format!("{base} holds no top-level file {name} to replace"))
             })?;
-        entries[at] = format!("100644 blob {blob}\t{name}").into_bytes();
+        entries[at] = std::borrow::Cow::Owned(format!("100644 blob {blob}\t{name}").into_bytes());
     }
-    let mut listing = Vec::new();
+    let mut listing = Vec::with_capacity(listed.len() + files.len() * 64);
     for entry in &entries {
         listing.extend_from_slice(entry);
         listing.push(0);

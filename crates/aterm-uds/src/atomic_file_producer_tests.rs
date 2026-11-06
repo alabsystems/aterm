@@ -25,7 +25,8 @@ fn producer_check_and_directory_failure_keep_the_atomic_boundary() {
             events.borrow_mut().push("check");
             Ok(())
         },
-        |_| {
+        Some(aterm_durable::Flush::Durable),
+        |_, _| {
             assert_eq!(std::fs::read(&path)?, b"new records");
             events.borrow_mut().push("directory");
             Err(io::Error::other("directory failed after rename"))
@@ -45,7 +46,8 @@ fn producer_check_and_directory_failure_keep_the_atomic_boundary() {
         0o600,
         |writer| writer.write_all(b"not published"),
         || Err(io::Error::new(io::ErrorKind::PermissionDenied, "changed")),
-        |_| panic!("a refused check cannot reach directory flushing"),
+        Some(aterm_durable::Flush::Durable),
+        |_, _| panic!("a refused check cannot reach directory flushing"),
     );
     assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     assert_eq!(std::fs::read(&path).unwrap(), b"new records");
@@ -70,7 +72,8 @@ fn metadata_capture_observes_the_written_temporary_and_failure_keeps_old_file() 
             Ok((metadata.dev(), metadata.ino()))
         },
         || Ok(()),
-        |_| Ok(()),
+        Some(aterm_durable::Flush::Durable),
+        |_, _| Ok(()),
     )
     .unwrap();
     landed.unwrap();
@@ -88,7 +91,8 @@ fn metadata_capture_observes_the_written_temporary_and_failure_keeps_old_file() 
             ))
         },
         || panic!("capture failure reached check"),
-        |_| panic!("capture failure reached rename"),
+        Some(aterm_durable::Flush::Durable),
+        |_, _| panic!("capture failure reached rename"),
     );
     assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     assert_eq!(std::fs::read(&path).unwrap(), b"new");

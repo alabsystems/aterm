@@ -3,7 +3,7 @@
 
 //! Build provenance for the Settings `/about` route and `aterm ctl version`.
 
-use aterm_types::version::BuildStamp;
+use aterm_stamp::Stamp;
 use std::sync::OnceLock;
 
 pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
@@ -17,10 +17,11 @@ pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
 pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
 /// The stamp this crate's test binary reads: a clean, stamped Trust build, so the suite is
-/// deterministic.
+/// deterministic. Its version is a fixed release (the one current when the product version left
+/// the library graph), so no bump is an input of this test binary.
 #[cfg(test)]
-const TEST_STAMP: BuildStamp = BuildStamp {
-    app_version: env!("CARGO_PKG_VERSION"),
+const TEST_STAMP: Stamp = Stamp {
+    app_version: "0.156.0",
     git_commit: "7e57b1d0c0de",
     git_commit_full: "7e57b1d0c0de7e57b1d0c0de7e57b1d0c0de7e57",
     git_dirty: "false",
@@ -34,17 +35,18 @@ const TEST_STAMP: BuildStamp = BuildStamp {
     compiler_flavor: "t",
     build_profile: "debug",
     trust_verify: "off",
+    index_hint: "",
     release_build: false,
 };
 
 /// The running binary's build facts: the stamp `crates/aterm` installs first thing in `main`
-/// (`aterm_types::version`), read by every accessor here.
-fn stamp() -> &'static BuildStamp {
+/// (`aterm_stamp`), read by every accessor here.
+fn stamp() -> &'static Stamp {
     #[cfg(test)]
     let unstamped = &TEST_STAMP;
     #[cfg(not(test))]
-    let unstamped = &BuildStamp::UNSTAMPED;
-    aterm_types::version::installed().unwrap_or(unstamped)
+    let unstamped = &Stamp::UNSTAMPED;
+    aterm_stamp::installed().unwrap_or(unstamped)
 }
 
 /// Workspace package version.

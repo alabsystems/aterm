@@ -418,18 +418,12 @@ fn definite_failure(e: &io::Error) -> bool {
 
 /// A resolver answer that specifically says the name has no address.
 fn definite_name_failure(e: &io::Error) -> bool {
-    if e.kind() == io::ErrorKind::NotFound {
-        return true;
-    }
     #[cfg(target_os = "macos")]
-    {
-        e.to_string()
-            == "failed to lookup address information: nodename nor servname provided, or not known"
-    }
+    let worded = e.to_string()
+        == "failed to lookup address information: nodename nor servname provided, or not known";
     #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    let worded = false;
+    e.kind() == io::ErrorKind::NotFound || worded
 }
 
 /// The same four answers by raw errno.

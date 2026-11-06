@@ -4524,13 +4524,13 @@ pub mod proc_tree {
         if info.pbsd.pbi_pid != pid.unsigned_abs() || info.pbsd.pbi_uid != euid() {
             return None;
         }
-        let comm: Vec<u8> = info
+        let trustd = info
             .pbsd
             .pbi_comm
             .iter()
             .map(|c| c.to_ne_bytes()[0])
-            .take_while(|b| *b != 0)
-            .collect();
+            .take_while(|&b| b != 0)
+            .eq(b"trustd".iter().copied());
         // SAFETY: `getsid` takes an integer and touches no memory of ours.
         let sid = unsafe { getsid(pid) };
         // The session is the process read above only while its pid still holds it.
@@ -4542,7 +4542,7 @@ pub mod proc_tree {
             sid,
             zombie: info.pbsd.pbi_status == SZOMB,
             ctty: info.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0 || info.pbsd.e_tdev != NODEV,
-            trustd: comm == b"trustd",
+            trustd,
             forked: info.pbsd.pbi_flags & PROC_FLAG_EXEC == 0,
             leader_only: false,
         })
@@ -6394,7 +6394,7 @@ mod tests {
         assert_eq!(read_costs(Some(&none), &seed).len(), 2, "a fresh clone");
         assert_eq!(read_costs(None, &seed).len(), 2, "no state at all");
         assert!(read_costs(None, &none).is_empty(), "every library heavy");
-        let committed = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let committed = aterm_tempfile::manifest_dir()
             .join("../..")
             .join(trust_facts::COSTS);
         assert!(
@@ -8044,7 +8044,7 @@ mod tests {
     fn slots_base() -> PathBuf {
         let mut refused = Vec::new();
         for base in [
-            option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from),
+            Some(aterm_tempfile::target_tmpdir()),
             Some(std::env::temp_dir()),
             std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         ]

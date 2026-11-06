@@ -193,8 +193,9 @@ impl PartialEq for Classified {
 
 /// What the classifier knows besides the scan.
 pub(crate) struct Judge<'a> {
-    /// The stored bytes the scan read.
-    pub(crate) bytes: &'a [u8],
+    /// The stored bytes after the scan's intact prefix: from its end
+    /// ([`Scan::valid_len`]) to the end of the file, empty when the scan reached it.
+    pub(crate) rest: &'a [u8],
     /// The at-rest key and optional `<log>.seal` binding, when the log is sealed at rest.
     pub(crate) key: Option<AtRestRef<'a>>,
     /// The retention base: the offset of the first stored record.
@@ -251,7 +252,7 @@ const fn keep_all(keep: usize, records: usize) -> Classified {
 
 /// Classify the bytes after `scan`'s intact prefix — see the module docs.
 pub(crate) fn classify(scan: &Scan, j: &Judge<'_>) -> Classified {
-    let records = scan.records.len();
+    let records = scan.count;
     let e = j.base.saturating_add(records as u64);
     let p = scan.valid_len;
     // A later intact record in a newer format must refuse before ANY path that
@@ -260,7 +261,7 @@ pub(crate) fn classify(scan: &Scan, j: &Judge<'_>) -> Classified {
     let after = if matches!(&scan.tail, Tail::Clean | Tail::Newer { .. }) {
         Vec::new()
     } else {
-        frames_after(j.bytes, p, e, j.key)
+        frames_after(j.rest, p, e, j.key)
     };
     if let Some((offset, at_byte, version)) = first_newer_after(&after) {
         return Classified::Newer {
@@ -342,16 +343,15 @@ fn damaged(
     p: usize,
     found: &str,
 ) -> Classified {
-    let records = scan.records.len();
+    let records = scan.count;
     let cut_at_any = j.mutation.cut_at_any_damage();
     // The file ends inside the frame at `p` — its header or payload cut short, no placed
     // record behind it (a planted record frame inside the unfinished record's own body is
     // `Found::Nothing`, even when `scan_from`'s un-placed `later_record_exists` reported
     // `Tail::Corrupt { tear: true }`) — and that frame is no whole record under a rotted
     // length.
-    let ends_short = !intact_records_after(after)
-        && ends_inside_a_frame(j.bytes, p)
-        && !whole_to_eof(j.bytes, p);
+    let ends_short =
+        !intact_records_after(after) && ends_inside_a_frame(j.rest) && !whole_to_eof(j.rest);
     if e < floor && !cut_at_any {
         if ends_short {
             // A log that ENDS below its floor is shorter than its last open saw — a copy
@@ -385,7 +385,7 @@ fn damaged(
         return Classified::Keep {
             keep: p,
             records,
-            written: behind || written_frame(j.bytes, p),
+            written: behind || written_frame(j.rest),
         };
     }
     let Some((b0, b0_at)) = batch_start(scan, floor) else {
@@ -414,7 +414,7 @@ fn damaged(
             Classified::Keep {
                 keep: b0_at,
                 records: b0.saturating_sub(j.base) as usize,
-                written: (b0_at < p && !unfinished) || found || written_frame(j.bytes, p),
+                written: (b0_at < p && !unfinished) || found || written_frame(j.rest),
             }
         }
     }
@@ -444,22 +444,20 @@ const fn has_nonzero(mut bytes: &[u8]) -> bool {
     false
 }
 
-/// Whether the file ends inside the frame at byte `p`: something other than zeros is
+/// Whether the file ends inside the frame `rest` (the bytes from `p` to the end) starts
+/// with: something other than zeros is
 /// there, and it is a frame's beginning that runs past the end (`Frame::decode` asks
 /// for more bytes) — what a write stopped part-way leaves, and what a copy taken while
 /// the log was written ends in. Nothing but zeros is a size that landed without its
 /// data, never a write that stopped.
-fn ends_inside_a_frame(bytes: &[u8], p: usize) -> bool {
-    let Some(rest) = bytes.get(p..) else {
-        return false;
-    };
+fn ends_inside_a_frame(rest: &[u8]) -> bool {
     has_nonzero(rest) && matches!(Frame::decode(rest), Ok(None))
 }
 
-/// Whether the damaged frame at byte `p` is the shape a WRITTEN record leaves damaged
-/// (see the module docs): whole-sized with data, or whole to the end of the file.
-fn written_frame(bytes: &[u8], p: usize) -> bool {
-    whole_sized(bytes, p) || whole_to_eof(bytes, p)
+/// Whether the damaged frame `rest` starts with (at byte `p`) is the shape a WRITTEN
+/// record leaves damaged (see the module docs): whole-sized with data, or whole to the end of the file.
+fn written_frame(rest: &[u8]) -> bool {
+    whole_sized(rest) || whole_to_eof(rest)
 }
 
 /// Whether the damaged frame at byte `p` is WHOLE-SIZED with data in it — its header
@@ -506,10 +504,7 @@ const fn split_header_crc_and_magic_v1(rest: &[u8]) -> Option<(u32, &[u8])> {
     Some((crc, payload))
 }
 
-fn whole_sized(bytes: &[u8], p: usize) -> bool {
-    let Some(rest) = bytes.get(p..) else {
-        return false;
-    };
+fn whole_sized(rest: &[u8]) -> bool {
     let Some((len, after_hdr)) = split_header_len_field(rest) else {
         return false;
     };
@@ -523,16 +518,13 @@ fn whole_sized(bytes: &[u8], p: usize) -> bool {
     has_nonzero(claimed)
 }
 
-/// Whether the frame at byte `p` is a WHOLE record running exactly to the end of the
+/// Whether the frame `rest` starts with (at byte `p`) is a WHOLE record running exactly to the end of the
 /// file under a length field that says otherwise: its magic and version stand, and its
 /// CRC holds over every byte after its header — at least a minimal record's payload. A
 /// record's CRC never holds over a part of it (one chance in 2^32), so this is the last
 /// record of the file with its LENGTH rotted, a shape that otherwise reads as a write
 /// cut short (running past the end) or a frame that does not decode (above the cap).
-fn whole_to_eof(bytes: &[u8], p: usize) -> bool {
-    let Some(rest) = bytes.get(p..) else {
-        return false;
-    };
+fn whole_to_eof(rest: &[u8]) -> bool {
     let Some((crc, payload)) = split_header_crc_and_magic_v1(rest) else {
         return false;
     };
@@ -583,17 +575,15 @@ enum Found {
     Foreign,
 }
 
-/// Every intact frame after byte `p`, in order, each parsed — the magic scan
+/// Every intact frame after the first byte of `rest` (the bytes from `p`), in order, each
+/// parsed — the magic scan
 /// `later_record_exists` does, stepping past each record frame it accepts so a
 /// record's own body is never read as a frame, and judging every other by its place
 /// ([`placed`]), since the damaged record's body was never stepped past. `e` is the
 /// offset expected at `p`; a keyed log's frame is tried at every offset it can hold (it
 /// is sealed under its own).
-fn frames_after(bytes: &[u8], p: usize, e: u64, key: Option<AtRestRef<'_>>) -> Vec<Found> {
+fn frames_after(rest: &[u8], p: usize, e: u64, key: Option<AtRestRef<'_>>) -> Vec<Found> {
     let mut out = Vec::new();
-    let Some(rest) = bytes.get(p..) else {
-        return out;
-    };
     let mut q = 1usize;
     let mut next = e;
     while q.saturating_add(HEADER_SIZE) <= rest.len() {
@@ -840,11 +830,11 @@ mod tests {
         unclean_relaxed: bool,
         same_boot: bool,
     ) -> Classified {
-        let scan = scan_from(bytes, None, 0, floor, Mutation::Off);
+        let scan = scan_from(bytes, None, 0, floor, Mutation::Off).scan;
         classify(
             &scan,
             &Judge {
-                bytes,
+                rest: bytes.get(scan.valid_len..).unwrap_or(&[]),
                 key: None,
                 base: 0,
                 floor,
@@ -1016,9 +1006,9 @@ mod tests {
             }
         }
         // The same record cut short is no whole record: a write that never finished.
-        assert!(!whole_to_eof(&bytes[..at[2] - 1], at[1]));
+        assert!(!whole_to_eof(&bytes[at[1]..at[2] - 1]));
         assert!(
-            whole_to_eof(&bytes, at[1]),
+            whole_to_eof(&bytes[at[1]..]),
             "an intact last frame is whole too"
         );
     }
@@ -1242,11 +1232,11 @@ mod tests {
             Frame::new(ciphertext).encode().unwrap()
         };
         let keyed_judge = |bytes: &[u8], floor, unclean_relaxed| {
-            let scan = scan_from(bytes, Some(AtRestRef::v1(&KEY)), 0, floor, Mutation::Off);
+            let scan = scan_from(bytes, Some(AtRestRef::v1(&KEY)), 0, floor, Mutation::Off).scan;
             classify(
                 &scan,
                 &Judge {
-                    bytes,
+                    rest: bytes.get(scan.valid_len..).unwrap_or(&[]),
                     key: Some(AtRestRef::v1(&KEY)),
                     base: 0,
                     floor,

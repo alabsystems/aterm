@@ -1461,6 +1461,7 @@ fn proving_checked<T>(
                 Some(desk::Proof {
                     decide,
                     refuses,
+                    authority: None,
                     fleet,
                 }),
             )
@@ -1560,6 +1561,7 @@ fn a_failed_possession_flush_cannot_send_the_mac_to_a_second_member() {
                     Some(desk::Proof {
                         decide: &decide,
                         refuses: &|_| None,
+                        authority: None,
                         fleet: None,
                     }),
                 );

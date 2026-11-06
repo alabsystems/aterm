@@ -3014,7 +3014,7 @@ mod tests {
     }
 
     fn measured(name: &str) -> Vec<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = aterm_tempfile::manifest_dir()
             .join("src/fixtures")
             .join(name);
         std::fs::read_to_string(&path)
@@ -3097,7 +3097,7 @@ mod tests {
     #[test]
     fn every_recorded_card_is_placed_or_refused_by_its_layout() {
         let banner = crate::anchor!("launch.banner");
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .expect("the fixtures")
             .map(|e| e.expect("a fixture").path())
@@ -3886,7 +3886,7 @@ mod tests {
 
     #[test]
     fn the_placed_cards_version_is_its_banners() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
         let mut read = 0;
         for entry in std::fs::read_dir(&dir).expect("the fixtures") {
             let path = entry.expect("a fixture").path();
@@ -3986,7 +3986,7 @@ mod tests {
     #[test]
     fn a_kept_card_reading_is_the_scans() {
         let anchor = crate::anchor!("launch.banner");
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+        let dir = aterm_tempfile::manifest_dir().join("src/fixtures");
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .expect("the fixtures")
             .map(|e| e.expect("a fixture").path())

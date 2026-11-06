@@ -18,22 +18,22 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm-alloc"
-version = "0.107.0"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-bidi"
-version = "0.107.0"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-durable"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "astream-sys",
 ]
 
 [[package]]
 name = "aterm-font"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "aterm-bidi",
  "aterm-grapheme",
@@ -49,33 +49,33 @@ dependencies = [
 
 [[package]]
 name = "aterm-grapheme"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-hash"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "astream-wire",
 ]
 
 [[package]]
 name = "aterm-log"
-version = "0.107.0"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-tempfile"
-version = "0.107.0"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-time"
-version = "0.107.0"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-types"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "aterm-alloc",
  "aterm-durable",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-uds"
-version = "0.107.0"
+version = "0.0.0"
 dependencies = [
  "libc",
 ]

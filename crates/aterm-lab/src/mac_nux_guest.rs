@@ -919,18 +919,23 @@ impl Reading {
 
     /// Whether setup has only the vault left while the Secrets stage runs: the join's look for
     /// a vault, which keeps trying for macOS's Local Network answer for up to
-    /// [`aterm_secrets::client::PATIENT_LOOK_MAX`] by its own design. Pure.
+    /// [`aterm_secrets::client::PATIENT_LOOK_MAX`] by its own design. Only the vault is left when
+    /// `setup=` names it alone (`pending:vault`), or names no row (`pending`): the vault row has no
+    /// reading until a try of the look ends, so 0.155.0 said `pending` through the whole first
+    /// look (E3's third first-launch run, 2026-11-05, ended by the one-minute detector 61 s into
+    /// a 212 s look). Pure.
     #[must_use]
     pub fn vault_look(&self) -> bool {
-        self.setup
-            .as_deref()
-            .and_then(|field| field.strip_prefix("pending:"))
-            .is_some_and(|rest| rest.split(';').next() == Some("vault"))
-            && self
-                .record
-                .as_ref()
-                .and_then(|r| r.running)
-                .is_some_and(|bit| stage_name(bit) == "Secrets")
+        self.setup.as_deref().is_some_and(|field| {
+            field == "pending"
+                || field
+                    .strip_prefix("pending:")
+                    .is_some_and(|rest| rest.split(';').next() == Some("vault"))
+        }) && self
+            .record
+            .as_ref()
+            .and_then(|r| r.running)
+            .is_some_and(|bit| stage_name(bit) == "Secrets")
     }
 
     /// What it says, on one line: what [`Stall`] compares.
@@ -1552,6 +1557,10 @@ mod tests {
         let vault = reading("pending:vault", 8);
         assert!(vault.vault_look());
         assert!(reading("pending:vault;needs:vault", 8).vault_look());
+        // The first look, before the vault row has a reading, names no row.
+        let first = reading("pending", 8);
+        assert!(first.vault_look(), "the look before its first reading");
+        assert!(!reading("pending", 16).vault_look(), "another stage runs");
         assert!(
             !reading("pending:vault,repos", 8).vault_look(),
             "more than the vault left"
@@ -1567,6 +1576,11 @@ mod tests {
             wait.see(STALL_MS + look, &vault),
             Waited::Stalled { .. }
         ));
+        // The first look is waited out the same: a minute into it is no stall (the reading E3's
+        // third run stopped on).
+        let mut first_wait = Stall::new(STALL_MS);
+        assert_eq!(first_wait.see(0, &first), Waited::Moving);
+        assert_eq!(first_wait.see(STALL_MS + 1_000, &first), Waited::Moving);
         let other = reading("pending:vault", 16);
         let mut control = Stall::new(STALL_MS);
         assert_eq!(control.see(0, &other), Waited::Moving);

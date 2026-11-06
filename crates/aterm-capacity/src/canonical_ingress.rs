@@ -69,7 +69,7 @@ impl Identity {
     }
 }
 
-fn owned_directory(file: &File) -> io::Result<()> {
+fn owned_directory(file: &File) -> io::Result<Identity> {
     let m = file.metadata()?;
     // SAFETY: geteuid only reads this process's account identity.
     if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
@@ -77,9 +77,9 @@ fn owned_directory(file: &File) -> io::Result<()> {
             "ingress directory must be owned and not writable by others",
         ));
     }
-    Ok(())
+    Ok(Identity(m.dev(), m.ino()))
 }
-fn private_file(file: &File) -> io::Result<()> {
+fn private_file(file: &File) -> io::Result<(Identity, u64)> {
     let m = file.metadata()?;
     // SAFETY: geteuid only reads this process's account identity.
     if !m.is_file()
@@ -91,7 +91,7 @@ fn private_file(file: &File) -> io::Result<()> {
             "ingress record must be private, owned and single-link",
         ));
     }
-    Ok(())
+    Ok((Identity(m.dev(), m.ino()), m.len()))
 }
 fn directory(path: &Path) -> io::Result<(File, Vec<Identity>)> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -131,16 +131,19 @@ fn node(parent: &File, name: &str, writable: bool) -> io::Result<File> {
         .map_err(io::Error::from)
     })
 }
+#[cfg(test)]
 fn create(parent: &File, name: &str) -> io::Result<File> {
+    create_identity(parent, name).map(|(file, _)| file)
+}
+fn create_identity(parent: &File, name: &str) -> io::Result<(File, Identity)> {
     let file = crate::cohort_namespace::create(parent, name)?;
     // Normalize only this exclusively created inode, never a legacy directory.
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    private_file(&file)?;
-    Ok(file)
+    let (identity, _) = private_file(&file)?;
+    Ok((file, identity))
 }
-fn read(file: &File) -> io::Result<Vec<u8>> {
-    private_file(file)?;
-    let length = file.metadata()?.len();
+fn read(file: &File) -> io::Result<(Identity, Vec<u8>)> {
+    let (identity, length) = private_file(file)?;
     if length == 0 || length > MAX_RECORD {
         return Err(refused(
             "partial or oversized ingress intent remains unavailable",
@@ -148,7 +151,7 @@ fn read(file: &File) -> io::Result<Vec<u8>> {
     }
     let mut bytes = vec![0; length as usize];
     file.read_exact_at(&mut bytes, 0)?;
-    Ok(bytes)
+    Ok((identity, bytes))
 }
 
 /// Path selection only, never admission or migration authority.
@@ -278,13 +281,13 @@ struct Lock {
 }
 impl Lock {
     fn take(parent: &File, kind: Ingress, fresh: bool) -> io::Result<Self> {
-        let file = if fresh {
-            create(parent, kind.record())?
+        let (file, identity) = if fresh {
+            create_identity(parent, kind.record())?
         } else {
-            node(parent, kind.record(), true)?
+            let file = node(parent, kind.record(), true)?;
+            let (identity, _) = private_file(&file)?;
+            (file, identity)
         };
-        private_file(&file)?;
-        let identity = Identity::of(&file)?;
         let owner = std::process::id();
         #[expect(
             clippy::disallowed_methods,
@@ -342,7 +345,8 @@ impl Location {
         if ancestors != self.ancestors {
             return Err(refused("original ingress ancestry changed"));
         }
-        owned_directory(&self.parent)
+        owned_directory(&self.parent)?;
+        Ok(())
     }
 }
 #[derive(Debug)]
@@ -413,16 +417,15 @@ struct Entry {
     description: Description,
 }
 impl Entry {
-    fn fresh(location: Location, original: File) -> io::Result<Self> {
-        owned_directory(&original)?;
+    fn fresh(location: Location, original: File, original_id: Identity) -> io::Result<Self> {
         let lock = Lock::take(&location.parent, location.kind, true)?;
-        let fence = create(&location.parent, location.kind.prior())?;
+        let (fence, fence_id) = create_identity(&location.parent, location.kind.prior())?;
         let description = Description {
             path: location.path.clone(),
             ancestors: location.ancestors.clone(),
             record: lock.identity.clone(),
-            original: Identity::of(&original)?,
-            fence: Identity::of(&fence)?,
+            original: original_id,
+            fence: fence_id,
         };
         Ok(Self {
             location,
@@ -444,13 +447,11 @@ impl Entry {
         }
         let old = node(&location.parent, location.kind.name(), false)?;
         let prior = node(&location.parent, location.kind.prior(), false)?;
-        let (original, fence) = if Identity::of(&old)? == description.original
-            && Identity::of(&prior)? == description.fence
-        {
+        let old_id = Identity::of(&old)?;
+        let prior_id = Identity::of(&prior)?;
+        let (original, fence) = if old_id == description.original && prior_id == description.fence {
             (old, prior)
-        } else if Identity::of(&old)? == description.fence
-            && Identity::of(&prior)? == description.original
-        {
+        } else if old_id == description.fence && prior_id == description.original {
             (prior, old)
         } else {
             return Err(refused("original ingress pair is missing or replaced"));
@@ -467,29 +468,29 @@ impl Entry {
     }
     fn validate(&self, bytes: &[u8]) -> io::Result<NameState> {
         self.location.validate()?;
-        owned_directory(&self.original)?;
-        private_file(&self.fence)?;
+        let original_id = owned_directory(&self.original)?;
         let record = node(&self.location.parent, self.location.kind.record(), false)?;
-        if Identity::of(&record)? != self.lock.identity
-            || read(&record)? != bytes
-            || read(&self.lock.file)? != bytes
-            || read(&self.fence)? != bytes
-            || Identity::of(&self.original)? != self.description.original
-            || Identity::of(&self.fence)? != self.description.fence
+        let (record_id, record_bytes) = read(&record)?;
+        let (_, lock_bytes) = read(&self.lock.file)?;
+        let (fence_id, fence_bytes) = read(&self.fence)?;
+        if record_id != self.lock.identity
+            || record_bytes != bytes
+            || lock_bytes != bytes
+            || fence_bytes != bytes
+            || original_id != self.description.original
+            || fence_id != self.description.fence
         {
             return Err(refused("original ingress intent or held objects changed"));
         }
         let old = node(&self.location.parent, self.location.kind.name(), false)?;
         let prior = node(&self.location.parent, self.location.kind.prior(), false)?;
-        if Identity::of(&old)? == self.description.original
-            && Identity::of(&prior)? == self.description.fence
-        {
+        let old_id = Identity::of(&old)?;
+        let prior_id = Identity::of(&prior)?;
+        if old_id == self.description.original && prior_id == self.description.fence {
             owned_directory(&old)?;
             private_file(&prior)?;
             Ok(NameState::LegacyDirectory)
-        } else if Identity::of(&old)? == self.description.fence
-            && Identity::of(&prior)? == self.description.original
-        {
+        } else if old_id == self.description.fence && prior_id == self.description.original {
             private_file(&old)?;
             owned_directory(&prior)?;
             Ok(NameState::FileFence)
@@ -531,10 +532,8 @@ impl Preparation {
         // Check both original directory scopes before creating any record.
         let old_capacity = node(&capacity.parent, "capacity", false)?;
         let old_slots = node(&slots.parent, "build-slot", false)?;
-        owned_directory(&old_capacity)?;
-        owned_directory(&old_slots)?;
-        let capacity_id = Identity::of(&old_capacity)?;
-        let slots_id = Identity::of(&old_slots)?;
+        let capacity_id = owned_directory(&old_capacity)?;
+        let slots_id = owned_directory(&old_slots)?;
         if capacity_id == slots_id
             || capacity.ancestors.contains(&slots_id)
             || slots.ancestors.contains(&capacity_id)
@@ -542,8 +541,8 @@ impl Preparation {
             return Err(refused("ingress scopes physically overlap"));
         }
         let mut entries = [
-            Entry::fresh(capacity, old_capacity)?,
-            Entry::fresh(slots, old_slots)?,
+            Entry::fresh(capacity, old_capacity, capacity_id)?,
+            Entry::fresh(slots, old_slots, slots_id)?,
         ];
         let value = aterm_json::json!({"schema":1,"state":"pending-only","host":scope.host,"uid":scope.uid,
             "capacity":entries[0].description.value(),"build_slot":entries[1].description.value()});
@@ -580,8 +579,8 @@ impl Preparation {
         let slots = Location::open(&checked.build_slot, Ingress::BuildSlot)?;
         let capacity_lock = Lock::take(&capacity.parent, Ingress::Capacity, false)?;
         let slots_lock = Lock::take(&slots.parent, Ingress::BuildSlot, false)?;
-        let bytes = read(&capacity_lock.file)?;
-        if read(&slots_lock.file)? != bytes {
+        let (_, bytes) = read(&capacity_lock.file)?;
+        if read(&slots_lock.file)?.1 != bytes {
             return Err(refused("paired ingress intents disagree"));
         }
         let value: Value = aterm_json::from_slice(&bytes).map_err(io::Error::other)?;

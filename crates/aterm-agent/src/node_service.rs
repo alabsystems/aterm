@@ -913,34 +913,46 @@ pub fn node_plist_text(
     )
 }
 
-fn systemd_escape_exec(word: &str) -> String {
-    let mut out = String::with_capacity(word.len() + 2);
-    out.push('"');
-    for ch in word.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn systemd_escape_env(key: &str, val: &str) -> String {
-    let mut out = String::from("\"");
-    out.push_str(key);
-    out.push('=');
+/// Writes `val` into a quoted systemd word: `\\` and `\"` for the quoting, `%%` for a
+/// specifier and, in an `ExecStart=` word (`exec`), `$$` for a variable. A line break, a tab and
+/// every other control character is written as its C escape (`\n`, `\t`, `\r`, `\xNN` below
+/// U+0080, `\uNNNN` above it), which systemd decodes inside the word. Written raw, a line break
+/// would end the directive (systemd ends a line at a line feed and at a carriage return), and
+/// what follows it in a program path or a home would be read as a line of its own: another
+/// `ExecStart=` or `Environment=`.
+fn systemd_escape_into(out: &mut String, val: &str, exec: bool) {
     for ch in val.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
+            '$' if exec => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() && c.is_ascii() => {
+                out.push_str(&format!("\\x{:02x}", u32::from(c)));
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
             c => out.push(c),
         }
     }
+}
+
+fn systemd_escape_exec(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('"');
+    systemd_escape_into(&mut out, word, true);
+    out.push('"');
+    out
+}
+
+fn systemd_escape_env(key: &str, val: &str) -> String {
+    let mut out = String::with_capacity(key.len() + val.len() + 3);
+    out.push('"');
+    out.push_str(key);
+    out.push('=');
+    systemd_escape_into(&mut out, val, false);
     out.push('"');
     out
 }
@@ -977,6 +989,11 @@ fn systemd_unescape_exec(rest: &str) -> Option<String> {
             '\\' => match chars.next()? {
                 '\\' => out.push('\\'),
                 '"' => out.push('"'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'x' => out.push(hex_char(&mut chars, 2).filter(char::is_ascii)?),
+                'u' => out.push(hex_char(&mut chars, 4)?),
                 other => {
                     out.push('\\');
                     out.push(other);
@@ -994,6 +1011,16 @@ fn systemd_unescape_exec(rest: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The character the next `digits` hex digits of `chars` name (a `\x` or `\u` escape's), if
+/// they name one other than NUL, which systemd refuses in an escape.
+fn hex_char(chars: &mut impl Iterator<Item = char>, digits: usize) -> Option<char> {
+    let mut code = 0u32;
+    for _ in 0..digits {
+        code = (code << 4) | chars.next()?.to_digit(16)?;
+    }
+    char::from_u32(code).filter(|&c| c != '\0')
 }
 
 /// Extract the `ProgramArguments[0]` or `ExecStart` binary path from a rendered unit file.
@@ -1058,6 +1085,17 @@ pub trait ServiceSupervisor {
     /// The program did not identify as an aterm release, or this supervisor does not measure it.
     fn program_release(&self, _program: &Path) -> Result<(u64, u64, u64), String> {
         Err("the program's release was not measured".to_owned())
+    }
+    /// The oldest release a fresh service may run: the one this process is, as its installed
+    /// identity says (`aterm_stamp`).
+    ///
+    /// # Errors
+    /// This process installed no identity, or its version is not `MAJOR.MINOR.PATCH`: nothing
+    /// says which release includes this node implementation, so no program is chosen.
+    fn required_release(&self) -> Result<(u64, u64, u64), String> {
+        aterm_stamp::installed()
+            .and_then(aterm_stamp::Stamp::release)
+            .ok_or_else(|| "this process carries no release identity".to_owned())
     }
     /// Load/restart the written unit file at `unit_path`.
     ///
@@ -1920,24 +1958,20 @@ pub fn resolve_installed_program(
     None
 }
 
-/// A fresh service must run a release that includes this node implementation.
-fn required_node_release() -> Result<(u64, u64, u64), String> {
-    let number = |part: &str| {
-        crate::parse_uint::<u64>(part).ok_or_else(|| "invalid node release version".to_owned())
-    };
-    Ok((
-        number(env!("CARGO_PKG_VERSION_MAJOR"))?,
-        number(env!("CARGO_PKG_VERSION_MINOR"))?,
-        number(env!("CARGO_PKG_VERSION_PATCH"))?,
-    ))
-}
-
-fn compatible_program(proposed: &Path, release: (u64, u64, u64)) -> Result<PathBuf, String> {
-    if release < required_node_release()? {
+/// A fresh service must run a release that includes this node implementation
+/// ([`ServiceSupervisor::required_release`]).
+fn compatible_program(
+    proposed: &Path,
+    release: (u64, u64, u64),
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<PathBuf, String> {
+    let required = supervisor.required_release()?;
+    if release < required {
+        let (major, minor, patch) = required;
         return Err(format!(
-            "{} is older than this node implementation ({}); the node job was kept",
-            proposed.display(),
-            env!("CARGO_PKG_VERSION")
+            "{} is older than this node implementation ({major}.{minor}.{patch}); the node job \
+             was kept",
+            proposed.display()
         ));
     }
     Ok(proposed.to_path_buf())
@@ -1958,7 +1992,7 @@ fn sync_program(
         if matches!(state, NodeJobState::Installed { pid: Some(_), .. }) {
             return Err("the running node program is unknown; the node job was kept".to_owned());
         }
-        return compatible_program(proposed, supervisor.program_release(proposed)?);
+        return compatible_program(proposed, supervisor.program_release(proposed)?, supervisor);
     };
     if kept == proposed {
         return Ok(proposed.to_path_buf());
@@ -1977,7 +2011,7 @@ fn sync_program(
                 kept.display()
             ))
         }
-        (Err(_), Ok(next)) => compatible_program(proposed, next),
+        (Err(_), Ok(next)) => compatible_program(proposed, next, supervisor),
         (Ok(_), Ok(_)) => Ok(proposed.to_path_buf()),
         (Err(_), Err(_)) => Err(format!(
             "neither {} nor {} identified as an aterm release; the node job was kept",

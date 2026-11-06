@@ -12,10 +12,12 @@
 //! port's `ask` ALPN, the one path a caller without the fleet secret reaches.
 
 pub mod allowed;
+mod authority;
 pub mod bundle;
 pub mod desk;
 pub mod join;
 pub mod joiner;
+pub(crate) mod proof_retry;
 mod wire;
 
 pub use crate::pake::PhraseState;
@@ -51,6 +53,21 @@ where
         let line = wire::read_line(member)?;
         wire::write_line(joiner, &line)?;
         let parsed = wire::Line::parse(&line);
+        if parsed.verb == "OK"
+            && let Ok(size) = parsed.get("authority")
+        {
+            let size: u64 = Some(size)
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
+                .filter(|size| *size <= crate::membership_log::MAX_RECORDS_STREAM as u64)
+                .ok_or_else(|| crate::Error::new("the member's authority size is out of bounds"))?;
+            let copied = std::io::copy(&mut std::io::Read::take(&mut *member, size), joiner)?;
+            if copied != size {
+                return Err(crate::Error::new("the member's authority was cut short"));
+            }
+            joiner.flush()?;
+            continue;
+        }
         if let Ok(size) = parsed.get("bundle") {
             let size: u64 = Some(size)
                 .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
@@ -75,5 +92,54 @@ where
         let asked = wire::Line::parse(&line);
         acks |= asked.verb == "run" && asked.get("ack").is_ok_and(|ack| ack == "1");
         wire::write_line(member, &line)?;
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use std::io::{Cursor, Read, Write};
+
+    struct Duplex {
+        incoming: Cursor<&'static [u8]>,
+        written: Vec<u8>,
+    }
+
+    impl Duplex {
+        fn reading(bytes: &'static [u8]) -> Self {
+            Self {
+                incoming: Cursor::new(bytes),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.incoming.read(bytes)
+        }
+    }
+
+    impl Write for Duplex {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.written.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_truncated_authority_frame_forwards_no_possession() {
+        let mut member =
+            Duplex::reading(b"ALAB member=1 authority=abcdef\nOK authority=4 authoritysig=00\nab");
+        let mut joiner = Duplex::reading(b"prove authority=00\npossess response=must-not-send\n");
+        assert!(relay(&mut joiner, &mut member).is_err());
+        assert_eq!(member.written, b"prove authority=00\n");
+        assert_eq!(
+            joiner.incoming.position(),
+            b"prove authority=00\n".len() as u64
+        );
     }
 }

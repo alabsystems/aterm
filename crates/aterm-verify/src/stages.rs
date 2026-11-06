@@ -1093,6 +1093,7 @@ type Compiled = (
 );
 
 fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
+    let identity_before = crate::test_index::identities(&ctx.root, &ctx.tools.targo).ok();
     let Compile {
         mut run,
         stdout,
@@ -1114,6 +1115,21 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
     }
     let artifacts = crate::shape::artifacts(&stdout);
     let script_runs = crate::shape::script_runs(&stdout);
+    if run.ok {
+        let indexed = crate::test_index::identities(&ctx.root, &ctx.tools.targo)
+            .and_then(|identity| {
+                if Some(&identity) != identity_before.as_ref() {
+                    return Err(std::io::Error::other(
+                        "candidate changed during test compile",
+                    ));
+                }
+                crate::test_index::Index::from_messages(identity.0, identity.1, &stdout)
+            })
+            .and_then(|index| index.write(&ctx.state_dir().join("test-executables.json")));
+        if let Err(error) = indexed {
+            r.raw(format!("test executable index unavailable: {error}"));
+        }
+    }
     let exes = crate::testrun::take_test_executables(&mut stdout);
     rejoin(&mut run, stdout);
     r.raw(run.output.as_str());
@@ -2763,6 +2779,75 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_clean_compile_indexes_its_executables_but_a_failure_or_edit_does_not() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("tools")).unwrap();
+        // This probe is a test double, not a compiler; echo supplies observable identity
+        // output without copying an Apple executable into scratch.
+        std::os::unix::fs::symlink("/bin/echo", target.join("tools/trustc")).unwrap();
+        let binary = target.join("aterm_gui-0123456789abcdef");
+        std::fs::write(&binary, b"binary").unwrap();
+        let wire = aterm_json::json!({"reason":"compiler-artifact", "package_id":"aterm-gui", "manifest_path":root.join("crates/aterm-gui/Cargo.toml"), "target":{"kind":["lib"],"name":"aterm_gui"}, "profile":{"test":true}, "executable":binary}).to_string();
+        std::fs::write(root.join("wire"), wire).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Andrew Yates",
+                "-c",
+                "user.email=test@aterm.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "compile input",
+            ],
+        ] {
+            assert!(
+                aterm_uds::spawnfd::command("git")
+                    .current_dir(&root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let mut ctx = Ctx::new(
+            root.clone(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            target.clone(),
+        );
+        ctx.tools.targo = target.join("tools/targo");
+        let path = ctx.state_dir().join("test-executables.json");
+        for (script, code, indexed) in [
+            ("/bin/cat wire; exit \"$1\"", "0", true),
+            ("/bin/cat wire; exit \"$1\"", "3", false),
+            ("/bin/cat wire; /usr/bin/touch changed", "0", false),
+        ] {
+            let _ = std::fs::remove_file(&path);
+            let cmd = Cmd::new("/bin/sh").args(["-c", script, "compile-index", code]);
+            let mut report = Report::new("test compile");
+            let _ = compile_tests(&ctx, &mut report, "test compile", &cmd);
+            let index = crate::test_index::Index::read(&path);
+            assert_eq!(index.is_some(), indexed, "{}", report.render());
+            if let Some(index) = index {
+                assert!(
+                    index
+                        .fixture_binary(&index.tree, &index.toolchain, &root)
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

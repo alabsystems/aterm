@@ -6,11 +6,8 @@
 use aterm_render::{FaceId, Renderer, Theme};
 
 fn dejavu() -> Vec<u8> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/DejaVuSansMono.ttf"
-    ))
-    .expect("bundled DejaVu asset")
+    std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+        .expect("bundled DejaVu asset")
 }
 
 /// A Nerd Font PUA icon (powerline branch) the bundled Symbols Nerd Font covers

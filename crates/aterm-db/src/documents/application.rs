@@ -152,7 +152,7 @@ pub(crate) fn observe_store_if_declared<T>(
     observe_store_if_declared_until(paths, descriptor, admission_deadline(), action)
 }
 
-fn observe_store_if_declared_until<T>(
+pub(crate) fn observe_store_if_declared_until<T>(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     deadline: std::time::Instant,

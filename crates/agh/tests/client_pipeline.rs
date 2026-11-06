@@ -63,7 +63,7 @@ fn headers_go_in_order_at_the_api_origin() {
             ),
             (
                 "User-Agent".to_string(),
-                format!("agh/{} (test)", agh::VERSION)
+                format!("agh/{} (test)", agh::version())
             ),
             ("X-GitHub-Api-Version".to_string(), "2022-11-28".to_string()),
             ("If-None-Match".to_string(), "W/\"e\"".to_string()),

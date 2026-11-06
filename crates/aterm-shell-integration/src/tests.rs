@@ -380,7 +380,10 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
         ));
     }
     for (shell, args, script_name, print, exact) in lanes {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let run = |rr: Option<&str>, ag: Option<&str>, path: &str, pre: &str| {
             let mut cmd = shell_command(shell);
             cmd.args(args)
@@ -499,7 +502,10 @@ fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
         ));
     }
     for (shell, args, script_name, command, exact) in lanes {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let mut cmd = shell_command(shell);
         let bin = cmd.home().join(".aterm").join("bin");
         std::fs::create_dir_all(&bin).expect("mk ~/.aterm/bin");
@@ -622,7 +628,10 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
         }
     }
     for (shell, args, quiet, script_name, preexec) in runs {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let line = format!(
             "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; {command}\
              REPLY=mine; __aterm_report_cwd >/dev/null; {preexec}printf 'KEPT=%s' \"$REPLY\""
@@ -713,7 +722,10 @@ fn test_report_cwd_emits_percent_encoded_osc_7() {
     );
     let mut shells = ShellLanes::default();
     for (shell, args, script_name, quiet) in posix_lanes(&mut shells) {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let output = shell_command(shell)
             .args(args)
             .arg("-c")
@@ -756,7 +768,10 @@ fn test_report_cwd_is_signed_with_the_captured_nonce() {
     ));
     let mut shells = ShellLanes::default();
     for (shell, args, script_name, quiet) in posix_lanes(&mut shells) {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let output = shell_command(shell)
             .args(args)
             .arg("-c")
@@ -805,7 +820,7 @@ fn test_fish_reports_its_cwd_at_load_only_for_an_upgrade_in_place() {
     let (_dir, cwd) = create_special_cwd();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.fish",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let mut cmd = shell_command(fish);
     cmd.args(["-i", "-c"])
@@ -848,7 +863,7 @@ fn test_pwsh_report_cwd_is_signed_with_the_captured_nonce() {
     let (_dir, cwd) = create_special_cwd();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let mut cmd = shell_command(pwsh);
     cmd.args([
@@ -891,7 +906,7 @@ fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
     let pwsh = need_pwsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let run = |body: &str| -> String {
         let mut cmd = shell_command(pwsh);
@@ -950,7 +965,7 @@ fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
 fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let calls = dir.path().join("cygpath-calls");
@@ -1043,7 +1058,7 @@ fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
 fn test_bash_preexec_skips_prompt_command_array_siblings() {
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let command = "\
 __fake_vte_precmd() { :; }\n\
@@ -1100,7 +1115,7 @@ echo real-command\n";
 fn test_bash_prompt_command_array_of_one_runs_its_element_once_a_prompt() {
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let command = "\
 __user_precmd() { printf '[user-precmd]'; }\n\
@@ -1207,7 +1222,10 @@ fn test_cwd_tab_title_strips_control_chars() {
         ));
     }
     for (shell, args, script_name, hook) in lanes {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let output = shell_command(shell)
             .args(&args)
             .arg("-c")
@@ -1242,7 +1260,10 @@ fn test_osc_frame_writer_preserves_payload_escapes() {
         assert_eq!(encoded, PAYLOAD, "fish");
     }
     for (shell, args, script_name, quiet) in posix_lanes(&mut shells) {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/src/scripts/{script_name}",
+            aterm_tempfile::manifest_dir().display()
+        );
         let output = shell_command(shell)
             .args(args)
             .arg("-c")
@@ -1291,7 +1312,7 @@ fn test_prepare_unknown_returns_none() {
 fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> String {
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.fish",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let mut cmd = shell_command(fish);
     cmd.arg("-i")
@@ -1465,7 +1486,10 @@ fn test_a_long_command_title_ends_with_its_cut_mark() {
             } else {
                 "__aterm_preexec"
             };
-            let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+            let script = format!(
+                "{}/src/scripts/{script_name}",
+                aterm_tempfile::manifest_dir().display()
+            );
             let output = shell_command(shell)
                 .args(args)
                 .arg("-c")
@@ -1530,7 +1554,7 @@ fn test_bash_children_never_inherit_the_nonce_through_ps1() {
     let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let command = "\
 source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1\n\
@@ -1578,7 +1602,7 @@ fn test_zsh_unsets_shell_nonce_env_after_source() {
     let zsh = need_zsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.zsh",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
     for (given, suffix) in [(Some(nonce), format!(";id={nonce}")), (None, String::new())] {
@@ -1715,7 +1739,7 @@ fn powershell_output_in(
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.ps1",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let mut command = PowerShellWorld::home_guard().to_owned();
     command.push_str(prelude);
@@ -2337,7 +2361,10 @@ fn run_mux_probe(
     env: &[(&str, &str)],
     report: &str,
 ) -> (String, String) {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        "{}/src/scripts/{script_name}",
+        aterm_tempfile::manifest_dir().display()
+    );
     let mut cmd = shell_command(shell);
     cmd.args(args)
         .arg("-c")
@@ -3458,7 +3485,7 @@ fn test_zsh_loads_zstat_only_once_there_is_a_hook_to_stamp() {
     let zsh = need_zsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.zsh",
-        env!("CARGO_MANIFEST_DIR")
+        aterm_tempfile::manifest_dir().display()
     );
     let scenario = "\
 source \"$ATERM_TEST_SCRIPT\"\n\
@@ -3698,7 +3725,7 @@ fn piped_interactive_shells_in_a_background_group_neither_stop_nor_touch_the_tty
             shells.absent.clear();
             let script = format!(
                 "{}/src/scripts/aterm_shell_integration",
-                env!("CARGO_MANIFEST_DIR")
+                aterm_tempfile::manifest_dir().display()
             );
             for (shell, args, file, _) in lanes {
                 let out = shell_command(shell)

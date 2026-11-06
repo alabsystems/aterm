@@ -395,15 +395,16 @@ fn a_glass_solved_to_the_bare_fg_holds_a_letter_under_its_bar() {
 
 /// The window's face, loaded by the path [`Renderer::from_system`] takes it from: SF Mono on
 /// macOS, the bundled JetBrains Mono elsewhere.
-fn window_face() -> (&'static str, Vec<u8>) {
+fn window_face() -> (String, Vec<u8>) {
     #[cfg(target_os = "macos")]
-    let path = "/System/Library/Fonts/SFNSMono.ttf";
+    let path = String::from("/System/Library/Fonts/SFNSMono.ttf");
     #[cfg(not(target_os = "macos"))]
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/bundled/JetBrainsMono-Regular.ttf"
-    );
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let path = aterm_tempfile::manifest_dir()
+        .join("assets/bundled/JetBrainsMono-Regular.ttf")
+        .into_os_string()
+        .into_string()
+        .expect("a UTF-8 package directory");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     (path, bytes)
 }
 

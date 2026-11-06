@@ -620,6 +620,7 @@ pub(crate) fn claim_order(offer: &Offer, folder: Option<&Path>) -> crate::task_l
         fact_line: false,
         autopilot: Autopilot::Land,
         chrome: true,
+        program: None,
     }
 }
 

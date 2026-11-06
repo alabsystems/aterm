@@ -551,7 +551,7 @@ fn the_recording_says_it_holds_unseen_keys_wherever_it_goes() {
     assert_eq!(exported.unseen, 2);
     let root = aterm_tempfile::tempdir().expect("a scratch state dir");
     let path = write_export(root.path(), "unseen.trace", &exported.bytes).expect("writes");
-    let checked = check_file(&path, &aterm_types::version::build_id()).expect("checks");
+    let checked = check_file(&path, &aterm_stamp::build_id()).expect("checks");
     assert!(checked.contains(" unseen=2 "), "{checked}");
 
     let later = settled + ms(100);

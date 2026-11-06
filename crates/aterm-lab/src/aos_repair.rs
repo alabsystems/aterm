@@ -45,9 +45,9 @@ hold exactly its 24 keys and no reset. A host whose `aos trace` lacks sealed=/ke
   --publish PLAN_HEX
                 Aos M4: the control's first 24 keys, then `aos publish plan=PLAN_HEX` (a plan's 12 bytes as 24 hex
                 digits), the plan live, `aos bundle` decoded and verified in the lab (only when the window's build
-                names this lab's clean commit; else verify=skipped(foreign build), a FAIL), then the same 12-key
-                phase measured: T, P and Z, presents, the slot rounding of the settle answers, and the moved caret's
-                lag
+                names this lab's clean commit, which only a build with ATERM_STAMP=commit stamps; else
+                verify=skipped(foreign build), a FAIL), then the same 12-key phase measured: T, P and Z, presents,
+                the slot rounding of the settle answers, and the moved caret's lag
   --keep        keep the scratch world (and the frames in it when --out is not given)
   --out DIR     where the frames, sidecars, contrast reports and the transcript go, OUTSIDE the repository
 

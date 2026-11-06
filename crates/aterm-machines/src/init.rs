@@ -189,22 +189,6 @@ impl Options {
             && self.develop.is_none()
             && self.only.iter().all(|word| word == crate::init_toolset::ID)
     }
-
-    /// Whether this run may join a vault: a workstation run its `--only` words, if any, do not
-    /// narrow to other items (`--only init.spotlight` looks for no vault).
-    fn joins(&self) -> bool {
-        self.workstation()
-            && (self.only.is_empty()
-                || self.only.iter().any(|word| {
-                    word.starts_with("init.secrets@")
-                        || aterm_converge::selects(
-                            word,
-                            "init.secrets@",
-                            crate::init_secrets::FAMILY,
-                            Some(Layer::Workstation),
-                        )
-                }))
-    }
 }
 
 /// The workstation groups a run applies: by this Mac's scope (every one on an ALab Mac, none
@@ -1125,18 +1109,6 @@ fn entry(
         eprintln!("aterm init: {AWAY_FROM_HOME}");
         return ExitCode::FAILURE;
     }
-    // The look for the ALab vault overlaps reading the Mac (its context and the develop
-    // layer); the secrets step takes its answer as the workstation groups are prepared, which
-    // is before the base layer runs, so every question comes before any change. A run aterm
-    // decided looks only from the secrets step, which at a Mac's console waits until macOS has
-    // answered its Local Network question ([`crate::init_secrets::Here::Unbidden`]) and in a
-    // remote shell, where macOS asks none, looks at once ([`crate::init_secrets::Here::Remote`]).
-    let ahead = (host.decided == Decider::Person
-        && options.action == Action::Apply
-        && options.joins()
-        && options.vault.is_none())
-    .then(crate::init_secrets::look_ahead)
-    .flatten();
     // What the person turned off in System State, or their Stop, holds this run's groups as it
     // holds the window's; the line saying so follows the tally.
     let held: Mutex<Vec<ItemReport>> = Mutex::new(Vec::new());
@@ -1160,7 +1132,6 @@ fn entry(
             sys,
             ctx,
             mode,
-            ahead.clone(),
             options.vault.as_deref(),
             reading,
             &standing,
@@ -3786,6 +3757,29 @@ pub fn run_initial_secrets(
     )
 }
 
+/// Apply the Secrets stage while the caller's admitted setup choices remain current.
+/// The same check reaches each native proof publication, including a Stop during a handshake.
+/// # Errors
+/// The context or journal cannot be resolved, or setup cannot finish safely.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected stage and its live authorization"
+)]
+pub fn run_initial_secrets_guarded(
+    sys: &dyn System,
+    ctx: &Ctx,
+    ops: Arc<dyn crate::init_secrets::SecretsOps>,
+    source: &str,
+    replaces: crate::init_secrets::Replaces,
+    password: &mut Option<aterm_secrets::SecretBytes>,
+    wait: std::time::Duration,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Vec<ItemReport>, String> {
+    let mut journal = sys.journal()?;
+    let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?;
+    run_vault_item(vault, sys, ctx, password, journal.as_mut(), current)
+}
+
 /// [`run_initial_secrets`], journaling in `journal`.
 ///
 /// # Errors
@@ -3805,7 +3799,7 @@ pub fn run_initial_secrets_with(
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
     let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?;
-    run_vault_item(vault, sys, ctx, password, journal)
+    run_vault_item(vault, sys, ctx, password, journal, &|| Ok(()))
 }
 
 /// The converge pass's join of the ALab vault (`sync.peers`): [`run_initial_secrets_with`]
@@ -3825,7 +3819,7 @@ pub(crate) fn run_converge_join(
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
     let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?.keeping_off();
-    run_vault_item(vault, sys, ctx, &mut None, journal)
+    run_vault_item(vault, sys, ctx, &mut None, journal, &|| Ok(()))
 }
 
 /// Run `vault`, the Secrets stage's vault item, as an apply journaled in `journal`, holding
@@ -3836,10 +3830,19 @@ fn run_vault_item(
     ctx: &Ctx,
     password: &mut Option<aterm_secrets::SecretBytes>,
     journal: &mut dyn Journal,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Vec<ItemReport>, String> {
     vault.hold_password(password.take());
+    let held = |_: &str| current().err();
+    let guarded = HeldLate {
+        inner: &vault,
+        held: &held,
+        decided: std::sync::OnceLock::new(),
+        late: std::sync::OnceLock::new(),
+        said: std::sync::OnceLock::new(),
+    };
     let bound = crate::engine::bind(
-        [(&vault as &dyn Item, workstation_place(Class::Install))],
+        [(&guarded as &dyn Item, workstation_place(Class::Install))],
         sys,
         ctx,
     );
@@ -3968,8 +3971,9 @@ struct Standing<'a> {
 type Prepare<'a> =
     dyn Fn(&dyn System, &Ctx, Mode, &Reading<'_>) -> Result<(Vec<Group>, Picked), String> + 'a;
 
-/// Prepare workstation groups, reading optional profiles before probing; the look for the ALab
-/// vault answers with `ahead`'s, and `vault` is `--vault`'s. Which settings run is this Mac's
+/// Prepare workstation groups, reading optional profiles before probing; `vault` is
+/// `--vault`'s. Default discovery waits for the authorized apply, after native admission.
+/// Which settings run is this Mac's
 /// scope, the flags and the person's choices in System State ([`picked`], `standing`); nothing
 /// asks. Who is at this run ([`crate::console::presence`]) decides whether it may change the
 /// person's own Mac: over SSH, or under another login's console, nothing of the workstation is
@@ -3983,22 +3987,17 @@ type Prepare<'a> =
 /// waits for macOS's Local Network answer (a remote shell, where macOS asks none, looks at once),
 /// and Rust in Spotlight searches no folder of the person's. A group that cannot be built is one
 /// row saying why ([`Unbuilt`]); the others run.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one run's workstation inputs, each its own"
-)]
 fn prepare_groups(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
-    ahead: Option<Arc<crate::init_secrets::Lookahead>>,
     vault: Option<&str>,
     reading: &Reading<'_>,
     standing: &Standing<'_>,
     grants: Grants,
 ) -> Result<(Vec<Group>, Picked), String> {
     prepare_groups_with(sys, ctx, mode, vault, reading, standing, grants, |ctx| {
-        crate::init_secrets::live(ctx, ahead)
+        crate::init_secrets::live(ctx)
     })
 }
 
@@ -7804,9 +7803,28 @@ mod tests {
                     "{lane}: {rows:?}"
                 );
             }
-            assert_eq!(status(&rows, Action::Apply), 0);
+            let secrets = rows
+                .iter()
+                .find(|row| row.id.starts_with("init.secrets@"))
+                .expect("the background vault join");
+            assert_eq!(secrets.outcome, Outcome::Blocked, "{rows:?}");
+            assert!(matches!(
+                secrets.stood_aside,
+                Some(aterm_converge::StoodAside::Offline(_))
+            ));
+            assert_eq!(status(&rows, Action::Apply), 69, "{rows:?}");
             assert!(
-                !sys.calls().iter().any(|call| call.contains("hidutil")),
+                !sys.calls().iter().any(|call| {
+                    [
+                        "hidutil",
+                        "defaults",
+                        "killall",
+                        "osascript",
+                        "accounts.data",
+                    ]
+                    .iter()
+                    .any(|console| call.contains(console))
+                }),
                 "{:?}",
                 sys.calls()
             );
@@ -7886,7 +7904,11 @@ mod tests {
             };
             let (bound, groups, ctx, vault) = bound_for(&sys, &standing, false);
             assert!(ctx.console.is_some(), "the console's own session");
-            assert_eq!(vault.probes(), 1, "{presence:?} looks for the ALab vault");
+            assert_eq!(
+                vault.probes(),
+                0,
+                "{presence:?} prepares without looking for the ALab vault"
+            );
             assert!(
                 bound
                     .iter()
@@ -7924,6 +7946,7 @@ mod tests {
                 &mut NoJournal,
             )
             .unwrap();
+            assert_eq!(vault.probes(), 1, "{presence:?} looks during apply");
             let away = rows
                 .iter()
                 .find(|row| row.id == AWAY)
@@ -7956,7 +7979,7 @@ mod tests {
         sys.agent = None;
         assert_eq!(init_presence(&sys), Presence::AtConsole);
         let (bound, _, _, vault) = bound_for(&sys, &personal_standing(), false);
-        assert_eq!(vault.probes(), 1, "the vault look ran and found nothing");
+        assert_eq!(vault.probes(), 0, "preparation leaves discovery to apply");
         assert!(
             bound
                 .iter()
@@ -8085,7 +8108,6 @@ mod tests {
         let follow_up = options(&words(&PACKAGE_FOLLOW_UP)).unwrap();
         assert_eq!(follow_up.action, Action::Apply);
         assert_eq!(follow_up.base_lock(true), BaseLock::Try);
-        assert!(follow_up.joins());
         let alab = follow_up.picks.choice(true);
         assert_eq!(
             alab,
@@ -10239,21 +10261,7 @@ mod tests {
             station: unnamed(&Base::none(), &parsed.only),
             ..parsed
         };
-        assert!(options.workstation() && !options.joins());
-        for only in [
-            &[][..],
-            &["secrets"],
-            &["init.secrets@alice"],
-            &["workstation"],
-        ] {
-            let only: Vec<String> = only.iter().map(|word| (*word).to_owned()).collect();
-            let joins = Options {
-                station: unnamed(&Base::none(), &only),
-                only,
-                ..Options::default()
-            };
-            assert!(joins.joins(), "{joins:?}");
-        }
+        assert!(options.workstation());
         let sys = alice_with_checkout(501, None);
         let groups = |ctx: &Ctx| {
             vec![

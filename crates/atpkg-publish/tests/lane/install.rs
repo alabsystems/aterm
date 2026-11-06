@@ -23,6 +23,8 @@ use super::fixture::{Fx, git};
 struct FakeBuild {
     n: Mutex<u32>,
     edit: Option<&'static str>,
+    /// A build input that gains a line at its end while the build runs.
+    grow: Option<&'static str>,
 }
 
 impl SnapshotBuilder for FakeBuild {
@@ -31,6 +33,14 @@ impl SnapshotBuilder for FakeBuild {
         *n += 1;
         if let Some(rel) = self.edit {
             std::fs::write(repo.join(rel), format!("// edited during build {n}\n")).expect("edit");
+        }
+        if let Some(rel) = self.grow {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(repo.join(rel))
+                .expect("open to grow");
+            std::io::Write::write_all(&mut file, format!("// grown during build {n}\n").as_bytes())
+                .expect("grow");
         }
         let binary = target_dir.join("release").join(install::BINARY);
         std::fs::create_dir_all(binary.parent().expect("parent")).expect("mkdir");
@@ -488,6 +498,38 @@ fn an_edit_that_lands_during_the_build_is_never_snapshotted() {
         },
     );
     r.expect("a still tree, dirty on purpose");
+}
+
+/// A dirty build input whose diff is more than a git query's whole stdout may be
+/// (`MAX_COMPLETE_STDOUT_BYTES`) is compared whole: an install allowed dirty takes it, and the
+/// same input grown at its end while the snapshot builds is still caught.
+#[test]
+fn a_dirty_input_larger_than_a_git_reply_is_compared_whole() {
+    let mut b = machine("install-large-diff", Os::Darwin);
+    let line = "// one line of a large edit\n";
+    let lines = aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES / line.len() + 1;
+    std::fs::write(
+        b.fx.ctx.repo_root.join("crates/x/lib.rs"),
+        line.repeat(lines),
+    )
+    .expect("edit");
+    let dirty = || InstallFlags {
+        allow_dirty: true,
+        no_arm: true,
+        ..InstallFlags::default()
+    };
+    let (r, _) = install(&b, LaneKind::Alab, dirty());
+    r.expect("a still tree whose diff is larger than a git reply");
+    b.machine.builder = Box::new(FakeBuild {
+        grow: Some("crates/x/lib.rs"),
+        ..FakeBuild::default()
+    });
+    let (r, _) = install(&b, LaneKind::Alab, dirty());
+    assert!(
+        r.expect_err("the input grew under the build")
+            .to_string()
+            .contains("changed while the snapshot was building")
+    );
 }
 
 #[test]

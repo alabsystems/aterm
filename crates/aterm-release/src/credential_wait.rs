@@ -81,11 +81,19 @@ fn args_of(pid: i32) -> String {
         return String::new();
     }
     aterm_uds::process::read_process_argv(pid).map_or_else(String::new, |words| {
-        words
+        let cap: usize = words
             .iter()
-            .map(|word| word.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
+            .map(|w| w.len().saturating_add(1))
+            .sum::<usize>()
+            .saturating_sub(1);
+        let mut out = String::with_capacity(cap);
+        for (i, word) in words.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&word.to_string_lossy());
+        }
+        out
     })
 }
 

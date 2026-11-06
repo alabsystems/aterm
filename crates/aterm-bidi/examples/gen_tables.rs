@@ -56,7 +56,7 @@ const CODE_SPACE: usize = 0x11_0000;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = aterm_tempfile::manifest_dir();
     let done = match args.as_slice() {
         [verb, derived, brackets] if verb == "tables" => tables(&read(derived), &read(brackets))
             .and_then(|text| aterm_census::seal::stamp(&text))

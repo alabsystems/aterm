@@ -1976,7 +1976,7 @@ fn join_with_denial_deadline(
         node: me.node().to_owned(),
         host,
         port,
-        version: aterm_types::version::app_version().to_owned(),
+        version: aterm_stamp::app_version().to_owned(),
         key: None,
         signed: None,
     }

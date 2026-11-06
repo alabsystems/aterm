@@ -203,16 +203,13 @@ impl Scratch {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> aterm_uds::spawnfd::Child {
-        let atpkg = env!("CARGO_BIN_EXE_atpkg");
+        let atpkg = aterm_tempfile::bin_exe("atpkg");
         let mut cmd = match ignored {
-            None => aterm_uds::spawnfd::command(atpkg),
+            None => aterm_uds::spawnfd::command(&atpkg),
             Some(ignored) => {
                 let mut sh = aterm_uds::spawnfd::command("/bin/sh");
-                sh.args([
-                    "-c",
-                    &format!("trap '' {ignored}; exec \"$0\" \"$@\""),
-                    atpkg,
-                ]);
+                sh.args(["-c", &format!("trap '' {ignored}; exec \"$0\" \"$@\"")])
+                    .arg(&atpkg);
                 sh
             }
         };
@@ -691,7 +688,7 @@ fn an_ordinary_ancestors_unlocked_lock_file_cannot_force_admission() {
             ])
             .arg(&lock)
             .arg(&ready)
-            .arg(env!("CARGO_BIN_EXE_atpkg"))
+            .arg(aterm_tempfile::bin_exe("atpkg"))
             .args(["__build_admit", "--shim", "targo", "-"])
             .arg(s.targo())
             .args(["--unverified", "check", "-p", "small"])
@@ -1016,5 +1013,229 @@ fn a_build_keeps_the_signals_its_front_was_started_ignoring() {
             .expect("the build's word")
             .trim(),
         "survived"
+    );
+}
+
+/// A complete store build `build` under `prefix` (its ready marker beside it) whose `targo` writes
+/// `ran <build>` to `$HOP_RAN`, and the fold of its tree (`atpkg::tree::tree_root`).
+fn lock_store_build(prefix: &Path, build: u64) -> String {
+    let dir = atpkg::trust_lock::build_dir(prefix, build);
+    std::fs::create_dir_all(dir.join("bin")).expect("bin");
+    std::fs::write(atpkg::trust_lock::ready_marker(prefix, build), "ok\n").expect("ready");
+    let targo = dir.join("bin/targo");
+    std::fs::write(
+        &targo,
+        format!("#!/bin/sh\necho \"ran {build} $*\" > \"$HOP_RAN\"\n"),
+    )
+    .expect("the stand-in");
+    std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("runnable");
+    atpkg::tree::tree_root(&dir).expect("its fold")
+}
+
+/// THE SHIM HOP IN A LOCKED TREE (A14): the real front, handed the build its shim was laid for,
+/// runs the build the tree's `trust.lock` names instead, from a directory under the tree; with
+/// no lock it runs what it was handed (the negative control), and a lock whose build the store
+/// holds with another tree starts nothing (exit 75).
+#[test]
+fn the_hop_runs_the_build_a_trees_lock_names() {
+    let s = Scratch::new();
+    let prefix = s.root().join("pkg");
+    let locked_root = lock_store_build(&prefix, 16387);
+    lock_store_build(&prefix, 16500);
+    let laid = atpkg::trust_lock::build_dir(&prefix, 16500).join("bin/targo");
+    let tree = s.root().join("checkout");
+    let cwd = tree.join("crates/one");
+    std::fs::create_dir_all(&cwd).expect("checkout");
+    let ran = s.root().join("ran");
+    let hop = |cwd: &Path| {
+        let _ = std::fs::remove_file(&ran);
+        let out = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"))
+            .args(["__build_admit", "--shim", "targo", "-"])
+            .arg(&laid)
+            .args(["--unverified", "run", "-p", "a"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", s.home())
+            .env("ATERM_STATE_HOME", s.state())
+            .env(atpkg::build_admit::LEDGER_ENV, s.ledger())
+            .env("HOP_RAN", &ran)
+            .current_dir(cwd)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::piped())
+            .output()
+            .expect("the front");
+        (
+            out.status.code(),
+            std::fs::read_to_string(&ran).unwrap_or_default(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, said, _) = hop(&cwd);
+    assert_eq!(
+        (code, said.trim()),
+        (Some(0), "ran 16500 --unverified run -p a"),
+        "no lock"
+    );
+
+    let lock = atpkg::trust_lock::TrustLock {
+        build: 16387,
+        tree_root: locked_root,
+        compiler_commit: "29ebb403de7a102850d6cb10a62d5cc3baf723ed".to_owned(),
+        receipt: "SEED-MINT sha256:00".to_owned(),
+        stock_toolchain: "1.99.1".to_owned(),
+    };
+    std::fs::write(
+        tree.join(atpkg::trust_lock::LOCK_FILE),
+        atpkg::trust_lock::render_body(&lock),
+    )
+    .expect("the lock");
+    let (code, said, _) = hop(&cwd);
+    assert_eq!(
+        (code, said.trim()),
+        (Some(0), "ran 16387 --unverified run -p a"),
+        "locked"
+    );
+
+    let mut other = lock.clone();
+    other.tree_root = "e".repeat(64);
+    std::fs::write(
+        tree.join(atpkg::trust_lock::LOCK_FILE),
+        atpkg::trust_lock::render_body(&other),
+    )
+    .expect("the lock");
+    let (code, said, stderr) = hop(&cwd);
+    assert_eq!((code, said.as_str()), (Some(75), ""), "{stderr}");
+    assert!(stderr.contains("no build started"), "{stderr}");
+}
+
+/// A LOCKED BUILD THE STORE LACKS IS INSTALLED BY THE HOP, into the store it resolves from: the
+/// real front spawns `atpkg install --no-init trust --build <N> --wait-lock …`, whose words it
+/// parses (a registry with no index refuses the install, not its usage), with its output on
+/// stderr and none on the build's stdout, and starts no build when the install fails. A shim laid
+/// in another store than this atpkg installs into is refused before any install.
+#[test]
+fn an_absent_locked_build_is_installed_by_the_hop_into_its_store() {
+    let s = Scratch::new();
+    let registry = s.root().join("registry");
+    std::fs::create_dir_all(&registry).expect("an empty registry");
+    let tree = s.root().join("checkout");
+    std::fs::create_dir_all(&tree).expect("checkout");
+    let lock = atpkg::trust_lock::TrustLock {
+        build: 16999,
+        tree_root: "4".repeat(64),
+        compiler_commit: "29ebb403de7a102850d6cb10a62d5cc3baf723ed".to_owned(),
+        receipt: "SEED-MINT sha256:00".to_owned(),
+        stock_toolchain: "1.99.1".to_owned(),
+    };
+    std::fs::write(
+        tree.join(atpkg::trust_lock::LOCK_FILE),
+        atpkg::trust_lock::render_body(&lock),
+    )
+    .expect("the lock");
+    let ran = s.root().join("ran");
+    let hop = |prefix: &Path| {
+        lock_store_build(prefix, 16500);
+        let laid = atpkg::trust_lock::build_dir(prefix, 16500).join("bin/targo");
+        let out = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"))
+            .args(["__build_admit", "--shim", "targo", "-"])
+            .arg(&laid)
+            .args(["--unverified", "metadata"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", s.home())
+            .env("ATERM_STATE_HOME", s.state())
+            .env(atpkg::build_admit::LEDGER_ENV, s.ledger())
+            .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
+            .env("HOP_RAN", &ran)
+            .current_dir(&tree)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .expect("the front");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let home_store = atpkg::toolchain::atpkg_prefix(&s.home(), None);
+    let (code, stdout, stderr) = hop(&home_store);
+    assert_eq!(code, Some(75), "{stderr}");
+    assert_eq!(stdout, "", "the install says nothing on the build's stdout");
+    assert!(stderr.contains("installing Trust build 16999"), "{stderr}");
+    assert!(stderr.contains("its install failed"), "{stderr}");
+    assert!(
+        stderr.contains("exit status: 1"),
+        "the child parsed its words and refused the install, not its usage (2): {stderr}"
+    );
+    for usage in [
+        "one program at a time",
+        "takes a build number",
+        "--build stages",
+    ] {
+        assert!(!stderr.contains(usage), "a usage refusal: {stderr}");
+    }
+    assert!(stderr.contains("no build started"), "{stderr}");
+    assert!(!ran.exists(), "no build ran");
+
+    // Negative control: a shim laid in a store this atpkg does not install into.
+    let (code, stdout, stderr) = hop(&s.root().join("pkg"));
+    assert_eq!((code, stdout.as_str()), (Some(75), ""), "{stderr}");
+    assert!(stderr.contains("installs into"), "{stderr}");
+    assert!(!stderr.contains("installing Trust build"), "{stderr}");
+    assert!(!ran.exists(), "no build ran");
+}
+
+#[test]
+fn the_front_says_it_honours_locks() {
+    let out = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"))
+        .args(["__build_admit", atpkg::trust_lock::LOCK_CAPABILITY_FLAG])
+        .output()
+        .expect("the front");
+    assert!(out.status.success());
+    assert_eq!(
+        out.stdout,
+        format!("{}\n", atpkg::trust_lock::LOCK_CAPABILITY).as_bytes()
+    );
+    assert!(atpkg::trust_lock::helper_honours_lock(
+        &aterm_tempfile::bin_exe("atpkg")
+    ));
+    // Negative control: a front that takes the flag for its target does not honour locks.
+    assert!(!atpkg::trust_lock::helper_honours_lock(Path::new(
+        "/usr/bin/false"
+    )));
+
+    // What verify reads of this Mac's shim: one that hops through this front runs locked builds;
+    // one whose helper is an older front runs the build it was laid for.
+    let s = Scratch::new();
+    let prefix = s.root().join("pkg");
+    let target = atpkg::trust_lock::build_dir(&prefix, 16500).join("bin/targo");
+    let lay = |helper: &Path| {
+        std::fs::create_dir_all(prefix.join("bin")).expect("bin");
+        let hop = atpkg::build_cache::registered::shim_hop(
+            helper,
+            "targo",
+            &target.to_string_lossy(),
+            None,
+        );
+        std::fs::write(
+            prefix.join("bin/targo"),
+            format!("#!/bin/sh\n{hop}exec '{}' \"$@\"\n", target.display()),
+        )
+        .expect("the shim");
+        atpkg::trust_lock::shim_answer(&prefix)
+    };
+    assert_eq!(
+        lay(&aterm_tempfile::bin_exe("atpkg")),
+        atpkg::trust_lock::ShimAnswer::Locked
+    );
+    assert_eq!(
+        lay(Path::new("/usr/bin/false")),
+        atpkg::trust_lock::ShimAnswer::Laid {
+            target: target.clone(),
+            build: Some(16500)
+        }
     );
 }

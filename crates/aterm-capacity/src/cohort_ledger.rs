@@ -114,14 +114,13 @@ impl Custody {
     fn check(&self, lock: &RecordLock, path: &Path, transaction: &Transaction) -> io::Result<()> {
         self.namespace.validate()?;
         read_only(lock)?;
-        same_file(lock, &self.writer)?;
+        let held = same_file(lock, &self.writer)?;
         let named = fd::fstatat(
             &self.directory,
             path.file_name()
                 .ok_or_else(|| refused("claim has no name"))?,
             AtFlags::SYMLINK_NOFOLLOW,
         )?;
-        let held = fd::fstat(lock.as_fd())?;
         // SAFETY: geteuid takes no arguments and reads this process's effective identity.
         let uid = unsafe { libc::geteuid() };
         if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)
@@ -227,7 +226,7 @@ fn open_mode(directory: &File, name: &str, create: bool, write: bool) -> io::Res
     Ok(file)
 }
 
-fn same_file(guard: &RecordLock, writer: &File) -> io::Result<()> {
+fn same_file(guard: &RecordLock, writer: &File) -> io::Result<fd::Stat> {
     let guard = fd::fstat(guard.as_fd())?;
     let writer = fd::fstat(writer)?;
     if (guard.st_dev, guard.st_ino) != (writer.st_dev, writer.st_ino) {
@@ -235,7 +234,7 @@ fn same_file(guard: &RecordLock, writer: &File) -> io::Result<()> {
             "private cohort writer opens another inode than its guard",
         ));
     }
-    Ok(())
+    Ok(guard)
 }
 
 fn read_only(guard: &RecordLock) -> io::Result<()> {
@@ -593,11 +592,11 @@ pub(super) fn claim_state(
             &mut transaction,
         )?;
         // A successful reap may have transferred the whole original directory atomically.
-        match std::fs::symlink_metadata(namespace.active().join(reference.key())) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match fd::fstatat(&active, reference.key(), AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) if error.is_noent() => {
                 return checkpoint::archived_state(namespace, reference, reap);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
     }
@@ -754,18 +753,16 @@ impl Laid {
     }
 
     fn transaction(&self) -> io::Result<Transaction> {
-        use std::os::unix::fs::MetadataExt as _;
         let custody = self
             .custody
             .as_ref()
             .ok_or_else(|| refused("legacy claim has no cohort transaction"))?;
         custody.namespace.validate()?;
         read_only(&self.lock)?;
-        same_file(&self.lock, &custody.writer)?;
-        let m = self.lock.metadata()?;
+        let held = same_file(&self.lock, &custody.writer)?;
         if !custody.checkpoint.matches_guard(ClaimGuardIdentity {
-            device: m.dev(),
-            inode: m.ino(),
+            device: held.st_dev,
+            inode: held.st_ino,
         }) {
             return Err(refused(
                 "controller lost its original immutable guard binding",

@@ -13,6 +13,7 @@
 //! reading as a boot that moves.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The kernel's panic line.
@@ -39,8 +40,8 @@ pub enum Seen {
 pub struct Console {
     partial: Vec<u8>,
     tail: VecDeque<String>,
-    seen: HashSet<String>,
-    seen_order: VecDeque<String>,
+    seen: HashSet<Arc<str>>,
+    seen_order: VecDeque<Arc<str>>,
     last_progress: Option<Duration>,
     lines: u64,
     repeats: u64,
@@ -153,14 +154,15 @@ impl Console {
             return None;
         }
         self.lines += 1;
-        if !self.seen.contains(&key) {
+        if !self.seen.contains(key.as_str()) {
             if self.seen_order.len() == SEEN_LINES
                 && let Some(oldest) = self.seen_order.pop_front()
             {
                 self.seen.remove(&oldest);
             }
-            self.seen.insert(key.clone());
-            self.seen_order.push_back(key);
+            let shared: Arc<str> = Arc::from(key);
+            self.seen.insert(Arc::clone(&shared));
+            self.seen_order.push_back(shared);
             self.last_progress = Some(now);
         } else {
             self.repeats += 1;

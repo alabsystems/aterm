@@ -212,7 +212,9 @@ fn the_mode_row_reads_claudes_jobs_and_the_grid_keeps_claudes_row() {
         frame(&mut app, wid);
         let top = glass_of(&app, wid, strip(&app, wid) + 20);
         assert!(
-            top.contains("alab claude harness"),
+            top.contains(&crate::claude_footer::probe::harness_label(
+                aterm_phase::CliHarness::ClaudeCode
+            )),
             "the border is aterm's: {top:?}"
         );
         let glass = glass_of(&app, wid, row);

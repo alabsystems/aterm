@@ -27,7 +27,10 @@ struct Loaded {
 
 fn load(face: &corpus::FaceFile) -> Option<Loaded> {
     let path = match face.origin {
-        Origin::Repo(rel) => format!("{}/../aterm-render/{rel}", env!("CARGO_MANIFEST_DIR")),
+        Origin::Repo(rel) => format!(
+            "{}/../aterm-render/{rel}",
+            aterm_tempfile::manifest_dir().display()
+        ),
         Origin::System(abs) => abs.to_string(),
     };
     let bytes = match std::fs::read(&path) {
@@ -50,12 +53,11 @@ type Recorded = BTreeMap<String, BTreeMap<(u32, String), BTreeMap<String, String
 
 /// Parses recorded `read` lines from `tests/fixtures/font-oracle/<file>` in `aterm-render`.
 fn recorded(file: &str) -> Recorded {
-    let path = format!(
-        "{}/../aterm-render/tests/fixtures/font-oracle/{file}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = aterm_tempfile::manifest_dir()
+        .join("../aterm-render/tests/fixtures/font-oracle")
+        .join(file);
     let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("the TF.1 reader corpus {path}: {e}"))
+        .unwrap_or_else(|e| panic!("the TF.1 reader corpus {}: {e}", path.display()))
         .replace("\r\n", "\n");
     let mut out = Recorded::new();
     for t in text

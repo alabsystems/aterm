@@ -335,6 +335,8 @@ pub(crate) enum MenuAction {
     /// Change Nickname… — this Mac's nickname, from the menu bar's machine menu
     /// (`docs/DESIGN-machine-names-2026-11-04.md` §5.4).
     ChangeNickname,
+    /// Change this Mac's number and nickname from the machine menu.
+    RenameMachine,
 }
 
 impl MenuAction {
@@ -424,6 +426,7 @@ impl MenuAction {
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
             MenuAction::ChangeNickname => 102,
+            MenuAction::RenameMachine => 103,
         }
     }
 
@@ -514,6 +517,7 @@ impl MenuAction {
             97 => MenuAction::ForgetAllHistory,
             101 => MenuAction::RecordUnseenKeys,
             102 => MenuAction::ChangeNickname,
+            103 => MenuAction::RenameMachine,
             _ => return None,
         })
     }
@@ -1087,7 +1091,8 @@ impl MenuAction {
             MenuAction::ToggleStatsLens
             | MenuAction::ExportPaneHistory
             | MenuAction::RecordUnseenKeys
-            | MenuAction::ChangeNickname => PersonOnly,
+            | MenuAction::ChangeNickname
+            | MenuAction::RenameMachine => PersonOnly,
             MenuAction::ForgetAllHistory => OwnerOnly,
             MenuAction::ChooseTheme => ConfigWrite,
             MenuAction::About
@@ -1150,7 +1155,8 @@ impl MenuAction {
             | MenuAction::ForgetPaneHistory
             | MenuAction::ForgetAllHistory
             | MenuAction::RecordUnseenKeys
-            | MenuAction::ChangeNickname => false,
+            | MenuAction::ChangeNickname
+            | MenuAction::RenameMachine => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1396,6 +1402,7 @@ impl MenuAction {
             MenuAction::ChangeNickname => {
                 "Change this Mac's nickname, shown in the menu bar beside its number."
             }
+            MenuAction::RenameMachine => "Change this Mac's number and nickname.",
         }
     }
 
@@ -1404,7 +1411,10 @@ impl MenuAction {
     pub(crate) const fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
-            MenuAction::SystemState | MenuAction::RecordUnseenKeys | MenuAction::ChangeNickname => {
+            MenuAction::SystemState
+            | MenuAction::RecordUnseenKeys
+            | MenuAction::ChangeNickname
+            | MenuAction::RenameMachine => {
                 cfg!(target_os = "macos")
             }
             _ => true,
@@ -1419,6 +1429,7 @@ impl MenuAction {
             "SoftwareUpdate" => Some(MenuAction::SoftwareUpdate),
             "Version" => Some(MenuAction::Version),
             "ChangeNickname" => Some(MenuAction::ChangeNickname),
+            "RenameMachine" => Some(MenuAction::RenameMachine),
             "ApplyUpdate" => Some(MenuAction::ApplyUpdate),
             "Preferences" => Some(MenuAction::Preferences),
             "Quit" => Some(MenuAction::Quit),
@@ -2313,12 +2324,20 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
 pub(crate) const MACHINE_SECTION: &str = "Machine";
 
 /// The machine menu's actions, below its information row (§5.2).
-const MACHINE_MENU: &[MenuEntry] = &[Item {
-    label: "Change Nickname\u{2026}",
-    action: MenuAction::ChangeNickname,
-    key: "",
-    mods: MenuMods::None,
-}];
+const MACHINE_MENU: &[MenuEntry] = &[
+    Item {
+        label: "Rename This Mac\u{2026}",
+        action: MenuAction::RenameMachine,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Change Nickname\u{2026}",
+        action: MenuAction::ChangeNickname,
+        key: "",
+        mods: MenuMods::None,
+    },
+];
 
 /// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines, leaving out a section this
 /// platform offers none of (the machine menu off macOS).
@@ -2385,10 +2404,10 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, ask_nickname, choose_local_file, choose_local_image, choose_save_path, confirm,
-    confirm_owner, defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
-    order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
-    update_machine_menu, update_version_menu,
+    MenuHandle, ask_machine_name, ask_nickname, choose_local_file, choose_local_image,
+    choose_save_path, confirm, confirm_owner, defer_quit_for_terminate, install,
+    open_file_in_workspace, open_help_url, order_front_regardless, reveal_file_in_workspace,
+    show_handoff_target_version, update_machine_menu, update_version_menu,
 };
 
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3231,6 +3250,24 @@ mod macos {
         body: &str,
         current: &str,
     ) -> Option<crate::machine_title::NickAnswer> {
+        ask_machine_text(title, body, current, true)
+    }
+
+    /// Ask for the number and optional nickname, with Change and Cancel buttons.
+    pub(crate) fn ask_machine_name(
+        title: &str,
+        body: &str,
+        current: &str,
+    ) -> Option<crate::machine_title::NickAnswer> {
+        ask_machine_text(title, body, current, false)
+    }
+
+    fn ask_machine_text(
+        title: &str,
+        body: &str,
+        current: &str,
+        random_noun: bool,
+    ) -> Option<crate::machine_title::NickAnswer> {
         if super::os_ui_refused(title) {
             return None;
         }
@@ -3238,7 +3275,7 @@ mod macos {
         let _park = crate::watchdog::park_modal();
         let _up = crate::alert_keys::ConfirmationUp::hold();
         if !crate::hwkey::fence_queued_keys(mtm) {
-            aterm_log::warn!("nickname: the key queue would not drain; not asking");
+            aterm_log::warn!("machine name: the key queue would not drain; not asking");
             return None;
         }
         let [change, cancel, random] = crate::machine_title::NICK_BUTTONS;
@@ -3295,7 +3332,9 @@ mod macos {
                 sel!(addButtonWithTitle:),
                 cancel.id(),
             ));
-            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), random.id());
+            if random_noun {
+                let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), random.id());
+            }
             appkit::send_v(alert.id(), sel!(layout));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
             if let Some(panel) = &panel {
@@ -4641,6 +4680,7 @@ mod tests {
                     MenuAction::SystemState
                         | MenuAction::RecordUnseenKeys
                         | MenuAction::ChangeNickname
+                        | MenuAction::RenameMachine
                 );
                 if macos_only {
                     assert_eq!(

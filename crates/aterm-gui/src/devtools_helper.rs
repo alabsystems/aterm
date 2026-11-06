@@ -2942,7 +2942,7 @@ pub(crate) struct Marks {
 
 impl Default for Marks {
     fn default() -> Self {
-        let version = aterm_types::version::app_version().to_owned();
+        let version = aterm_stamp::app_version().to_owned();
         Self {
             devtools: version.clone(),
             fda: version,

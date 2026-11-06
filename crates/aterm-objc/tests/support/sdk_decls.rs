@@ -6,8 +6,6 @@
 
 #![cfg(target_os = "macos")]
 
-use std::path::Path;
-
 use crate::sdk_consts;
 
 /// The geometry types the subjects use but do not declare.
@@ -32,7 +30,7 @@ struct Decls {
 
 /// `file` under the mounting crate's `src/`.
 fn subject(file: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
+    let path = aterm_tempfile::manifest_dir().join("src").join(file);
     let src = std::fs::read_to_string(&path).expect("the module is readable");
     src.lines()
         .map(|l| l.split("//").next().unwrap_or(""))

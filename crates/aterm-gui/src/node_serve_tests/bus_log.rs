@@ -322,7 +322,7 @@ fn a_members_bus_log_stream_is_admitted_as_a_driver_and_served_its_ring() {
             .iter()
             .map(|cap| cap.filter.clone())
             .collect::<Vec<_>>(),
-        aterm_mesh::logs::ring(FLEET, &principal_a, &principal_b),
+        aterm_mesh::logs::ring(FLEET, &principal_a, &principal_b, &Default::default()),
         "A hands B the ring of §4.11, minted for B (a capability's `filter` is its whole grant)"
     );
     let own = format!("/f/{FLEET}/in/{principal_a}/s-1/{principal_b}/note");

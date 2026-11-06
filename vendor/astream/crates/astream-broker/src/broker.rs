@@ -4738,6 +4738,22 @@ impl Broker {
         now_unix_ms()
     }
 
+    /// Say which producers continue others' sequences, `successor -> predecessors`, replacing what
+    /// the last call said: a produce under `(successor, seq)` that a predecessor's record already
+    /// holds at `(predecessor, seq)` is answered from that record, as a resend, and appends
+    /// nothing. An embedder says it whenever a producer it admits takes a new id for an old
+    /// sequence, before it admits the new id's writes: a federation mirror whose source's key
+    /// rotated pushes its source's offsets under the new key's producer, and a burst the old one
+    /// landed here but never committed at the source is not appended twice
+    /// ([`BrokerLog::set_producer_lineage`](crate::store::BrokerLog::set_producer_lineage)).
+    pub fn set_producer_lineage(&self, lineage: impl IntoIterator<Item = (u64, Vec<u64>)>) {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_producer_lineage(lineage);
+    }
+
     /// Say whose relayed records this broker takes: exactly these Ed25519 keys, replacing the set
     /// the last call gave. An embedder calls it whenever its membership changes. A relayed record
     /// must name `identity_principal(key)` as its subject's owner, carry that principal's derived

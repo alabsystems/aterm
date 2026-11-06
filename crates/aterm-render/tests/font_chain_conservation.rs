@@ -141,11 +141,8 @@ fn chain_laws_hold_over_the_complete_input_space() {
 }
 
 fn dejavu() -> Vec<u8> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/DejaVuSansMono.ttf"
-    ))
-    .expect("bundled DejaVu asset")
+    std::fs::read(aterm_tempfile::manifest_dir().join("assets/DejaVuSansMono.ttf"))
+        .expect("bundled DejaVu asset")
 }
 
 /// A Nerd Font PUA icon: covered by the bundled symbol face, absent from DejaVu.

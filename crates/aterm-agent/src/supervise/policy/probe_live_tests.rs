@@ -9,6 +9,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
 use super::*;
+#[cfg(unix)]
+use crate::supervise::policy::approval::default_secrets;
 use crate::supervise::policy::rm_breaker::{RmScope, ScratchRoot, resolve_rm_line};
 
 /// The bound these tests wait a look for: the look behind a shut gate never ends.
@@ -144,7 +146,7 @@ fn a_look_the_disk_does_not_answer_refuses_what_it_would_have_proved() {
         "PATH=/usr/bin:/bin".to_string(),
     ]);
     let comps = vec!["private".to_string(), "tmp".to_string()];
-    let (physical, real, twin, view, env, startup, asks, cwds) =
+    let (physical, real, twin, walked, view, env, startup, asks, cwds) =
         on_own_thread(Some(Arc::clone(&gate)), SHORT, move || {
             let probe = LiveProbe;
             let launch = Path::new("/private/tmp");
@@ -157,6 +159,7 @@ fn a_look_the_disk_does_not_answer_refuses_what_it_would_have_proved() {
                 probe.rm_physical(&comps),
                 probe.real_components(&comps),
                 probe.hidden_twin_in(&comps, None),
+                probe.below_tree(&comps, usize::MAX, &[], None),
                 probe.git_view(&worker, launch, &writes),
                 probe.settings_env(&worker, launch),
                 probe.shell_startup(&worker, launch),
@@ -172,6 +175,7 @@ fn a_look_the_disk_does_not_answer_refuses_what_it_would_have_proved() {
     );
     assert_eq!(real, None, "no resolution, so the Read is refused");
     assert!(twin.is_err(), "{twin:?}");
+    assert!(walked.is_err(), "{walked:?}");
     assert!(view.is_err(), "{view:?}");
     assert!(env.is_err(), "{env:?}");
     assert!(startup.is_err(), "{startup:?}");
@@ -319,4 +323,103 @@ fn an_rm_off_unix_is_refused_before_the_disk_is_asked() {
         Err("the session cwd is not an absolute path".to_string())
     );
     assert_eq!(held.looks(), 0, "no look started");
+}
+
+/// A walk below a tree ([`below_within`]) holds every name below it to every rule, within the
+/// levels a reader reads, and follows every link: a key a basename rule names deep below, a
+/// component rule's folder (whose name is met where a reader enters it, above the last level),
+/// a file link to a key, a folder link into a component rule's folder, and a link into a
+/// home-rooted rule's folder, met as the disk resolves it though the rule names the home by an
+/// alias, are each a secret, named. A tree that is itself a key is one. Nothing at the path is
+/// missing; a link that names nothing and one back up the tree end clear; a walk past its entry
+/// bound or into a folder it cannot list is cut.
+#[cfg(unix)]
+#[test]
+fn a_walk_below_a_tree_meets_every_rule_and_follows_every_link() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
+    let root = real_dir(&tree);
+    for f in [
+        "home/.secrets/t",
+        "vault/id_rsa",
+        "vault/.aws/config",
+        "deep/x.rs",
+        "deep/a/b/c.pem",
+        "comp/x.rs",
+        "comp/d/.ssh/k",
+        "ln/x.rs",
+        "ld/x.rs",
+        "lu/x.rs",
+        "dangle/x.rs",
+        "cycle/x.rs",
+        "clean/x.rs",
+        "clean/src/y.rs",
+        "locked/l/z.rs",
+    ] {
+        let path = root.join(f);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a folder");
+        std::fs::write(&path, "token\n").expect("a file");
+    }
+    let link = |target: &str, at: &str| symlink(target, root.join(at)).expect("a link");
+    link("home", "alias");
+    link("../vault/id_rsa", "ln/f");
+    link("../vault/.aws", "ld/k");
+    link("../home/.secrets", "lu/s");
+    link("../nowhere", "dangle/n");
+    link("..", "cycle/up");
+    let alias = root.join("alias");
+    let secrets = default_secrets(Some(&alias));
+    let walk = |rel: &str, below: usize, max: usize| {
+        below_within(
+            &comps_of(&root.join(rel)),
+            below,
+            &secrets,
+            Some(&alias),
+            max,
+        )
+    };
+    let met = |rel: &str, below: usize| match walk(rel, below, 1000) {
+        Ok(Below::Secret(met)) => met,
+        other => panic!("{rel} within {below}: {other:?}"),
+    };
+    assert!(met("deep", usize::MAX).contains("c.pem"));
+    assert!(met("comp", usize::MAX).contains(".ssh"));
+    assert!(met("comp", 3).contains(".ssh"));
+    assert!(met("ln", usize::MAX).contains("id_rsa"));
+    assert!(met("ld", usize::MAX).contains(".aws"));
+    assert!(met("lu", usize::MAX).contains(".secrets"));
+    assert!(met("vault/id_rsa", 0).contains("id_rsa"));
+    // A link back up the tree enters the folder above it, which holds the vault and the home.
+    let above = met("cycle", usize::MAX);
+    assert!(
+        ["id_rsa", ".aws", ".secrets", ".ssh", "c.pem"]
+            .iter()
+            .any(|name| above.contains(name)),
+        "{above}"
+    );
+    let r = walk("locked", usize::MAX, 1000);
+    let mode = |m: u32| {
+        std::fs::set_permissions(root.join("locked/l"), std::fs::Permissions::from_mode(m))
+            .expect("a mode");
+    };
+    mode(0o000);
+    let cut = walk("locked", usize::MAX, 1000);
+    mode(0o755);
+    assert!(
+        cut.as_ref()
+            .is_err_and(|why| why.contains("cannot be listed")),
+        "{cut:?}"
+    );
+    let big = walk("clean", usize::MAX, 2);
+    assert!(
+        big.as_ref().is_err_and(|why| why.contains("too big")),
+        "{big:?}"
+    );
+    // NEGATIVE CONTROL: the levels a reader stops above, a clear tree, nothing there.
+    assert_eq!(walk("deep", 2, 1000), Ok(Below::Clear));
+    assert_eq!(walk("comp", 2, 1000), Ok(Below::Clear));
+    assert_eq!(r, Ok(Below::Clear));
+    assert_eq!(walk("clean", usize::MAX, 3), Ok(Below::Clear));
+    assert_eq!(walk("dangle", usize::MAX, 1000), Ok(Below::Clear));
+    assert_eq!(walk("gone", usize::MAX, 1000), Ok(Below::Missing));
 }

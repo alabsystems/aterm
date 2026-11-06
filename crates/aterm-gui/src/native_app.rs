@@ -6614,7 +6614,11 @@ pub(crate) struct EditorApp {
     /// it when the document opened ([`EditorApp::concealment`]).
     pub(crate) concealed: Option<crate::document_store::Concealed>,
     /// NEGATIVE CONTROL for the concealment tests: publish the document as though nothing were
-    /// concealed, which puts each revealed value back in the window's accessibility tree.
+    /// concealed, which puts each revealed value back in the window's accessibility tree. A test
+    /// sets it on one Editor (`NativeRuntime::publish_plain_for_negative_control`); in a debug
+    /// build every Editor starts with it when the process turns on the `plain-publication`
+    /// negative control (`aterm_types::negative_control::on`: `lab reveal-tab --plain-publication`,
+    /// `lab mac nux --scenario reveal-tab-control`), so a live reader can be shown to see a leak.
     #[cfg(any(test, debug_assertions))]
     pub(crate) plain_for_negative_control: bool,
 }
@@ -6684,7 +6688,7 @@ impl EditorApp {
             line_index_cache: std::cell::RefCell::new(None),
             concealed: None,
             #[cfg(any(test, debug_assertions))]
-            plain_for_negative_control: false,
+            plain_for_negative_control: aterm_types::negative_control::on("plain-publication"),
             table_cache: std::cell::RefCell::default(),
         }
     }

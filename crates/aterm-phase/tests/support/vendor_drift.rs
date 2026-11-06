@@ -519,4 +519,5 @@ pub(crate) const PLANTED_ROLLOUT_KEY: &[Anchor] = &[Anchor {
     text: "turn_context_planted_by_no_build",
     since: "0.163.0",
     kind: AnchorKind::Literal,
+    gone_in: None,
 }];

@@ -5,8 +5,10 @@
 
 use core::fmt;
 
-use astream_wire::frame::{HEADER_SIZE, MAGIC as FRAME_MAGIC, MAX_PAYLOAD_LEN};
-use astream_wire::steps::{STEP_HEADER, StepEnd, encode_step, scan_steps_from};
+use astream_wire::frame::{
+    HEADER_SIZE, MAGIC as FRAME_MAGIC, MAX_PAYLOAD_LEN, encode_frame_header,
+};
+use astream_wire::steps::{STEP_HEADER, StepEnd, encode_step_header, scan_steps_from};
 
 use crate::ident::{Digest, DigestBuilder, TaskIdentity, len_u64};
 use crate::task::Schema;
@@ -640,12 +642,25 @@ impl<S: Schema> EventLog<S> {
 }
 
 fn put_record(out: &mut Vec<u8>, step: u64, body: &[u8]) -> Result<(), LogFault> {
-    let rec = encode_step(step, body).map_err(|_| LogFault::TooLarge {
+    let step_hdr = encode_step_header(step, body.len()).map_err(|_| LogFault::TooLarge {
         at: step,
         len: body.len(),
         limit: MAX_BODY,
     })?;
-    out.extend_from_slice(&rec);
+    let start = out.len();
+    out.reserve(BODY_OFFSET.saturating_add(body.len()));
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    out.extend_from_slice(&step_hdr);
+    out.extend_from_slice(body);
+    let frame_hdr = encode_frame_header(&out[start + HEADER_SIZE..]).map_err(|_| {
+        out.truncate(start);
+        LogFault::TooLarge {
+            at: step,
+            len: body.len(),
+            limit: MAX_BODY,
+        }
+    })?;
+    out[start..start + HEADER_SIZE].copy_from_slice(&frame_hdr);
     Ok(())
 }
 

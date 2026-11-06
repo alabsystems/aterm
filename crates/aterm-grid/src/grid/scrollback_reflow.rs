@@ -210,13 +210,18 @@ pub(super) fn history_row_len(row: &crate::Row, successor: Option<&crate::Row>) 
 
 const MAX_LOGICAL_WIDTH: usize = crate::MAX_GRID_COLS as usize * crate::MAX_GRID_ROWS as usize;
 
+#[cfg(test)]
+thread_local! {
+    static BUILT_HISTORY_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Unit<'a> {
     /// The grapheme text for the cell (base char plus combining marks / zwj).
     text: &'a str,
     /// Attributes for the cell.
     attrs: CellAttrs,
-    /// Hyperlink (url, id) covering this cell.
-    link: Option<(std::sync::Arc<str>, Option<std::sync::Arc<str>>)>,
+    /// Source hyperlink span covering this cell; output rows acquire ownership.
+    link: Option<&'a HyperlinkSpan>,
     /// Packed SGR 58 underline colour covering this cell.
     underline_color: Option<u32>,
     /// Display width (1 or 2).
@@ -244,13 +249,13 @@ pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line
             out.push(run[0].cloned_for_rewrap());
             continue;
         }
-        emit_logical_line(run, new_cols, &mut units, &mut out);
+        emit_logical_line(run, new_cols, &mut units, &mut out, None);
     }
     out
 }
 
 /// The rows [`reflow_scrollback_lines`]`(lines, new_cols)` makes.
-// COST: O(cells of `lines`), as the rewrap.
+// COST: O(lines + decoded units), with constant mapping scratch.
 #[must_use]
 pub(super) fn rewrap_cell_row(
     lines: &[Line],
@@ -261,8 +266,6 @@ pub(super) fn rewrap_cell_row(
     let cols = usize::from(new_cols.max(1));
     let mut point = None;
     let mut rows = 0usize;
-    let mut units: Vec<Unit<'_>> = Vec::new();
-    let mut firsts: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let start = i;
@@ -270,35 +273,47 @@ pub(super) fn rewrap_cell_row(
         while i < lines.len() && lines[i].is_wrapped() {
             i += 1;
         }
-        units.clear();
-        firsts.clear();
-        for line in &lines[start..i] {
-            firsts.push(units.len());
-            if units.len() < MAX_LOGICAL_WIDTH {
-                collect_units(line, &mut units);
+        let (mut col, mut row, mut seen) = (0usize, 0usize, 0usize);
+        let mut pending = false;
+        for (index, source) in lines[start..i].iter().enumerate() {
+            let selected = start + index == line;
+            if selected {
+                pending = true;
+            }
+            if seen == MAX_LOGICAL_WIDTH {
+                continue;
+            }
+            let Some(text) = source.as_str() else {
+                continue;
+            };
+            let mut consumed = 0usize;
+            for stored in super::scroll_materialize::StoredUnits::new(source, text)
+                .take(MAX_LOGICAL_WIDTH - seen)
+            {
+                let width =
+                    if super::scroll_materialize::stored_unit_is_wide(stored.unit, stored.attrs) {
+                        2
+                    } else {
+                        1
+                    };
+                if col + width > cols && col > 0 {
+                    row += 1;
+                    col = 0;
+                }
+                // A soft source-row end resolves at the next unit, after its
+                // wrap; a hard logical end resolves at the final position below.
+                if pending && (!selected || consumed + width > cells) {
+                    point = Some((rows + row, u16::try_from(col).unwrap_or(u16::MAX)));
+                    pending = false;
+                }
+                if selected {
+                    consumed += width;
+                }
+                col += width;
+                seen += 1;
             }
         }
-        let mut placed = Vec::with_capacity(units.len());
-        let (mut col, mut row) = (0usize, 0usize);
-        for unit in &units {
-            let w = usize::from(unit.width);
-            if col + w > cols && col > 0 {
-                row += 1;
-                col = 0;
-            }
-            placed.push((row, col));
-            col += w;
-        }
-        if (start..i).contains(&line) {
-            let first = firsts[line - start];
-            let end = firsts.get(line - start + 1).copied().unwrap_or(units.len());
-            let mut at = first;
-            let mut width = 0usize;
-            while at < end && width + usize::from(units[at].width) <= cells {
-                width += usize::from(units[at].width);
-                at += 1;
-            }
-            let (row, col) = placed.get(at).copied().unwrap_or((row, col));
+        if pending {
             point = Some((rows + row, u16::try_from(col).unwrap_or(u16::MAX)));
         }
         rows += row + 1;
@@ -306,13 +321,14 @@ pub(super) fn rewrap_cell_row(
     (rows, point)
 }
 
-// COST: O(rows × new_cols + one logical line): every logical line rewrapped
-// but the oldest one visited yields only kept rows, at most `new_cols` cells
-// each.
+// COST: O(rows × max(1, new_cols) + one logical line): visited logical lines
+// are scanned, but only retained rows are materialized.
 /// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`.
 #[must_use]
 pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> Vec<Line> {
+    let new_cols = new_cols.max(1);
     let mut runs: Vec<Vec<Line>> = Vec::new();
+    let mut units = Vec::new();
     let mut produced = 0;
     let mut end = lines.len();
     while end > 0 && produced < rows {
@@ -320,14 +336,26 @@ pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> 
             .iter()
             .rposition(|line| !line.is_wrapped())
             .unwrap_or(0);
-        let run = reflow_scrollback_lines(&lines[head..end], new_cols);
+        let source = &lines[head..end];
+        let mut run = Vec::new();
+        if source.len() == 1 && rewrap_passthrough_eligible(&source[0], new_cols) {
+            #[cfg(any(test, debug_assertions))]
+            super::count_reflow_passthrough_lines(1);
+            run.push(source[0].cloned_for_rewrap());
+        } else {
+            emit_logical_line(
+                source,
+                new_cols,
+                &mut units,
+                &mut run,
+                Some(rows - produced),
+            );
+        }
         produced += run.len();
         runs.push(run);
         end = head;
     }
-    let mut out: Vec<Line> = runs.into_iter().rev().flatten().collect();
-    out.drain(..out.len().saturating_sub(rows));
-    out
+    runs.into_iter().rev().flatten().collect()
 }
 
 /// The full-decomposition rewrap with passthrough disabled: the reference for
@@ -345,7 +373,7 @@ pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -
         while i < lines.len() && lines[i].is_wrapped() {
             i += 1;
         }
-        emit_logical_line(&lines[start..i], new_cols, &mut units, &mut out);
+        emit_logical_line(&lines[start..i], new_cols, &mut units, &mut out, None);
     }
     out
 }
@@ -377,8 +405,12 @@ fn emit_logical_line<'a>(
     new_cols: u16,
     units: &mut Vec<Unit<'a>>,
     out: &mut Vec<Line>,
+    tail_rows: Option<usize>,
 ) {
     units.clear();
+    if tail_rows == Some(0) {
+        return;
+    }
     let first_out = out.len();
     for line in run {
         collect_units(line, units);
@@ -394,23 +426,41 @@ fn emit_logical_line<'a>(
     }
 
     let cols = new_cols as usize;
+    let skip_rows = tail_rows.map_or(0, |keep| {
+        let (mut rows, mut col) = (1usize, 0usize);
+        for unit in units.iter() {
+            let width = usize::from(unit.width);
+            if col + width > cols && col > 0 {
+                rows += 1;
+                col = 0;
+            }
+            col += width;
+        }
+        rows.saturating_sub(keep)
+    });
     let mut col = 0usize;
     let mut seg_start = 0usize;
-    let mut first = true;
+    let mut row = 0usize;
     let mut idx = 0usize;
     while idx < units.len() {
         let w = units[idx].width as usize;
         if col + w > cols && col > 0 {
-            out.push(build_line(&units[seg_start..idx], !first));
-            first = false;
+            if row >= skip_rows {
+                out.push(build_line(&units[seg_start..idx], row != 0));
+            }
+            row += 1;
             seg_start = idx;
             col = 0;
         }
         col += w;
         idx += 1;
     }
-    out.push(build_line(&units[seg_start..], !first));
-    carry_image_spans(run, new_cols, out, first_out);
+    if row >= skip_rows {
+        out.push(build_line(&units[seg_start..], row != 0));
+    }
+    if skip_rows == 0 {
+        carry_image_spans(run, new_cols, out, first_out);
+    }
 }
 
 fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: usize) {
@@ -463,10 +513,7 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
         while span_idx < spans.len() && spans[span_idx].end_col <= col {
             span_idx += 1;
         }
-        let link = spans
-            .get(span_idx)
-            .filter(|s| s.contains(col))
-            .map(|s| (s.url.clone(), s.id.clone()));
+        let link = spans.get(span_idx).filter(|s| s.contains(col));
         while ul_idx < ul_spans.len() && ul_spans[ul_idx].end_col <= col {
             ul_idx += 1;
         }
@@ -489,6 +536,8 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
 }
 
 fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
+    #[cfg(test)]
+    BUILT_HISTORY_ROWS.with(|count| count.set(count.get() + 1));
     let mut text = String::with_capacity(
         units
             .iter()
@@ -497,7 +546,7 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
     );
     let mut attrs_rle: Rle<CellAttrs> = Rle::new();
     let mut spans: Vec<HyperlinkSpan> = Vec::new();
-    let mut open: Option<(u16, std::sync::Arc<str>, Option<std::sync::Arc<str>>)> = None;
+    let mut open: Option<(u16, &HyperlinkSpan)> = None;
     let mut ul_spans: Vec<UnderlineColorSpan> = Vec::new();
     let mut ul_open: Option<(u16, u32)> = None;
     let mut col: u16 = 0;
@@ -515,18 +564,18 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
                 attrs_rle.push(unit.attrs);
             }
         }
-        match (&open, &unit.link) {
-            (None, Some((url, id))) => open = Some((col, url.clone(), id.clone())),
-            (Some((_, ourl, oid)), Some((url, id)))
-                if std::sync::Arc::ptr_eq(ourl, url) && oid == id => {}
-            (Some((start, ourl, oid)), next) => {
+        match (open, unit.link) {
+            (None, Some(link)) => open = Some((col, link)),
+            (Some((_, previous)), Some(link))
+                if std::sync::Arc::ptr_eq(&previous.url, &link.url) && previous.id == link.id => {}
+            (Some((start, previous)), next) => {
                 spans.push(HyperlinkSpan::with_id(
-                    *start,
+                    start,
                     col,
-                    ourl.clone(),
-                    oid.clone(),
+                    previous.url.clone(),
+                    previous.id.clone(),
                 ));
-                open = next.as_ref().map(|(u, i)| (col, u.clone(), i.clone()));
+                open = next.map(|link| (col, link));
             }
             (None, None) => {}
         }
@@ -541,8 +590,13 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
         }
         col = col.saturating_add(unit.width);
     }
-    if let Some((start, url, id)) = open {
-        spans.push(HyperlinkSpan::with_id(start, col, url, id));
+    if let Some((start, link)) = open {
+        spans.push(HyperlinkSpan::with_id(
+            start,
+            col,
+            link.url.clone(),
+            link.id.clone(),
+        ));
     }
     if let Some((start, color)) = ul_open {
         ul_spans.push(UnderlineColorSpan::new(start, col, color));
@@ -703,6 +757,7 @@ mod tests {
                 b.is_wrapped(),
                 "wrap flag diverges at line {idx}"
             );
+            assert_eq!(a.images(), b.images(), "image spans diverge at line {idx}");
             let chars = a.as_str().map_or(0, |t| t.chars().count());
             for ci in 0..chars {
                 assert_eq!(
@@ -817,8 +872,168 @@ mod tests {
     }
 
     #[test]
+    fn decoded_hyperlinks_borrow_sources_until_output_owns_the_span() {
+        use std::sync::Arc;
+        let url: Arc<str> = Arc::from("https://example.com");
+        let id: Arc<str> = Arc::from("id");
+        let source = Line::with_hyperlinks(
+            &"x".repeat(4096),
+            Rle::new(),
+            vec![HyperlinkSpan::with_id(
+                0,
+                4096,
+                url.clone(),
+                Some(id.clone()),
+            )],
+        );
+        let owners = (Arc::strong_count(&url), Arc::strong_count(&id));
+        let mut units = Vec::new();
+        collect_units(&source, &mut units);
+        assert_eq!(units.len(), 4096);
+        assert_eq!(
+            (Arc::strong_count(&url), Arc::strong_count(&id)),
+            owners,
+            "decoded cells must not retain a URL and ID separately per unit"
+        );
+        let output = build_line(&units, false);
+        assert_eq!(
+            (Arc::strong_count(&url), Arc::strong_count(&id)),
+            (owners.0 + 1, owners.1 + 1),
+            "the output owns one span"
+        );
+        drop(units);
+        drop(source);
+        let span = output
+            .get_hyperlink_span(4095)
+            .expect("output owns its span");
+        assert!(Arc::ptr_eq(&span.url, &url));
+        assert_eq!(span.id.as_deref(), Some("id"));
+        assert_eq!(output.as_str().map(str::len), Some(4096));
+    }
+
+    #[test]
+    fn mapped_history_point_keeps_cell_and_wrap_boundaries() {
+        let input = [
+            styled("AB", false),
+            styled("日C", true),
+            styled("", true),
+            styled("D", false),
+        ];
+        type Case = (u16, usize, [(usize, u16); 7]);
+        let cases: &[Case] = &[
+            (
+                0,
+                5,
+                [(0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (4, 0), (4, 1)],
+            ),
+            (
+                1,
+                5,
+                [(0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (4, 0), (4, 1)],
+            ),
+            (
+                2,
+                4,
+                [(0, 0), (0, 1), (1, 0), (2, 0), (2, 1), (3, 0), (3, 1)],
+            ),
+            (
+                3,
+                3,
+                [(0, 0), (0, 1), (1, 0), (1, 2), (1, 3), (2, 0), (2, 1)],
+            ),
+            (
+                4,
+                3,
+                [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 1)],
+            ),
+            (
+                20,
+                2,
+                [(0, 0), (0, 1), (0, 2), (0, 4), (0, 5), (1, 0), (1, 1)],
+            ),
+        ];
+        for &(cols, rows, [a, b, wide, c, end, d, d_end]) in cases {
+            for (line, cells, expected) in [
+                (0, 0, a),
+                (0, 1, b),
+                (0, 2, wide),
+                (0, 99, wide),
+                (1, 0, wide),
+                (1, 1, wide),
+                (1, 2, c),
+                (1, 3, end),
+                (1, 99, end),
+                (2, 0, end),
+                (2, 99, end),
+                (3, 0, d),
+                (3, 1, d_end),
+                (3, 99, d_end),
+            ] {
+                assert_eq!(
+                    rewrap_cell_row(&input, cols, line, cells),
+                    (rows, Some(expected)),
+                    "width={cols}, line={line}, cells={cells}"
+                );
+            }
+            assert_eq!(rewrap_cell_row(&input, cols, 4, 0), (rows, None));
+        }
+        assert_eq!(rewrap_cell_row(&[], 0, 0, 0), (0, None));
+        assert_eq!(
+            rewrap_cell_row(&[styled("", false)], 1, 0, 99),
+            (1, Some((0, 0)))
+        );
+        let joined = [styled("e\u{301}👩‍💻Z", false)];
+        for (cells, expected) in [
+            (0, (0, 0)),
+            (1, (1, 0)),
+            (2, (1, 0)),
+            (3, (2, 0)),
+            (4, (2, 1)),
+        ] {
+            assert_eq!(rewrap_cell_row(&joined, 2, 0, cells), (3, Some(expected)));
+        }
+    }
+
+    #[test]
+    fn newest_rows_builds_only_retained_rows_of_a_logical_line() {
+        let input = [styled(&"x".repeat(16_384), false)];
+        BUILT_HISTORY_ROWS.with(|count| count.set(0));
+        let whole = reflow_scrollback_lines(&input, 1);
+        assert_eq!(BUILT_HISTORY_ROWS.with(|count| count.replace(0)), 16_384);
+        for rows in [0, 1, 4, 40] {
+            let newest = reflow_newest_rows(&input, 1, rows);
+            let built = BUILT_HISTORY_ROWS.with(|count| count.replace(0));
+            assert!(built <= rows, "built {built} rows for a {rows}-row request");
+            assert_semantically_equal(&newest, &whole[whole.len().saturating_sub(rows)..]);
+        }
+    }
+
+    #[test]
     fn reflow_newest_rows_is_the_tail_of_the_whole_rewrap() {
         let mut corpus = vec![styled("orphan tail", true)];
+        let mut decorated = Line::with_hyperlinks(
+            "e\u{301}日👩‍💻ABCDEFGHIJ",
+            Rle::with_value(CellAttrs::new(0x01_112233, 0x01_aabbcc, 0), 32),
+            vec![HyperlinkSpan::new(0, 8, std::sync::Arc::from("u"))],
+        );
+        decorated.set_underline_colors(vec![UnderlineColorSpan::new(2, 9, 0x01_123456)]);
+        corpus.push(decorated);
+        let image = std::sync::Arc::new(crate::ImageData {
+            bytes: vec![7; 256],
+            format: crate::ImageFormat::Png,
+            cols: 2,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: crate::ImageScaling::Fit,
+            source_rect: None,
+        });
+        for text in ["image-bearing-long-row", ""] {
+            let mut line = styled(text, false);
+            line.set_images(vec![ImageSpan::new(0, 2, 0, 0, image.clone())]);
+            corpus.push(line);
+        }
         for i in 0..12 {
             corpus.push(styled(&format!("R{i}-ABCDEFGH"), false));
             corpus.push(styled("IJKLMNOP", true));
@@ -827,7 +1042,7 @@ mod tests {
             corpus.push(styled("世界世界世", false));
             corpus.push(styled(&format!("short {i}"), false));
         }
-        for new_cols in [3u16, 7, 11, 40] {
+        for new_cols in [0u16, 1, 3, 7, 11, 40] {
             let whole = reflow_scrollback_lines(&corpus, new_cols);
             for rows in 0..=whole.len() + 2 {
                 let newest = reflow_newest_rows(&corpus, new_cols, rows);

@@ -20,6 +20,7 @@ pub mod program_check;
 pub mod ring;
 pub mod scheduling;
 pub mod services;
+pub mod starts;
 pub mod strain;
 pub mod sys;
 pub mod trend;
@@ -33,16 +34,17 @@ pub use model::{
     AccountIx, AneCheck, AneSample, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView,
     CommitSample, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot,
     Hog, LinkKind, LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView,
-    NetState, NetView, NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcLimits, ProcSample,
-    ProcState, ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig,
-    ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens,
-    TabView, TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
+    NetState, NetView, NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample, ProcState,
+    ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView,
+    Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView,
+    TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
 };
 pub use peaks::{DailyMax, DiskPeaks, PeakRow, Peaks};
 pub use ring::{
     Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
     SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, Tiers, TimeGap,
 };
+pub use starts::{StartCount, TaskFlow};
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};
 pub use units::{BlockSample, DiskLocation, Units};

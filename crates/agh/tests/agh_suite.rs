@@ -61,6 +61,8 @@ mod redaction;
 mod refs;
 #[cfg(unix)]
 mod release_writes;
+#[cfg(unix)]
+mod repo_create;
 mod res_contents;
 mod res_git;
 mod res_public;

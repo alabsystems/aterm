@@ -679,6 +679,49 @@ fn unrelated_local_history_is_not_founded_over() {
     assert!(no_control(&lab.paths));
 }
 
+/// A kill or power loss mid-write of the founding's own history leaves its temporary
+/// (`.device.age.tmp.<pid>.<salt>`, as `create_temp_beside` names it) in `commons/`, which is no
+/// unrelated history: the founding reads due and founds. A name of that shape beside any other
+/// file, one off that shape, or any other name still refuses, naming the file.
+/// NEGATIVE CONTROL: a check that knows only the exact names refuses the temporaries.
+#[test]
+fn a_leftover_temporary_of_the_foundings_own_history_is_no_unrelated_history() {
+    let lab = lab_open("default-leftover");
+    let commons = lab.paths.dir.join("commons");
+    fsx::ensure_private_dir(&commons).unwrap();
+    for leftover in [
+        ".device.age.tmp.4242.0a1b2c3d",
+        ".device.claim.tmp.17.deadbeef",
+        ".runtime.lock.tmp.9.00000000",
+    ] {
+        std::fs::write(commons.join(leftover), b"half").unwrap();
+    }
+    let read = commons_foundable(&lab.paths).unwrap();
+    assert!(matches!(read, Foundable::Due(_)), "{read:?}");
+    for stranger in [
+        ".default.pin.tmp.4242.0a1b2c3d",
+        // A pid no leftover has, as a case-insensitive volume would take an uppercase twin
+        // of a leftover's name for the leftover itself.
+        ".device.age.tmp.5151.0A1B2C3D",
+        ".device.age.tmp.4242.0a1b2c",
+        ".device.age.tmp..0a1b2c3d",
+        "device.age.tmp.4242.0a1b2c3d",
+        ".DS_Store",
+    ] {
+        std::fs::write(commons.join(stranger), b"").unwrap();
+        let read = commons_foundable(&lab.paths).unwrap();
+        assert!(
+            matches!(&read, Foundable::Elsewhere(why) if why.contains("existing local history")
+                && why.contains(stranger)),
+            "{stranger}: {read:?}"
+        );
+        std::fs::remove_file(commons.join(stranger)).unwrap();
+    }
+    let founded = admin_commons_found_by_default(&lab.paths).unwrap();
+    assert!(founded.published, "{founded:?}");
+    assert!(!no_control(&lab.paths));
+}
+
 /// An attempt this Mac kept is what a founding by default publishes, byte for byte; one kept
 /// under another authority is never founded over.
 /// NEGATIVE CONTROL: a read that skips the kept attempt's authority reads the second vault due.

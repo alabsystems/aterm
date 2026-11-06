@@ -207,25 +207,24 @@ impl Log {
                 changes,
                 ..
             } = command
-            {
-                let target_changes = self
-                    .records
-                    .get(target)
-                    .and_then(|(_, command)| command.as_ref())
-                    .and_then(Command::changes);
-                if !self.index.observes(&id, target)
+                && (!self.index.observes(&id, target)
                     || !structural.contains(target)
-                    || !target_changes.is_some_and(|target| {
-                        crate::database::change_keys(target)
-                            == crate::database::change_keys(changes)
-                    })
-                {
-                    refusals.insert(
-                        id,
-                        "revert does not name a structurally valid observed edit with the same keys".into(),
-                    );
-                    continue;
-                }
+                    || !self
+                        .records
+                        .get(target)
+                        .and_then(|(_, command)| command.as_ref())
+                        .and_then(Command::changes)
+                        .is_some_and(|target| {
+                            crate::database::change_keys(target)
+                                == crate::database::change_keys(changes)
+                        }))
+            {
+                refusals.insert(
+                    id,
+                    "revert does not name a structurally valid observed edit with the same keys"
+                        .into(),
+                );
+                continue;
             }
             // Structural validity depends only on the authenticated causal past,
             // not on a later request collision by the target's author. Such a
@@ -319,15 +318,15 @@ impl Log {
         (records, merges)
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let (cells, refusals, eligible) = self.project(None, &BTreeSet::new(), true);
+        let (cells, mut refusals, eligible) = self.project(None, &BTreeSet::new(), true);
         let operations = self
             .records
             .iter()
             .map(|(id, (operation, _))| {
                 let mut operation = operation.clone();
                 operation.eligible = eligible.contains(id);
-                if let Some(refusal) = refusals.get(id) {
-                    operation.refusal = Some(refusal.clone());
+                if let Some(refusal) = refusals.remove(id) {
+                    operation.refusal = Some(refusal);
                 }
                 if self.opaque_authors.contains(&operation.header.actor) {
                     operation.refusal.get_or_insert_with(|| {

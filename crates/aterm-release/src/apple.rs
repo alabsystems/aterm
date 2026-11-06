@@ -1914,19 +1914,20 @@ fn write_credentials_profile_in(
     let signing_key_str = std::str::from_utf8(signing_key.expose())
         .map_err(|_| "encoded signing key is not UTF-8".to_string())?;
 
-    let mut body = String::new();
-    body.push_str(&format!(
-        "# Written by `{} provision --id {id}`. 0600, owner-only: it carries this\n\
-         # machine's release signing key. Name it with `{} --release-credentials`.\n\n",
-        crate::publish::SHIP_COMMAND,
-        crate::publish::CUT_COMMAND
-    ));
-    body.push_str(&format!("signing_key = \"{signing_key_str}\"\n"));
-    body.push_str(&format!("machine_id = \"{id}\"\n"));
-    body.push_str(&format!("machine_roster = \"{}\"\n", roster.display()));
-    body.push_str(&format!("notary_profile = \"{}\"\n", NOTARY_PROFILE));
+    let mut body = format!(
+        "# Written by `{ship} provision --id {id}`. 0600, owner-only: it carries this\n\
+         # machine's release signing key. Name it with `{cut} --release-credentials`.\n\n\
+         signing_key = \"{signing_key_str}\"\n\
+         machine_id = \"{id}\"\n\
+         machine_roster = \"{}\"\n\
+         notary_profile = \"{NOTARY_PROFILE}\"\n",
+        roster.display(),
+        ship = crate::publish::SHIP_COMMAND,
+        cut = crate::publish::CUT_COMMAND,
+    );
     if let Some(sha1) = identity_sha1 {
-        body.push_str(&format!("signing_identity_sha1 = \"{sha1}\"\n"));
+        use std::fmt::Write as _;
+        let _ = writeln!(body, "signing_identity_sha1 = \"{sha1}\"");
     }
     let body = aterm_uds::secret::Secret::from_vec(body.into_bytes());
 

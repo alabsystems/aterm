@@ -65,14 +65,15 @@ fn api_method(inv: &Invocation) -> &str {
     inv.flag("--method").unwrap_or("GET")
 }
 
-/// A one-shot write recorded against github.com (plan §14, body 5): `release create`,
+/// A one-shot write recorded against github.com (plan §14, body 5): `repo create`, `release create`,
 /// `release ensure`, `ref create`, `ref update-atomic`, or an `api` POST,
 /// `--dry-run` included.
 fn one_shot(inv: &Invocation) -> bool {
     let path = inv.path.as_slice();
     matches!(
         path,
-        ["release", "create"]
+        ["repo", "create"]
+            | ["release", "create"]
             | ["release", "ensure"]
             | ["ref", "create"]
             | ["ref", "update-atomic"]
@@ -207,7 +208,11 @@ fn backstop(inv: &Invocation) -> Option<std::time::Duration> {
 fn settle_adoption(ctx: &mut Ctx, inv: &Invocation) -> Result<()> {
     ctx.anonymous = inv.global.anonymous;
     ctx.timeout = backstop(inv);
-    let settled = ctx.github_noting(true);
+    let settled = if inv.path == ["repo", "create"] && inv.has("--dry-run") {
+        ctx.github_recorded()
+    } else {
+        ctx.github_noting(true)
+    };
     ctx.github = None;
     if let Err(mut e) = settled {
         ctx.vault_next(&mut e);

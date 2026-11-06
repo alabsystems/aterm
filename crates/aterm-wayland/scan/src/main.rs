@@ -16,8 +16,22 @@ fn write_fresh(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Resu
         .write_all(bytes.as_ref())
 }
 
+/// This generator's package directory: `CARGO_MANIFEST_DIR` as `targo run` sets it when it
+/// starts the generator, else the working directory, which its manifest says to run it from.
+fn package_dir() -> std::io::Result<std::path::PathBuf> {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(std::env::current_dir, |dir| Ok(dir.into()))
+}
+
 fn main() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let root = match package_dir() {
+        Ok(dir) => dir.join(".."),
+        Err(e) => {
+            eprintln!("wayland-scan: the working directory: {e}");
+            std::process::exit(1);
+        }
+    };
     let root = root.as_path();
     let files = match generate::generate(root) {
         Ok(files) => files,

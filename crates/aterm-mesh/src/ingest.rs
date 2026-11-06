@@ -291,7 +291,14 @@ impl Ingest {
                     }
                     queue.push_back(Delivered { offset, record });
                 }
-                Some(astream_broker::Event::Mark { .. }) => self.bell.ring(),
+                Some(astream_broker::Event::Mark { .. }) => {
+                    // The head moved: a neighbour's relay commits its group on this log, which
+                    // a push waits on ([`Mesh::push_table`]).
+                    if let Some(mesh) = mesh.upgrade() {
+                        mesh.acked();
+                    }
+                    self.bell.ring();
+                }
                 Some(astream_broker::Event::Gap(gap)) => {
                     // The cut never passes the group's position: a gap here means the log was
                     // renewed beneath it. What it held reaches this Mac by `Inventory`.
@@ -415,14 +422,14 @@ impl Ingest {
         if records.is_empty() {
             return false;
         }
-        self.egress
-            .arrived(records.iter().map(|(_, record)| stores::digest(record)));
-        let wires: Vec<Vec<u8>> = records.iter().map(|(_, record)| record.clone()).collect();
-        let verdicts = self.stores.ingest_members(&wires);
+        let (offsets, wires): (Vec<u64>, Vec<Vec<u8>>) = records.into_iter().unzip();
+        let verdicts = self
+            .egress
+            .delivering(&wires, || self.stores.ingest_members(&wires));
         let mut landed = false;
         let (mut applied, mut waiting, mut refused) = (0, 0, 0);
         let mut state = self.state.lock_or_recover();
-        for ((offset, record), verdict) in records.into_iter().zip(verdicts) {
+        for ((offset, record), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
             state.waiting.remove(&offset);
             state.busy.remove(&offset);
             match verdict {
@@ -473,28 +480,33 @@ impl Ingest {
             }
         }
         for (table, kind, run) in runs {
-            let wires: Vec<Vec<u8>> = run.iter().map(|(_, wire)| wire.clone()).collect();
-            let verdicts = self.stores.ingest_table(table, kind, &wires);
+            let (offsets, wires): (Vec<u64>, Vec<Vec<u8>>) = run.into_iter().unzip();
+            let verdicts = self
+                .egress
+                .delivering(&wires, || self.stores.ingest_table(table, kind, &wires));
             let (mut applied, mut waiting, mut refused) = (0, 0, 0);
             let mut state = self.state.lock_or_recover();
-            for ((offset, wire), verdict) in run.into_iter().zip(verdicts) {
+            for ((offset, wire), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
                 state.waiting.remove(&offset);
                 state.busy.remove(&offset);
-                let payload = stores::table_payload(kind, &wire);
                 match verdict {
                     Verdict::Applied => applied += 1,
                     Verdict::Waiting(_) => {
                         waiting += 1;
-                        state
-                            .waiting
-                            .insert(offset, (Carries::Table(table), payload));
+                        state.waiting.insert(
+                            offset,
+                            (Carries::Table(table), stores::table_payload(kind, &wire)),
+                        );
                     }
                     Verdict::Refused(why) => {
                         refused += 1;
                         aterm_log::debug!("mesh: a table record at {offset} is refused: {why}");
                     }
                     Verdict::Busy(_) => {
-                        state.busy.insert(offset, (Carries::Table(table), payload));
+                        state.busy.insert(
+                            offset,
+                            (Carries::Table(table), stores::table_payload(kind, &wire)),
+                        );
                     }
                 }
             }
@@ -583,7 +595,11 @@ impl Ingest {
         };
         // The waiting offsets go to disk before the commit passes them.
         if let Some(waiting) = waiting {
-            let text: String = waiting.iter().map(|o| format!("{o}\n")).collect();
+            use std::fmt::Write as _;
+            let mut text = String::with_capacity(waiting.len() * 12);
+            for o in &waiting {
+                let _ = writeln!(text, "{o}");
+            }
             match aterm_uds::private_file::write_private(&self.dir, WAITING_FILE, text.as_bytes()) {
                 Ok(()) => self.state.lock_or_recover().written = waiting,
                 Err(e) => {
@@ -649,10 +665,13 @@ impl Ingest {
     /// neighbours relayed to within 7 days, once that floor is [`CUT_STEP`] past its base.
     fn cut(&self, mesh: &Mesh) {
         let broker = mesh.broker(MeshLog::Tables);
-        let mine = self.floor(mesh);
+        let threshold = broker.base().saturating_add(CUT_STEP);
+        let mut floor = self.floor(mesh).min(broker.visible_head());
+        if floor < threshold {
+            return;
+        }
         let file = mesh.log_file(MeshLog::Tables);
         let big = std::fs::metadata(&file).is_ok_and(|meta| meta.len() > CUT_BYTES);
-        let mut floor = mine;
         if !big {
             let peers = mesh
                 .hosted(MeshLog::Tables)
@@ -663,8 +682,7 @@ impl Ingest {
                 floor = floor.min(broker.group_start(&relay::group_of(&peer)));
             }
         }
-        let floor = floor.min(broker.visible_head());
-        if floor < broker.base().saturating_add(CUT_STEP) {
+        if floor < threshold {
             return;
         }
         match broker.retain_before_carrying_state(floor) {

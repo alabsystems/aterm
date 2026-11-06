@@ -233,7 +233,8 @@ impl Keys<'_> {
             CallBody::Json(body),
         );
         let guard = self.guard_how();
-        let ours = |held: &KeyObject| held.title == title && key_body(&held.key) == key_body(key);
+        let wanted_body = key_body(key);
+        let ours = |held: &KeyObject| held.title == title && key_body(&held.key) == wanted_body;
         let mut found: Option<KeyObject> = None;
         let sent = self.attempts(&call, permit, &mut || {
             let listed = self.read(&guard)?;
@@ -302,7 +303,7 @@ impl Keys<'_> {
         if already_in_use(&error)
             && relisted
                 .iter()
-                .any(|held| key_body(&held.key) == key_body(key))
+                .any(|held| key_body(&held.key) == wanted_body)
         {
             return Err(already_held(error));
         }

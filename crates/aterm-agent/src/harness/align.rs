@@ -13,7 +13,13 @@ use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 #[cfg(all(test, unix))]
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
+
+#[cfg(unix)]
+use super::wake_deadline::SLEEP_CHECK;
+use super::wake_deadline::WakeDeadline;
 
 /// On non-Unix hosts the reader still uses a blocking pipe.
 #[cfg(not(unix))]
@@ -457,38 +463,33 @@ fn mark_capture_child_reaped(observer: &CaptureObserver) {
     let _ = observer;
 }
 
-/// A capture's deadline on two clocks: the one that stops while the host sleeps ([`Instant`]:
-/// macOS's `mach_absolute_time`, Linux's `CLOCK_MONOTONIC`), and the one that counts through
-/// sleep ([`aterm_uds::process::continuous_ns`]), where the host has one. A budget the first
-/// alone measures outlasts its wall time across sleep and dark wakes: a renewal's 300 s held the
-/// sign-in lock for 6.2 h (KI-1105-14). The deadline has passed once either clock says so.
+/// A capture's deadline ([`WakeDeadline`]), read against `observer`'s clock that counts through
+/// sleep ([`through_sleep_ns`]), which a test sets.
 #[derive(Clone, Copy)]
-struct Deadline {
-    awake: Instant,
-    through_sleep: Option<u64>,
-}
+struct Deadline(WakeDeadline);
 
 impl Deadline {
     /// `budget` from now.
     fn after(budget: Duration, observer: &CaptureObserver) -> Self {
-        let now = Instant::now();
-        Self {
-            awake: now
-                .checked_add(budget)
-                .unwrap_or_else(|| now + Duration::from_secs(3600)),
-            through_sleep: through_sleep_ns(observer).map(|now| {
-                now.saturating_add(u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX))
-            }),
-        }
+        Self(WakeDeadline::after_from(budget, through_sleep_ns(observer)))
     }
 
     /// What is left of it now: the less of what each clock leaves.
-    fn remaining(&self, observer: &CaptureObserver) -> Duration {
-        let awake = self.awake.saturating_duration_since(Instant::now());
-        match (self.through_sleep, through_sleep_ns(observer)) {
-            (Some(at), Some(now)) => awake.min(Duration::from_nanos(at.saturating_sub(now))),
-            _ => awake,
-        }
+    fn remaining(self, observer: &CaptureObserver) -> Duration {
+        self.0.remaining_from(through_sleep_ns(observer))
+    }
+
+    /// It on the clock that stops in sleep, from what is left of it now: the output reader's
+    /// bound, which the capture's wait cancels where sleep ends the deadline first.
+    #[cfg(unix)]
+    fn awake_end(self, observer: &CaptureObserver) -> Instant {
+        Instant::now() + self.remaining(observer)
+    }
+
+    /// Whether it counts the time the host slept ([`WakeDeadline::counts_sleep`]).
+    #[cfg(unix)]
+    fn counts_sleep(self) -> bool {
+        self.0.counts_sleep()
     }
 }
 
@@ -504,11 +505,6 @@ fn through_sleep_ns(observer: &CaptureObserver) -> Option<u64> {
     let _ = observer;
     Some(now)
 }
-
-/// How often a capture that watches nothing else reads the clock that counts through sleep, so
-/// a deadline sleep has passed ends it within this much of the host's waking ([`Deadline`]).
-#[cfg(unix)]
-const SLEEP_CHECK: Duration = Duration::from_secs(1);
 
 /// What one bounded child did: the bytes it printed, and how it left.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,6 +921,8 @@ fn capture_with(
     };
     #[cfg(all(test, unix))]
     let reader_observer = observer.clone();
+    #[cfg(unix)]
+    let reader_until = deadline.awake_end(&observer);
     let reader = std::thread::Builder::new()
         .name("aterm-capture-output".to_owned())
         .spawn(move || {
@@ -934,7 +932,7 @@ fn capture_with(
             let read = read_capture_pipe_until(
                 stdout,
                 max_stdout,
-                deadline.awake,
+                reader_until,
                 stop,
                 cancel_reader.as_ref().map(AsRawFd::as_raw_fd),
             );
@@ -969,7 +967,7 @@ fn capture_with(
             (true, false) => STDERR_WATCH,
             (false, true) => REAP_CHECK,
             // The wait cannot see the clock that counts through sleep, so it looks again.
-            (false, false) if deadline.through_sleep.is_some() => SLEEP_CHECK,
+            (false, false) if deadline.counts_sleep() => SLEEP_CHECK,
             (false, false) => {
                 #[cfg(all(test, unix))]
                 observed_step(&observer, |o| &o.in_wait);

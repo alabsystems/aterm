@@ -6,7 +6,7 @@ name = "aterm-lexicon"
 # Integration tests are modules of the suite binaries declared below; with autotests off, a
 # `tests/*.rs` file listed nowhere never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,6 +27,9 @@ aterm-toml = { workspace = true }
 # `host::could_not_run`: the dictionary gates end COULD NOT RUN on a host without
 # Webster's Second, never as a pass.
 aterm-spec = { workspace = true }
+# The serde corpus is found from the package directory when the tests run
+# (`aterm_tempfile::manifest_dir`).
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

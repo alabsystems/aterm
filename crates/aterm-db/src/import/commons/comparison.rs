@@ -114,6 +114,7 @@ fn report_with_limits(
         .filter(|cell| cell.candidates.len() > 1)
         .count();
     let mut comparisons = Vec::new();
+    let current_rows = rows_by_record(current);
     for ((collection, key), cell) in &snapshot.cells {
         if collection != "sources" || cell.stopped {
             return Err(Error::new("invalid import comparison source"));
@@ -129,7 +130,7 @@ fn report_with_limits(
                 .iter()
                 .find(|op| op.header.id == candidate.operation)
                 .ok_or_else(|| Error::new("import comparison provenance is unavailable"))?;
-            let mut comparison = compare_rows(current, stored, detail_limit);
+            let mut comparison = compare_rows(current, &current_rows, stored, detail_limit);
             let object = comparison.as_object_mut().unwrap();
             object.insert("source_sha256".into(), json!(key));
             object.insert("source_digest_matches".into(), json!(key == current_key));
@@ -186,8 +187,12 @@ fn rows_by_record(value: &Value) -> BTreeMap<u64, &Value> {
         .collect()
 }
 
-fn compare_rows(current: &Value, stored: &Value, detail_limit: usize) -> Value {
-    let current_rows = rows_by_record(current);
+fn compare_rows(
+    current: &Value,
+    current_rows: &BTreeMap<u64, &Value>,
+    stored: &Value,
+    detail_limit: usize,
+) -> Value {
     let stored_rows = rows_by_record(stored);
     let records: BTreeSet<_> = current_rows.keys().chain(stored_rows.keys()).collect();
     let (mut only_current, mut only_stored, mut identical, mut shared_identities) = (0, 0, 0, 0);

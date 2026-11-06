@@ -821,10 +821,8 @@ fn the_actions_an_at_can_send_reach_the_window() {
 }
 
 fn recorded(name: &str) -> Vec<u8> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-dbus/tests/recorded/zbus-5.16.0-messages.tsv"
-    );
+    let path = aterm_tempfile::manifest_dir()
+        .join("../aterm-dbus/tests/recorded/zbus-5.16.0-messages.tsv");
     let text = std::fs::read_to_string(path).unwrap();
     let hex = text
         .lines()

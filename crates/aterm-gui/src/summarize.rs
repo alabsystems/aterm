@@ -60,6 +60,7 @@ pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::Ta
         fact_line: false,
         autopilot: aterm_agent::supervise::Autopilot::Land,
         chrome: false,
+        program: None,
     }
 }
 

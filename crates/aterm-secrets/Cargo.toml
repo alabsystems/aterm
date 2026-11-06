@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-secrets"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -30,6 +30,7 @@ aterm-digest = { workspace = true }
 # systemctl, $EDITOR, scutil), `atomic_file::write`, `peer::our_uid`.
 aterm-uds = { workspace = true }
 # `dirs::home_dir`, `fs_restricted` (0700 directories).
+aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
 # `hv_vmm_present`: an identity made in a virtual machine is a lab identity (`LabMark`).
 aterm-sysprobe = { workspace = true }
@@ -87,6 +88,9 @@ aterm-codec = { workspace = true }
 aterm-models-db.workspace = true
 aterm-models-swarm.workspace = true
 aterm-spec.workspace = true
+# The CCTV vectors are found from the package directory when the tests run
+# (`aterm_tempfile::manifest_dir`), off Unix too, where it is no normal dependency.
+aterm-tempfile.workspace = true
 
 [[example]]
 name = "commons_control_probe"

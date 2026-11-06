@@ -17,6 +17,12 @@ mod wire;
 
 use std::fmt;
 
+/// The `User-Agent` every request names: `aterm-mail/<the running aterm's product version>`.
+pub(crate) fn user_agent() -> &'static str {
+    static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| format!("aterm-mail/{}", aterm_stamp::app_version()))
+}
+
 /// A provider's stable folder identity, independent of its display name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {

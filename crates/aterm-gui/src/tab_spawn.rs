@@ -1134,13 +1134,15 @@ fn park_reader(
     (session, None)
 }
 
+/// Hold a tab's spawn until a test releases it. The test waits on the `.held` marker's being
+/// there while this process runs, so it is whole by its rename and flushed by nothing.
 fn hold_for_test(completion: &TabSpawnCompletion) {
     let Some(path) = aterm_types::dev_seam!("ATERM_DEBUG_SPAWN_HOLD") else {
         return;
     };
     let mut held = path.clone();
     held.push(".held");
-    let _ = aterm_uds::atomic_file::write(std::path::Path::new(&held), b"", 0o600);
+    let _ = aterm_uds::atomic_file::write_flushed(std::path::Path::new(&held), b"", 0o600, None);
     let path = std::path::PathBuf::from(path);
     let until = Instant::now() + Duration::from_secs(60);
     while !completion.cancelled() && !path.exists() && Instant::now() < until {

@@ -405,6 +405,22 @@ pub static VERBS: &[Verb] = &[
         run: cmd_git::tags,
     },
     Verb {
+        path: &["repo", "create"],
+        class: Class::Write,
+        usage: "agh repo create OWNER/NAME --public [--dry-run]",
+        summary: "create a public repository for the authenticated User owner",
+        example: "agh repo create alabsystems/new-project --public --dry-run",
+        noun: Noun::Write,
+        gh: "gh repo create",
+        milestone: 2,
+        flags: &[
+            on("--public", "required: create public, with no initial files"),
+            DRY_RUN,
+        ],
+        positionals: &["REPO"],
+        run: cmd_repo::repo_create,
+    },
+    Verb {
         path: &["repo", "view"],
         class: Class::Read,
         usage: "agh repo view REPO",
@@ -723,6 +739,22 @@ pub static VERBS: &[Verb] = &[
         ],
         positionals: &["REPO"],
         run: cmd_ref::ref_update_atomic,
+    },
+    Verb {
+        path: &["repo", "fetch"],
+        class: Class::Git,
+        usage: "agh repo fetch REPO DIR --ref REF_OR_OID --into refs/agh/NAME [--anonymous]",
+        summary: "fetch one exact source into agh's local namespace without moving other refs",
+        example: "agh repo fetch alabsystems/aterm . --ref refs/heads/main --into refs/agh/main --anonymous",
+        noun: Noun::Repo,
+        gh: "git fetch",
+        milestone: 2,
+        flags: &[
+            value("--ref", "full ref or forty-digit object id"),
+            value("--into", "destination beneath refs/agh/"),
+        ],
+        positionals: &["REPO", "DIR"],
+        run: cmd_repo::repo_fetch,
     },
     Verb {
         path: &["repo", "fetch-main"],
@@ -1140,11 +1172,6 @@ pub static REFUSED: &[Refused] = &[
         path: &["repo", "delete"],
         why: "agh never deletes a repository",
         next: "a person deletes it on github.com",
-    },
-    Refused {
-        path: &["repo", "create"],
-        why: "agh does not create repositories",
-        next: "use gh repo create",
     },
     Refused {
         path: &["pr"],

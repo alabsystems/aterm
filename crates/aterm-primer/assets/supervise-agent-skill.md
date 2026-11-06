@@ -97,6 +97,12 @@ and old news never fires twice.
   out), or `repeated` (Land stopped typing to a reply that came back the same with no work). A
   `turn` into it reopens it. `task mark failed` by hand is refused while a loop carries the
   session: its Autopilot Off stops the typing, and that fails the task.
+- A `spawn program=<p> [arg=<a>]… -` worker runs a program no harness reads, its task file
+  as its standard input: its exit status concludes it once, `done why=exit-status exit=0`,
+  `failed why=exit-status exit=<n>`, or `failed why=no-exit-status` where none was read, and
+  `result` is its output tail (`source=output`). A `turn` types into its tab without
+  reopening it, and no Autopilot moves it. Nothing reads its screen, so a program that asks
+  on its terminal waits there: bound the wait with `await task … timeout=`.
 - `exited`: the agent exited and nothing relaunches it: `conclusion=finished` if the task had
   finished, whatever word finished it (a landing keeps `why=landed`), else `conclusion=failed`.
 - `stalled`: its shell ended or a person used it before its first prompt (`why=shell`), no

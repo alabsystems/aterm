@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use super::wake_deadline::WakeDeadline;
 use crate::ai::connector::{Cli, Completion, Drive, Flow, Grammar, Region, Route, Seam, SignIn};
 
 /// The hang detector of one sign-in: the vendors' device codes live 15 minutes (Codex's) to
@@ -555,8 +556,9 @@ pub struct Handoff<'a> {
     pub email: Option<&'a str>,
     /// Whether the CLI already said it is done, or closed its output.
     pub finished: &'a dyn Fn() -> bool,
-    /// When the sign-in's hang detector ends it.
-    pub deadline: Instant,
+    /// When the sign-in's hang detector ends it, on both clocks: it counts the time the host
+    /// slept ([`WakeDeadline`]).
+    pub deadline: WakeDeadline,
 }
 
 /// What an [`Approver`] made of the page.
@@ -606,7 +608,11 @@ pub trait Approver {
     }
     /// Resume an unpublished native completion before requiring or starting a native child.
     /// A returned completion must be revalidated by `complete` before publication.
-    fn resume(&mut self, _request: &Request<'_>, _deadline: Instant) -> Result<Resume, String> {
+    fn resume(
+        &mut self,
+        _request: &Request<'_>,
+        _deadline: WakeDeadline,
+    ) -> Result<Resume, String> {
         Ok(Resume::Fresh)
     }
 
@@ -625,7 +631,7 @@ pub trait Approver {
         &mut self,
         _request: &Request<'_>,
         _outcome: &Outcome,
-        _deadline: Instant,
+        _deadline: WakeDeadline,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -737,7 +743,8 @@ pub struct Spec<'a> {
     pub hosts: &'a [&'a str],
     /// The row's email, for the approver.
     pub email: Option<&'a str>,
-    /// The hang detector ([`HANG`]).
+    /// The hang detector ([`HANG`]): [`drive`] measures it on both clocks ([`WakeDeadline`]), so it
+    /// counts the time the host slept.
     pub hang: Duration,
 }
 
@@ -816,7 +823,8 @@ fn spawn_reader(
 
 /// Runs `spec`'s child, hands its page to `approver` once its grammar named the URL (and, for a
 /// device flow, the code), and waits for it to say it is done and exit, all within
-/// [`Spec::hang`]. The child is tied to this process ([`super::align::tie`]), so a quit, an exec
+/// [`Spec::hang`], which counts the time the host slept ([`WakeDeadline`]): a sign-in the host
+/// slept past is ended at its first look after the host wakes. The child is tied to this process ([`super::align::tie`]), so a quit, an exec
 /// in its place, a crash or a `SIGKILL` of this process ends it too; where this process's
 /// executable was replaced since it started, so the tie cannot hold, it is not run.
 pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
@@ -863,10 +871,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             host: None,
         };
     }
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(spec.hang)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
+    let deadline = WakeDeadline::after(spec.hang);
     let (tx, rx) = mpsc::channel::<Option<(usize, String)>>();
     let said_done = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicUsize::new(0));
@@ -931,7 +936,8 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 host,
             };
         }
-        let left = deadline.saturating_duration_since(Instant::now());
+        // Its first look after the approver returns, or after the host woke, reads both clocks.
+        let left = deadline.remaining();
         if left.is_zero() {
             end(&mut child);
             return Drove {
@@ -1343,7 +1349,8 @@ pub fn no_desk_argv(program: &Path, lead: &[OsString]) -> Vec<OsString> {
 
 /// `req`'s sign-in run as `program` (after `lead`), its `PATH` `path` (else the opener-free
 /// one, where the CLI's [`SignIn::no_opener`]), its other variables from `var`
-/// ([`child_env`]), its page handed to `approver`, within `hang`. Where the CLI's
+/// ([`child_env`]), its page handed to `approver`, within `hang`, which counts the time the host
+/// slept ([`WakeDeadline`]). Where the CLI's
 /// [`SignIn::no_desk`] names this system, the child runs under the sandbox `no_desk` names
 /// ([`no_desk_argv`]). A retained completion is revalidated before native setup. Otherwise
 /// no child runs where its sandbox is not a file, cannot apply here ([`sandbox_refusal`]),
@@ -1374,11 +1381,8 @@ pub fn sign_in_with(
     if matches!(req.route.drive, Drive::NativeGoogle) {
         return not_run("native Google login requires its typed grant driver".into());
     }
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(hang)
-        .unwrap_or_else(|| started + Duration::from_secs(86_400));
-    if Instant::now() >= deadline {
+    let deadline = WakeDeadline::after(hang);
+    if deadline.passed() {
         return not_run("native sign-in deadline expired".into());
     }
     if req
@@ -1486,7 +1490,7 @@ pub fn sign_in_with(
     let env = child_env(req.cli, signin, req.staging, &path, var);
     let email = req.row.email.as_deref();
     let args = child_args(req.route, req.row.vendor.region);
-    if Instant::now() >= deadline {
+    if deadline.passed() {
         return not_run("native sign-in deadline expired".into());
     }
     if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
@@ -1503,7 +1507,7 @@ pub fn sign_in_with(
             completion: *completion,
             hosts: req.hosts,
             email,
-            hang: deadline.saturating_duration_since(Instant::now()),
+            hang: deadline.remaining(),
         },
         approver,
     );
@@ -1514,7 +1518,7 @@ fn complete_sign_in(
     req: &Request<'_>,
     approver: &mut dyn Approver,
     mut drove: Drove,
-    deadline: Instant,
+    deadline: WakeDeadline,
     retained: bool,
 ) -> Drove {
     if retained && let Outcome::NotRun(why) | Outcome::PageNotOpened(why) = &drove.outcome {

@@ -68,8 +68,9 @@ fn base_command(dir: &Path, args: &[&str]) -> Command {
     settle_before_fork();
     // A fresh build's first-exec check is waited out here, outside the terminal runs' hang
     // detectors (an unknown verb ends it at once).
-    aterm_spec::wait::first_exec(Path::new(env!("CARGO_BIN_EXE_atpkg-keys")), &["--help"]);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg-keys"));
+    let exe = aterm_tempfile::bin_exe("atpkg-keys");
+    aterm_spec::wait::first_exec(&exe, &["--help"]);
+    let mut cmd = Command::new(&exe);
     cmd.args(args)
         .env("HOME", dir)
         .env("ATPKG_MASTER", PAPER)

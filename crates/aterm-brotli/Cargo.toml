@@ -13,7 +13,7 @@ name = "aterm-brotli"
 # of one suite binary. With autotests off a `tests/*.rs` file listed nowhere
 # never compiles.
 autotests = false
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license = "Apache-2.0 AND BSD-2-Clause"
 repository.workspace = true
@@ -31,6 +31,9 @@ path = "src/lib.rs"
 # SHA-256 of what the recorded streams decode to: the brotli 1.2.0 CLI's own
 # answers (tests/recorded), which are the decoder's oracle.
 aterm-digest = { workspace = true }
+# The recorded streams are found from the package directory when the tests run
+# (`aterm_tempfile::manifest_dir`).
+aterm-tempfile = { workspace = true }
 
 [[test]]
 name = "brotli_suite"

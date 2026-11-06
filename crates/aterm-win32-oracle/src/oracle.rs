@@ -740,7 +740,7 @@ mod tests {
     }
     #[test]
     fn every_plant_finds_its_one_spot_in_aterm_win32() {
-        let krate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-win32");
+        let krate = aterm_tempfile::manifest_dir().join("../aterm-win32");
         for p in PLANTS {
             let text = read(&krate.join(p.file)).unwrap();
             assert_eq!(

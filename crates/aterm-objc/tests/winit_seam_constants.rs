@@ -5,7 +5,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::sdk_consts;
 use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_const_decl};
@@ -47,7 +47,7 @@ const ROWS: &[(&str, &str)] = &[
 ];
 
 fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    aterm_tempfile::manifest_dir().join("../..")
 }
 
 fn seam() -> PathBuf {

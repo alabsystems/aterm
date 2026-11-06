@@ -665,7 +665,7 @@ pub(crate) fn cmd(
         Ok(Form::Export(kept)) => return export(proxy, kept),
         Ok(Form::Check(file)) => {
             let answer = check_path(aterm_types::dirs::state_dir().as_deref(), &file)
-                .and_then(|path| check_file(&path, &aterm_types::version::build_id()));
+                .and_then(|path| check_file(&path, &aterm_stamp::build_id()));
             return match answer {
                 Ok(line) => format!("OK {line}\n"),
                 Err(e) => format!("ERR {e}\n"),
@@ -675,7 +675,7 @@ pub(crate) fn cmd(
     };
     #[cfg(debug_assertions)]
     let ask = match asked {
-        Asked::Publish(plan) => match evaluate(&aterm_types::version::build_id(), &plan) {
+        Asked::Publish(plan) => match evaluate(&aterm_stamp::build_id(), &plan) {
             Ok(admitted) => Ask::Publish(Box::new(admitted)),
             Err(refusal) => return format!("ERR {refusal}\n"),
         },

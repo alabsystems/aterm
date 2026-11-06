@@ -2741,7 +2741,7 @@ fn coverable(row: &str, width: usize) -> Vec<bool> {
 
 #[test]
 fn every_recorded_screen_has_a_rule_the_footer_can_write() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
     let facts = FooterFacts {
         model: Some("Opus 5.5".into()),
         effort: Some("xhigh".into()),
@@ -3964,7 +3964,7 @@ fn a_reason_takes_the_accounts_room() {
 #[test]
 fn the_launch_card_is_read_only_under_a_live_repl() {
     let fixture = |name: &str| -> Vec<String> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = aterm_tempfile::manifest_dir()
             .join("../aterm-phase/src/fixtures")
             .join(name);
         std::fs::read_to_string(path)
@@ -4826,7 +4826,7 @@ fn the_agents_panel_is_found_under_the_footer() {
     assert_eq!(kinds(&panel), [(8, Main), (9, Agent)]);
 
     let fixture = |name: &str| -> Vec<String> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = aterm_tempfile::manifest_dir()
             .join("../aterm-phase/src/fixtures")
             .join(name);
         std::fs::read_to_string(path)
@@ -5363,7 +5363,7 @@ fn the_effort_hint_says_its_level() {
 fn the_measured_2_1_304_panel_and_pill_are_found() {
     use aterm_phase::agents_panel::RowKind::{Agent, Main};
     let fixture = |name: &str| -> Vec<String> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = aterm_tempfile::manifest_dir()
             .join("../aterm-phase/src/fixtures")
             .join(format!("claude-2.1.304-{name}.txt"));
         std::fs::read_to_string(path)
@@ -5406,7 +5406,7 @@ fn the_measured_2_1_304_panel_and_pill_are_found() {
 }
 
 fn measured_2_1_304(name: &str) -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("../aterm-phase/src/fixtures")
         .join(format!("claude-2.1.304-{name}.txt"));
     std::fs::read_to_string(&path)
@@ -6047,6 +6047,16 @@ fn top_rule_tag_finds_the_key_alone() {
     );
     let inside = format!("{rule} {CLAUDE_TOP_EFFORT_KEY} {rule}");
     assert_eq!(top_rule_tag(&inside), None, "not the rule's end");
+    let glued = format!("{rule}{CLAUDE_TOP_EFFORT_KEY} \u{2500}");
+    assert!(aterm_phase::phase::is_rule(&glued), "{glued:?}");
+    assert_eq!(top_rule_labels(&glued), None, "{glued:?}");
+    assert_eq!(
+        top_rule_tag(&glued),
+        None,
+        "glued to the rule's dashes: {glued:?}"
+    );
+    let spaced = format!("{rule} {CLAUDE_TOP_EFFORT_KEY} \u{2500}");
+    assert_eq!(top_rule_tag(&spaced), Some((41, 50)), "CONTROL: {spaced:?}");
     let not_a_rule = format!("  {CLAUDE_TOP_EFFORT_KEY} \u{2500}");
     assert_eq!(top_rule_tag(&not_a_rule), None);
 }

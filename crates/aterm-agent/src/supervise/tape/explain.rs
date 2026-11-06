@@ -481,7 +481,7 @@ impl<'t> Book<'t> {
                 |h| h.tape.clone(),
             ),
             recorded_by: header.map_or_else(|_| self.written("build"), |h| Some(h.build.clone())),
-            explained_by: aterm_types::version::build_id(),
+            explained_by: aterm_stamp::build_id(),
             door: d.door.clone(),
             mark: mark_ordinal,
             at_ms: self.walls[d.item],

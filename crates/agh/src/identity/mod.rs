@@ -497,7 +497,7 @@ fn never_narrowed(dir: &Path, home: &Path, held: Held<'_>) -> bool {
     let matches = |path: &Path| id(path) == Some(dir_id);
     if !home.as_os_str().is_empty() {
         let config = home.join(".config");
-        if matches(home) || matches(&config.join("aterm")) || matches(&config) {
+        if matches(home) || matches(&config) || matches(&config.join("aterm")) {
             return true;
         }
     }

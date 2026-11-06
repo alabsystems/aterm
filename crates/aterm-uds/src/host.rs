@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub mod bash;
 pub mod chrome;
 mod tools;
+pub mod upstream;
 pub use tools::TOOLS;
 
 /// The words that open a refusal by the machine.

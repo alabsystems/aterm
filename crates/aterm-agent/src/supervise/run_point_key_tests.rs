@@ -434,7 +434,7 @@ fn a_draft_typed_and_cleared_is_no_new_point_under_any_program() {
             Program::Codex | Program::Generic => None,
         }
     };
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
     let grok: Vec<Vec<String>> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .flatten()
@@ -534,7 +534,7 @@ fn claude_rule(reader: &dyn ScreenReader, turn: &Turn) -> (String, Option<(u64, 
 /// Build's keys, cut at their frames, differ from it on their own screens.
 #[test]
 fn every_other_programs_point_keeps_claude_codes_rule() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let dir = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
     let mut screens: Vec<(String, Vec<String>)> = std::fs::read_dir(&dir)
         .expect("the fixtures")
         .flatten()

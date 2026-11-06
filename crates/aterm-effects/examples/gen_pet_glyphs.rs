@@ -3,7 +3,6 @@
 
 //! Regenerates `crates/aterm-effects/src/pet_glyphs_gen.rs` from `art/pet/*.toml`.
 
-use std::path::Path;
 use std::process::ExitCode;
 
 #[path = "../src/cat_glyphs_codegen.rs"]
@@ -16,7 +15,7 @@ use cat_glyphs_codegen::generate_pet_from_assets;
 mod asset_dir;
 
 fn main() -> ExitCode {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = aterm_tempfile::manifest_dir();
     let pet_dir = root.join("art/pet");
     let out = root.join("src/pet_glyphs_gen.rs");
 

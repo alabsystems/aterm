@@ -16,7 +16,7 @@ use crate::install::StageError;
 use crate::manifest::{Channel, DigestAlg, Index, parse_pkg};
 use crate::select::{Candidate, select_index};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
-use crate::store::{Layout, ToolName};
+use crate::store::{Layout, MemoLane, ToolName};
 
 pub(crate) mod ahead;
 pub(crate) mod arriving;
@@ -312,6 +312,9 @@ pub enum FlowError {
     Activate(String),
     /// Rollback-specific failure.
     Rollback(String),
+    /// A build named by number ([`install_build`]) that is withdrawn, below its floor, not the
+    /// tree asked for, or held in the store with another tree.
+    NamedBuild(String),
     /// Disk preflight failed.
     InsufficientDisk { required: u64, available: u64 },
     /// The program is dev-linked (linkmode).
@@ -373,6 +376,7 @@ impl std::fmt::Display for FlowError {
                 // CLI edge already prints the rollback head.
                 f.write_str(m)
             }
+            FlowError::NamedBuild(m) => f.write_str(m),
             FlowError::InsufficientDisk {
                 required,
                 available,
@@ -1043,7 +1047,7 @@ pub(crate) fn land_artifact(
 ) -> Result<Landed, FlowError> {
     let (program, pinned, artifact) = (l.program, l.build, l.artifact);
     let turn = TurnHeld(l.download_turn);
-    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, false) {
+    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, Retry::Program) {
         return Err(FlowError::StageRefused(note));
     }
     let dl = staged_download_path(layout, program, &artifact.asset)?;
@@ -1093,6 +1097,7 @@ pub(crate) fn land_artifact(
     let build_dir = layout.build_dir(program, pinned);
     let was_live =
         std::fs::read_link(layout.program_current(program)).is_ok_and(|t| t == build_dir);
+    let was_held = crate::store::build_is_complete(&build_dir);
     if let Err(e) = disk_gate(
         artifact.cost.disk_installed,
         crate::freespace::available_bytes(&build_dir),
@@ -1118,7 +1123,7 @@ pub(crate) fn land_artifact(
         }
     };
     let _ = std::fs::remove_file(&dl);
-    activate_landed(layout, l, build_dir, was_live, root)
+    activate_landed(layout, l, build_dir, (was_live, was_held), root)
 }
 
 /// Another row's complete build that holds exactly the tree a [`Landing`]'s signed bytes stage
@@ -1150,12 +1155,13 @@ pub(crate) fn land_from_tree(
     source: &SourceTree<'_>,
 ) -> Result<Option<Landed>, FlowError> {
     let (program, pinned, artifact) = (l.program, l.build, l.artifact);
-    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, false) {
+    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, Retry::Program) {
         return Err(FlowError::StageRefused(note));
     }
     let build_dir = layout.build_dir(program, pinned);
     let was_live =
         std::fs::read_link(layout.program_current(program)).is_ok_and(|t| t == build_dir);
+    let was_held = crate::store::build_is_complete(&build_dir);
     // A clone on APFS takes no new blocks, but on a volume that cannot clone it is a full copy
     // of the tree: the room the tree takes is held as a download's second gate holds it.
     disk_gate(
@@ -1205,16 +1211,17 @@ pub(crate) fn land_from_tree(
         "atpkg: {program}: copied {}'s verified build of the same bytes; nothing downloaded",
         source.program
     );
-    activate_landed(layout, l, build_dir, was_live, root).map(Some)
+    activate_landed(layout, l, build_dir, (was_live, was_held), root).map(Some)
 }
 
 /// The back half of a landing whose tree is staged at `build_dir` and folds to `root`: forget
-/// its stage refusal, activate it, record and shim what it exposes.
+/// its stage refusal, activate it, record and shim what it exposes. `(was_live, was_held)` are
+/// [`Staged`]'s, read before the stage.
 fn activate_landed(
     layout: &Layout,
     l: &Landing<'_>,
     build_dir: PathBuf,
-    was_live: bool,
+    (was_live, was_held): (bool, bool),
     root: String,
 ) -> Result<Landed, FlowError> {
     let (program, pinned, artifact, installed, strategy) =
@@ -1238,6 +1245,7 @@ fn activate_landed(
         exposes: tools,
         prior_build: installed,
         was_live,
+        was_held,
         reloc: None,
         tree_root: String::new(),
         aliases,
@@ -1279,6 +1287,271 @@ fn fetch_artifact(
             Err(m)
         }
     }
+}
+
+/// THE SIGNED MANIFEST OF A BUILD NAMED BY NUMBER, and the repository the index names for its
+/// program: `req`'s program `build`, verified under the head index and its roster, refused when
+/// the channel withdrew it or holds it below its floor.
+/// [`install_build`] stages its artifact; `atpkg-publish adopt` holds a lock's tree root to it
+/// ([`crate::cli::signed_tree_root`]), so no lock names a build no other Mac can install.
+///
+/// # Errors
+/// The index's ([`resolve_verified_index`]), a channel or row the index lacks, a withdrawn or
+/// floored build ([`FlowError::NamedBuild`]), and the signed manifest's fetch, signature and
+/// match.
+pub fn signed_pkg(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    now_unix: i64,
+    req: &InstallRequest<'_>,
+    build: u64,
+) -> Result<(String, crate::manifest::PkgManifest), FlowError> {
+    let (channel, program, triple) = (req.channel, req.program, req.triple);
+    let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
+    let row = index
+        .program(program)
+        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
+    let repo = row.repo.clone();
+    let ch = index
+        .channel_for(channel, triple)
+        .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
+    if !crate::gate::current_build_ok(&ch, program, Some(build)) {
+        return Err(FlowError::NamedBuild(format!(
+            "{program} {build} is withdrawn or below the channel's floor in index {}",
+            index.index_build
+        )));
+    }
+    let (raw, sig) = fetcher.pkg_manifest(&repo, program, build).map_err(|e| {
+        note_fetch_fault();
+        FlowError::PkgFetch(e)
+    })?;
+    let verified = index
+        .verify_pkg(raw, &sig)
+        .map_err(|_| FlowError::PkgVerify)?;
+    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
+    if !pkg.is_for(program) || pkg.build_number != build {
+        return Err(FlowError::Mismatch);
+    }
+    Ok((repo, pkg))
+}
+
+/// What [`install_build`] found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedBuild {
+    /// The store already held the build, with its signed tree.
+    Present {
+        /// The build's tree root.
+        tree_root: String,
+    },
+    /// The build was downloaded, verified and staged beside the program's `current`.
+    Staged {
+        /// The build's tree root.
+        tree_root: String,
+    },
+}
+
+/// The build a named install asks for ([`install_build`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamedAsk<'a> {
+    /// The build number.
+    pub build: u64,
+    /// The tree root it must have (the `trust.lock` above the working directory's), if any.
+    pub expect_root: Option<&'a str>,
+    /// Forget the build's stage refusal memo first (`--retry`), so a refused build is downloaded
+    /// again now.
+    pub retry: bool,
+}
+
+/// A BUILD NAMED BY NUMBER, STAGED BESIDE `current` (A14: the build a tree's `trust.lock` names,
+/// which an index need not pin): verified under the head index and its roster, refused when the
+/// channel withdrew it or holds it below its floor, its signed tree root held to the
+/// [`NamedAsk`]'s `expect_root` when given, then downloaded, checked against its signed digest and tree and staged with its
+/// tree-root record. It flips neither `current` nor a shim: the program's commands run what they
+/// ran. A build the store already holds with the signed tree (its record, or a fold of a build
+/// staged before records, recorded now) is kept as it is; one holding another tree, or a tree that
+/// does not fold, is staged over from the signed pack. A stage refusal remembered for the pack's
+/// digest refuses without a download, as the update lane's does, unless the ask's `retry` forgets
+/// it first. A sysroot bundle whose resolve check fails is refused and taken out of every
+/// reader's reach (`settle_resolve`).
+///
+/// # Errors
+/// [`signed_pkg`]'s, a tree other than `ask.expect_root` ([`FlowError::NamedBuild`]), no
+/// artifact for `triple`, and the download and stage.
+pub fn install_build(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    now_unix: i64,
+    req: &InstallRequest<'_>,
+    ask: NamedAsk<'_>,
+) -> Result<NamedBuild, FlowError> {
+    let (program, triple) = (req.program, req.triple);
+    let (build, expect_root) = (ask.build, ask.expect_root);
+    let (repo, pkg) = signed_pkg(fetcher, layout, anchor, floor, now_unix, req, build)?;
+    let artifact = pkg
+        .artifact_for(triple)
+        .ok_or_else(|| FlowError::NoArtifact(triple.to_string()))?;
+    crate::vendor::check_row(artifact, &pkg.exposes)?;
+    let strategy = crate::dispatch::strategy_for(&artifact.kind, &artifact.protocol);
+    match strategy {
+        crate::dispatch::ApplyStrategy::Shim => {}
+        crate::dispatch::ApplyStrategy::SysrootBundle => apply_sysroot_bundle(&artifact.reloc)?,
+        crate::dispatch::ApplyStrategy::VendorApp | crate::dispatch::ApplyStrategy::AppBundle => {
+            return Err(FlowError::AppBundleRefused(program.to_string()));
+        }
+        crate::dispatch::ApplyStrategy::Unknown => {
+            return Err(FlowError::UnsupportedKind(artifact.kind.clone()));
+        }
+    }
+    if let Some(expected) = expect_root.filter(|r| **r != artifact.tree_root) {
+        return Err(FlowError::NamedBuild(format!(
+            "{program} {build}'s signed tree root for {triple} is {}, not the {expected} asked \
+             for: nothing installed",
+            artifact.tree_root
+        )));
+    }
+    let build_dir = layout.build_dir(program, build);
+    if held_root(&build_dir).as_deref() == Some(artifact.tree_root.as_str()) {
+        return Ok(NamedBuild::Present {
+            tree_root: artifact.tree_root.clone(),
+        });
+    }
+    if ask.retry {
+        crate::store::clear_stage_refusal(&build_dir);
+    }
+    if let Some(note) = digest_refusal_note(layout, program, build, artifact, Retry::Named) {
+        return Err(FlowError::StageRefused(note));
+    }
+    // `current` names this build and its tree is there: a dangling `current`, or one naming a
+    // link to an aside that is gone, keeps nothing live.
+    let was_live = std::fs::read_link(layout.program_current(program))
+        .is_ok_and(|t| t == build_dir)
+        && !crate::store::tree_absent(&build_dir);
+    let dl = staged_download_path(layout, program, &artifact.asset)?;
+    disk_gate(
+        LandingBytes::of(artifact).need(),
+        crate::freespace::available_bytes(&dl),
+    )?;
+    make_staging_dir(&dl).map_err(|e| FlowError::Download(e.to_string()))?;
+    if !carried_archive(&dl, artifact) {
+        // No sweep of the folder's other archives: this build is staged beside the pin, whose
+        // held quiet-flip archive or resumable download may be there.
+        let _ = std::fs::remove_file(&dl);
+        crate::progress::note_build(program, build);
+        if let Err(e) = fetch_artifact(fetcher, program, &repo, artifact, &dl) {
+            let _ = std::fs::remove_file(&dl);
+            note_fetch_fault();
+            return Err(FlowError::Download(e));
+        }
+    }
+    if let Err(e) = disk_gate(
+        artifact.cost.disk_installed,
+        crate::freespace::available_bytes(&build_dir),
+    ) {
+        let _ = std::fs::remove_file(&dl);
+        return Err(e);
+    }
+    let shim_env = pkg.shim_env();
+    if let Err(e) = crate::shim_env::write_sidecar(&build_dir, &shim_env) {
+        let _ = std::fs::remove_file(&dl);
+        return Err(FlowError::Activate(format!("shim_env sidecar: {e}")));
+    }
+    let alab_gate = alab_pack_gate(program, &pkg.exposes);
+    let staged = verify_and_stage(
+        artifact,
+        &dl,
+        &build_dir,
+        &stage_hooks(alab_gate.as_deref()),
+    );
+    let tree_root = match staged {
+        Ok(root) => root,
+        Err(e) => {
+            record_digest_refusal_in(MemoLane::Named, &build_dir, artifact, &e);
+            reclaim_after_failed_stage(&dl, &e);
+            return Err(FlowError::Stage(e));
+        }
+    };
+    let _ = std::fs::remove_file(&dl);
+    let (tools, _) = crate::store::split_exposed(&pkg.exposes);
+    let checked = if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
+        bundle_resolve_verdict(&build_dir, &tools)
+    } else {
+        Ok(())
+    };
+    settle_resolve(&build_dir, artifact, checked, was_live)?;
+    let _ = crate::store::write_exposes(&build_dir, &tools);
+    let _ = crate::store::write_version(&build_dir, &pkg.version);
+    Ok(NamedBuild::Staged { tree_root })
+}
+
+/// A NAMED BUILD STAGED ([`install_build`]) IS SETTLED BY ITS RESOLVE CHECK: one the check accepts
+/// (`checked` is `Ok`, as for a build with no sysroot bundle) forgets its stage refusal memo, and
+/// only then, so a refused one's attempts add up across asks.
+///
+/// One the check refused is left where no lock reaches it and no `targo` hop downloads it on every
+/// call. A build that was not `current` before the stage
+/// is discarded; a tree that stays (its first-exec hold keeps it, a tool that died by a signal, or
+/// `current` names it, kept for repair as an aborted update leaves a live build) loses its ready
+/// marker and tree-root record, so `trust_lock::standing` and discovery read it absent, and gc's
+/// partial arm sweeps a held one once the hold lets go. The failure is remembered for the pack's
+/// digests in the named lane ([`MemoLane::Named`]): a verdict on the build (its loader cannot
+/// resolve it here, [`crate::sysroot::Unresolved::verdict`]) binds from this first one, so the
+/// next named install refuses without a download until `--retry`; a fault of this run (a hold
+/// that could not be written, a spawn short of resources) cools down as a stage failure does.
+///
+/// # Errors
+/// [`FlowError::Activate`] with the check's reason, when `checked` is an error.
+fn settle_resolve(
+    build_dir: &Path,
+    artifact: &crate::manifest::Artifact,
+    checked: Result<(), crate::sysroot::Unresolved>,
+    was_live: bool,
+) -> Result<(), FlowError> {
+    let unresolved = match checked {
+        Ok(()) => {
+            crate::store::clear_stage_refusal(build_dir);
+            return Ok(());
+        }
+        Err(unresolved) => unresolved,
+    };
+    if !was_live {
+        crate::store::discard_build_keeping_memo(build_dir);
+    }
+    if !crate::store::tree_absent(build_dir) {
+        crate::store::unmark_refused(build_dir);
+    }
+    let kind = if unresolved.verdict {
+        crate::store::RefusalKind::Held
+    } else {
+        crate::store::RefusalKind::Cooldown
+    };
+    let e = FlowError::Activate(unresolved.why);
+    if let Some(digest) = artifact.digest() {
+        let _ = crate::store::record_refusal_in(
+            MemoLane::Named,
+            kind,
+            build_dir,
+            digest,
+            &artifact.tree_root,
+            &e.to_string(),
+            now_unix(),
+        );
+    }
+    Err(e)
+}
+
+/// The tree root of the complete build the store holds at `build_dir` ([`install_build`]): its
+/// record, or its fold, recorded now, for a build staged before stages recorded one. `None` when
+/// there is no complete build there or its tree does not fold.
+fn held_root(build_dir: &Path) -> Option<String> {
+    if !crate::store::build_is_complete(build_dir) {
+        return None;
+    }
+    crate::trust_lock::recorded_root_at(build_dir)
+        .or_else(|| crate::trust_lock::fold_and_record(build_dir).ok().flatten())
 }
 
 /// Re-point `program` at its retained build `to` (the vendor lane's signed-yank rollback).
@@ -1324,6 +1597,9 @@ fn abort_activated_install(layout: &Layout, program: &str, staged: &Staged) {
         }
         return;
     }
+    if staged.was_held {
+        return;
+    }
     crate::store::discard_build(&staged.build_dir);
 }
 
@@ -1336,6 +1612,10 @@ struct Staged {
     prior_build: Option<u64>,
     /// Whether `build_dir` was already the live build when staged.
     was_live: bool,
+    /// Whether `build_dir` held a complete build before this stage, live or not (a build a
+    /// `trust.lock` named and `install --build` staged, a retained one): an abort never discards
+    /// a build it did not create, and gc decides its fate.
+    was_held: bool,
     /// `Some(reloc_policy)` for a `sysroot-bundle` member.
     reloc: Option<String>,
     /// The signed `tree_root` of the staged build.
@@ -2116,9 +2396,10 @@ fn apply_group_txn_inner(
         TxnOutcome::Aborted { .. } | TxnOutcome::Deferred { .. }
     ) {
         for s in staged.borrow().values() {
-            // Never delete a build that was already live when re-staged: gc protects it
-            // ([`crate::gc::live_builds`]), and deleting it would leave `current` dangling.
-            if s.was_live {
+            // Never delete a build that was already there when re-staged: a live one gc protects
+            // ([`crate::gc::live_builds`]), and deleting it would leave `current` dangling; a held
+            // one may be what a tree's `trust.lock` names, and gc decides its fate.
+            if s.was_live || s.was_held {
                 continue;
             }
             crate::store::discard_build(&s.build_dir);
@@ -2335,16 +2616,29 @@ fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
 }
 
 fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact, e: &StageError) {
+    record_digest_refusal_in(MemoLane::Update, build_dir, artifact, e);
+}
+
+/// The memo a deterministic stage failure leaves in `lane`: a digest mismatch cools down, a
+/// signer refusal and a tree root mismatch bind from the first; any other failure leaves none.
+fn record_digest_refusal_in(
+    lane: MemoLane,
+    build_dir: &Path,
+    artifact: &crate::manifest::Artifact,
+    e: &StageError,
+) {
     let Some(digest) = artifact.digest() else {
         return;
     };
-    let record = match e {
-        StageError::DigestMismatch { .. } => crate::store::record_stage_refusal,
-        StageError::SignerRefused(_) => crate::store::record_signer_refusal,
-        StageError::TreeRootMismatch { .. } => crate::store::record_held_refusal,
+    let kind = match e {
+        StageError::DigestMismatch { .. } => crate::store::RefusalKind::Cooldown,
+        StageError::SignerRefused(_) => crate::store::RefusalKind::Signer,
+        StageError::TreeRootMismatch { .. } => crate::store::RefusalKind::Held,
         _ => return,
     };
-    let _ = record(
+    let _ = crate::store::record_refusal_in(
+        lane,
+        kind,
         build_dir,
         digest,
         &artifact.tree_root,
@@ -2353,15 +2647,27 @@ fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact,
     );
 }
 
+/// Which lane a stage refusal memo refused, which names the command that retries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// A grouped update: `aterm pkg update --retry`.
+    Grouped,
+    /// One program's pinned build: `aterm pkg install <program>`.
+    Program,
+    /// A build named by number ([`install_build`]): `aterm pkg install <program> --build <N>
+    /// --retry`, which forgets that build's memo alone and moves no `current`.
+    Named,
+}
+
 /// The note of a stage refusal memo that still binds `program`'s `build` at `artifact`'s
 /// digests ([`crate::store::StageRefusal::binds`]): why nothing is fetched, and the command
-/// that retries it (`update --retry` when `grouped`).
+/// that retries it ([`Retry`]).
 pub(crate) fn digest_refusal_note(
     layout: &Layout,
     program: &str,
     build: u64,
     artifact: &crate::manifest::Artifact,
-    grouped: bool,
+    retry: Retry,
 ) -> Option<String> {
     let now = now_unix();
     let memo = crate::store::stage_refusal(&layout.build_dir(program, build))?;
@@ -2369,27 +2675,50 @@ pub(crate) fn digest_refusal_note(
         return None;
     }
     let mut how = String::new();
+    if retry == Retry::Named {
+        // A build named by number is that build: no newer publication replaces it.
+        how.push_str("not downloaded again");
+        if !(memo.signer || memo.held) {
+            how.push_str(" for about ");
+            how.push_str(&memo_hours(&memo, now).to_string());
+            how.push('h');
+        }
+        how.push_str(" \u{2014} now: aterm pkg install ");
+        how.push_str(program);
+        how.push(' ');
+        how.push_str(crate::cli::BUILD_FLAG);
+        how.push(' ');
+        how.push_str(&build.to_string());
+        how.push(' ');
+        how.push_str(crate::cli::RETRY_FLAG);
+        return Some(crate::state::held_failed(&memo.why, &how));
+    }
     if memo.signer || memo.held {
         how.push_str("not downloaded again until a new build is published \u{2014} now: ");
     } else {
-        let hours = memo
-            .retry_after()
-            .saturating_sub(now)
-            .saturating_add(3599)
-            .div_euclid(3600)
-            .max(1);
         how.push_str(&memo.attempts.to_string());
         how.push_str(" attempts failed; not downloaded again for about ");
-        how.push_str(&u64::try_from(hours).unwrap_or(0).to_string());
+        how.push_str(&memo_hours(&memo, now).to_string());
         how.push_str("h or until a new build is published \u{2014} now: ");
     }
-    if grouped {
+    if retry == Retry::Grouped {
         how.push_str("aterm pkg update --retry");
     } else {
         how.push_str("aterm pkg install ");
         how.push_str(program);
     }
     Some(crate::state::held_failed(&memo.why, &how))
+}
+
+/// The whole hours, at least one, until `memo` stops binding.
+fn memo_hours(memo: &crate::store::StageRefusal, now: i64) -> u64 {
+    let hours = memo
+        .retry_after()
+        .saturating_sub(now)
+        .saturating_add(3599)
+        .div_euclid(3600)
+        .max(1);
+    u64::try_from(hours).unwrap_or(0)
 }
 
 pub(crate) const fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
@@ -2531,10 +2860,14 @@ pub(crate) fn planned_landing(
         InstallNeed::Unpublished { .. } => return PlannedLanding::Nothing,
         InstallNeed::Unknown => return PlannedLanding::Unknown,
     };
-    let grouped = group.group.is_some();
+    let retry = if group.group.is_some() {
+        Retry::Grouped
+    } else {
+        Retry::Program
+    };
     if pins
         .iter()
-        .any(|p| digest_refusal_note(layout, &p.program, p.build, &p.artifact, grouped).is_some())
+        .any(|p| digest_refusal_note(layout, &p.program, p.build, &p.artifact, retry).is_some())
     {
         PlannedLanding::Nothing
     } else if pins.iter().any(|p| p.artifact.cost.disk_installed == 0) {
@@ -2906,6 +3239,7 @@ pub fn rollback_returning_index(
         exposes: crate::ops::active_tools(layout, program, current),
         prior_build: Some(target),
         was_live: true,
+        was_held: true,
         reloc: None,
         tree_root: String::new(),
         aliases: Aliases::for_program(program, index.program(program)),
@@ -3331,7 +3665,7 @@ fn fetch_member(
             return None;
         }
     };
-    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, true) {
+    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, Retry::Grouped) {
         eprintln!("{}", stage_failure_note(program, pinned, &note));
         *why = note;
         return None;
@@ -3428,6 +3762,7 @@ fn stage_fetched(
     let build_dir = layout.build_dir(program, pinned);
     let was_live =
         std::fs::read_link(layout.program_current(program)).is_ok_and(|t| t == build_dir);
+    let was_held = crate::store::build_is_complete(&build_dir);
     if let Err(e) = crate::shim_env::write_sidecar(&build_dir, &pkg.shim_env()) {
         let note = format!("its environment file could not be written beside the build: {e}");
         eprintln!("{}", stage_failure_note(program, pinned, &note));
@@ -3467,6 +3802,7 @@ fn stage_fetched(
         exposes,
         prior_build,
         was_live,
+        was_held,
         reloc,
         tree_root: artifact.tree_root.clone(),
         aliases: Aliases::for_program(program, index.program(program)),
@@ -3767,14 +4103,23 @@ pub(crate) fn bundle_resolve_check(
     build_dir: &Path,
     exposes: &[ToolName],
 ) -> Result<(), FlowError> {
+    bundle_resolve_verdict(build_dir, exposes).map_err(|u| FlowError::Activate(u.why))
+}
+
+/// [`bundle_resolve_check`], with whether its refusal is a verdict on the build
+/// ([`crate::sysroot::Unresolved::verdict`]).
+pub(crate) fn bundle_resolve_verdict(
+    build_dir: &Path,
+    exposes: &[ToolName],
+) -> Result<(), crate::sysroot::Unresolved> {
     bundle_resolve_check_with(build_dir, exposes, &crate::sysroot::resolve_check)
 }
 
 fn bundle_resolve_check_with(
     build_dir: &Path,
     exposes: &[ToolName],
-    check: &(dyn Fn(&Path) -> Result<(), String> + Sync),
-) -> Result<(), FlowError> {
+    check: &(dyn Fn(&Path) -> Result<(), crate::sysroot::Unresolved> + Sync),
+) -> Result<(), crate::sysroot::Unresolved> {
     let bins: Vec<PathBuf> = exposes
         .iter()
         .map(|tool| build_dir.join("bin").join(tool.exe_file()))
@@ -3784,8 +4129,7 @@ fn bundle_resolve_check_with(
         .collect();
     crate::net::fan_out(&bins, &|bin: &PathBuf| check(bin))
         .into_iter()
-        .collect::<Result<(), String>>()
-        .map_err(FlowError::Activate)
+        .collect::<Result<(), crate::sysroot::Unresolved>>()
 }
 
 /// Current Unix epoch second, the `now_unix` every freshness gate takes as a parameter.

@@ -15,9 +15,10 @@ use super::{LaneRun, Status, TrendSample};
 /// The pass threshold as a fraction of the recorded baseline.
 pub(crate) const PASS_RATIO: f64 = 0.45;
 
-/// Where the committed baselines and the trend ledger live.
+/// Where the committed baselines and the trend ledger live, in the running checkout
+/// ([`workspace_root`]).
 pub(crate) fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/golden")
+    aterm_tempfile::manifest_dir().join("perf/golden")
 }
 
 /// The verdict of comparing one fresh number against its baseline.

@@ -372,6 +372,20 @@ pub fn prove<S: Read + Write + ?Sized>(
     sign_node: SignNode<'_>,
     sent: &mut bool,
 ) -> Result<Bundle> {
+    prove_guarded(stream, greeting, joining, sign_node, sent, false, &|_| {
+        Ok(())
+    })
+}
+
+pub(crate) fn prove_guarded<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    greeting: &Greeting,
+    joining: &Joining<'_>,
+    sign_node: SignNode<'_>,
+    sent: &mut bool,
+    authority: bool,
+    ready: &dyn Fn(&Request) -> Result<()>,
+) -> Result<Bundle> {
     let request = joining.request(greeting)?;
     let message = prove_message(
         &greeting.key,
@@ -380,23 +394,51 @@ pub fn prove<S: Read + Write + ?Sized>(
         request.bytes(),
     );
     let signature = sign(joining.device, &message)?;
-    wire::write_line(
-        stream,
-        &format!(
-            "prove request={} node={} name={} sig={} nodesig={} reads=2 records-bound={}{}",
-            wire::b64(request.bytes()),
-            wire::hex(&joining.node),
-            wire::escape(&joining.name),
-            wire::hex(signature.as_ref()),
-            wire::hex(&sign_node(&message)),
-            wire::escape(&joining.records_bound.value()),
-            wire::lab_field(joining.device.lab())
-        ),
-    )?;
+    let mut nonce = [0; 32];
+    if authority {
+        aterm_uds::rand::fill(&mut nonce)
+            .map_err(|why| Error::new(format!("no randomness for proof authority: {why}")))?;
+    }
+    let proof_line = format!(
+        "prove request={} node={} name={} sig={} nodesig={} reads=2 records-bound={}{}{}",
+        wire::b64(request.bytes()),
+        wire::hex(&joining.node),
+        wire::escape(&joining.name),
+        wire::hex(signature.as_ref()),
+        wire::hex(&sign_node(&message)),
+        wire::escape(&joining.records_bound.value()),
+        wire::lab_field(joining.device.lab()),
+        if authority {
+            format!(" authority={}", wire::hex(&nonce))
+        } else {
+            String::new()
+        },
+    );
+    wire::write_line(stream, &proof_line)?;
+    if authority {
+        let line = wire::read_line(stream)?;
+        let response = wire::answer(&line)?;
+        let size: usize = Some(response.get("authority")?)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .filter(|size| *size <= crate::membership_log::MAX_RECORDS_STREAM)
+            .ok_or_else(|| Error::new("the member's authority size is out of bounds"))?;
+        let mut records = vec![0; size];
+        stream.read_exact(&mut records)?;
+        super::authority::verify(
+            &records,
+            greeting,
+            &nonce,
+            &proof_line,
+            &response.hex::<64>("authoritysig")?,
+            joining.records_bound,
+        )?;
+    }
     let line = wire::read_line(stream)?;
     let challenge = wire::answer(&line)?.b64("challenge")?;
     let response = joining.device.answer(&request, &challenge)?;
     let possession = format!("possess response={}", wire::b64(&response));
+    ready(&request)?;
     *sent = true;
     wire::write_line(stream, &possession)?;
     let line = wire::read_line(stream)?;

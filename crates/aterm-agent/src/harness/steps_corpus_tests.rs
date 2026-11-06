@@ -8,16 +8,20 @@ use std::collections::BTreeMap;
 
 use super::*;
 
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-slog/tests/sequences");
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervise/fixtures");
-const MEASURED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
+/// `aterm-slog`'s replay corpus.
+fn corpus_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("../aterm-slog/tests/sequences")
+}
 
-fn fixture_path(file: &str) -> String {
-    if MEASURED_BUILDS.contains(&file) {
-        format!("{MEASURED}/{file}.jsonl")
+fn fixture_path(file: &str) -> std::path::PathBuf {
+    let dir = if MEASURED_BUILDS.contains(&file) {
+        "src/harness/testdata/steps"
     } else {
-        format!("{FIXTURES}/{file}.jsonl")
-    }
+        "src/supervise/fixtures"
+    };
+    aterm_tempfile::manifest_dir()
+        .join(dir)
+        .join(format!("{file}.jsonl"))
 }
 const FP: u64 = 0x5eed_0000_0000_0005;
 const ID: Option<(u64, u64)> = Some((16_777_220, 5));
@@ -168,7 +172,7 @@ fn said_of_event(e: &StepEvent) -> Option<Said> {
 
 fn fold_whole(file: &str) -> Result<Vec<Folded>, String> {
     let path = fixture_path(file);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut fold = StepFold::new(0, None);
     fold.read_at(FP, ID, 0, false);
     let (mut end, mut ends) = (0u64, Vec::new());
@@ -202,7 +206,7 @@ fn fold(file: &str, a: usize, b: usize) -> Result<Vec<Folded>, String> {
     let whole = fold_whole(file)?;
     let path = fixture_path(file);
     let n = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{path}: {e}"))?
+        .map_err(|e| format!("{}: {e}", path.display()))?
         .lines()
         .count();
     if b > n || a == 0 || a > b {
@@ -351,7 +355,7 @@ fn check(runs: &[Run]) -> Result<(), String> {
 }
 
 fn corpus() -> Vec<(String, String)> {
-    let mut all: Vec<(String, String)> = std::fs::read_dir(CORPUS)
+    let mut all: Vec<(String, String)> = std::fs::read_dir(corpus_dir())
         .expect("the corpus")
         .map(|e| e.expect("an entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "seq"))

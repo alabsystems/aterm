@@ -20,7 +20,10 @@ pub use account::AccountIssuerSuccession;
 mod account_input;
 mod alab_join;
 pub use account_input::{admin_set_entry_until, open_account_input};
-pub use alab_join::prepare_alab_join_retry;
+pub use alab_join::{
+    NativeAdmission, NativeBootstrap, check_bootstrap_allowed, native_bootstrap,
+    on_bootstrap_allowed, on_native_bootstrap, prepare_alab_join_retry,
+};
 mod admin_keys;
 pub mod admin_service;
 mod admission;
@@ -44,9 +47,11 @@ mod http204_observation;
 mod inspection;
 mod join_queues;
 mod join_routing;
+mod lab_labels;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod member_authority;
 mod member_routes;
 mod mirrors;
 mod network_observation;
@@ -70,12 +75,12 @@ mod toml_cache;
 mod vault_memo;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
-pub(crate) use admit::seated_member;
 pub use admit::{
     ByLog, LogAdmission, accepts_bundle, admit_by_phrase, admits_by_log, hand_over, hand_over_with,
     log_admitted_actors, member_by_log, post_records_to_servers, readmit_from_log_bundle,
     write_from_log_bundle,
 };
+pub(crate) use admit::{readmit_from_log_bundle_admitted, seated_member, with_proof_admission};
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
 #[cfg(any(test, debug_assertions))]
 pub use commons_excluded::{CommonsExcluded, test_commons_excluded};
@@ -118,6 +123,7 @@ pub(crate) use inspection::newest_everyone_until;
 pub use inspection::{
     CommonsControlInspection, MembershipHistoryInspection, inspect_membership_history_until,
 };
+pub use lab_labels::{LabLabels, LabelHold, lab_labels};
 pub use ledger_publish::{
     MergedHeads, ObservedHead, extend_parent_spine, ledger_publish_environment,
     merge_diverged_heads, publish_to_servers, read_server_heads, verify_approved_in_served_head,
@@ -133,6 +139,7 @@ pub use log_entries::{
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
 };
+pub use member_authority::member_authority;
 pub use mirrors::{
     MAX_MIRRORS, MirrorProbe, mirror_notes, mirror_typed, probe_mirror, set_mirrors,
 };
@@ -276,6 +283,22 @@ impl Paths {
         aterm_types::dirs::home_dir()
             .map(|home| Paths::for_home(&home))
             .ok_or_else(|| Error::new("no home directory"))
+    }
+
+    /// The files whose change can move this Mac's standing in its vault (in, asking, let in,
+    /// let go): its source, its saved state, its identity and the Allowed a member handed it
+    /// (which moves it from asking to let in). A reader that shows the standing can watch them
+    /// rather than poll; a change to the trusted log alone (which decides a seat) it reads at the
+    /// next change of one of them, which comes within a minute while the vault's subscriber runs,
+    /// since each of its rounds replaces the saved state.
+    #[must_use]
+    pub fn standing_files(&self) -> [PathBuf; 4] {
+        [
+            self.source_file(),
+            self.state_file(),
+            self.identity_file(),
+            handover::allowed_file(self),
+        ]
     }
 
     fn source_file(&self) -> PathBuf {
@@ -7394,11 +7417,22 @@ fn ask_members_if_due(
     ask: AskMembers<'_>,
     log: &dyn Fn(&str),
 ) {
+    ask_members_if_due_with_native(paths, asked, ask, &alab_join::background_native, log);
+}
+
+fn ask_members_if_due_with_native(
+    paths: &Paths,
+    asked: &mut MembersAsked,
+    ask: AskMembers<'_>,
+    native: &dyn Fn(&Paths) -> crate::Result<NativeAdmission>,
+    log: &dyn Fn(&str),
+) {
     let config = self::config(paths)
         .ok()
         .flatten()
         .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
     let state = load_state(paths).ok();
+    let bootstrap = alab_join::pending(paths);
     // A seatless recipient (its locker opened, no seat binds it) asks as a waiting Mac does, with
     // the same keys, until a seat binds it (one-mesh S1, `seat_ask`).
     let waiting = config.as_ref().is_some_and(|config| {
@@ -7408,7 +7442,8 @@ fn ask_members_if_due(
             && (!holds_allowed(paths)
                 || log_entries::trusted_configured_log(paths, config)
                     .is_ok_and(|log| log.is_some()))
-    }) || seat_ask::asks_for_seat(paths);
+    }) || seat_ask::asks_for_seat(paths)
+        || bootstrap;
     let Some(state) = state.filter(|_| waiting) else {
         // A wait that begins again starts its pauses over.
         asked.at = None;
@@ -7438,12 +7473,27 @@ fn ask_members_if_due(
     asked.at = Some(Instant::now());
     asked.asks = asked.asks.saturating_add(1);
     asked.on = Some((network, state.requested));
-    let said = match ask(paths) {
-        Ok(0) => "asked ALab's members to let this Mac in: none answers on this network".to_owned(),
-        Ok(heard) => format!(
-            "asked ALab's members to let this Mac in: {heard} answered; a member on this Mac's home ALab LAN lets it in by itself"
-        ),
-        Err(error) => format!("asking ALab's members to let this Mac in failed: {error}"),
+    let said = if bootstrap {
+        match native(paths) {
+            Ok(NativeAdmission::Admitted) => "native bootstrap admitted this Mac".to_owned(),
+            Ok(NativeAdmission::Uncertain) => {
+                "native bootstrap waits for its proof to be confirmed".to_owned()
+            }
+            Ok(NativeAdmission::None) => {
+                "native bootstrap heard no admitting member on this network".to_owned()
+            }
+            Err(why) => format!("native bootstrap waits: {why}"),
+        }
+    } else {
+        match ask(paths) {
+            Ok(0) => {
+                "asked ALab's members to let this Mac in: none answers on this network".to_owned()
+            }
+            Ok(heard) => format!(
+                "asked ALab's members to let this Mac in: {heard} answered; a member on this Mac's home ALab LAN lets it in by itself"
+            ),
+            Err(error) => format!("asking ALab's members to let this Mac in failed: {error}"),
+        }
     };
     if said != asked.said {
         log(&said);
@@ -10575,6 +10625,7 @@ fn request_join_until(
     asker: Asker,
     deadline: Option<Instant>,
 ) -> crate::Result<String> {
+    refuse_pending_native_enrollment(paths, config)?;
     // A12: an ask nobody typed (the subscriber's re-ask, the handover's ask with its `Allowed`)
     // goes to ALab's vault only from an identity that is no lab identity. A join a person typed
     // was judged where they typed it (`join`).
@@ -10919,6 +10970,9 @@ fn join_with_until(
         let _lock = bounded::take(paths, deadline)?;
         creation::permit_join(paths)?;
         expected.check(paths)?;
+        // Native possession persists its retry marker under this same StateLock: a slow
+        // default HTTP fetch cannot publish over a proof that may have signed admission.
+        refuse_pending_native_enrollment(paths, &config)?;
         // Before the reset below clears it, and before this Mac's key is announced or asked
         // with: the vault that dropped this Mac refuses that key.
         if previous
@@ -11075,6 +11129,15 @@ fn join_with_until(
         }
     }
     Ok(JoinOutcome::Pending { code, host })
+}
+
+fn refuse_pending_native_enrollment(paths: &Paths, config: &Config) -> crate::Result<()> {
+    if alab_vault(config) && crate::members::join::pending_proof(paths)? {
+        return Err(Error::new(
+            "a native member may have signed this Mac's admission; the same proof retries before any vault enrollment",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `bytes`, what the caller fetched from `source` earlier, still serve a join there:

@@ -2125,7 +2125,7 @@ fn the_control_is_exchangeable_with_v0() {
 
 /// This crate's root.
 fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
 }
 
 /// What each file the import allowlist reads may `use` from this crate: a path, or every item of

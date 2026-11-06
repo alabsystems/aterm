@@ -5280,18 +5280,33 @@ impl StateDir {
         self.write("halt-acked", &off.to_string())
     }
 
-    /// The inbox-group commit a bridge owed when it exited with no broker connection to make it on (`Bridge::hand_over_inbox_commit`).
+    /// The inbox-group commit a bridge of `node` owed when it exited with no broker connection to
+    /// make it on (`Bridge::hand_over_inbox_commit`). Each node's is its own: a commit a bridge of
+    /// another node left, one before this Mac's key rotated, is that node's group's, which the
+    /// node service's own-inbox move follows since (§11 C3b), and made on this node's group it
+    /// would pass this node's unread mail there.
     #[must_use]
-    pub fn inbox_owed(&self) -> Option<u64> {
-        self.read("inbox-owed").and_then(|s| crate::parse_uint(&s))
+    pub fn inbox_owed(&self, node: &str) -> Option<u64> {
+        self.owed_entry()
+            .filter(|(of, _)| of == node)
+            .map(|(_, off)| off)
     }
 
-    /// Hand over the inbox-group commit through `off` ([`Self::inbox_owed`]).
-    pub fn set_inbox_owed(&self, off: u64) -> io::Result<()> {
-        if self.inbox_owed().is_some_and(|have| have >= off) {
+    /// The node and offset of the inbox-group commit handed over, whichever node's.
+    fn owed_entry(&self) -> Option<(String, u64)> {
+        let text = self.read("inbox-owed")?;
+        let (node, off) = text.split_once(' ')?;
+        Some((node.to_owned(), crate::parse_uint(off)?))
+            .filter(|(node, _)| crate::subject::is_principal(node))
+    }
+
+    /// Hand over `node`'s inbox-group commit through `off` ([`Self::inbox_owed`]), in place of
+    /// another node's.
+    pub fn set_inbox_owed(&self, node: &str, off: u64) -> io::Result<()> {
+        if self.inbox_owed(node).is_some_and(|have| have >= off) {
             return Ok(());
         }
-        self.write("inbox-owed", &off.to_string())
+        self.write("inbox-owed", &format!("{node} {off}"))
     }
 
     /// The inbox commit handed over has been made.
@@ -5393,7 +5408,7 @@ impl StateDir {
             posts: post_resets,
         } = self.publication_offset_resets(keep_below)?;
         let in_flight = self.in_flight()?;
-        let owed = self.inbox_owed();
+        let owed = self.owed_entry().map(|(_, off)| off);
         for path in seen_removed.into_iter().chain(unhandled_removed) {
             match self.remove_path(&path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -6236,7 +6251,7 @@ mod tests {
         st.set_topic_floors("s-x", &floors).expect("floors");
         st.set_seen_off("s-x", 9).expect("seen");
         st.set_halt_acked(4).expect("halt-acked");
-        st.set_inbox_owed(5).expect("inbox-owed");
+        st.set_inbox_owed("n-a", 5).expect("inbox-owed");
         st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 0, 8)
             .expect("acked");
         st.append_self_acked(None, &[3]).expect("acked, appended");
@@ -8124,7 +8139,7 @@ mod tests {
                 .unwrap();
             st.set_topic_floors("s-y", &floors(&[("c", 6)])).unwrap();
             st.set_halt_acked(2).unwrap();
-            st.set_inbox_owed(4).unwrap();
+            st.set_inbox_owed("n-a", 4).unwrap();
             st.set_deadlines_as_an_older_build(&[deadline(3), deadline(6)])
                 .unwrap();
             st.set_asked_as_an_older_build(&[asked(3), asked(6)])
@@ -8154,7 +8169,7 @@ mod tests {
             assert!(st.topic_floors("s-y").unwrap().is_empty());
             assert_eq!(st.halt_acked(), None, "cleared, clamped or not");
             assert_eq!(
-                st.inbox_owed(),
+                st.inbox_owed("n-a"),
                 Some(4),
                 "the commit owed is below the fork"
             );
@@ -8211,7 +8226,7 @@ mod tests {
         assert_eq!(st.topics("s-x"), cursors(&[("a", 12), ("b", 12)]));
         assert!(st.topic_floors("s-x").unwrap().is_empty());
         assert_eq!(st.halt_acked(), None);
-        assert_eq!(st.inbox_owed(), None);
+        assert_eq!(st.inbox_owed("n-a"), None);
         assert!(st.deadlines().is_empty() && st.asked().is_empty());
         assert_eq!(
             st.key_pin("s-x", "low").unwrap().unwrap().original_off,

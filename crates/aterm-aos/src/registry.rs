@@ -91,10 +91,21 @@ impl Judged {
     /// The judgement as one token (`pass`, `fail:<law>@<cursor>`, `unjudged:<why>`).
     #[must_use]
     pub fn token(&self) -> String {
+        let mut out = String::with_capacity(24);
+        self.write_token(&mut out);
+        out
+    }
+
+    fn write_token(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
-            Judged::Pass => "pass".to_owned(),
-            Judged::Fail { law, cursor } => format!("fail:{}@{cursor}", token_word(law)),
-            Judged::Unjudged(why) => format!("unjudged:{}", token_word(why)),
+            Judged::Pass => out.push_str("pass"),
+            Judged::Fail { law, cursor } => {
+                let _ = write!(out, "fail:{}@{cursor}", token_word(law));
+            }
+            Judged::Unjudged(why) => {
+                let _ = write!(out, "unjudged:{}", token_word(why));
+            }
         }
     }
 }
@@ -138,6 +149,18 @@ impl Row {
     /// The row as `key=value` words after its slot and index.
     #[must_use]
     pub fn words(&self) -> String {
+        let cap = match self {
+            Row::Segment { code, .. } => 96 + code.len(),
+            Row::Detached { why } => 13 + why.len(),
+            Row::Unseen { why, .. } => 15 + why.len(),
+        };
+        let mut out = String::with_capacity(cap);
+        self.write_words(&mut out);
+        out
+    }
+
+    fn write_words(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
             Row::Segment {
                 cause,
@@ -147,19 +170,32 @@ impl Row {
                 to,
                 judged,
                 kept,
-            } => format!(
-                "segment cause={} code={} log_epoch={log_epoch} range={from}..{to} judged={} kept={}",
-                cause.word(),
-                token_word(code),
-                judged.token(),
-                kept.map_or_else(|| "no".to_owned(), |k| k.to_string())
-            ),
-            Row::Detached { why } => format!("detached why={}", token_word(why)),
-            Row::Unseen { on, why } => format!(
-                "unseen={} why={}",
-                if *on { "on" } else { "off" },
-                token_word(why)
-            ),
+            } => {
+                let _ = write!(
+                    out,
+                    "segment cause={} code={} log_epoch={log_epoch} range={from}..{to} judged=",
+                    cause.word(),
+                    token_word(code),
+                );
+                judged.write_token(out);
+                match kept {
+                    Some(k) => {
+                        let _ = write!(out, " kept={k}");
+                    }
+                    None => out.push_str(" kept=no"),
+                }
+            }
+            Row::Detached { why } => {
+                let _ = write!(out, "detached why={}", token_word(why));
+            }
+            Row::Unseen { on, why } => {
+                let _ = write!(
+                    out,
+                    "unseen={} why={}",
+                    if *on { "on" } else { "off" },
+                    token_word(why)
+                );
+            }
         }
     }
 }
@@ -331,7 +367,11 @@ impl Registry {
         for l in &self.listings {
             out.push(l.line());
             for (k, row) in l.timeline.rows().enumerate() {
-                out.push(format!("slot={} row={k} {}", l.slot, row.words()));
+                use std::fmt::Write;
+                let mut line = String::with_capacity(120);
+                let _ = write!(line, "slot={} row={k} ", l.slot);
+                row.write_words(&mut line);
+                out.push(line);
             }
         }
         out

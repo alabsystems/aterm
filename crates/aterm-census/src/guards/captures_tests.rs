@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-use std::path::Path;
-
 use super::*;
 use crate::guards::Corpus;
 
@@ -186,7 +184,7 @@ fn a_finding_names_the_record_holding_the_match_not_the_first() {
 #[test]
 fn the_exports_rows_compile_and_every_capture_row_does() {
     assert_eq!(capture_rows().len(), CAPTURE_ROWS.len());
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = aterm_tempfile::manifest_dir().join("../..");
     let text = match std::fs::read_to_string(root.join(EXTRA)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

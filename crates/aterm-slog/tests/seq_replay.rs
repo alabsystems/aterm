@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 
 use aterm_models_session::{transcript_join_model, turn_tracker_model};
 use aterm_slog::{
@@ -21,7 +22,9 @@ use crate::seq_twins::{self, Took};
 use crate::support::{self, WALL0, agent_session, at, time_order_holds};
 
 /// Path to the `.seq` replay corpus directory.
-pub const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sequences");
+pub fn corpus_dir() -> PathBuf {
+    aterm_tempfile::manifest_dir().join("tests/sequences")
+}
 
 const FP: u64 = 0xc1a0_de00_0000_0001;
 const DEV: u64 = 16_777_220;
@@ -686,9 +689,9 @@ pub fn parse(name: &str, text: &str) -> Result<Seq, String> {
     Ok(seq)
 }
 
-/// Load and parse all `.seq` files in [`CORPUS`] in filename order.
+/// Load and parse all `.seq` files in [`corpus_dir`] in filename order.
 pub fn corpus() -> Vec<Seq> {
-    let mut paths: Vec<_> = std::fs::read_dir(CORPUS)
+    let mut paths: Vec<_> = std::fs::read_dir(corpus_dir())
         .expect("the corpus directory")
         .map(|e| e.expect("a corpus entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "seq"))
@@ -2162,7 +2165,7 @@ fn an_expect_names_a_records_at_field_apart_from_its_instant() {
 
 #[test]
 fn a_planted_wrong_expect_of_each_kind_fails() {
-    let path = format!("{CORPUS}/tx-tool-call-and-result.seq");
+    let path = corpus_dir().join("tx-tool-call-and-result.seq");
     let text = std::fs::read_to_string(&path).expect("reads");
     let fails = |what: &str, text: &str| {
         let planted = parse("planted.seq", text).expect("parses");
@@ -2206,7 +2209,7 @@ fn a_planted_wrong_expect_of_each_kind_fails() {
 fn a_planted_wrong_link_fails() {
     let mut flipped = 0;
     for seq in corpus().iter().filter(|s| s.name.starts_with("t10-")) {
-        let text = std::fs::read_to_string(format!("{CORPUS}/{}", seq.name)).expect("reads");
+        let text = std::fs::read_to_string(corpus_dir().join(&seq.name)).expect("reads");
         replay(seq, Broken::No).expect("the file passes");
         for (right, wrong) in [
             ("expect link=none", "expect link=@3"),

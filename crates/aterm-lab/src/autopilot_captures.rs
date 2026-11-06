@@ -741,7 +741,12 @@ chip drawn, then idle 20 s): on ATERM first, then on this lab's aterm, back to b
 binary, agy, stub, keys and pace (typing-agy.txt). --typing codex-alab takes it on codex-alab instead, in codex-alab-proof's `off`
 leg under Autopilot Off at rest, each take then idle 20 s, four takes in the order baseline, this
 tree, this tree, baseline, so neither arm always runs second; each line names its slot
-(typing-codex-alab.txt). Take it on a quiet machine.
+(typing-codex-alab.txt). Each take also reads aterm's own counters (proc_pid_rusage): its CPU
+time and retired instructions from the burst's metrics reset to its percentiles read, per
+rendered frame (cpu_ms, cpu_us_per_render, kinsn_per_render), its main thread's CPU time and
+instructions a frame (main_us_per_render, main_kinsn_per_render: the headless frame's thread,
+apart from the recording's conversion), and its CPU time across the idle wait (idle_cpu_ms);
+other sessions' load moves these far less than a frame's wall time. Take it on a quiet machine.
 
 Each harness also gets <harness>-<scale>x-sheet.png (its frames at rest, a scene a row, Day then
 Night), <harness>-<scale>x-titles.png (its hovered titles' bands, stacked) and, for codex-alab,
@@ -1055,6 +1060,9 @@ trait Lab {
     fn said(&self, args: &[&str]) -> String;
     /// Where `ctl image <name>` writes.
     fn images(&self) -> PathBuf;
+    /// The instance's aterm process, whose counters a typing take reads ([`spent`]); `None`
+    /// where it is not known.
+    fn aterm_pid(&self) -> Option<i32>;
 }
 
 impl Lab for Door<'_> {
@@ -1068,6 +1076,12 @@ impl Lab for Door<'_> {
 
     fn images(&self) -> PathBuf {
         crate::paths::physical(Path::new(&self.run().sockdir)).join("images")
+    }
+
+    /// A headless lab's instance pid is aterm's own; a windowed one's may be its keeper's, so
+    /// it is not read.
+    fn aterm_pid(&self) -> Option<i32> {
+        (!crate::lab::windowed(self.run())).then_some(self.run().instance_pid)
     }
 }
 
@@ -1083,6 +1097,10 @@ impl Lab for Proof {
 
     fn images(&self) -> PathBuf {
         crate::paths::physical(&self.images_dir())
+    }
+
+    fn aterm_pid(&self) -> Option<i32> {
+        self.instance_aterm_pid()
     }
 }
 
@@ -2621,7 +2639,11 @@ const TYPING_SAYS: &str = "the agy typing take: 200 keys (one `send` or `key \
     first reply, under one `video 60 keys` that must outlast the burst, then an idle window of \
     20 s, on a private headless lab 144x50 at 1x of its own; the baseline's arm first, then this tree's, back to back, the \
     same lab binary, agy, stub, keys and pace, only the aterm differing; headless, so \
-    frames are n_render with render_p*";
+    frames are n_render with render_p*; cpu_ms, cpu_us_per_render and kinsn_per_render are \
+    aterm's own CPU time and retired instructions (proc_pid_rusage) from the burst's metrics \
+    reset to its percentiles read, per rendered frame, main_us_per_render and \
+    main_kinsn_per_render its main thread's CPU time and instructions a frame, and idle_cpu_ms \
+    its CPU time across the idle wait";
 
 /// The `metrics percentiles` keys a take quotes.
 const TAKE_KEYS: [&str; 12] = [
@@ -2724,10 +2746,118 @@ fn recording_held(said: &str, outlasted: bool) -> Result<String, String> {
     }
 }
 
-/// The burst: 200 keys, then 200 backspaces, 50 ms apart, after the metrics are reset.
-fn type_burst(lab: &dyn Lab, sid: &str) -> Result<(), Fail> {
+/// What the instance's aterm had spent at one reading (`proc_pid_rusage`): its CPU time, user and
+/// system together, in the kernel's ticks, and the instructions its threads retired; and its main
+/// thread's id, CPU time in ns ([`crate::sys::thread_cpu_ns`], the least thread id) and retired
+/// instructions ([`crate::sys::thread_instructions`]), where it draws a headless frame, apart from
+/// the threads a `video` recording converts frames on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Spent {
+    ticks: u64,
+    insn: u64,
+    main: Option<MainSpent>,
+}
+
+/// The main thread's part of a [`Spent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MainSpent {
+    tid: u64,
+    ns: u64,
+    insn: Option<u64>,
+}
+
+/// `pid`'s [`Spent`] now, or `None` when it cannot be read.
+fn spent(pid: i32) -> Option<Spent> {
+    if pid <= 1 {
+        return None;
+    }
+    let main = crate::sys::thread_cpu_ns(pid).and_then(|threads| {
+        threads.first().map(|t| MainSpent {
+            tid: t.tid,
+            ns: t.ns,
+            insn: crate::sys::thread_instructions(pid, t.tid),
+        })
+    });
+    crate::sys::rusage(pid).map(|u| Spent {
+        ticks: u.ri_user_time.saturating_add(u.ri_system_time),
+        insn: u.ri_instructions,
+        main,
+    })
+}
+
+/// `v` tenths as `<whole>.<tenth>`.
+fn tenths(v: u64) -> String {
+    format!("{}.{}", v / 10, v % 10)
+}
+
+/// The window between two [`Spent`] readings, at the kernel's timebase `tb`: `cpu_ms=`, its CPU
+/// time, and, over its `frames` rendered frames, `cpu_us_per_render=` and `kinsn_per_render=`
+/// (thousands of instructions a frame), and `main_us_per_render=` and `main_kinsn_per_render=`,
+/// the main thread's CPU time and instructions a frame. A word reads `-` where a reading, the
+/// timebase, a frame or a retired-instruction count
+/// is missing, a counter went backwards (another process), or the main thread is not the same one.
+/// The first three count every thread of the process, so a frame's share is the whole take's work
+/// over its frames, a recording's frame conversion included. Other sessions' load moves all of
+/// them far less than a frame's wall time: CPU time still moves with which core ran the work,
+/// retired instructions hardly at all.
+fn spent_words(
+    from: Option<Spent>,
+    to: Option<Spent>,
+    frames: Option<u64>,
+    tb: Option<(u32, u32)>,
+) -> String {
+    let d = spent_between(from, to);
+    let ns = cpu_ns(d, tb);
+    let frames = frames.filter(|&f| f > 0);
+    let dash = || "-".to_string();
+    let main = from
+        .and_then(|a| a.main)
+        .zip(to.and_then(|b| b.main))
+        .filter(|(a, b)| a.tid == b.tid);
+    let main_ns = main.filter(|(a, b)| b.ns >= a.ns).map(|(a, b)| b.ns - a.ns);
+    let main_insn = main
+        .and_then(|(a, b)| a.insn.zip(b.insn))
+        .filter(|(a, b)| b > a)
+        .map(|(a, b)| b - a);
+    format!(
+        "cpu_ms={} cpu_us_per_render={} kinsn_per_render={} main_us_per_render={} \
+         main_kinsn_per_render={}",
+        ns.map_or_else(dash, |ns| tenths(ns / 100_000)),
+        ns.zip(frames)
+            .map_or_else(dash, |(ns, f)| tenths(ns / f.saturating_mul(100))),
+        d.map(|(_, i)| i)
+            .filter(|&i| i > 0)
+            .zip(frames)
+            .map_or_else(dash, |(i, f)| tenths(i / f.saturating_mul(100))),
+        main_ns
+            .zip(frames)
+            .map_or_else(dash, |(ns, f)| tenths(ns / f.saturating_mul(100))),
+        main_insn
+            .zip(frames)
+            .map_or_else(dash, |(i, f)| tenths(i / f.saturating_mul(100)))
+    )
+}
+
+/// The ticks and instructions spent from `from` to `to`; `None` where either is missing or a
+/// counter went backwards.
+fn spent_between(from: Option<Spent>, to: Option<Spent>) -> Option<(u64, u64)> {
+    from.zip(to)
+        .filter(|(a, b)| b.ticks >= a.ticks && b.insn >= a.insn)
+        .map(|(a, b)| (b.ticks - a.ticks, b.insn - a.insn))
+}
+
+/// [`spent_between`]'s ticks in nanoseconds at the timebase `tb`.
+fn cpu_ns(d: Option<(u64, u64)>, tb: Option<(u32, u32)>) -> Option<u64> {
+    d.zip(tb)
+        .map(|((t, _), (n, dn))| aterm_sysprobe::procs::ticks_to_ns(t, n, dn))
+}
+
+/// The burst: 200 keys, then 200 backspaces, 50 ms apart, after the metrics are reset; what the
+/// instance had spent just after the reset ([`spent`]).
+fn type_burst(lab: &dyn Lab, sid: &str) -> Result<Option<Spent>, Fail> {
     stop::sleep(Duration::from_secs(2))?;
     let _ = lab.said(&["metrics", "reset"]);
+    let from = lab.aterm_pid().and_then(spent);
     let keys = "the quick brown fox jumps over the lazy dog ";
     for c in keys.chars().cycle().take(200) {
         if c == ' ' {
@@ -2741,15 +2871,16 @@ fn type_burst(lab: &dyn Lab, sid: &str) -> Result<(), Fail> {
         let _ = on(lab, sid, &["key", "backspace"]);
         stop::sleep(Duration::from_millis(50))?;
     }
-    Ok(())
+    Ok(from)
 }
 
 /// The burst ([`type_burst`]) under one `video 60 keys` that must outlast it, then `metrics
-/// percentiles`: the take's [`TAKE_KEYS`] words and what the recording said, or why it is not
+/// percentiles`: the take's [`TAKE_KEYS`] words, what aterm spent from the reset to that read
+/// ([`spent_words`] over its `n_render` frames), and what the recording said, or why it is not
 /// taken ([`recording_held`]).
 fn burst_taken(lab: &(dyn Lab + Sync), sid: &str) -> Result<(String, String), Fail> {
     let burst_over = AtomicBool::new(false);
-    let (pct, video) = std::thread::scope(|s| {
+    let (pct, (from, to), video) = std::thread::scope(|s| {
         // One recording for the whole burst: it holds the window focused, as a person's typing
         // does. `video` answers when it ends: at `video stop` after the burst, or at once when
         // it is refused.
@@ -2759,35 +2890,41 @@ fn burst_taken(lab: &(dyn Lab + Sync), sid: &str) -> Result<(String, String), Fa
         });
         let typed = type_burst(lab, sid);
         let pct = lab.said(&["metrics", "percentiles"]);
+        let to = lab.aterm_pid().and_then(spent);
         burst_over.store(true, Ordering::Relaxed);
         let _ = lab.said(&["video", "stop"]);
         let video = recording
             .join()
             .unwrap_or_else(|_| ("ERR the recording's thread panicked".to_string(), false));
-        typed.map(|()| (pct, video))
+        typed.map(|from| (pct, (from, to), video))
     })?;
     let said = recording_held(&video.0, video.1).map_err(Fail::die)?;
-    let picked: Vec<String> = TAKE_KEYS
+    let mut picked: Vec<String> = TAKE_KEYS
         .iter()
         .filter_map(|k| forever::word(&pct, k).map(|v| format!("{k}={v}")))
         .collect();
+    picked.push(spent_words(
+        from,
+        to,
+        forever::word(&pct, "n_render").and_then(|n| n.parse().ok()),
+        aterm_sysprobe::procs::kernel_timebase(),
+    ));
     Ok((picked.join(" "), said))
 }
 
-/// The idle window's words after a take: `metrics reset`, 2 s to settle, the opening counts,
-/// [`forever::surfaces::IDLE_MS`] with no read, the closing counts; what moved in it
-/// (`timer_wakes`, `deadline_arms_by_owner`, `wakes_by_variant`, `n_render`) and, where the
-/// window did not rest, why ([`forever::surfaces::idle_counts`]).
+/// The idle window's words after a take: its opening counts once the settle after its `metrics
+/// reset` has passed ([`forever::surfaces::open_idle_count`]), [`forever::surfaces::IDLE_MS`]
+/// with no read, the closing counts; what moved in it
+/// (`timer_wakes`, `deadline_arms_by_owner`, `wakes_by_variant`, `n_render`), the CPU time aterm
+/// spent across that wait (`idle_cpu_ms`) and, where the window did not rest, why
+/// ([`forever::surfaces::idle_counts`]).
 fn idle_taken(lab: &dyn Lab) -> Result<String, Fail> {
-    let _ = lab.said(&["metrics", "reset"]);
-    stop::sleep(Duration::from_secs(2))?;
-    let (m0, p0) = (
-        lab.said(&["metrics"]),
-        lab.said(&["metrics", "percentiles"]),
-    );
+    let (m0, p0) = forever::surfaces::open_idle_count(|args| lab.said(args), stop::sleep)?;
+    let from = lab.aterm_pid().and_then(spent);
     stop::sleep(Duration::from_millis(
         u64::try_from(forever::surfaces::IDLE_MS).unwrap_or(20_000),
     ))?;
+    let to = lab.aterm_pid().and_then(spent);
     let (m1, p1) = (
         lab.said(&["metrics"]),
         lab.said(&["metrics", "percentiles"]),
@@ -2801,6 +2938,14 @@ fn idle_taken(lab: &dyn Lab) -> Result<String, Fail> {
     said.push(format!(
         "n_render={}",
         forever::word(&p, "n_render").unwrap_or_else(|| "-".into())
+    ));
+    said.push(format!(
+        "idle_cpu_ms={}",
+        cpu_ns(
+            spent_between(from, to),
+            aterm_sysprobe::procs::kernel_timebase()
+        )
+        .map_or_else(|| "-".to_string(), |ns| tenths(ns / 100_000))
     ));
     let bad = forever::surfaces::idle_counts(&m, &p);
     Ok(format!(

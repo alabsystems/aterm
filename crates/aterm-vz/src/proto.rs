@@ -537,9 +537,39 @@ impl Request {
             Self::Keep(_) => 1,
             Self::Connect { .. } => 4,
             Self::Release { .. } | Self::Stop { .. } => 8,
-            Self::Attach(a) => 17 + a.helper_sha256.len() + a.agent_sha256.len(),
-            Self::Boot(_) => 256,
-            Self::Share(entries) => 4 + entries.len() * 32,
+            Self::Attach(a) => {
+                17 + a.helper_sha256.len()
+                    + a.agent_sha256.len()
+                    + a.shares
+                        .iter()
+                        .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+                        .sum::<usize>()
+            }
+            Self::Boot(plan) => {
+                64 + plan.name.len()
+                    + plan.kernel.as_os_str().len()
+                    + plan.initrd.as_os_str().len()
+                    + plan.command_line.len()
+                    + plan
+                        .disks
+                        .iter()
+                        .map(|d| 5 + d.path.as_os_str().len())
+                        .sum::<usize>()
+                    + plan.boot_share.as_os_str().len()
+                    + plan
+                        .shares
+                        .iter()
+                        .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+                        .sum::<usize>()
+                    + plan.console_log.as_os_str().len()
+                    + plan.agent_sha256.len()
+            }
+            Self::Share(entries) => {
+                4 + entries
+                    .iter()
+                    .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+                    .sum::<usize>()
+            }
         };
         let mut p = Put::new(cap);
         let kind = match self {
@@ -648,8 +678,10 @@ impl Reply {
             }
             Self::State(s) => {
                 64 + s.helper_sha256.len()
+                    + s.live_disk.as_os_str().len()
                     + s.boot_id.len()
                     + s.agent_sha256.len()
+                    + s.failed_units.iter().map(|u| 4 + u.len()).sum::<usize>()
                     + s.console_tail.len()
             }
         };

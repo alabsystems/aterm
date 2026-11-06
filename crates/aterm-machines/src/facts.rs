@@ -133,7 +133,7 @@ fn gather_with_cache_inner(
             Vec::new()
         },
         cached: cached(sys, cache_dir),
-        agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        agent_version: aterm_stamp::app_version().to_owned(),
     }
 }
 
@@ -1158,7 +1158,7 @@ UserShell: /bin/zsh
             f.cached,
             vec!["0b1f8c6a2d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeef".to_owned()]
         );
-        assert_eq!(f.agent_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(f.agent_version, aterm_stamp::app_version());
     }
 
     #[test]

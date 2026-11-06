@@ -115,34 +115,55 @@ impl Reading {
 /// log says the machine did while a step ran, so a step refused as starved explains itself.
 #[must_use]
 pub fn between(from: &Reading, to: &Reading) -> String {
-    let pair = |a: String, b: String| if a == b { a } else { format!("{a}→{b}") };
-    let load = |r: &Reading| {
-        r.load1
-            .map_or_else(|| "?".to_owned(), |l| format!("{l:.1}"))
+    use std::fmt::Write as _;
+    let write_pair = |out: &mut String, a: Option<f64>, b: Option<f64>| {
+        let start = out.len();
+        match a {
+            Some(v) => {
+                let _ = write!(out, "{v:.1}");
+            }
+            None => out.push('?'),
+        }
+        let a_end = out.len();
+        out.push('→');
+        let b_start = out.len();
+        match b {
+            Some(v) => {
+                let _ = write!(out, "{v:.1}");
+            }
+            None => out.push('?'),
+        }
+        if out[start..a_end] == out[b_start..] {
+            out.truncate(a_end);
+        }
     };
-    let gib = |b: Option<u64>| b.map_or_else(|| "?".to_owned(), |b| format!("{:.1}", tenths(b)));
-    let mut parts = vec![format!(
-        "load {} on {} cores",
-        pair(load(from), load(to)),
-        to.cores
-    )];
+    let mut out = String::with_capacity(96);
+    out.push_str("load ");
+    write_pair(&mut out, from.load1, to.load1);
+    let _ = write!(out, " on {} cores", to.cores);
     if from.available.is_some() || to.available.is_some() {
-        let of = to
-            .physical
-            .map(|p| format!(" of {}", crate::gib(p)))
-            .unwrap_or_default();
-        parts.push(format!(
-            "{} GiB{of} available",
-            pair(gib(from.available), gib(to.available))
-        ));
+        out.push_str(", ");
+        write_pair(
+            &mut out,
+            from.available.map(tenths),
+            to.available.map(tenths),
+        );
+        out.push_str(" GiB");
+        if let Some(p) = to.physical {
+            let _ = write!(out, " of {}", crate::gib(p));
+        }
+        out.push_str(" available");
     }
     if from.swap_used.is_some() || to.swap_used.is_some() {
-        parts.push(format!(
-            "swap {} GiB",
-            pair(gib(from.swap_used), gib(to.swap_used))
-        ));
+        out.push_str(", swap ");
+        write_pair(
+            &mut out,
+            from.swap_used.map(tenths),
+            to.swap_used.map(tenths),
+        );
+        out.push_str(" GiB");
     }
-    parts.join(", ")
+    out
 }
 
 /// `bytes` in GiB to a tenth.

@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-png"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,6 +23,9 @@ astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 [dev-dependencies]
 # `check::each`: the repository corpus test decodes a file per core.
 aterm-spec = { workspace = true }
+# The repository corpus is found from the package directory when the tests run
+# (`aterm_tempfile::manifest_dir`).
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

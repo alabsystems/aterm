@@ -219,11 +219,6 @@ impl AtermTerminal {
     ) -> Result<AtermTerminal, String> {
         #[cfg(target_arch = "wasm32")]
         aterm_wasm_abi::panic_hook::set_once(host::CONSOLE);
-        #[cfg(target_arch = "wasm32")]
-        aterm_types::version::install(aterm_types::version::BuildStamp {
-            app_version: env!("CARGO_PKG_VERSION"),
-            ..aterm_types::version::BuildStamp::UNSTAMPED
-        });
         let theme = Theme {
             fg,
             bg,

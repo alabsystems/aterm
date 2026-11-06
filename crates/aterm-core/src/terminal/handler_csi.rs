@@ -463,10 +463,7 @@ impl TerminalHandler<'_> {
             CsiHandler::Xtversion => {
                 let ps = params.first().copied().unwrap_or(0);
                 if ps == 0 {
-                    let response = format!(
-                        "\x1bP>|aterm({})\x1b\\",
-                        aterm_types::version::app_version()
-                    );
+                    let response = format!("\x1bP>|aterm({})\x1b\\", aterm_stamp::app_version());
                     self.send_response(cap, response.as_bytes());
                 }
             }

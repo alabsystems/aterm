@@ -97,7 +97,7 @@ fn keys(value: &Value) -> Vec<String> {
 
 /// The error object of a failure's second stderr line.
 fn fixture(name: &str) -> Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = aterm_tempfile::manifest_dir()
         .join("tests/fixtures/jq/inputs")
         .join(name);
     aterm_json::from_slice(&std::fs::read(path).expect("the fixture")).expect("JSON")

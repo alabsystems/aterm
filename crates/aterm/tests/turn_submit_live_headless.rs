@@ -24,8 +24,9 @@ const INSIDE_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS - 1
 /// Claude Code's frame around a composer, a logo that repaints whatever the input loop does, and
 /// that loop, which reads nothing while `$0.hold` stands. Its second word is `still` for a logo
 /// that stands still while the hold does, as a starved Claude Code, one process, draws nothing
-/// while it reads nothing, or `late` for a loop that draws what it read 1.5 s after the read.
-const COMPOSER: &str = r#"#!/bin/sh
+/// while it reads nothing, or `late` for a loop that draws what it read 1.5 s after the read. Its first word is `takes` for a composer whose Enter moves the line up to the
+/// next history row (row 3 first) and empties it.
+pub(crate) const COMPOSER: &str = r#"#!/bin/sh
 mode="$1"
 stty raw -echo 2>/dev/null
 esc=$(printf '\033')
@@ -111,7 +112,15 @@ fn spawn(inst: &Instance) -> String {
         .to_string()
 }
 
-fn start(inst: &Instance, sid: &str, script: &std::path::Path, claude: bool, mode: &str) {
+/// [`COMPOSER`] started at `sid`'s shell prompt in `mode`, as Claude Code (its argv0 `claude`,
+/// once aterm reads it so) where `claude` says.
+pub(crate) fn start(
+    inst: &Instance,
+    sid: &str,
+    script: &std::path::Path,
+    claude: bool,
+    mode: &str,
+) {
     ctl_ok(
         inst,
         &[&format!("@{sid}"), "await", "match", r"[$#]\s*$", HANG_MS],

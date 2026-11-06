@@ -227,7 +227,7 @@ fn check_verb(ctx: &crate::SessionCtx, export: bool) -> String {
             None => return format!("ERR rewind: {}\n", unreplayable(&rec)),
         }
     };
-    let build = aterm_types::version::build_id();
+    let build = aterm_stamp::build_id();
     let checks: Vec<PaneCheck> = chains
         .iter()
         .map(|chain| chain.check(PaneCode::ThisBuild, &build))
@@ -588,7 +588,7 @@ mod tests {
         witness(&app, &crate::term_lock(s.live_term()));
         let (pending, before) = {
             let rec = s.ctx.temporal.lock().expect("recorder");
-            let build = aterm_types::version::build_id();
+            let build = aterm_stamp::build_id();
             let checks: Vec<PaneCheck> = rec
                 .pane_chains()
                 .expect("chains")

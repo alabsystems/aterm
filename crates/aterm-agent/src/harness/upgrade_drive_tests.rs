@@ -15,6 +15,7 @@ use super::*;
 use crate::supervise::ScratchDir;
 use crate::supervise::policy::turn_end::RestartClaim;
 use aterm_uds::spawnfd::Command;
+use std::io::Write as _;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Where a test plants `session`'s record by hand: the record module keeps its
@@ -447,6 +448,14 @@ fn a_tab_is_held_by_a_halt_a_hand_a_person_or_an_unreadable_status() {
         !held_by_status(&typed("4000"), 0),
         "a zero grace holds nobody"
     );
+}
+
+/// aterm's built-in host in process `pid` holds a tab as `aterm-harness@<pid>`, this process's own
+/// hand included: the name `lab harness-proof` reads off another aterm's `status supervisor=`.
+#[test]
+fn a_hand_is_named_by_the_pid_of_its_aterm() {
+    assert_eq!(hand_name_of(71465), "aterm-harness@71465");
+    assert_eq!(hand_name(), hand_name_of(std::process::id()));
 }
 
 /// The harness's own hand (`hand=lease:aterm-harness@<this pid>`) holds nothing against itself.
@@ -3029,6 +3038,80 @@ fn dead_pid() -> u32 {
     let dead = child.id();
     child.wait().expect("reap");
     dead
+}
+
+fn ledger_report(step: &str) -> Report {
+    Report {
+        pid: 7,
+        tab: "s-ledger".into(),
+        session: "session-ledger".into(),
+        from: "1.0.0".into(),
+        to: "2.0.0".into(),
+        step: step.into(),
+    }
+}
+
+#[test]
+fn upgrade_ledger_separates_new_event_from_an_interrupted_row() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let opts = drive(tmp.path());
+    let path = ensure_upgrade_tree(&opts.state, None)
+        .unwrap()
+        .join("ledger.jsonl");
+    let interrupted = b"{\"interrupted\":";
+    std::fs::write(&path, interrupted).unwrap();
+    let detail = "first line\nquoted \"detail\"";
+    ledger(&opts, &ledger_report("moved"), detail);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(interrupted));
+    let rows: Vec<Value> = bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|row| aterm_json::from_slice(row).ok())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "new event must remain a distinct JSON record: {bytes:?}"
+    );
+    assert_eq!(rows[0]["step"].as_str(), Some("moved"));
+    assert_eq!(rows[0]["detail"].as_str(), Some(detail));
+    assert_eq!(rows[0]["pid"].as_u64(), Some(7));
+}
+
+#[test]
+fn upgrade_ledger_does_not_append_to_a_cut_in_progress() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let opts = drive(tmp.path());
+    let path = ensure_upgrade_tree(&opts.state, None)
+        .unwrap()
+        .join("ledger.jsonl");
+    let original = "{\"step\":\"older\"}\n{\"step\":\"kept\"}\n";
+    std::fs::write(&path, original).unwrap();
+    // A cut retains this lock from its snapshot through its atomic replacement.
+    let held = aterm_uds::line_log::lock(&path).unwrap();
+    let snapshot = std::fs::read_to_string(&path).unwrap();
+    let kept = format!("{}\n", snapshot.lines().next_back().unwrap());
+    ledger(&opts, &ledger_report("during-cut"), "held");
+    let after_append = std::fs::read(&path).unwrap();
+    super::super::upgrade_models::write_atomic_ordered(&path, &kept).unwrap();
+    drop(held);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), kept);
+    assert_eq!(
+        after_append,
+        original.as_bytes(),
+        "an append under the cut's lock would be lost when its snapshot replaces the file"
+    );
+
+    // A later event, after the cut finishes, must reach the replacement file.
+    ledger(&opts, &ledger_report("after-cut"), "released");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|row| aterm_json::from_str(row).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["step"].as_str(), Some("kept"));
+    assert_eq!(rows[1]["step"].as_str(), Some("after-cut"));
 }
 
 fn ledger_lines(opts: &Opts) -> usize {

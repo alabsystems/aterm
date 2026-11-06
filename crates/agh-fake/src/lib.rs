@@ -28,28 +28,25 @@ pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
         .flatten()
 }
 
-fn seeded_hex(domain: &[u8], seed: &str) -> String {
+fn seeded_digest(domain: &[u8], seed: &str) -> [u8; 32] {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(domain);
     hasher.update(seed.as_bytes());
-    aterm_codec::hex::encode_lower(&hasher.finalize())
+    hasher.finalize()
 }
 
 /// Generates a deterministic classic test token (`ghp_...`) from `seed`.
 #[must_use]
 pub fn token(seed: &str) -> String {
-    let mut hex = seeded_hex(b"agh-fake\0", seed);
-    hex.truncate(36);
-    format!("ghp_{hex}")
+    let digest = seeded_digest(b"agh-fake\0", seed);
+    format!("ghp_{}", aterm_codec::hex::encode_lower(&digest[..18]))
 }
 
 /// Generates a deterministic fine-grained test token (`github_pat_...`) from `seed`.
 #[must_use]
 pub fn fine_grained_token(seed: &str) -> String {
-    format!(
-        "github_pat_{}",
-        seeded_hex(b"agh-fake/fine-grained\0", seed)
-    )
+    let digest = seeded_digest(b"agh-fake/fine-grained\0", seed);
+    format!("github_pat_{}", aterm_codec::hex::encode_lower(&digest))
 }
 
 /// An asset as [`FakeGithub::release_state`] reports it: its name and its bytes.
@@ -732,6 +729,22 @@ impl FakeGithub {
             token.to_string(),
             scopes.iter().map(|s| (*s).to_string()).collect(),
         ));
+    }
+
+    /// Stand `token`'s core rate at `used` requests, as that many charged calls leave it: a
+    /// test reaches the limit without making them, each of which leaves a TIME_WAIT socket
+    /// for 30 s (macOS) once the fake closes it.
+    /// # Panics
+    /// Panics if `used` passes a token's core limit.
+    pub fn set_rate_used(&self, token: &str, used: u64) {
+        let limit = routes::limit_for(true, "core");
+        assert!(
+            used <= limit,
+            "agh-fake: {used} requests pass a token's limit of {limit}"
+        );
+        self.state()
+            .used
+            .insert((Some(token.to_string()), "core"), used);
     }
 
     /// Make release `release_id` immutable, or not.

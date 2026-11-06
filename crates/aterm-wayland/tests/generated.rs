@@ -3,14 +3,12 @@
 
 //! Verifies that the committed Wayland protocol modules match the generator's output.
 
-use std::path::Path;
-
 use crate::generate;
 
 #[test]
 fn the_committed_modules_are_the_generators_output() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = generate::generate(root).expect("the protocol files parse");
+    let root = aterm_tempfile::manifest_dir();
+    let files = generate::generate(&root).expect("the protocol files parse");
     assert_eq!(
         files.len(),
         generate::FILES.len() + 2,
@@ -28,7 +26,7 @@ fn the_committed_modules_are_the_generators_output() {
 
 #[test]
 fn a_protocol_one_attribute_away_generates_other_text() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = aterm_tempfile::manifest_dir();
     let scratch = aterm_tempfile::tempdir().expect("a scratch directory");
     std::fs::create_dir(scratch.path().join("protocols")).unwrap();
     for (file, _) in generate::FILES {
@@ -42,7 +40,7 @@ fn a_protocol_one_attribute_away_generates_other_text() {
         }
         std::fs::write(scratch.path().join("protocols").join(file), text).unwrap();
     }
-    let fresh = generate::generate(root).unwrap();
+    let fresh = generate::generate(&root).unwrap();
     let moved = generate::generate(scratch.path()).unwrap();
     let differ: Vec<_> = fresh
         .iter()

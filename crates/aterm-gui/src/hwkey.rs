@@ -319,9 +319,14 @@ pub(crate) fn window_callback_origin() -> InputOrigin {
     let retained = WINDOW_EVENT_ORIGIN_STUB.with(std::cell::Cell::get);
     #[cfg(all(not(test), target_os = "macos"))]
     let retained = aterm_window::platform::macos::window_event_origin();
+    #[cfg(any(test, target_os = "macos"))]
+    {
+        retained.unwrap_or_else(current_event_origin)
+    }
     #[cfg(all(not(test), not(target_os = "macos")))]
-    let retained: Option<InputOrigin> = None;
-    retained.unwrap_or_else(current_event_origin)
+    {
+        current_event_origin()
+    }
 }
 
 /// Where `seen`, a native event a native monitor holds before AppKit dispatches it, or the one

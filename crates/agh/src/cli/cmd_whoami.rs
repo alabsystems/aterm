@@ -94,20 +94,20 @@ pub(super) fn profile_row(
 /// One row per ambient token (`GH_TOKEN`, then `GITHUB_TOKEN`), never used as ambient. Its
 /// remedy names the matching profile in `profiles` ([`profile_row`]).
 pub(super) fn ambient_rows(env: &dyn EnvSource, profiles: &[Value]) -> Vec<Value> {
-    let field = |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+    fn field<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
+        row.get(key).and_then(Value::as_str)
+    }
     identity::ambient(env)
         .into_iter()
         .map(|ambient| {
             let source = format!("env:{}", ambient.var);
             let by_source = profiles
                 .iter()
-                .find(|row| field(row, "source").as_deref() == Some(source.as_str()))
+                .find(|row| field(row, "source") == Some(source.as_str()))
                 .and_then(|row| field(row, "profile"));
             let by_token = profiles
                 .iter()
-                .find(|row| {
-                    field(row, "fingerprint").as_deref() == Some(ambient.fingerprint.as_str())
-                })
+                .find(|row| field(row, "fingerprint") == Some(ambient.fingerprint.as_str()))
                 .and_then(|row| field(row, "profile"));
             let remedy = match (by_source, by_token) {
                 (Some(profile), _) => {
@@ -347,12 +347,9 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                 }),
         );
         rows.sort_by(|a, b| {
-            let name = |row: &Value| {
-                row.get("profile")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            };
-            name(a).cmp(&name(b))
+            a.get("profile")
+                .and_then(Value::as_str)
+                .cmp(&b.get("profile").and_then(Value::as_str))
         });
     }
     let ambient = ambient_rows(&*ctx.env, &rows);

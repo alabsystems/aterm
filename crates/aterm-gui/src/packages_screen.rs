@@ -2969,7 +2969,10 @@ mod tests {
             .expect("an installed toolset with no C compiler is named");
         assert_eq!(note, atpkg::prereq::CcVerdict::NoDriver);
         let cc = std::path::PathBuf::from("/usr/bin/cc");
-        let wedged = atpkg::prereq::CcVerdict::Unanswered { driver: cc.clone() };
+        let wedged = atpkg::prereq::CcVerdict::Unanswered {
+            driver: cc.clone(),
+            bound: atpkg::prereq::PROBE_TIMEOUT,
+        };
         assert_eq!(cc_prereq_note(&installed, || wedged), None, "an unknown");
         let ready = atpkg::prereq::CcVerdict::Ready { driver: cc };
         assert_eq!(cc_prereq_note(&installed, || ready), None, "a compiler");

@@ -91,7 +91,7 @@ impl Running {
         watch: bool,
     ) -> Self {
         let prepared = harness_local::prepare_fixture(
-            Path::new(env!("CARGO_BIN_EXE_atpkg-publish")),
+            &aterm_tempfile::bin_exe("atpkg-publish"),
             &home,
             &config,
             watch,

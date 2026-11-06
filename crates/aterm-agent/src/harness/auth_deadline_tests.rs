@@ -192,3 +192,32 @@ fn read_to_end_checks_the_deadline_again_after_partial_input() {
     assert!(from_client.is_empty());
     assert_eq!(deadline.remaining(), Err(Expired));
 }
+
+/// A POLL'S DEADLINE MADE FROM A SIGN-IN'S PASSES WHEN THE SIGN-IN'S DOES (KI-1105-14): from an
+/// hour's sign-in deadline whose host then slept two hours, it has expired, leaves nothing,
+/// pauses for nothing, and hands a mail leaf no later end than now; so does a sub-limit taken
+/// from it. CONTROL: before the sleep it leaves most of the hour and its end is about an hour
+/// off. NEGATIVE CONTROL: a deadline that measured what the sign-in's left when made on the clock
+/// that stops in sleep alone left the hour, and kept handing leaves an end an hour away.
+#[cfg(unix)]
+#[test]
+fn a_deadline_made_from_a_sign_ins_passes_when_the_host_slept_past_it() {
+    use super::wake_deadline::{SleepSeam, WakeDeadline, host_slept};
+    const HOUR: Duration = Duration::from_secs(3600);
+    let _seam = SleepSeam::hold();
+    let clock = Instant::now;
+    let poll = Deadline::waking(WakeDeadline::after(HOUR), &clock);
+    let sub = poll.limited(2 * HOUR);
+    assert!(!poll.expired(), "CONTROL: an hour's, just taken");
+    assert!(poll.remaining().is_ok_and(|left| left > HOUR / 2));
+    assert!(poll.end() > Instant::now() + HOUR / 2, "CONTROL: its end");
+    assert!(poll.counts_sleep());
+
+    host_slept(2 * HOUR);
+    assert!(poll.expired(), "the host slept past the sign-in's deadline");
+    assert_eq!(poll.remaining(), Err(Expired));
+    assert_eq!(poll.left(), Err(EXPIRED));
+    assert_eq!(poll.pause(Duration::from_secs(2)), Err(Expired));
+    assert!(poll.end() <= Instant::now(), "a leaf gets no time");
+    assert!(sub.expired() && sub.end() <= Instant::now(), "a sub-limit");
+}

@@ -449,10 +449,8 @@ fn escape_fixtures_match_cpu() {
             "\x1b[?25le\u{0301} \u{0301}b",
         ),
     ];
-    let symbol_primary = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf"
-    ));
+    let symbol_primary = aterm_tempfile::manifest_dir()
+        .join("../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf");
     let symbol_fixtures = [(
         "condensed symbol-tier arrows",
         (1, 12),
@@ -464,7 +462,7 @@ fn escape_fixtures_match_cpu() {
     for ((mut cpu, mut gpu), table) in [
         (backends(18.0, theme), &fixtures[..]),
         (
-            common::backends_with_font(symbol_primary, 18.0, theme),
+            common::backends_with_font(&symbol_primary, 18.0, theme),
             &symbol_fixtures[..],
         ),
     ] {

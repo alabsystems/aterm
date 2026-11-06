@@ -13,16 +13,23 @@
 //! one. The instance's name and host target (`alab-secrets.local`) do not tell the two apart,
 //! since a guest's vault would register the same ones. So an advert is placed by where its host
 //! target resolves on the interface it came over (`dns-sd -i <index> -L`, then `dns-sd -i <index>
-//! -G v4` of each host it names; [`resolve`]). It is this Mac's own when every address is one of
-//! this Mac's (its LAN address, or its end of the bridge for a registration scoped there).
-//! Otherwise it is another's ([`whose`]). An advert that resolved to nothing is another's too, so
-//! one nobody could place still fails a row.
+//! -G v4v6` of each host it names; [`resolve`]). It is this Mac's own when every address is one
+//! of this Mac's (its LAN address, its end of the bridge for a registration scoped there, or an
+//! IPv6 address of an interface of its). Otherwise it is another's ([`whose`]). An advert that
+//! resolved to nothing is another's too, so one nobody could place still fails a row.
+//!
+//! Both families are asked because one can be missing where the other answers: in E3's second
+//! first-launch run (2026-11-05), the guest's `-G v4 m22.local` over the bridge heard only
+//! mDNSResponder's negative answer (`0.0.0.0 … No Such Record`), which the v4 reader took for an
+//! address, and m22's own member advert failed the row as another's. A negative answer names no
+//! address ([`addresses`]).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use crate::Fail;
 
-/// How long each resolve listens (`-L`, then `-G v4` of each host), in the guest and on this Mac.
+/// How long each resolve listens (`-L`, then `-G v4v6` of each host), in the guest and on this
+/// Mac.
 /// This Mac and a guest on its bridge answer within a second, and the browse that heard the
 /// advert has usually cached the answer already.
 pub const RESOLVE_SECS: u64 = 2;
@@ -62,54 +69,10 @@ pub fn heard(transcript: &str) -> Vec<Heard> {
     out
 }
 
-/// The hosts a `dns-sd -L` transcript says its instance can be reached at
-/// (`… can be reached at alab-secrets.local.:7484 (interface 25)`): lowercase, without the
-/// trailing dot, each once. A host with other characters than a DNS name's is left out.
-#[must_use]
-pub fn reach_hosts(transcript: &str) -> Vec<String> {
-    const REACHED: &str = " can be reached at ";
-    let mut out: Vec<String> = Vec::new();
-    for line in transcript.lines() {
-        let Some((_, rest)) = line.split_once(REACHED) else {
-            continue;
-        };
-        let target = rest.split(" (interface ").next().unwrap_or(rest).trim();
-        let Some((host, _port)) = target.rsplit_once(':') else {
-            continue;
-        };
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        let named = !host.is_empty()
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'));
-        if named && !out.contains(&host) {
-            out.push(host);
-        }
-    }
-    out
-}
+pub use super::dns_sd_text::{addresses, reach_hosts};
 
-/// The IPv4 addresses the `Add` rows of a `dns-sd -G v4 <host>` transcript name
-/// (`Timestamp A/R Flags IF Hostname Address TTL`), each once.
-#[must_use]
-pub fn v4_addresses(transcript: &str) -> Vec<Ipv4Addr> {
-    let mut out: Vec<Ipv4Addr> = Vec::new();
-    for line in transcript.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.get(1) != Some(&"Add") {
-            continue;
-        }
-        if let Some(address) = f.get(5).and_then(|a| a.parse().ok())
-            && !out.contains(&address)
-        {
-            out.push(address);
-        }
-    }
-    out
-}
-
-/// Where one advert's host targets resolved: each host it named, with its IPv4 addresses.
-pub type Resolved = Vec<(String, Vec<Ipv4Addr>)>;
+/// Where one advert's host targets resolved: each host it named, with its addresses.
+pub type Resolved = Vec<(String, Vec<IpAddr>)>;
 
 /// Whose an advert is ([`whose`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,13 +87,10 @@ pub enum Whose {
 /// It is this Mac's only when it named a host, each host resolved, and every address is in `own`.
 /// Otherwise it is another's, an advert that resolved to nothing included.
 #[must_use]
-pub fn whose(resolved: &[(String, Vec<Ipv4Addr>)], own: &[IpAddr]) -> Whose {
+pub fn whose(resolved: &[(String, Vec<IpAddr>)], own: &[IpAddr]) -> Whose {
     let mine = !resolved.is_empty()
         && resolved.iter().all(|(_, addresses)| {
-            !addresses.is_empty()
-                && addresses
-                    .iter()
-                    .all(|address| own.contains(&IpAddr::V4(*address)))
+            !addresses.is_empty() && addresses.iter().all(|address| own.contains(address))
         });
     if mine {
         return Whose::ThisMac;
@@ -159,8 +119,8 @@ pub fn whose(resolved: &[(String, Vec<Ipv4Addr>)], own: &[IpAddr]) -> Whose {
 pub type DnsSd<'a> = dyn FnMut(&[String]) -> Result<String, Fail> + 'a;
 
 /// Resolve `heard` of `service` through `dns_sd`, on the interface it came over:
-/// `-i <interface> -L <instance> <service> local.`, then `-i <interface> -G v4 <host>` for each
-/// host that names ([`reach_hosts`], [`v4_addresses`]).
+/// `-i <interface> -L <instance> <service> local.`, then `-i <interface> -G v4v6 <host>` for each
+/// host that names ([`reach_hosts`], [`addresses`]).
 ///
 /// # Errors
 /// A `dns-sd` run could not be made, or the run was stopped.
@@ -176,11 +136,11 @@ pub fn resolve(heard: &Heard, service: &str, dns_sd: &mut DnsSd<'_>) -> Result<R
     ])?;
     let mut out = Vec::new();
     for host in reach_hosts(&lookup) {
-        let addresses = v4_addresses(&dns_sd(&[
+        let addresses = addresses(&dns_sd(&[
             "-i".to_owned(),
             at.clone(),
             "-G".to_owned(),
-            "v4".to_owned(),
+            "v4v6".to_owned(),
             host.clone(),
         ])?);
         out.push((host, addresses));
@@ -242,7 +202,11 @@ pub fn split(
 
 /// Each advert in `heard` of `service` with whose it is ([`resolve`] through `dns_sd`, then
 /// [`whose`] against `own`), in the order heard. With `own` a guest's addresses (`vault-phrase`'s
-/// browse of its lab members service), [`Whose::ThisMac`] reads "the guest's own".
+/// browse of its lab members service), [`Whose::ThisMac`] reads "the guest's own". An advert
+/// whose lookup named no host says what that lookup heard ([`lookup_words`]), so the row it fails
+/// carries the evidence: E3's mdns-silent row (2026-11-05) failed on this Mac's own vault advert
+/// over tart's bridge with a lookup that answered nothing within the hang detector, and the run's
+/// transcripts went with its folder.
 ///
 /// # Errors
 /// A `dns-sd` run could not be made, or the run was stopped.
@@ -255,12 +219,37 @@ pub fn place(
     heard
         .iter()
         .map(|advert| {
-            Ok((
-                advert.clone(),
-                whose(&resolve(advert, service, dns_sd)?, own),
-            ))
+            let mut lookup = String::new();
+            let resolved = resolve(advert, service, &mut |args: &[String]| {
+                let transcript = dns_sd(args)?;
+                if args.iter().any(|a| a == "-L") {
+                    lookup.clone_from(&transcript);
+                }
+                Ok(transcript)
+            })?;
+            let placed = match whose(&resolved, own) {
+                Whose::Another(why) if resolved.is_empty() => {
+                    Whose::Another(format!("{why}; its lookup heard {}", lookup_words(&lookup)))
+                }
+                placed => placed,
+            };
+            Ok((advert.clone(), placed))
         })
         .collect()
+}
+
+/// What a `dns-sd -L` transcript heard, for the row an unplaced advert fails ([`place`]): its
+/// lines on one line and cut, or "nothing" for a transcript left empty.
+fn lookup_words(transcript: &str) -> String {
+    let said: Vec<&str> = transcript
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if said.is_empty() {
+        return "nothing".to_owned();
+    }
+    super::squeeze(&said.join(" | "), 200)
 }
 
 /// This Mac's own addresses now, every interface's (its end of tart's bridge included while a
@@ -277,6 +266,7 @@ pub fn this_macs_addresses() -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::net::Ipv4Addr;
 
     use super::*;
 
@@ -392,7 +382,9 @@ mod tests {
         assert_eq!((split.others.len(), split.this_macs.len()), (0, 1));
     }
 
-    /// An advert whose instance names no host (a resolve that heard nothing) is never this Mac's.
+    /// An advert whose instance names no host (a resolve that heard nothing) is never this Mac's,
+    /// and the row it fails says what its lookup heard, or that it heard nothing.
+    /// NEGATIVE CONTROL: `whose` alone, the reader before, names no lookup.
     #[test]
     fn an_advert_that_resolves_to_no_host_is_another_s() {
         let heard = [Heard {
@@ -404,6 +396,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!((split.others.len(), split.this_macs.len()), (1, 0));
+        assert!(
+            split.others[0].ends_with("(its host did not resolve; its lookup heard nothing)"),
+            "{:?}",
+            split.others
+        );
+        let started = "Lookup nux lab._alab-vault._tcp.local.\r\n 9:12:01.001  ...STARTING...\r\n";
+        let started_only = super::split(
+            &heard,
+            SERVICE,
+            &name_of,
+            &own(),
+            &mut |args: &[String]| {
+                Ok(if args.iter().any(|a| a == "-L") {
+                    started.to_owned()
+                } else {
+                    String::new()
+                })
+            },
+        )
+        .unwrap();
+        assert!(
+            started_only.others[0].contains(
+                "its lookup heard Lookup nux lab._alab-vault._tcp.local. | 9:12:01.001  ...STARTING..."
+            ),
+            "{:?}",
+            started_only.others
+        );
+        assert_eq!(
+            whose(&[], &own()),
+            Whose::Another("its host did not resolve".to_owned())
+        );
         // NEGATIVE CONTROL: the same advert resolved to this Mac's address is this Mac's.
         let split = placed("nux lab", &["192.168.1.242"], &own());
         assert_eq!((split.others.len(), split.this_macs.len()), (0, 1));
@@ -425,7 +448,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].1, [Ipv4Addr::new(192, 168, 64, 3)]);
+        assert_eq!(resolved[0].1, ["192.168.64.3".parse::<IpAddr>().unwrap()]);
         assert_eq!(asked.len(), 2);
         assert!(asked.iter().all(|a| a[..2] == ["-i", "25"]), "{asked:?}");
         assert!(asked[0].contains(&heard.instance), "{asked:?}");
@@ -464,10 +487,42 @@ mod tests {
         );
         assert!(reach_hosts("Lookup x\r\n ...STARTING...\r\n").is_empty());
 
-        let addresses = answering("h.local", &["192.168.1.242", "192.168.1.242", "10.0.0.9"])(
-            &args("-G", "v4"),
+        let answered = answering("h.local", &["192.168.1.242", "192.168.1.242", "10.0.0.9"])(
+            &args("-G", "v4v6"),
         )
         .unwrap();
-        assert_eq!(v4_addresses(&addresses).len(), 2);
+        assert_eq!(addresses(&answered).len(), 2);
+    }
+
+    /// The negative answer `dns-sd -G` prints for a family the host has no record of
+    /// (`addrinfo_reply`'s `No Such Record`, its address the zeroed sockaddr's), as the guest heard
+    /// it of `m22.local` over tart's bridge (2026-11-05).
+    const NEGATIVE_V4: &str = " 8:43:01.120  Add  40000002       6  m22.local.                             0.0.0.0                                      120   No Such Record\r\n";
+
+    /// This Mac's own member advert, whose host answered the guest's v4 question with a negative
+    /// answer and its v6 one with this Mac's link-local address, is this Mac's; the same answer
+    /// on a Mac that holds no such address is another's.
+    #[test]
+    fn an_advert_placed_by_its_v6_address_alone_is_this_macs_only_when_that_address_is() {
+        let resolved = vec![(
+            "m22.local".to_owned(),
+            addresses(&format!(
+                "{NEGATIVE_V4} 8:43:01.121  Add  40000002       6  m22.local.     FE80:0000:0000:0000:1C92:EBFC:C6EB:C0EA%en0  120\r\n"
+            )),
+        )];
+        let mut mine = own();
+        mine.push("fe80::1c92:ebfc:c6eb:c0ea".parse().unwrap());
+        assert_eq!(whose(&resolved, &mine), Whose::ThisMac);
+        // NEGATIVE CONTROL: without that address among this Mac's, the advert is another's.
+        assert_eq!(
+            whose(&resolved, &own()),
+            Whose::Another("m22.local fe80::1c92:ebfc:c6eb:c0ea".to_owned())
+        );
+        // A host that only answered no is unresolved, whatever this Mac holds.
+        let negative = vec![("m22.local".to_owned(), addresses(NEGATIVE_V4))];
+        assert_eq!(
+            whose(&negative, &mine),
+            Whose::Another("m22.local unresolved".to_owned())
+        );
     }
 }

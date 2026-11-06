@@ -29,8 +29,8 @@ use crate::{Claim, Error, Ledger};
 /// How long an admission's row waits for another writer's lock on the log.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_millis(50);
 
-/// This process's host facts, read at its first admission.
-static FACTS: OnceLock<HostFacts> = OnceLock::new();
+/// This process's host facts and precomputed digest, read at its first admission.
+static FACTS: OnceLock<(HostFacts, Digest)> = OnceLock::new();
 
 /// The rows this process lost.
 static LOST: Lost = Lost::new();
@@ -79,17 +79,48 @@ pub(crate) fn decided(ledger: &Ledger, asked: &Asked, result: &Result<Claim, Err
     let Some(dir) = aterm_telemetry::log::default_dir() else {
         return;
     };
-    let facts = FACTS.get_or_init(HostFacts::read);
-    decided_in(ledger, &user, &dir, facts, asked, result, &LOST);
+    let (facts, digest) = FACTS.get_or_init(|| {
+        let facts = HostFacts::read();
+        let digest = facts.digest();
+        (facts, digest)
+    });
+    decided_in_digest(ledger, &user, &dir, facts, *digest, asked, result, &LOST);
 }
 
 /// [`decided`] with this user's ledger folder `user`, the log's folder `dir`, the host's
 /// `facts` and the process's `lost` given: nothing unless `ledger` is `user`'s.
+#[cfg(test)]
 pub(crate) fn decided_in(
     ledger: &Ledger,
     user: &Path,
     dir: &Path,
     facts: &HostFacts,
+    asked: &Asked,
+    result: &Result<Claim, Error>,
+    lost: &Lost,
+) {
+    decided_in_digest(
+        ledger,
+        user,
+        dir,
+        facts,
+        facts.digest(),
+        asked,
+        result,
+        lost,
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shares precomputed HostFacts digest with decided_in test entry"
+)]
+fn decided_in_digest(
+    ledger: &Ledger,
+    user: &Path,
+    dir: &Path,
+    facts: &HostFacts,
+    digest: Digest,
     asked: &Asked,
     result: &Result<Claim, Error>,
     lost: &Lost,
@@ -106,7 +137,7 @@ pub(crate) fn decided_in(
         &decision,
         aterm_telemetry::now_ms(),
         &facts.host,
-        facts.digest(),
+        digest,
     );
     let _ = write(dir.to_path_buf(), facts, &row, lost);
 }

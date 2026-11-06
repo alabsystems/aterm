@@ -15,8 +15,15 @@ use super::*;
 
 const FP: u64 = 0x5eed_0000_0000_0009;
 const ID: Option<(u64, u64)> = Some((16_777_220, 9));
-const MEASURED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervise/fixtures");
+/// Where a measured build's reduction is committed.
+fn measured_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("src/harness/testdata/steps")
+}
+
+/// The transcript fixtures.
+fn fixtures_dir() -> std::path::PathBuf {
+    aterm_tempfile::manifest_dir().join("src/supervise/fixtures")
+}
 
 /// Every anchor the fold's own source names (`anchor!("transcript.<text>")`), read off the code
 /// rather than a list beside it: the keys it reads and the closed words its arms compare, which
@@ -60,14 +67,14 @@ fn the_fold_reads_what_the_transcript_keys_name() {
 
 /// The committed Claude Code reductions: name and rows (no `#` line, no blank one).
 fn reductions() -> Vec<(String, Vec<String>)> {
-    let mut out: Vec<(String, Vec<String>)> = std::fs::read_dir(MEASURED_DIR)
+    let dir = measured_dir();
+    let mut out: Vec<(String, Vec<String>)> = std::fs::read_dir(&dir)
         .expect("the step testdata")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".jsonl") && !n.starts_with("codex-"))
         .map(|n| {
-            let text = std::fs::read_to_string(std::path::Path::new(MEASURED_DIR).join(&n))
-                .expect("a reduction");
+            let text = std::fs::read_to_string(dir.join(&n)).expect("a reduction");
             let rows = text
                 .lines()
                 .map(str::trim)
@@ -85,7 +92,7 @@ fn reductions() -> Vec<(String, Vec<String>)> {
 /// The transcript fixtures' rows, and the corpus's Claude Code rows.
 fn other_rows() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(FIXTURES)
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(fixtures_dir())
         .expect("the fixtures")
         .filter_map(Result::ok)
         .map(|e| e.path())

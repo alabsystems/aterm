@@ -710,7 +710,7 @@ impl Reader {
 pub struct Header {
     /// The tape's own id.
     pub tape: String,
-    /// The build that recorded it (`aterm_types::version::build_id`).
+    /// The build that recorded it (`aterm_stamp::build_id`).
     pub build: String,
     /// The OS and architecture it ran on.
     pub os: String,
@@ -760,7 +760,7 @@ impl Header {
             .is_ok_and(|back| back.policy == opts.policy);
         Self {
             tape: tape.into(),
-            build: aterm_types::version::build_id(),
+            build: aterm_stamp::build_id(),
             os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             entry,
             roots: Roots::capture(state, &setup, &opts),

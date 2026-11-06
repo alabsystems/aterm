@@ -204,10 +204,89 @@ impl<C> TlsTransport<C> {
         self.stream
     }
 
+    /// Consume into a stream whose entire remaining exchange ends at `until`.
+    ///
+    /// Capture `until` before dialing to include connection and handshake time in the same
+    /// budget. Progress never extends it: a watchdog interrupts blocked socket I/O at the
+    /// deadline, and subsequent reads and writes return [`io::ErrorKind::TimedOut`].
+    ///
+    /// # Errors
+    /// If the socket watchdog cannot start.
+    pub fn into_bounded_stream(self, until: Instant) -> io::Result<BoundedStream<C>> {
+        let watchdog = crate::slots::HandshakeWatchdog::arm_until(&self.stream.sock, until)?;
+        Ok(BoundedStream {
+            watchdog,
+            stream: self.stream,
+            until,
+        })
+    }
+
     /// The socket under the stream.
     #[inline]
     pub(crate) const fn tcp(&self) -> &TcpStream {
         &self.stream.sock
+    }
+}
+
+/// An owned TLS exchange with one absolute deadline for all reads and writes.
+///
+/// Dropping this stream cancels and joins its watchdog before closing the socket. The raw TLS
+/// stream is deliberately retained here so no socket can escape the deadline's ownership.
+pub struct BoundedStream<C> {
+    // Fields drop in declaration order. This guard must join before `stream` closes the socket
+    // whose descriptor the Unix watchdog borrows.
+    watchdog: crate::slots::HandshakeWatchdog,
+    stream: StreamOwned<C, TcpStream>,
+    until: Instant,
+}
+
+impl<C> BoundedStream<C> {
+    fn expired(&self) -> bool {
+        Instant::now() >= self.until || self.watchdog.fired()
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.expired() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS exchange deadline elapsed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<C, S> Read for BoundedStream<C>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        let result = self.stream.read(buf);
+        self.check()?;
+        result
+    }
+}
+
+impl<C, S> Write for BoundedStream<C>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check()?;
+        let result = self.stream.write(buf);
+        self.check()?;
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        let result = self.stream.flush();
+        self.check()?;
+        result
     }
 }
 
@@ -838,6 +917,161 @@ mod tests {
         LOOPBACK_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn completed_pair() -> (
+        TlsTransport<ClientConnection>,
+        TlsTransport<ServerConnection>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
+            tcp.set_write_timeout(Some(NET_TEST_LIVENESS_BOUND))
+                .unwrap();
+            accept(tcp, scfg).unwrap()
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
+        tcp.set_write_timeout(Some(NET_TEST_LIVENESS_BOUND))
+            .unwrap();
+        let client = connect(
+            tcp,
+            test_server_name(),
+            client_config(cert_fingerprint(TEST_CERT_DER)),
+        )
+        .unwrap();
+        let server = server.join().unwrap();
+        for socket in [&client.stream.sock, &server.stream.sock] {
+            socket.set_read_timeout(None).unwrap();
+            socket.set_write_timeout(None).unwrap();
+        }
+        (client, server)
+    }
+
+    #[test]
+    fn bounded_tls_progress_cannot_extend_the_absolute_exchange_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _serial = serialize_loopback();
+        let (client, mut server) = completed_pair();
+        let before = Instant::now();
+        let until = before + NET_TEST_LIVENESS_BOUND * 10;
+        let expired = Arc::new(AtomicBool::new(false));
+        let clock_expired = Arc::clone(&expired);
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let watchdog = crate::slots::HandshakeWatchdog::arm_until_with_clock(
+            &client.stream.sock,
+            until,
+            move || {
+                worker_tx.send(std::thread::current()).unwrap();
+                if clock_expired.load(Ordering::Acquire) {
+                    until
+                } else {
+                    before
+                }
+            },
+        )
+        .unwrap();
+        let mut stream = BoundedStream {
+            watchdog,
+            stream: client.stream,
+            until,
+        };
+        let worker = worker_rx.recv_timeout(NET_TEST_LIVENESS_BOUND).unwrap();
+        // Real TLS progress succeeds before the controlled clock reaches the deadline.
+        for byte in b"drip" {
+            server.stream().write_all(&[*byte]).unwrap();
+            server.stream().flush().unwrap();
+            let mut received = [0];
+            stream.read_exact(&mut received).unwrap();
+            assert_eq!(received, [*byte]);
+        }
+
+        let (reading_tx, reading_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reading_tx.send(()).unwrap();
+            let read = stream.read_exact(&mut [0; 1024]);
+            let write = stream.write_all(b"late");
+            let flush = stream.flush();
+            done_tx.send((read, write, flush)).unwrap();
+        });
+        reading_rx.recv_timeout(NET_TEST_LIVENESS_BOUND).unwrap();
+        expired.store(true, Ordering::Release);
+        worker.unpark();
+        let ended = done_rx.recv_timeout(NET_TEST_LIVENESS_BOUND);
+        // Also release the real reader on regression so the test leaves no blocked thread.
+        aterm_uds::hangup::hang_up(&server.stream.sock);
+        reader.join().unwrap();
+        let (read, write, flush) = ended.expect("the absolute deadline interrupts read_exact");
+        for outcome in [read, write, flush] {
+            assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[test]
+    fn bounded_tls_rejects_an_already_expired_phase_before_io() {
+        let _serial = serialize_loopback();
+        let (client, _server) = completed_pair();
+        let mut stream = client.into_bounded_stream(Instant::now()).unwrap();
+        assert_eq!(
+            stream.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            stream.write(b"late").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(stream.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn bounded_tls_exchanges_data_and_cancels_its_owned_watchdog_on_drop() {
+        let _serial = serialize_loopback();
+        let (client, mut server) = completed_pair();
+        let mut stream = client
+            .into_bounded_stream(Instant::now() + NET_TEST_LIVENESS_BOUND * 10)
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        stream.flush().unwrap();
+        let mut request = [0; 4];
+        server.stream().read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"ping");
+        server.stream().write_all(b"pong").unwrap();
+        server.stream().flush().unwrap();
+        let mut reply = [0; 4];
+        stream.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"pong");
+
+        #[cfg(unix)]
+        let joined_while_open = {
+            use std::os::fd::AsRawFd as _;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let fd = stream.stream.sock.as_raw_fd();
+            let observed = Arc::new(AtomicBool::new(false));
+            let probe = Arc::clone(&observed);
+            stream.watchdog.observe_join(move || {
+                // SAFETY: the wrapper owns this descriptor throughout watchdog teardown.
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                probe.store(true, Ordering::Release);
+            });
+            observed
+        };
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(stream);
+            dropped_tx.send(()).unwrap();
+        });
+        dropped_rx
+            .recv_timeout(NET_TEST_LIVENESS_BOUND)
+            .expect("Drop cancels and joins rather than waiting for the exchange deadline");
+        dropper.join().unwrap();
+        #[cfg(unix)]
+        assert!(joined_while_open.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

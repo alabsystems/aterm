@@ -59,7 +59,8 @@ tree_root = "6038b1f5b21832d15f8e7b21ffbd2429dc52bb55cdab4797933686c275041ddc"
 
 #[test]
 fn status_records_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "status");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(dir.to_str().expect("a UTF-8 package directory"), "status");
     let read = |doc: &str| {
         aterm_toml::from_str::<Status>(doc)
             .map_err(|e| e.to_string())
@@ -312,7 +313,11 @@ disk_installed = 230824016
 
 #[test]
 fn index_and_manifests_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "index-manifest");
+    let dir = aterm_tempfile::manifest_dir();
+    let mut corpus = Corpus::new(
+        dir.to_str().expect("a UTF-8 package directory"),
+        "index-manifest",
+    );
     let index = |doc: &str| aterm_toml::from_str::<Index>(doc).map(|v| format!("{v:?}"));
     let pkg = |doc: &str| aterm_toml::from_str::<PkgManifest>(doc).map(|v| format!("{v:?}"));
     corpus.record("index/base", index(INDEX));

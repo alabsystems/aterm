@@ -3,7 +3,7 @@
 
 [package]
 name = "aterm-spec-models"
-version.workspace = true
+version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,6 +12,11 @@ description = "The proof bundles beside aterm's models (the ay certificates), re
 # No code deps: `spec-check ay` (aterm-models) re-checks the bundles under
 # `proofs/ay`. The bundles ARE the crate; tests/ay_bundles.rs holds the two
 # generated bundles to their generator.
+
+[dev-dependencies]
+# tests/ay_bundles.rs reads the committed bundles from the package directory it runs in, and
+# writes a stale one's fresh copy into the build's scratch directory.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

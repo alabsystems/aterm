@@ -62,9 +62,12 @@ impl Version {
         let version = Self(parts.next()??, parts.next()??, parts.next()??);
         parts.next().is_none().then_some(version)
     }
-    /// The release of the code that runs this check: what this device reports.
+    /// The release of the code that runs this check: what this device reports. The running
+    /// binary's installed version (`aterm_stamp`), never below [`LIFTED`]: this code is
+    /// [`LIFTED`]'s, so a process that installed no identity (a library's test binary) or one
+    /// whose version does not read as a release still runs at least that release.
     pub fn own() -> Self {
-        Self::parse(env!("CARGO_PKG_VERSION")).expect("the workspace version is MAJOR.MINOR.PATCH")
+        Self::parse(aterm_stamp::app_version()).map_or(LIFTED, |own| own.max(LIFTED))
     }
     fn bytes(self) -> [u8; 12] {
         let mut out = [0; 12];

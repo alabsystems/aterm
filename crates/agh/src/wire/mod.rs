@@ -470,6 +470,8 @@ pub struct WireRequest<'a> {
     pub(crate) as_profile: Option<&'a str>,
     /// A typed atomic-ref call's exact-body capability, absent for raw requests.
     pub(crate) atomic_refs: Option<&'a crate::github::refs::AtomicRefWrite>,
+    /// A typed repository-creation call's exact-body capability.
+    pub(crate) repo_create: Option<&'a crate::github::repos::RepoCreateWrite>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -493,6 +495,7 @@ impl<'a> WireRequest<'a> {
             body_digest: None,
             as_profile: None,
             atomic_refs: None,
+            repo_create: None,
         }
     }
 }

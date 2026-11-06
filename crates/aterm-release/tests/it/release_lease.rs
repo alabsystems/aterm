@@ -40,7 +40,7 @@ struct BareFixture {
 
 fn bare_fixture(name: &str) -> BareFixture {
     static BUILT: crate::template::Template<(String, String)> = crate::template::Template::new();
-    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("release-lease");
+    let parent = aterm_tempfile::target_tmpdir().join("release-lease");
     std::fs::create_dir_all(&parent).expect("create lease fixture");
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("{name}-"))

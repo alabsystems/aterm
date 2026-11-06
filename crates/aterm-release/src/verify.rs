@@ -206,16 +206,22 @@ fn release_identity_listing(
 }
 
 fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) -> String {
-    page.lines()
-        .filter(|line| {
-            line.split('\t')
-                .next()
-                .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|id| id.parse::<u64>().ok())
-                .is_some_and(|id| wanted.contains(&id))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for line in page.lines() {
+        let matches = line
+            .split('\t')
+            .next()
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| wanted.contains(&id));
+        if matches {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 fn parse_canonical_tag(tag: &str) -> Result<String> {
@@ -406,8 +412,11 @@ pub(crate) fn scan_release_page(
         if release.exact_count == 0 {
             continue;
         }
-        let asset = manifest_out::MANIFEST_ASSET.to_string();
-        let bytes = fetch_manifest(release.release_id, release.tag, &asset)?;
+        let bytes = fetch_manifest(
+            release.release_id,
+            release.tag,
+            manifest_out::MANIFEST_ASSET,
+        )?;
         let Ok(mtext) = String::from_utf8(bytes) else {
             eprintln!(
                 "    WARNING: {}: manifest is not UTF-8 — skipped",
@@ -422,7 +431,7 @@ pub(crate) fn scan_release_page(
                 tag: release.tag.to_string(),
                 build: manifest.build_number,
                 version: manifest.version,
-                asset,
+                asset: manifest_out::MANIFEST_ASSET.to_string(),
                 min_build: manifest.min_build,
                 text: mtext,
             }),
@@ -851,7 +860,12 @@ pub fn run_status(repo: &Path) -> Result<()> {
     let ledger_text = crate::durable::read_text(&repo.join(ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?;
     let records = ledger::parse(&ledger_text)?;
-    let tail = ledger::tail(&ledger_text)?;
+    let tail = records.last().ok_or_else(|| {
+        Error::new(format!(
+            "{} has no records — it must contain at least the v0.25 seed line",
+            ledger::LEDGER_FILE
+        ))
+    })?;
     step(
         "app",
         &next_cut_line(repo, gates::published_source(), &release_version),

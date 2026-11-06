@@ -730,6 +730,11 @@ fn ordered_shared_candidates(
 #[path = "accounts_shared_candidate_tests.rs"]
 mod candidate_tests;
 
+/// One native preparation for this upkeep pass, admitted through `guard`. What the pass says is
+/// logged once per change for `guard` ([`AutoRenewGuard::native_said`]): a refusal that lasts
+/// across passes (the Commons excluding this installation, its table not initialized) is
+/// logged on the pass it first appears, and again only once a pass said something else or
+/// nothing. A started task's own failure is a distinct attempt, logged each time.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -822,7 +827,7 @@ pub(super) fn prepare_native(
         );
         permit.is_some()
     });
-    match (task, permit) {
+    let (admitted, said) = match (task, permit) {
         (Ok(Some(task)), Some((mut permit, admitted))) if task.preparation == admitted => {
             let completion = permit.follow_scope(scope);
             let log = log.clone();
@@ -844,18 +849,26 @@ pub(super) fn prepare_native(
                 },
                 spawn,
             );
-            true
+            (true, None)
         }
-        (Ok(Some(_)), _) => {
-            log("native account preparation: task has no matching admission");
-            false
-        }
-        (Err(why), _) => {
-            log(&format!("native account preparation: {why}"));
-            false
-        }
-        _ => false,
+        (Ok(Some(_)), _) => (
+            false,
+            Some("native account preparation: task has no matching admission".to_owned()),
+        ),
+        (Err(why), _) => (false, Some(format!("native account preparation: {why}"))),
+        (Ok(None), _) => (false, None),
+    };
+    let last = std::mem::replace(
+        &mut guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .native_said,
+        said.clone(),
+    );
+    if let Some(line) = said.filter(|line| last.as_ref() != Some(line)) {
+        log(&line);
     }
+    admitted
 }
 
 struct Automatic {

@@ -57,10 +57,9 @@ fn logical_plan(input: &aterm_core::render::RenderInput, logical: &str) -> Vec<C
 }
 
 fn recorded(case: &str) -> Vec<(u32, u32)> {
-    let corpus = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/font-oracle/shaping.txt"
-    ))
+    let corpus = std::fs::read_to_string(
+        aterm_tempfile::manifest_dir().join("tests/fixtures/font-oracle/shaping.txt"),
+    )
     .unwrap();
     let line = corpus
         .lines()

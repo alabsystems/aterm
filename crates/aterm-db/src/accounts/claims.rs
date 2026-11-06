@@ -273,10 +273,13 @@ fn latest(logs: &[(Source, Log)], machines: &BTreeMap<Actor, [u8; 16]>) -> BTree
         let (tier, generation) = source.tier();
         for (operation, command) in log.eligible() {
             let actor = operation.header.actor;
+            let Some(&expected_machine) = machines.get(&actor) else {
+                continue;
+            };
             let Ok((machine, body, _, _)) = row_fields(command) else {
                 continue;
             };
-            if machines.get(&actor) != Some(&machine) {
+            if machine != expected_machine {
                 continue;
             }
             let counter = body.get("counter").and_then(Value::as_u64).unwrap_or(0);
@@ -374,13 +377,26 @@ fn legacy_logs(
     bootstrap: &Bootstrap,
     now: u64,
 ) -> Vec<(Source, Log)> {
-    let (Ok(snapshot), Ok(first)) = (
-        directory.snapshot_if_exists(session),
-        legacy_descriptor(bootstrap, 1),
-    ) else {
+    legacy_logs_from(
+        session,
+        directory,
+        bootstrap,
+        directory.snapshot_if_exists(session).ok().as_ref(),
+        now,
+    )
+}
+
+fn legacy_logs_from(
+    session: &Session<'_>,
+    directory: &Directory,
+    bootstrap: &Bootstrap,
+    snapshot: Option<&CatalogSnapshot>,
+    now: u64,
+) -> Vec<(Source, Log)> {
+    let (Some(snapshot), Ok(first)) = (snapshot, legacy_descriptor(bootstrap, 1)) else {
         return Vec::new();
     };
-    if !legacy_active(&snapshot, &first, now) {
+    if !legacy_active(snapshot, &first, now) {
         return Vec::new();
     }
     (1..=LEGACY_GENERATIONS)
@@ -674,18 +690,23 @@ pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Res
     // catalog slot on a new Mac (lab model design §3.10). Only a generation still declared alone
     // is sealed, once; a seal this Mac cannot make (its creator budget is spent) never fails the
     // write.
-    let declared = directory
-        .snapshot_if_exists(&session)
-        .map(|snapshot| snapshot.entries)
-        .unwrap_or_default();
-    for generation in 1..=LEGACY_GENERATIONS {
-        if let Ok(retired) = legacy_descriptor(&bootstrap, generation)
-            && declared
-                .get(&retired.scope.digest())
-                .is_some_and(|entry| entry.declarations.iter().all(|d| d.descriptor == retired))
-        {
-            let _ = directory.seal(&session, &retired);
+    let mut snapshot = directory.snapshot_if_exists(&session).ok();
+    let mut sealed_legacy = false;
+    if let Some(snapshot) = &snapshot {
+        for generation in 1..=LEGACY_GENERATIONS {
+            if let Ok(retired) = legacy_descriptor(&bootstrap, generation)
+                && snapshot
+                    .entries
+                    .get(&retired.scope.digest())
+                    .is_some_and(|entry| entry.declarations.iter().all(|d| d.descriptor == retired))
+                && directory.seal(&session, &retired).is_ok()
+            {
+                sealed_legacy = true;
+            }
         }
+    }
+    if sealed_legacy {
+        snapshot = directory.snapshot_if_exists(&session).ok();
     }
     let state = directory.retire(&session, &CLAIMS, now)?;
     // The registry roll's housekeeping rides the same writer pass as the ring's retirement: this
@@ -693,9 +714,9 @@ pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Res
     // lets a roll seal the one before (`alab::roll::endorse`), and at most daily each sealed
     // table whose rows lapsed or were carried frees its directory (`catalog::release`). Neither
     // ever fails the write.
-    if let Ok(snapshot) = directory.snapshot_if_exists(&session) {
-        crate::alab::roll::endorse(&session, &directory, &snapshot);
-        let _ = directory.release_due(&session, &snapshot, now, &crate::alab::roll::covered);
+    if let Some(snapshot) = &snapshot {
+        crate::alab::roll::endorse(&session, &directory, snapshot);
+        let _ = directory.release_due(&session, snapshot, now, &crate::alab::roll::covered);
     }
 
     // The admitted session holds one exclusive control writer through the revision check across
@@ -707,7 +728,13 @@ pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Res
         retry |= log.retry(session.actor(), &command)?.is_some();
     }
     let ring = logs.len();
-    logs.extend(legacy_logs(&session, &directory, &bootstrap, now));
+    logs.extend(legacy_logs_from(
+        &session,
+        &directory,
+        &bootstrap,
+        snapshot.as_ref(),
+        now,
+    ));
     let latest = latest(&logs, &machines);
     let mine = latest.get(&session.actor());
     let current = mine.map(|latest| &latest.body);

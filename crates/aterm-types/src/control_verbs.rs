@@ -3605,7 +3605,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [window=] [raise=<t|f>] [cwd=] [split=<v|h>] [connected=…|agent=…]: OK <sid>",
+        "spawn [window=] [raise=<t|f>] [cwd=] [split=<v|h>] [connected=…|agent=…|program=…]: OK <sid>",
         "— mints a session (a new tab, or `split=v|h` splitting the focused pane), addressable at \
          once. `theme=<name>` gives it a session theme (`theme session`; `ERR theme \"<name>\": \
          <why>`). `window=<id>` (`inspect app/v1 tabs`; `window=0` on `--headless`; `ERR no such \
@@ -3659,7 +3659,35 @@ pub const VERBS: &[VerbSpec] = &[
          is installed, the launch note says so and the line runs any copy of the shell's own. \
          The startup deadline waits while it installs, until the install makes no progress for \
          45 minutes, and a launcher whose task is no longer `working` types nothing, so a launch \
-         that stalled while held or installing never starts later. Over \
+         that stalled while held or installing never starts later. Program form (Owner-only): \
+         `spawn … program=<pct> [arg=<pct>]… [from=<sid>] len=<n>` (`aterm ctl spawn \
+         program=<p> [arg=<a>]… -` reads stdin and percent-encodes each word) runs as a worker a \
+         program no harness of aterm's reads: it lands and parks as an agent's worker does and \
+         writes the task file as given, with no fact line, and at the first prompt types the \
+         program and its words, quoted, with the task file as its standard input (`'<p>' \
+         '<a>'… < \"$ATERM_TASK_FILE\"`), setting no Autopilot. The exit status of that line's \
+         block (from the shell block it was typed into on; a command a person runs in the tab is \
+         never it) concludes it once: `done why=exit-status exit=0`, else `failed \
+         why=exit-status exit=<n>` (a signal as the shell reports it, 128 plus its number), or \
+         `failed why=no-exit-status` where no status was read (the next prompt sealed its block \
+         first, job control hid how it ended, a restore found its shell gone); a job stopped \
+         (Ctrl-Z) has not ended. `result` answers `source=output` with its output tail (its last \
+         200 rows still held, redacted as `survey` redacts a screen, at most 16 KiB). It is \
+         `stalled why=startup` if its line has not run within 120 s, and a stall before its \
+         line was typed stands. No Autopilot word moves its task, a `turn` types into its tab \
+         without reopening it, and a harness's `task mark` on it is `ERR task mark: a program \
+         worker's task is concluded by its program's exit status, not by a harness` (a CLI the \
+         program runs is read as any tab's, but concludes nothing). Nothing reads its screen, so \
+         a program that asks on its terminal (a password, a `[y/N]`) waits there until someone \
+         answers in its tab: bound a wait with `await task … timeout=`. A `program=` empty, \
+         starting `-` or `~`, or holding a control character, an `arg=` holding one, an `arg=` \
+         with no `program=`, and a `program=` beside `agent=`, `model=` or `autopilot=` are the \
+         usage line; a program whose file name is a CLI whose harness concludes its worker \
+         (`agent=claude|codex|agy|muse`) is `ERR spawn program=<p>: <CLI> has a harness here; \
+         spawn it as `agent=<word>``. It needs the window harness supervising (`ERR \
+         unsupervised: …`, `[harness] enabled = false` and `headless = false` included) and \
+         shell integration (`ERR spawn program=<p>: shell integration is off, …`), not the \
+         harness's agent switches or its Autopilot. Over \
          an authenticated fleet drive, a worker's spawn takes \
          `agent=`, `model=`, `autopilot=`, an absolute `cwd=` or `'cwd=~/<path>'` (a folder in \
          the driven Mac's home, resolved there and refused where it leaves the home, lies in a \
@@ -3851,8 +3879,8 @@ pub const VERBS: &[VerbSpec] = &[
          state=<working|done|exited|stalled|failed|-|closed> agent=<word> \
          program_state=<word|-> attention=<pct|-> result_bytes=<n> \
          [conclusion=<finished|failed>] [why=<word>] [checked=<word>] [left=<word>] \
-         [fact=<word|-> fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=`, `checked=` \
-         and `left=` as `task` says \
+         [exit=<n>] [fact=<word|-> fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=`, \
+         `checked=`, `left=` and `exit=` as `task` says \
          (a tab closed on a task with no conclusion reads `conclusion=failed`); \
          `program_state=` is `status program_state=`, a claim that never wakes it). `aterm ctl \
          [--host <h>] await task board …` waits on a `board`'s open rows instead of named sids. \
@@ -4008,7 +4036,12 @@ pub const VERBS: &[VerbSpec] = &[
          only that authenticated node's direct conversations. `inbox fleet [since=f<id>]` \
          lists retained direct conversations, including `reply_text=` when answered. A direct \
          `await inbox` wake returns `OK inbox <bus-id> fleet=f<id>`; rearm with \
-         `since=<bus-id> fleet_since=f<id>`, or `since=f<id>` for direct mail alone.",
+         `since=<bus-id> fleet_since=f<id>`, or `since=f<id>` for direct mail alone. With the \
+         mesh on (§11 C6), unlisted direct fleet mail enters the ring instead, one `msg <id> \
+         off=- t=<ms> from=fleet:<node> kind=<k> trust=agent fleet=f<id> ...` row each, and no \
+         `msg f<id>` rows follow: listing the row marks the message in its mailbox, so a \
+         restart or a seamless update offers again only what no listing marked, and a plain \
+         `await inbox` wakes on it as on bus mail.",
     ),
     v(
         "inbox get",
@@ -4034,7 +4067,8 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "inbox seen <id> [handled|refused|deferred]: advance the HANDLED watermark (and ack)",
         "— lists all rows `<= <id>`, advances `seen=`, and replies `OK seen=<w>` (emitting `EVENT \
-         <local> inbox-seen <id> off=<n> floor=<f|-> seen=<w>`). Adding \
+         <local> inbox-seen <id> off=<n|-> floor=<f|-> seen=<w>`; `off=-` for a direct fleet \
+         message's row, which owes no receipt and is answered by `post re=f<id>`). Adding \
          `handled|refused|deferred` attaches `verdict=<v> kind=<k> from=<p>` for row `<id>` and \
          queues a receipt (`kind=ack re=<off> verdict=<v>`) on `outbox` for an `ask` or `task` \
          row (unless `[fabric] receipts = false`), waking the sender's `post --wait-ack` and \
@@ -4057,7 +4091,13 @@ pub const VERBS: &[VerbSpec] = &[
          session and returns `OK f<id>`; it takes no `to=`, uses no terminal input, and \
          attributes the sender to the proved node. Locally, `post re=f<id> key=<token> \
          kind=answer -- <text>` retains a reply for that sender's next `inbox` read. Reusing a \
-         retained key with identical bytes returns `dup=1`; different bytes refuse. \
+         retained key with identical bytes returns `dup=1`; different bytes refuse. With the \
+         mesh on (§11 C6), `to=@<sid>@<node>` for a Mac whose presence row this Mac has not \
+         heard (a pre-R3 Mac) goes by one fleet drive as direct fleet mail and replies `OK \
+         fleet=f<id> to=@<sid>@<node> key=<token>[ dup=1]` (a post with no key gets \
+         `<sid>.<16 hex>`); it takes inline one-line text of kind ask, task, note, answer or \
+         report, refuses `re=`, `dl=`, `via=`, `--wait-ack` and `len=` (`ERR fleet-mail: ...`), \
+         and its reply is read by a drive of that Mac (`inbox fleet` there). \
          `to=say[:<topic>]` broadcasts \
          on `say/<topic>` (`<topic>` in `[a-z0-9][a-z0-9._-]{0,31}`, default `say`) to sessions \
          with `topic add <topic>` (`topic=<t>`). \

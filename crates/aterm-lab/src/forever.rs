@@ -2850,8 +2850,8 @@ pub struct Cover {
     /// L20, C5: the tool results the conversation carried back (the dialog's answer among them),
     /// read from the stub's dumps once its watch is over ([`dialog_answers_of`]).
     pub dialog_answers: Option<Vec<String>>,
-    /// F3: the screen's last rows read once the first point after the prompt was journaled, and
-    /// when.
+    /// F3: the screen's rows (blank ones dropped) read once the first point after the prompt was
+    /// journaled, and when ([`cover::first_turn`] finds the first turn's rows in them).
     pub first_screen: Option<(i64, Vec<String>)>,
     /// ANGLES: what of the other session's work ([`Repo::Others`]) no longer stands as laid, read
     /// once the watch is over ([`angles::others_left`]; empty: all of it stands).
@@ -7138,7 +7138,9 @@ fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
     if !pointed {
         return;
     }
-    let rows = tail_rows(door, &tab.sid, 12);
+    // The whole screen, so the first turn's rows from the opener's echo down are in it
+    // ([`cover::first_turn`]), and in the run's log.
+    let rows = tail_rows(door, &tab.sid, usize::MAX);
     let t = now_ms();
     println!(
         "  [{}] +{} screen  at the first point:",

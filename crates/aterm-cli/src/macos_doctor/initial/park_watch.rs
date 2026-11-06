@@ -5,7 +5,8 @@
 //! ([`super::InitialSetupParkMark::watches`]): the secrets folder changing (the subscriber's
 //! `state.toml`, a join's identity or source, and materialized `~/.secrets` files), this Mac's
 //! network addresses changing (a route socket's address and interface messages), and a `git`
-//! arriving (atpkg's, the Command Line Tools' or Xcode's). A watch only
+//! arriving (atpkg's, the Command Line Tools' or Xcode's), and the selected repository inputs
+//! or pinned helper changing. A watch only
 //! says "look again": the park reads its mark again and runs a pass only when a fact changed.
 //! Each watch lets a burst settle before it says so, and the network watch says so at most once a
 //! minute, so an interface that keeps going up and down moves a park no more often than the
@@ -26,15 +27,15 @@ pub struct Watches {
     pub secrets: bool,
     /// This Mac's network addresses.
     pub network: bool,
-    /// A `git` arriving: atpkg's, the Command Line Tools' or Xcode's.
-    pub developer_tools: bool,
+    /// Git activation and local repository inputs: the selected source and pinned helper.
+    pub git: bool,
 }
 
 impl Watches {
     /// Whether nothing is watched: the park waits on a person, or on its one timer.
     #[must_use]
     pub const fn none(self) -> bool {
-        !self.secrets && !self.network && !self.developer_tools
+        !self.secrets && !self.network && !self.git
     }
 }
 
@@ -69,12 +70,13 @@ impl ParkWatch {
             network: None,
         };
         let mut folders = Vec::new();
+        let mut input_files = Vec::new();
         if watches.secrets {
             let home = aterm_types::dirs::home_dir()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?;
             folders.extend(secrets_folders(&home));
         }
-        if watches.developer_tools {
+        if watches.git {
             let tools = Path::new(aterm_machines::items::github::CLT_GIT)
                 .parent()
                 .map_or_else(PathBuf::new, Path::to_path_buf);
@@ -83,14 +85,24 @@ impl ParkWatch {
             if let Some(layout) = atpkg::store::resolve_configured() {
                 folders.extend(packaged_git_folders(&layout.prefix));
             }
+            input_files = aterm_machines::init_github::repository_input_watch_paths(
+                &aterm_machines::port::Live::new(),
+            )
+            .map_err(io::Error::other)?;
+            folders.extend(repository_input_folders(&input_files));
         }
         if !folders.is_empty() {
-            watch.files = Some(watch_folders(
-                folders,
-                Arc::clone(&stop),
-                Arc::clone(&lost),
-                changed,
-            )?);
+            watch.files = Some(if input_files.is_empty() {
+                watch_folders(folders, Arc::clone(&stop), Arc::clone(&lost), changed)?
+            } else {
+                watch_paths(
+                    folders,
+                    input_files,
+                    Arc::clone(&stop),
+                    Arc::clone(&lost),
+                    changed,
+                )?
+            });
         }
         if watches.network {
             watch.network = Some(watch_network(stop, lost, changed)?);
@@ -187,6 +199,16 @@ fn packaged_git_folders(prefix: &Path) -> Vec<FolderTarget> {
     ]
 }
 
+/// Observe declared input files through their parents, including a missing parent or a
+/// symlink's replacement. A new park resolves the source and helper again after they change.
+fn repository_input_folders(paths: &[PathBuf]) -> Vec<FolderTarget> {
+    paths
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .map(|parent| (parent, PathBuf::from("/")).into())
+        .collect()
+}
+
 struct ArmedFolder {
     resolved: PathBuf,
     id: atpkg::dirwatch::WatchId,
@@ -196,9 +218,11 @@ struct ArmedFolder {
 /// the destination appears, including a config link retargeted while its old destination lives.
 struct Folders {
     targets: Vec<FolderTarget>,
+    files: Vec<PathBuf>,
     /// The nearest directory each target currently reaches.
     watched: Vec<Option<(PathBuf, atpkg::dirwatch::WatchId)>>,
     armed: BTreeMap<PathBuf, ArmedFolder>,
+    armed_files: BTreeMap<PathBuf, atpkg::dirwatch::WatchId>,
 }
 
 impl Folders {
@@ -206,8 +230,10 @@ impl Folders {
         let watched = targets.iter().map(|_| None).collect();
         Self {
             targets,
+            files: Vec::new(),
             watched,
             armed: BTreeMap::new(),
+            armed_files: BTreeMap::new(),
         }
     }
 
@@ -306,9 +332,59 @@ impl Folders {
             if self.targets.iter().zip(coverage).all(|(target, before)| {
                 nearest(&target.target, &target.floor, target.follow_links) == before
             }) {
-                return Ok(());
+                return self.arm_files(watcher, fired, &changed);
             }
         }
+    }
+
+    /// Parent watches hear replacement and arrival; file watches also hear in-place writes.
+    /// Reopen a signaled or replaced file before releasing its old watch.
+    fn arm_files(
+        &mut self,
+        watcher: &atpkg::dirwatch::Watcher,
+        fired: &BTreeSet<atpkg::dirwatch::WatchId>,
+        changed: &[PathBuf],
+    ) -> io::Result<()> {
+        let mut next = BTreeMap::new();
+        let mut added = Vec::new();
+        let armed = (|| {
+            for path in &self.files {
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => continue, // A link's parent hears its replacement; its target is separate.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+                let kept = self.armed_files.get(path).filter(|id| {
+                    !fired.contains(*id)
+                        && !watcher.is_gone(**id)
+                        && !changed.iter().any(|parent| path.starts_with(parent))
+                });
+                let id = if let Some(id) = kept {
+                    *id
+                } else {
+                    let id = watcher.add_file(path)?;
+                    added.push(id);
+                    id
+                };
+                next.insert(path.clone(), id);
+            }
+            Ok(())
+        })();
+        if let Err(error) = armed {
+            for id in added {
+                watcher.remove(id);
+            }
+            return Err(error);
+        }
+        let kept: BTreeSet<_> = next.values().copied().collect();
+        for id in self.armed_files.values() {
+            if !kept.contains(id) {
+                watcher.remove(*id);
+            }
+        }
+        self.armed_files = next;
+        Ok(())
     }
 }
 
@@ -327,8 +403,21 @@ fn watch_folders(
     lost: Arc<AtomicBool>,
     changed: fn(),
 ) -> io::Result<Arc<atpkg::dirwatch::Watcher>> {
+    watch_paths(targets, Vec::new(), stop, lost, changed)
+}
+
+fn watch_paths(
+    targets: Vec<FolderTarget>,
+    mut files: Vec<PathBuf>,
+    stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    changed: fn(),
+) -> io::Result<Arc<atpkg::dirwatch::Watcher>> {
     let watcher = Arc::new(atpkg::dirwatch::Watcher::new()?);
     let mut folders = Folders::new(targets);
+    files.sort();
+    files.dedup();
+    folders.files = files;
     folders.arm(&watcher)?;
     if folders.watched.iter().any(Option::is_none) {
         // Nothing at or below a floor to watch: the park keeps its timer.
@@ -582,6 +671,160 @@ mod tests {
 
     static GIT_FIRED: AtomicUsize = AtomicUsize::new(0);
 
+    static REPOSITORY_INPUT_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn repository_input_fired() {
+        REPOSITORY_INPUT_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static DANGLING_HELPER_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn dangling_helper_fired() {
+        DANGLING_HELPER_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_dangling_helper_target_arriving_rebinds_its_file_watch() {
+        use std::io::Write as _;
+
+        for parent_link in [false, true] {
+            let root = aterm_tempfile::TempDir::new().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let home = base.join("home");
+            let launcher = home.join(".local/bin/aterm");
+            let target = base.join("package/bin/aterm");
+            let declaration = if parent_link {
+                std::fs::create_dir_all(home.join(".local")).unwrap();
+                let link = home.join(".local/bin");
+                std::os::unix::fs::symlink(target.parent().unwrap(), &link).unwrap();
+                link
+            } else {
+                std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&target, &launcher).unwrap();
+                launcher.clone()
+            };
+            assert!(launcher.canonicalize().is_err(), "the helper is absent");
+            let original = std::fs::read_link(&declaration).unwrap();
+            let files = vec![launcher.clone(), target.clone()];
+            let mut folders = repository_input_folders(&files);
+            for folder in &mut folders {
+                folder.floor = base.clone();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let lost = Arc::new(AtomicBool::new(false));
+            let watcher = watch_paths(
+                folders,
+                files,
+                Arc::clone(&stop),
+                Arc::clone(&lost),
+                dangling_helper_fired,
+            )
+            .unwrap();
+            if parent_link {
+                let before = DANGLING_HELPER_FIRED.load(Ordering::SeqCst);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                until("the missing helper parent was not heard", || {
+                    DANGLING_HELPER_FIRED.load(Ordering::SeqCst) > before
+                });
+            }
+            let before = DANGLING_HELPER_FIRED.load(Ordering::SeqCst);
+            std::fs::write(&target, "helper01").unwrap();
+            until("the dangling helper target's arrival was not heard", || {
+                DANGLING_HELPER_FIRED.load(Ordering::SeqCst) > before
+            });
+            assert_eq!(launcher.canonicalize().unwrap(), target);
+            assert_eq!(std::fs::read_link(&declaration).unwrap(), original);
+
+            let before = DANGLING_HELPER_FIRED.load(Ordering::SeqCst);
+            let mut helper = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .unwrap();
+            helper.write_all(b"helper02").unwrap();
+            drop(helper);
+            until("the arriving helper's file watch was not rebound", || {
+                DANGLING_HELPER_FIRED.load(Ordering::SeqCst) > before
+            });
+            assert!(!lost.load(Ordering::Acquire));
+            stop.store(true, Ordering::Release);
+            watcher.wake().unwrap();
+            let ended = Arc::downgrade(&watcher);
+            drop(watcher);
+            until("the helper watch outlived its park", || {
+                ended.upgrade().is_none()
+            });
+        }
+    }
+
+    #[test]
+    fn selected_inputs_and_helper_wake_for_in_place_writes_and_replacement() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let profile = home.join(".config/aterm/init.toml");
+        let token = root.path().join("team/private-token");
+        let helper = root.path().join("application/Contents/MacOS/aterm");
+        let launcher = home.join(".local/bin/aterm");
+        for file in [&profile, &token, &helper, &launcher] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        }
+        for file in [&profile, &token, &helper] {
+            std::fs::write(file, "before01").unwrap();
+        }
+        std::os::unix::fs::symlink(&helper, &launcher).unwrap();
+        let files = vec![profile.clone(), token.clone(), launcher, helper.clone()];
+        let mut folders = repository_input_folders(&files);
+        // The production watch follows parent chains to root; this isolated tree is the
+        // test's namespace, so unrelated tests cannot supply its notification.
+        for target in &mut folders {
+            target.floor = root.path().to_path_buf();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_paths(
+            folders,
+            files,
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            repository_input_fired,
+        )
+        .unwrap();
+        let rewrite = |path: &Path, bytes: &[u8]| {
+            let before = REPOSITORY_INPUT_FIRED.load(Ordering::SeqCst);
+            let inode = std::fs::metadata(path).unwrap().ino();
+            let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.write_all(bytes).unwrap();
+            drop(file);
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            until("the in-place repository input change was not heard", || {
+                REPOSITORY_INPUT_FIRED.load(Ordering::SeqCst) > before
+            });
+        };
+        rewrite(&profile, b"profile2");
+        rewrite(&token, b"token002");
+        rewrite(&helper, b"helper02");
+
+        let before = REPOSITORY_INPUT_FIRED.load(Ordering::SeqCst);
+        let replacement = token.with_extension("replacement");
+        std::fs::write(&replacement, "replaced").unwrap();
+        std::fs::rename(replacement, &token).unwrap();
+        until("the token replacement was not heard", || {
+            REPOSITORY_INPUT_FIRED.load(Ordering::SeqCst) > before
+        });
+        rewrite(&token, b"token003");
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+        let ended = Arc::downgrade(&watcher);
+        drop(watcher);
+        until("the input watch outlived its park", || {
+            ended.upgrade().is_none()
+        });
+    }
+
     fn git_fired() {
         GIT_FIRED.fetch_add(1, Ordering::SeqCst);
     }
@@ -592,6 +835,10 @@ mod tests {
         let prefix = home.path().join("pkg");
         std::fs::create_dir_all(prefix.join("store/git")).unwrap();
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let current = prefix.join("store/git/current");
+        let next = prefix.join("store/git/current.next");
+        std::os::unix::fs::symlink("41", &current).unwrap();
+        std::os::unix::fs::symlink("42", &next).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
         let watcher = watch_folders(
@@ -601,6 +848,11 @@ mod tests {
             git_fired,
         )
         .unwrap();
+        let before = GIT_FIRED.load(Ordering::SeqCst);
+        std::fs::rename(next, current).unwrap();
+        until("the managed Git activation link never woke setup", || {
+            GIT_FIRED.load(Ordering::SeqCst) > before
+        });
         let before = GIT_FIRED.load(Ordering::SeqCst);
         std::fs::write(prefix.join("store/git/42.ready"), "ready").unwrap();
         until("the managed Git activation never woke setup", || {

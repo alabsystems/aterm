@@ -624,21 +624,21 @@ impl Sidecar {
         Some(sidecar)
     }
 
-    /// Whether `durable` (the log's stored frames from `base`) still holds, at the
-    /// newest offset this sidecar saw, the record it saw there. True when there is
-    /// nothing to compare: it saw no record, or retention has since pruned it (a log
-    /// SHORTER than it saw is caught by the head check, not here).
-    fn still_names(&self, durable: &[u8], base: u64) -> bool {
-        let Some(prev) = self.head.checked_sub(1) else {
-            return true;
-        };
-        let Some(index) = prev.checked_sub(base) else {
-            return true;
-        };
-        let Ok(index) = usize::try_from(index) else {
-            return true;
-        };
-        match frames(durable).nth(index) {
+    /// Where, among the log's stored frames from `base`, the newest record this sidecar
+    /// saw sits: `None` when it saw none, or retention has since pruned it.
+    fn newest_place(&self, base: u64) -> Option<usize> {
+        let prev = self.head.checked_sub(1)?;
+        let index = prev.checked_sub(base)?;
+        usize::try_from(index).ok()
+    }
+
+    /// Whether the log still holds, at the newest offset this sidecar saw, the record it
+    /// saw there: `named` is the stored frame at its place ([`Prior::newest_place`]). True
+    /// when there is nothing to compare: it saw no record, retention has since pruned it,
+    /// or the frames end before its place (a log SHORTER than it saw is caught by the head
+    /// check, not here).
+    fn still_names(&self, named: Option<&[u8]>) -> bool {
+        match named {
             Some(frame) => fingerprint(frame) == self.newest,
             None => true,
         }
@@ -651,8 +651,8 @@ impl Sidecar {
 
     /// This record as a CLEAN CLOSE writes it: the run stopped at `head` with every
     /// byte below flushed in full, so the floor rises to it and the next open, in any
-    /// boot, finds nothing it must move the generation for. `kept` is the log's stored
-    /// frames from its base.
+    /// boot, finds nothing it must move the generation for. `kept`: stored frames whose
+    /// last is the newest (that frame alone, as a clean close reads it), for its fingerprint.
     pub(crate) fn closed(&self, base: u64, head: u64, kept: &[u8]) -> Sidecar {
         Sidecar {
             base,
@@ -706,6 +706,24 @@ impl Prior {
             Prior::Recorded(p) => Some(p),
             Prior::Absent | Prior::Unreadable => None,
         }
+    }
+
+    /// Where, among the log's stored frames from `base`, the newest record the last open
+    /// saw sits, when it recorded one this log still retains: the frame the identity rules
+    /// compare with what it saw ([`Facts::named`]).
+    pub(crate) fn newest_place(&self, base: u64) -> Option<usize> {
+        match self.recorded() {
+            Some(p) => p.newest_place(base),
+            None => None,
+        }
+    }
+
+    /// Whether the head recorded is where the log stopped: a clean close wrote it
+    /// ([`State::Closed`], as a FORMAT 1 record reads). Any other record's head is what an
+    /// open, a lossy record or a cut saw, and the run may have appended past it before it
+    /// stopped.
+    pub(crate) fn closed_clean(&self) -> bool {
+        matches!(self.recorded(), Some(p) if p.state == State::Closed)
     }
 
     /// The durable floor recovery judges by: a FORMAT 2 record's floor, raised to the
@@ -833,14 +851,16 @@ pub(crate) fn write(dir: &Dir, sidecar: &Sidecar) -> io::Result<()> {
 pub(crate) struct Facts<'a> {
     /// The log is a replication target.
     pub(crate) replica: bool,
-    /// The intact frames from `base` up to the first damage (or the end), BEFORE any
-    /// cut: what the last open's evidence is checked against.
-    pub(crate) pre_cut: &'a [u8],
+    /// The stored frame, among the intact ones from `base` up to the first damage (or the
+    /// end) BEFORE any cut, at the place of the newest record the last open saw
+    /// ([`Prior::newest_place`]): what that open's evidence is checked against. `None` when
+    /// those frames hold none there.
+    pub(crate) named: Option<&'a [u8]>,
     /// The head those frames reach.
     pub(crate) pre_cut_head: u64,
-    /// The frames that survive this open's cut (all of `pre_cut` when nothing intact is
-    /// cut).
-    pub(crate) kept: &'a [u8],
+    /// The first and the newest of the stored frames that survive this open's cut, as
+    /// stored ([`ends`]); `None` when none does.
+    pub(crate) kept: Option<(&'a [u8], &'a [u8])>,
     /// The retention base.
     pub(crate) base: u64,
     /// The head after the cut.
@@ -886,7 +906,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
         _ if f.kept_head == 0 => minted_settled(f.minted),
         // Every record pruned: nothing stored to derive from but two numbers, which
         // another such log can share — a fresh id instead.
-        Prior::Absent if frames(f.kept).next().is_none() => minted_settled(f.minted),
+        Prior::Absent if f.kept.is_none() => minted_settled(f.minted),
         Prior::Absent => Settled {
             identity: LogIdentity {
                 id: derived_id(f.kept, f.base, f.kept_head),
@@ -902,8 +922,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
             // the cut was durable): finding the same cut again moves nothing more.
             let announced = matches!(p.state, State::Cutting { .. }) && f.kept_head == p.head;
             let own_loss = (f.unclean || f.cut_records || f.repair_cut) && !announced;
-            let other_log =
-                f.base < p.base || f.kept_head < p.head || !p.still_names(f.pre_cut, f.base);
+            let other_log = f.base < p.base || f.kept_head < p.head || !p.still_names(f.named);
             if !(own_loss || other_log) {
                 return Settled {
                     identity: p.identity,
@@ -921,8 +940,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
             // Lineage only for a loss this log can bound, judged on the bytes BEFORE
             // this open's cut: a repair below the last open's head keeps it (the
             // shortening is its own cut), a restored backup does not.
-            let continuous =
-                f.pre_cut_head >= p.head && f.base >= p.base && p.still_names(f.pre_cut, f.base);
+            let continuous = f.pre_cut_head >= p.head && f.base >= p.base && p.still_names(f.named);
             let lineage = if (own_loss && continuous) || f.lineage_on_shorter {
                 step(&p.lineage, generation, f.kept_head)
             } else {
@@ -944,7 +962,8 @@ pub(crate) struct Record<'a> {
     pub(crate) settled: &'a Settled,
     pub(crate) base: u64,
     pub(crate) head: u64,
-    /// The kept frames from `base` (for the newest record's fingerprint).
+    /// Stored frames whose last is the newest kept one (that frame alone, or every kept
+    /// frame from `base`), for its fingerprint; empty when none is kept.
     pub(crate) kept: &'a [u8],
     pub(crate) served: u8,
     pub(crate) boot: Option<[u8; 16]>,
@@ -1137,10 +1156,17 @@ fn frames(bytes: &[u8]) -> Frames<'_> {
 
 /// The first of `bytes`' stored frames, header and payload as stored, or `None` when it
 /// holds none: what an interrupted compaction is judged by at the next open
-/// (`compact.rs`).
-#[cfg(feature = "retention")]
+/// (`compact.rs`), and the first of the frames an open keeps ([`Facts::kept`]), which the
+/// open reads alone (`open_scan::first_frame`).
 pub(crate) fn first_frame(bytes: &[u8]) -> Option<&[u8]> {
     frames(bytes).next()
+}
+
+/// The `n`th of `bytes`' stored frames (from 0), as stored: the whole-buffer reference's
+/// [`Facts::named`] (`open_scan_tests.rs`).
+#[cfg(test)]
+pub(crate) fn nth_frame(bytes: &[u8], n: usize) -> Option<&[u8]> {
+    frames(bytes).nth(n)
 }
 
 /// A stored frame's [`fingerprint`], for the compaction intent's identities
@@ -1187,17 +1213,29 @@ fn fingerprint(frame: &[u8]) -> [u8; 16] {
 
 /// The id of a log that holds records and has no identity of its own yet:
 /// deterministic in what it stores, so it is the same whichever build derives it and
-/// however often — and different once the log holds anything else.
-fn derived_id(durable: &[u8], base: u64, head: u64) -> [u8; 16] {
+/// however often — and different once the log holds anything else. `kept`: the first and
+/// the newest of its stored frames ([`ends`]).
+fn derived_id(kept: Option<(&[u8], &[u8])>, base: u64, head: u64) -> [u8; 16] {
     let base_bytes = encode_u64_le_bytes(base);
     let head_bytes = encode_u64_le_bytes(head);
+    let (first, newest) = kept.unwrap_or((&[], &[]));
     fnv1a_128(&[
         b"astream-log-id/derived/1",
         &base_bytes,
         &head_bytes,
-        frames(durable).next().unwrap_or(&[]),
-        frames(durable).last().unwrap_or(&[]),
+        first,
+        newest,
     ])
+}
+
+/// The first and the newest of `bytes`' stored frames, each as stored, or `None` when it
+/// holds none: what the identity rules read of the frames an open keeps ([`Facts::kept`]).
+/// The open reads the two alone; the whole-buffer reference reads them here.
+#[cfg(test)]
+pub(crate) fn ends(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let first = frames(bytes).next()?;
+    let newest = frames(bytes).last()?;
+    Some((first, newest))
 }
 
 /// A fresh id for a log that has just been created (or never held a record): two
@@ -1531,11 +1569,11 @@ mod tests {
         assert_ne!(minted_id(p), minted_id(p));
         let one = Frame::new(b"one".to_vec()).encode().unwrap();
         let two = [one.clone(), Frame::new(b"two".to_vec()).encode().unwrap()].concat();
-        assert_eq!(derived_id(&two, 0, 2), derived_id(&two, 0, 2));
-        assert_ne!(derived_id(&two, 0, 2), derived_id(&one, 0, 1));
+        assert_eq!(derived_id(ends(&two), 0, 2), derived_id(ends(&two), 0, 2));
+        assert_ne!(derived_id(ends(&two), 0, 2), derived_id(ends(&one), 0, 1));
         assert_ne!(
-            derived_id(&two, 0, 2),
-            derived_id(&two, 5, 7),
+            derived_id(ends(&two), 0, 2),
+            derived_id(ends(&two), 5, 7),
             "base and head count"
         );
     }

@@ -25,12 +25,12 @@ struct Kept {
 
 impl Kept {
     fn start(tag: &str) -> Kept {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("keeper-{tag}-{}", std::process::id()));
+        let dir =
+            aterm_tempfile::target_tmpdir().join(format!("keeper-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let (lifeline, far) = Lifeline::open(&dir).expect("lifeline FIFO");
-        let mut child = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"))
+        let mut child = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"))
             .args([
                 "keeper",
                 "--",

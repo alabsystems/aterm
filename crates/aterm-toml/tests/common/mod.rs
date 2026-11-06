@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// The repository root, two levels up from this crate's manifest.
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    aterm_tempfile::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .expect("crates/aterm-toml sits two levels under the repository root")

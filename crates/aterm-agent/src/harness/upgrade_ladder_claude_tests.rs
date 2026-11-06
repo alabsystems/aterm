@@ -471,7 +471,7 @@ fn the_stall_screens_upgrade_never_restarts_over_the_work_it_shows() {
     );
     // A workflow's progress row left at its full bar after the workflow ended (measured on
     // 2.1.304) is no running work of the agent's: it holds no restart.
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+    let path = aterm_tempfile::manifest_dir().join(
         "../aterm-phase/src/fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt",
     );
     let done = screen(&std::fs::read_to_string(path).expect("the fixture"));

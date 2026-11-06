@@ -187,9 +187,9 @@ impl Log {
             file.write_all(lines[0].as_bytes())?;
             return Ok(done);
         }
-        let mut out = String::with_capacity(batch + 256);
+        let mut out = String::with_capacity(if len == 0 { batch + 256 } else { batch });
         if len == 0 {
-            out.push_str(&self.facts.line(crate::now_ms()));
+            self.facts.write_line_into(crate::now_ms(), &mut out);
         }
         for line in lines {
             out.push_str(line);

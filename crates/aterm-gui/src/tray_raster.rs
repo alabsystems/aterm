@@ -5142,9 +5142,27 @@ fn columns_within(cx: f32, half: f32, x0: i32, x1: i32) -> std::ops::Range<i32> 
     if start < end { start..end } else { x1..x1 }
 }
 
-/// Whether [`Canvas::stroke_rect`] draws a stroke rounded (by its distance field).
-fn rounded_stroke(r: f32, w: f32, h: f32, sw: f32) -> bool {
+/// Whether [`Canvas::stroke_rect`] draws a stroke rounded (by its distance field), centred on its
+/// rect's edge; otherwise it draws the stroke inside its rect, on whole device px.
+pub(crate) fn rounded_stroke(r: f32, w: f32, h: f32, sw: f32) -> bool {
     r > 0.5 && w > sw * 2.0 + 1.0 && h > sw * 2.0 + 1.0
+}
+
+/// The device px a [`crate::widget::DrawPrim::Stroke`] of rect `(x, y, w, h)` inks, `(x, y, w, h)`:
+/// a rounded stroke is centred on its rect's edge, an unrounded one drawn inside its rect
+/// ([`rounded_stroke`]).
+#[cfg(test)]
+pub(crate) fn stroke_px(
+    (x, y, w, h): (f32, f32, f32, f32),
+    radius: f32,
+    width: f32,
+) -> (f32, f32, f32, f32) {
+    if rounded_stroke(radius, w, h, width) {
+        let half = width / 2.0;
+        (x - half, y - half, w + width, h + width)
+    } else {
+        (x, y, w, h)
+    }
 }
 
 /// A half-open device-pixel rectangle in a retained tray raster.

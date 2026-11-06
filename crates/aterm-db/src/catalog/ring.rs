@@ -804,12 +804,16 @@ impl Directory {
             let mut changed = false;
             for epoch in state.window(ring, now) {
                 let scope = ring.scope(self.trust, epoch)?;
+                let digest = scope.digest();
+                if policy.excluded.contains(&digest) {
+                    continue;
+                }
                 let path = self.path(scope)?;
-                if policy.excluded.contains(&scope.digest()) || !path.try_exists()? {
+                if !path.try_exists()? {
                     continue;
                 }
                 changed |= state.hold(ring, epoch, now)?;
-                tables.insert(scope.digest(), (scope, path));
+                tables.insert(digest, (scope, path));
             }
             if changed {
                 self.save_ring_state(session, ring, &state)?;
@@ -842,12 +846,12 @@ impl Directory {
             let mut wanted = Vec::new();
             for epoch in state.window(ring, now) {
                 let scope = ring.scope(self.trust, epoch)?;
-                let path = self.path(scope)?;
-                if offered.contains(&scope.digest())
-                    && !policy.excluded.contains(&scope.digest())
-                    && !path.try_exists()?
-                {
-                    wanted.push((epoch, scope, path));
+                let digest = scope.digest();
+                if offered.contains(&digest) && !policy.excluded.contains(&digest) {
+                    let path = self.path(scope)?;
+                    if !path.try_exists()? {
+                        wanted.push((epoch, digest, scope, path));
+                    }
                 }
             }
             if wanted.is_empty() {
@@ -856,7 +860,7 @@ impl Directory {
             self.ensure_catalog(session)?;
             let (_, mut count) = self.retained()?;
             let mut held = state.held.len();
-            wanted.retain(|(epoch, _, _)| {
+            wanted.retain(|(epoch, _, _, _)| {
                 if count > MAX_TABLES {
                     return false;
                 }
@@ -872,13 +876,13 @@ impl Directory {
             if wanted.is_empty() {
                 continue;
             }
-            for (epoch, _, _) in &wanted {
+            for (epoch, _, _, _) in &wanted {
                 state.hold(ring, *epoch, now)?;
             }
             self.save_ring_state(session, ring, &state)?;
-            for (_, scope, path) in wanted {
+            for (_, digest, scope, path) in wanted {
                 private_file::create_private_dir(&path)?;
-                tables.insert(scope.digest(), (scope, path));
+                tables.insert(digest, (scope, path));
             }
             aterm_durable::durable_dir(&self.root)?;
         }
@@ -930,14 +934,18 @@ impl Directory {
             }
             for epoch in state.window(ring, now) {
                 let scope = ring.scope(self.trust, epoch)?;
+                let digest = scope.digest();
+                if policy.excluded.contains(&digest) {
+                    continue;
+                }
                 let path = self.path(scope)?;
-                if policy.excluded.contains(&scope.digest()) || !path.try_exists()? {
+                if !path.try_exists()? {
                     continue;
                 }
                 if !state.held.contains(&epoch) {
                     return Ok(None);
                 }
-                tables.insert(scope.digest(), (scope, path));
+                tables.insert(digest, (scope, path));
             }
         }
         Ok(Some(tables))

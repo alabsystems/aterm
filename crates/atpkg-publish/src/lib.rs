@@ -3,6 +3,7 @@
 
 //! `atpkg-publish`: packs, signs, and publishes atpkg builds and channel indexes.
 
+pub mod adopt;
 pub mod api;
 pub mod artifact;
 pub mod channel;

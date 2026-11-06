@@ -125,24 +125,34 @@ impl FabricSession for crate::SessionCtx {
     /// writes `request` and reads the one line that answers it.
     #[cfg(unix)]
     fn fleet_drive(&self, node: &str, request: &str) -> Result<String, String> {
-        use std::io::{BufRead as _, Read as _, Write as _};
         let link = aterm_agent::drive_fleet(node, FLEET_MAIL_WITHIN).map_err(|r| r.why)?;
-        let label = link.label;
-        let mut stream = link.stream;
-        stream
-            .write_all(format!("{request}\n").as_bytes())
-            .and_then(|()| stream.flush())
-            .map_err(|e| format!("{label}: {e}"))?;
-        let mut line = String::new();
-        std::io::BufReader::new(stream)
-            .take(FLEET_MAIL_ANSWER_MAX)
-            .read_line(&mut line)
-            .map_err(|e| format!("{label}: {e}"))?;
-        if line.is_empty() {
-            return Err(format!("{label} hung up before it answered"));
-        }
-        Ok(line)
+        ask_one_line(link.stream, &link.label, request)
     }
+}
+
+/// Write `request` as one line on a drive's `stream` and read the one line that answers it, at
+/// most [`FLEET_MAIL_ANSWER_MAX`] bytes, which a peer that sends no newline cannot outrun.
+/// `label` names the peer in what it says.
+#[cfg(unix)]
+fn ask_one_line(
+    mut stream: impl std::io::Read + std::io::Write,
+    label: &str,
+    request: &str,
+) -> Result<String, String> {
+    use std::io::{BufRead as _, Read as _};
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("{label}: {e}"))?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .take(FLEET_MAIL_ANSWER_MAX)
+        .read_line(&mut line)
+        .map_err(|e| format!("{label}: {e}"))?;
+    if line.is_empty() {
+        return Err(format!("{label} hung up before it answered"));
+    }
+    Ok(line)
 }
 
 /// How mail reaches `node` from the Mac whose state directory is `state` (§11 C6): by the mesh
@@ -274,7 +284,62 @@ mod handoff_carry;
 
 #[cfg(all(test, unix))]
 mod peer_mail_tests {
-    use super::{fleet_mail::PeerMail, peer_mail_in};
+    use super::{FLEET_MAIL_ANSWER_MAX, ask_one_line, fleet_mail::PeerMail, peer_mail_in};
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+
+    /// The far end of a drive that has answered `answer` (and, `hang_up`, closed its side).
+    fn peer(answer: &[u8], hang_up: bool) -> (UnixStream, UnixStream) {
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        // A one-minute hang detector: an unbounded read of a peer that stays open never ends.
+        ours.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("a read timeout");
+        theirs.write_all(answer).expect("the answer");
+        if hang_up {
+            theirs.shutdown(std::net::Shutdown::Write).expect("hung up");
+        }
+        (ours, theirs)
+    }
+
+    fn request_read(mut theirs: UnixStream) -> String {
+        theirs
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("a read timeout");
+        let mut got = [0u8; 256];
+        let n = theirs.read(&mut got).expect("the request");
+        String::from_utf8_lossy(&got[..n]).into_owned()
+    }
+
+    /// A drive writes its request as one line and takes the one line that answers it; a peer that
+    /// hangs up first is refused, and one that sends no newline is cut at the bound.
+    #[test]
+    fn a_fleet_drive_writes_one_line_and_reads_the_one_line_that_answers_it() {
+        let (ours, theirs) = peer(b"OK f7\nAFTER\n", false);
+        assert_eq!(
+            ask_one_line(&ours, "m9", "@s-87654321 post key=k kind=ask -- HI"),
+            Ok("OK f7\n".to_owned()),
+            "the first line, nothing after it"
+        );
+        assert_eq!(
+            request_read(theirs),
+            "@s-87654321 post key=k kind=ask -- HI\n"
+        );
+
+        // Control: a peer that hangs up before it answers gives no answer.
+        let (ours, _theirs) = peer(b"", true);
+        assert_eq!(
+            ask_one_line(&ours, "m9", "@s-87654321 inbox"),
+            Err("m9 hung up before it answered".to_owned())
+        );
+
+        let (ours, _theirs) = peer(&[b'x'; 5000], false);
+        let cut = ask_one_line(&ours, "m9", "@s-87654321 inbox").expect("a cut line");
+        assert_eq!(
+            u64::try_from(cut.len()).ok(),
+            Some(FLEET_MAIL_ANSWER_MAX),
+            "an answer with no newline ends at the bound, with the peer still open"
+        );
+    }
 
     /// A Mac reaches a peer by the mesh once its presence row was heard, and its own node always;
     /// any other by direct fleet mail.

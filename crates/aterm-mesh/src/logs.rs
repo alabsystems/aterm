@@ -333,12 +333,28 @@ impl Standings {
     }
 }
 
+fn principal_buf(key: &[u8; 32]) -> [u8; 18] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 18];
+    out[0] = b'n';
+    out[1] = b'-';
+    for (i, &b) in key[..8].iter().enumerate() {
+        out[2 + i * 2] = HEX[usize::from(b >> 4)];
+        out[3 + i * 2] = HEX[usize::from(b & 0x0f)];
+    }
+    out
+}
+
+fn principal_str(buf: &[u8; 18]) -> &str {
+    std::str::from_utf8(buf).unwrap_or("")
+}
+
 /// The class a broker reads a key as: its producer id, `producer_id_of(identity_principal(key))`.
 /// A broker keys its origins and revocations by the principal (the key's first 8 bytes) and
 /// deduplicates relayed records by the producer id that principal hashes to, so two keys of one
 /// class are one origin to it, each able to shadow or pre-empt the other.
 fn class_of(key: &[u8; 32]) -> u64 {
-    astream_broker::producer_id_of(&astream_broker::identity_principal(key))
+    astream_broker::producer_id_of(principal_str(&principal_buf(key)))
 }
 
 /// What the brokers take of a read, with keys judged by class ([`class_of`]), current winning:
@@ -384,11 +400,13 @@ impl Verdict {
             .map(|key| {
                 let next = classes.len();
                 let class = *classes.entry(class(key)).or_insert(next);
-                let name = astream_broker::identity_principal(key);
-                let principal = principal_of.get(&name).copied().unwrap_or_else(|| {
+                let buf = principal_buf(key);
+                let name = principal_str(&buf);
+                let principal = principal_of.get(name).copied().unwrap_or_else(|| {
                     let idx = names.len();
-                    principal_of.insert(name.clone(), idx);
-                    names.push(name);
+                    let owned = name.to_owned();
+                    principal_of.insert(owned.clone(), idx);
+                    names.push(owned);
                     idx
                 });
                 let gone = read.removed.contains(key) || read.retired.contains(key);
@@ -410,9 +428,10 @@ impl Verdict {
         Self {
             origins: pick(&|k| verdict.is_origin(k)),
             keys: pick(&|k| verdict.is_revoked(k)),
-            principals: (0..names.len())
-                .filter(|&p| verdict.is_principal_revoked(p))
-                .map(|p| names[p].clone())
+            principals: names
+                .into_iter()
+                .enumerate()
+                .filter_map(|(p, name)| verdict.is_principal_revoked(p).then_some(name))
                 .collect(),
         }
     }
@@ -585,7 +604,7 @@ fn guard_secret(dir: &Path) -> io::Result<Secret> {
             let wrote =
                 aterm_uds::private_file::write_private_new(dir, GUARD_SECRET, &fresh, |_| Ok(()));
             if wrote.is_ok() {
-                let held = Secret::from_vec(fresh.to_vec());
+                let held = Secret::new(&fresh);
                 aterm_uds::secret::scrub(&mut fresh);
                 return Ok(held);
             }
@@ -1051,6 +1070,11 @@ impl Mesh {
             }
             broker.set_origin_keys(verdict.origins.iter().copied());
         }
+        // Before the new verdict admits a rotated seat's new key, its pushes' resends of what its
+        // old one landed here are known for what they are.
+        if let Some(bus) = &bus {
+            bus.set_producer_lineage(lineage(&read, &self.me.key));
+        }
         // A key that left `Removed` is retired again should it come back.
         applied.retired.retain(|key| read.removed.contains(key));
         applied.unretired.retain(|key| read.removed.contains(key));
@@ -1119,7 +1143,7 @@ impl Mesh {
                     || !applied
                         .verdict
                         .principals
-                        .contains(&astream_broker::identity_principal(key))
+                        .contains(principal_str(&principal_buf(key)))
                 {
                     continue;
                 }
@@ -1249,8 +1273,10 @@ impl Mesh {
             return;
         }
         if let Some(host) = host.as_ref()
-            && applied.read.is_some()
+            && let Some(read) = applied.read.as_ref()
         {
+            host.broker
+                .set_producer_lineage(lineage(read, &self.me.key));
             for key in &applied.verdict.keys {
                 host.broker.revoke_key(*key);
             }
@@ -1389,7 +1415,11 @@ impl Mesh {
             Some(true) => {}
         }
         let peer = astream_broker::identity_principal(&key);
-        let grants = match host.ring_for(&self.me.principal, &peer) {
+        let olds = self
+            .standings()
+            .map(|read| retired_of(&read, &key))
+            .unwrap_or_default();
+        let grants = match host.ring_for(&self.me.principal, &peer, &olds) {
             Ok(grants) => grants,
             Err(e) => {
                 aterm_log::warn!("mesh: no bus.log ring for {peer}: {e}");
@@ -1511,10 +1541,56 @@ fn unbound_ring() -> bool {
 
 /// The grants a neighbour `peer` (its principal) is served this Mac's (`me`) `bus.log` with, for
 /// `fleet` (§4.11): [`aterm_link::federate::peer_ring`]'s, mail to this Mac sent as the peer
-/// itself, the peer's topics, the halt rows and the relay of halts.
+/// itself, or under a node its seat held before a key rotation (`olds`), the peer's topics, the
+/// halt rows and the relay of halts.
 #[must_use]
-pub fn ring(fleet: &str, me: &str, peer: &str) -> Vec<String> {
-    aterm_link::federate::peer_ring(fleet, me, peer)
+pub fn ring(fleet: &str, me: &str, peer: &str, olds: &BTreeSet<String>) -> Vec<String> {
+    aterm_link::federate::peer_ring(fleet, me, peer, olds)
+}
+
+/// The retired nodes of the seat whose node key is `key` now, by `read`: each key a rotation
+/// replaced with it (`Standings::rotated`), as a node, but one that names a current seat's node
+/// too, as the hand-off leaves it out (`Handoff::retired`): a ring granting it would let the
+/// seat write as that other Mac.
+#[must_use]
+pub fn retired_of(read: &Standings, key: &[u8; 32]) -> BTreeSet<String> {
+    let seated: BTreeSet<String> = read
+        .current
+        .iter()
+        .map(astream_broker::identity_principal)
+        .collect();
+    read.rotated
+        .iter()
+        .filter(|(_, now)| *now == key)
+        .map(|(old, _)| astream_broker::identity_principal(old))
+        .filter(|old| !seated.contains(old))
+        .collect()
+}
+
+/// Which producers continue others' sequences on this Mac's (`me`) `bus.log`, by `read`: each
+/// other seat's node now continues every node a rotation retired it from
+/// ([`Broker::set_producer_lineage`](astream_broker::Broker::set_producer_lineage)). Another
+/// seat writes here only by its push, a mirror numbered by its own `bus.log`'s offsets, which a
+/// rotation keeps; so a burst its old node landed here and never committed at home, sent again
+/// under its new node, lands once (§11 C3b). This Mac's own nodes are left out: its bridge
+/// numbers its records by incarnation, not by a log both nodes share.
+#[must_use]
+pub fn lineage(read: &Standings, me: &[u8; 32]) -> Vec<(u64, Vec<u64>)> {
+    let mut lineage: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (old, now) in &read.rotated {
+        if now == me || old == me {
+            continue;
+        }
+        lineage
+            .entry(astream_cap::producer_id_of(
+                &astream_broker::identity_principal(now),
+            ))
+            .or_default()
+            .push(astream_cap::producer_id_of(
+                &astream_broker::identity_principal(old),
+            ));
+    }
+    lineage.into_iter().collect()
 }
 
 /// Open a `Bus` stream for a neighbour's `bus.log` over `link` and read the ring it hands this
@@ -1744,11 +1820,17 @@ impl BusHost {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
 
-    /// The ring neighbour `peer` is served with by this Mac (`me`) ([`ring`]), minted.
+    /// The ring neighbour `peer`, whose seat held the nodes `olds` before, is served with by this
+    /// Mac (`me`) ([`ring`]), minted.
     /// # Errors
     /// A peer principal astream does not take in a grant.
-    pub fn ring_for(&self, me: &str, peer: &str) -> io::Result<Vec<Capability>> {
-        let grants = ring(&self.spec.fleet, me, peer);
+    pub fn ring_for(
+        &self,
+        me: &str,
+        peer: &str,
+        olds: &BTreeSet<String>,
+    ) -> io::Result<Vec<Capability>> {
+        let grants = ring(&self.spec.fleet, me, peer, olds);
         #[cfg(any(test, debug_assertions))]
         let grants = if self.unbound {
             let mut unbound = grants;

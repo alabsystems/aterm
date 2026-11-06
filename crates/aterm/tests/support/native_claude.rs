@@ -11,7 +11,7 @@ pub fn place(root: &Path, dest: &Path, idle: &str) {
     std::fs::write(root.join("sc/idle.txt"), idle).expect("idle screen");
     std::fs::create_dir_all(dest.parent().expect("native fixture parent"))
         .expect("native fixture directory");
-    aterm_uds::deadline::ad_hoc_copy(Path::new(env!("CARGO_BIN_EXE_aterm-claude-fixture")), dest);
+    aterm_uds::deadline::ad_hoc_copy(&aterm_tempfile::bin_exe("aterm-claude-fixture"), dest);
     let mut proof = aterm_uds::spawnfd::command(dest)
         .env("ATERM_CLAUDE_FIXTURE_ROOT", root)
         .arg("--version")

@@ -3,7 +3,7 @@
 
 //! Geometry, viewbox, ground-line, and silhouette checks for the full-body pet poses under `art/pet/`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aterm_effects::cat_baker::CatColorKey;
 use aterm_effects::kitty_pet::ART_ROWS;
@@ -31,7 +31,7 @@ const AIRBORNE: &[&str] = &[
 ];
 
 fn art_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
+    aterm_tempfile::manifest_dir().join("art/pet")
 }
 
 struct Pose {

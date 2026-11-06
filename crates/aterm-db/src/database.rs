@@ -943,26 +943,26 @@ impl History {
                         continue;
                     }
                     let reverting = matches!(command, Command::Revert { .. });
-                    if let Command::Revert { operation, .. } = command {
-                        let target_changes = self.command(operation).and_then(|(_, c)| match c {
-                            Command::Write { changes, .. }
-                                if changes.iter().all(|c| c.value.is_some()) =>
-                            {
-                                Some(changes.as_slice())
-                            }
-                            Command::Revert { changes, .. } => Some(changes.as_slice()),
-                            _ => None,
-                        });
-                        if id == operation
+                    if let Command::Revert { operation, .. } = command
+                        && (id == operation
                             || !self.index.observes(id, operation)
                             || !eligible.contains(operation)
                             || view.invalid.contains(operation)
-                            || !target_changes
-                                .is_some_and(|target| change_keys(target) == change_keys(changes))
-                        {
-                            view.invalid.insert(*id);
-                            continue;
-                        }
+                            || !self.command(operation).is_some_and(|(_, c)| match c {
+                                Command::Write {
+                                    changes: target, ..
+                                } => {
+                                    target.iter().all(|c| c.value.is_some())
+                                        && change_keys(target) == change_keys(changes)
+                                }
+                                Command::Revert {
+                                    changes: target, ..
+                                } => change_keys(target) == change_keys(changes),
+                                _ => false,
+                            }))
+                    {
+                        view.invalid.insert(*id);
+                        continue;
                     }
                     for change in changes {
                         if change.collection == "machines"

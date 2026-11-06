@@ -574,8 +574,9 @@ impl Layers {
             aterm_durable::durable_dir(&dir).map_err(|e| io("flush", &dir, &e))?;
         }
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if entry.file_name() != name.as_str() {
-                let path = entry.path();
+            let entry_name = entry.file_name();
+            if entry_name != name.as_str() {
+                let path = dir.join(entry_name);
                 let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
                     std::fs::remove_dir_all(&path)
                 } else {
@@ -637,9 +638,12 @@ fn files(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(&keep))
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
-        .map(|e| e.path())
+        .filter_map(|e| {
+            let name = e.file_name();
+            (name.to_str().is_some_and(&keep)
+                && e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
+            .then(|| dir.join(name))
+        })
         .collect();
     found.sort();
     found

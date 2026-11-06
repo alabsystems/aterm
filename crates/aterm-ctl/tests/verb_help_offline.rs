@@ -25,7 +25,7 @@ fn ask_help(verb: &str) -> Output {
 /// multiplexer variable removed and every `ATERM_*` one but the verify run's mark
 /// ([`aterm_uds::process::stripped_from_child`]).
 fn ctl(args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
+    let mut command = Command::new(aterm_tempfile::bin_exe("aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         let multiplexer = key == "TMUX" || key == "STY" || key == "ZELLIJ";
         if aterm_uds::process::stripped_from_child(&key) || multiplexer {

@@ -16,9 +16,12 @@
 //! as the file, so a save that replaces the file by rename (a new inode, as
 //! most editors, formatters and `git checkout` save) is heard too, as is a
 //! deleted file made again, and after each burst it arms again on whatever
-//! file the path names now. A file whose folder went with it has nothing to
-//! arm on, so the watch arms it again every `REARM_EVERY` until its folder
-//! is back, and only while some file is unarmed.
+//! file the path names now. Where the directory is missing it watches the
+//! nearest one above it that is there, whose every change is a look (each
+//! finding no change until the file is made), so a file whose folder does
+//! not exist yet, or went with it, is heard once both are made. A file with
+//! nothing at all to arm on (every folder above it refused) is armed again
+//! every `REARM_EVERY`, and only while some file is unarmed.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
@@ -157,11 +160,14 @@ impl Debounce {
 /// The platform side of the watch: arms events on files and reports which
 /// keys heard one. The watch thread owns it.
 pub trait FileEvents: Send {
-    /// Hear events on the file `path` names now and on its directory, under
-    /// `key`, in place of whatever `key` was armed on before.
+    /// Hear events on the file `path` names now and on its directory (where
+    /// that is missing, on the nearest directory above it that is there, so
+    /// the missing one's making is heard), under `key`, in place of whatever
+    /// `key` was armed on before.
     ///
     /// # Errors
-    /// The platform's, when neither the file nor its directory can be armed.
+    /// The platform's, when neither the file nor any directory of its can be
+    /// armed.
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()>;
 
     /// Stop hearing `key`.
@@ -509,6 +515,24 @@ impl FileEvents for PollEvents {
     }
 }
 
+/// How many times one arm looks again lower, where a missing folder of the
+/// file's was made while it armed: each look starts one folder lower, so a
+/// path made all at once settles in a few, and a folder made and taken away
+/// again and again cannot keep the watch thread arming.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ARM_AGAIN: usize = 8;
+
+/// The folders a watch of `path` can listen on, nearest first, each with the
+/// entry below it on the way to `path`: its own folder (with `path`), then
+/// each one above (with the folder below it). Where `path`'s folder is
+/// missing, the nearest one that is there hears it made, and the look that
+/// event brings arms again lower.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn folders_up(path: &Path) -> impl Iterator<Item = (&Path, &Path)> {
+    std::iter::successors(Some(path), |below| below.parent())
+        .filter_map(|below| Some((below.parent()?, below)))
+}
+
 /// `poll(2)`'s timeout for a [`FileEvents::wait`] of at most `timeout`: `-1`
 /// (until an event or a wake) for none, `0` for a wait already due, which only
 /// takes what is ready, and otherwise its whole milliseconds, a rest under one
@@ -546,12 +570,13 @@ fn open_for_events(path: &Path, directory: bool) -> io::Result<std::fs::File> {
 #[cfg(target_os = "macos")]
 mod kqueue {
     //! macOS: one kqueue, a vnode filter on each watched file and on its
-    //! directory, and a user event that wakes the wait.
+    //! directory (or the nearest one above it that is there), and a user event
+    //! that wakes the wait.
 
     use std::collections::BTreeMap;
     use std::io;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -623,14 +648,38 @@ mod kqueue {
         }
     }
 
+    impl KqueueEvents {
+        /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): the
+        /// missing folder just below it, when that is not `path`'s own.
+        fn listen_folder(&mut self, key: u64, path: &Path) -> io::Result<Option<PathBuf>> {
+            let mut missing = None;
+            for (directory, below) in super::folders_up(path) {
+                match self.listen(key, directory, true) {
+                    Ok(()) => return Ok(missing),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        missing = Some(below.to_path_buf());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
     impl FileEvents for KqueueEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-            self.disarm(key);
-            let file = self.listen(key, path, false);
-            let directory = path
-                .parent()
-                .map_or(Ok(()), |directory| self.listen(key, directory, true));
-            file.or(directory)
+            for again in 0..=super::ARM_AGAIN {
+                self.disarm(key);
+                let file = self.listen(key, path, false);
+                match self.listen_folder(key, path) {
+                    // Made between its failed open and the listen above it, which hears
+                    // nothing inside it: arm again, lower.
+                    Ok(Some(made)) if again < super::ARM_AGAIN && made.exists() => {}
+                    Ok(_) => return Ok(()),
+                    Err(error) => return file.or(Err(error)),
+                }
+            }
+            Ok(())
         }
 
         fn disarm(&mut self, key: u64) {
@@ -766,9 +815,10 @@ fn inotify_touched(buffer: &[u8], keys: &BTreeMap<u64, (i32, Vec<u8>)>, touched:
 
 #[cfg(target_os = "linux")]
 mod inotify {
-    //! Linux: one inotify descriptor watching each watched file's directory
-    //! (events name the entry, so a replace by rename is heard), and a pipe
-    //! that wakes the wait.
+    //! Linux: one inotify descriptor watching each watched file's directory, or
+    //! the nearest one above it that is there (events name the entry, so a
+    //! replace by rename is heard, as is the making of the missing folder), and
+    //! a pipe that wakes the wait.
 
     use std::collections::BTreeMap;
     use std::ffi::CString;
@@ -829,6 +879,32 @@ mod inotify {
             })
         }
 
+        /// Watch the nearest folder of `path`'s that is there ([`super::folders_up`]): its watch,
+        /// and the entry below it on the way to `path` (`path` itself, where its own folder is
+        /// there).
+        fn watch_folder<'a>(&self, path: &'a Path) -> io::Result<(i32, &'a Path)> {
+            for (directory, below) in super::folders_up(path) {
+                let directory = CString::new(directory.as_os_str().as_bytes())
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                // SAFETY: a live inotify descriptor and a NUL-terminated path.
+                let wd = unsafe {
+                    libc::inotify_add_watch(
+                        self.fd.as_raw_fd(),
+                        directory.as_ptr(),
+                        DIRECTORY_EVENTS,
+                    )
+                };
+                if wd >= 0 {
+                    return Ok((wd, below));
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            Err(io::Error::from(io::ErrorKind::InvalidInput))
+        }
+
         fn drain_wakes(&self) {
             let mut sink = [0u8; 64];
             // SAFETY: a live non-blocking descriptor and a buffer of the length passed.
@@ -866,24 +942,23 @@ mod inotify {
 
     impl FileEvents for InotifyEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-            let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
-                return Err(io::Error::from(io::ErrorKind::InvalidInput));
-            };
-            let directory = CString::new(directory.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // SAFETY: a live inotify descriptor and a NUL-terminated path.
-            let wd = unsafe {
-                libc::inotify_add_watch(self.fd.as_raw_fd(), directory.as_ptr(), DIRECTORY_EVENTS)
-            };
-            if wd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if let Some((old_wd, _)) = self.keys.insert(key, (wd, name.as_bytes().to_vec()))
-                && old_wd != wd
-                && !self.keys.values().any(|(other, _)| *other == old_wd)
-            {
-                // SAFETY: a live inotify descriptor and a watch it returned.
-                unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), old_wd) };
+            for again in 0..=super::ARM_AGAIN {
+                let (wd, below) = self.watch_folder(path)?;
+                let name = below
+                    .file_name()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+                if let Some((old_wd, _)) = self.keys.insert(key, (wd, name.as_bytes().to_vec()))
+                    && old_wd != wd
+                    && !self.keys.values().any(|(other, _)| *other == old_wd)
+                {
+                    // SAFETY: a live inotify descriptor and a watch it returned.
+                    unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), old_wd) };
+                }
+                // A folder made between its failed watch and the watch above it, which
+                // hears nothing inside it: arm again, lower.
+                if below == path || again == super::ARM_AGAIN || !below.exists() {
+                    break;
+                }
             }
             Ok(())
         }
